@@ -21,12 +21,14 @@ import select
 import signal
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +57,7 @@ SERVE_TYPES = {
     "serve_stream",
     "serve_stream_equivalence_unicode",
     "serve_disconnect_release",
+    "serve_abort_release_matrix",
     "serve_structured_output",
     "serve_response_format_matrix",
     "serve_negative_api_matrix",
@@ -462,6 +465,70 @@ def request_sse_until_output_then_disconnect(
         "first_output_event": first_output_event,
         "active_health": active_health,
         "time_to_first_output_sec": time.monotonic() - started,
+    }
+
+
+def request_until_admitted_then_abort(
+    base_url: str,
+    payload: dict[str, Any],
+    *,
+    variant: str,
+    timeout: float,
+    timeout_delay_sec: float,
+    on_admitted: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    require(variant in {"cancel", "timeout", "disconnect"}, f"unknown abort variant: {variant}")
+    require(timeout > 0, "abort socket timeout must be positive")
+    require(timeout_delay_sec > 0, "abort deadline delay must be positive")
+    parsed = urllib.parse.urlsplit(base_url)
+    require(parsed.scheme == "http", "raw C09 abort probe requires an http product endpoint")
+    require(bool(parsed.hostname), "raw C09 abort probe endpoint has no host")
+    body = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    request = (
+        "POST /v1/chat/completions HTTP/1.1\r\n"
+        f"Host: {parsed.hostname}:{parsed.port or 80}\r\n"
+        "Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii") + body
+    started = time.monotonic()
+    sock = socket.create_connection(
+        (parsed.hostname or "127.0.0.1", parsed.port or 80), timeout=timeout
+    )
+    sock.settimeout(timeout)
+    trigger = "unclassified"
+    try:
+        sock.sendall(request)
+        active_health = on_admitted()
+        admitted = time.monotonic()
+        if variant == "cancel":
+            trigger = "client_explicit_socket_shutdown"
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                trigger = "client_explicit_peer_already_closed"
+        elif variant == "timeout":
+            time.sleep(timeout_delay_sec)
+            trigger = "client_deadline_expired"
+        else:
+            trigger = "client_tcp_reset"
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    finally:
+        sock.close()
+    finished = time.monotonic()
+    return {
+        "status_source": "runner_client_abort",
+        "client_abort": variant,
+        "abort_trigger": trigger,
+        "request_body_bytes": len(body),
+        "request_body_sha256": hashlib.sha256(body).hexdigest(),
+        "active_health": active_health,
+        "time_to_admission_sec": admitted - started,
+        "timeout_delay_sec": timeout_delay_sec if variant == "timeout" else None,
+        "abort_after_admission_sec": finished - admitted,
+        "duration_sec": finished - started,
     }
 
 
@@ -1810,6 +1877,8 @@ class ScenarioRunner:
             return self.serve_stream_equivalence_unicode(scenario, out)
         if typ == "serve_disconnect_release":
             return self.serve_disconnect_release(scenario, out)
+        if typ == "serve_abort_release_matrix":
+            return self.serve_abort_release_matrix(scenario, out)
         if typ == "serve_structured_output":
             return self.serve_structured_output(scenario, out)
         if typ == "serve_response_format_matrix":
@@ -2308,6 +2377,262 @@ class ScenarioRunner:
                 "disconnect": json_fingerprint(disconnect_payload),
                 "followup": json_fingerprint(followup_payload),
             },
+        }
+
+    def serve_abort_release_matrix(
+        self, scenario: dict[str, Any], out: Path
+    ) -> dict[str, Any]:
+        variants = scenario.get("variants", ["cancel", "timeout", "disconnect"])
+        require(
+            variants == ["cancel", "timeout", "disconnect"],
+            "C09 abort matrix variants must be exactly cancel, timeout, disconnect",
+        )
+        cases_per_variant = int(scenario.get("cases_per_variant", 1))
+        require(cases_per_variant == 1, "S2 C09 requires exactly one sentinel per abort variant")
+        release_timeout = float(scenario.get("release_timeout_sec", 5.0))
+        admission_timeout = float(scenario.get("admission_timeout_sec", 5.0))
+        poll_interval = float(scenario.get("poll_interval_sec", 0.05))
+        timeout_delay = float(scenario.get("timeout_delay_sec", 0.05))
+        max_tokens = int(scenario.get("max_tokens", 1024))
+        seed = int(scenario.get("seed", 9271))
+        expected_cap = scenario.get("expected_effective_max_concurrent")
+        require(max_tokens > 0, "C09 abort matrix max_tokens must be positive")
+        require(release_timeout > 0, "C09 abort matrix release timeout must be positive")
+        require(admission_timeout > 0, "C09 abort matrix admission timeout must be positive")
+        require(poll_interval > 0, "C09 abort matrix poll interval must be positive")
+        require(timeout_delay > 0, "C09 abort matrix timeout delay must be positive")
+        if scenario.get("require_scheduler_trace") is True:
+            require(
+                self.observability_enabled(),
+                "C09 abort matrix scheduler-tick validation requires observability",
+            )
+
+        def validate_capacity(snapshot: dict[str, Any], label: str) -> None:
+            if expected_cap is None:
+                return
+            require(
+                snapshot["admission"]["effective_max_concurrent"] == int(expected_cap),
+                f"{label} effective capacity does not match the scenario contract",
+            )
+
+        def wait_until_admitted() -> dict[str, Any]:
+            started = time.monotonic()
+            samples: list[dict[str, Any]] = []
+            last: dict[str, Any] | None = None
+            while time.monotonic() - started <= admission_timeout:
+                remaining = admission_timeout - (time.monotonic() - started)
+                snapshot = admission_health_snapshot(
+                    self.require_base_url(), min(2.0, max(0.1, remaining))
+                )
+                snapshot["elapsed_sec"] = time.monotonic() - started
+                samples.append(snapshot)
+                last = snapshot
+                validate_capacity(snapshot, "C09 admitted request")
+                active = sum(snapshot["admission"][key] for key in ADMISSION_QUIESCENT_FIELDS)
+                if active > 0:
+                    return {
+                        "status": "pass",
+                        "elapsed_sec": snapshot["elapsed_sec"],
+                        "sample_count": len(samples),
+                        "samples": samples,
+                        "terminal": snapshot,
+                    }
+                time.sleep(poll_interval)
+            raise ScenarioError(
+                f"C09 request was not admitted within {admission_timeout:.3f}s; "
+                f"last={last['admission'] if last else None}"
+            )
+
+        rows: list[dict[str, Any]] = []
+        for variant in variants:
+            case_out = out / variant
+            case_out.mkdir(parents=True, exist_ok=True)
+            before = wait_admission_quiescent(
+                self.require_base_url(), timeout=release_timeout, poll_interval=poll_interval
+            )
+            validate_capacity(before["terminal"], f"C09 {variant} before")
+            write_json(case_out / "health.before.json", before)
+
+            marker = f"m1-s2-c09-{variant}"
+            abort_payload = chat_payload(
+                self.model,
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Write the integers from 1 through 1000, one per line, and do not "
+                            "summarize or stop before the requested sequence is complete."
+                        ),
+                    }
+                ],
+                max_tokens=max_tokens,
+                temperature=0,
+            )
+            abort_payload["seed"] = seed
+            abort_payload["stream"] = True
+            abort_payload["stream_options"] = {"include_usage": True}
+            abort_payload["chat_template_kwargs"] = {"enable_thinking": False}
+            abort_payload["metadata"] = {
+                "ferrum_scenario": "c09_abort_release",
+                "ferrum_abort_probe": True,
+                "ferrum_abort_variant": variant,
+                "ferrum_marker": marker,
+            }
+            write_json(case_out / "abort.request.json", abort_payload)
+            observed = request_until_admitted_then_abort(
+                self.require_base_url(),
+                abort_payload,
+                variant=variant,
+                timeout=float(self.timeout),
+                timeout_delay_sec=timeout_delay,
+                on_admitted=wait_until_admitted,
+            )
+            active_health = observed.get("active_health")
+            require(isinstance(active_health, dict), f"C09 {variant} active health missing")
+            validate_capacity(active_health["terminal"], f"C09 {variant} active")
+            active = sum(
+                active_health["terminal"]["admission"][key]
+                for key in ADMISSION_QUIESCENT_FIELDS
+            )
+            require(active > 0, f"C09 {variant} was not active before abort")
+            require(
+                observed.get("request_body_sha256")
+                == hashlib.sha256(
+                    json.dumps(
+                        abort_payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest(),
+                f"C09 {variant} raw request body fingerprint mismatch",
+            )
+            write_json(case_out / "abort.observed.json", observed)
+
+            released = wait_admission_quiescent(
+                self.require_base_url(), timeout=release_timeout, poll_interval=poll_interval
+            )
+            validate_capacity(released["terminal"], f"C09 {variant} released")
+            require(
+                released["elapsed_sec"] <= release_timeout,
+                f"C09 {variant} release exceeded {release_timeout:.3f}s",
+            )
+            write_json(case_out / "health.released.json", released)
+
+            expected = {"marker": marker, "status": "released"}
+            expected_text = json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+            followup_payload = chat_payload(
+                self.model,
+                [
+                    {
+                        "role": "user",
+                        "content": (
+                            "Return the following JSON object exactly, with no extra text. "
+                            f"EXACT_JSON:{expected_text}"
+                        ),
+                    }
+                ],
+                max_tokens=max_tokens,
+                temperature=0,
+            )
+            followup_payload["seed"] = seed
+            followup_payload["chat_template_kwargs"] = {"enable_thinking": False}
+            followup_payload["metadata"] = {
+                "ferrum_scenario": "c09_abort_release_followup",
+                "ferrum_abort_variant": variant,
+                "ferrum_marker": marker,
+            }
+            followup_payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": f"c09_{variant}_release_followup",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "marker": {"type": "string", "const": marker},
+                            "status": {"type": "string", "const": "released"},
+                        },
+                        "required": ["marker", "status"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+            require(
+                followup_payload["max_tokens"] == abort_payload["max_tokens"],
+                f"C09 {variant} follow-up must request the same token capacity",
+            )
+            write_json(case_out / "followup.request.json", followup_payload)
+            followup_status, followup_body = post_json(
+                self.require_base_url(), followup_payload, timeout=self.timeout
+            )
+            (case_out / "followup.response.json").write_text(
+                followup_body, encoding="utf-8"
+            )
+            followup = parse_json_response(
+                f"C09 {variant} same-capacity follow-up", followup_status, followup_body
+            )
+            followup_text = message_text(followup)
+            assert_no_bad_text(f"C09 {variant} same-capacity follow-up", followup_text)
+            try:
+                followup_object = json.loads(followup_text)
+            except json.JSONDecodeError as error:
+                raise ScenarioError(f"C09 {variant} follow-up content is not JSON") from error
+            require(
+                followup_object == expected,
+                f"C09 {variant} follow-up mismatch: {followup_object!r}",
+            )
+            require(
+                finish_reason(followup) == "stop",
+                f"C09 {variant} follow-up did not finish normally",
+            )
+            followup_usage = response_usage(
+                f"C09 {variant} same-capacity follow-up", followup
+            )
+            after = wait_admission_quiescent(
+                self.require_base_url(), timeout=release_timeout, poll_interval=poll_interval
+            )
+            validate_capacity(after["terminal"], f"C09 {variant} after")
+            write_json(case_out / "health.after.json", after)
+            row = with_canonical_sha256(
+                {
+                    "status": "pass",
+                    "variant": variant,
+                    "marker": marker,
+                    "max_tokens": max_tokens,
+                    "effective_max_concurrent": before["terminal"]["admission"][
+                        "effective_max_concurrent"
+                    ],
+                    "abort_trigger": observed["abort_trigger"],
+                    "time_to_admission_sec": observed["time_to_admission_sec"],
+                    "release_elapsed_sec": released["elapsed_sec"],
+                    "release_timeout_sec": release_timeout,
+                    "same_capacity_followup": True,
+                    "followup_usage": followup_usage,
+                    "scheduler_tick_limit": 2,
+                    "scheduler_trace_required": scenario.get("require_scheduler_trace") is True,
+                    "request_fingerprints": {
+                        "abort": json_fingerprint(abort_payload),
+                        "followup": json_fingerprint(followup_payload),
+                    },
+                }
+            )
+            write_json(case_out / "result.json", row)
+            rows.append(row)
+
+        return {
+            "status": "pass",
+            "case_count": len(rows),
+            "cases_per_variant": cases_per_variant,
+            "variant_counts": {variant: 1 for variant in variants},
+            "admitted_case_count": len(rows),
+            "same_capacity_followup_count": len(rows),
+            "max_tokens": max_tokens,
+            "effective_max_concurrent": rows[0]["effective_max_concurrent"],
+            "release_timeout_sec": release_timeout,
+            "scheduler_tick_limit": 2,
+            "scheduler_trace_required": scenario.get("require_scheduler_trace") is True,
+            "cases": rows,
         }
 
     def serve_structured_output(self, scenario: dict[str, Any], out: Path) -> dict[str, Any]:
@@ -3356,7 +3681,10 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
         echo_marker = self.echo_value_marker(payload)
         if payload.get("stream"):
             metadata = payload.get("metadata")
-            if isinstance(metadata, dict) and metadata.get("ferrum_disconnect_probe") is True:
+            if isinstance(metadata, dict) and (
+                metadata.get("ferrum_disconnect_probe") is True
+                or metadata.get("ferrum_abort_probe") is True
+            ):
                 self.send_disconnect_stream()
             elif echo_marker is not None:
                 self.send_stream_tool_call(echo_marker)
@@ -3860,6 +4188,20 @@ def self_test() -> int:
                             "require_scheduler_trace": False,
                         },
                         {
+                            "name": "abort-release-matrix",
+                            "type": "serve_abort_release_matrix",
+                            "variants": ["cancel", "timeout", "disconnect"],
+                            "cases_per_variant": 1,
+                            "expected_effective_max_concurrent": 1,
+                            "max_tokens": 64,
+                            "admission_timeout_sec": 5.0,
+                            "timeout_delay_sec": 0.02,
+                            "release_timeout_sec": 5.0,
+                            "poll_interval_sec": 0.02,
+                            "require_scheduler_trace": False,
+                            "seed": 9271,
+                        },
+                        {
                             "name": "structured",
                             "type": "serve_structured_output",
                             "expected_object": {"answer": "scenario-ok"},
@@ -3952,12 +4294,12 @@ def self_test() -> int:
             if f"BACKEND REGRESSION SMOKE PASS: {out.resolve()}" not in proc.stdout:
                 raise AssertionError(proc.stdout)
             summary = load_json_object(out / "summary.json")
-            if summary.get("status") != "pass" or summary.get("scenario_count") != 15:
+            if summary.get("status") != "pass" or summary.get("scenario_count") != 16:
                 raise AssertionError(summary)
             if (
-                summary.get("manifest_scenario_count") != 15
+                summary.get("manifest_scenario_count") != 16
                 or summary.get("requested_scenarios") != []
-                or len(summary.get("selected_scenarios", [])) != 15
+                or len(summary.get("selected_scenarios", [])) != 16
             ):
                 raise AssertionError(summary)
             receipt = load_json_object(out / "execution_receipt.json")
@@ -4082,6 +4424,31 @@ def self_test() -> int:
                 or disconnect_result.get("scheduler_tick_limit") != 2
             ):
                 raise AssertionError(disconnect_result)
+            abort_result = load_json_object(out / "abort-release-matrix" / "result.json")
+            if (
+                abort_result.get("case_count") != 3
+                or abort_result.get("variant_counts")
+                != {"cancel": 1, "timeout": 1, "disconnect": 1}
+                or abort_result.get("admitted_case_count") != 3
+                or abort_result.get("same_capacity_followup_count") != 3
+                or abort_result.get("effective_max_concurrent") != 1
+                or abort_result.get("scheduler_tick_limit") != 2
+            ):
+                raise AssertionError(abort_result)
+            expected_triggers = {
+                "cancel": {"client_explicit_socket_shutdown", "client_explicit_peer_already_closed"},
+                "timeout": {"client_deadline_expired"},
+                "disconnect": {"client_tcp_reset"},
+            }
+            for case in abort_result.get("cases", []):
+                variant = case.get("variant")
+                if (
+                    variant not in expected_triggers
+                    or case.get("abort_trigger") not in expected_triggers[variant]
+                    or case.get("same_capacity_followup") is not True
+                    or case.get("release_elapsed_sec", 6) > 5.0
+                ):
+                    raise AssertionError(case)
             for turn in ("turn1", "turn2"):
                 if not (out / "multiturn" / f"{turn}.request.json").is_file():
                     raise AssertionError(f"missing persisted multi-turn request: {turn}")
