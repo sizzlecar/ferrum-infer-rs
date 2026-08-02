@@ -46,9 +46,18 @@ HELPER_PATH = ROOT / "openai_concurrency_quality_regression.py"
 SCENARIO_MANIFEST_PATH = ROOT / "scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json"
 MODEL = "Qwen/Qwen3.5-4B"
 SECRET = "ferrum-s2-blue"
+HISTORICAL_CASE_ID = "H02.1"
 RUN_NAME = "m1_s2_run_multiturn_recall"
 SERVE_NAME = "m1_s2_serve_multiturn_recall"
 CONCURRENCY_NAME = "m1_s2_serve_concurrency_quality"
+RUN_PROMPTS = (
+    "Remember the exact code ferrum-s2-blue. Reply with only OK.",
+    "Reply with only TWO.",
+    "Reply with only THREE.",
+    "Reply with only FOUR.",
+    "What was the exact code? Reply with only the code.",
+)
+RUN_ANSWERS = ("OK", "TWO", "THREE", "FOUR", SECRET)
 SCENARIOS = (
     (RUN_NAME, "run_multiturn"),
     (SERVE_NAME, "serve_multiturn_recall"),
@@ -69,7 +78,7 @@ QWEN35_CACHE_RE = re.compile(
 )
 EXPECTED_CONCURRENCY = (1, 4)
 EXPECTED_SERVE_REQUESTS = 7
-EXPECTED_RUN_REQUESTS = 2
+EXPECTED_RUN_REQUESTS = len(RUN_PROMPTS)
 WORKER_LIMIT = 32
 DOES_NOT_PROVE = [
     "full S2",
@@ -244,6 +253,20 @@ def validate_manifest(source: Path) -> dict[str, Any]:
         "manifest scenario identity/order mismatch",
     )
     require(scenarios[0].get("enable_thinking") is False, "run multi-turn must disable thinking")
+    require(
+        scenarios[0].get("historical_case_ids") == [HISTORICAL_CASE_ID],
+        "run multi-turn historical case binding mismatch",
+    )
+    require(
+        scenarios[0].get("use_default_max_tokens") is True
+        and "max_tokens" not in scenarios[0],
+        "H02.1 must exercise the user-visible default max-token budget",
+    )
+    require(
+        scenarios[0].get("min_assistant_turns") == len(RUN_PROMPTS)
+        and scenarios[0].get("prompts") == list(RUN_PROMPTS),
+        "H02.1 five-turn prompt contract mismatch",
+    )
     require(scenarios[1].get("enable_thinking") is False, "serve multi-turn must disable thinking")
     require(scenarios[2].get("enable_thinking") is False, "concurrency probe must disable thinking")
     require(scenarios[2].get("concurrency_cells") == [1, 4], "concurrency cells mismatch")
@@ -443,11 +466,13 @@ def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[
 
 def validate_run(source: Path, recorded: Path, receipt: dict[str, Any], row: dict[str, Any]) -> tuple[set[str], dict[str, Any]]:
     root = source / RUN_NAME
-    require(row.get("assistant_turns") == 2 and row.get("length_finishes") == 0, "run multi-turn result mismatch")
-    expected_input = (
-        "Remember the exact code ferrum-s2-blue. Reply with only OK.\n"
-        "What was the exact code? Reply with only the code.\n/bye\n"
+    require(
+        row.get("assistant_turns") == len(RUN_PROMPTS)
+        and row.get("length_finishes") == 0
+        and row.get("used_default_max_tokens") is True,
+        "run multi-turn result mismatch",
     )
+    expected_input = "\n".join(RUN_PROMPTS) + "\n/bye\n"
     input_text = read_text(root / "input.txt")
     require(input_text == expected_input, "run multi-turn stdin mismatch")
     command = read_json(root / "command.json")
@@ -457,8 +482,9 @@ def validate_run(source: Path, recorded: Path, receipt: dict[str, Any], row: dic
     require(command.get("stdin_sha256") == hashlib.sha256(input_text.encode()).hexdigest(), "run stdin SHA mismatch")
     stdin_path = resolve_member(source, recorded, command.get("stdin_path"), "run stdin path")
     require(stdin_path == root / "input.txt", "run stdin path mismatch")
-    for flag, expected in (("--backend", "cuda"), ("--max-tokens", "128"), ("--temperature", "0.0"), ("--output-format", "jsonl")):
+    for flag, expected in (("--backend", "cuda"), ("--temperature", "0.0"), ("--output-format", "jsonl")):
         require(flag in argv and argv[argv.index(flag) + 1] == expected, f"run command {flag} mismatch")
+    require("--max-tokens" not in argv, "H02.1 run command must use the product default max-token budget")
     require("--disable-thinking" in argv and "--enable-thinking" not in argv, "run thinking mode mismatch")
     require(argv[-1] == MODEL and "run" in argv, "run product identity mismatch")
     require(isinstance(command.get("cwd"), str) and Path(command["cwd"]).is_absolute(), "run cwd invalid")
@@ -497,25 +523,25 @@ def validate_run(source: Path, recorded: Path, receipt: dict[str, Any], row: dic
     assistants = [event for event in events if event.get("event") == "assistant"]
     require(len(ready) == 1 and ready[0].get("backend") == "CUDA(0)", "run ready event mismatch")
     require(len(exits) == 1, "run exit event mismatch")
-    require(len(users) == 2 and len(assistants) == 2, "run turn cardinality mismatch")
+    require(
+        len(users) == len(RUN_PROMPTS) and len(assistants) == len(RUN_PROMPTS),
+        "run turn cardinality mismatch",
+    )
     session_ids = {event.get("session_id") for event in [*users, *assistants]}
     require(len(session_ids) == 1 and None not in session_ids, "run session identity mismatch")
-    require([event.get("turn") for event in users] == [0, 1], "run user turn order mismatch")
-    require([event.get("turn") for event in assistants] == [0, 1], "run assistant turn order mismatch")
-    expected_prompts = [
-        "Remember the exact code ferrum-s2-blue. Reply with only OK.",
-        "What was the exact code? Reply with only the code.",
-    ]
+    expected_turns = list(range(len(RUN_PROMPTS)))
+    require([event.get("turn") for event in users] == expected_turns, "run user turn order mismatch")
+    require([event.get("turn") for event in assistants] == expected_turns, "run assistant turn order mismatch")
     request_ids: set[str] = set()
-    for turn in (0, 1):
+    for turn, expected_prompt in enumerate(RUN_PROMPTS):
         user = users[turn]
         assistant = assistants[turn]
         request_id = user.get("request_id")
         require(isinstance(request_id, str) and request_id, f"run turn {turn}: request id missing")
         require(assistant.get("request_id") == request_id, f"run turn {turn}: request/response id mismatch")
-        require(user.get("content") == expected_prompts[turn], f"run turn {turn}: prompt mismatch")
+        require(user.get("content") == expected_prompt, f"run turn {turn}: prompt mismatch")
         request_ids.add(request_id)
-    require(len(request_ids) == 2, "run request ids are not unique")
+    require(len(request_ids) == len(RUN_PROMPTS), "run request ids are not unique")
     for event in assistants:
         require(event.get("finish_reason") in {"stop", "eos"}, "run assistant finish mismatch")
         require(
@@ -525,12 +551,19 @@ def validate_run(source: Path, recorded: Path, receipt: dict[str, Any], row: dic
         )
         validate_usage(event.get("usage"), "run assistant usage")
         assert_clean_output("run assistant", str(event.get("content") or ""))
-    require_exact_visible_answer(assistants[0].get("content"), "OK", "run turn 0")
-    require_exact_visible_answer(assistants[1].get("content"), SECRET, "run turn 1")
+    for turn, expected_answer in enumerate(RUN_ANSWERS):
+        require_exact_visible_answer(
+            assistants[turn].get("content"), expected_answer, f"run turn {turn}"
+        )
     effective = read_json(root / "effective_config.json")
     require(effective.get("backend") == "cuda", "run effective backend mismatch")
     read_jsonl(root / "decision_trace.jsonl")
-    return request_ids, {"assistant_turns": 2, "session_id": next(iter(session_ids))}
+    return request_ids, {
+        "assistant_turns": len(RUN_PROMPTS),
+        "session_id": next(iter(session_ids)),
+        "historical_case_id": HISTORICAL_CASE_ID,
+        "used_default_max_tokens": True,
+    }
 
 
 def validate_serve_multiturn(source: Path, row: dict[str, Any]) -> dict[str, Any]:
@@ -939,7 +972,11 @@ def validate_observability(source: Path, recorded: Path, summary: dict[str, Any]
     require(categories.count("concurrency") == 5, "serve concurrency request count mismatch")
     expected_markers = {"ferrum0100", "ferrum0400", "ferrum0401", "ferrum0402", "ferrum0403"}
     require(markers == expected_markers, "serve concurrency request markers incomplete")
-    return {"run_requests": 2, "serve_requests": 7, "execution_lifecycles": 9}
+    return {
+        "run_requests": EXPECTED_RUN_REQUESTS,
+        "serve_requests": EXPECTED_SERVE_REQUESTS,
+        "execution_lifecycles": EXPECTED_RUN_REQUESTS + EXPECTED_SERVE_REQUESTS,
+    }
 
 
 def validate_source(source: Path, expected_git_sha: str | None = None) -> dict[str, Any]:
@@ -1096,19 +1133,28 @@ def create_fixture(root: Path) -> None:
     binary_sha = "3" * 64
     run_root = root / RUN_NAME
     run_root.mkdir()
-    input_text = "Remember the exact code ferrum-s2-blue. Reply with only OK.\nWhat was the exact code? Reply with only the code.\n/bye\n"
+    input_text = "\n".join(RUN_PROMPTS) + "\n/bye\n"
     (run_root / "input.txt").write_text(input_text, encoding="utf-8")
-    run_argv = [binary_path, "run", "--backend", "cuda", "--max-tokens", "128", "--temperature", "0.0", "--output-format", "jsonl", "--effective-config-json", str(run_root / "effective_config.json"), "--decision-trace-jsonl", str(run_root / "decision_trace.jsonl"), "--profile-jsonl", str(run_root / "observability/profile.jsonl"), "--profile-detail", "basic", "--memory-profile-jsonl", str(run_root / "observability/memory_profile.jsonl"), "--scheduler-trace-jsonl", str(run_root / "observability/scheduler_trace.jsonl"), "--request-dump-dir", str(run_root / "observability/request_dump"), "--profile-sample-rate", "1.0", "--disable-thinking", MODEL]
+    run_argv = [binary_path, "run", "--backend", "cuda", "--temperature", "0.0", "--output-format", "jsonl", "--effective-config-json", str(run_root / "effective_config.json"), "--decision-trace-jsonl", str(run_root / "decision_trace.jsonl"), "--profile-jsonl", str(run_root / "observability/profile.jsonl"), "--profile-detail", "basic", "--memory-profile-jsonl", str(run_root / "observability/memory_profile.jsonl"), "--scheduler-trace-jsonl", str(run_root / "observability/scheduler_trace.jsonl"), "--request-dump-dir", str(run_root / "observability/request_dump"), "--profile-sample-rate", "1.0", "--disable-thinking", MODEL]
     write_json(run_root / "command.json", {"argv": run_argv, "binary_sha256": binary_sha, "child_env": {"HF_HOME": "/workspace/hf-cache", "NO_COLOR": "1"}, "cwd": "/workspace/ferrum", "env_policy": "remove_FERRUM_prefix", "removed_hidden_env_names": [], "stdin_path": str(run_root / "input.txt"), "stdin_sha256": hashlib.sha256(input_text.encode()).hexdigest()})
-    run_ids = ["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"]
+    run_ids = [f"{index + 1:08d}-1111-1111-1111-{index + 1:012d}" for index in range(len(RUN_PROMPTS))]
     events = [
-        {"schema_version": 2, "event": "ready", "session_id": "session-fixture", "backend": "CUDA(0)"},
-        {"schema_version": 2, "event": "user", "session_id": "session-fixture", "request_id": run_ids[0], "turn": 0, "content": "Remember the exact code ferrum-s2-blue. Reply with only OK."},
-        {"schema_version": 2, "event": "assistant", "session_id": "session-fixture", "request_id": run_ids[0], "turn": 0, "content": "OK", "reasoning": None, "finish_reason": "stop", "usage": {"prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11}},
-        {"schema_version": 2, "event": "user", "session_id": "session-fixture", "request_id": run_ids[1], "turn": 1, "content": "What was the exact code? Reply with only the code."},
-        {"schema_version": 2, "event": "assistant", "session_id": "session-fixture", "request_id": run_ids[1], "turn": 1, "content": SECRET, "reasoning": None, "finish_reason": "stop", "usage": {"prompt_tokens": 20, "completion_tokens": 2, "total_tokens": 22}},
-        {"schema_version": 2, "event": "exit", "session_id": "session-fixture", "reason": "user_exit"},
+        {"schema_version": 2, "event": "ready", "session_id": "session-fixture", "backend": "CUDA(0)"}
     ]
+    for turn, (request_id, prompt, answer) in enumerate(
+        zip(run_ids, RUN_PROMPTS, RUN_ANSWERS, strict=True)
+    ):
+        prompt_tokens = 10 * (turn + 1)
+        completion_tokens = 1 if turn < len(RUN_ANSWERS) - 1 else 2
+        events.extend(
+            [
+                {"schema_version": 2, "event": "user", "session_id": "session-fixture", "request_id": request_id, "turn": turn, "content": prompt},
+                {"schema_version": 2, "event": "assistant", "session_id": "session-fixture", "request_id": request_id, "turn": turn, "content": answer, "reasoning": None, "finish_reason": "stop", "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}},
+            ]
+        )
+    events.append(
+        {"schema_version": 2, "event": "exit", "session_id": "session-fixture", "reason": "user_exit"}
+    )
     (run_root / "stdout.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     (run_root / "stderr.log").write_text("clean run\n", encoding="utf-8")
     effective = {"schema_version": 1, "backend": "cuda", "cuda_device_count": 1, "selected_gpu_devices": [0], "model_capabilities": {"architecture": "qwen3_5"}, "hardware_capabilities": {"backend": "cuda", "compiled_features": {"cuda": True}}}
@@ -1188,7 +1234,7 @@ def create_fixture(root: Path) -> None:
     write_json(concurrency_root / "concurrency_quality_regression.json", {"model": MODEL, "cells": cell_summaries, "status": "pass"})
 
     scenario_rows = [
-        {"name": RUN_NAME, "type": "run_multiturn", "status": "pass", "assistant_turns": 2, "length_finishes": 0, "artifact": str(run_root / "result.json"), "duration_sec": 1.0},
+        {"name": RUN_NAME, "type": "run_multiturn", "status": "pass", "assistant_turns": len(RUN_PROMPTS), "length_finishes": 0, "used_default_max_tokens": True, "artifact": str(run_root / "result.json"), "duration_sec": 1.0},
         {"name": SERVE_NAME, "type": "serve_multiturn_recall", "status": "pass", "assistant_turns": 2, "recalled_secret": True, "artifact": str(serve_root / "result.json"), "duration_sec": 1.0},
         {"name": CONCURRENCY_NAME, "type": "serve_concurrency_quality", "status": "pass", "cells": cell_summaries, "artifact": str(concurrency_root / "result.json"), "duration_sec": 1.0},
     ]
@@ -1277,7 +1323,11 @@ def self_test() -> None:
         root.mkdir()
         create_fixture(root)
         evidence = validate_source(root, "a" * 40)
-        require(evidence["observability"]["execution_lifecycles"] == 9, "baseline lifecycle count mismatch")
+        require(
+            evidence["observability"]["execution_lifecycles"]
+            == EXPECTED_RUN_REQUESTS + EXPECTED_SERVE_REQUESTS,
+            "baseline lifecycle count mismatch",
+        )
         source_tree_sha = file_sha256(root / "artifact_tree.json")
         nested_output = root / "validator-output"
         for invalid_output in (root, nested_output):
@@ -1350,6 +1400,16 @@ def self_test() -> None:
             path = candidate / RUN_NAME / "command.json"
             command = read_json(path)
             command["cwd"] = "/workspace/other"
+            write_json(path, command)
+
+        def explicit_run_max_tokens(candidate: Path) -> None:
+            path = candidate / RUN_NAME / "command.json"
+            command = read_json(path)
+            argv = command["argv"]
+            argv[argv.index("--temperature"):argv.index("--temperature")] = [
+                "--max-tokens",
+                "128",
+            ]
             write_json(path, command)
 
         def swapped_run_request_ids(candidate: Path) -> None:
@@ -1433,6 +1493,7 @@ def self_test() -> None:
         expect_reject(root, helper_drift, "helper drift")
         expect_reject(root, inherited_run_env, "inherited run env")
         expect_reject(root, changed_run_cwd, "changed run cwd")
+        expect_reject(root, explicit_run_max_tokens, "explicit run max tokens")
         expect_reject(root, swapped_run_request_ids, "swapped run ids")
         expect_reject(root, raw_reasoning_leak, "raw reasoning leak")
         expect_reject(root, request_dump_drift, "request dump drift")

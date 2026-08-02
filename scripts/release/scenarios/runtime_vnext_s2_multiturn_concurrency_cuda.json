@@ -28,11 +28,17 @@
       "enable_thinking": false,
       "secret": "ferrum-s2-blue",
       "expected_recall": "ferrum-s2-blue",
-      "min_assistant_turns": 2,
-      "max_tokens": 128,
+      "historical_case_ids": [
+        "H02.1"
+      ],
+      "min_assistant_turns": 5,
+      "use_default_max_tokens": true,
       "temperature": 0.0,
       "prompts": [
         "Remember the exact code ferrum-s2-blue. Reply with only OK.",
+        "Reply with only TWO.",
+        "Reply with only THREE.",
+        "Reply with only FOUR.",
         "What was the exact code? Reply with only the code."
       ]
     },
