@@ -68,6 +68,7 @@ LANES = (
     "vnext-s2-stream-disconnect",
     "vnext-s2-tool-schema",
     "vnext-s2-multiturn-concurrency",
+    "vnext-s2-historical-resource-source",
     "vnext-cuda-determinism",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
@@ -1176,6 +1177,26 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s2-multiturn-concurrency",
+        )
+    if lane == "vnext-s2-historical-resource-source":
+        if args.historical_corpus is None:
+            raise GateError(
+                "vnext-s2-historical-resource-source requires --historical-corpus"
+            )
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s2_historical_resource_source.py",
+                "--historical-corpus",
+                str(args.historical_corpus.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S2 HISTORICAL RESOURCE SOURCE PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s2-historical-resource-source",
         )
     if lane == "vnext-cuda-determinism":
         if args.cuda_determinism_artifact_root is None:
@@ -8974,6 +8995,65 @@ def self_test() -> int:
                 == f"{child_prefix}: {lane_out}",
                 lane_manifest,
             )
+        historical_raw = (root / "historical-corpus").resolve()
+        historical_lane_out = (
+            root / "vnext-s2-historical-resource-source-dry-run"
+        ).resolve()
+        historical_lane = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-s2-historical-resource-source",
+                "--historical-corpus",
+                str(historical_raw),
+                "--out",
+                str(historical_lane_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            historical_lane.returncode == 0,
+            historical_lane.stderr or historical_lane.stdout,
+        )
+        historical_lane_manifest = json.loads(
+            (historical_lane_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            historical_lane_manifest["status"] == "dry-run"
+            and historical_lane_manifest["lane"]
+            == "vnext-s2-historical-resource-source"
+            and historical_lane_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_s2_historical_resource_source.py",
+                "--historical-corpus",
+                str(historical_raw),
+                "--out",
+                str(historical_lane_out),
+            ]
+            and historical_lane_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT S2 HISTORICAL RESOURCE SOURCE PASS: "
+                f"{historical_lane_out}"
+            ),
+            historical_lane_manifest,
+        )
+        missing_historical = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-s2-historical-resource-source",
+                "--out",
+                str(root / "vnext-s2-historical-resource-missing-input"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            missing_historical.returncode != 0
+            and "--historical-corpus"
+            in (missing_historical.stderr + missing_historical.stdout),
+            missing_historical.stderr or missing_historical.stdout,
+        )
         missing_s2 = run_selftest_command(
             [
                 sys.executable,
@@ -9572,6 +9652,7 @@ def main() -> int:
     parser.add_argument("--s1-decode-capacity", type=Path)
     parser.add_argument("--s1-artifact", type=Path)
     parser.add_argument("--s2-artifact-root", type=Path)
+    parser.add_argument("--historical-corpus", type=Path)
     parser.add_argument("--g07a-evidence-root", type=Path)
     parser.add_argument("--source-gate", type=Path)
     parser.add_argument("--semantic-plan-equivalence", type=Path)
@@ -9608,6 +9689,7 @@ def main() -> int:
         "vnext-s2-stream-disconnect",
         "vnext-s2-tool-schema",
         "vnext-s2-multiturn-concurrency",
+        "vnext-s2-historical-resource-source",
     }:
         try:
             require_external_vnext_g00_output(out_dir)
@@ -9648,7 +9730,8 @@ def main() -> int:
             lane_command.cmd,
             out_dir,
             args.timeout,
-            prepare_out_dir=lane_command.provenance_kind != "vnext-g00a",
+            prepare_out_dir=lane_command.provenance_kind
+            not in {"vnext-g00a", "vnext-s2-historical-resource-source"},
         )
         child_returncode = proc.returncode
         if proc.returncode != 0:
