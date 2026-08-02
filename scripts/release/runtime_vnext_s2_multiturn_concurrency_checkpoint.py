@@ -4,14 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
+import io
 import json
 import re
 import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -279,6 +282,42 @@ def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[
     require(receipt.get("backend") == "cuda" and receipt.get("model") == MODEL, "execution model/backend mismatch")
     require(receipt.get("selected_scenarios") == [name for name, _ in SCENARIOS], "execution scenario mismatch")
     require(receipt.get("scenario_count") == 3 and receipt.get("failed") == 0 and receipt.get("skipped") == 0, "execution result mismatch")
+    execution_phases = receipt.get("scenario_execution_phases")
+    require(isinstance(execution_phases, list) and len(execution_phases) == 2, "execution phase receipt mismatch")
+    expected_phases = (
+        ("run", [RUN_NAME]),
+        ("serve", [SERVE_NAME, CONCURRENCY_NAME]),
+    )
+    parsed_phases: list[tuple[datetime, datetime]] = []
+    for row, (expected_phase, expected_scenarios) in zip(
+        execution_phases, expected_phases, strict=True
+    ):
+        require(
+            isinstance(row, dict)
+            and set(row) == {"phase", "scenarios", "started_at", "finished_at"},
+            f"{expected_phase} execution phase shape mismatch",
+        )
+        require(
+            row.get("phase") == expected_phase
+            and row.get("scenarios") == expected_scenarios,
+            f"{expected_phase} execution phase identity mismatch",
+        )
+        try:
+            phase_started = datetime.fromisoformat(str(row.get("started_at")))
+            phase_finished = datetime.fromisoformat(str(row.get("finished_at")))
+        except ValueError as error:
+            raise ValidationError(f"{expected_phase} execution phase timestamp invalid") from error
+        require(
+            phase_started.tzinfo is not None
+            and phase_finished.tzinfo is not None
+            and phase_started <= phase_finished,
+            f"{expected_phase} execution phase interval invalid",
+        )
+        parsed_phases.append((phase_started, phase_finished))
+    require(
+        parsed_phases[0][1] <= parsed_phases[1][0],
+        "run and serve execution phases overlap",
+    )
     runner_argv = receipt.get("runner_argv")
     runner_path = receipt.get("runner_path")
     require(isinstance(runner_argv, list) and len(runner_argv) >= 2, "runner argv missing")
@@ -340,6 +379,14 @@ def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[
     require(receipt.get("server_returncode") in (0, -15), "server return code mismatch")
     for field in ("server_started_at", "server_finished_at"):
         require(isinstance(receipt.get(field), str) and receipt[field], f"{field} missing")
+    try:
+        server_started_at = datetime.fromisoformat(receipt["server_started_at"])
+    except ValueError as error:
+        raise ValidationError("server_started_at invalid") from error
+    require(
+        parsed_phases[0][1] <= parsed_phases[1][0] <= server_started_at <= parsed_phases[1][1],
+        "server did not start strictly after the run-only phase",
+    )
     evidence = receipt.get("evidence_files")
     expected_evidence = {
         "effective_config": "server.effective_config.json",
@@ -920,10 +967,25 @@ def validate_source(source: Path, expected_git_sha: str | None = None) -> dict[s
     }
 
 
+def validate_output_layout(source: Path, out: Path) -> tuple[Path, Path]:
+    source = source.resolve(strict=True)
+    out = out.resolve(strict=False)
+    require(out != source, "checkpoint output must differ from source artifact root")
+    require(
+        source not in out.parents,
+        "checkpoint output must not be inside source artifact root",
+    )
+    return source, out
+
+
 def run_checkpoint(source: Path, out: Path, expected_git_sha: str | None) -> int:
     started_at = iso_now()
     started = time.monotonic()
-    out = out.resolve(strict=False)
+    try:
+        source, out = validate_output_layout(source, out)
+    except (OSError, ValidationError) as error:
+        print(f"{FAIL_PREFIX}: {out.resolve(strict=False)}: {error}", file=sys.stderr)
+        return 1
     out.mkdir(parents=True, exist_ok=True)
     manifest: dict[str, Any] = {
         "schema_version": 1,
@@ -931,7 +993,7 @@ def run_checkpoint(source: Path, out: Path, expected_git_sha: str | None) -> int
         "scope": ["S2/run-multiturn", "S2/serve-multiturn", "S2/c1-c4-concurrency"],
         "full_s2": False,
         "does_not_prove": DOES_NOT_PROVE,
-        "source_root": str(source.resolve(strict=False)),
+        "source_root": str(source),
         "artifact_dir": str(out),
         "started_at": started_at,
     }
@@ -1167,7 +1229,7 @@ def create_fixture(root: Path) -> None:
         "concurrency_quality_helper": {"path": str(inputs / "openai_concurrency_quality_regression.py"), "sha256": file_sha256(inputs / "openai_concurrency_quality_regression.py")},
     }
     evidence = {key: {"path": str(root / filename), "size": (root / filename).stat().st_size, "sha256": file_sha256(root / filename)} for key, filename in {"effective_config": "server.effective_config.json", "decision_trace": "server.decision_trace.jsonl", "server_log": "server.log", "health_before": "server.health.json", "health_after": "server.health.after.json"}.items()}
-    receipt = self_hash({"schema_version": 1, "mode": "start", "runner_argv": ["/usr/bin/python3", "/workspace/ferrum/scripts/release/run_scenarios.py", "--manifest", "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "--out", str(root)], "runner_path": "/workspace/ferrum/scripts/release/run_scenarios.py", "runner_sha256": file_sha256(inputs / "run_scenarios.py"), "manifest_path": "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "manifest_sha256": file_sha256(inputs / "scenario_manifest.json"), "cwd": "/workspace/ferrum", "git_sha": "a" * 40, "dirty_status": {"is_dirty": False, "status_short": []}, "input_artifacts": input_artifacts, "backend": "cuda", "model": MODEL, "selected_scenarios": [name for name, _ in SCENARIOS], "scenario_count": 3, "failed": 0, "skipped": 0, "server_argv": [binary_path, "serve", "--host", "127.0.0.1", "--effective-config-json", str(root / "server.effective_config.json"), "--decision-trace-jsonl", str(root / "server.decision_trace.jsonl"), "--backend", "cuda", MODEL], "binary_path": binary_path, "binary_sha256": binary_sha, "hardware": {"argv": ["nvidia-smi", "--query-gpu=index,name,uuid,memory.total,driver_version", "--format=csv,noheader,nounits"], "returncode": 0, "stdout": "0, NVIDIA GeForce RTX 4090, GPU-fixture, 24564, 570.00\n", "stderr": ""}, "removed_hidden_env_names": [], "child_env": {"HF_HOME": "/workspace/hf-cache", "NO_COLOR": "1"}, "server_started_at": "2026-08-02T00:00:00+00:00", "server_finished_at": "2026-08-02T00:01:00+00:00", "server_returncode": -15, "evidence_files": evidence})
+    receipt = self_hash({"schema_version": 1, "mode": "start", "runner_argv": ["/usr/bin/python3", "/workspace/ferrum/scripts/release/run_scenarios.py", "--manifest", "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "--out", str(root)], "runner_path": "/workspace/ferrum/scripts/release/run_scenarios.py", "runner_sha256": file_sha256(inputs / "run_scenarios.py"), "manifest_path": "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "manifest_sha256": file_sha256(inputs / "scenario_manifest.json"), "cwd": "/workspace/ferrum", "git_sha": "a" * 40, "dirty_status": {"is_dirty": False, "status_short": []}, "input_artifacts": input_artifacts, "backend": "cuda", "model": MODEL, "selected_scenarios": [name for name, _ in SCENARIOS], "scenario_execution_phases": [{"phase": "run", "scenarios": [RUN_NAME], "started_at": "2026-08-02T00:00:00+00:00", "finished_at": "2026-08-02T00:00:10+00:00"}, {"phase": "serve", "scenarios": [SERVE_NAME, CONCURRENCY_NAME], "started_at": "2026-08-02T00:00:10+00:00", "finished_at": "2026-08-02T00:01:00+00:00"}], "scenario_count": 3, "failed": 0, "skipped": 0, "server_argv": [binary_path, "serve", "--host", "127.0.0.1", "--effective-config-json", str(root / "server.effective_config.json"), "--decision-trace-jsonl", str(root / "server.decision_trace.jsonl"), "--backend", "cuda", MODEL], "binary_path": binary_path, "binary_sha256": binary_sha, "hardware": {"argv": ["nvidia-smi", "--query-gpu=index,name,uuid,memory.total,driver_version", "--format=csv,noheader,nounits"], "returncode": 0, "stdout": "0, NVIDIA GeForce RTX 4090, GPU-fixture, 24564, 570.00\n", "stderr": ""}, "removed_hidden_env_names": [], "child_env": {"HF_HOME": "/workspace/hf-cache", "NO_COLOR": "1"}, "server_started_at": "2026-08-02T00:00:11+00:00", "server_finished_at": "2026-08-02T00:01:00+00:00", "server_returncode": -15, "evidence_files": evidence})
     write_json(root / "execution_receipt.json", receipt)
     summary = {"schema_version": 1, "status": "pass", "manifest": "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "artifact_dir": str(root), "model": MODEL, "backend": "cuda", "base_url": "http://127.0.0.1:8000", "git_sha": "a" * 40, "dirty_status": {"is_dirty": False, "status_short": []}, "started_at": "2026-08-02T00:00:00+00:00", "finished_at": "2026-08-02T00:01:00+00:00", "scenario_count": 3, "manifest_scenario_count": 3, "requested_scenarios": [], "selected_scenarios": [name for name, _ in SCENARIOS], "failed": 0, "skipped": 0, "scenarios": scenario_rows, "response_format_matrix_contract": {"artifact": str(root / "response_format_matrix_contract.json"), "case_counts": {"json_schema": 0, "json_object": 0}, "unique_json_schema_count": 0}, "observability": observability, "execution_receipt": {"artifact": str(root / "execution_receipt.json"), "artifact_sha256": file_sha256(root / "execution_receipt.json"), "canonical_sha256": receipt["canonical_sha256"], "mode": "start", "runner_sha256": receipt["runner_sha256"], "manifest_sha256": receipt["manifest_sha256"], "binary_sha256": binary_sha}, "pass_line": f"BACKEND REGRESSION SMOKE PASS: {root}"}
     write_json(root / "summary.json", summary)
@@ -1177,6 +1239,24 @@ def create_fixture(root: Path) -> None:
 def rewrite_tree(root: Path) -> None:
     (root / "artifact_tree.json").unlink(missing_ok=True)
     write_fixture_tree(root)
+
+
+def rewrite_execution_receipt(
+    root: Path, mutation: Callable[[dict[str, Any]], None]
+) -> None:
+    receipt_path = root / "execution_receipt.json"
+    receipt = read_json(receipt_path)
+    receipt.pop("canonical_sha256", None)
+    receipt.pop("canonical_sha256_scope", None)
+    mutation(receipt)
+    receipt = self_hash(receipt)
+    write_json(receipt_path, receipt)
+    summary_path = root / "summary.json"
+    summary = read_json(summary_path)
+    summary_receipt = summary["execution_receipt"]
+    summary_receipt["artifact_sha256"] = file_sha256(receipt_path)
+    summary_receipt["canonical_sha256"] = receipt["canonical_sha256"]
+    write_json(summary_path, summary)
 
 
 def expect_reject(root: Path, mutation: Callable[[Path], None], expected: str) -> None:
@@ -1198,6 +1278,22 @@ def self_test() -> None:
         create_fixture(root)
         evidence = validate_source(root, "a" * 40)
         require(evidence["observability"]["execution_lifecycles"] == 9, "baseline lifecycle count mismatch")
+        source_tree_sha = file_sha256(root / "artifact_tree.json")
+        nested_output = root / "validator-output"
+        for invalid_output in (root, nested_output):
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                rc = run_checkpoint(root, invalid_output, "a" * 40)
+            require(rc == 1, "unsafe checkpoint output layout unexpectedly passed")
+            require(
+                "checkpoint output must" in stderr.getvalue(),
+                "unsafe checkpoint output rejection missing diagnostic",
+            )
+            require(
+                file_sha256(root / "artifact_tree.json") == source_tree_sha,
+                "unsafe checkpoint output mutated source artifact tree",
+            )
+        require(not nested_output.exists(), "unsafe nested checkpoint output was created")
         try:
             validate_source(root, "b" * 40)
         except ValidationError:
@@ -1321,6 +1417,14 @@ def self_test() -> None:
             summary["scenarios"][2]["cells"][1] = summary_cell
             write_json(summary_path, summary)
 
+        def server_overlaps_run_phase(candidate: Path) -> None:
+            rewrite_execution_receipt(
+                candidate,
+                lambda receipt: receipt.__setitem__(
+                    "server_started_at", "2026-08-02T00:00:05+00:00"
+                ),
+            )
+
         expect_reject(root, bad_recall, "bad recall")
         expect_reject(root, bad_first_turn, "bad first turn")
         expect_reject(root, thinking_wrapper, "thinking wrapper")
@@ -1333,6 +1437,7 @@ def self_test() -> None:
         expect_reject(root, raw_reasoning_leak, "raw reasoning leak")
         expect_reject(root, request_dump_drift, "request dump drift")
         expect_reject(root, serial_client_intervals, "serial client intervals")
+        expect_reject(root, server_overlaps_run_phase, "server overlaps run phase")
     print(SELFTEST_PASS_LINE)
 
 
