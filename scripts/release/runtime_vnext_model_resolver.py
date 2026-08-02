@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import copy
 import datetime as dt
 import fnmatch
 import hashlib
 import http.client
+import io
 import json
 import os
 import re
@@ -69,6 +71,10 @@ GIT_BOUNDED_CONFIG = [
 
 
 class ResolutionError(Exception):
+    pass
+
+
+class RetryablePayloadError(Exception):
     pass
 
 
@@ -218,7 +224,14 @@ class Transport:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
 
-    def fetch(self, url: str, kind: str) -> Response:
+    def fetch(
+        self,
+        url: str,
+        kind: str,
+        *,
+        expected_size: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> Response:
         raise NotImplementedError
 
     def fetch_json(self, url: str, kind: str) -> tuple[Any, Response]:
@@ -252,7 +265,14 @@ class NetworkTransport(Transport):
         self.token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
         self.opener = urllib.request.build_opener(SafeRedirectHandler())
 
-    def fetch(self, url: str, kind: str) -> Response:
+    def fetch(
+        self,
+        url: str,
+        kind: str,
+        *,
+        expected_size: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> Response:
         require(url.startswith(f"{HF_BASE}/"), f"refusing non-Hugging-Face request URL: {url}")
         headers = {
             "Accept": "application/json" if kind != "metadata-file" else "application/octet-stream",
@@ -287,8 +307,31 @@ class NetworkTransport(Transport):
                         body=body,
                     )
                 require(200 <= response.status < 300, f"HTTP {response.status} for {kind}: {url}")
+                if expected_size is not None and len(response.body) != expected_size:
+                    raise RetryablePayloadError(
+                        f"download/tree size mismatch for {url}: "
+                        f"{len(response.body)} != {expected_size}"
+                    )
+                if (
+                    expected_sha256 is not None
+                    and hashlib.sha256(response.body).hexdigest() != expected_sha256
+                ):
+                    raise RetryablePayloadError(
+                        f"downloaded metadata SHA256 mismatch for {url}"
+                    )
                 self.record(url, kind, response)
+                print(
+                    "RUNTIME VNEXT MODEL RESOLVER PROGRESS: "
+                    f"request={len(self.requests)} kind={kind} "
+                    f"status={response.status} bytes={len(response.body)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return response
+            except RetryablePayloadError as exc:
+                last_error = exc
+                if attempt == self.retries:
+                    raise ResolutionError(str(exc)) from exc
             except urllib.error.HTTPError as exc:
                 last_error = exc
                 retryable = exc.code == 429 or 500 <= exc.code < 600
@@ -321,7 +364,14 @@ class FixtureTransport(Transport):
         require(data.get("schema_version") == 1, "offline fixture schema_version must be 1")
         self.responses = require_object(data.get("responses"), "offline fixture.responses")
 
-    def fetch(self, url: str, kind: str) -> Response:
+    def fetch(
+        self,
+        url: str,
+        kind: str,
+        *,
+        expected_size: int | None = None,
+        expected_sha256: str | None = None,
+    ) -> Response:
         raw = self.responses.get(url)
         require(raw is not None, f"offline fixture has no response for {url}")
         item = require_object(raw, f"offline fixture response {url}")
@@ -529,7 +579,11 @@ class Resolver:
                 f"non-LFS selected file exceeds metadata limit ({MAX_METADATA_BYTES} bytes): {snapshot.repo}/{path}",
             )
             url = resolve_file_url(snapshot.repo, snapshot.revision, path)
-            response = self.transport.fetch(url, "metadata-file")
+            response = self.transport.fetch(
+                url,
+                "metadata-file",
+                expected_size=entry.size,
+            )
             require(
                 len(response.body) == entry.size,
                 f"download/tree size mismatch for {snapshot.repo}/{path}: {len(response.body)} != {entry.size}",
@@ -569,7 +623,12 @@ class Resolver:
             f"LFS metadata exceeds metadata limit ({MAX_METADATA_BYTES} bytes): {snapshot.repo}/{path}",
         )
         url = resolve_file_url(snapshot.repo, snapshot.revision, path)
-        response = self.transport.fetch(url, "metadata-file")
+        response = self.transport.fetch(
+            url,
+            "metadata-file",
+            expected_size=entry.size,
+            expected_sha256=entry.lfs_oid,
+        )
         require(
             len(response.body) == entry.size,
             f"download/tree size mismatch for {snapshot.repo}/{path}: {len(response.body)} != {entry.size}",
@@ -1490,6 +1549,73 @@ def run_selftest() -> None:
         == ["-c", "core.preloadindex=false", "-c", "index.threads=1"],
         "selftest Git worker bound mismatch",
     )
+
+    class FakeNetworkResponse:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+            self.status = 200
+            self.headers = {"content-length": str(len(body))}
+
+        def __enter__(self) -> FakeNetworkResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self, _limit: int | None = None) -> bytes:
+            return self.body
+
+    class FakeNetworkOpener:
+        def __init__(self, bodies: list[bytes]) -> None:
+            self.bodies = list(bodies)
+            self.calls = 0
+
+        def open(self, _request: Any, *, timeout: float) -> FakeNetworkResponse:
+            require(timeout > 0, "selftest network timeout must be positive")
+            self.calls += 1
+            require(bool(self.bodies), "selftest network response sequence exhausted")
+            return FakeNetworkResponse(self.bodies.pop(0))
+
+    expected_body = b"complete-metadata"
+    retry_transport = NetworkTransport(timeout=1.0, retries=1)
+    retry_opener = FakeNetworkOpener([b"truncated", expected_body])
+    retry_transport.opener = retry_opener
+    progress = io.StringIO()
+    with contextlib.redirect_stderr(progress):
+        retried = retry_transport.fetch(
+            f"{HF_BASE}/selftest/metadata.json",
+            "metadata-file",
+            expected_size=len(expected_body),
+            expected_sha256=hashlib.sha256(expected_body).hexdigest(),
+        )
+    require(retried.body == expected_body, "semantic response retry lost the valid body")
+    require(retry_opener.calls == 2, "semantic response retry count mismatch")
+    require(
+        len(retry_transport.requests) == 1,
+        "semantic response retry recorded an invalid response",
+    )
+    require(
+        "request=1 kind=metadata-file status=200" in progress.getvalue(),
+        "network progress record is missing",
+    )
+
+    rejected_transport = NetworkTransport(timeout=1.0, retries=0)
+    rejected_transport.opener = FakeNetworkOpener([expected_body])
+    try:
+        rejected_transport.fetch(
+            f"{HF_BASE}/selftest/metadata.json",
+            "metadata-file",
+            expected_size=len(expected_body),
+            expected_sha256="0" * 64,
+        )
+    except ResolutionError as error:
+        require(
+            "downloaded metadata SHA256 mismatch" in str(error),
+            "semantic response rejection reported the wrong failure",
+        )
+    else:
+        raise ResolutionError("semantic response retry accepted a wrong SHA256")
+
     for payload in ('{"fact":1,"fact":2}', '{"fact":NaN}'):
         try:
             strict_json_loads(payload)
