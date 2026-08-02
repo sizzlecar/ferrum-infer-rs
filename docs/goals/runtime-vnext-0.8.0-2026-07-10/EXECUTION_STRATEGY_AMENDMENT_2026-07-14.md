@@ -189,6 +189,46 @@ S3 使用同一 ModelProgram 增加 Metal providers/GGUF mapping，并在 dual-b
 legacy entry。S4/S5 每完成一个模型立即删除对应 legacy factory/runner/flag/fallback；adapter 必须有
 当前里程碑 sunset，不能延后到总发布。
 
+### S2 精确退出合同（2026-08-02）
+
+S2 是 Qwen3.5-4B CUDA 的 focused 完整产品纵切，不提前执行 S6 的完整 C01-C21、G02、G05、
+G06 或 G08 分母。S2 aggregate 必须显式消费下列同一 clean source identity 的外层
+`run_gate.py` artifact，缺一项即失败：
+
+1. 未被 change-impact 判定失效的 G01 reference-runtime artifact，以及 S1 actual-model CUDA
+   basic/capacity/decode-capacity artifact；若当前提交触及 production runtime、核心 contract 或其
+   validator，禁止人工复用 stale artifact。
+2. M1 CUDA determinism focused witness，以及 G02 core 的 L0/L1 bounded receipt。S2 不得打印完整
+   `FERRUM RUNTIME VNEXT G02 TEST EVIDENCE PASS`；16-family historical、完整 planner/timing/mutation
+   分母仍在 S6。
+3. 当前 M1 CUDA product checkpoints：response-format、negative API/text-only modality、Unicode
+   stream equivalence、tool/schema priority 与 tool-result lifecycle、run/serve multi-turn 和 c1/c4
+   concurrent isolation。
+4. C09 focused sentinel：`cancel`、`timeout`、`disconnect` 各一个已经真实 admission 的请求；每个
+   请求都必须在 runtime 接收终止后 `<=2` scheduler tick 且 wall `<=5s` 到达
+   released/expected-cache 终态，resource leak/underflow/double-release=`0`，随后同容量请求成功。
+   三类各 `20` 的正式 C09 分母仍属于 S6，不能用三个 sentinel 冒充完整 C09。
+5. M1 CUDA historical resource focused set 精确为 `H02.1`、`H12.1`、`H12.2`、`H12.3`、
+   `H12.4`；每项必须绑定 catalog identity、冻结 bad input 或 mutation/revert、当前修复路径和
+   mutation/revert kill receipt，并按 catalog 适用范围覆盖 `run`/`serve`。`H15.1/H15.2` 是
+   Qwen3.5-35B c32/G08B 投影，不计入 S2。
+6. M1 CUDA latency/first-failure attribution artifact：typed `latency` preset 可从产品 CLI/config
+   到达；请求 identity 至少贯穿 request/sequence/plan/node/op/resource/backend event；成功样本包含
+   prompt/output/total token、token source、E2E，stream 还包含 TTFT/ITL；注入的 blocking/resource
+   failure 能报告首个失败 phase/kind/status/error 和资源 snapshot。clock conversion error
+   `<=0.5% decode wall`。latency profile overhead `<=5%` 只报告，`noisy`/`target_miss` 不阻塞 S2。
+
+aggregate 必须重新验证 child 原始 artifact，而不是只匹配 stdout；并交叉检查 Git SHA/tree、dirty
+状态、binary SHA256、模型 revision/files、typed config、runner/validator SHA 和单 RTX 4090 hardware
+identity 一致。最终仅允许打印：
+
+```text
+FERRUM RUNTIME VNEXT S2 CUDA PRODUCT CONTRACT PASS: <out_dir>
+FERRUM GATE vnext-s2 PASS: <out_dir>
+```
+
+该 PASS 只解锁 S3；它不证明完整 G02/G04/G05/G06/G08、Metal、正式性能或发布。
+
 ## G00 分层
 
 完整 G00 不再阻塞 S0-S5：

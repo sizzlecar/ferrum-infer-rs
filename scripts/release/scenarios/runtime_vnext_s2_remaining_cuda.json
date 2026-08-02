@@ -43,10 +43,18 @@
       }
     },
     {
-      "name": "m1_s2_disconnect_release",
-      "type": "serve_disconnect_release",
+      "name": "m1_s2_c09_abort_release",
+      "type": "serve_abort_release_matrix",
+      "variants": [
+        "cancel",
+        "timeout",
+        "disconnect"
+      ],
+      "cases_per_variant": 1,
       "expected_effective_max_concurrent": 1,
       "max_tokens": 1024,
+      "admission_timeout_sec": 5.0,
+      "timeout_delay_sec": 0.05,
       "poll_interval_sec": 0.05,
       "release_timeout_sec": 5.0,
       "require_scheduler_trace": true,

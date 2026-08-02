@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the Qwen3.5-4B CUDA S2 Unicode-stream/disconnect sentinel."""
+"""Validate the Qwen3.5-4B CUDA S2 Unicode-stream and focused C09 sentinels."""
 
 from __future__ import annotations
 
@@ -29,9 +29,16 @@ SCENARIO_MANIFEST_PATH = (
 )
 MODEL = "Qwen/Qwen3.5-4B"
 UNICODE_NAME = "m1_s2_stream_equivalence_unicode"
-DISCONNECT_NAME = "m1_s2_disconnect_release"
-SCENARIO_NAMES = (UNICODE_NAME, DISCONNECT_NAME)
-SCENARIO_TYPES = ("serve_stream_equivalence_unicode", "serve_disconnect_release")
+C09_NAME = "m1_s2_c09_abort_release"
+SCENARIO_NAMES = (UNICODE_NAME, C09_NAME)
+SCENARIO_TYPES = ("serve_stream_equivalence_unicode", "serve_abort_release_matrix")
+C09_VARIANTS = ("cancel", "timeout", "disconnect")
+C09_MARKERS = {variant: f"m1-s2-c09-{variant}" for variant in C09_VARIANTS}
+C09_TRIGGER_VALUES = {
+    "cancel": {"client_explicit_socket_shutdown", "client_explicit_peer_already_closed"},
+    "timeout": {"client_deadline_expired"},
+    "disconnect": {"client_tcp_reset"},
+}
 CATEGORIES = ("chinese", "emoji", "combining")
 EXPECTED_CATEGORY_COUNTS = {"chinese": 7, "emoji": 7, "combining": 6}
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -565,7 +572,7 @@ def partition_request_dump_bundles(root: Path) -> tuple[Path, list[Path]]:
     startup_bundles = [path for path in all_bundles if path.name.startswith("serve-startup-")]
     request_bundles = [path for path in all_bundles if not path.name.startswith("serve-startup-")]
     require(len(startup_bundles) == 1, f"expected one serve startup bundle, found {len(startup_bundles)}")
-    require(len(request_bundles) == 42, f"expected 42 scenario request bundles, found {len(request_bundles)}")
+    require(len(request_bundles) == 46, f"expected 46 scenario request bundles, found {len(request_bundles)}")
     return startup_bundles[0], request_bundles
 
 
@@ -609,11 +616,19 @@ def validate_request_dumps(source: Path, trace_rows: list[dict[str, Any]]) -> di
             case = metadata.get("ferrum_case")
             require(isinstance(case, str), f"Unicode bundle case missing: {request_id}")
             key = (scenario, case, body.get("stream") is True)
-        elif scenario == "disconnect_release":
-            require(metadata.get("ferrum_disconnect_probe") is True, "disconnect bundle marker missing")
-            key = (scenario, metadata.get("ferrum_marker"))
-        elif scenario == "disconnect_release_followup":
-            key = (scenario, metadata.get("ferrum_marker"))
+        elif scenario == "c09_abort_release":
+            variant = metadata.get("ferrum_abort_variant")
+            marker = metadata.get("ferrum_marker")
+            require(variant in C09_VARIANTS, f"C09 bundle variant invalid: {request_id}")
+            require(marker == C09_MARKERS[variant], f"C09 bundle marker invalid: {request_id}")
+            require(metadata.get("ferrum_abort_probe") is True, "C09 abort bundle probe marker missing")
+            key = (scenario, variant, marker)
+        elif scenario == "c09_abort_release_followup":
+            variant = metadata.get("ferrum_abort_variant")
+            marker = metadata.get("ferrum_marker")
+            require(variant in C09_VARIANTS, f"C09 follow-up variant invalid: {request_id}")
+            require(marker == C09_MARKERS[variant], f"C09 follow-up marker invalid: {request_id}")
+            key = (scenario, variant, marker)
         else:
             raise ValidationError(f"unexpected request bundle scenario: {scenario!r}")
         require(key not in keys, f"duplicate request bundle key: {key}")
@@ -630,74 +645,265 @@ def validate_request_dumps(source: Path, trace_rows: list[dict[str, Any]]) -> di
         for stream in (False, True)
     }
     require(expected_unicode_keys <= set(keys), "Unicode request dump matrix incomplete")
-    marker = "m1-s2-disconnect-release"
-    disconnect_key = ("disconnect_release", marker)
-    followup_key = ("disconnect_release_followup", marker)
-    require(set(keys) == expected_unicode_keys | {disconnect_key, followup_key}, "request dump key set mismatch")
-    disconnect_id = keys[disconnect_key]
-    followup_id = keys[followup_key]
-    require(disconnect_id != followup_id, "disconnect and followup share request id")
-    trace = validate_trace(trace_rows, request_ids, disconnect_id)
-    followup_rows = [index for index, row in enumerate(trace_rows) if row.get("request_id") == followup_id]
-    require(followup_rows and min(followup_rows) > trace["released_row"], "followup began before disconnect release")
+    c09_keys = {
+        (scenario, variant, C09_MARKERS[variant])
+        for scenario in ("c09_abort_release", "c09_abort_release_followup")
+        for variant in C09_VARIANTS
+    }
+    require(set(keys) == expected_unicode_keys | c09_keys, "request dump key set mismatch")
+    traces: dict[str, dict[str, Any]] = {}
+    request_bindings: dict[str, dict[str, str]] = {}
+    for variant in C09_VARIANTS:
+        marker = C09_MARKERS[variant]
+        abort_key = ("c09_abort_release", variant, marker)
+        followup_key = ("c09_abort_release_followup", variant, marker)
+        abort_id = keys[abort_key]
+        followup_id = keys[followup_key]
+        require(abort_id != followup_id, f"C09 {variant} abort and follow-up share request id")
+        trace = validate_trace(trace_rows, request_ids, abort_id)
+        followup_rows = [
+            index for index, row in enumerate(trace_rows) if row.get("request_id") == followup_id
+        ]
+        require(
+            followup_rows and min(followup_rows) > trace["released_row"],
+            f"C09 {variant} follow-up began before abort release",
+        )
+        traces[variant] = trace
+        request_bindings[variant] = {"abort_id": abort_id, "followup_id": followup_id}
     return {
         "request_count": len(request_ids),
         "startup_request_id": startup_request_id,
-        "disconnect_id": disconnect_id,
-        "followup_id": followup_id,
-        **trace,
+        "request_bindings": request_bindings,
+        "traces": traces,
     }
 
 
-def validate_disconnect(source: Path, recorded: Path, summary_row: dict[str, Any]) -> dict[str, Any]:
-    root = source / DISCONNECT_NAME
+def expected_c09_payloads(variant: str) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    marker = C09_MARKERS[variant]
+    abort: dict[str, Any] = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Write the integers from 1 through 1000, one per line, and do not "
+                    "summarize or stop before the requested sequence is complete."
+                ),
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 1024,
+        "seed": 9271,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "chat_template_kwargs": {"enable_thinking": False},
+        "metadata": {
+            "ferrum_scenario": "c09_abort_release",
+            "ferrum_abort_probe": True,
+            "ferrum_abort_variant": variant,
+            "ferrum_marker": marker,
+        },
+    }
+    expected = {"marker": marker, "status": "released"}
+    expected_text = json.dumps(expected, ensure_ascii=False, separators=(",", ":"))
+    followup: dict[str, Any] = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Return the following JSON object exactly, with no extra text. "
+                    f"EXACT_JSON:{expected_text}"
+                ),
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 1024,
+        "seed": 9271,
+        "chat_template_kwargs": {"enable_thinking": False},
+        "metadata": {
+            "ferrum_scenario": "c09_abort_release_followup",
+            "ferrum_abort_variant": variant,
+            "ferrum_marker": marker,
+        },
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": f"c09_{variant}_release_followup",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "marker": {"type": "string", "const": marker},
+                        "status": {"type": "string", "const": "released"},
+                    },
+                    "required": ["marker", "status"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    }
+    return abort, followup, expected
+
+
+def validate_c09_abort_matrix(
+    source: Path, recorded: Path, summary_row: dict[str, Any]
+) -> dict[str, Any]:
+    root = source / C09_NAME
     result = read_json(root / "result.json")
-    require(result == summary_row, "disconnect summary/result mismatch")
-    require(result.get("status") == "pass" and result.get("type") == SCENARIO_TYPES[1], "disconnect scenario failed")
-    require(resolve_member(source, recorded, result.get("artifact"), "disconnect artifact") == root / "result.json", "disconnect artifact path mismatch")
-    expected_files = {
-        "disconnect.request.json",
-        "disconnect.partial.sse",
-        "disconnect.observed.json",
-        "followup.request.json",
-        "followup.response.json",
-        "health.before.json",
-        "health.released.json",
-        "health.after.json",
-        "result.json",
-    }
-    require({path.name for path in root.iterdir() if path.is_file() and not path.is_symlink()} == expected_files, "disconnect file set mismatch")
-    marker = "m1-s2-disconnect-release"
-    disconnect_request = read_json(root / "disconnect.request.json")
-    followup_request = read_json(root / "followup.request.json")
-    require(disconnect_request.get("model") == MODEL and followup_request.get("model") == MODEL, "disconnect model mismatch")
-    require(disconnect_request.get("max_tokens") == followup_request.get("max_tokens") == result.get("max_tokens") == 1024, "disconnect capacity mismatch")
-    require(disconnect_request.get("stream") is True and disconnect_request.get("stream_options") == {"include_usage": True}, "disconnect stream contract mismatch")
-    require(disconnect_request.get("metadata") == {"ferrum_scenario": "disconnect_release", "ferrum_disconnect_probe": True, "ferrum_marker": marker}, "disconnect metadata mismatch")
-    require(followup_request.get("metadata") == {"ferrum_scenario": "disconnect_release_followup", "ferrum_marker": marker}, "followup metadata mismatch")
-    require(followup_request.get("seed") == 9271 and followup_request.get("chat_template_kwargs") == {"enable_thinking": False}, "followup deterministic contract mismatch")
-    require(result.get("request_fingerprints") == {"disconnect": json_sha256(disconnect_request), "followup": json_sha256(followup_request)}, "disconnect request fingerprints mismatch")
-    before = read_json(root / "health.before.json")
-    released = read_json(root / "health.released.json")
-    after = read_json(root / "health.after.json")
-    validate_quiescent(before, "health.before")
-    validate_quiescent(released, "health.released")
-    validate_quiescent(after, "health.after")
-    release_elapsed = finite_number(released.get("elapsed_sec"), "release elapsed")
-    require(release_elapsed <= 5.0 and result.get("release_elapsed_sec") == released.get("elapsed_sec"), "disconnect wall release mismatch")
-    require(result.get("release_timeout_sec") == 5.0 and result.get("scheduler_tick_limit") == 2, "disconnect limits mismatch")
-    require(result.get("scheduler_trace_required") is True and result.get("effective_max_concurrent") == 1, "disconnect trace/capacity contract mismatch")
-    observed = read_json(root / "disconnect.observed.json")
-    require(observed.get("http_status") == 200 and isinstance(observed.get("first_output_event"), dict), "disconnect did not observe output")
-    active = observed.get("active_health", {}).get("admission")
-    require(isinstance(active, dict) and active.get("effective_max_concurrent") == 1, "disconnect active health missing")
-    require(sum(int(active.get(key, 0)) for key in QUIESCENT_FIELDS) > 0, "disconnect was not active at first output")
-    partial = parse_sse((root / "disconnect.partial.sse").read_bytes(), "disconnect partial SSE")
-    require(partial["content_delta_count"] > 0 and partial["done_count"] == 0, "disconnect partial SSE is not an interrupted stream")
-    expected_followup = json.dumps({"marker": marker, "status": "released"}, ensure_ascii=False, separators=(",", ":"))
-    followup_usage, _ = parse_sync_response(root / "followup.response.json", expected_followup)
-    require(result.get("same_capacity_followup") is True and result.get("followup_usage") == followup_usage, "disconnect followup result mismatch")
-    return {"release_elapsed_sec": release_elapsed, "followup_usage": followup_usage}
+    require(result == summary_row, "C09 summary/result mismatch")
+    require(
+        result.get("status") == "pass" and result.get("type") == SCENARIO_TYPES[1],
+        "C09 abort matrix scenario failed",
+    )
+    require(
+        resolve_member(source, recorded, result.get("artifact"), "C09 artifact")
+        == root / "result.json",
+        "C09 artifact path mismatch",
+    )
+    root_files = {path.name for path in root.iterdir() if path.is_file() and not path.is_symlink()}
+    root_dirs = {path.name for path in root.iterdir() if path.is_dir() and not path.is_symlink()}
+    require(root_files == {"result.json"}, "C09 root file set mismatch")
+    require(root_dirs == set(C09_VARIANTS), "C09 variant directory set mismatch")
+    require(
+        result.get("case_count") == result.get("admitted_case_count")
+        == result.get("same_capacity_followup_count")
+        == len(C09_VARIANTS),
+        "C09 aggregate count mismatch",
+    )
+    require(result.get("cases_per_variant") == 1, "C09 cases_per_variant mismatch")
+    require(
+        result.get("variant_counts") == {variant: 1 for variant in C09_VARIANTS},
+        "C09 variant counts mismatch",
+    )
+    require(
+        result.get("max_tokens") == 1024
+        and result.get("effective_max_concurrent") == 1
+        and result.get("release_timeout_sec") == 5.0
+        and result.get("scheduler_tick_limit") == 2
+        and result.get("scheduler_trace_required") is True,
+        "C09 aggregate limits mismatch",
+    )
+    rows = result.get("cases")
+    require(isinstance(rows, list) and len(rows) == len(C09_VARIANTS), "C09 cases missing")
+    evidence: dict[str, Any] = {}
+    for index, variant in enumerate(C09_VARIANTS):
+        case_root = root / variant
+        expected_files = {
+            "abort.request.json",
+            "abort.observed.json",
+            "followup.request.json",
+            "followup.response.json",
+            "health.before.json",
+            "health.released.json",
+            "health.after.json",
+            "result.json",
+        }
+        actual_files = {
+            path.name for path in case_root.iterdir() if path.is_file() and not path.is_symlink()
+        }
+        require(actual_files == expected_files, f"C09 {variant} file set mismatch")
+        case = read_json(case_root / "result.json")
+        validate_self_hash(case, f"C09 {variant} result")
+        require(case == rows[index], f"C09 {variant} aggregate/result mismatch")
+        abort_expected, followup_expected, expected_object = expected_c09_payloads(variant)
+        abort_request = read_json(case_root / "abort.request.json")
+        followup_request = read_json(case_root / "followup.request.json")
+        require(abort_request == abort_expected, f"C09 {variant} abort request mismatch")
+        require(followup_request == followup_expected, f"C09 {variant} follow-up request mismatch")
+        require(
+            case.get("request_fingerprints")
+            == {
+                "abort": json_sha256(abort_request),
+                "followup": json_sha256(followup_request),
+            },
+            f"C09 {variant} request fingerprints mismatch",
+        )
+        require(
+            case.get("status") == "pass"
+            and case.get("variant") == variant
+            and case.get("marker") == C09_MARKERS[variant]
+            and case.get("max_tokens") == 1024
+            and case.get("effective_max_concurrent") == 1,
+            f"C09 {variant} identity/capacity mismatch",
+        )
+        before = read_json(case_root / "health.before.json")
+        released = read_json(case_root / "health.released.json")
+        after = read_json(case_root / "health.after.json")
+        validate_quiescent(before, f"C09 {variant} health.before")
+        validate_quiescent(released, f"C09 {variant} health.released")
+        validate_quiescent(after, f"C09 {variant} health.after")
+        release_elapsed = finite_number(
+            released.get("elapsed_sec"), f"C09 {variant} release elapsed"
+        )
+        require(
+            release_elapsed <= 5.0
+            and case.get("release_elapsed_sec") == released.get("elapsed_sec"),
+            f"C09 {variant} release wall mismatch",
+        )
+        require(
+            case.get("release_timeout_sec") == 5.0
+            and case.get("scheduler_tick_limit") == 2
+            and case.get("scheduler_trace_required") is True,
+            f"C09 {variant} limits mismatch",
+        )
+        observed = read_json(case_root / "abort.observed.json")
+        require(
+            observed.get("status_source") == "runner_client_abort"
+            and observed.get("client_abort") == variant
+            and observed.get("abort_trigger") in C09_TRIGGER_VALUES[variant],
+            f"C09 {variant} client trigger mismatch",
+        )
+        request_body = json.dumps(
+            abort_request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        require(
+            observed.get("request_body_bytes") == len(request_body)
+            and observed.get("request_body_sha256") == hashlib.sha256(request_body).hexdigest(),
+            f"C09 {variant} raw request binding mismatch",
+        )
+        active_health = observed.get("active_health")
+        require(isinstance(active_health, dict), f"C09 {variant} active health missing")
+        active_terminal = active_health.get("terminal")
+        require(isinstance(active_terminal, dict), f"C09 {variant} active terminal missing")
+        active = active_terminal.get("admission")
+        require(
+            isinstance(active, dict) and active.get("effective_max_concurrent") == 1,
+            f"C09 {variant} active admission missing",
+        )
+        require(
+            sum(int(active.get(key, 0)) for key in QUIESCENT_FIELDS) > 0,
+            f"C09 {variant} was not admitted before the client abort",
+        )
+        finite_number(observed.get("time_to_admission_sec"), f"C09 {variant} admission time")
+        finite_number(observed.get("abort_after_admission_sec"), f"C09 {variant} abort delay")
+        if variant == "timeout":
+            require(
+                observed.get("timeout_delay_sec") == 0.05,
+                "C09 timeout client deadline mismatch",
+            )
+        else:
+            require(
+                observed.get("timeout_delay_sec") is None,
+                f"C09 {variant} unexpectedly records a timeout deadline",
+            )
+        expected_text = json.dumps(
+            expected_object, ensure_ascii=False, separators=(",", ":")
+        )
+        followup_usage, _ = parse_sync_response(
+            case_root / "followup.response.json", expected_text
+        )
+        require(
+            case.get("same_capacity_followup") is True
+            and case.get("followup_usage") == followup_usage,
+            f"C09 {variant} follow-up result mismatch",
+        )
+        evidence[variant] = {
+            "trigger": observed["abort_trigger"],
+            "release_elapsed_sec": release_elapsed,
+            "followup_usage": followup_usage,
+        }
+    return {"case_count": len(rows), "variants": evidence}
 
 
 def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[str, Any], Path, dict[str, Any]]:
@@ -767,6 +973,21 @@ def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[
     require(manifest.get("goal_scope") == {"full_s2": False, "model_matrix_c09_complete": False, "model_matrix_c17_complete": False}, "input manifest overclaims S2/C09/C17")
     manifest_scenarios = manifest.get("scenarios")
     require(isinstance(manifest_scenarios, list) and [(row.get("name"), row.get("type")) for row in manifest_scenarios if isinstance(row, dict)] == list(zip(SCENARIO_NAMES, SCENARIO_TYPES)), "input manifest scenario matrix mismatch")
+    c09_scenario = manifest_scenarios[1]
+    require(
+        isinstance(c09_scenario, dict)
+        and c09_scenario.get("variants") == list(C09_VARIANTS)
+        and c09_scenario.get("cases_per_variant") == 1
+        and c09_scenario.get("expected_effective_max_concurrent") == 1
+        and c09_scenario.get("max_tokens") == 1024
+        and c09_scenario.get("admission_timeout_sec") == 5.0
+        and c09_scenario.get("timeout_delay_sec") == 0.05
+        and c09_scenario.get("release_timeout_sec") == 5.0
+        and c09_scenario.get("poll_interval_sec") == 0.05
+        and c09_scenario.get("require_scheduler_trace") is True
+        and c09_scenario.get("seed") == 9271,
+        "input manifest C09 focused contract mismatch",
+    )
     evidence = receipt.get("evidence_files")
     require(isinstance(evidence, dict), "execution evidence bindings missing")
     for label, filename in (("effective_config", "server.effective_config.json"), ("decision_trace", "server.decision_trace.jsonl"), ("server_log", "server.log"), ("health_before", "server.health.json"), ("health_after", "server.health.after.json")):
@@ -801,7 +1022,7 @@ def validate_source(source: Path, expected_git_sha: str | None) -> dict[str, Any
     require(isinstance(scenarios, list) and len(scenarios) == 2, "summary scenarios missing")
     require([row.get("name") for row in scenarios if isinstance(row, dict)] == list(SCENARIO_NAMES), "summary scenario order mismatch")
     unicode = validate_unicode(source, recorded, scenarios[0])
-    disconnect = validate_disconnect(source, recorded, scenarios[1])
+    c09 = validate_c09_abort_matrix(source, recorded, scenarios[1])
     trace_rows = validate_observability(source, recorded, summary)
     request_trace = validate_request_dumps(source, trace_rows)
     tree = validate_artifact_tree(source, recorded)
@@ -815,7 +1036,7 @@ def validate_source(source: Path, expected_git_sha: str | None) -> dict[str, Any
         "model_matrix_c09_complete": False,
         "model_matrix_c17_complete": False,
         "unicode": unicode,
-        "disconnect": disconnect,
+        "c09": c09,
         "request_trace": request_trace,
         "artifact_tree": tree,
         "source_sha256": {"summary.json": file_sha256(source / "summary.json")},
@@ -869,10 +1090,10 @@ def self_test() -> None:
         root = Path(tmp)
         startup = root / "serve-startup-fixture"
         startup.mkdir()
-        for index in range(42):
+        for index in range(46):
             (root / f"request-{index:02d}").mkdir()
         observed_startup, observed_requests = partition_request_dump_bundles(root)
-        require(observed_startup == startup and len(observed_requests) == 42, "selftest request bundle partition mismatch")
+        require(observed_startup == startup and len(observed_requests) == 46, "selftest request bundle partition mismatch")
         duplicate_startup = root / "serve-startup-duplicate"
         duplicate_startup.mkdir()
         try:
@@ -887,7 +1108,7 @@ def self_test() -> None:
         try:
             partition_request_dump_bundles(root)
         except ValidationError as error:
-            require("42 scenario request bundles" in str(error), "selftest extra request failed for wrong reason")
+            require("46 scenario request bundles" in str(error), "selftest extra request failed for wrong reason")
         else:
             raise ValidationError("selftest extra scenario request bundle unexpectedly passed")
     with tempfile.TemporaryDirectory(prefix="ferrum-s2-stream-disconnect-selftest-") as tmp:
@@ -915,7 +1136,10 @@ def run_checkpoint(source: Path, out: Path, expected_git_sha: str | None) -> int
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "checkpoint_id": CHECKPOINT_ID,
-        "scope": ["S2/Unicode-stream-sentinel", "S2/disconnect-release-sentinel"],
+        "scope": [
+            "S2/Unicode-stream-sentinel",
+            "S2/C09-focused-cancel-timeout-disconnect",
+        ],
         "full_s2": False,
         "model_matrix_c09_complete": False,
         "model_matrix_c17_complete": False,
