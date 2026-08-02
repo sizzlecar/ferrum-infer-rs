@@ -43,22 +43,30 @@ INPUT_SPECS = {
     "g00f": {
         "lane": "vnext-g00f",
         "artifact_type": "runtime_vnext_g00f_facts_manifest",
+        "outer_child_kind": "vnext-g00f",
     },
     "g01a": {
         "lane": "vnext-g01a",
         "artifact_type": "runtime_vnext_g01a_contract_split_manifest",
+        "outer_child_kind": "vnext-g01a-s0a",
     },
     "s1": {
         "lane": "vnext-s1-cuda",
         "artifact_type": "runtime_vnext_s1_cuda_basic_slice_manifest",
+        "outer_child_kind": "delegated-manifest",
+        "allow_independent_validator_source": True,
     },
     "s1_capacity": {
         "lane": "vnext-s1-cuda-capacity",
         "artifact_type": "runtime_vnext_s1_cuda_capacity_pressure_validation_v2",
+        "outer_child_kind": "delegated-manifest",
+        "allow_independent_validator_source": True,
     },
     "s1_decode_capacity": {
         "lane": "vnext-s1-cuda-decode-capacity",
         "artifact_type": "runtime_vnext_s1_cuda_decode_capacity_validation",
+        "outer_child_kind": "delegated-manifest",
+        "allow_independent_validator_source": True,
     },
 }
 
@@ -267,24 +275,108 @@ def relocated_path(recorded: str, recorded_root: str, local_root: Path) -> Path:
     return (local_root / relative).resolve()
 
 
-def load_gate_input(
-    input_path: Path,
+def validate_input_source_binding(
     key: str,
-) -> dict[str, Any]:
+    validator_git_sha: Any,
+    evidence_source_git_sha: Any,
+) -> tuple[str, str]:
+    require(key in INPUT_SPECS, f"unknown G01B input key: {key}")
+    require(
+        GIT_SHA_RE.fullmatch(str(validator_git_sha)) is not None,
+        f"{key} validator source SHA is invalid",
+    )
+    require(
+        GIT_SHA_RE.fullmatch(str(evidence_source_git_sha)) is not None,
+        f"{key} evidence source SHA is invalid",
+    )
+    if not INPUT_SPECS[key].get("allow_independent_validator_source", False):
+        require(
+            validator_git_sha == evidence_source_git_sha,
+            f"{key} validator/evidence source SHA mismatch",
+        )
+    return str(validator_git_sha), str(evidence_source_git_sha)
+
+
+def child_source_git_sha(key: str, child: dict[str, Any]) -> Any:
+    source_sha = child.get("source_git_sha")
+    if source_sha is None:
+        source_sha = require_object(child.get("source"), f"{key} child source").get(
+            "git_sha"
+        )
+    return source_sha
+
+
+def validate_gate_manifest_pair(
+    key: str,
+    outer: dict[str, Any],
+    child: dict[str, Any],
+    child_digest: str,
+) -> tuple[str, str]:
     spec = INPUT_SPECS[key]
-    outer_path = input_path.expanduser().resolve()
-    outer = read_json(outer_path, f"{key} outer manifest")
     lane = spec["lane"]
     require(outer.get("schema_version") == 1, f"{key} outer schema mismatch")
     require(outer.get("lane") == lane, f"{key} outer lane mismatch")
     require(outer.get("status") == "pass", f"{key} outer status is not pass")
     dirty = require_object(outer.get("dirty_status"), f"{key} outer dirty_status")
-    require(dirty.get("is_dirty") is False and dirty.get("status_short") == [], f"{key} outer source was dirty")
-    artifact_dir = require_string(outer.get("artifact_dir"), f"{key} outer artifact_dir")
+    require(
+        dirty.get("is_dirty") is False and dirty.get("status_short") == [],
+        f"{key} outer source was dirty",
+    )
+    artifact_dir = require_string(
+        outer.get("artifact_dir"), f"{key} outer artifact_dir"
+    )
     require(
         outer.get("pass_line") == f"FERRUM GATE {lane} PASS: {artifact_dir}",
         f"{key} outer PASS line mismatch",
     )
+    child_artifacts = require_object(
+        outer.get("child_artifacts"), f"{key} child_artifacts"
+    )
+    require(
+        child_artifacts.get("kind") == spec["outer_child_kind"],
+        f"{key} child artifact kind mismatch",
+    )
+    child_ref = require_object(
+        child_artifacts.get("child_manifest"), f"{key} child manifest ref"
+    )
+    require_string(child_ref.get("path"), f"{key} child manifest path")
+    embedded_digest = require_string(
+        child_ref.get("sha256"), f"{key} child manifest SHA256"
+    )
+    require(
+        SHA256_RE.fullmatch(child_digest) is not None,
+        f"{key} copied child manifest SHA256 is invalid",
+    )
+    require(
+        embedded_digest == child_digest,
+        f"{key} outer child manifest SHA256 mismatch",
+    )
+    require(
+        child.get("artifact_type") == spec["artifact_type"],
+        f"{key} child artifact_type mismatch",
+    )
+    require(child.get("status") == "pass", f"{key} child status is not pass")
+    child_pass_line = require_string(
+        child.get("pass_line"), f"{key} child PASS line"
+    )
+    require(
+        outer.get("child_pass_line") == child_pass_line,
+        f"{key} outer/child PASS line mismatch",
+    )
+    return validate_input_source_binding(
+        key,
+        outer.get("git_sha"),
+        child_source_git_sha(key, child),
+    )
+
+
+def load_gate_input(
+    input_path: Path,
+    key: str,
+) -> dict[str, Any]:
+    outer_path = input_path.expanduser().resolve()
+    outer = read_json(outer_path, f"{key} outer manifest")
+    artifact_dir = require_string(outer.get("artifact_dir"), f"{key} outer artifact_dir")
     child_artifacts = require_object(outer.get("child_artifacts"), f"{key} child_artifacts")
     child_ref = require_object(child_artifacts.get("child_manifest"), f"{key} child manifest ref")
     child_recorded = require_string(child_ref.get("path"), f"{key} child manifest path")
@@ -294,13 +386,12 @@ def load_gate_input(
     require(child_path.is_file(), f"{key} relocated child manifest is missing: {child_path}")
     require(sha256(child_path) == child_digest, f"{key} child manifest SHA256 mismatch")
     child = read_json(child_path, f"{key} child manifest")
-    require(child.get("artifact_type") == spec["artifact_type"], f"{key} child artifact_type mismatch")
-    require(child.get("status") == "pass", f"{key} child status is not pass")
-    source_sha = child.get("source_git_sha")
-    if source_sha is None:
-        source_sha = require_object(child.get("source"), f"{key} child source").get("git_sha")
-    require(GIT_SHA_RE.fullmatch(str(source_sha)) is not None, f"{key} child source SHA is invalid")
-    require(outer.get("git_sha") == source_sha, f"{key} outer/child source SHA mismatch")
+    validator_git_sha, source_sha = validate_gate_manifest_pair(
+        key,
+        outer,
+        child,
+        child_digest,
+    )
     return {
         "key": key,
         "outer_path": outer_path,
@@ -309,6 +400,7 @@ def load_gate_input(
         "child_path": child_path,
         "child": child,
         "child_sha256": child_digest,
+        "validator_git_sha": validator_git_sha,
         "source_git_sha": source_sha,
     }
 
@@ -499,6 +591,7 @@ def revalidate_basic(item: dict[str, Any], model: dict[str, Any]) -> dict[str, A
         "S1 basic child manifest differs from raw evidence revalidation",
     )
     return {
+        "validator_git_sha": item["validator_git_sha"],
         "source_git_sha": item["source_git_sha"],
         "binary_sha256": child.get("binary_sha256"),
         "model_revision": revision,
@@ -622,6 +715,7 @@ def revalidate_capacity(
             f"{item['key']} capacity-pressure evidence ownership is invalid",
         )
     return {
+        "validator_git_sha": item["validator_git_sha"],
         "source_git_sha": item["source_git_sha"],
         "binary_sha256": child.get("binary_sha256"),
         "model_revision": revision,
@@ -636,6 +730,32 @@ def revalidate_capacity(
     }
 
 
+def validate_production_scope_binding(
+    key: str,
+    role: str,
+    git_sha: str,
+    observed: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    summary = {
+        "git_sha": git_sha,
+        "file_count": observed["file_count"],
+        "sha256": observed["sha256"],
+    }
+    require(
+        {
+            "file_count": observed["file_count"],
+            "sha256": observed["sha256"],
+        }
+        == {
+            "file_count": current["file_count"],
+            "sha256": current["sha256"],
+        },
+        f"{key} {role} production source is stale against current HEAD",
+    )
+    return summary
+
+
 def validate_cuda_inputs(
     inputs: dict[str, dict[str, Any]],
     current_production: dict[str, Any],
@@ -644,15 +764,21 @@ def validate_cuda_inputs(
     scopes = {}
     for key in ("s1", "s1_capacity", "s1_decode_capacity"):
         item = inputs[key]
-        scope = production_scope(item["source_git_sha"])
-        require(
-            scope["sha256"] == current_production["sha256"],
-            f"{key} production source is stale against current HEAD",
-        )
         scopes[key] = {
-            "source_git_sha": item["source_git_sha"],
-            "file_count": scope["file_count"],
-            "sha256": scope["sha256"],
+            "validator": validate_production_scope_binding(
+                key,
+                "validator",
+                item["validator_git_sha"],
+                production_scope(item["validator_git_sha"]),
+                current_production,
+            ),
+            "evidence": validate_production_scope_binding(
+                key,
+                "evidence",
+                item["source_git_sha"],
+                production_scope(item["source_git_sha"]),
+                current_production,
+            ),
         }
     return {
         "production_source_scope": {
@@ -869,6 +995,7 @@ def copy_input_manifests(
         require(sha256(child_copy) == item["child_sha256"], f"{key} copied child manifest changed")
         references[key] = {
             "lane": INPUT_SPECS[key]["lane"],
+            "validator_git_sha": item["validator_git_sha"],
             "source_git_sha": item["source_git_sha"],
             "outer_manifest": {
                 "path": outer_copy.relative_to(checkpoint_root).as_posix(),
@@ -1122,17 +1249,71 @@ def verify_checkpoint_manifest(
 
     inputs = require_object(manifest.get("inputs"), "G01B inputs")
     require(set(inputs) == set(INPUT_SPECS), "G01B input matrix mismatch")
+    copied_inputs = {}
     for key, spec in INPUT_SPECS.items():
         ref = require_object(inputs.get(key), f"G01B input {key}")
         require(ref.get("lane") == spec["lane"], f"G01B input {key} lane mismatch")
+        resolved_paths = {}
         for kind in ("outer_manifest", "child_manifest"):
             file_ref = require_object(ref.get(kind), f"G01B input {key} {kind}")
             relative = require_string(file_ref.get("path"), f"G01B input {key} {kind} path")
             file_path = (root / relative).resolve()
             require(root in file_path.parents, f"G01B input path escapes checkpoint: {relative}")
             require(sha256(file_path) == file_ref.get("sha256"), f"G01B input {key} {kind} SHA mismatch")
-        copied_child = read_json(root / ref["child_manifest"]["path"], f"G01B copied {key} child")
-        require(copied_child.get("artifact_type") == spec["artifact_type"], f"G01B copied {key} type mismatch")
+            resolved_paths[kind] = file_path
+        copied_child = read_json(
+            resolved_paths["child_manifest"], f"G01B copied {key} child"
+        )
+        copied_outer = read_json(
+            resolved_paths["outer_manifest"], f"G01B copied {key} outer"
+        )
+        copied_child_digest = sha256(resolved_paths["child_manifest"])
+        validator_git_sha, evidence_source_git_sha = validate_gate_manifest_pair(
+            key,
+            copied_outer,
+            copied_child,
+            copied_child_digest,
+        )
+        require(
+            ref.get("validator_git_sha") == validator_git_sha
+            and ref.get("source_git_sha") == evidence_source_git_sha,
+            f"G01B copied {key} source binding mismatch",
+        )
+        copied_inputs[key] = {
+            "outer": copied_outer,
+            "child": copied_child,
+            "validator_git_sha": validator_git_sha,
+            "source_git_sha": evidence_source_git_sha,
+            "child_sha256": copied_child_digest,
+        }
+
+    for key in ("g00f", "g01a"):
+        require(
+            copied_inputs[key]["validator_git_sha"] == source_sha
+            and copied_inputs[key]["source_git_sha"] == source_sha,
+            f"G01B copied {key} source is stale against G01B source",
+        )
+    copied_g01a_g00f = require_object(
+        copied_inputs["g01a"]["child"].get("g00f"),
+        "G01B copied G01A G00F binding",
+    )
+    copied_g01a_g00f_child = require_object(
+        copied_g01a_g00f.get("child_manifest"),
+        "G01B copied G01A G00F child binding",
+    )
+    require(
+        copied_g01a_g00f_child.get("sha256")
+        == copied_inputs["g00f"]["child_sha256"],
+        "G01B copied G01A is not byte-bound to copied G00F",
+    )
+    require(
+        require_object(
+            copied_g01a_g00f.get("source"),
+            "G01B copied G01A G00F source binding",
+        ).get("git_sha")
+        == source_sha,
+        "G01B copied G01A G00F source binding is stale",
+    )
 
     evidence = require_object(manifest.get("evidence"), "G01B evidence")
     expected_evidence = {
@@ -1164,6 +1345,52 @@ def verify_checkpoint_manifest(
         "G01B product model identity mismatch",
     )
     require(manifest.get("model") == model, "G01B manifest/product model identity mismatch")
+    cuda = require_object(product.get("cuda"), "G01B product CUDA evidence")
+    expected_input_scopes = {}
+    for key in ("s1", "s1_capacity", "s1_decode_capacity"):
+        copied = copied_inputs[key]
+        expected_input_scopes[key] = {
+            "validator": validate_production_scope_binding(
+                key,
+                "validator",
+                copied["validator_git_sha"],
+                production_scope(copied["validator_git_sha"]),
+                current_production,
+            ),
+            "evidence": validate_production_scope_binding(
+                key,
+                "evidence",
+                copied["source_git_sha"],
+                production_scope(copied["source_git_sha"]),
+                current_production,
+            ),
+        }
+    require(
+        cuda.get("production_source_scope")
+        == {
+            "current": {
+                "file_count": current_production["file_count"],
+                "sha256": current_production["sha256"],
+            },
+            "inputs": expected_input_scopes,
+        },
+        "G01B product CUDA production source scope mismatch",
+    )
+    for section, input_key in (
+        ("basic", "s1"),
+        ("capacity", "s1_capacity"),
+        ("decode_capacity", "s1_decode_capacity"),
+    ):
+        summary = require_object(
+            cuda.get(section), f"G01B product CUDA {section} summary"
+        )
+        require(
+            summary.get("validator_git_sha")
+            == copied_inputs[input_key]["validator_git_sha"]
+            and summary.get("source_git_sha")
+            == copied_inputs[input_key]["source_git_sha"],
+            f"G01B product CUDA {section} source binding mismatch",
+        )
     extension = documents["extension_drills"]
     require(
         extension.get("drills_passed") == 5
@@ -1209,6 +1436,7 @@ def verify_checkpoint_manifest(
         "model": manifest["model"],
         "inputs": {
             key: {
+                "validator_git_sha": value["validator_git_sha"],
                 "source_git_sha": value["source_git_sha"],
                 "child_manifest_sha256": value["child_manifest"]["sha256"],
             }
@@ -1224,6 +1452,138 @@ def self_test() -> int:
     require(len(TEST_SPECS["source-audit"]["expected_tests"]) == 3, "G01B source audit count drifted")
     require(len(TEST_SPECS["plan-snapshots"]["expected_tests"]) == 13, "G01B plan test count drifted")
     require(TEST_SPECS["overhead"]["release"] is True, "G01B overhead must use release mode")
+    strict_sha = "1" * 40
+    independent_sha = "2" * 40
+    for key in ("g00f", "g01a"):
+        validate_input_source_binding(key, strict_sha, strict_sha)
+        try:
+            validate_input_source_binding(key, strict_sha, independent_sha)
+            raise AssertionError(f"{key} accepted an independent validator source")
+        except GateError as error:
+            require(
+                "validator/evidence source SHA mismatch" in str(error),
+                f"{key} independent validator source failed for the wrong reason",
+            )
+    for key in ("s1", "s1_capacity", "s1_decode_capacity"):
+        require(
+            validate_input_source_binding(key, strict_sha, independent_sha)
+            == (strict_sha, independent_sha),
+            f"{key} did not preserve independent validator/evidence provenance",
+        )
+    try:
+        validate_input_source_binding("s1", "invalid", independent_sha)
+        raise AssertionError("S1 accepted an invalid validator source SHA")
+    except GateError as error:
+        require(
+            "validator source SHA is invalid" in str(error),
+            "S1 invalid validator source failed for the wrong reason",
+        )
+
+    def gate_pair_fixture(
+        key: str,
+        validator_sha: str,
+        evidence_sha: str,
+    ) -> tuple[dict[str, Any], dict[str, Any], str]:
+        child_digest = "a" * 64
+        child_pass_line = f"{key} CHILD PASS"
+        child = {
+            "artifact_type": INPUT_SPECS[key]["artifact_type"],
+            "status": "pass",
+            "source_git_sha": evidence_sha,
+            "pass_line": child_pass_line,
+        }
+        artifact_dir = f"/tmp/{key}-gate"
+        outer = {
+            "schema_version": 1,
+            "lane": INPUT_SPECS[key]["lane"],
+            "status": "pass",
+            "git_sha": validator_sha,
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "artifact_dir": artifact_dir,
+            "pass_line": (
+                f"FERRUM GATE {INPUT_SPECS[key]['lane']} PASS: {artifact_dir}"
+            ),
+            "child_pass_line": child_pass_line,
+            "child_artifacts": {
+                "kind": INPUT_SPECS[key]["outer_child_kind"],
+                "child_manifest": {
+                    "path": f"{artifact_dir}/manifest.json",
+                    "sha256": child_digest,
+                },
+            },
+        }
+        return outer, child, child_digest
+
+    pair_outer, pair_child, pair_digest = gate_pair_fixture(
+        "s1", strict_sha, independent_sha
+    )
+    require(
+        validate_gate_manifest_pair(
+            "s1", pair_outer, pair_child, pair_digest
+        )
+        == (strict_sha, independent_sha),
+        "S1 gate pair lost independent source provenance",
+    )
+    dirty_outer, dirty_child, dirty_digest = gate_pair_fixture(
+        "s1", strict_sha, independent_sha
+    )
+    dirty_outer["dirty_status"] = {"is_dirty": True, "status_short": [" M file"]}
+    try:
+        validate_gate_manifest_pair("s1", dirty_outer, dirty_child, dirty_digest)
+        raise AssertionError("S1 accepted a dirty outer manifest")
+    except GateError as error:
+        require(
+            "outer source was dirty" in str(error),
+            "S1 dirty outer manifest failed for the wrong reason",
+        )
+    digest_outer, digest_child, digest_value = gate_pair_fixture(
+        "s1", strict_sha, independent_sha
+    )
+    digest_outer["child_artifacts"]["child_manifest"]["sha256"] = "b" * 64
+    try:
+        validate_gate_manifest_pair("s1", digest_outer, digest_child, digest_value)
+        raise AssertionError("S1 accepted a mismatched outer child digest")
+    except GateError as error:
+        require(
+            "outer child manifest SHA256 mismatch" in str(error),
+            "S1 outer child digest failed for the wrong reason",
+        )
+    pass_outer, pass_child, pass_digest = gate_pair_fixture(
+        "s1", strict_sha, independent_sha
+    )
+    pass_outer["child_pass_line"] = "forged PASS"
+    try:
+        validate_gate_manifest_pair("s1", pass_outer, pass_child, pass_digest)
+        raise AssertionError("S1 accepted a mismatched outer child PASS line")
+    except GateError as error:
+        require(
+            "outer/child PASS line mismatch" in str(error),
+            "S1 outer child PASS line failed for the wrong reason",
+        )
+
+    scope_sha = "c" * 64
+    scope = {"file_count": 7, "sha256": scope_sha}
+    require(
+        validate_production_scope_binding(
+            "s1", "validator", strict_sha, scope, scope
+        )["sha256"]
+        == scope_sha,
+        "S1 validator production scope binding drifted",
+    )
+    try:
+        validate_production_scope_binding(
+            "s1",
+            "validator",
+            strict_sha,
+            {"file_count": 7, "sha256": "d" * 64},
+            scope,
+        )
+        raise AssertionError("S1 accepted a stale validator production scope")
+    except GateError as error:
+        require(
+            "validator production source is stale" in str(error),
+            "S1 stale validator production scope failed for the wrong reason",
+        )
     require(
         capacity_checkpoint.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
         == "vnext-s1-cuda-decode-capacity/target-rebalance-probe",
