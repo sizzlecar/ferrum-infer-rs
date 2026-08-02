@@ -144,6 +144,9 @@ RUNTIME_VNEXT_S2_API_MODALITY_CHECKPOINT = (
 RUNTIME_VNEXT_S2_STREAM_DISCONNECT_CHECKPOINT = (
     REPO_ROOT / "scripts/release/runtime_vnext_s2_stream_disconnect_checkpoint.py"
 )
+RUNTIME_VNEXT_S2_TOOL_SCHEMA_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_s2_tool_schema_checkpoint.py"
+)
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
 PRODUCT_OBSERVABILITY_L1_SMOKE = REPO_ROOT / "scripts/release/product_observability_l1_smoke.py"
 BACKEND_RUNTIME_GOAL_GATE = REPO_ROOT / "scripts/release/backend_runtime_preset_goal_gate.py"
@@ -1052,6 +1055,17 @@ def test_runtime_vnext_s2_stream_disconnect_checkpoint_selftest() -> None:
     )
 
 
+def test_runtime_vnext_s2_tool_schema_checkpoint_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S2_TOOL_SCHEMA_CHECKPOINT), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 TOOL SCHEMA PRIORITY SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_product_backend_sentinel_selftest() -> None:
     ok = run([sys.executable, str(PRODUCT_BACKEND_SENTINEL_GATE), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -1270,6 +1284,7 @@ def main() -> int:
     test_runtime_vnext_s2_response_format_checkpoint_selftest()
     test_runtime_vnext_s2_api_modality_checkpoint_selftest()
     test_runtime_vnext_s2_stream_disconnect_checkpoint_selftest()
+    test_runtime_vnext_s2_tool_schema_checkpoint_selftest()
     test_product_backend_sentinel_selftest()
     test_product_observability_l1_smoke_selftest()
     test_backend_runtime_goal_gate_selftest()

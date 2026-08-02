@@ -1,10 +1,23 @@
 {
   "backend": "cuda",
   "ferrum_bin": "target/release/ferrum",
+  "goal_scope": {
+    "full_s2": false,
+    "model_matrix_c21_complete": false
+  },
   "model": "Qwen/Qwen3.5-4B",
+  "observability": {
+    "enabled": true,
+    "profile_detail": "basic",
+    "profile_sample_rate": 1.0
+  },
   "schema_version": 1,
   "server": {
-    "mode": "external"
+    "args": [
+      "--backend",
+      "cuda"
+    ],
+    "mode": "start"
   },
   "timeout_sec": 180,
   "scenarios": [
