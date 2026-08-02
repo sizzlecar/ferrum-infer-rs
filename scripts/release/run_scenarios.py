@@ -1450,8 +1450,8 @@ class ScenarioRunner:
         server = self.manifest.get("server")
         return isinstance(server, dict) and server.get("mode") == "start"
 
-    def ensure_server(self) -> None:
-        if not self.needs_serve():
+    def ensure_server(self, scenarios: list[dict[str, Any]]) -> None:
+        if not any(str(scenario.get("type")) in SERVE_TYPES for scenario in scenarios):
             return
         if self.base_url and not self.should_start_server():
             if self.observability_enabled():
@@ -1600,20 +1600,52 @@ class ScenarioRunner:
         )
         matrix_contract = response_format_matrix_contract(selected)
         write_json(self.out / "response_format_matrix_contract.json", matrix_contract)
-        results: list[dict[str, Any]] = []
-        failures = 0
-        skipped = 0
+        unknown_types = sorted(
+            {
+                str(scenario.get("type"))
+                for scenario in selected
+                if str(scenario.get("type")) not in RUN_TYPES | SERVE_TYPES
+            }
+        )
+        require(not unknown_types, f"unknown scenario types: {unknown_types!r}")
+        run_scenarios = [
+            scenario for scenario in selected if str(scenario.get("type")) in RUN_TYPES
+        ]
+        serve_scenarios = [
+            scenario for scenario in selected if str(scenario.get("type")) in SERVE_TYPES
+        ]
+        results_by_name: dict[str, dict[str, Any]] = {}
+        execution_phases: list[dict[str, Any]] = []
         observability: dict[str, Any] | None = None
         try:
-            self.ensure_server()
-            for scenario in selected:
-                result = self.run_one(scenario)
-                if result["status"] == "fail":
-                    failures += 1
-                elif result["status"] == "skipped":
-                    skipped += 1
-                results.append(result)
-            if self.needs_serve() and self.base_url:
+            if run_scenarios:
+                phase_started_at = iso_now()
+                for scenario in run_scenarios:
+                    result = self.run_one(scenario)
+                    results_by_name[str(scenario["name"])] = result
+                execution_phases.append(
+                    {
+                        "phase": "run",
+                        "scenarios": [str(scenario["name"]) for scenario in run_scenarios],
+                        "started_at": phase_started_at,
+                        "finished_at": iso_now(),
+                    }
+                )
+            if serve_scenarios:
+                phase_started_at = iso_now()
+                self.ensure_server(serve_scenarios)
+                for scenario in serve_scenarios:
+                    result = self.run_one(scenario)
+                    results_by_name[str(scenario["name"])] = result
+                execution_phases.append(
+                    {
+                        "phase": "serve",
+                        "scenarios": [str(scenario["name"]) for scenario in serve_scenarios],
+                        "started_at": phase_started_at,
+                        "finished_at": iso_now(),
+                    }
+                )
+            if serve_scenarios and self.base_url:
                 capture_health(
                     self.base_url,
                     self.out,
@@ -1624,8 +1656,12 @@ class ScenarioRunner:
         finally:
             if self.started_server is not None:
                 self.started_server.stop()
+        results = [results_by_name[str(scenario["name"])] for scenario in selected]
+        failures = sum(result["status"] == "fail" for result in results)
+        skipped = sum(result["status"] == "skipped" for result in results)
         self.execution_receipt.update(
             {
+                "scenario_execution_phases": execution_phases,
                 "scenario_count": len(results),
                 "failed": failures,
                 "skipped": skipped,
@@ -3899,8 +3935,23 @@ def self_test() -> int:
                 raise AssertionError(summary)
             receipt = load_json_object(out / "execution_receipt.json")
             receipt_sha = receipt.pop("canonical_sha256", None)
+            execution_phases = receipt.get("scenario_execution_phases")
+            phase_receipt_valid = (
+                isinstance(execution_phases, list)
+                and len(execution_phases) == 1
+                and isinstance(execution_phases[0], dict)
+                and set(execution_phases[0])
+                == {"phase", "scenarios", "started_at", "finished_at"}
+                and execution_phases[0].get("phase") == "serve"
+                and execution_phases[0].get("scenarios")
+                == [str(scenario["name"]) for scenario in load_json_object(manifest)["scenarios"]]
+                and isinstance(execution_phases[0].get("started_at"), str)
+                and isinstance(execution_phases[0].get("finished_at"), str)
+                and execution_phases[0]["started_at"] <= execution_phases[0]["finished_at"]
+            )
             if (
                 receipt.get("mode") != "external"
+                or not phase_receipt_valid
                 or json_fingerprint(receipt) != receipt_sha
                 or summary.get("execution_receipt", {}).get("artifact_sha256")
                 != file_sha256(out / "execution_receipt.json")
