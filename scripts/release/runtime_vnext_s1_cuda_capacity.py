@@ -652,10 +652,112 @@ def require_replayed_pool_snapshot(
         replay.get("pool_resident_bytes") == calibration.get("pool_resident_bytes"),
         "replay per-pool residency differs from calibration",
     )
+    static_bytes = calibration.get("static_bytes")
     require(
-        replay.get("pool_envelopes") == calibration.get("pool_envelopes"),
-        "replay per-pool allocation envelope differs from calibration",
+        isinstance(static_bytes, int)
+        and not isinstance(static_bytes, bool)
+        and exact_budget > static_bytes,
+        "replay exact dynamic capacity is invalid",
     )
+    exact_dynamic_capacity = exact_budget - static_bytes
+    calibration_envelopes = calibration.get("pool_envelopes")
+    replay_envelopes = replay.get("pool_envelopes")
+    require(
+        isinstance(calibration_envelopes, dict)
+        and isinstance(replay_envelopes, dict)
+        and calibration_envelopes.keys() == replay_envelopes.keys(),
+        "replay per-pool allocation envelope identities differ from calibration",
+    )
+    for pool_id in sorted(calibration_envelopes):
+        calibration_envelope = calibration_envelopes[pool_id]
+        replay_envelope = replay_envelopes[pool_id]
+        require(
+            isinstance(calibration_envelope, dict)
+            and isinstance(replay_envelope, dict),
+            f"replay has an invalid allocation envelope for {pool_id}",
+        )
+        calibration_contract = calibration_envelope.get("contract")
+        replay_contract = replay_envelope.get("contract")
+        require(
+            isinstance(calibration_contract, dict)
+            and isinstance(replay_contract, dict),
+            f"replay has no typed pool contract for {pool_id}",
+        )
+        calibration_provisioning = calibration_contract.get("provisioning")
+        replay_provisioning = replay_contract.get("provisioning")
+        require(
+            isinstance(calibration_provisioning, dict)
+            and isinstance(replay_provisioning, dict),
+            f"replay has no typed provisioning contract for {pool_id}",
+        )
+        calibration_maximum = calibration_provisioning.get(
+            "maximum_resident_bytes"
+        )
+        calibration_minimum = calibration_provisioning.get(
+            "minimum_resident_bytes"
+        )
+        calibration_resident = calibration_envelope.get("resident_bytes")
+        replay_maximum = replay_provisioning.get("maximum_resident_bytes")
+        replay_minimum = replay_provisioning.get("minimum_resident_bytes")
+        replay_resident = replay_envelope.get("resident_bytes")
+        require(
+            all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (
+                    calibration_maximum,
+                    calibration_minimum,
+                    calibration_resident,
+                    replay_maximum,
+                    replay_minimum,
+                    replay_resident,
+                )
+            )
+            and calibration_maximum > 0
+            and calibration_minimum > 0
+            and calibration_minimum <= calibration_resident <= calibration_maximum
+            and replay_minimum > 0
+            and replay_resident >= replay_minimum,
+            f"replay has invalid typed provisioning bounds for {pool_id}",
+        )
+        expected_replay_maximum = min(
+            calibration_maximum, exact_dynamic_capacity
+        )
+        require(
+            replay_maximum == expected_replay_maximum
+            and replay_minimum <= replay_maximum
+            and replay_resident <= replay_maximum,
+            "replay budget-derived provisioning ceiling differs for "
+            f"{pool_id}: expected {expected_replay_maximum}, observed {replay_maximum}",
+        )
+        calibration_stable_contract = {
+            **calibration_contract,
+            "provisioning": {
+                key: value
+                for key, value in calibration_provisioning.items()
+                if key != "maximum_resident_bytes"
+            },
+        }
+        replay_stable_contract = {
+            **replay_contract,
+            "provisioning": {
+                key: value
+                for key, value in replay_provisioning.items()
+                if key != "maximum_resident_bytes"
+            },
+        }
+        calibration_stable_envelope = {
+            key: value
+            for key, value in calibration_envelope.items()
+            if key != "contract"
+        }
+        replay_stable_envelope = {
+            key: value for key, value in replay_envelope.items() if key != "contract"
+        }
+        require(
+            replay_stable_contract == calibration_stable_contract
+            and replay_stable_envelope == calibration_stable_envelope,
+            f"replay phase-stable allocation envelope differs for {pool_id}",
+        )
     require(
         replay.get("budget_claimed_bytes") == exact_budget,
         "replay budget claim differs from the calibrated exact budget",
@@ -3288,6 +3390,23 @@ def self_test() -> int:
         return result
 
     empty_live_occupancy = live_occupancy_fixture()
+    linear_profile = {"allocator": "linear", "view": "contiguous"}
+
+    def pool_contract(minimum: int, maximum: int) -> dict[str, Any]:
+        return {
+            "compatibility": {"profile": linear_profile, "usage": "state"},
+            "minimum_request_bytes": minimum,
+            "minimum_sequence_bytes": 0,
+            "minimum_step_bytes": 0,
+            "minimum_invocation_peak_bytes": 0,
+            "provisioning": {
+                "mode": "demand_driven_elastic",
+                "minimum_resident_bytes": minimum,
+                "maximum_resident_bytes": maximum,
+            },
+            "resources": [{"resource_id": f"resource-{minimum}"}],
+        }
+
     executor = {
         "static_bytes": 7,
         "dynamic_pools": {
@@ -3308,7 +3427,8 @@ def self_test() -> int:
                     "descriptor_mismatch_chunks": 0,
                     "publication_rejected_chunks": 0,
                     "poisoned": False,
-                    "storage_profile": {"allocator": "linear", "view": "contiguous"},
+                    "storage_profile": linear_profile,
+                    "contract": pool_contract(5, 100),
                 },
                 {
                     "pool_id": "pool-b",
@@ -3325,20 +3445,47 @@ def self_test() -> int:
                     "descriptor_mismatch_chunks": 0,
                     "publication_rejected_chunks": 0,
                     "poisoned": False,
-                    "storage_profile": {"allocator": "linear", "view": "contiguous"},
+                    "storage_profile": linear_profile,
+                    "contract": pool_contract(7, 10),
                 },
             ],
         },
     }
     pool_snapshot = quiescent_pool_snapshot(executor, "self-test")
-    require_replayed_pool_snapshot(pool_snapshot, pool_snapshot, 19)
-    drifted = json.loads(json.dumps(pool_snapshot))
+    replay_snapshot = json.loads(json.dumps(pool_snapshot))
+    replay_snapshot["pool_envelopes"]["pool-a"]["contract"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 12
+    require_replayed_pool_snapshot(pool_snapshot, replay_snapshot, 19)
+    drifted = json.loads(json.dumps(replay_snapshot))
     drifted["pool_resident_bytes"] = {"pool-a": 6, "pool-b": 6}
     try:
         require_replayed_pool_snapshot(pool_snapshot, drifted, 19)
         raise AssertionError("per-pool replay drift unexpectedly passed")
     except CapacityGateError:
         pass
+    replay_mutations = []
+    wrong_ceiling = json.loads(json.dumps(replay_snapshot))
+    wrong_ceiling["pool_envelopes"]["pool-a"]["contract"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 13
+    replay_mutations.append(("budget-derived ceiling", wrong_ceiling))
+    changed_minimum = json.loads(json.dumps(replay_snapshot))
+    changed_minimum["pool_envelopes"]["pool-a"]["contract"]["provisioning"][
+        "minimum_resident_bytes"
+    ] = 4
+    replay_mutations.append(("minimum resident", changed_minimum))
+    changed_compatibility = json.loads(json.dumps(replay_snapshot))
+    changed_compatibility["pool_envelopes"]["pool-a"]["contract"][
+        "compatibility"
+    ]["usage"] = "activations"
+    replay_mutations.append(("compatibility", changed_compatibility))
+    for label, mutation in replay_mutations:
+        try:
+            require_replayed_pool_snapshot(pool_snapshot, mutation, 19)
+            raise AssertionError(f"replay {label} drift unexpectedly passed")
+        except CapacityGateError:
+            pass
     startup_baseline = json.loads(json.dumps(executor))
     startup_pool = startup_baseline["dynamic_pools"]["pools"][0]
     startup_pool["free_bytes"] = 4
