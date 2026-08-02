@@ -1826,22 +1826,22 @@ impl RecurrentStateAdmission {
     }
 }
 
-#[must_use = "backend workspace leases must be released or dropped to close the trace lifecycle"]
-pub(super) struct BackendWorkspaceLease<'a> {
+#[must_use = "legacy backend workspace trace leases must be released or dropped"]
+pub(super) struct LegacyBackendWorkspaceTraceLease<'a> {
     pub(super) engine: &'a EngineInner,
     pub(super) request_ids: Vec<RequestId>,
     pub(super) release_phase: &'static str,
     pub(super) armed: bool,
 }
 
-impl<'a> BackendWorkspaceLease<'a> {
+impl<'a> LegacyBackendWorkspaceTraceLease<'a> {
     pub(super) fn new(
         engine: &'a EngineInner,
         request_ids: Vec<RequestId>,
         phase_prefix: &'static str,
         release_phase: &'static str,
     ) -> Self {
-        engine.trace_backend_workspace_acquire_many(&request_ids, phase_prefix);
+        engine.trace_legacy_backend_workspace_acquire_many(&request_ids, phase_prefix);
         Self {
             engine,
             request_ids,
@@ -1857,11 +1857,11 @@ impl<'a> BackendWorkspaceLease<'a> {
 
     pub(super) fn release_now(&self) {
         self.engine
-            .trace_backend_workspace_release_many(&self.request_ids, self.release_phase);
+            .trace_legacy_backend_workspace_release_many(&self.request_ids, self.release_phase);
     }
 }
 
-impl Drop for BackendWorkspaceLease<'_> {
+impl Drop for LegacyBackendWorkspaceTraceLease<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.release_now();

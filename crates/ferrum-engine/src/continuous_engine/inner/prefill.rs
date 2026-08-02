@@ -223,11 +223,11 @@ impl EngineInner {
                 if let Some(state) = current_recurrent_state.clone() {
                     input = input.with_recurrent_state(state);
                 }
-                let workspace_lease = self.acquire_backend_workspace_lease(
+                let workspace_lease = self.acquire_legacy_backend_workspace_trace_lease(
                     vec![request_id.clone()],
                     "engine_prefill_workspace",
                     "engine_prefill_workspace_release",
-                );
+                )?;
                 let out = match self.model_executor.prefill(&input).await {
                     Ok(out) => {
                         workspace_lease.release();
@@ -275,11 +275,11 @@ impl EngineInner {
             } else {
                 prefill_input
             };
-            let workspace_lease = self.acquire_backend_workspace_lease(
+            let workspace_lease = self.acquire_legacy_backend_workspace_trace_lease(
                 vec![request_id.clone()],
                 "engine_prefill_workspace",
                 "engine_prefill_workspace_release",
-            );
+            )?;
             match self.model_executor.prefill(&prefill_input).await {
                 Ok(out) => {
                     workspace_lease.release();
@@ -407,18 +407,12 @@ impl EngineInner {
             chunk,
         )?;
 
-        let workspace_lease = self.acquire_backend_workspace_lease(
-            vec![request_id.clone()],
-            "plan_runtime_prefill_workspace",
-            "plan_runtime_prefill_workspace_release",
-        );
         match self
             .model_executor
             .plan_runtime_prefill_with_capacity(&input)
             .await?
         {
             PlanRuntimePrefillOutcome::Completed(completion) => {
-                workspace_lease.release();
                 return self
                     .commit_plan_runtime_prefill_completion(
                         request_id,
@@ -429,7 +423,6 @@ impl EngineInner {
                     .await;
             }
             PlanRuntimePrefillOutcome::Deferred(deferral) => {
-                drop(workspace_lease);
                 if let Some(retry) =
                     deferral.validated_maintenance_retry_scope(std::slice::from_ref(request_id))?
                 {
@@ -784,20 +777,12 @@ impl EngineInner {
             ));
         }
 
-        let workspace_lease = self.acquire_backend_workspace_lease(
-            work.iter().map(|item| item.request_id.clone()).collect(),
-            "plan_runtime_batch_prefill_workspace",
-            "plan_runtime_batch_prefill_workspace_release",
-        );
         let completions = match self
             .model_executor
             .plan_runtime_batch_prefill_with_capacity(&inputs)
             .await?
         {
-            PlanRuntimeBatchPrefillOutcome::Completed(completions) => {
-                workspace_lease.release();
-                completions
-            }
+            PlanRuntimeBatchPrefillOutcome::Completed(completions) => completions,
             PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral) => {
                 let request_ids = work
                     .iter()
@@ -831,7 +816,6 @@ impl EngineInner {
                         "latest_capacity_epoch": receipt.latest_capacity_epoch(),
                         "scheduler": self.scheduler.trace_snapshot(),
                     }));
-                    drop(workspace_lease);
                     return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
                         fallback_request_ids,
                     ));
@@ -846,13 +830,11 @@ impl EngineInner {
                     "backing_blockers": deferral.backing_blockers(),
                     "scheduler": self.scheduler.trace_snapshot(),
                 }));
-                drop(workspace_lease);
                 return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
                     work.into_iter().map(|item| item.request_id).collect(),
                 ));
             }
             PlanRuntimeBatchPrefillOutcome::Unsupported => {
-                drop(workspace_lease);
                 return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
                     work.into_iter().map(|item| item.request_id).collect(),
                 ));
@@ -1137,11 +1119,11 @@ impl EngineInner {
             });
         }
 
-        let workspace_lease = self.acquire_backend_workspace_lease(
+        let workspace_lease = self.acquire_legacy_backend_workspace_trace_lease(
             workspace_request_ids,
             "engine_batch_prefill_workspace",
             "engine_batch_prefill_workspace_release",
-        );
+        )?;
         let outputs = match self.model_executor.batch_prefill(&inputs).await {
             Ok(outputs) => {
                 workspace_lease.release();

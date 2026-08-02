@@ -52,31 +52,19 @@ impl EngineInner {
             .iter()
             .map(|input| input.logits_policy.clone())
             .collect::<Vec<_>>();
-        let workspace_lease = self.acquire_backend_workspace_lease(
-            rids.clone(),
-            "engine_plan_runtime_batch_decode_workspace",
-            "engine_plan_runtime_batch_decode_workspace_release",
-        );
         let outputs = match self
             .model_executor
             .plan_runtime_batch_decode_with_capacity(&inputs)
             .await
         {
-            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {
-                workspace_lease.release();
-                outputs
-            }
+            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => outputs,
             Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
-                workspace_lease.release();
                 return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids: rids,
                     deferral,
                 });
             }
-            Err(error) => {
-                drop(workspace_lease);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
         if outputs.len() != rids.len() {
             return Err(FerrumError::internal(format!(
@@ -478,11 +466,11 @@ impl EngineInner {
 
         let prof = self.runtime_config.rbd_prof;
         let t_decode = if prof { Some(Instant::now()) } else { None };
-        let workspace_lease = self.acquire_backend_workspace_lease(
+        let workspace_lease = self.acquire_legacy_backend_workspace_trace_lease(
             rids.clone(),
             "engine_batch_decode_workspace",
             "engine_batch_decode_workspace_release",
-        );
+        )?;
         let results = match self.model_executor.unified_decode(&batch).await {
             Ok(results) => {
                 workspace_lease.release();
@@ -665,11 +653,11 @@ impl EngineInner {
         };
 
         let input_recurrent_state = decode_input.recurrent_state.clone();
-        let workspace_lease = self.acquire_backend_workspace_lease(
+        let workspace_lease = self.acquire_legacy_backend_workspace_trace_lease(
             vec![request_id.clone()],
             "engine_decode_workspace",
             "engine_decode_workspace_release",
-        );
+        )?;
         let decode_output = match self.model_executor.decode(&decode_input).await {
             Ok(output) => {
                 workspace_lease.release();

@@ -2071,11 +2071,11 @@ impl EngineInner {
         );
     }
 
-    fn backend_workspace_capacity(&self) -> Option<usize> {
+    fn legacy_backend_workspace_trace_capacity(&self) -> Option<usize> {
         Some(self.config.scheduler.max_running_requests.max(1))
     }
 
-    fn trace_backend_workspace_acquire(&self, request_id: &RequestId, phase_prefix: &str) {
+    fn trace_legacy_backend_workspace_acquire(&self, request_id: &RequestId, phase_prefix: &str) {
         self.trace_resource_reserve_commit(
             request_id,
             "request",
@@ -2083,11 +2083,11 @@ impl EngineInner {
             "backend_workspace",
             phase_prefix,
             1,
-            self.backend_workspace_capacity(),
+            self.legacy_backend_workspace_trace_capacity(),
         );
     }
 
-    fn trace_backend_workspace_release(&self, request_id: &RequestId, phase: &str) {
+    fn trace_legacy_backend_workspace_release(&self, request_id: &RequestId, phase: &str) {
         self.trace_resource_release(
             request_id,
             "request",
@@ -2095,29 +2095,43 @@ impl EngineInner {
             "backend_workspace",
             phase,
             1,
-            self.backend_workspace_capacity(),
+            self.legacy_backend_workspace_trace_capacity(),
         );
     }
 
-    fn trace_backend_workspace_acquire_many(&self, request_ids: &[RequestId], phase_prefix: &str) {
+    fn trace_legacy_backend_workspace_acquire_many(
+        &self,
+        request_ids: &[RequestId],
+        phase_prefix: &str,
+    ) {
         for request_id in request_ids {
-            self.trace_backend_workspace_acquire(request_id, phase_prefix);
+            self.trace_legacy_backend_workspace_acquire(request_id, phase_prefix);
         }
     }
 
-    fn trace_backend_workspace_release_many(&self, request_ids: &[RequestId], phase: &str) {
+    fn trace_legacy_backend_workspace_release_many(&self, request_ids: &[RequestId], phase: &str) {
         for request_id in request_ids {
-            self.trace_backend_workspace_release(request_id, phase);
+            self.trace_legacy_backend_workspace_release(request_id, phase);
         }
     }
 
-    fn acquire_backend_workspace_lease(
+    fn acquire_legacy_backend_workspace_trace_lease(
         &self,
         request_ids: Vec<RequestId>,
         phase_prefix: &'static str,
         release_phase: &'static str,
-    ) -> BackendWorkspaceLease<'_> {
-        BackendWorkspaceLease::new(self, request_ids, phase_prefix, release_phase)
+    ) -> Result<LegacyBackendWorkspaceTraceLease<'_>> {
+        if self.resource_composition.authority() != ExecutionResourceAuthority::LegacyEngine {
+            return Err(FerrumError::internal(
+                "synthetic backend workspace tracing is forbidden for PlanRuntime authority",
+            ));
+        }
+        Ok(LegacyBackendWorkspaceTraceLease::new(
+            self,
+            request_ids,
+            phase_prefix,
+            release_phase,
+        ))
     }
 
     fn apply_model_cache_ref_update(&self, request_id: &RequestId, update: ModelCacheRefUpdate) {
