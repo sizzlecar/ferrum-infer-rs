@@ -46,8 +46,9 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    num::NonZeroU64,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     time::Instant,
@@ -114,6 +115,91 @@ pub enum ExecutionCapacityAction {
     InvariantViolation {
         violation: PressureInvariantViolation,
     },
+}
+
+const EXECUTION_READINESS_PENDING: u8 = 0;
+const EXECUTION_READINESS_READY: u8 = 1;
+const EXECUTION_READINESS_FAILED: u8 = 2;
+const EXECUTION_READINESS_CANCELLED: u8 = 3;
+
+#[derive(Debug)]
+struct ExecutionReadinessState {
+    status: AtomicU8,
+}
+
+/// Exact, generation-bearing wake authority for one scheduler readiness
+/// deferral. A wake only makes the frontier eligible for an authoritative
+/// executor reprobe; it never grants a resource permit.
+#[derive(Debug, Clone)]
+pub struct ExecutionReadinessWake {
+    ticket_id: NonZeroU64,
+    state: Arc<ExecutionReadinessState>,
+}
+
+impl ExecutionReadinessWake {
+    pub const fn ticket_id(&self) -> NonZeroU64 {
+        self.ticket_id
+    }
+
+    pub fn mark_ready(&self) -> bool {
+        self.transition(EXECUTION_READINESS_READY)
+    }
+
+    pub fn mark_failed(&self) -> bool {
+        self.transition(EXECUTION_READINESS_FAILED)
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.transition(EXECUTION_READINESS_CANCELLED)
+    }
+
+    fn transition(&self, next: u8) -> bool {
+        self.state
+            .status
+            .compare_exchange(
+                EXECUTION_READINESS_PENDING,
+                next,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExecutionReadinessBlock {
+    ticket_id: NonZeroU64,
+    state: Arc<ExecutionReadinessState>,
+}
+
+impl ExecutionReadinessBlock {
+    fn status(&self) -> u8 {
+        self.state.status.load(Ordering::Acquire)
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        self.ticket_id == other.ticket_id && Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutionReadinessDeferralReceipt {
+    deferred_count: usize,
+    wake: ExecutionReadinessWake,
+}
+
+impl ExecutionReadinessDeferralReceipt {
+    pub const fn deferred_count(&self) -> usize {
+        self.deferred_count
+    }
+
+    pub const fn wake(&self) -> &ExecutionReadinessWake {
+        &self.wake
+    }
+
+    pub fn into_wake(self) -> ExecutionReadinessWake {
+        self.wake
+    }
 }
 
 /// Scheduler receipt for a voluntary fairness yield backed by real dynamic
@@ -317,6 +403,10 @@ pub struct ContinuousBatchRequest {
     pub waiting_admission_ticket: Option<WaitingAdmissionTicket>,
     /// Exact PlanRuntime capacity predicate suppressing blind execution retries.
     pub execution_capacity_deferral: Option<AdmissionDeferral>,
+    /// Exact non-capacity readiness ticket, currently used for Request-state
+    /// hazards. It is compare-exact so a stale waiter cannot unblock a newer
+    /// frontier generation that reuses the same product request id.
+    execution_readiness_block: Option<ExecutionReadinessBlock>,
     /// Scheduler-owned fairness yield after a proven physical backing mutation.
     execution_maintenance_retry: Option<ExecutionMaintenanceRetryTicket>,
     /// Rejects replay of a previously consumed maintenance mutation receipt.
@@ -345,6 +435,7 @@ impl ContinuousBatchRequest {
             capacity_deferred_from_decode: false,
             waiting_admission_ticket: None,
             execution_capacity_deferral: None,
+            execution_readiness_block: None,
             execution_maintenance_retry: None,
             last_execution_maintenance_capacity_epoch: None,
         }
@@ -504,6 +595,9 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub capacity_blocked_waiting_len: usize,
     pub execution_capacity_blocked_prefill_len: usize,
     pub execution_capacity_blocked_decode_len: usize,
+    pub execution_readiness_deferred_total: u64,
+    pub execution_readiness_blocked_prefill_len: usize,
+    pub execution_readiness_blocked_decode_len: usize,
     pub capacity_release_epoch: u64,
     pub capacity_mixed_recompute_epoch: u64,
     pub capacity_mixed_recompute_blocked_until_epoch: u64,
@@ -575,6 +669,8 @@ pub struct ContinuousBatchScheduler {
     preempted_counter: AtomicU64,
     admitted_counter: AtomicU64,
     capacity_deferred_counter: AtomicU64,
+    execution_readiness_deferred_counter: AtomicU64,
+    next_execution_readiness_ticket: AtomicU64,
     capacity_backpressure_limit: AtomicUsize,
     decode_capacity_backpressure_limit: AtomicUsize,
     capacity_backpressure_iteration: AtomicU64,
@@ -718,6 +814,8 @@ impl ContinuousBatchScheduler {
             preempted_counter: AtomicU64::new(0),
             admitted_counter: AtomicU64::new(0),
             capacity_deferred_counter: AtomicU64::new(0),
+            execution_readiness_deferred_counter: AtomicU64::new(0),
+            next_execution_readiness_ticket: AtomicU64::new(1),
             capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             decode_capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             capacity_backpressure_iteration: AtomicU64::new(u64::MAX),
@@ -763,6 +861,13 @@ impl ContinuousBatchScheduler {
         {
             let prefill = self.prefill_queue.read();
             for request in prefill.iter() {
+                if request
+                    .execution_readiness_block
+                    .as_ref()
+                    .is_some_and(|block| block.status() != EXECUTION_READINESS_CANCELLED)
+                {
+                    continue;
+                }
                 let Some(deferral) = request.execution_capacity_deferral.as_ref() else {
                     return Ok(None);
                 };
@@ -772,6 +877,13 @@ impl ContinuousBatchScheduler {
         {
             let decode = self.decode_queue.read();
             for request in decode.values() {
+                if request
+                    .execution_readiness_block
+                    .as_ref()
+                    .is_some_and(|block| block.status() != EXECUTION_READINESS_CANCELLED)
+                {
+                    continue;
+                }
                 let Some(deferral) = request.execution_capacity_deferral.as_ref() else {
                     return Ok(None);
                 };
@@ -842,6 +954,27 @@ impl ContinuousBatchScheduler {
         Ok(Some(condition))
     }
 
+    /// True only when every active frontier is parked behind an exact
+    /// non-capacity readiness ticket. The engine may sleep on `work_notify` in
+    /// this state because each pending ticket has a separately owned waiter.
+    pub fn all_active_execution_readiness_blocked(&self) -> bool {
+        let prefill = self.prefill_queue.read();
+        let decode = self.decode_queue.read();
+        let active = prefill.len() + decode.len();
+        active != 0
+            && prefill.iter().chain(decode.values()).all(|request| {
+                request
+                    .execution_readiness_block
+                    .as_ref()
+                    .is_some_and(|block| {
+                        matches!(
+                            block.status(),
+                            EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
+                        )
+                    })
+            })
+    }
+
     /// Get number of decoding requests
     pub fn decoding_count(&self) -> usize {
         self.decode_queue.read().len()
@@ -887,6 +1020,21 @@ impl ContinuousBatchScheduler {
                 .read()
                 .values()
                 .filter(|request| request.execution_capacity_deferral.is_some())
+                .count(),
+            execution_readiness_deferred_total: self
+                .execution_readiness_deferred_counter
+                .load(Ordering::Relaxed),
+            execution_readiness_blocked_prefill_len: self
+                .prefill_queue
+                .read()
+                .iter()
+                .filter(|request| request.execution_readiness_block.is_some())
+                .count(),
+            execution_readiness_blocked_decode_len: self
+                .decode_queue
+                .read()
+                .values()
+                .filter(|request| request.execution_readiness_block.is_some())
                 .count(),
             capacity_release_epoch: self.capacity_release_epoch.load(Ordering::Relaxed),
             capacity_mixed_recompute_epoch: self
@@ -1594,6 +1742,97 @@ impl ContinuousBatchScheduler {
         release_snapshot: &ExecutionCapacityReleaseSnapshot,
     ) -> Result<ExecutionCapacityAction> {
         self.plan_execution_capacity_pressure(request_ids, deferral, release_snapshot)
+    }
+
+    /// Suspend only the exact active frontiers blocked by a non-capacity
+    /// execution dependency. The caller must already own a live waiter before
+    /// installing this ticket and must drive the returned wake to one terminal
+    /// state. Installation is all-or-nothing across the cohort.
+    pub fn defer_for_execution_readiness(
+        &self,
+        request_ids: &[RequestId],
+    ) -> Result<ExecutionReadinessDeferralReceipt> {
+        let requested = request_ids.iter().collect::<HashSet<_>>();
+        if request_ids.is_empty() || requested.len() != request_ids.len() {
+            return Err(FerrumError::scheduler(
+                "execution readiness deferral requires a non-empty unique cohort",
+            ));
+        }
+        let ticket_value = self
+            .next_execution_readiness_ticket
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| FerrumError::scheduler("execution readiness ticket space exhausted"))?;
+        let ticket_id = NonZeroU64::new(ticket_value)
+            .ok_or_else(|| FerrumError::scheduler("execution readiness issued a zero ticket id"))?;
+        let state = Arc::new(ExecutionReadinessState {
+            status: AtomicU8::new(EXECUTION_READINESS_PENDING),
+        });
+        let block = ExecutionReadinessBlock {
+            ticket_id,
+            state: Arc::clone(&state),
+        };
+
+        let mut prefill = self.prefill_queue.write();
+        let mut decode = self.decode_queue.write();
+        let existing = prefill.iter().chain(decode.values()).find(|request| {
+            requested.contains(&request.inner.request.id)
+                && request.execution_readiness_block.is_some()
+        });
+        if let Some(request) = existing {
+            return Err(FerrumError::scheduler(format!(
+                "request {} already owns an execution readiness ticket",
+                request.inner.request.id
+            )));
+        }
+        let mut installed = 0usize;
+        for request in prefill.iter_mut().chain(decode.values_mut()) {
+            if requested.contains(&request.inner.request.id) {
+                request.execution_readiness_block = Some(block.clone());
+                installed += 1;
+            }
+        }
+        if installed != request_ids.len() {
+            Self::rollback_execution_readiness_install(&mut prefill, &mut decode, &block);
+            return Err(FerrumError::scheduler(format!(
+                "execution readiness retained {installed} of {} active frontiers",
+                request_ids.len()
+            )));
+        }
+        drop(decode);
+        drop(prefill);
+        self.execution_readiness_deferred_counter
+            .fetch_add(installed as u64, Ordering::Relaxed);
+        Ok(ExecutionReadinessDeferralReceipt {
+            deferred_count: installed,
+            wake: ExecutionReadinessWake { ticket_id, state },
+        })
+    }
+
+    fn rollback_execution_readiness_install(
+        prefill: &mut VecDeque<ContinuousBatchRequest>,
+        decode: &mut HashMap<RequestId, ContinuousBatchRequest>,
+        block: &ExecutionReadinessBlock,
+    ) {
+        for request in prefill.iter_mut() {
+            if request
+                .execution_readiness_block
+                .as_ref()
+                .is_some_and(|installed| installed.matches(block))
+            {
+                request.execution_readiness_block = None;
+            }
+        }
+        for request in decode.values_mut() {
+            if request
+                .execution_readiness_block
+                .as_ref()
+                .is_some_and(|installed| installed.matches(block))
+            {
+                request.execution_readiness_block = None;
+            }
+        }
     }
 
     /// Yield active frontiers after the executor has committed its bounded
@@ -2682,6 +2921,9 @@ impl ContinuousBatchScheduler {
             if scheduled_request_ids.contains(&req.inner.request.id) {
                 continue;
             }
+            if Self::execution_readiness_is_blocked(req) {
+                continue;
+            }
             if Self::execution_maintenance_retry_is_blocked(req, iteration)? {
                 continue;
             }
@@ -2882,6 +3124,20 @@ impl ContinuousBatchScheduler {
         Ok(false)
     }
 
+    fn execution_readiness_is_blocked(req: &mut ContinuousBatchRequest) -> bool {
+        let Some(block) = req.execution_readiness_block.as_ref() else {
+            return false;
+        };
+        match block.status() {
+            EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED => true,
+            EXECUTION_READINESS_READY | EXECUTION_READINESS_CANCELLED => {
+                req.execution_readiness_block = None;
+                false
+            }
+            _ => true,
+        }
+    }
+
     fn execution_maintenance_retry_is_blocked(
         req: &mut ContinuousBatchRequest,
         iteration: u64,
@@ -2923,6 +3179,9 @@ impl ContinuousBatchScheduler {
                 break;
             }
             if scheduled_request_ids.contains(&req.inner.request.id) {
+                continue;
+            }
+            if Self::execution_readiness_is_blocked(req) {
                 continue;
             }
             if Self::execution_maintenance_retry_is_blocked(req, iteration)? {
@@ -7662,5 +7921,117 @@ mod tests {
 
         assert_eq!(scheduler.prefilling_count(), 0);
         assert_eq!(scheduler.decoding_count(), 1);
+    }
+
+    fn activate_decode_requests(
+        scheduler: &ContinuousBatchScheduler,
+        count: usize,
+    ) -> Vec<RequestId> {
+        let mut request_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            let request = create_test_request_with_prompt_tokens(Priority::Normal, 1);
+            request_ids.push(request.id.clone());
+            enqueue_waiting(scheduler, request);
+        }
+        let batch = scheduler
+            .create_iteration_batch(BatchHint::simple(count.max(1)))
+            .expect("test requests should enter prefill");
+        assert_eq!(batch.requests.len(), count);
+        for request_id in &request_ids {
+            scheduler.mark_prefill_complete(request_id, 1);
+        }
+        request_ids
+    }
+
+    #[test]
+    fn execution_readiness_blocks_only_the_exact_frontier() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request_ids = activate_decode_requests(&scheduler, 2);
+        let receipt = scheduler
+            .defer_for_execution_readiness(std::slice::from_ref(&request_ids[0]))
+            .unwrap();
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint::simple(2))
+            .expect("unrelated decode must remain runnable");
+        let scheduled = batch
+            .requests
+            .iter()
+            .map(|request| &request.request.id)
+            .collect::<Vec<_>>();
+        assert!(!scheduled.contains(&&request_ids[0]));
+        assert!(scheduled.contains(&&request_ids[1]));
+        assert!(!scheduler.all_active_execution_readiness_blocked());
+
+        assert!(receipt.wake().mark_ready());
+        let resumed = scheduler
+            .create_iteration_batch(BatchHint::simple(2))
+            .expect("ready ticket must authorize an exact reprobe");
+        assert!(resumed
+            .requests
+            .iter()
+            .any(|request| request.request.id == request_ids[0]));
+    }
+
+    #[test]
+    fn stale_execution_readiness_wake_cannot_unblock_replacement_ticket() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request_id = activate_decode_requests(&scheduler, 1).remove(0);
+        let first = scheduler
+            .defer_for_execution_readiness(std::slice::from_ref(&request_id))
+            .unwrap();
+        let stale = first.wake().clone();
+        assert!(stale.mark_ready());
+        assert!(scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .is_some());
+
+        let replacement = scheduler
+            .defer_for_execution_readiness(std::slice::from_ref(&request_id))
+            .unwrap();
+        assert_ne!(stale.ticket_id(), replacement.wake().ticket_id());
+        assert!(!stale.mark_ready());
+        assert!(scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .is_none());
+        assert!(scheduler.all_active_execution_readiness_blocked());
+
+        assert!(replacement.wake().mark_ready());
+        assert!(scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .is_some());
+    }
+
+    #[test]
+    fn failed_execution_readiness_ticket_remains_parked_for_terminal_owner() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request_id = activate_decode_requests(&scheduler, 1).remove(0);
+        let receipt = scheduler
+            .defer_for_execution_readiness(std::slice::from_ref(&request_id))
+            .unwrap();
+        assert!(receipt.wake().mark_failed());
+
+        assert!(scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .is_none());
+        assert!(scheduler.all_active_execution_readiness_blocked());
+        let snapshot = scheduler.trace_snapshot();
+        assert_eq!(snapshot.execution_readiness_deferred_total, 1);
+        assert_eq!(snapshot.execution_readiness_blocked_decode_len, 1);
+    }
+
+    #[test]
+    fn execution_readiness_install_is_all_or_nothing() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig::default());
+        let request_id = activate_decode_requests(&scheduler, 1).remove(0);
+        let missing = RequestId::new();
+        assert!(scheduler
+            .defer_for_execution_readiness(&[request_id.clone(), missing])
+            .is_err());
+
+        let batch = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .expect("failed cohort install must not retain a partial block");
+        assert_eq!(batch.requests[0].request.id, request_id);
     }
 }

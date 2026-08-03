@@ -19,13 +19,13 @@ use ferrum_interfaces::{
     model_executor::{
         ExecutionResourceAuthority, ExecutorAdmissionEpochs, ExecutorCapacityWaitRegistration,
         ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityPreemption,
-        ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
+        ExecutorExecutionDeferral, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
         ExecutorPrefillAdmissionReceipt, ExecutorPrefillMaintenanceDeferral,
-        ExecutorPrefillMaintenanceOutcome, ExecutorRequestOrigin, ExecutorSamplingOutput,
-        ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest, LogitsReturnPolicy,
-        PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput,
-        PlanRuntimePrefillInput, PlanRuntimePrefillOutcome, PlanRuntimePrefillProduct,
-        TokenSelectionMask,
+        ExecutorPrefillMaintenanceOutcome, ExecutorRequestOrigin, ExecutorRequestStateDeferral,
+        ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty, KvSlotRequest,
+        LogitsReturnPolicy, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
+        PlanRuntimeDecodeInput, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
+        PlanRuntimePrefillProduct, TokenSelectionMask,
     },
     sampler::{SamplingConfig as TokenSamplingPlan, SamplingRng},
     vnext::{
@@ -45,8 +45,8 @@ use ferrum_kv::cache::prefix::PrefixCache;
 use ferrum_sampler::structured_output::{StructuredOutputFactory, StructuredOutputProcessor};
 use ferrum_scheduler::implementations::{
     ContinuousBatchScheduler, ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot,
-    ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, PressureYieldTransaction,
-    RequestPhase,
+    ExecutionReadinessWake, ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation,
+    PressureYieldTransaction, RequestPhase,
 };
 #[cfg(test)]
 use ferrum_scheduler::implementations::{PressureTransitionKind, PressureYieldKind};
@@ -62,12 +62,13 @@ use ferrum_types::{
     DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
 };
-use futures::stream::Stream;
+use futures::{stream::Stream, FutureExt};
 use metrics::{counter, gauge, histogram};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -76,7 +77,7 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 // Env-name constants + `from_env_vars` are retained as test-only parse
@@ -1193,6 +1194,143 @@ enum EngineResourceComposition {
     PlanRuntime,
 }
 
+const MAX_EXECUTION_READINESS_WAITERS: usize = 64;
+
+struct ExecutionReadinessWaitFailure {
+    ticket_id: u64,
+    request_ids: Vec<RequestId>,
+    message: String,
+}
+
+struct ExecutionReadinessWaitTask {
+    wake: ExecutionReadinessWake,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct ExecutionReadinessWaitRegistry {
+    slots: Arc<Semaphore>,
+    tasks: Mutex<HashMap<u64, ExecutionReadinessWaitTask>>,
+    failures: Arc<Mutex<VecDeque<ExecutionReadinessWaitFailure>>>,
+}
+
+impl ExecutionReadinessWaitRegistry {
+    fn new() -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(MAX_EXECUTION_READINESS_WAITERS)),
+            tasks: Mutex::new(HashMap::new()),
+            failures: Arc::new(Mutex::new(VecDeque::new())),
+        }
+    }
+
+    async fn reserve(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| FerrumError::internal("execution readiness waiter registry is closed"))
+    }
+
+    fn track<F>(
+        &self,
+        wake: ExecutionReadinessWake,
+        wait: F,
+        request_ids: Vec<RequestId>,
+        work_notify: Arc<Notify>,
+        slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<()>
+    where
+        F: Future<Output = std::result::Result<(), String>> + Send + 'static,
+    {
+        let ticket_id = wake.ticket_id().get();
+        let failures = Arc::clone(&self.failures);
+        let retained_wake = wake.clone();
+        let mut tasks = self.tasks.lock();
+        if tasks.contains_key(&ticket_id) {
+            failures.lock().push_back(ExecutionReadinessWaitFailure {
+                ticket_id,
+                request_ids,
+                message: format!("execution readiness ticket {ticket_id} was registered twice"),
+            });
+            wake.mark_failed();
+            work_notify.notify_one();
+            drop(slot);
+            return Err(FerrumError::internal(format!(
+                "execution readiness ticket {ticket_id} was registered twice"
+            )));
+        }
+        let task = tokio::spawn(async move {
+            let result = std::panic::AssertUnwindSafe(wait).catch_unwind().await;
+            match result {
+                Ok(Ok(_)) => {
+                    wake.mark_ready();
+                }
+                Ok(Err(error)) => {
+                    failures.lock().push_back(ExecutionReadinessWaitFailure {
+                        ticket_id,
+                        request_ids,
+                        message: error.to_string(),
+                    });
+                    wake.mark_failed();
+                }
+                Err(_) => {
+                    failures.lock().push_back(ExecutionReadinessWaitFailure {
+                        ticket_id,
+                        request_ids,
+                        message: "Request-state readiness waiter panicked".to_string(),
+                    });
+                    wake.mark_failed();
+                }
+            }
+            drop(slot);
+            work_notify.notify_one();
+        });
+        tasks.insert(
+            ticket_id,
+            ExecutionReadinessWaitTask {
+                wake: retained_wake,
+                handle: task,
+            },
+        );
+        Ok(())
+    }
+
+    fn reap_finished(&self) {
+        self.tasks
+            .lock()
+            .retain(|_, task| !task.handle.is_finished());
+    }
+
+    fn take_failures(&self) -> Vec<ExecutionReadinessWaitFailure> {
+        self.failures.lock().drain(..).collect()
+    }
+
+    fn pending_count(&self) -> usize {
+        MAX_EXECUTION_READINESS_WAITERS - self.slots.available_permits()
+    }
+
+    async fn abort_and_join(&self) -> Result<()> {
+        let tasks = self
+            .tasks
+            .lock()
+            .drain()
+            .map(|(_, task)| task)
+            .collect::<Vec<_>>();
+        for task in &tasks {
+            task.wake.cancel();
+            task.handle.abort();
+        }
+        for task in tasks {
+            if let Err(error) = task.handle.await {
+                if !error.is_cancelled() {
+                    return Err(FerrumError::internal(format!(
+                        "execution readiness waiter join failed: {error}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl EngineResourceComposition {
     const fn authority(&self) -> ExecutionResourceAuthority {
         match self {
@@ -1256,6 +1394,7 @@ struct EngineInner {
     resource_lifecycle: Mutex<ResourceLifecycleLedger>,
     resource_trace_event_counter: AtomicU64,
     dynamic_admission_availability: Mutex<Vec<CapacityAvailabilityEpoch>>,
+    execution_readiness_waiters: ExecutionReadinessWaitRegistry,
     // stats
     iteration_count: AtomicU64,
     total_prefill_tokens: AtomicU64,
@@ -2678,6 +2817,7 @@ impl ContinuousBatchEngine {
                 resource_lifecycle: Mutex::new(ResourceLifecycleLedger::default()),
                 resource_trace_event_counter: AtomicU64::new(0),
                 dynamic_admission_availability: Mutex::new(Vec::with_capacity(16)),
+                execution_readiness_waiters: ExecutionReadinessWaitRegistry::new(),
                 total_prefill_tokens: AtomicU64::new(0),
                 total_decode_tokens: AtomicU64::new(0),
                 total_preemptions: AtomicU64::new(0),
@@ -3104,6 +3244,11 @@ impl InferenceEngine for ContinuousBatchEngine {
             }),
             None => Ok(()),
         };
+        let readiness_result = self
+            .inner
+            .execution_readiness_waiters
+            .abort_and_join()
+            .await;
 
         let mut trace_journals = Vec::with_capacity(2);
         if let Some(journal) = self.inner.profile_trace_jsonl.clone() {
@@ -3136,6 +3281,7 @@ impl InferenceEngine for ContinuousBatchEngine {
         };
 
         loop_result?;
+        readiness_result?;
         trace_result
     }
 

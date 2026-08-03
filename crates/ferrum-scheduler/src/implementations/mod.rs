@@ -8,8 +8,9 @@ pub mod priority;
 pub use continuous::{
     ContinuousBatchConfig, ContinuousBatchRequest, ContinuousBatchScheduler,
     ExecutionCapacityAction, ExecutionCapacityReleaseSnapshot, ExecutionCapacityYieldDisposition,
-    ExecutorAdmissionProbeOutcome, ExecutorAdmissionQueueObservation, LogicalWorkGeneration,
-    PressureEpisodeId, PressureEpisodeState, PressureHoldReleaseReason, PressureInvariantViolation,
+    ExecutionReadinessDeferralReceipt, ExecutionReadinessWake, ExecutorAdmissionProbeOutcome,
+    ExecutorAdmissionQueueObservation, LogicalWorkGeneration, PressureEpisodeId,
+    PressureEpisodeState, PressureHoldReleaseReason, PressureInvariantViolation,
     PressureInvariantViolationClass, PressureTransition, PressureTransitionKind,
     PressureTransitionOrdinal, PressureYieldKind, PressureYieldTransaction, RequestPhase,
 };
