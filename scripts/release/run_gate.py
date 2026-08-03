@@ -69,6 +69,7 @@ LANES = (
     "vnext-s2-stream-disconnect",
     "vnext-s2-tool-schema",
     "vnext-s2-multiturn-concurrency",
+    "vnext-s2-latency-first-failure",
     "vnext-s2-historical-resource-source",
     "vnext-s2-m1-determinism",
     "vnext-cuda-determinism",
@@ -1194,6 +1195,29 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s2-multiturn-concurrency",
+        )
+    if lane == "vnext-s2-latency-first-failure":
+        if args.s2_artifact_root is None:
+            raise GateError(
+                "vnext-s2-latency-first-failure requires --s2-artifact-root"
+            )
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_s2_latency_failure_checkpoint.py",
+                "--source",
+                str(args.s2_artifact_root.resolve()),
+                "--expected-git-sha",
+                git_sha(),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                "FERRUM RUNTIME VNEXT S2 LATENCY FIRST FAILURE PASS: "
+                f"{out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-s2-latency-first-failure",
         )
     if lane == "vnext-s2-historical-resource-source":
         if args.historical_corpus is None:
@@ -9082,6 +9106,11 @@ def self_test() -> int:
                 "--source",
                 "FERRUM RUNTIME VNEXT S2 MULTITURN CONCURRENCY PASS",
             ),
+            "vnext-s2-latency-first-failure": (
+                "scripts/release/runtime_vnext_s2_latency_failure_checkpoint.py",
+                "--source",
+                "FERRUM RUNTIME VNEXT S2 LATENCY FIRST FAILURE PASS",
+            ),
         }
         for lane, (script, source_flag, child_prefix) in s2_lane_specs.items():
             lane_out = (root / f"{lane}-dry-run").resolve()
@@ -9814,6 +9843,7 @@ def main() -> int:
         "vnext-s2-stream-disconnect",
         "vnext-s2-tool-schema",
         "vnext-s2-multiturn-concurrency",
+        "vnext-s2-latency-first-failure",
         "vnext-s2-historical-resource-source",
         "vnext-s2-m1-determinism",
     }:
