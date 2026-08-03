@@ -19,7 +19,8 @@ use super::{
     DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
     DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
     HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
-    NodeId, PreparedStepSubmissionWave, ResourceId, StreamState, VNextError,
+    NodeId, PreparedStepSubmissionWave, RequestStateHazardTerminalDisposition, ResourceId,
+    StreamState, VNextError,
 };
 
 mod readback_collection;
@@ -1397,6 +1398,16 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
         }
     }
 
+    fn finish_request_state_hazards(
+        &mut self,
+        disposition: RequestStateHazardTerminalDisposition,
+    ) -> Result<(), VNextError> {
+        match self {
+            Self::Invocation(invocation) => invocation.finish_request_state_hazards(disposition),
+            Self::Wave(wave) => wave.finish_request_state_hazards(disposition),
+        }
+    }
+
     fn backing_view(
         &self,
         node_id: &NodeId,
@@ -1545,6 +1556,14 @@ impl<R: DeviceRuntime> CompletionQuarantineOwnership<R> {
             }
         }
     }
+
+    fn resources_mut(&mut self) -> &mut CompletionResourceLease<R> {
+        match self {
+            Self::InFlight { resources, .. } | Self::SubmissionIndeterminate { resources, .. } => {
+                resources
+            }
+        }
+    }
 }
 
 impl<R: DeviceRuntime> CompletionRecord<R> {
@@ -1556,6 +1575,19 @@ impl<R: DeviceRuntime> CompletionRecord<R> {
             Self::Quarantined { ownership, .. } => Some(ownership.deferred_cleanup_domain()),
             Self::Reserved | Self::Reaped => None,
         }
+    }
+
+    fn finish_request_state_hazards_after_drain(&mut self) -> Result<(), VNextError> {
+        let resources = match self {
+            Self::InFlight { resources, .. } | Self::SubmissionIndeterminate { resources, .. } => {
+                resources
+            }
+            Self::Quarantined { ownership, .. } => ownership.resources_mut(),
+            Self::Reserved | Self::Reaped => return Ok(()),
+        };
+        resources.finish_request_state_hazards(
+            RequestStateHazardTerminalDisposition::IndeterminateAfterDrain,
+        )
     }
 }
 
@@ -2202,6 +2234,19 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
                     )),
                 );
             }
+            let hazard_disposition =
+                if matches!(disposition, OperationCompletionDisposition::Succeeded) {
+                    RequestStateHazardTerminalDisposition::Succeeded
+                } else {
+                    RequestStateHazardTerminalDisposition::FailedButQuiescent
+                };
+            if let Err(error) = resources.finish_request_state_hazards(hazard_disposition) {
+                disposition = OperationCompletionDisposition::ContractFailedButQuiescent(
+                    QuiescentCompletionContractFailure::new(format!(
+                        "request-state hazard terminal transition failed: {error}"
+                    )),
+                );
+            }
             drop(guard);
             self.remove_exact(slot_id, &record);
             return OperationCompletionReceipt::new(
@@ -2344,13 +2389,15 @@ impl<R: DeviceRuntime> CompletionReaper<R> {
             };
             return Ok(CompletionRecoveryOutcome::Quarantined(receipt));
         }
-        let old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
+        let mut old = std::mem::replace(&mut *guard, CompletionRecord::Reaped);
         if let CompletionRecord::Quarantined { receipt, .. } = &old {
             receipt.freshness.invalidate();
         }
+        let hazard_result = old.finish_request_state_hazards_after_drain();
         drop(guard);
         self.remove_exact(slot_id, &record);
         drop(old);
+        hazard_result?;
         Ok(CompletionRecoveryOutcome::Drained(CompletionDrainReceipt {
             slot_id,
             batch_identity,
@@ -3423,12 +3470,16 @@ impl<R: DeviceRuntime> CompletionReservation<R> {
         let transition = match &mut *record {
             CompletionRecord::InFlight {
                 resources, lane, ..
-            } => resources
-                .mark_submission_fence_installed()
-                .map_err(|error| {
+            } => match resources.mark_submission_fence_installed() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    // Submission already returned a fence. Any partial ownership
+                    // transition is therefore unknown, never cleanly unsubmitted.
+                    resources.mark_submission_indeterminate();
                     lane.fail_closed();
-                    error
-                }),
+                    Err(error)
+                }
+            },
             _ => unreachable!("completion record was just armed"),
         };
         drop(record);

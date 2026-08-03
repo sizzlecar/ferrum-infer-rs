@@ -11,10 +11,10 @@ use super::{
     LogicalRequestLease, ManuallyDrop, Mutex, NonZeroU64, Ordering, ParticipantNodeKey,
     PlanBackingDeferral, PlanCapacityWaitRegistration, PreparedBackingClaim,
     RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, RequestResourceAdmissionRequest,
-    ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, SequenceRecoveryRegistry,
-    SequenceResourceAdmissionRequest, Serialize, Sha256, StaticProvisioningLease,
-    TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence, VNextError, Weak,
-    SEQUENCE_DISPATCH_POISONED_BIT,
+    RequestStateHazardRegistration, ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId,
+    SequenceRecoveryRegistry, SequenceResourceAdmissionRequest, Serialize, Sha256,
+    StaticProvisioningLease, TrustedPlanRuntimeBinding, TrustedPlanRuntimeEvidence, VNextError,
+    Weak, SEQUENCE_DISPATCH_POISONED_BIT,
 };
 use crate::vnext::CapacityAvailabilitySource;
 
@@ -400,16 +400,16 @@ where
                         ));
                     }
 
-                    let request = Arc::new(AdmittedRequestResources {
-                        backing_slices: request_backing,
-                        logical_lease: request_logical,
-                        plan: TrustedPlanRuntimeBinding {
+                    let request = Arc::new(AdmittedRequestResources::new(
+                        TrustedPlanRuntimeBinding {
                             resources: Arc::clone(&self.resources),
                         },
-                        work_shape: request_work_shape,
+                        request_logical,
+                        request_backing,
+                        request_work_shape,
                         run_id,
                         request_id,
-                    });
+                    )?);
                     return Ok(InitialSequenceResourceAdmissionDecision::Admitted(
                         Arc::new(AdmittedSequenceResources::new(
                             request,
@@ -459,6 +459,9 @@ pub struct AdmittedRequestResources<R>
 where
     R: DeviceRuntime,
 {
+    // Unregister Request-state hazard cells before backing and logical
+    // capacity are released. A live permit retains this exact request Arc.
+    _request_state_hazard_registration: Option<RequestStateHazardRegistration>,
     backing_slices: Vec<LogicalBackingSliceAuthority>,
     logical_lease: LogicalRequestLease,
     pub(super) plan: TrustedPlanRuntimeBinding<R>,
@@ -484,7 +487,12 @@ where
                 "logical request authority belongs to another coordinator",
             ));
         }
+        let request_state_hazard_registration = plan
+            .dynamic_pools()
+            .request_state_hazards
+            .register_request(logical_lease.request())?;
         Ok(Self {
+            _request_state_hazard_registration: request_state_hazard_registration,
             backing_slices,
             logical_lease,
             plan,

@@ -30,7 +30,8 @@ use super::{
     LogicalBatchCapacityLease, LogicalCapacityLease, LogicalRequestLease, NodeId, PlanHash, PlanId,
     PlanNode, RequestAdmissionDecision, RequestAuthorityId, RequestIdentity, ResourceAllocation,
     ResourceId, ResourceWorkShape, RunId, SequenceAuthorityId, StepResourceSlotKind, StreamState,
-    TokenSpanWork, TransactionId, VNextError, MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
+    TensorAccess, TokenSpanWork, TransactionId, VNextError,
+    MAX_DEFERRED_DEVICE_CLEANUP_MAINTENANCE_TASKS,
 };
 
 mod contracts;
@@ -68,6 +69,8 @@ mod work;
 pub use work::*;
 mod plan_runtime;
 pub use plan_runtime::*;
+mod request_state_hazard;
+pub use request_state_hazard::*;
 mod sequence_state;
 use sequence_state::*;
 mod sequence;

@@ -344,6 +344,26 @@ impl PlanNode {
         node
     }
 
+    #[cfg(test)]
+    pub(crate) fn resource_test_node_with_state_effect(
+        id: NodeId,
+        state_id: StateId,
+        state_value_id: ProgramValueId,
+        lifetime: AllocationLifetime,
+        access: TensorAccess,
+        resource_ids: Vec<ResourceId>,
+    ) -> Self {
+        let mut node = Self::resource_test_node(id);
+        node.state_effects = vec![PlanStateEffect {
+            state_id,
+            state_value_id,
+            lifetime,
+            access,
+            resource_ids,
+        }];
+        node
+    }
+
     pub fn id(&self) -> &NodeId {
         &self.id
     }

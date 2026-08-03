@@ -16,8 +16,11 @@ use super::{
     LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSliceAuthority,
     LogicalBatchCapacityLease, NodeId, Ordering, ParticipantFlightCandidate,
     ParticipantFlightPhase, ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration,
-    PreparedParticipantFlightHold, PreparedSubmissionWaveParticipantFlightHold, ResourceId,
-    SequenceAuthorityId, SequenceBackingSnapshot, SequenceRecoveryRegistry, SequenceSessionEpoch,
+    PreparedParticipantFlightHold, PreparedSubmissionWaveParticipantFlightHold,
+    RequestStateHazardAcquireDecision, RequestStateHazardDeferral, RequestStateHazardPermit,
+    RequestStateHazardPoison, RequestStateHazardSplitRequired,
+    RequestStateHazardTerminalDisposition, ResourceId, SequenceAuthorityId,
+    SequenceBackingSnapshot, SequenceRecoveryRegistry, SequenceSessionEpoch,
     SequenceSessionFingerprint, Serialize, Sha256, StateInitialization, StaticProvisioningLease,
     StepFinalizationFailure, StepFrameFinalization, StepParticipantFrameAssignment,
     StepParticipantRetirement, StepParticipantRetirementDisposition, StepResourceLease,
@@ -831,6 +834,19 @@ where
                     rejected,
                 ));
             }
+            PreparedInvocationScopeDecision::RequestStateDeferred(deferred) => {
+                return Ok(InvocationResourceAdmissionDecision::RequestStateDeferred(
+                    deferred,
+                ));
+            }
+            PreparedInvocationScopeDecision::RequestStateSplitRequired(split) => {
+                return Ok(InvocationResourceAdmissionDecision::RequestStateSplitRequired(split));
+            }
+            PreparedInvocationScopeDecision::RequestStatePoisoned(poison) => {
+                return Ok(InvocationResourceAdmissionDecision::RequestStatePoisoned(
+                    poison,
+                ));
+            }
         };
         let PreparedInvocationScope {
             participants,
@@ -838,6 +854,7 @@ where
             node_id,
             claimed_backing,
             flight_candidates,
+            request_state_hazards,
         } = prepared;
         let batch_invocation_id = issue_batch_invocation_id()?;
         let prepared_participant_flights =
@@ -867,6 +884,7 @@ where
                 claimed_backing,
                 prepared_participant_flights,
                 active_wave,
+                request_state_hazards,
             )?,
         ))
     }
@@ -1053,6 +1071,31 @@ where
                 PreparedStepSubmissionNode::new(plan_node_index, Arc::clone(&participant_authority))
             })
             .collect::<Vec<_>>();
+        let request_participants = participant_authority
+            .participants
+            .iter()
+            .map(|participant| Arc::clone(participant.request_resources()))
+            .collect::<Vec<_>>();
+        let request_state_hazards = match plan
+            .dynamic_pools()
+            .request_state_hazards
+            .try_acquire(&request_participants, node_indices)?
+        {
+            RequestStateHazardAcquireDecision::Acquired(permit) => permit,
+            RequestStateHazardAcquireDecision::Deferred(deferred) => {
+                return Ok(StepSubmissionWaveAdmissionDecision::RequestStateDeferred(
+                    deferred,
+                ));
+            }
+            RequestStateHazardAcquireDecision::SplitRequired(split) => {
+                return Ok(StepSubmissionWaveAdmissionDecision::RequestStateSplitRequired(split));
+            }
+            RequestStateHazardAcquireDecision::Poisoned(poison) => {
+                return Ok(StepSubmissionWaveAdmissionDecision::RequestStatePoisoned(
+                    poison,
+                ));
+            }
+        };
         let immediate_shape = work_shape.immediate_shape();
         let fit_shape = match fit_policy {
             AdmissionFitPolicy::ImmediateOnly => immediate_shape,
@@ -1171,6 +1214,7 @@ where
             PreparedStepSubmissionWave {
                 claimed_backing,
                 initializations: None,
+                request_state_hazards,
                 nodes: prepared_nodes,
                 prepared_participant_flights,
                 active_wave,
@@ -1197,12 +1241,43 @@ where
             fit_policy,
             pressure_action,
         } = self.prepare_invocation_metadata(request)?;
+        let plan = &participants[0].request.plan;
+        let node_index = plan
+            .nodes()
+            .iter()
+            .position(|node| node.id() == &node_id)
+            .ok_or_else(|| invalid_resource("invocation references an unknown plan node"))?;
+        let request_participants = participants
+            .iter()
+            .map(|participant| Arc::clone(participant.request_resources()))
+            .collect::<Vec<_>>();
+        let request_state_hazards = match plan
+            .dynamic_pools()
+            .request_state_hazards
+            .try_acquire(&request_participants, &[node_index])?
+        {
+            RequestStateHazardAcquireDecision::Acquired(permit) => permit,
+            RequestStateHazardAcquireDecision::Deferred(deferred) => {
+                return Ok(PreparedInvocationScopeDecision::RequestStateDeferred(
+                    deferred,
+                ));
+            }
+            RequestStateHazardAcquireDecision::SplitRequired(split) => {
+                return Ok(PreparedInvocationScopeDecision::RequestStateSplitRequired(
+                    split,
+                ));
+            }
+            RequestStateHazardAcquireDecision::Poisoned(poison) => {
+                return Ok(PreparedInvocationScopeDecision::RequestStatePoisoned(
+                    poison,
+                ));
+            }
+        };
         let immediate_shape = work_shape.immediate_shape();
         let fit_shape = match fit_policy {
             AdmissionFitPolicy::ImmediateOnly => immediate_shape,
             AdmissionFitPolicy::FullInputMustFit => work_shape.fit_shape(),
         };
-        let plan = &participants[0].request.plan;
         let (demand, requested_slices) = plan.scoped_demand(
             AllocationLifetime::Invocation,
             Some(&node_id),
@@ -1274,6 +1349,7 @@ where
                 node_id,
                 claimed_backing,
                 flight_candidates,
+                request_state_hazards,
             },
         ))
     }
@@ -1430,6 +1506,9 @@ where
     Deferred(AdmissionDeferred),
     BackingDeferred(InvocationAdmissionBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+    RequestStateDeferred(RequestStateHazardDeferral),
+    RequestStateSplitRequired(RequestStateHazardSplitRequired),
+    RequestStatePoisoned(RequestStateHazardPoison),
 }
 
 /// Non-cloneable backing authority for one exact node invocation under one
@@ -1505,6 +1584,9 @@ where
     Deferred(AdmissionDeferred),
     BackingDeferred(DynamicBackingDeferred),
     PermanentRejected(AdmissionRejected),
+    RequestStateDeferred(RequestStateHazardDeferral),
+    RequestStateSplitRequired(RequestStateHazardSplitRequired),
+    RequestStatePoisoned(RequestStateHazardPoison),
 }
 
 struct PreparedInvocationScope<R>
@@ -1516,6 +1598,7 @@ where
     participant_frames: Vec<StepParticipantFrameAssignment>,
     flight_candidates: Vec<ParticipantFlightCandidate>,
     node_id: NodeId,
+    request_state_hazards: Option<RequestStateHazardPermit<R>>,
 }
 
 struct PreparedInvocationMetadata<R>
@@ -1631,6 +1714,9 @@ where
     Deferred(AdmissionDeferred),
     BackingDeferred(StepSubmissionWaveBackingDeferral<R>),
     PermanentRejected(AdmissionRejected),
+    RequestStateDeferred(RequestStateHazardDeferral),
+    RequestStateSplitRequired(RequestStateHazardSplitRequired),
+    RequestStatePoisoned(RequestStateHazardPoison),
 }
 
 /// Non-cloneable backing authority for one immutable-plan submission wave.
@@ -1782,6 +1868,7 @@ where
     // Drop wave backing and participant flights before releasing the Step.
     claimed_backing: ClaimedSubmissionWaveBacking,
     initializations: Option<PreparedBackingInitializations>,
+    request_state_hazards: Option<RequestStateHazardPermit<R>>,
     nodes: Vec<PreparedStepSubmissionNode<R>>,
     prepared_participant_flights: Vec<PreparedSubmissionWaveParticipantFlightHold>,
     active_wave: ActiveInvocationWaveGuard,
@@ -1920,12 +2007,19 @@ where
             .as_mut()
             .ok_or_else(|| invalid_resource("submission wave initialization was not prepared"))?
             .mark_in_flight()?;
-        self.active_wave.mark_in_flight()
+        self.active_wave.mark_in_flight()?;
+        if let Some(hazards) = &mut self.request_state_hazards {
+            hazards.mark_submission_fence_installed()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn mark_submission_indeterminate(&mut self) {
         if let Some(initializations) = &mut self.initializations {
             initializations.mark_indeterminate();
+        }
+        if let Some(hazards) = &mut self.request_state_hazards {
+            hazards.mark_submission_indeterminate();
         }
     }
 
@@ -1937,6 +2031,16 @@ where
             .as_mut()
             .ok_or_else(|| invalid_resource("submission wave initialization was not prepared"))?
             .finish(succeeded)
+    }
+
+    pub(crate) fn finish_request_state_hazards(
+        &mut self,
+        disposition: RequestStateHazardTerminalDisposition,
+    ) -> Result<(), VNextError> {
+        match &mut self.request_state_hazards {
+            Some(hazards) => hazards.finish(disposition),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn definitely_not_submitted(
@@ -2040,6 +2144,7 @@ where
     // authorities. It retains the immutable work fingerprint even when empty.
     claimed_backing: ClaimedBackingTransaction,
     initializations: Option<PreparedBackingInitializations>,
+    request_state_hazards: Option<RequestStateHazardPermit<R>>,
     prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
     active_wave: ActiveInvocationWaveGuard,
     participants: Vec<Arc<AdmittedSequenceResources<R>>>,
@@ -2062,6 +2167,7 @@ where
         claimed_backing: ClaimedBackingTransaction,
         prepared_participant_flights: Vec<PreparedParticipantFlightHold>,
         active_wave: ActiveInvocationWaveGuard,
+        request_state_hazards: Option<RequestStateHazardPermit<R>>,
     ) -> Result<Self, VNextError> {
         if participants.is_empty() {
             return Err(invalid_resource(
@@ -2123,6 +2229,7 @@ where
         Ok(Self {
             claimed_backing,
             initializations: None,
+            request_state_hazards,
             prepared_participant_flights,
             active_wave,
             participants,
@@ -2199,12 +2306,19 @@ where
             .as_mut()
             .ok_or_else(|| invalid_resource("invocation initialization was not prepared"))?
             .mark_in_flight()?;
-        self.active_wave.mark_in_flight()
+        self.active_wave.mark_in_flight()?;
+        if let Some(hazards) = &mut self.request_state_hazards {
+            hazards.mark_submission_fence_installed()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn mark_submission_indeterminate(&mut self) {
         if let Some(initializations) = &mut self.initializations {
             initializations.mark_indeterminate();
+        }
+        if let Some(hazards) = &mut self.request_state_hazards {
+            hazards.mark_submission_indeterminate();
         }
     }
 
@@ -2216,6 +2330,16 @@ where
             .as_mut()
             .ok_or_else(|| invalid_resource("invocation initialization was not prepared"))?
             .finish(succeeded)
+    }
+
+    pub(crate) fn finish_request_state_hazards(
+        &mut self,
+        disposition: RequestStateHazardTerminalDisposition,
+    ) -> Result<(), VNextError> {
+        match &mut self.request_state_hazards {
+            Some(hazards) => hazards.finish(disposition),
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn definitely_not_submitted(

@@ -302,6 +302,11 @@ pub(crate) fn admit_single_participant_invocation(
             InvocationResourceAdmissionDecision::PermanentRejected(_) => {
                 panic!("event single-participant invocation unexpectedly rejected")
             }
+            InvocationResourceAdmissionDecision::RequestStateDeferred(_)
+            | InvocationResourceAdmissionDecision::RequestStateSplitRequired(_)
+            | InvocationResourceAdmissionDecision::RequestStatePoisoned(_) => {
+                panic!("event invocation hit an unexpected request-state hazard")
+            }
         }
     }
     unreachable!("bounded event invocation admission always returns or panics")

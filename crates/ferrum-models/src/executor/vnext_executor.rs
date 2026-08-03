@@ -5360,6 +5360,24 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         "vNext submission wave exceeds its immutable plan: {rejected:?}"
                     )))
                 }
+                StepSubmissionWaveAdmissionDecision::RequestStateDeferred(deferred) => {
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "vNext submission wave is waiting for Request-state hazards: {:?}",
+                        deferred.blockers()
+                    )))
+                }
+                StepSubmissionWaveAdmissionDecision::RequestStateSplitRequired(split) => {
+                    return Err(FerrumError::request_validation(format!(
+                        "vNext submission wave requires sibling split for request {:?}: {:?}",
+                        split.request(),
+                        split.resource_ids()
+                    )))
+                }
+                StepSubmissionWaveAdmissionDecision::RequestStatePoisoned(poison) => {
+                    return Err(FerrumError::backend(format!(
+                        "vNext Request-state resource is poisoned: {poison:?}"
+                    )))
+                }
             }
         }
     }
