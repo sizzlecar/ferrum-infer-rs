@@ -44,6 +44,31 @@ impl Default for SequenceFitPolicy {
     }
 }
 
+/// Explicit one-shot faults used to prove product-path failure attribution.
+/// These are never inferred and remain disabled in normal execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VNextDiagnosticFault {
+    PrefillResourceAfterSubmitOnce,
+}
+
+impl VNextDiagnosticFault {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PrefillResourceAfterSubmitOnce => "prefill-resource-after-submit-once",
+        }
+    }
+
+    pub fn parse_runtime_value(raw: &str) -> std::result::Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "prefill-resource-after-submit-once" => Ok(Self::PrefillResourceAfterSubmitOnce),
+            _ => Err(format!(
+                "expected prefill-resource-after-submit-once; got {raw:?}"
+            )),
+        }
+    }
+}
+
 /// Explicit diagnostic capture of semantic vNext activations. Product paths
 /// leave this unset; release tooling must supply a dedicated empty directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +121,8 @@ pub struct RuntimeKnobs {
     pub tp: Option<usize>,
     #[serde(default)]
     pub vnext_checkpoint_capture: Option<VNextCheckpointCaptureConfig>,
+    #[serde(default)]
+    pub vnext_diagnostic_fault: Option<VNextDiagnosticFault>,
 }
 
 /// Engine configuration
@@ -198,6 +225,12 @@ impl EngineConfig {
                     "FERRUM_PROFILE_DETAIL: expected one of off, basic, resource, latency, kernel, debug, replay, verify, full; got {value:?}"
                     )
                 })?;
+        }
+        if let Some(value) = runtime_config_value(snapshot, "FERRUM_VNEXT_DIAGNOSTIC_FAULT") {
+            self.runtime.vnext_diagnostic_fault = Some(
+                VNextDiagnosticFault::parse_runtime_value(value)
+                    .map_err(|reason| format!("FERRUM_VNEXT_DIAGNOSTIC_FAULT: {reason}"))?,
+            );
         }
         self.runtime.unified_post_prof |=
             runtime_config_value(snapshot, "FERRUM_UNIFIED_POST_PROF").is_some();
@@ -888,6 +921,53 @@ mod tests {
             serde_json::from_str::<SequenceFitPolicy>("\"immediate-only\"").unwrap(),
             SequenceFitPolicy::ImmediateOnly
         );
+    }
+
+    #[test]
+    fn diagnostic_fault_uses_one_canonical_product_value() {
+        assert_eq!(
+            VNextDiagnosticFault::parse_runtime_value("prefill_resource_after_submit_once")
+                .unwrap(),
+            VNextDiagnosticFault::PrefillResourceAfterSubmitOnce
+        );
+        assert_eq!(
+            VNextDiagnosticFault::PrefillResourceAfterSubmitOnce.as_runtime_value(),
+            "prefill-resource-after-submit-once"
+        );
+        assert!(VNextDiagnosticFault::parse_runtime_value("resource-failure").is_err());
+    }
+
+    #[test]
+    fn engine_config_applies_typed_diagnostic_fault() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([(
+            "FERRUM_VNEXT_DIAGNOSTIC_FAULT",
+            "prefill-resource-after-submit-once",
+        )]);
+
+        config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect("runtime config should apply");
+
+        assert_eq!(
+            config.runtime.vnext_diagnostic_fault,
+            Some(VNextDiagnosticFault::PrefillResourceAfterSubmitOnce)
+        );
+    }
+
+    #[test]
+    fn engine_config_rejects_unknown_diagnostic_fault() {
+        let mut config = EngineConfig::default();
+        let snapshot = RuntimeConfigSnapshot::from_env_vars([(
+            "FERRUM_VNEXT_DIAGNOSTIC_FAULT",
+            "resource-failure",
+        )]);
+
+        let error = config
+            .apply_runtime_config_snapshot(&snapshot)
+            .expect_err("unknown diagnostic fault must fail closed");
+
+        assert!(error.contains("FERRUM_VNEXT_DIAGNOSTIC_FAULT"));
     }
 
     #[test]

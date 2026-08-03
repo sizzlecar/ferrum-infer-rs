@@ -1179,40 +1179,7 @@ impl PlanRuntimeResourceSnapshot {
         pending_growth_bytes: u64,
         quarantined_bytes: u64,
     ) -> Result<Self> {
-        if usable_capacity_bytes > device_capacity_bytes {
-            return Err(ferrum_types::FerrumError::internal(format!(
-                "plan runtime usable capacity {usable_capacity_bytes} exceeds device capacity {device_capacity_bytes}"
-            )));
-        }
-        if process_claimed_bytes > usable_capacity_bytes {
-            return Err(ferrum_types::FerrumError::internal(format!(
-                "plan runtime process claims {process_claimed_bytes} exceed usable capacity {usable_capacity_bytes}"
-            )));
-        }
-        if plan_claimed_bytes > process_claimed_bytes {
-            return Err(ferrum_types::FerrumError::internal(format!(
-                "plan runtime plan claims {plan_claimed_bytes} exceed process claims {process_claimed_bytes}"
-            )));
-        }
-        if dynamic_free_bytes > dynamic_resident_bytes {
-            return Err(ferrum_types::FerrumError::internal(format!(
-                "plan runtime dynamic free bytes {dynamic_free_bytes} exceed resident bytes {dynamic_resident_bytes}"
-            )));
-        }
-        let minimum_plan_claim = static_bytes
-            .checked_add(dynamic_resident_bytes)
-            .and_then(|bytes| bytes.checked_add(quarantined_bytes))
-            .ok_or_else(|| {
-                ferrum_types::FerrumError::internal(
-                    "plan runtime static, resident, and quarantined bytes overflow u64",
-                )
-            })?;
-        if minimum_plan_claim > plan_claimed_bytes {
-            return Err(ferrum_types::FerrumError::internal(format!(
-                "plan runtime accounted plan bytes {minimum_plan_claim} exceed plan claims {plan_claimed_bytes}"
-            )));
-        }
-        Ok(Self {
+        let snapshot = Self {
             device_capacity_bytes,
             usable_capacity_bytes,
             process_claimed_bytes,
@@ -1222,7 +1189,54 @@ impl PlanRuntimeResourceSnapshot {
             dynamic_free_bytes,
             pending_growth_bytes,
             quarantined_bytes,
-        })
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
+    }
+
+    /// Revalidates deserialized evidence before it crosses a trusted failure or
+    /// profile boundary.
+    pub fn validate(&self) -> Result<()> {
+        if self.usable_capacity_bytes > self.device_capacity_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime usable capacity {} exceeds device capacity {}",
+                self.usable_capacity_bytes, self.device_capacity_bytes
+            )));
+        }
+        if self.process_claimed_bytes > self.usable_capacity_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime process claims {} exceed usable capacity {}",
+                self.process_claimed_bytes, self.usable_capacity_bytes
+            )));
+        }
+        if self.plan_claimed_bytes > self.process_claimed_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime plan claims {} exceed process claims {}",
+                self.plan_claimed_bytes, self.process_claimed_bytes
+            )));
+        }
+        if self.dynamic_free_bytes > self.dynamic_resident_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime dynamic free bytes {} exceed resident bytes {}",
+                self.dynamic_free_bytes, self.dynamic_resident_bytes
+            )));
+        }
+        let minimum_plan_claim = self
+            .static_bytes
+            .checked_add(self.dynamic_resident_bytes)
+            .and_then(|bytes| bytes.checked_add(self.quarantined_bytes))
+            .ok_or_else(|| {
+                ferrum_types::FerrumError::internal(
+                    "plan runtime static, resident, and quarantined bytes overflow u64",
+                )
+            })?;
+        if minimum_plan_claim > self.plan_claimed_bytes {
+            return Err(ferrum_types::FerrumError::internal(format!(
+                "plan runtime accounted plan bytes {minimum_plan_claim} exceed plan claims {}",
+                self.plan_claimed_bytes
+            )));
+        }
+        Ok(())
     }
 
     pub const fn device_capacity_bytes(&self) -> u64 {

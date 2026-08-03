@@ -64,6 +64,7 @@ struct PlanRuntimeAdmissionTestExecutor {
     prefill_calls: AtomicU64,
     batch_prefill_calls: AtomicU64,
     defer_batch_prefill_once: AtomicBool,
+    fail_next_prefill_after_admission: AtomicBool,
 }
 
 struct PlanRuntimeChunkedPrefillTestExecutor {
@@ -689,7 +690,16 @@ impl PlanRuntimeAdmissionTestExecutor {
             prefill_calls: AtomicU64::new(0),
             batch_prefill_calls: AtomicU64::new(0),
             defer_batch_prefill_once: AtomicBool::new(false),
+            fail_next_prefill_after_admission: AtomicBool::new(false),
         }
+    }
+
+    fn new_with_resource_prefill_failure(vocab_size: usize) -> Self {
+        let executor = Self::new(vocab_size);
+        executor
+            .fail_next_prefill_after_admission
+            .store(true, Ordering::Release);
+        executor
     }
 
     fn new_with_serial_backing_growth(vocab_size: usize) -> Self {
@@ -878,6 +888,14 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
             ));
         }
         self.prefill_calls.fetch_add(1, Ordering::Relaxed);
+        if self
+            .fail_next_prefill_after_admission
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(FerrumError::resource_exhausted(
+                "typed diagnostic resource failure after prefill submission",
+            ));
+        }
         self.inner.prefill(input).await
     }
 
@@ -4411,6 +4429,51 @@ async fn plan_runtime_product_path_requires_typed_admission_before_prefill() {
     assert!(trace.dynamic_admission_ticks >= 1);
 }
 
+#[tokio::test]
+async fn plan_runtime_prefill_resource_failure_preserves_terminal_error_and_releases_request() {
+    let mut config = EngineConfig::default();
+    config.kv_cache.max_blocks = 128;
+    let scheduler = Arc::new(ContinuousBatchScheduler::new(config.scheduler.clone()));
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(ferrum_testkit::MockTokenizer::new(128));
+    let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(ferrum_testkit::MockSampler);
+    let executor =
+        Arc::new(PlanRuntimeAdmissionTestExecutor::new_with_resource_prefill_failure(128));
+    let tensor_factory: Arc<dyn TensorFactory> = Arc::new(FailingFromSliceTensorFactory);
+    let engine = ContinuousBatchEngine::new_plan_runtime(
+        config,
+        scheduler,
+        tokenizer,
+        sampler,
+        executor.clone(),
+        tensor_factory,
+    )
+    .unwrap();
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 1;
+    let request_id = request.id.clone();
+
+    let error = engine
+        .infer(request)
+        .await
+        .expect_err("injected resource failure must terminate the request");
+
+    assert!(
+        matches!(error, FerrumError::ResourceExhausted { .. }),
+        "unexpected terminal error: {error:?}"
+    );
+    assert!(error
+        .to_string()
+        .contains("typed diagnostic resource failure after prefill submission"));
+    assert!(!engine.inner.sequences.read().contains_key(&request_id));
+    assert!(executor
+        .retained
+        .lock()
+        .expect("retained admission mutex poisoned")
+        .is_empty());
+    assert_eq!(executor.prefill_calls.load(Ordering::Relaxed), 1);
+}
+
 #[test]
 fn plan_runtime_recompute_admission_preserves_product_usage_accounting() {
     let mut config = EngineConfig::default();
@@ -6362,7 +6425,7 @@ fn vnext_profile_test_operation_event() -> ferrum_interfaces::vnext::ExecutionEv
         DeviceId, ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionFrameId,
         ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionPhase, MonotonicTimestamp,
         NodeId, NodeInvocationId, OperationId, PlanHash, PlanId, ProviderId, RequestIdentity,
-        RunId, SpanId, EXECUTION_IDENTITY_VERSION,
+        ResourcePoolId, RunId, SpanId, TransactionId, EXECUTION_IDENTITY_VERSION,
     };
 
     let fingerprint = |digit: char| digit.to_string().repeat(64);
@@ -6386,11 +6449,15 @@ fn vnext_profile_test_operation_event() -> ferrum_interfaces::vnext::ExecutionEv
             operation_id: Some(OperationId::new("operation/vnext/engine-profile-test").unwrap()),
             provider_id: Some(ProviderId::new("provider/vnext/engine-profile-test").unwrap()),
             device_id: Some(DeviceId::new("device/vnext/engine-profile-test").unwrap()),
-            resource_pool_id: None,
-            resource_pool_identity_fingerprint: None,
-            provisioning_run_id: None,
-            provisioning_request_id: None,
-            transaction_id: None,
+            resource_pool_id: Some(ResourcePoolId::try_from(7).unwrap()),
+            resource_pool_identity_fingerprint: Some(fingerprint('3')),
+            provisioning_run_id: Some(RunId::new("run.vnext.pool-provisioning").unwrap()),
+            provisioning_request_id: Some(
+                RequestIdentity::new("request.vnext.pool-provisioning").unwrap(),
+            ),
+            transaction_id: Some(
+                TransactionId::new("transaction.vnext.pool-provisioning").unwrap(),
+            ),
             active_sequence_slot: Some(1),
             admission_generation: Some(1),
             activation_epoch: Some(1),
@@ -6403,12 +6470,125 @@ fn vnext_profile_test_operation_event() -> ferrum_interfaces::vnext::ExecutionEv
             resource_batch_fingerprint: None,
             span_id: SpanId::new("vnext/request/engine-profile-test/operation/1").unwrap(),
             parent_span_id: Some(SpanId::new("vnext/request/engine-profile-test/node/1").unwrap()),
-            async_links: Vec::new(),
+            async_links: vec![SpanId::new("vnext/request/engine-profile-test/async/1").unwrap()],
         })
         .unwrap(),
         ExecutionEventDetail::None,
     )
     .unwrap()
+}
+
+fn vnext_profile_test_resource_failure_event() -> ferrum_interfaces::vnext::ExecutionEvent {
+    use ferrum_interfaces::vnext::{
+        ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
+        ExecutionPhase, FailureDomain, FailureEnvelope, IdentifiedFailure, MonotonicTimestamp,
+        SpanId,
+    };
+
+    let submitted = vnext_profile_test_operation_event();
+    let failure = IdentifiedFailure::new(
+        submitted.identity().clone(),
+        FailureEnvelope::new(
+            FailureDomain::Resource,
+            "diagnostic_resource_after_submit",
+            "injected resource failure after operation submission",
+            false,
+        )
+        .unwrap()
+        .with_resource_snapshot(
+            PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).unwrap(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut observation = submitted.identity().parts().clone();
+    observation.sequence = 4;
+    observation.parent_span_id = Some(observation.span_id.clone());
+    observation.span_id = SpanId::new("vnext/request/engine-profile-test/failure/1").unwrap();
+
+    ExecutionEvent::new(
+        MonotonicTimestamp {
+            nanos_since_run_start: 4,
+        },
+        ExecutionPhase::Execution,
+        ExecutionEventKind::FailureObserved,
+        ExecutionIdentityEnvelope::new(observation).unwrap(),
+        ExecutionEventDetail::Failure(failure),
+    )
+    .unwrap()
+}
+
+#[test]
+fn vnext_profile_preserves_the_complete_canonical_execution_identity() {
+    let trace_path = resource_trace_temp_path("vnext-complete-execution-identity");
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Latency;
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
+
+    let profile = sink
+        .profile_event(&vnext_profile_test_operation_event())
+        .unwrap();
+    let identity = &profile.attributes["execution_identity"];
+
+    assert_eq!(
+        profile.attributes["execution_identity_version"],
+        ferrum_interfaces::vnext::EXECUTION_IDENTITY_VERSION.to_string()
+    );
+    assert_eq!(profile.attributes["resource_pool_id"], "resource-pool:7");
+    assert_eq!(profile.attributes["active_sequence_slot"], 1);
+    assert_eq!(profile.attributes["admission_generation"], 1);
+    assert_eq!(profile.attributes["activation_epoch"], 1);
+    assert_eq!(
+        profile.attributes["async_links"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(identity["resource_pool_id"], 7);
+    assert_eq!(identity["active_sequence_slot"], 1);
+    assert_eq!(identity["resource_id"], serde_json::Value::Null);
+    assert_eq!(identity["async_links"], profile.attributes["async_links"]);
+
+    drop(sink);
+    journal.close().unwrap();
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
+fn vnext_profile_preserves_real_resource_failure_evidence() {
+    let trace_path = resource_trace_temp_path("vnext-resource-failure-evidence");
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Latency;
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Serve, &config);
+
+    let profile = sink
+        .profile_event(&vnext_profile_test_resource_failure_event())
+        .unwrap();
+    let resource = profile.resource.as_ref().expect("resource trace evidence");
+    let snapshot = &profile.attributes["plan_runtime_resource_snapshot"];
+
+    profile.validate().unwrap();
+    assert_eq!(profile.phase, "vnext.failure_observed");
+    assert_eq!(profile.status, ProfileStatus::Failure);
+    assert_eq!(resource.action, ResourceAction::Reject);
+    assert_eq!(resource.owner_kind, "resource_pool");
+    assert_eq!(resource.owner_id, "resource-pool:7");
+    assert_eq!(resource.before, Some(400));
+    assert_eq!(resource.after, Some(400));
+    assert_eq!(resource.capacity, Some(900));
+    assert_eq!(snapshot["device_capacity_bytes"], 1_000);
+    assert_eq!(snapshot["usable_capacity_bytes"], 900);
+    assert_eq!(snapshot["dynamic_resident_bytes"], 300);
+    assert_eq!(
+        profile.error.as_ref().unwrap().kind,
+        "diagnostic_resource_after_submit"
+    );
+
+    drop(sink);
+    journal.close().unwrap();
+    let _ = std::fs::remove_file(trace_path);
 }
 
 #[test]

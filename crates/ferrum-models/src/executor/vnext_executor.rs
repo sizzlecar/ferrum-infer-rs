@@ -35,7 +35,8 @@ use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
-    ModelInfo, RequestId, Result, SchedulingPolicy, SequenceFitPolicy, TokenId,
+    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RequestId, Result, SchedulingPolicy,
+    SequenceFitPolicy, TokenId, VNextDiagnosticFault,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -205,6 +206,7 @@ pub struct VNextExecutorConfig {
     pub runtime_policy: ResolvedRuntimePolicy,
     pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
+    pub diagnostic_fault: Option<VNextDiagnosticFault>,
 }
 
 impl VNextExecutorConfig {
@@ -383,6 +385,19 @@ impl VNextExecutorConfig {
             DEFAULT_STATIC_COMMANDS_PER_BATCH,
         )
         .map_err(|error| FerrumError::config(error.to_string()))?;
+        let diagnostic_fault = engine.runtime.vnext_diagnostic_fault;
+        if diagnostic_fault.is_some()
+            && (engine.runtime.profile_detail != ObservabilityProfileDetail::Latency
+                || engine.runtime.profile_jsonl.is_none()
+                || !matches!(
+                    engine.runtime.profile_entrypoint,
+                    Some(ProfileEntrypoint::Run | ProfileEntrypoint::Serve)
+                ))
+        {
+            return Err(FerrumError::config(
+                "vNext diagnostic faults require a product run/serve latency profile and --profile-jsonl",
+            ));
+        }
 
         Ok(Self {
             maximum_model_tokens,
@@ -390,6 +405,7 @@ impl VNextExecutorConfig {
             runtime_policy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_chunks,
+            diagnostic_fault,
         })
     }
 }
@@ -1700,6 +1716,7 @@ struct VNextExecutionJournal {
     last_timestamp_nanos: u64,
     root_span: SpanId,
     pending_submission: Option<JournaledSubmission>,
+    first_failure: Option<IdentifiedFailure>,
 }
 
 impl VNextExecutionJournal {
@@ -1732,6 +1749,7 @@ impl VNextExecutionJournal {
             last_timestamp_nanos: 0,
             root_span,
             pending_submission: None,
+            first_failure: None,
         };
         let accepted = journal.event(
             ExecutionPhase::Resolution,
@@ -2089,6 +2107,168 @@ impl VNextExecutionJournal {
         Ok(())
     }
 
+    fn observe_resource_failure(
+        &mut self,
+        snapshot: PlanRuntimeResourceSnapshot,
+        code: &str,
+        message: &str,
+    ) -> std::result::Result<String, ExecutionEventSinkError> {
+        if self.first_failure.is_some() {
+            return Err(Self::error(
+                "execution journal already observed its first failure",
+            ));
+        }
+        let failed_operation = match self.pending_submission.as_ref() {
+            Some(JournaledSubmission::Captured { receipt, selected }) => {
+                let first = *selected
+                    .first()
+                    .ok_or_else(|| Self::error("captured submission has no request participant"))?;
+                receipt
+                    .participants()
+                    .get(first)
+                    .ok_or_else(|| Self::error("captured failure participant is missing"))?
+                    .identity()
+                    .clone()
+            }
+            Some(JournaledSubmission::Suppressed { .. }) => {
+                return Err(Self::error(
+                    "resource failure attribution requires a captured operation",
+                ))
+            }
+            None => {
+                return Err(Self::error(
+                    "resource failure attribution requires one submitted operation",
+                ))
+            }
+        };
+        let envelope = FailureEnvelope::new(FailureDomain::Resource, code, message, false)
+            .and_then(|failure| failure.with_resource_snapshot(snapshot))
+            .map_err(Self::error)?;
+        let failure =
+            IdentifiedFailure::new(failed_operation.clone(), envelope).map_err(Self::error)?;
+        let failure_fingerprint = failure.fingerprint();
+        let sequence = self.emitter.cursor().last_sequence().saturating_add(1);
+        let mut parts = failed_operation.parts().clone();
+        parts.sequence = sequence;
+        parts.parent_span_id = Some(failed_operation.parts().span_id.clone());
+        parts.span_id =
+            SpanId::new(format!("{}/failure/{sequence}", self.root_span)).map_err(Self::error)?;
+        let event = self.event(
+            ExecutionPhase::Execution,
+            ExecutionEventKind::FailureObserved,
+            parts,
+            ExecutionEventDetail::Failure(failure.clone()),
+        )?;
+        self.emitter.emit(
+            event,
+            &TrustedExecutionEventContext::failure(
+                self.active.run_id(),
+                self.active.request_id(),
+                Some(&self.topology),
+                Some(&self.active),
+                &failure,
+            ),
+        )?;
+        self.first_failure = Some(failure);
+        Ok(failure_fingerprint)
+    }
+
+    fn settle_failed_submission(
+        &mut self,
+        completion: &OperationCompletionReceipt,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if self.first_failure.is_none() {
+            return Err(Self::error(
+                "cannot settle a failed submission before observing its failure",
+            ));
+        }
+        let pending = self
+            .pending_submission
+            .take()
+            .ok_or_else(|| Self::error("failed submission is no longer journaled"))?;
+        let JournaledSubmission::Captured { receipt, .. } = pending else {
+            return Err(Self::error(
+                "failed submission was suppressed from the execution journal",
+            ));
+        };
+        if completion.submission().fingerprint() != receipt.fingerprint() {
+            return Err(Self::error(
+                "settled failure differs from the journaled physical submission",
+            ));
+        }
+        Ok(())
+    }
+
+    fn fail_sequence(
+        &mut self,
+        receipt: &SequenceSessionTerminalReceipt,
+    ) -> std::result::Result<(), ExecutionEventSinkError> {
+        if self.pending_submission.is_some() {
+            return Err(Self::error(
+                "sequence failure still has an in-flight journal submission",
+            ));
+        }
+        let failure = self
+            .first_failure
+            .clone()
+            .ok_or_else(|| Self::error("sequence failure lacks its first observed failure"))?;
+        let aborted = TrustedAbortedSequenceBinding::from_session_receipt(receipt, &self.active)
+            .map_err(Self::error)?;
+        let sequence_number = self.emitter.cursor().last_sequence().saturating_add(1);
+        let sequence_span =
+            SpanId::new(format!("{}/sequence-aborted", self.root_span)).map_err(Self::error)?;
+        let mut parts = self.bind_active(self.bind_plan(self.base_parts(
+            sequence_number,
+            sequence_span,
+            Some(self.root_span.clone()),
+        )));
+        parts.aborted_sequence_fingerprint = Some(aborted.fingerprint().to_owned());
+        let sequence_aborted = self.event(
+            ExecutionPhase::Completion,
+            ExecutionEventKind::SequenceAborted,
+            parts,
+            ExecutionEventDetail::None,
+        )?;
+        self.emitter.emit(
+            sequence_aborted,
+            &TrustedExecutionEventContext::aborted(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+                &aborted,
+            ),
+        )?;
+
+        let request_sequence = self.emitter.cursor().last_sequence().saturating_add(1);
+        let mut parts = self.bind_active(self.bind_plan(self.base_parts(
+            request_sequence,
+            self.root_span.clone(),
+            None,
+        )));
+        parts.aborted_sequence_fingerprint = Some(aborted.fingerprint().to_owned());
+        let request_failed = self.event(
+            ExecutionPhase::Completion,
+            ExecutionEventKind::RequestFailed,
+            parts,
+            ExecutionEventDetail::FailureTerminal {
+                first_failure_fingerprint: failure.fingerprint(),
+            },
+        )?;
+        self.emitter.emit(
+            request_failed,
+            &TrustedExecutionEventContext::failure_with_disposition(
+                self.active.run_id(),
+                self.active.request_id(),
+                &self.topology,
+                &self.active,
+                None,
+                Some(&aborted),
+                &failure,
+            ),
+        )
+    }
+
     fn complete_sequence(
         &mut self,
         receipt: &SequenceSessionTerminalReceipt,
@@ -2162,6 +2342,7 @@ struct VNextSequence<R: DeviceRuntime> {
     request: Arc<VNextRequestRoot<R>>,
     session: Arc<SequenceSession<R>>,
     active_binding: Arc<TrustedActiveSequenceBinding>,
+    request_origin: ExecutorRequestOrigin,
     tokens: Mutex<Vec<u32>>,
     maximum_tokens: usize,
     active: AtomicBool,
@@ -2292,6 +2473,34 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         self.active.store(false, Ordering::Release);
         let _ = self.session.request_cancel();
         let _ = self.session.try_abort();
+    }
+
+    fn abort_after_observed_failure(&self) -> Result<()> {
+        if !self.active.swap(false, Ordering::AcqRel) {
+            return Err(FerrumError::already_exists(format!(
+                "vNext request `{}` is already terminal",
+                self.request_id()
+            )));
+        }
+        self.session.request_cancel().map_err(|error| {
+            FerrumError::backend(format!("vNext failure cancellation: {error}"))
+        })?;
+        let receipt = self
+            .session
+            .try_abort()
+            .map_err(|error| FerrumError::backend(format!("vNext failure abort: {error}")))?;
+        self.events
+            .as_ref()
+            .ok_or_else(|| {
+                FerrumError::internal(
+                    "vNext diagnostic failure requires an execution event journal",
+                )
+            })?
+            .lock()
+            .fail_sequence(&receipt)
+            .map_err(|error| {
+                FerrumError::backend(format!("vNext execution journal failure: {error}"))
+            })
     }
 }
 
@@ -3119,6 +3328,8 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     sequences: Mutex<VNextSequenceRegistry<R>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
+    diagnostic_fault: Option<VNextDiagnosticFault>,
+    diagnostic_fault_armed: AtomicBool,
     metrics: VNextExecutorMetrics,
 }
 
@@ -3244,6 +3455,22 @@ impl<R: DeviceRuntime> Drop for VNextStartupSequenceGuard<'_, R> {
 }
 
 impl<R: DeviceRuntime> VNextModelExecutor<R> {
+    fn claim_prefill_resource_diagnostic_fault(
+        &self,
+        participants: &[VNextExecutionParticipant<'_, R>],
+        kind: VNextExecutionWaveKind,
+    ) -> bool {
+        matches!(
+            self.diagnostic_fault,
+            Some(VNextDiagnosticFault::PrefillResourceAfterSubmitOnce)
+        ) && kind == VNextExecutionWaveKind::Prefill
+            && matches!(participants, [participant] if participant.sequence.request_origin == ExecutorRequestOrigin::Product)
+            && self
+                .diagnostic_fault_armed
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
     fn resolve_language_io_ids(program: &ModelProgram) -> Result<VNextLanguageIoIds> {
         let embedding_nodes = program
             .blocks()
@@ -3642,6 +3869,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             sequences: Mutex::new(VNextSequenceRegistry::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
+            diagnostic_fault: config.diagnostic_fault,
+            diagnostic_fault_armed: AtomicBool::new(config.diagnostic_fault.is_some()),
             metrics: VNextExecutorMetrics::default(),
         })
     }
@@ -4610,6 +4839,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             request,
             session,
             active_binding,
+            request_origin,
             tokens: Mutex::new(tokens),
             maximum_tokens,
             active: AtomicBool::new(true),
@@ -6255,6 +6485,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         }
+        let diagnostic_failure_requested =
+            self.claim_prefill_resource_diagnostic_fault(participants, kind);
+        let mut diagnostic_failure_observed = false;
+        if diagnostic_failure_requested {
+            let observation = self
+                .plan_runtime_resource_snapshot()
+                .and_then(|snapshot| {
+                    snapshot.ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext diagnostic resource failure lacks a plan runtime snapshot",
+                        )
+                    })
+                })
+                .and_then(|snapshot| {
+                    participants[0]
+                        .sequence
+                        .events
+                        .as_ref()
+                        .ok_or_else(|| {
+                            FerrumError::internal(
+                                "vNext diagnostic resource failure lacks an execution journal",
+                            )
+                        })?
+                        .lock()
+                        .observe_resource_failure(
+                            snapshot,
+                            "diagnostic_resource_after_submit",
+                            "typed diagnostic resource failure after prefill submission",
+                        )
+                        .map_err(|error| FerrumError::backend(error.to_string()))
+                });
+            match observation {
+                Ok(_) => diagnostic_failure_observed = true,
+                Err(error) => {
+                    execution_event_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
 
         let reaper = Arc::clone(&self.reaper);
         let observation = {
@@ -6320,10 +6588,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 }
             }
         }
-        for participant in participants {
-            if let Some(events) = &participant.sequence.events {
-                if let Err(error) = events.lock().completed(receipt.completion()) {
-                    execution_event_error.get_or_insert_with(|| error.to_string());
+        if !diagnostic_failure_requested {
+            for participant in participants {
+                if let Some(events) = &participant.sequence.events {
+                    if let Err(error) = events.lock().completed(receipt.completion()) {
+                        execution_event_error.get_or_insert_with(|| error.to_string());
+                    }
                 }
             }
         }
@@ -6337,6 +6607,40 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             );
             drop(receipt);
             return Err(self.abort_step(step, message).await);
+        }
+        if diagnostic_failure_requested {
+            if diagnostic_failure_observed {
+                if let Err(error) = participants[0]
+                    .sequence
+                    .events
+                    .as_ref()
+                    .expect("observed diagnostic failure has an execution journal")
+                    .lock()
+                    .settle_failed_submission(receipt.completion())
+                {
+                    execution_event_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+            drop(receipt);
+            if let Err(failure) = step.try_retire_normal() {
+                execution_event_error.get_or_insert_with(|| {
+                    format!(
+                        "vNext diagnostic step retirement failed: {}",
+                        failure.error()
+                    )
+                });
+            }
+            if let Some(error) = execution_event_error {
+                participants[0].sequence.abort();
+                let message =
+                    format!("vNext diagnostic resource failure attribution failed closed: {error}");
+                self.metrics.record_failure(message.clone());
+                return Err(FerrumError::backend(message));
+            }
+            participants[0].sequence.abort_after_observed_failure()?;
+            let message = "typed diagnostic resource failure after prefill submission".to_string();
+            self.metrics.record_failure(message.clone());
+            return Err(FerrumError::resource_exhausted(message));
         }
         let processed = (|| -> Result<(
             Vec<ExecutorSamplingOutput>,

@@ -1,5 +1,6 @@
 mod vnext_event_contract;
 
+use ferrum_interfaces::model_executor::PlanRuntimeResourceSnapshot;
 use vnext_event_contract::*;
 
 #[test]
@@ -22,7 +23,7 @@ fn trusted_event_topology_binds_provider_execution_semantics() {
 
 #[test]
 fn vnext_event_execution_contract() {
-    const EXPECTED_CASES: usize = 54;
+    const EXPECTED_CASES: usize = 55;
     let mut passed = 0_usize;
     let runtime_catalog = catalog();
     let operation_registry = make_operation_registry(&runtime_catalog);
@@ -1163,6 +1164,21 @@ fn vnext_event_execution_contract() {
     check(
         &mut passed,
         IdentifiedFailure::new(journal[4].identity().clone(), wrong_domain).is_ok(),
+    );
+    let resource_snapshot =
+        PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).unwrap();
+    let resource_failure = FailureEnvelope::new(
+        FailureDomain::Resource,
+        "resource_after_submit",
+        "resource failure after operation submission",
+        false,
+    )
+    .unwrap()
+    .with_resource_snapshot(resource_snapshot)
+    .unwrap();
+    check(
+        &mut passed,
+        IdentifiedFailure::new(journal[4].identity().clone(), resource_failure).is_ok(),
     );
     assert_eq!(passed, EXPECTED_CASES);
     println!("\nVNEXT EVENT EXECUTION PASS: {passed}/{EXPECTED_CASES}");

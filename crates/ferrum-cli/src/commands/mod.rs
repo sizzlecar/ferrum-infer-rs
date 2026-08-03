@@ -17,6 +17,19 @@ impl SequenceFitPolicyArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VNextDiagnosticFaultArg {
+    PrefillResourceAfterSubmitOnce,
+}
+
+impl VNextDiagnosticFaultArg {
+    pub const fn as_runtime_value(self) -> &'static str {
+        match self {
+            Self::PrefillResourceAfterSubmitOnce => "prefill-resource-after-submit-once",
+        }
+    }
+}
+
 pub mod bench;
 pub mod bench_serve;
 pub mod embed;

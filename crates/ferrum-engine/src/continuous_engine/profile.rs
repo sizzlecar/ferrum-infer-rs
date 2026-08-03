@@ -410,15 +410,35 @@ impl VNextProfileEventContext {
                 "span_id".to_string(),
                 serde_json::json!(identity.span_id.to_string()),
             ),
+            (
+                "execution_identity".to_string(),
+                serde_json::to_value(identity).map_err(|error| {
+                    ExecutionEventSinkError::new(format!(
+                        "failed to serialize canonical vNext execution identity: {error}"
+                    ))
+                })?,
+            ),
+            (
+                "execution_identity_version".to_string(),
+                serde_json::json!(identity.version.to_string()),
+            ),
+            (
+                "async_links".to_string(),
+                serde_json::json!(identity
+                    .async_links
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()),
+            ),
         ]);
+        attributes.insert(
+            "execution_request_id".to_string(),
+            serde_json::json!(identity.request_id.to_string()),
+        );
         if let Some(origin) = request_origin {
             attributes.insert(
                 "execution_request_origin".to_string(),
                 serde_json::json!(origin.namespace()),
-            );
-            attributes.insert(
-                "execution_request_id".to_string(),
-                serde_json::json!(identity.request_id.to_string()),
             );
         }
         match event.detail() {
@@ -438,6 +458,16 @@ impl VNextProfileEventContext {
                     "failure_retryable".to_string(),
                     serde_json::json!(failure.failure().retryable()),
                 );
+                if let Some(snapshot) = failure.failure().resource_snapshot() {
+                    attributes.insert(
+                        "plan_runtime_resource_snapshot".to_string(),
+                        serde_json::to_value(snapshot).map_err(|error| {
+                            ExecutionEventSinkError::new(format!(
+                                "failed to serialize vNext failure resource snapshot: {error}"
+                            ))
+                        })?,
+                    );
+                }
             }
             ExecutionEventDetail::FailureTerminal {
                 first_failure_fingerprint,
@@ -482,11 +512,120 @@ impl VNextProfileEventContext {
                 "parent_span_id",
                 identity.parent_span_id.as_ref().map(ToString::to_string),
             ),
+            (
+                "resource_pool_id",
+                identity.resource_pool_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "resource_pool_identity_fingerprint",
+                identity.resource_pool_identity_fingerprint.clone(),
+            ),
+            (
+                "provisioning_run_id",
+                identity
+                    .provisioning_run_id
+                    .as_ref()
+                    .map(ToString::to_string),
+            ),
+            (
+                "provisioning_request_id",
+                identity
+                    .provisioning_request_id
+                    .as_ref()
+                    .map(ToString::to_string),
+            ),
+            (
+                "transaction_id",
+                identity.transaction_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "runtime_implementation_fingerprint",
+                identity.runtime_implementation_fingerprint.clone(),
+            ),
+            (
+                "active_sequence_fingerprint",
+                identity.active_sequence_fingerprint.clone(),
+            ),
+            (
+                "completed_sequence_fingerprint",
+                identity.completed_sequence_fingerprint.clone(),
+            ),
+            (
+                "aborted_sequence_fingerprint",
+                identity.aborted_sequence_fingerprint.clone(),
+            ),
+            (
+                "resource_id",
+                identity.resource_id.as_ref().map(ToString::to_string),
+            ),
+            (
+                "resource_batch_fingerprint",
+                identity.resource_batch_fingerprint.clone(),
+            ),
         ] {
             if let Some(value) = value {
                 attributes.insert(key.to_string(), serde_json::json!(value));
             }
         }
+        for (key, value) in [
+            (
+                "active_sequence_slot",
+                identity.active_sequence_slot.map(u64::from),
+            ),
+            ("admission_generation", identity.admission_generation),
+            ("activation_epoch", identity.activation_epoch),
+            ("resource_generation", identity.resource_generation),
+        ] {
+            if let Some(value) = value {
+                attributes.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        let resource = match event.detail() {
+            ExecutionEventDetail::Failure(failure) => failure
+                .failure()
+                .resource_snapshot()
+                .map(|snapshot| {
+                    let available = snapshot.available_bytes().map_err(|error| {
+                        ExecutionEventSinkError::new(format!(
+                            "invalid vNext failure resource availability: {error}"
+                        ))
+                    })?;
+                    let to_i64 = |value: u64, label: &str| {
+                        i64::try_from(value).map_err(|_| {
+                            ExecutionEventSinkError::new(format!(
+                                "vNext failure {label} exceeds profile i64 range"
+                            ))
+                        })
+                    };
+                    Ok::<_, ExecutionEventSinkError>(ResourceTraceEvent {
+                        owner_kind: if identity.resource_pool_id.is_some() {
+                            "resource_pool".to_string()
+                        } else {
+                            "request".to_string()
+                        },
+                        owner_id: identity
+                            .resource_pool_id
+                            .as_ref()
+                            .map_or_else(|| identity.request_id.to_string(), ToString::to_string),
+                        resource_kind: "plan_runtime_memory".to_string(),
+                        action: ResourceAction::Reject,
+                        amount: None,
+                        before: Some(to_i64(available, "available bytes")?),
+                        after: Some(to_i64(available, "available bytes")?),
+                        capacity: Some(to_i64(
+                            snapshot.usable_capacity_bytes(),
+                            "usable capacity",
+                        )?),
+                        underflow_amount: None,
+                        reason: Some(failure.failure().message().to_string()),
+                        error_kind: Some(failure.failure().code().to_string()),
+                        message: Some(failure.failure().message().to_string()),
+                        resource_error_kind: Some("plan_runtime_resource_failure".to_string()),
+                    })
+                })
+                .transpose()?,
+            _ => None,
+        };
         let profile = FerrumProfileEvent {
             schema_version: OBSERVABILITY_PROFILE_SCHEMA_VERSION,
             ts_unix_nanos: timestamp
@@ -512,7 +651,7 @@ impl VNextProfileEventContext {
             model: Some(self.model.clone()),
             duration_us: None,
             memory: None,
-            resource: None,
+            resource,
             error: failure,
             replay: None,
             shape,

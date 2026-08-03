@@ -143,8 +143,16 @@ impl EngineInner {
                         prefill_ids.len(),
                         error
                     );
+                    let resource_exhausted = is_resource_exhausted_error(&error);
+                    let message = error.to_string();
                     for rid in &prefill_ids {
-                        self.complete_request(rid, FinishReason::Error).await?;
+                        let terminal_error = if resource_exhausted {
+                            FerrumError::resource_exhausted(message.clone())
+                        } else {
+                            FerrumError::backend(message.clone())
+                        };
+                        self.complete_request_with_error(rid, terminal_error)
+                            .await?;
                     }
                     per_request_prefill_ids.clear();
                 }
@@ -169,7 +177,7 @@ impl EngineInner {
                         "Plan-runtime prefill crossed typed admission with insufficient capacity"
                     );
                 }
-                self.complete_request(rid, FinishReason::Error).await?;
+                self.complete_request_with_error(rid, error).await?;
             }
         }
 
