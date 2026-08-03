@@ -111,9 +111,29 @@ manufacture fallback evidence. The final artifact validates `12` unique lifecycl
 request bundles, c4 `max_in_flight=4`, all six c4 overlap pairs, and zero crosstalk/error. Exact
 PASS lines and the GitHub-verified archive are recorded in [`GOAL.md`](GOAL.md).
 
-This closes only S2 multi-turn/concurrency. Response format, API/modality, Unicode stream and C09
-termination, tool/schema, determinism, historical resource, latency attribution, and the S2
-aggregate remain subject to the exact S2 exit contract.
+This closes only S2 multi-turn/concurrency. Response format, API/modality, determinism, historical
+resource, latency attribution, and the S2 aggregate remain subject to the exact S2 exit contract.
+
+## 2026-08-03 S2 Unicode Stream, Termination, And Tool/Schema Checkpoints
+
+Clean pushed source `a4e8472cc1aa3fa46cf8f95d89e8b6385f09576f` passes the real Qwen3.5-4B CUDA
+Unicode stream checkpoint: exact stream/non-stream content, finish reason, usage, and multibyte
+split are `20/20`; malformed JSON/SSE, missing or duplicate `[DONE]`, usage mismatch, replacement
+characters, and bad text are zero. The same artifact passes the focused C09 cancel, timeout, and
+disconnect sentinel `3/3`, including same-capacity follow-up success `3/3`.
+
+Clean pushed source `e894c59e4a2da5ea97303776b72e8532574736f9` then passes the tool/schema
+checkpoint. Four required-tool plus strict-schema markers across sync and stream are `8/8`, always
+select tool priority, emit no fabricated schema content, and produce schema-valid arguments.
+Omitted and explicit-auto tool choice, required and named choice, and tool-result fill all pass.
+The tool-result oracle keeps an exact unguessable receipt but makes that receipt part of the user's
+original requested result; it no longer treats a model's reasonable omission of an internal field
+as evidence that Ferrum dropped tool history. The final answer contains city, exact temperature,
+unit, description, and the receipt exactly once.
+
+The exact PASS lines, binary identity, GitHub-verified archives, and hashes are recorded in
+[`GOAL.md`](GOAL.md). These checkpoints do not close response format, API/modality, determinism,
+historical resource, latency attribution, the S2 aggregate, or canonical G05.
 
 ## 兼容性
 

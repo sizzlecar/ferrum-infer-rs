@@ -554,6 +554,25 @@ The GitHub-verified archive is
 This is product-path evidence for G04 lifecycle ownership, not canonical G04 PASS; state-model,
 failure/cancel/recovery aggregation, allocation/performance, and final G04 validators remain Open.
 
+## 2026-08-03 C09 Termination And Capacity-Reentry Checkpoint
+
+Clean pushed source `a4e8472cc1aa3fa46cf8f95d89e8b6385f09576f` passes the focused real-model
+CUDA C09 sentinel. One already-admitted request for each of cancel, timeout, and disconnect reaches
+its released or expected-cache terminal state with scheduler tick delta `0`. Validator-observed
+release wall is `9.742219`, `8.701876`, and `8.229095 ms`; the corresponding trace release wall is
+`0.374516`, `0.382336`, and `0.473429 ms`. Leak, underflow, double release, and post-terminal submit
+counts are zero, and all three same-capacity follow-up requests succeed.
+
+The source fix preceding this run was confined to the evidence consumer: executor health defines
+`current_batch_size` as optional while idle, so the runner now validates null or a nonnegative
+integer instead of inventing a production zero. Required quiescence remains owned by queue depth,
+active prefill, and active decode; a present batch count must still be zero. The exact PASS lines
+and GitHub-verified archive are recorded in [`GOAL.md`](GOAL.md).
+
+This closes the S2 focused C09 sentinel, not the formal 20-case-per-termination denominator in S6
+or canonical G04. The five historical resource kills, state model, allocation profile, aggregate
+failure/cancel/recovery artifact, and final G04 validators remain Open.
+
 ## 性能约束
 
 - L1 reference workload scheduler bookkeeping 占 runtime wall time `<=5%`；真实 CUDA c32

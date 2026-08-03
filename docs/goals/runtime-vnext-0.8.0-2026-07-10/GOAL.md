@@ -4,6 +4,45 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-08-03，S2 CUDA 又关闭两个 focused product checkpoint。clean、已推送 source
+`a4e8472cc1aa3fa46cf8f95d89e8b6385f09576f` 的真实 Qwen3.5-4B Unicode stream/C09
+artifact 中，stream/non-stream exact content、finish reason、usage 和 multibyte split 为
+`20/20`；已经 admission 的 cancel/timeout/disconnect 为 `3/3`，runtime release wall 分别为
+`9.742219/8.701876/8.229095 ms`，scheduler tick delta 均为 `0`，随后同容量请求为 `3/3`。
+正式 validator 和统一 gate 打印：
+
+```text
+FERRUM RUNTIME VNEXT S2 STREAM DISCONNECT PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-stream-disconnect-a4e8472c-20260803/gate-r1
+FERRUM GATE vnext-s2-stream-disconnect PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-stream-disconnect-a4e8472c-20260803/gate-r1
+```
+
+随后 clean、已推送 source `e894c59e4a2da5ea97303776b72e8532574736f9` 关闭 tool/schema
+checkpoint：required-tool 与 strict-schema priority 的四个 marker 在 sync/stream 共 `8/8`，
+omitted/explicit-auto/required/named tool choice 和 tool-result fill 全部通过。原失败不是 Ferrum
+丢失 tool result，而是 2026-08-02 新增测试要求模型暴露一个用户从未要求的内部 receipt；同一
+binary 已经正确使用 city/temp/unit/desc。测试现在从首轮明确要求返回不可猜的查询回执，继续以
+exact nonce 证明 tool-result history 到达模型，没有放宽为语义近似。正式 PASS 为：
+
+```text
+FERRUM RUNTIME VNEXT S2 TOOL SCHEMA PRIORITY PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-tool-schema-e894c59e-20260803/gate-r1
+FERRUM GATE vnext-s2-tool-schema PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-tool-schema-e894c59e-20260803/gate-r1
+```
+
+两条证据复用 binary SHA256
+`41dcb29df52ebefc1052b990911a3f3f26e0ee697471a04ed51f1e8f8edbe605`。stream archive
+`runtime-vnext-s2-stream-disconnect-a4e8472c-cuda-pass-20260803.tar.zst` 的 SHA256 为
+`d56252bee7173a144a25c4a9d9a37b496dd08f85ead52b729909f69c3964f2d3`，位于 draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-a187c237c3a6487c949e)；
+tool/schema archive `runtime-vnext-s2-tool-schema-e894c59e-cuda-pass-20260803.tar.zst` 的 SHA256 为
+`3c3c2e07362d470b9337ed2345a2b4d363beb8225aaadd6aa04abdc56833b03f`，位于 draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-9b22242822f2734b5c02)。
+两者均经 GitHub 回下载、SHA256、`zstd -t` 和 required-member 复验。付费 GPU 实例随后已停止并
+确认 `actual_status=exited`。
+
+这些证据只关闭 Unicode stream/C09 和 tool/schema 子门，不等于完整 S2、G04、G05、性能、
+Metal 或 release PASS。S2 仍需 response-format、API/modality、M1 determinism、五项 historical
+resource、latency/first-failure attribution，以及最终同一 source identity 的 aggregate。
+
 截至 2026-08-03，clean、已推送 source
 `cc2556610d30749e761f85fafe25ccf1a13ce116` 已关闭当前 source 的 S2 CUDA
 multi-turn/concurrency sentinel。真实 Qwen3.5-4B CUDA 覆盖 `ferrum run` 五轮默认预算、
@@ -31,9 +70,9 @@ CUDA release build bounded duration 为 `403.82842s`，binary SHA256 为
 并经 GitHub 回下载、SHA256、`zstd -t` 和 required-member 复验。
 
 该证据只关闭 S2 multi-turn/concurrency 子门，不等于完整 S2、G02、G04、G05、G06、性能、
-Metal 或 release PASS。由于当前 source 修改了 `run` 产品/观测路径，S2 aggregate 仍须在同一
-source identity 上收齐或按 change-impact 复验 S1 inputs、determinism、其余 product checkpoints、
-C09 abort/release、五项 historical resource、latency attribution，最后才能打印 S2 aggregate PASS。
+Metal 或 release PASS。S2 aggregate 仍须在同一 source identity 上收齐或按 change-impact 复验
+S1 inputs、determinism、response-format、API/modality、五项 historical resource、latency
+attribution，最后才能打印 S2 aggregate PASS。
 
 截至 2026-08-03，clean、已推送 source
 `61399d6907677af3373f543c01b5f0cad720dbe4` 已关闭当前 source 的 S1 CUDA
