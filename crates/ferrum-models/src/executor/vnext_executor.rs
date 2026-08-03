@@ -4544,6 +4544,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         replayed_output_tokens: usize,
         work: ResourceWorkShape,
     ) -> Result<VNextPrefillProbeResolution<R>> {
+        let product_prompt_tokens = u64::try_from(product_prompt_tokens).map_err(|_| {
+            FerrumError::request_validation("product prompt token count exceeds u64")
+        })?;
+        let replayed_output_tokens = u64::try_from(replayed_output_tokens).map_err(|_| {
+            FerrumError::request_validation("replayed output token count exceeds u64")
+        })?;
         let identity = RequestIdentity::new(format!(
             "request.{}.{request_id}",
             request_origin.namespace()
@@ -4568,6 +4574,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 return Ok(VNextPrefillProbeResolution::PermanentRejected(rejected));
             }
         };
+        let request = match VNextRequestRoot::bind_initial(request_id.clone(), &identity, &session)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return Err(terminalize_unsubmitted_session(&session, error));
+            }
+        };
         let active_binding = match TrustedActiveSequenceBinding::from_session(&session) {
             Ok(active_binding) => Arc::new(active_binding),
             Err(error) => {
@@ -4579,31 +4592,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let events = match self.execution_journal(&active_binding, request_origin) {
             Ok(events) => events,
-            Err(error) => {
-                return Err(terminalize_unsubmitted_session(&session, error));
-            }
-        };
-        let product_prompt_tokens = match u64::try_from(product_prompt_tokens) {
-            Ok(product_prompt_tokens) => product_prompt_tokens,
-            Err(_) => {
-                return Err(terminalize_unsubmitted_session(
-                    &session,
-                    FerrumError::request_validation("product prompt token count exceeds u64"),
-                ));
-            }
-        };
-        let replayed_output_tokens = match u64::try_from(replayed_output_tokens) {
-            Ok(replayed_output_tokens) => replayed_output_tokens,
-            Err(_) => {
-                return Err(terminalize_unsubmitted_session(
-                    &session,
-                    FerrumError::request_validation("replayed output token count exceeds u64"),
-                ));
-            }
-        };
-        let request = match VNextRequestRoot::bind_initial(request_id.clone(), &identity, &session)
-        {
-            Ok(request) => request,
             Err(error) => {
                 return Err(terminalize_unsubmitted_session(&session, error));
             }
@@ -5420,8 +5408,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map(VNextExecutionCapacityDecision::RequestStateDeferred);
                 }
                 StepSubmissionWaveAdmissionDecision::RequestStateSplitRequired(split) => {
-                    return Err(FerrumError::request_validation(format!(
-                        "vNext submission wave requires sibling split for request {:?}: {:?}",
+                    return Err(FerrumError::internal(format!(
+                        "vNext product executor reached an unsplit sibling Request-state wave for request {:?}: {:?}",
                         split.request(),
                         split.resource_ids()
                     )))
@@ -5944,6 +5932,38 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
+    fn rollback_unsubmitted_step(
+        &self,
+        step: Arc<StepResourceLease<R>>,
+        context: &'static str,
+    ) -> Result<()> {
+        let rollback_failure = match step.try_rollback_unsubmitted() {
+            Ok(_) => return Ok(()),
+            Err(failure) => failure,
+        };
+        let rollback_error = rollback_failure.error().to_string();
+        let step = rollback_failure.into_step();
+        match step.try_abort() {
+            Ok(_) => {
+                let message = format!(
+                    "{context} rollback failed: {rollback_error}; exact step was aborted fail-closed"
+                );
+                self.metrics.record_failure(message.clone());
+                Err(FerrumError::backend(message))
+            }
+            Err(abort_failure) => {
+                let abort_error = abort_failure.error().to_string();
+                let step = abort_failure.into_step();
+                drop(step);
+                let message = format!(
+                    "{context} rollback failed: {rollback_error}; explicit abort failed: {abort_error}; exact step authority was released to fail-closed Drop"
+                );
+                self.metrics.record_failure(message.clone());
+                Err(FerrumError::backend(message))
+            }
+        }
+    }
+
     async fn execute_step(
         &self,
         sequence: &Arc<VNextSequence<R>>,
@@ -6026,34 +6046,28 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind) {
                     Ok(decision) => decision,
                     Err(error) => {
-                        let error = match step.try_rollback_unsubmitted() {
-                            Ok(_) => error,
-                            Err(failure) => FerrumError::backend(format!(
-                                "{error}; vNext failed-wave unsubmitted step rollback failed: {}",
-                                failure.error()
-                            )),
-                        };
+                        if let Err(cleanup_error) = self
+                            .rollback_unsubmitted_step(step, "vNext failed-wave unsubmitted step")
+                        {
+                            return Err(FerrumError::backend(format!("{error}; {cleanup_error}")));
+                        }
                         return Err(error);
                     }
                 };
             let wave = match wave_decision {
                 VNextExecutionCapacityDecision::Ready(wave) => wave,
                 VNextExecutionCapacityDecision::Deferred(deferred) => {
-                    step.try_rollback_unsubmitted().map_err(|failure| {
-                        FerrumError::backend(format!(
-                            "vNext capacity-deferred unsubmitted step rollback failed: {}",
-                            failure.error()
-                        ))
-                    })?;
+                    self.rollback_unsubmitted_step(
+                        step,
+                        "vNext capacity-deferred unsubmitted step",
+                    )?;
                     return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
                 }
                 VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                    step.try_rollback_unsubmitted().map_err(|failure| {
-                        FerrumError::backend(format!(
-                            "vNext readiness-deferred unsubmitted step rollback failed: {}",
-                            failure.error()
-                        ))
-                    })?;
+                    self.rollback_unsubmitted_step(
+                        step,
+                        "vNext readiness-deferred unsubmitted step",
+                    )?;
                     return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
                         deferred,
                     ));
