@@ -360,8 +360,13 @@ fn write_actual_run_artifacts(
     observation: &ActualRunObservation,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
-    let mut written =
-        write_actual_artifacts(config, events, &observation.request_id, replay_command)?;
+    let mut written = write_actual_artifacts_with_scheduler(
+        config,
+        events,
+        &observation.request_id,
+        replay_command,
+        observation.execution_evidence.is_none(),
+    )?;
     if let Some(dir) = &config.request_dump_dir {
         written.extend(write_replay_bundle(
             dir,
@@ -430,13 +435,23 @@ fn write_actual_artifacts(
     request_id: &str,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
+    write_actual_artifacts_with_scheduler(config, events, request_id, replay_command, true)
+}
+
+fn write_actual_artifacts_with_scheduler(
+    config: &ProductObservabilityConfig,
+    events: &[FerrumProfileEvent],
+    request_id: &str,
+    replay_command: &str,
+    include_scheduler: bool,
+) -> Result<Vec<PathBuf>> {
     let mut written = write_profile_outputs(
         config,
         events,
         ferrum_bench_core::JsonlJournalOpenMode::Append,
         true,
         true,
-        true,
+        include_scheduler,
     )?;
     if let Some(dir) = &config.request_dump_dir {
         fs_create_dir_all(dir)?;
@@ -2482,6 +2497,10 @@ mod tests {
             .position(|stage| stage == "shutdown")
             .expect("shutdown stage");
         assert!(first_request_index < shutdown_index);
+        assert!(
+            !root.join("scheduler.jsonl").exists(),
+            "typed engine execution evidence owns the scheduler lifecycle"
+        );
         fs::remove_dir_all(root).ok();
     }
 
