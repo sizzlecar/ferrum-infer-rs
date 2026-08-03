@@ -18,19 +18,34 @@
     ]
   },
   "coordinator_id": 1,
-  "wake_epochs": {
+  "current_wake_epochs": {
     "release": 182,
     "capacity": 515,
+    "policy": 0
+  },
+  "post_release_wake_epochs": {
+    "release": 183,
+    "capacity": 516,
     "policy": 0
   },
   "requests": [
     {
       "role": "recompute_prefill",
-      "request_id": "2c0cbe46-0e60-49f8-9fd8-841f52205ea6"
+      "request_id": "2c0cbe46-0e60-49f8-9fd8-841f52205ea6",
+      "observed_wake_epochs": {
+        "release": 122,
+        "capacity": 395,
+        "policy": 0
+      }
     },
     {
       "role": "decode",
-      "request_id": "5ea9181c-abd4-4ec7-90a8-20e8c1548825"
+      "request_id": "5ea9181c-abd4-4ec7-90a8-20e8c1548825",
+      "observed_wake_epochs": {
+        "release": 182,
+        "capacity": 515,
+        "policy": 0
+      }
     }
   ],
   "wait_sources": [
@@ -44,6 +59,17 @@
       "epoch": 1
     }
   ],
+  "post_release_wait_sources": [
+    {
+      "kind": "domain",
+      "domain": 4,
+      "epoch": 74
+    },
+    {
+      "kind": "plan_device_budget",
+      "epoch": 1
+    }
+  ],
   "rejected_terminal": {
     "active": 2,
     "prefill": 1,
@@ -51,6 +77,96 @@
     "blocked_prefill": 1,
     "blocked_decode": 1,
     "pending_release_fences": 0
+  },
+  "expected": {
+    "yield_plan": {
+      "kind": "peer_handoff",
+      "progress_owner": "recompute_prefill",
+      "victim": "decode"
+    },
+    "transitions": [
+      {
+        "ordinal": 1,
+        "episode_id": 1,
+        "kind": "opened",
+        "request": null,
+        "peer": null,
+        "related_episode_id": null,
+        "state": "open"
+      },
+      {
+        "ordinal": 2,
+        "episode_id": 1,
+        "kind": "frontier_blocked",
+        "request": "recompute_prefill",
+        "peer": null,
+        "related_episode_id": null,
+        "state": "open"
+      },
+      {
+        "ordinal": 3,
+        "episode_id": 1,
+        "kind": "frontier_blocked",
+        "request": "decode",
+        "peer": null,
+        "related_episode_id": null,
+        "state": "open"
+      },
+      {
+        "ordinal": 4,
+        "episode_id": 1,
+        "kind": "yield_planned",
+        "request": "decode",
+        "peer": "recompute_prefill",
+        "related_episode_id": null,
+        "state": "yield_planned"
+      },
+      {
+        "ordinal": 5,
+        "episode_id": 1,
+        "kind": "release_fence_armed",
+        "request": "decode",
+        "peer": "recompute_prefill",
+        "related_episode_id": null,
+        "state": "await_release_fence"
+      },
+      {
+        "ordinal": 6,
+        "episode_id": 1,
+        "kind": "release_fence_completed",
+        "request": "decode",
+        "peer": "recompute_prefill",
+        "related_episode_id": null,
+        "state": "await_release_fence"
+      },
+      {
+        "ordinal": 7,
+        "episode_id": 1,
+        "kind": "frontier_resumable",
+        "request": "recompute_prefill",
+        "peer": "decode",
+        "related_episode_id": null,
+        "state": "resumable"
+      },
+      {
+        "ordinal": 8,
+        "episode_id": 1,
+        "kind": "frontier_terminal",
+        "request": "recompute_prefill",
+        "peer": null,
+        "related_episode_id": null,
+        "state": "resumable"
+      },
+      {
+        "ordinal": 9,
+        "episode_id": 1,
+        "kind": "closed",
+        "request": "recompute_prefill",
+        "peer": "decode",
+        "related_episode_id": null,
+        "state": "closed"
+      }
+    ]
   },
   "steps": [
     {
@@ -84,6 +200,12 @@
       "action": "arm_and_complete_yield",
       "attempted_decode_width": 1,
       "observed_free_blocks": 0
+    },
+    {
+      "action": "post_release_schedule",
+      "max_batch_size": 2,
+      "expected_role": "recompute_prefill",
+      "expected_phase": "prefilling"
     },
     {
       "action": "cancel_all"

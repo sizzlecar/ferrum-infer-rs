@@ -16,10 +16,13 @@ struct HistoricalReplayFixture {
     name: String,
     source: HistoricalReplaySource,
     coordinator_id: u64,
-    wake_epochs: HistoricalWakeEpochs,
+    current_wake_epochs: HistoricalWakeEpochs,
+    post_release_wake_epochs: HistoricalWakeEpochs,
     requests: Vec<HistoricalRequest>,
     wait_sources: Vec<HistoricalWaitSource>,
+    post_release_wait_sources: Vec<HistoricalWaitSource>,
     rejected_terminal: HistoricalRejectedTerminal,
+    expected: HistoricalExpectedReplay,
     steps: Vec<HistoricalReplayStep>,
 }
 
@@ -33,11 +36,17 @@ struct HistoricalReplaySource {
     terminal_event_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 struct HistoricalWakeEpochs {
     release: u64,
     capacity: u64,
     policy: u64,
+}
+
+impl HistoricalWakeEpochs {
+    fn snapshot(self, coordinator: NonZeroU64) -> AdmissionWakeEpochs {
+        AdmissionWakeEpochs::new(coordinator, self.release, self.capacity, self.policy)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
@@ -51,6 +60,7 @@ enum HistoricalRequestRole {
 struct HistoricalRequest {
     role: HistoricalRequestRole,
     request_id: String,
+    observed_wake_epochs: HistoricalWakeEpochs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +93,128 @@ enum HistoricalExpectedAction {
     YieldPlanned,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HistoricalExpectedPhase {
+    Prefilling,
+    Decoding,
+}
+
+impl HistoricalExpectedPhase {
+    const fn runtime(self) -> RequestPhase {
+        match self {
+            Self::Prefilling => RequestPhase::Prefilling,
+            Self::Decoding => RequestPhase::Decoding,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HistoricalPressureYieldKind {
+    PeerHandoff,
+    SelfRecompute,
+}
+
+impl From<PressureYieldKind> for HistoricalPressureYieldKind {
+    fn from(kind: PressureYieldKind) -> Self {
+        match kind {
+            PressureYieldKind::PeerHandoff => Self::PeerHandoff,
+            PressureYieldKind::SelfRecompute => Self::SelfRecompute,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HistoricalPressureTransitionKind {
+    Opened,
+    FrontierBlocked,
+    WaitSatisfied,
+    EpisodeMerged,
+    EpisodeBridgeDeferred,
+    YieldPlanned,
+    YieldAborted,
+    ReleaseFenceArmed,
+    ReleaseFenceCompleted,
+    FrontierResumable,
+    OwnerAdmissionPending,
+    OwnerAdmitted,
+    FrontierRetargeted,
+    FrontierTerminal,
+    Closed,
+}
+
+impl From<PressureTransitionKind> for HistoricalPressureTransitionKind {
+    fn from(kind: PressureTransitionKind) -> Self {
+        match kind {
+            PressureTransitionKind::Opened => Self::Opened,
+            PressureTransitionKind::FrontierBlocked => Self::FrontierBlocked,
+            PressureTransitionKind::WaitSatisfied => Self::WaitSatisfied,
+            PressureTransitionKind::EpisodeMerged => Self::EpisodeMerged,
+            PressureTransitionKind::EpisodeBridgeDeferred => Self::EpisodeBridgeDeferred,
+            PressureTransitionKind::YieldPlanned => Self::YieldPlanned,
+            PressureTransitionKind::YieldAborted => Self::YieldAborted,
+            PressureTransitionKind::ReleaseFenceArmed => Self::ReleaseFenceArmed,
+            PressureTransitionKind::ReleaseFenceCompleted => Self::ReleaseFenceCompleted,
+            PressureTransitionKind::FrontierResumable => Self::FrontierResumable,
+            PressureTransitionKind::OwnerAdmissionPending => Self::OwnerAdmissionPending,
+            PressureTransitionKind::OwnerAdmitted => Self::OwnerAdmitted,
+            PressureTransitionKind::FrontierRetargeted => Self::FrontierRetargeted,
+            PressureTransitionKind::FrontierTerminal => Self::FrontierTerminal,
+            PressureTransitionKind::Closed => Self::Closed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HistoricalPressureEpisodeState {
+    Open,
+    YieldPlanned,
+    AwaitReleaseFence,
+    Resumable,
+    OwnerAdmissionPending,
+    Closed,
+}
+
+impl From<PressureEpisodeState> for HistoricalPressureEpisodeState {
+    fn from(state: PressureEpisodeState) -> Self {
+        match state {
+            PressureEpisodeState::Open => Self::Open,
+            PressureEpisodeState::YieldPlanned => Self::YieldPlanned,
+            PressureEpisodeState::AwaitReleaseFence => Self::AwaitReleaseFence,
+            PressureEpisodeState::Resumable => Self::Resumable,
+            PressureEpisodeState::OwnerAdmissionPending => Self::OwnerAdmissionPending,
+            PressureEpisodeState::Closed => Self::Closed,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoricalExpectedReplay {
+    yield_plan: HistoricalExpectedYield,
+    transitions: Vec<HistoricalTransitionProjection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HistoricalExpectedYield {
+    kind: HistoricalPressureYieldKind,
+    progress_owner: HistoricalRequestRole,
+    victim: HistoricalRequestRole,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct HistoricalTransitionProjection {
+    ordinal: u64,
+    episode_id: u64,
+    kind: HistoricalPressureTransitionKind,
+    request: Option<HistoricalRequestRole>,
+    peer: Option<HistoricalRequestRole>,
+    related_episode_id: Option<u64>,
+    state: HistoricalPressureEpisodeState,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum HistoricalReplayStep {
@@ -107,6 +239,11 @@ enum HistoricalReplayStep {
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
     },
+    PostReleaseSchedule {
+        max_batch_size: usize,
+        expected_role: HistoricalRequestRole,
+        expected_phase: HistoricalExpectedPhase,
+    },
     CancelAll,
 }
 
@@ -119,6 +256,7 @@ impl HistoricalReplayStep {
             Self::ReadmitRecompute { .. } => "readmit_recompute",
             Self::DeferForCapacity { .. } => "defer_for_capacity",
             Self::ArmAndCompleteYield { .. } => "arm_and_complete_yield",
+            Self::PostReleaseSchedule { .. } => "post_release_schedule",
             Self::CancelAll => "cancel_all",
         }
     }
@@ -147,7 +285,7 @@ impl HistoricalRejectedTerminal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HistoricalYieldProjection {
-    kind: PressureYieldKind,
+    kind: HistoricalPressureYieldKind,
     progress_owner: HistoricalRequestRole,
     victim: HistoricalRequestRole,
     planned_ordinal: u64,
@@ -163,7 +301,7 @@ struct HistoricalReplayProjection {
     snapshot_labels: Vec<&'static str>,
     snapshots: Vec<ContinuousSchedulerTraceSnapshot>,
     yield_projection: HistoricalYieldProjection,
-    journal: Vec<PressureTransition>,
+    journal: Vec<HistoricalTransitionProjection>,
     old_terminal_matches: usize,
     passive_park_prevented: bool,
 }
@@ -216,6 +354,39 @@ fn project_batch(
         .collect()
 }
 
+fn project_transition(
+    transition: &PressureTransition,
+    requests: &[(HistoricalRequestRole, RequestId)],
+) -> HistoricalTransitionProjection {
+    HistoricalTransitionProjection {
+        ordinal: transition.ordinal().get(),
+        episode_id: transition.episode_id().get(),
+        kind: transition.kind().into(),
+        request: transition
+            .request_id()
+            .map(|request_id| role_for_request(requests, request_id)),
+        peer: transition
+            .peer_request_id()
+            .map(|request_id| role_for_request(requests, request_id)),
+        related_episode_id: transition.related_episode_id().map(|id| id.get()),
+        state: transition.state().into(),
+    }
+}
+
+fn observed_wake_for_role(
+    fixture: &HistoricalReplayFixture,
+    role: HistoricalRequestRole,
+    coordinator: NonZeroU64,
+) -> AdmissionWakeEpochs {
+    fixture
+        .requests
+        .iter()
+        .find_map(|request| {
+            (request.role == role).then_some(request.observed_wake_epochs.snapshot(coordinator))
+        })
+        .unwrap_or_else(|| panic!("historical replay fixture is missing role {role:?}"))
+}
+
 async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
     let fixture: HistoricalReplayFixture = serde_json::from_str(HISTORICAL_REPLAY_JSON).unwrap();
     assert_eq!(fixture.schema_version, 1);
@@ -228,28 +399,74 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
         fixture.source.failure_class,
         "cross_phase_capacity_progress_deadlock"
     );
-    assert_eq!(fixture.source.terminal_event_ids.len(), 7);
     assert_eq!(
-        fixture.source.terminal_event_ids.first().unwrap(),
-        "evt-engine-vnext-admission-531"
+        fixture.source.binary_sha256,
+        "19fe1907e1d74c199fb34da4990297109e5e05257600f1299426f3e9eb6d50c4"
     );
     assert_eq!(
-        fixture.source.terminal_event_ids.last().unwrap(),
-        "evt-engine-vnext-admission-537"
+        fixture.source.trace_sha256,
+        "5360a85b49423e094400c5cf39f6e6b3df85b1254b62ec841925ee63c539011e"
     );
-    assert_eq!(fixture.source.binary_sha256.len(), 64);
-    assert_eq!(fixture.source.trace_sha256.len(), 64);
-    assert!(fixture.source.artifact.ends_with("scheduler-trace.jsonl"));
+    assert_eq!(
+        fixture.source.artifact,
+        "runtime-vnext-s1-progress-lease-da9c1ee8-20260717/raw/target/scheduler-trace.jsonl"
+    );
+    assert_eq!(
+        fixture.source.terminal_event_ids,
+        [
+            "evt-engine-vnext-admission-531",
+            "evt-engine-vnext-admission-532",
+            "evt-engine-vnext-admission-533",
+            "evt-engine-vnext-admission-534",
+            "evt-engine-vnext-admission-535",
+            "evt-engine-vnext-admission-536",
+            "evt-engine-vnext-admission-537",
+        ]
+    );
+    assert_eq!(
+        fixture.current_wake_epochs,
+        HistoricalWakeEpochs {
+            release: 182,
+            capacity: 515,
+            policy: 0,
+        }
+    );
+    assert_eq!(
+        fixture
+            .requests
+            .iter()
+            .map(|request| (request.role, request.observed_wake_epochs))
+            .collect::<Vec<_>>(),
+        [
+            (
+                HistoricalRequestRole::RecomputePrefill,
+                HistoricalWakeEpochs {
+                    release: 122,
+                    capacity: 395,
+                    policy: 0,
+                },
+            ),
+            (
+                HistoricalRequestRole::Decode,
+                HistoricalWakeEpochs {
+                    release: 182,
+                    capacity: 515,
+                    policy: 0,
+                },
+            ),
+        ]
+    );
 
     let coordinator = NonZeroU64::new(fixture.coordinator_id).unwrap();
-    let wake = AdmissionWakeEpochs::new(
-        coordinator,
-        fixture.wake_epochs.release,
-        fixture.wake_epochs.capacity,
-        fixture.wake_epochs.policy,
-    );
+    let wake = fixture.current_wake_epochs.snapshot(coordinator);
     let availability = fixture
         .wait_sources
+        .iter()
+        .map(HistoricalWaitSource::availability)
+        .collect::<Vec<_>>();
+    let post_release_wake = fixture.post_release_wake_epochs.snapshot(coordinator);
+    let post_release_availability = fixture
+        .post_release_wait_sources
         .iter()
         .map(HistoricalWaitSource::availability)
         .collect::<Vec<_>>();
@@ -366,7 +583,7 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
                 let request_id = request_id_for_role(&requests, role);
                 let deferral = AdmissionDeferral::new(
                     DeferredAction::WaitForRelease,
-                    wake,
+                    observed_wake_for_role(&fixture, role, coordinator),
                     wait_condition.clone(),
                 );
                 let action = match scheduler.trace_phase(request_id) {
@@ -399,7 +616,7 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
                             role_for_request(&requests, transaction.progress_owner_id());
                         let victim = role_for_request(&requests, transaction.victim_request_id());
                         yield_projection = Some(HistoricalYieldProjection {
-                            kind: transaction.kind(),
+                            kind: transaction.kind().into(),
                             progress_owner,
                             victim,
                             planned_ordinal: transaction.planned_ordinal().get(),
@@ -444,6 +661,29 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
                 projection.armed_ordinal = Some(armed.get());
                 projection.release_ordinal = Some(completion.release_transition_ordinal().get());
             }
+            HistoricalReplayStep::PostReleaseSchedule {
+                max_batch_size,
+                expected_role,
+                expected_phase,
+            } => {
+                let batch = scheduler
+                    .next_batch_with_dynamic_admission(
+                        BatchHint::simple(max_batch_size),
+                        AdmissionWakeSnapshot::new(post_release_wake, &post_release_availability),
+                        &mut |_| panic!("a held victim must not be probed before owner progress"),
+                    )
+                    .unwrap()
+                    .expect("release must make the selected progress owner schedulable");
+                let projected = project_batch(&batch, &requests);
+                assert_eq!(projected, [expected_role]);
+                assert_eq!(batch.requests.len(), 1);
+                assert_eq!(
+                    scheduler.trace_phase(&batch.requests[0].request.id),
+                    Some(expected_phase.runtime()),
+                    "the post-release batch must preserve the expected logical work phase"
+                );
+                batches.push(projected);
+            }
             HistoricalReplayStep::CancelAll => {
                 for (_, request_id) in &requests {
                     assert!(scheduler.cancel(request_id.clone()).await.unwrap());
@@ -458,13 +698,45 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
     let final_snapshot = snapshots.last().unwrap();
     assert_eq!(final_snapshot.active_len, 0);
     assert_eq!(final_snapshot.waiting_queue_len, 0);
+    assert_eq!(final_snapshot.prefill_queue_len, 0);
+    assert_eq!(final_snapshot.decode_queue_len, 0);
+    assert_eq!(final_snapshot.decode_selection_cursor, None);
+    assert_eq!(final_snapshot.preempted_queue_len, 0);
+    assert_eq!(final_snapshot.capacity_blocked_waiting_len, 0);
+    assert_eq!(final_snapshot.execution_capacity_blocked_prefill_len, 0);
+    assert_eq!(final_snapshot.execution_capacity_blocked_decode_len, 0);
+    assert_eq!(final_snapshot.execution_readiness_blocked_prefill_len, 0);
+    assert_eq!(final_snapshot.execution_readiness_blocked_decode_len, 0);
     assert_eq!(final_snapshot.pressure_active_episodes, 0);
     assert_eq!(final_snapshot.pressure_pending_release_fences, 0);
+    assert_eq!(final_snapshot.cancelled_total, requests.len() as u64);
+    assert_eq!(
+        scheduler.admission_phase_counts(),
+        ContinuousSchedulerAdmissionCounts {
+            waiting_requests: 0,
+            active_prefill_sequences: 0,
+            active_decode_sequences: 0,
+        }
+    );
     let old_terminal_matches = snapshots
         .iter()
         .filter(|snapshot| fixture.rejected_terminal.matches(snapshot))
         .count();
     assert_eq!(old_terminal_matches, 0);
+
+    let yield_projection = yield_projection.expect("fixture must plan one typed yield");
+    assert_eq!(yield_projection.kind, fixture.expected.yield_plan.kind);
+    assert_eq!(
+        yield_projection.progress_owner,
+        fixture.expected.yield_plan.progress_owner
+    );
+    assert_eq!(yield_projection.victim, fixture.expected.yield_plan.victim);
+    let journal = scheduler
+        .pressure_transition_journal()
+        .iter()
+        .map(|transition| project_transition(transition, &requests))
+        .collect::<Vec<_>>();
+    assert_eq!(journal, fixture.expected.transitions);
 
     HistoricalReplayProjection {
         source_git_sha: fixture.source.git_sha,
@@ -472,8 +744,8 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
         batches,
         snapshot_labels,
         snapshots,
-        yield_projection: yield_projection.expect("fixture must plan one typed yield"),
-        journal: scheduler.pressure_transition_journal(),
+        yield_projection,
+        journal,
         old_terminal_matches,
         passive_park_prevented,
     }
@@ -485,8 +757,12 @@ async fn da9c1ee8_cross_phase_capacity_replay_rejects_old_terminal_one_hundred_o
     let expected = replay_historical_cross_phase_fixture().await;
     assert_eq!(expected.old_terminal_matches, 0);
     assert!(expected.passive_park_prevented);
-    assert_eq!(expected.snapshot_labels.len(), 8);
-    assert_eq!(expected.batches.len(), 2);
+    assert_eq!(expected.snapshot_labels.len(), 9);
+    assert_eq!(expected.batches.len(), 3);
+    assert_eq!(
+        expected.batches.last().unwrap(),
+        &[HistoricalRequestRole::RecomputePrefill]
+    );
     assert!(expected.yield_projection.planned_ordinal > 0);
     assert!(
         expected.yield_projection.planned_ordinal
@@ -499,7 +775,7 @@ async fn da9c1ee8_cross_phase_capacity_replay_rejects_old_terminal_one_hundred_o
     assert!(expected
         .journal
         .windows(2)
-        .all(|pair| pair[0].ordinal() < pair[1].ordinal()));
+        .all(|pair| pair[0].ordinal < pair[1].ordinal));
 
     for ordinal in 1..REPLAY_COUNT {
         assert_eq!(
@@ -509,7 +785,7 @@ async fn da9c1ee8_cross_phase_capacity_replay_rejects_old_terminal_one_hundred_o
         );
     }
     println!(
-        "FERRUM G04 HISTORICAL CAPACITY REPLAY KEEP: source_commit={} trace_sha256={} deterministic_replays={REPLAY_COUNT}/{REPLAY_COUNT} yield_planned={REPLAY_COUNT}/{REPLAY_COUNT} passive_park_prevented={REPLAY_COUNT}/{REPLAY_COUNT} old_terminal=0/{REPLAY_COUNT} snapshots={} journal_transitions={}",
+        "FERRUM G04 HISTORICAL CAPACITY REPLAY KEEP: source_commit={} trace_sha256={} deterministic_replays={REPLAY_COUNT}/{REPLAY_COUNT} independent_oracle={REPLAY_COUNT}/{REPLAY_COUNT} yield_planned={REPLAY_COUNT}/{REPLAY_COUNT} post_release_progress={REPLAY_COUNT}/{REPLAY_COUNT} global_park_prevented={REPLAY_COUNT}/{REPLAY_COUNT} old_terminal=0/{REPLAY_COUNT} snapshots={} journal_transitions={}",
         expected.source_git_sha,
         expected.source_trace_sha256,
         expected.snapshots.len(),
