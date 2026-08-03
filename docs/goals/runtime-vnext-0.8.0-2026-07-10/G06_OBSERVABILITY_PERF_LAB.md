@@ -484,6 +484,35 @@ FERRUM NATIVE WORK ATTRIBUTION PASS: /workspace/ferrum-artifacts/runtime-vnext-a
 它没有运行 historical replay、stage/top-kernel coverage、profile overhead 或 G09
 throughput，因此 G06 仍为 Open。
 
+### S2 latency/first-failure CUDA checkpoint（2026-08-04）
+
+Clean pushed source `04699472d17b72a5368692bacb81a4b38cdae04f` closes the focused S2
+latency/first-failure boundary on a single RTX 4090 with real Qwen3.5-4B product paths. The
+collector covers `run` and `serve` success, `run` failure, and `serve` failure plus recovery.
+Product terminal failure events now remain typed timed spans when they carry a real wall duration;
+their failure status and error detail are unchanged. This lets the common analyzer retain the first
+failure instead of requiring a synthetic timing event that production does not emit.
+
+The focused injected `run` failure records `actual_run_generation_failed`,
+`event_kind=timed_span`, and `duration_us=256196`. The canonical child validator and unified gate
+print:
+
+```text
+FERRUM RUNTIME VNEXT S2 LATENCY FIRST FAILURE PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-latency-04699472-20260803/gate-r1
+FERRUM GATE vnext-s2-latency-first-failure PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-latency-04699472-20260803/gate-r1
+```
+
+The same-hardware ABBA-BAAB report records off `67.473362 tok/s` versus latency
+`52.720071 tok/s`, mean overhead `21.8654%`, median overhead `21.7777%`, and CV below `0.9%`
+for both groups. The machine-readable classification is `target_miss` with `blocking=false`, as
+required by this document: attribution correctness passes, while the optional latency preset still
+misses its `<=5%` reporting target. It is not evidence for default-path G09 performance.
+
+The CUDA binary SHA256 is
+`c76002ba57203182dedc76e258225f057f148878800aa722d3215ce2febd8494`. The GitHub-verified
+archive, transfer URL, and SHA256 are recorded in [`GOAL.md`](GOAL.md). This child PASS does not
+close full historical attribution, G06, G09, Metal, or release validation.
+
 ## 验收
 
 - 顶层 observability 自测执行全部子组件；漏接线 `0`。
