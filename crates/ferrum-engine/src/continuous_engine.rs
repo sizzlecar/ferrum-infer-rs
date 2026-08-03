@@ -479,8 +479,10 @@ impl ResponseEnvelopeCompletionState {
     fn observe(&mut self, token_id: u32) -> Result<()> {
         match self.phase {
             ResponseEnvelopePhase::AwaitingOpen => {
+                let matched_before = self.open.matched;
                 if self.open.observe(token_id) {
                     if self.completed_envelopes == self.max_envelopes {
+                        self.open.matched = matched_before;
                         return Err(FerrumError::invalid_format(format!(
                             "generated response exceeded its {}-envelope protocol limit",
                             self.max_envelopes
