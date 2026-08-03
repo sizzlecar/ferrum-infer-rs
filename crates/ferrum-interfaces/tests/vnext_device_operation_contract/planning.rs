@@ -164,18 +164,35 @@ pub(crate) fn node_resolution_with_zero_state(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
 ) -> PlanNodeResolution {
+    node_resolution_with_state_profile(
+        family,
+        catalog,
+        runtime_policy,
+        registry,
+        TestStateProfile::from_zero_state(zero_state),
+    )
+}
+
+fn node_resolution_with_state_profile(
+    family: &PreparedModelFamily,
+    catalog: &CapabilityCatalog,
+    runtime_policy: &ResolvedRuntimePolicy,
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    state_profile: TestStateProfile,
+) -> PlanNodeResolution {
     node_resolution_for(
         family,
         catalog,
         runtime_policy,
         registry,
         "node.main",
-        if zero_state {
-            node_values_with_zero_state_for(
+        if state_profile.zero_state {
+            node_values_with_state_profile_for(
                 "value.input",
                 "resource.input",
                 "value.intermediate",
                 "resource.intermediate",
+                state_profile,
             )
         } else {
             node_values()
@@ -199,18 +216,35 @@ pub(crate) fn tail_node_resolution_with_zero_state(
     registry: &OperationRuntimeRegistry<TestRuntime>,
     zero_state: bool,
 ) -> PlanNodeResolution {
+    tail_node_resolution_with_state_profile(
+        family,
+        catalog,
+        runtime_policy,
+        registry,
+        TestStateProfile::from_zero_state(zero_state),
+    )
+}
+
+fn tail_node_resolution_with_state_profile(
+    family: &PreparedModelFamily,
+    catalog: &CapabilityCatalog,
+    runtime_policy: &ResolvedRuntimePolicy,
+    registry: &OperationRuntimeRegistry<TestRuntime>,
+    state_profile: TestStateProfile,
+) -> PlanNodeResolution {
     node_resolution_for(
         family,
         catalog,
         runtime_policy,
         registry,
         "node.tail",
-        if zero_state {
-            node_values_with_zero_state_for(
+        if state_profile.zero_state {
+            node_values_with_state_profile_for(
                 "value.intermediate",
                 "resource.intermediate",
                 "value.output",
                 "resource.output",
+                state_profile,
             )
         } else {
             tail_node_values()
@@ -232,44 +266,68 @@ pub(crate) fn resolved_model_plan_with_zero_state(
     let catalog = catalog_with_zero_state(zero_state);
     resolved_model_plan_with_zero_state_and_policy(
         registry,
-        zero_state,
-        false,
+        TestStateProfile::from_zero_state(zero_state),
         &runtime_policy,
         &catalog,
         false,
     )
 }
 
-fn test_raw_config(zero_state: bool, token_scaled_state: bool) -> Value {
-    match (zero_state, token_scaled_state) {
-        (false, false) => json!({"width": 4}),
-        (true, false) => json!({"width": 4, "zero_state": true}),
-        (true, true) => {
-            json!({"width": 4, "zero_state": true, "token_scaled_state": true})
-        }
-        (false, true) => unreachable!("token-scaled state requires the state binding"),
+fn test_raw_config(state_profile: TestStateProfile) -> Value {
+    match state_profile {
+        TestStateProfile {
+            zero_state: false,
+            token_scaled_state: false,
+            recurrent_state: false,
+        } => json!({"width": 4}),
+        TestStateProfile {
+            zero_state: true,
+            token_scaled_state: false,
+            recurrent_state: false,
+        } => json!({"width": 4, "zero_state": true}),
+        TestStateProfile {
+            zero_state: true,
+            token_scaled_state: true,
+            recurrent_state: false,
+        } => json!({"width": 4, "zero_state": true, "token_scaled_state": true}),
+        TestStateProfile {
+            zero_state: true,
+            token_scaled_state: true,
+            recurrent_state: true,
+        } => json!({
+            "width": 4,
+            "zero_state": true,
+            "token_scaled_state": true,
+            "recurrent_state": true,
+        }),
+        _ => unreachable!("invalid device-operation state profile"),
     }
 }
 
 fn resolved_model_plan_with_zero_state_and_policy(
     registry: &OperationRuntimeRegistry<TestRuntime>,
-    zero_state: bool,
-    token_scaled_state: bool,
+    state_profile: TestStateProfile,
     runtime_policy: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
     retain_determinism_outputs: bool,
 ) -> (ResolvedModelPlan, ExecutionPlan) {
     let model_registry = TestModelRegistry::new();
-    let raw_config = test_raw_config(zero_state, token_scaled_state);
+    let raw_config = test_raw_config(state_profile);
     let family = model_registry.registration.prepare(&raw_config).unwrap();
     let resolutions = vec![
-        node_resolution_with_zero_state(&family, catalog, runtime_policy, registry, zero_state),
-        tail_node_resolution_with_zero_state(
+        node_resolution_with_state_profile(
             &family,
             catalog,
             runtime_policy,
             registry,
-            zero_state,
+            state_profile,
+        ),
+        tail_node_resolution_with_state_profile(
+            &family,
+            catalog,
+            runtime_policy,
+            registry,
+            state_profile,
         ),
     ];
     let completion_retention = if retain_determinism_outputs {
@@ -425,8 +483,7 @@ pub(crate) fn plan_for_registry_with_zero_state(
     let catalog = catalog_with_zero_state(zero_state);
     plan_for_registry_with_zero_state_and_policy(
         registry,
-        zero_state,
-        false,
+        TestStateProfile::from_zero_state(zero_state),
         &runtime_policy,
         &catalog,
         false,
@@ -435,13 +492,12 @@ pub(crate) fn plan_for_registry_with_zero_state(
 
 fn plan_for_registry_with_zero_state_and_policy(
     registry: &OperationRuntimeRegistry<TestRuntime>,
-    zero_state: bool,
-    token_scaled_state: bool,
+    state_profile: TestStateProfile,
     runtime_policy: &ResolvedRuntimePolicy,
     catalog: &CapabilityCatalog,
     retain_determinism_outputs: bool,
 ) -> ExecutionPlan {
-    let raw_config = test_raw_config(zero_state, token_scaled_state);
+    let raw_config = test_raw_config(state_profile);
     let family = TypedFamilyRegistration::new(TestFamily)
         .prepare(&raw_config)
         .unwrap();
@@ -456,19 +512,19 @@ fn plan_for_registry_with_zero_state_and_policy(
             catalog,
             runtime_policy,
             vec![
-                node_resolution_with_zero_state(
+                node_resolution_with_state_profile(
                     &family,
                     catalog,
                     runtime_policy,
                     registry,
-                    zero_state,
+                    state_profile,
                 ),
-                tail_node_resolution_with_zero_state(
+                tail_node_resolution_with_state_profile(
                     &family,
                     catalog,
                     runtime_policy,
                     registry,
-                    zero_state,
+                    state_profile,
                 ),
             ],
         )
@@ -543,8 +599,19 @@ pub(crate) fn logical_resources_with_work(
     token_span: TokenSpanWork,
 ) -> Arc<AdmittedSequenceResources<TestRuntime>> {
     let work = ResourceWorkShape::single(token_span).unwrap();
+    let request_resources =
+        admit_request_resources_with_work(plan_resources, run_id, request_id, work.clone());
+    admit_sequence_resources_with_work(&request_resources, work)
+}
+
+pub(crate) fn admit_request_resources_with_work(
+    plan_resources: &Arc<PlanRuntimeResources<TestRuntime>>,
+    run_id: &str,
+    request_id: &str,
+    work: ResourceWorkShape,
+) -> Arc<AdmittedRequestResources<TestRuntime>> {
     let request = RequestResourceAdmissionRequest::new(
-        work.clone(),
+        work,
         AdmissionFitPolicy::ImmediateOnly,
         AdmissionPressureAction::WaitForRelease,
     )
@@ -573,6 +640,13 @@ pub(crate) fn logical_resources_with_work(
             }
         }
     };
+    request_resources
+}
+
+pub(crate) fn admit_sequence_resources_with_work(
+    request_resources: &Arc<AdmittedRequestResources<TestRuntime>>,
+    work: ResourceWorkShape,
+) -> Arc<AdmittedSequenceResources<TestRuntime>> {
     let sequence = SequenceResourceAdmissionRequest::new(
         work,
         AdmissionFitPolicy::ImmediateOnly,
@@ -828,12 +902,35 @@ pub(crate) fn fixture_with_determinism_provider_behavior(
 
 pub(crate) fn fixture_with_token_scaled_paged_state() -> Fixture {
     fixture_with_provider_behavior_execution_semantics_retention_and_storage(
-        true,
-        true,
+        TestStateProfile::token_scaled_sequence(),
         ProviderBehavior::Success,
         ProviderExecutionSemantics::bitwise_eager_and_replay(),
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         true,
+    )
+}
+
+pub(crate) fn fixture_with_token_scaled_paged_state_and_provider_behavior(
+    behavior: ProviderBehavior,
+) -> Fixture {
+    fixture_with_provider_behavior_execution_semantics_retention_and_storage(
+        TestStateProfile::token_scaled_sequence(),
+        behavior,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
+    )
+}
+
+pub(crate) fn fixture_with_hybrid_state_and_provider_behavior(
+    behavior: ProviderBehavior,
+) -> Fixture {
+    fixture_with_provider_behavior_execution_semantics_retention_and_storage(
+        TestStateProfile::hybrid_sequence(),
+        behavior,
+        ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        false,
     )
 }
 
@@ -860,8 +957,7 @@ fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
     retain_determinism_outputs: bool,
 ) -> Fixture {
     fixture_with_provider_behavior_execution_semantics_retention_and_storage(
-        zero_state,
-        false,
+        TestStateProfile::from_zero_state(zero_state),
         behavior,
         execution_semantics,
         execution_determinism,
@@ -870,8 +966,7 @@ fn fixture_with_provider_behavior_and_execution_semantics_and_retention(
 }
 
 fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
-    zero_state: bool,
-    token_scaled_state: bool,
+    state_profile: TestStateProfile,
     behavior: ProviderBehavior,
     execution_semantics: ProviderExecutionSemantics,
     execution_determinism: ExecutionDeterminismRequirement,
@@ -886,10 +981,9 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
         ResourcePresenceRequirement::Forbidden
     };
     let catalog = catalog_with_resource_options_execution_semantics_and_storage(
-        zero_state,
+        state_profile,
         scratch,
         execution_semantics,
-        token_scaled_state,
     );
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
         let (_, bucket) = reusable_policy();
@@ -900,7 +994,7 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
                         .expect("valid reusable execution policy"),
                 ),
                 execution_determinism,
-                token_scaled_state,
+                state_profile.token_scaled_state,
             ),
             Some(bucket),
         )
@@ -909,7 +1003,7 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
             policy_with_reusable_execution_determinism_and_storage(
                 None,
                 execution_determinism,
-                token_scaled_state,
+                state_profile.token_scaled_state,
             ),
             None,
         )
@@ -937,8 +1031,7 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
     );
     let (resolved, plan) = resolved_model_plan_with_zero_state_and_policy(
         &registry,
-        zero_state,
-        token_scaled_state,
+        state_profile,
         &runtime_policy,
         &catalog,
         retain_determinism_outputs,
@@ -950,8 +1043,7 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
     );
     let impostor_plan_hash = plan_for_registry_with_zero_state_and_policy(
         &impostor_registry,
-        zero_state,
-        token_scaled_state,
+        state_profile,
         &runtime_policy,
         &catalog,
         retain_determinism_outputs,
