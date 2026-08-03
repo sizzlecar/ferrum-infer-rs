@@ -63,19 +63,19 @@ pub(crate) fn paged_storage_profile() -> DynamicStorageProfile {
 pub(crate) fn contiguous_storage_bindings(
     operation: &OperationDescriptor,
 ) -> Vec<ProviderStorageBindingRequirement> {
-    storage_bindings(operation, false)
+    storage_bindings(operation, TestStateProfile::none())
 }
 
 fn storage_bindings(
     operation: &OperationDescriptor,
-    paged_state: bool,
+    state_profile: TestStateProfile,
 ) -> Vec<ProviderStorageBindingRequirement> {
     operation
         .inputs
         .iter()
         .enumerate()
         .map(|(ordinal, _)| {
-            let storage = if paged_state && ordinal == 2 {
+            let storage = if state_profile.token_scaled_state && ordinal == 2 {
                 DynamicStorageRequirement::new(vec![paged_storage_profile()]).unwrap()
             } else {
                 DynamicStorageRequirement::contiguous()
@@ -119,6 +119,57 @@ pub(crate) struct TestConfig {
     pub(crate) zero_state: bool,
     #[serde(default)]
     pub(crate) token_scaled_state: bool,
+    #[serde(default)]
+    pub(crate) recurrent_state: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TestStateProfile {
+    pub(crate) zero_state: bool,
+    pub(crate) token_scaled_state: bool,
+    pub(crate) recurrent_state: bool,
+}
+
+impl TestStateProfile {
+    pub(crate) const fn none() -> Self {
+        Self {
+            zero_state: false,
+            token_scaled_state: false,
+            recurrent_state: false,
+        }
+    }
+
+    pub(crate) const fn fixed_sequence() -> Self {
+        Self {
+            zero_state: true,
+            token_scaled_state: false,
+            recurrent_state: false,
+        }
+    }
+
+    pub(crate) const fn token_scaled_sequence() -> Self {
+        Self {
+            zero_state: true,
+            token_scaled_state: true,
+            recurrent_state: false,
+        }
+    }
+
+    pub(crate) const fn hybrid_sequence() -> Self {
+        Self {
+            zero_state: true,
+            token_scaled_state: true,
+            recurrent_state: true,
+        }
+    }
+
+    pub(crate) const fn from_zero_state(zero_state: bool) -> Self {
+        if zero_state {
+            Self::fixed_sequence()
+        } else {
+            Self::none()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -231,9 +282,14 @@ impl ModelFamilyProvider for TestFamily {
                 reason: "token-scaled test state requires the state binding".to_owned(),
             });
         }
+        if config.recurrent_state && !config.token_scaled_state {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "recurrent test state requires token-scaled KV state".to_owned(),
+            });
+        }
         let mut main_inputs = vec![id("value.input"), id("value.weight")];
         let mut tail_inputs = vec![id("value.intermediate"), id("value.weight")];
-        let states = if config.zero_state {
+        let mut states = if config.zero_state {
             main_inputs.push(id("value.state"));
             tail_inputs.push(id("value.state"));
             vec![StateSpec {
@@ -258,6 +314,22 @@ impl ModelFamilyProvider for TestFamily {
         } else {
             Vec::new()
         };
+        if config.recurrent_state {
+            main_inputs.push(id("value.recurrent-state"));
+            tail_inputs.push(id("value.recurrent-state"));
+            states.push(StateSpec {
+                id: id("state.device-operation.recurrent"),
+                value_id: id("value.recurrent-state"),
+                tensor: ProgramTensorSpec {
+                    dimensions: vec![config.width],
+                    element_type: ElementType::U8,
+                    layout: ResolvedTensorLayout::Contiguous,
+                },
+                lifetime: StateLifetime::Sequence,
+                capacity_demand: StateCapacityDemand::FixedPerScope,
+                initialization: StateInitialization::Zero,
+            });
+        }
         let main_work = if config.token_scaled_state {
             ProgramNodeWorkSpec::tokens(id("value.input"), 0)
         } else {
@@ -377,15 +449,35 @@ fn operation_with_resource_options_and_work(
     scratch: ResourcePresenceRequirement,
     token_scaled_state: bool,
 ) -> OperationDescriptor {
+    operation_with_resource_profile(
+        TestStateProfile {
+            zero_state,
+            token_scaled_state,
+            recurrent_state: false,
+        },
+        scratch,
+    )
+}
+
+fn operation_with_resource_profile(
+    state_profile: TestStateProfile,
+    scratch: ResourcePresenceRequirement,
+) -> OperationDescriptor {
     let mut inputs = vec![
-        if token_scaled_state {
+        if state_profile.token_scaled_state {
             token_tensor_contract(TensorAccess::Read)
         } else {
             tensor_contract(TensorAccess::Read)
         },
         tensor_contract(TensorAccess::Read),
     ];
-    if zero_state {
+    if state_profile.zero_state {
+        inputs.push(typed_tensor_contract(
+            ElementType::U8,
+            TensorAccess::ReadWrite,
+        ));
+    }
+    if state_profile.recurrent_state {
         inputs.push(typed_tensor_contract(
             ElementType::U8,
             TensorAccess::ReadWrite,
@@ -395,7 +487,7 @@ fn operation_with_resource_options_and_work(
         id: id("operation.main"),
         version: ContractVersion::new(1, 0),
         inputs,
-        outputs: vec![if token_scaled_state {
+        outputs: vec![if state_profile.token_scaled_state {
             token_tensor_contract(TensorAccess::Write)
         } else {
             tensor_contract(TensorAccess::Write)
@@ -441,20 +533,18 @@ fn catalog_with_resource_options_and_execution_semantics(
     execution_semantics: ProviderExecutionSemantics,
 ) -> CapabilityCatalog {
     catalog_with_resource_options_execution_semantics_and_storage(
-        zero_state,
+        TestStateProfile::from_zero_state(zero_state),
         scratch,
         execution_semantics,
-        false,
     )
 }
 
 fn catalog_with_resource_options_execution_semantics_and_storage(
-    zero_state: bool,
+    state_profile: TestStateProfile,
     scratch: ResourcePresenceRequirement,
     execution_semantics: ProviderExecutionSemantics,
-    paged_state: bool,
 ) -> CapabilityCatalog {
-    let operation = operation_with_resource_options_and_work(zero_state, scratch, paged_state);
+    let operation = operation_with_resource_profile(state_profile, scratch);
     let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
     let provider = OperationProviderDescriptor::new(
@@ -468,7 +558,7 @@ fn catalog_with_resource_options_execution_semantics_and_storage(
         capabilities.clone(),
         BTreeSet::from([id("weight-format.device-operation-composite")]),
         BTreeSet::new(),
-        storage_bindings(&operation, paged_state),
+        storage_bindings(&operation, state_profile),
         "resource-estimator.device-operation",
         ContractVersion::new(1, 0),
         sha('b'),
@@ -482,7 +572,7 @@ fn catalog_with_resource_options_execution_semantics_and_storage(
             total_memory_bytes: 1 << 20,
             runtime_implementation_fingerprint: sha('d'),
             capabilities: capabilities.clone(),
-            dynamic_storage_profiles: if paged_state {
+            dynamic_storage_profiles: if state_profile.token_scaled_state {
                 BTreeSet::from([contiguous_storage_profile(), paged_storage_profile()])
             } else {
                 BTreeSet::from([contiguous_storage_profile()])
@@ -956,22 +1046,58 @@ pub(crate) fn node_values_with_zero_state_for(
     output_value: &str,
     output_resource: &str,
 ) -> Vec<ResolvedValueBinding> {
+    node_values_with_state_profile_for(
+        input_value,
+        input_resource,
+        output_value,
+        output_resource,
+        TestStateProfile::fixed_sequence(),
+    )
+}
+
+pub(crate) fn node_values_with_state_profile_for(
+    input_value: &str,
+    input_resource: &str,
+    output_value: &str,
+    output_resource: &str,
+    state_profile: TestStateProfile,
+) -> Vec<ResolvedValueBinding> {
     let mut values = node_values_for(input_value, input_resource, output_value, output_resource);
-    values.insert(
-        2,
-        ResolvedValueBinding::new(
-            id("value.state"),
-            ResolvedValueRole::Input,
+    if state_profile.zero_state {
+        values.insert(
             2,
-            resolved_tensor_for(ElementType::U8),
-            TensorAccess::ReadWrite,
-            AliasPolicy::NoAlias,
-            BufferUsage::State,
-            None,
-            ResolvedValueStorage::single(id("resource.state"), 0, 4, ElementType::U8).unwrap(),
-        )
-        .unwrap(),
-    );
+            ResolvedValueBinding::new(
+                id("value.state"),
+                ResolvedValueRole::Input,
+                2,
+                resolved_tensor_for(ElementType::U8),
+                TensorAccess::ReadWrite,
+                AliasPolicy::NoAlias,
+                BufferUsage::State,
+                None,
+                ResolvedValueStorage::single(id("resource.state"), 0, 4, ElementType::U8).unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    if state_profile.recurrent_state {
+        values.insert(
+            3,
+            ResolvedValueBinding::new(
+                id("value.recurrent-state"),
+                ResolvedValueRole::Input,
+                3,
+                resolved_tensor_for(ElementType::U8),
+                TensorAccess::ReadWrite,
+                AliasPolicy::NoAlias,
+                BufferUsage::State,
+                None,
+                ResolvedValueStorage::single(id("resource.recurrent-state"), 0, 4, ElementType::U8)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
     values
 }
 
