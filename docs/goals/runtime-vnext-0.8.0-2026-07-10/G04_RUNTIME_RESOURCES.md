@@ -521,6 +521,39 @@ This is a formal PASS for the S1 CUDA decode-capacity supplemental lane, not the
 PASS. The 100,000-transition state model, aggregate failure/cancel/recovery artifact, canonical
 G04 tree, final `vnext-g04` validator, S2 product matrix, and performance gates remain Open.
 
+## 2026-08-03 Engine-Owned Product Lifecycle Checkpoint
+
+Clean pushed source `cc255661` closes the S2 multi-turn/concurrency sentinel on one RTX 4090 with
+real Qwen3.5-4B. Interactive `ferrum run` previously consumed the engine stream without writing a
+per-turn success/failure bundle, while the product observability writer could append a synthetic
+scheduler open/close beside the real engine events. That combination made multi-turn execution
+unverifiable and then produced two lifecycle pairs per request after the missing bundles were
+added.
+
+The corrected ownership boundary collects each interactive generation into the same typed result
+used by one-shot output, writes a replay bundle for each turn when observability is enabled, and
+keeps the default observability-off path free of those captures. Successful actual inference now
+requires the engine scheduler sink to own its lifecycle; the CLI writer retains profile, memory,
+failure, and replay artifacts but cannot synthesize a successful scheduler lifecycle. The final
+artifact contains `12` unique execution lifecycles: `5` run turns and `7` serve requests. Each of
+the five run request traces has exactly one engine request open and one engine request close.
+
+The CUDA validator records run five-turn default-budget recall, serve two-turn exact recall, and
+c1/c4 isolation. At c4, `4/4` requests completed with `max_in_flight=4`, all six request pairs
+overlapped, and crosstalk/error=`0`. It prints:
+
+```text
+FERRUM RUNTIME VNEXT S2 MULTITURN CONCURRENCY PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-multiturn-concurrency-cc255661-20260803/gate-r1
+FERRUM GATE vnext-s2-multiturn-concurrency PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-multiturn-concurrency-cc255661-20260803/gate-r1
+```
+
+The GitHub-verified archive is
+`runtime-vnext-s2-multiturn-concurrency-cc255661-cuda-pass-20260803.tar.zst`, SHA256
+`49918196a8d68de6b8de3403ac2dde4b4670412ca50c6135ee9e8ceb0e1b7a36`, in the draft
+[transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-74e720b07de638ea68c0).
+This is product-path evidence for G04 lifecycle ownership, not canonical G04 PASS; state-model,
+failure/cancel/recovery aggregation, allocation/performance, and final G04 validators remain Open.
+
 ## 性能约束
 
 - L1 reference workload scheduler bookkeeping 占 runtime wall time `<=5%`；真实 CUDA c32

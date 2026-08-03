@@ -95,6 +95,26 @@ G00 必须把 legacy `json_object` 的实际结果记录为锁定的 pass/known-
 G05 不得打印任何主模型迁移 PASS。它只完成产品组合与 API contract；G08 才把该 contract
 应用到三个真实模型和两个 backend。
 
+## 2026-08-03 S2 Multi-Turn/Concurrency Sentinel
+
+Clean pushed source `cc2556610d30749e761f85fafe25ccf1a13ce116` passes the focused real-model
+CUDA product sentinel for `ferrum run` five-turn default-budget recall, `ferrum serve` two-turn
+recall, and serve c1/c4 concurrent isolation. The reference-vLLM check was diagnostic only: both
+engines rejected or avoided repeating the original arbitrary project-secret prompt, while both
+could follow the stable `banana` codeword prompt. The gate therefore uses an exact answer on a
+model-supported instruction instead of treating reference-model refusal as a Ferrum state bug.
+
+The product change is independent of that oracle correction. Interactive `run` now emits one
+success/failure observability and replay bundle per turn. A successful request's scheduler
+lifecycle is owned only by the engine scheduler sink; the product writer cannot duplicate it or
+manufacture fallback evidence. The final artifact validates `12` unique lifecycles, five run
+request bundles, c4 `max_in_flight=4`, all six c4 overlap pairs, and zero crosstalk/error. Exact
+PASS lines and the GitHub-verified archive are recorded in [`GOAL.md`](GOAL.md).
+
+This closes only S2 multi-turn/concurrency. Response format, API/modality, Unicode stream and C09
+termination, tool/schema, determinism, historical resource, latency attribution, and the S2
+aggregate remain subject to the exact S2 exit contract.
+
 ## 兼容性
 
 保持已发布 CLI flag 和 OpenAI-compatible request shape，除非 migration guide 明确列为
