@@ -6747,6 +6747,10 @@ fn sequence_engine_timing_is_opt_in_and_matches_committed_tokens() {
         .unwrap()
         .expect("requested execution evidence");
     assert_eq!(evidence.prompt_token_ids, input);
+    assert_eq!(
+        evidence.output_token_ids,
+        vec![TokenId::new(3), TokenId::new(4)]
+    );
     let timing = evidence.engine_token_timing.expect("engine token timing");
     timing.validate(2).unwrap();
     assert_eq!(timing.token_commit_nanos_since_request_start.len(), 2);

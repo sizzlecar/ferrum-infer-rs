@@ -2619,11 +2619,22 @@ async fn handle_chat_completions_stream(
                             first_sse_enqueue_us
                                 .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         }
+                        let completion_token_count = chunk
+                            .usage
+                            .as_ref()
+                            .map(|usage| usage.completion_tokens)
+                            .unwrap_or(output_token_ids.len());
+                        let replay_output_token_ids = chunk
+                            .execution_evidence
+                            .as_ref()
+                            .map(|evidence| evidence.output_token_ids.as_slice())
+                            .filter(|tokens| tokens.len() == completion_token_count)
+                            .unwrap_or(output_token_ids.as_slice());
                         if let Err(err) = write_chat_request_completion_replay_bundle(
                             request_dump_dir.as_ref().map(|root| root.as_path()),
                             &replay_request_id,
                             &parsed_final.content,
-                            &output_token_ids,
+                            replay_output_token_ids,
                             final_finish_reason.as_deref(),
                         ) {
                             warn!("failed to write chat stream replay bundle: {}", err);
@@ -2640,7 +2651,7 @@ async fn handle_chat_completions_stream(
                                 first_engine_chunk_received_us,
                                 first_sse_enqueue_us,
                             },
-                            output_token_ids.len(),
+                            completion_token_count,
                             chunk.usage.as_ref(),
                             final_finish_reason.as_deref(),
                             None,
@@ -5823,6 +5834,9 @@ mod tests {
                 .capture_prompt_token_ids
                 .then(|| vec![TokenId::new(101), TokenId::new(202), TokenId::new(303)])
                 .unwrap_or_default(),
+            output_token_ids: (0..output_token_count)
+                .map(|index| TokenId::new(11 + index as u32))
+                .collect(),
             engine_token_timing: requested.capture_engine_token_timing.then(|| {
                 EngineTokenTimingEvidence {
                     clock_source: "rust_std_instant".to_string(),
@@ -5870,7 +5884,12 @@ mod tests {
                 }));
             }
             if let Some(chunks) = &self.stream_chunks {
-                let execution_evidence = stub_execution_evidence(&request, chunks.len());
+                let completion_token_count = self
+                    .stream_usage
+                    .as_ref()
+                    .map(|usage| usage.completion_tokens)
+                    .unwrap_or(chunks.len());
+                let execution_evidence = stub_execution_evidence(&request, completion_token_count);
                 let request_id = request.id;
                 let mut stream_chunks = Vec::with_capacity(
                     chunks.len() + usize::from(self.stream_final_chunk_separate),
@@ -9191,6 +9210,53 @@ mod tests {
         assert!(memory_event["memory"]["current_bytes"]
             .as_u64()
             .is_some_and(|bytes| bytes > 0));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(profile);
+    }
+
+    #[tokio::test]
+    async fn route_chat_stream_profile_retains_non_visible_terminal_token() {
+        let root = unique_request_dump_dir("chat-stream-profile-terminal-token");
+        let profile = unique_profile_jsonl("chat-stream-profile-terminal-token");
+        let llm = StubLlm {
+            stream_usage: Some(TokenUsage::new(5, 2)),
+            ..StubLlm::with_stream_chunks(&["Paris"])
+        };
+        let app = AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(llm))
+                .with_request_dump_dir(Some(root.clone()))
+                .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
+                .with_profile_jsonl(Some(profile.clone())),
+        )
+        .build_router();
+
+        let response = post_json(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "stream_options": {"include_usage": true}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("\"completion_tokens\":2"), "body: {body}");
+        assert!(body.contains("data: [DONE]"), "body: {body}");
+
+        let events = read_profile_events(&profile);
+        let event = events
+            .iter()
+            .find(|event| event["phase"] == "chat_completions_stream_complete")
+            .expect("stream completion profile event");
+        assert_eq!(event["attributes"]["output_token_count"], 2);
+        assert_eq!(event["attributes"]["completion_token_count"], 2);
+        assert_eq!(event["attributes"]["engine_token_commit_count"], 2);
+        assert_chat_success_replay_bundle(&root, &[11, 12], "stop", "Paris");
+
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(profile);
     }
