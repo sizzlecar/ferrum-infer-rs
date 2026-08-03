@@ -5,6 +5,37 @@
 Open。创建于 2026-07-10。
 
 截至 2026-08-03，clean、已推送 source
+`cc2556610d30749e761f85fafe25ccf1a13ce116` 已关闭当前 source 的 S2 CUDA
+multi-turn/concurrency sentinel。真实 Qwen3.5-4B CUDA 覆盖 `ferrum run` 五轮默认预算、
+`ferrum serve` 两轮 recall，以及 serve c1/c4 隔离；五轮 run 无 length finish，c4 达到
+`max_in_flight=4`、六对请求全部重叠且 crosstalk/error=`0`。共 `12` 个实际请求均有唯一
+engine-owned scheduler lifecycle，其中 run=`5`、serve=`7`。
+
+本轮先用同机 vLLM 作诊断 oracle，而不是 Ferrum 依赖或性能替代：旧的随机项目密钥提示在
+vLLM 和 Ferrum 上都会触发拒绝/不复述，不能证明多轮状态损坏；改为模型稳定遵循的
+`banana` codeword 后，两侧均可复述，Ferrum gate 仍要求 exact match。随后生产修复补齐交互式
+`run` 每轮 success/failure observability 和 replay bundle，并把成功请求的 scheduler 生命周期
+收敛到 engine 唯一 owner；CLI 不再重复写 synthetic open/close，也不能用 fallback 隐藏 engine
+trace 缺失。正式 validator 和统一 gate 分别打印：
+
+```text
+FERRUM RUNTIME VNEXT S2 MULTITURN CONCURRENCY PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-multiturn-concurrency-cc255661-20260803/gate-r1
+FERRUM GATE vnext-s2-multiturn-concurrency PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-multiturn-concurrency-cc255661-20260803/gate-r1
+```
+
+CUDA release build bounded duration 为 `403.82842s`，binary SHA256 为
+`41dcb29df52ebefc1052b990911a3f3f26e0ee697471a04ed51f1e8f8edbe605`。完整证据归档
+`runtime-vnext-s2-multiturn-concurrency-cc255661-cuda-pass-20260803.tar.zst` 的 SHA256 为
+`49918196a8d68de6b8de3403ac2dde4b4670412ca50c6135ee9e8ceb0e1b7a36`，已由 GPU 机直接上传
+到 draft [GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-74e720b07de638ea68c0)，
+并经 GitHub 回下载、SHA256、`zstd -t` 和 required-member 复验。
+
+该证据只关闭 S2 multi-turn/concurrency 子门，不等于完整 S2、G02、G04、G05、G06、性能、
+Metal 或 release PASS。由于当前 source 修改了 `run` 产品/观测路径，S2 aggregate 仍须在同一
+source identity 上收齐或按 change-impact 复验 S1 inputs、determinism、其余 product checkpoints、
+C09 abort/release、五项 historical resource、latency attribution，最后才能打印 S2 aggregate PASS。
+
+截至 2026-08-03，clean、已推送 source
 `61399d6907677af3373f543c01b5f0cad720dbe4` 已关闭当前 source 的 S1 CUDA
 decode execution-capacity 子门。此前物理 backing maintenance deferral 在 executor 到
 engine 的边界被折叠成 `None`，导致 scheduler trace 同时缺少 logical shortfall 和
