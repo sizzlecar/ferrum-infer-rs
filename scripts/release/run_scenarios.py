@@ -1331,8 +1331,8 @@ ADMISSION_QUIESCENT_FIELDS = (
     "queue_depth",
     "active_prefill",
     "active_decode",
-    "current_batch_size",
 )
+ADMISSION_OPTIONAL_COUNTER_FIELDS = ("current_batch_size",)
 
 
 def admission_health_snapshot(base_url: str, timeout: float) -> dict[str, Any]:
@@ -1343,12 +1343,20 @@ def admission_health_snapshot(base_url: str, timeout: float) -> dict[str, Any]:
     data = parse_json_response("admission health", status, body)
     admission = data.get("admission")
     require(isinstance(admission, dict), "health response is missing admission object")
-    counters: dict[str, int] = {}
+    counters: dict[str, int | None] = {}
     for key in ("effective_max_concurrent", *ADMISSION_QUIESCENT_FIELDS):
         value = admission.get(key)
         require(
             isinstance(value, int) and not isinstance(value, bool) and value >= 0,
             f"health admission.{key} must be a non-negative integer: {admission}",
+        )
+        counters[key] = value
+    for key in ADMISSION_OPTIONAL_COUNTER_FIELDS:
+        value = admission.get(key)
+        require(
+            value is None
+            or (isinstance(value, int) and not isinstance(value, bool) and value >= 0),
+            f"health admission.{key} must be null or a non-negative integer: {admission}",
         )
         counters[key] = value
     return {
@@ -3522,7 +3530,7 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
                         "queue_depth": 0,
                         "active_prefill": 0,
                         "active_decode": active,
-                        "current_batch_size": active,
+                        "current_batch_size": active if active > 0 else None,
                     },
                 },
             )

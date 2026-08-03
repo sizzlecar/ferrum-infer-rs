@@ -63,7 +63,7 @@ BAD_TEXT = (
     "segmentation fault",
     "panicked at",
 )
-QUIESCENT_FIELDS = ("queue_depth", "active_prefill", "active_decode", "current_batch_size")
+QUIESCENT_FIELDS = ("queue_depth", "active_prefill", "active_decode")
 
 
 class ValidationError(RuntimeError):
@@ -482,6 +482,11 @@ def validate_quiescent(value: dict[str, Any], label: str) -> None:
     require(admission.get("effective_max_concurrent") == 1, f"{label}: capacity mismatch")
     for key in QUIESCENT_FIELDS:
         require(admission.get(key) == 0, f"{label}: {key} is not quiescent")
+    current_batch_size = admission.get("current_batch_size")
+    require(
+        current_batch_size is None or current_batch_size == 0,
+        f"{label}: optional current_batch_size is not quiescent",
+    )
 
 
 def validate_resource_balance(rows: list[dict[str, Any]], request_id: str) -> None:
