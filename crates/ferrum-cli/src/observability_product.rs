@@ -937,7 +937,7 @@ fn actual_run_failure_events(
         config,
         &observation.request_id,
         "actual_run_generation_failed",
-        ProfileEventKind::Error,
+        ProfileEventKind::TimedSpan,
         base + Duration::microseconds(20),
     );
     failure.status = ProfileStatus::Failure;
@@ -2302,9 +2302,16 @@ mod tests {
         )
         .unwrap();
         let profile = fs::read_to_string(root.join("profile.jsonl")).unwrap();
-        assert!(profile.contains("\"status\":\"failure\""));
-        assert!(profile.contains("\"terminal_failure_event\":true"));
-        assert!(!profile.contains("\"first_failure_event\":true"));
+        let failure = profile
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["phase"] == "actual_run_generation_failed")
+            .expect("run failure profile event");
+        assert_eq!(failure["event_kind"], "timed_span");
+        assert_eq!(failure["status"], "failure");
+        assert_eq!(failure["duration_us"], 42);
+        assert_eq!(failure["attributes"]["terminal_failure_event"], true);
+        assert!(failure["attributes"]["first_failure_event"].is_null());
         let bundle_dir = root.join("request_dump").join(&request_id);
         assert!(bundle_dir.join("failure_diagnostics.json").is_file());
         let scan: serde_json::Value = serde_json::from_str(

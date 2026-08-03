@@ -1308,8 +1308,9 @@ def fixture_failure_events(entrypoint: str, request_id: str, *, recovery: bool) 
         entrypoint,
         product_phase,
         101,
-        kind="error",
+        kind="timed_span",
         status="failure",
+        duration_us=5_000,
         attributes={
             "execution_request_id": request_id,
             "terminal_failure_event": True,
@@ -1329,7 +1330,7 @@ def fixture_failure_events(entrypoint: str, request_id: str, *, recovery: bool) 
         },
     )
     events = [
-        base_event(request_id, entrypoint, "request_execution_started", 1, kind="timed_span", duration_us=1),
+        base_event(request_id, entrypoint, "request_execution_started", 1),
         submitted,
         failure,
         sequence_aborted,
