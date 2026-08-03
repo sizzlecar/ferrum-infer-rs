@@ -46,6 +46,7 @@
         "evidence": "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md"
       },
       "files": [
+        {"path": "chat_template.jinja", "required": true},
         {"path": "config.json", "required": true},
         {"path": "tokenizer_config.json", "required": true},
         {"path": "tokenizer.json", "required": true},
@@ -56,9 +57,10 @@
       "reference": {
         "semantic_repo": "Qwen/Qwen3.5-4B",
         "semantic_revision": {"status": "same_as_weight_revision"},
-        "required_semantic_files": ["README.md", "config.json", "tokenizer_config.json", "tokenizer.json"],
+        "required_semantic_files": ["README.md", "chat_template.jinja", "config.json", "tokenizer_config.json", "tokenizer.json"],
         "semantic_file_sha256": {
           "README.md": "1406be1b6b8fd8a6545870da516912804756593628a1d0fb0a7965211e82a7bb",
+          "chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
           "config.json": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
           "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
           "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
@@ -98,9 +100,10 @@
       "reference": {
         "semantic_repo": "Qwen/Qwen3.5-4B",
         "semantic_revision": {"status": "pinned", "value": "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"},
-        "required_semantic_files": ["README.md", "config.json", "tokenizer_config.json", "tokenizer.json"],
+        "required_semantic_files": ["README.md", "chat_template.jinja", "config.json", "tokenizer_config.json", "tokenizer.json"],
         "semantic_file_sha256": {
           "README.md": "1406be1b6b8fd8a6545870da516912804756593628a1d0fb0a7965211e82a7bb",
+          "chat_template.jinja": "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
           "config.json": "ddc63e1c717afa86c865bb5e01313d89d72bb53b97ad4a8a03ba8510c0621670",
           "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
           "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
@@ -134,6 +137,7 @@
         "evidence": "docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_vllm_h256_smoke_178d76fa_20260619T180824Z/lane_contract.json"
       },
       "files": [
+        {"path": "chat_template.jinja", "required": true},
         {"path": "config.json", "required": true},
         {"path": "generation_config.json", "required": true},
         {"path": "tokenizer_config.json", "required": true},
