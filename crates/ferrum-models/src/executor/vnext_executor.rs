@@ -55,11 +55,13 @@ use super::{
 };
 
 mod determinism;
+mod request;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
     VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
     MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
+use request::{terminalize_unsubmitted_session, VNextRequestRoot};
 
 const POLICY_ID: &str = "policy.ferrum.product.vnext.default";
 const POLICY_VERSION: ContractVersion = ContractVersion::new(3, 0);
@@ -2157,7 +2159,7 @@ impl VNextExecutionJournal {
 
 struct VNextSequence<R: DeviceRuntime> {
     cache_id: String,
-    request_id: RequestId,
+    request: Arc<VNextRequestRoot<R>>,
     session: Arc<SequenceSession<R>>,
     active_binding: Arc<TrustedActiveSequenceBinding>,
     tokens: Mutex<Vec<u32>>,
@@ -2228,11 +2230,15 @@ fn validate_sequence_completion_accounting(
 }
 
 impl<R: DeviceRuntime> VNextSequence<R> {
+    fn request_id(&self) -> &RequestId {
+        self.request.product_request_id()
+    }
+
     fn preempt_for_recompute(&self) -> Result<()> {
         if !self.active.load(Ordering::Acquire) {
             return Err(FerrumError::already_exists(format!(
                 "vNext request `{}` is already terminal",
-                self.request_id
+                self.request_id()
             )));
         }
         self.session
@@ -2244,7 +2250,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
 
     fn complete(&self, completion: &ExecutorSequenceCompletion) -> Result<()> {
         if let Err(error) = validate_sequence_completion_accounting(
-            &self.request_id,
+            self.request_id(),
             self.product_prompt_tokens,
             self.replayed_output_tokens,
             completion,
@@ -2263,7 +2269,7 @@ impl<R: DeviceRuntime> VNextSequence<R> {
         if !self.active.swap(false, Ordering::AcqRel) {
             return Err(FerrumError::already_exists(format!(
                 "vNext request `{}` is already terminal",
-                self.request_id
+                self.request_id()
             )));
         }
         let receipt = self.session.try_complete().map_err(|error| {
@@ -2571,7 +2577,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         if self
             .active
             .values()
-            .any(|sequence| sequence.request_id == *request_id)
+            .any(|sequence| sequence.request_id() == request_id)
         {
             return Err(FerrumError::already_exists(format!(
                 "vNext request `{request_id}` is already active"
@@ -2879,12 +2885,12 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
             return true;
         }
 
-        let Some(slot) = self.prefills.get(&sequence.request_id).cloned() else {
+        let Some(slot) = self.prefills.get(sequence.request_id()).cloned() else {
             return false;
         };
         if !self
             .prefills
-            .get(&sequence.request_id)
+            .get(sequence.request_id())
             .is_some_and(|current| Arc::ptr_eq(current, &slot))
         {
             return false;
@@ -2902,7 +2908,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         *state = VNextPrefillSlotState::Terminal;
         slot.cancelled.store(true, Ordering::Release);
         drop(state);
-        self.prefills.remove(&sequence.request_id);
+        self.prefills.remove(sequence.request_id());
         sequence.abort();
         true
     }
@@ -2927,7 +2933,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
         let sequence = retained.or_else(|| {
             self.active
                 .get(preemption.cache_id())
-                .filter(|sequence| sequence.request_id == *preemption.request_id())
+                .filter(|sequence| sequence.request_id() == preemption.request_id())
                 .cloned()
         });
         let Some(sequence) = sequence else {
@@ -2986,7 +2992,7 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
                 let detail = self
                     .active
                     .values()
-                    .find(|sequence| sequence.request_id == *request_id)
+                    .find(|sequence| sequence.request_id() == request_id)
                     .map_or_else(
                         || "no active sequence".to_string(),
                         |sequence| format!("active cache is {}", sequence.cache_id),
@@ -2995,11 +3001,11 @@ impl<R: DeviceRuntime> VNextSequenceRegistry<R> {
                     "vNext request `{request_id}` preemption did not match an authority: {detail}"
                 ))
             })?;
-        if sequence.request_id != *request_id {
+        if sequence.request_id() != request_id {
             return Err(FerrumError::request_validation(format!(
                 "vNext cache `{}` belongs to request {}, not {request_id}",
                 preemption.cache_id(),
-                sequence.request_id
+                sequence.request_id()
             )));
         }
         sequence.preempt_for_recompute()?;
@@ -3169,7 +3175,7 @@ impl<'executor, R: DeviceRuntime> VNextStartupSequenceGuard<'executor, R> {
         if retained.iter().any(|(request_id, sequence)| {
             sequence
                 .as_ref()
-                .is_none_or(|sequence| sequence.request_id != *request_id)
+                .is_none_or(|sequence| sequence.request_id() != request_id)
         }) {
             for sequence in retained.into_iter().filter_map(|(_, sequence)| sequence) {
                 sequence.abort();
@@ -4543,7 +4549,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             request_origin.namespace()
         ))
         .map_err(|error| FerrumError::internal(error.to_string()))?;
-        let session = match self.try_admit_sequence(identity, work)? {
+        let session = match self.try_admit_sequence(identity.clone(), work)? {
             VNextSequenceAdmissionDecision::Admitted(session) => session,
             VNextSequenceAdmissionDecision::Deferred(deferred) => {
                 if deferred.action() == DeferredAction::AwaitBackingGrowth {
@@ -4565,37 +4571,41 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let active_binding = match TrustedActiveSequenceBinding::from_session(&session) {
             Ok(active_binding) => Arc::new(active_binding),
             Err(error) => {
-                let _ = session.request_cancel();
-                let _ = session.try_abort();
-                return Err(FerrumError::backend(error.to_string()));
+                return Err(terminalize_unsubmitted_session(
+                    &session,
+                    FerrumError::backend(error.to_string()),
+                ));
             }
         };
         let events = match self.execution_journal(&active_binding, request_origin) {
             Ok(events) => events,
             Err(error) => {
-                let _ = session.request_cancel();
-                let _ = session.try_abort();
-                return Err(error);
+                return Err(terminalize_unsubmitted_session(&session, error));
             }
         };
         let product_prompt_tokens = match u64::try_from(product_prompt_tokens) {
             Ok(product_prompt_tokens) => product_prompt_tokens,
             Err(_) => {
-                let _ = session.request_cancel();
-                let _ = session.try_abort();
-                return Err(FerrumError::request_validation(
-                    "product prompt token count exceeds u64",
+                return Err(terminalize_unsubmitted_session(
+                    &session,
+                    FerrumError::request_validation("product prompt token count exceeds u64"),
                 ));
             }
         };
         let replayed_output_tokens = match u64::try_from(replayed_output_tokens) {
             Ok(replayed_output_tokens) => replayed_output_tokens,
             Err(_) => {
-                let _ = session.request_cancel();
-                let _ = session.try_abort();
-                return Err(FerrumError::request_validation(
-                    "replayed output token count exceeds u64",
+                return Err(terminalize_unsubmitted_session(
+                    &session,
+                    FerrumError::request_validation("replayed output token count exceeds u64"),
                 ));
+            }
+        };
+        let request = match VNextRequestRoot::bind_initial(request_id.clone(), &identity, &session)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return Err(terminalize_unsubmitted_session(&session, error));
             }
         };
         let sequence = Arc::new(VNextSequence {
@@ -4604,7 +4614,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 session.sequence_authority().sparse_id(),
                 session.sequence_authority().generation()
             ),
-            request_id: request_id.clone(),
+            request,
             session,
             active_binding,
             tokens: Mutex::new(tokens),
@@ -4880,7 +4890,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 deferral,
                                 backing_attempts,
                                 &maintenance_receipts,
-                                vec![sequence.request_id.clone()],
+                                vec![sequence.request_id().clone()],
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
                     }
@@ -4913,7 +4923,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 deferral,
                                 backing_attempts,
                                 &maintenance_receipts,
-                                vec![sequence.request_id.clone()],
+                                vec![sequence.request_id().clone()],
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
                     }
@@ -5130,7 +5140,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 &maintenance_receipts,
                                 sequences
                                     .iter()
-                                    .map(|sequence| sequence.request_id.clone())
+                                    .map(|sequence| sequence.request_id().clone())
                                     .collect(),
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
@@ -5166,7 +5176,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 &maintenance_receipts,
                                 sequences
                                     .iter()
-                                    .map(|sequence| sequence.request_id.clone())
+                                    .map(|sequence| sequence.request_id().clone())
                                     .collect(),
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
@@ -5329,7 +5339,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 &maintenance_receipts,
                                 sequences
                                     .iter()
-                                    .map(|sequence| sequence.request_id.clone())
+                                    .map(|sequence| sequence.request_id().clone())
                                     .collect(),
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
@@ -5365,7 +5375,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 &maintenance_receipts,
                                 sequences
                                     .iter()
-                                    .map(|sequence| sequence.request_id.clone())
+                                    .map(|sequence| sequence.request_id().clone())
                                     .collect(),
                             )
                             .map(VNextExecutionCapacityDecision::Deferred);
@@ -5397,9 +5407,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             .blockers()
                             .iter()
                             .any(|blocker| blocker.request() == request_authority)
-                            && !request_ids.contains(&sequence.request_id)
+                            && !request_ids.contains(sequence.request_id())
                         {
-                            request_ids.push(sequence.request_id.clone());
+                            request_ids.push(sequence.request_id().clone());
                         }
                     }
                     return ExecutorRequestStateDeferral::new(
@@ -6012,30 +6022,43 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ))
                     }
                 };
-            let wave =
-                match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)? {
-                    VNextExecutionCapacityDecision::Ready(wave) => wave,
-                    VNextExecutionCapacityDecision::Deferred(deferred) => {
-                        step.try_rollback_unsubmitted().map_err(|failure| {
-                            FerrumError::backend(format!(
-                                "vNext capacity-deferred unsubmitted step rollback failed: {}",
+            let wave_decision =
+                match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        let error = match step.try_rollback_unsubmitted() {
+                            Ok(_) => error,
+                            Err(failure) => FerrumError::backend(format!(
+                                "{error}; vNext failed-wave unsubmitted step rollback failed: {}",
                                 failure.error()
-                            ))
-                        })?;
-                        return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
-                    }
-                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
-                        step.try_rollback_unsubmitted().map_err(|failure| {
-                            FerrumError::backend(format!(
-                                "vNext readiness-deferred unsubmitted step rollback failed: {}",
-                                failure.error()
-                            ))
-                        })?;
-                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
-                            deferred,
-                        ));
+                            )),
+                        };
+                        return Err(error);
                     }
                 };
+            let wave = match wave_decision {
+                VNextExecutionCapacityDecision::Ready(wave) => wave,
+                VNextExecutionCapacityDecision::Deferred(deferred) => {
+                    step.try_rollback_unsubmitted().map_err(|failure| {
+                        FerrumError::backend(format!(
+                            "vNext capacity-deferred unsubmitted step rollback failed: {}",
+                            failure.error()
+                        ))
+                    })?;
+                    return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                }
+                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                    step.try_rollback_unsubmitted().map_err(|failure| {
+                        FerrumError::backend(format!(
+                            "vNext readiness-deferred unsubmitted step rollback failed: {}",
+                            failure.error()
+                        ))
+                    })?;
+                    return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                        deferred,
+                    ));
+                }
+            };
             PreparedVNextPrefill { step, wave }
         };
         let participants = sequences
@@ -6363,7 +6386,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                                 })?;
                             product_output_records.push(capture.write_product_output(
                                 capture_claim,
-                                &participant.sequence.request_id,
+                                participant.sequence.request_id(),
                                 participant.span,
                                 output_mode.checkpoint_mode(),
                                 output,
@@ -6387,7 +6410,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     })?;
                     checkpoint_records.push(capture.write_output(
                         capture_claim,
-                        &participant.sequence.request_id,
+                        participant.sequence.request_id(),
                         participant.span,
                         checkpoint,
                         output,
@@ -6713,7 +6736,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         for (original_index, input) in inputs.iter().enumerate() {
             let cache_id = input.kv_cache.cache_id();
             let sequence = self.sequence_for_cache(&cache_id)?;
-            if input.request_id != sequence.request_id {
+            if &input.request_id != sequence.request_id() {
                 return Err(FerrumError::request_validation(
                     "vNext batch-decode request identity differs from its cache owner",
                 ));
@@ -6933,7 +6956,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let request_id = input
                 .request_id
                 .clone()
-                .unwrap_or_else(|| sequence.request_id.clone());
+                .unwrap_or_else(|| sequence.request_id().clone());
             let typed = PlanRuntimeDecodeInput::new(
                 request_id,
                 TokenId::new(*input_token),
@@ -7262,7 +7285,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let mut operation_guards = Vec::with_capacity(candidates.len());
         for candidate in &candidates {
             operation_guards.push(candidate.sequence.operation.lock().await);
-            if candidate.sequence.request_id != candidate.slot.request_id
+            if candidate.sequence.request_id() != &candidate.slot.request_id
                 || candidate.sequence.maximum_tokens != candidate.maximum_tokens
                 || *candidate.sequence.tokens.lock() != candidate.tokens
             {
@@ -8200,7 +8223,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         if input
             .request_id
             .as_ref()
-            .is_some_and(|request_id| request_id != &sequence.request_id)
+            .is_some_and(|request_id| request_id != sequence.request_id())
         {
             return Err(FerrumError::request_validation(
                 "vNext decode request identity differs from its cache owner",
@@ -8315,7 +8338,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         let sequence = handle.sequence.upgrade().ok_or_else(|| {
             FerrumError::not_found("vNext prefill discard sequence is no longer retained")
         })?;
-        if authority.request_id() != &sequence.request_id
+        if authority.request_id() != sequence.request_id()
             || authority.committed_tokens() != handle.num_tokens()
             || handle.cache_id != sequence.cache_id
         {
