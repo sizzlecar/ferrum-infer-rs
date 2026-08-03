@@ -522,7 +522,7 @@ fn maximum_active_sequence_ceiling_is_nonzero_and_o_graph() {
 
     let mut expected_rows = None;
     let mut expected_provider_formula = None;
-    for maximum_active_sequences in [1, 32, u32::MAX] {
+    for maximum_active_sequences in [1, 32, 4096, u32::MAX] {
         let policy = policy_with(1 << 20, 128, maximum_active_sequences).unwrap();
         let planning = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
         let resolution = node_resolution(&family, &catalog, &policy, 0, &planning);

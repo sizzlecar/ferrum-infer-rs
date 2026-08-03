@@ -1265,40 +1265,33 @@ mod tests {
             )
             .unwrap();
 
-        let unrelated_epochs = AdmissionWakeEpochs::new(coordinator_id, 0, 1, 0);
-        let unrelated_availability = [
-            CapacityAvailabilityEpoch::new(domain_1, 1).unwrap(),
-            CapacityAvailabilityEpoch::new(domain_2, 2).unwrap(),
-        ];
         let mut skipped = Vec::new();
-        let unrelated = queue
-            .schedule_into_observed(
-                AdmissionWakeSnapshot::new(unrelated_epochs, &unrelated_availability),
-                1,
-                1,
-                &mut events,
-                |_, _, deferral| skipped.push(deferral.clone()),
-                |_| panic!("an unrelated domain change must not re-probe admission"),
-            )
-            .unwrap();
-        assert_eq!(unrelated.skipped_unchanged(), 1);
-        assert_eq!(skipped[0].observed(), unrelated_epochs);
+        for event in 1..=10_000_u64 {
+            let unrelated_epochs = AdmissionWakeEpochs::new(coordinator_id, 0, event, 0);
+            let unrelated_availability = [
+                CapacityAvailabilityEpoch::new(domain_1, 1).unwrap(),
+                CapacityAvailabilityEpoch::new(domain_2, event + 1).unwrap(),
+            ];
+            let unrelated = queue
+                .schedule_into_observed(
+                    AdmissionWakeSnapshot::new(unrelated_epochs, &unrelated_availability),
+                    1,
+                    1,
+                    &mut events,
+                    |_, _, deferral| skipped.push(deferral.clone()),
+                    |_| panic!("an unrelated domain change must not re-probe admission"),
+                )
+                .unwrap();
+            assert_eq!(unrelated.probed(), 0);
+            assert_eq!(unrelated.skipped_unchanged(), 1);
+            assert_eq!(skipped.last().unwrap().observed(), unrelated_epochs);
+        }
+        assert_eq!(skipped.len(), 10_000);
 
-        let repeated = queue
-            .schedule_into(
-                AdmissionWakeSnapshot::new(unrelated_epochs, &unrelated_availability),
-                1,
-                1,
-                &mut events,
-                |_| panic!("a repeated unrelated wake must remain suppressed"),
-            )
-            .unwrap();
-        assert_eq!(repeated.skipped_unchanged(), 1);
-
-        let relevant_epochs = AdmissionWakeEpochs::new(coordinator_id, 0, 2, 0);
+        let relevant_epochs = AdmissionWakeEpochs::new(coordinator_id, 0, 10_001, 0);
         let relevant_availability = [
             CapacityAvailabilityEpoch::new(domain_1, 2).unwrap(),
-            CapacityAvailabilityEpoch::new(domain_2, 2).unwrap(),
+            CapacityAvailabilityEpoch::new(domain_2, 10_001).unwrap(),
         ];
         let relevant = queue
             .schedule_into(
@@ -1312,6 +1305,7 @@ mod tests {
         assert_eq!(relevant.probed(), 1);
         assert_eq!(relevant.admitted(), 1);
         assert!(queue.is_empty());
+        println!("FERRUM G04 UNRELATED WAKE PASS: events=10000 probes=0 retries=1");
     }
 
     #[test]
