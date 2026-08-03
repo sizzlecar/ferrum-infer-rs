@@ -68,6 +68,88 @@ fn system_time_unix_nanos(time: SystemTime) -> Result<i64> {
         .map_err(|_| FerrumError::internal("system clock Unix nanos exceed i64"))
 }
 
+/// Request-local token history visible to logits processors and samplers.
+///
+/// Hidden reasoning and the visible structured result are distinct output
+/// domains. Keeping the boundary and frequency table together prevents a
+/// caller from slicing `previous_tokens` without also rebuilding additive and
+/// multiplicative penalty counts.
+#[derive(Debug, Default)]
+pub(super) struct SequenceSamplingHistory {
+    start_token_index: usize,
+    token_frequencies: HashMap<TokenId, usize>,
+}
+
+impl SequenceSamplingHistory {
+    pub(super) fn align_to(
+        &mut self,
+        start_token_index: usize,
+        generated_tokens: &[TokenId],
+    ) -> Result<bool> {
+        if start_token_index > generated_tokens.len() {
+            return Err(FerrumError::internal(format!(
+                "sampling history starts at token {start_token_index}, beyond generated length {}",
+                generated_tokens.len()
+            )));
+        }
+        if self.start_token_index == start_token_index {
+            return Ok(false);
+        }
+        self.start_token_index = start_token_index;
+        self.rebuild(generated_tokens);
+        Ok(true)
+    }
+
+    pub(super) fn reset_to_full_generation(&mut self, generated_tokens: &[TokenId]) {
+        self.start_token_index = 0;
+        self.rebuild(generated_tokens);
+    }
+
+    fn rebuild(&mut self, generated_tokens: &[TokenId]) {
+        self.token_frequencies.clear();
+        for &token in &generated_tokens[self.start_token_index..] {
+            *self.token_frequencies.entry(token).or_insert(0) += 1;
+        }
+    }
+
+    pub(super) fn record(&mut self, token: TokenId) {
+        *self.token_frequencies.entry(token).or_insert(0) += 1;
+    }
+
+    pub(super) fn previous_tokens<'a>(
+        &self,
+        generated_tokens: &'a [TokenId],
+    ) -> Result<&'a [TokenId]> {
+        generated_tokens
+            .get(self.start_token_index..)
+            .ok_or_else(|| {
+                FerrumError::internal(format!(
+                    "sampling history starts at token {}, beyond generated length {}",
+                    self.start_token_index,
+                    generated_tokens.len()
+                ))
+            })
+    }
+
+    pub(super) fn token_frequencies(&self) -> &HashMap<TokenId, usize> {
+        &self.token_frequencies
+    }
+
+    pub(super) fn start_token_index(&self) -> usize {
+        self.start_token_index
+    }
+
+    pub(super) fn token_count(&self, generated_tokens: &[TokenId]) -> usize {
+        generated_tokens
+            .len()
+            .saturating_sub(self.start_token_index)
+    }
+
+    pub(super) fn unique_token_count(&self) -> usize {
+        self.token_frequencies.len()
+    }
+}
+
 /// State of a running sequence in the continuous batch.
 #[derive(Debug)]
 pub struct SequenceState {
@@ -116,8 +198,8 @@ pub struct SequenceState {
     /// Tokenizer-aware hard grammar for `json_object` and strict schema.
     pub structured_output_processor: Option<StructuredOutputProcessor>,
     pub(super) draft_kv: Option<SequenceDraftKvState>,
-    /// Generated-token counts shared by repetition, presence, and frequency penalties.
-    pub token_frequencies: HashMap<TokenId, usize>,
+    /// Generated-token history scoped to the active typed output domain.
+    pub(super) sampling_history: SequenceSamplingHistory,
     /// Single-token stop ids: model's EOS + any `stop_sequences` that encode to
     /// exactly one token. Checked against the last generated token each step
     /// — replaces the old "token id near top of vocab = EOS" placeholder. Built
@@ -641,7 +723,7 @@ impl SequenceState {
             preemption_count: 0,
             structured_output_processor,
             draft_kv: None,
-            token_frequencies: HashMap::new(),
+            sampling_history: SequenceSamplingHistory::default(),
             stop_token_ids,
             model_eos_token_ids,
             response_completion_state,
@@ -1134,11 +1216,11 @@ impl SequenceState {
         if penalty == 1.0 || self.generated_tokens.is_empty() {
             return None;
         }
-        let token_ids: Vec<u32> = self
-            .generated_tokens
-            .iter()
-            .map(|token| token.get())
-            .collect();
+        let visible_tokens = self
+            .sampling_history
+            .previous_tokens(&self.generated_tokens)
+            .ok()?;
+        let token_ids: Vec<u32> = visible_tokens.iter().map(|token| token.get()).collect();
         if token_ids.is_empty() {
             None
         } else {
@@ -1223,7 +1305,7 @@ impl SequenceState {
         }
 
         self.accept_response_completion_token(tokenizer, token)?;
-        *self.token_frequencies.entry(token).or_insert(0) += 1;
+        self.sampling_history.record(token);
         Ok(())
     }
 
@@ -1303,9 +1385,11 @@ impl SequenceState {
             || (self.generated_tokens.is_empty() && self.initial_argmax_token_mask.is_some())
     }
 
-    pub fn reset_guided_processors(&self) -> Result<()> {
+    pub fn reset_guided_processors(&mut self) -> Result<()> {
         if let Some(processor) = &self.structured_output_processor {
             processor.reset()?;
+            self.sampling_history
+                .reset_to_full_generation(&self.generated_tokens);
         }
         Ok(())
     }
@@ -1368,6 +1452,7 @@ impl SequenceState {
         // fallback: a dead grammar state is a request error, not permission to
         // return malformed JSON.
         let mut required_structured_delimiter_token_id = None;
+        let mut grammar_start_token_index = None;
         if let Some(processor) = &self.structured_output_processor {
             let constraint = processor.mask_logits_with_terminals(
                 logits,
@@ -1376,9 +1461,14 @@ impl SequenceState {
                 &self.allowed_extended_token_ids,
             )?;
             required_structured_delimiter_token_id = constraint.required_delimiter_token_id;
+            grammar_start_token_index = constraint.grammar_start_token_index;
             if !constraint.accepting {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
+        }
+        if let Some(start_token_index) = grammar_start_token_index {
+            self.sampling_history
+                .align_to(start_token_index, &self.generated_tokens)?;
         }
         if !self.response_completion_state.allows_model_eos() {
             for &token_id in &self.model_eos_token_ids {
@@ -1422,12 +1512,15 @@ impl SequenceState {
         let vocab_size = logits.len();
         let previous_streamed_text_len = self.streamed_text_len;
         let token = {
+            let previous_tokens = self
+                .sampling_history
+                .previous_tokens(&self.generated_tokens)?;
             let mut ctx = SamplingContext::new(
                 step,
                 &self.sampling_params,
                 logits,
-                &self.generated_tokens,
-                &self.token_frequencies,
+                previous_tokens,
+                self.sampling_history.token_frequencies(),
                 vocab_size,
             );
             self.sampling_plan.processor_chain.process(&mut ctx)?;
@@ -1475,8 +1568,7 @@ impl SequenceState {
         };
 
         self.accept_response_completion_token(tokenizer, token)?;
-        // Update frequency tracking
-        *self.token_frequencies.entry(token).or_insert(0) += 1;
+        self.sampling_history.record(token);
 
         Ok(token)
     }

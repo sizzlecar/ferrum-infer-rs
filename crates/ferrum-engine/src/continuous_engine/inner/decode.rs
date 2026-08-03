@@ -967,7 +967,7 @@ impl EngineInner {
                 let mut sequences = self.sequences.write();
                 if let Some(seq) = sequences.get_mut(request_id) {
                     seq.generated_tokens.push(tok);
-                    *seq.token_frequencies.entry(tok).or_insert(0) += 1;
+                    seq.sampling_history.record(tok);
                     seq.tokens_this_iteration += 1;
                     seq.record_generated_token_commit();
                 }
