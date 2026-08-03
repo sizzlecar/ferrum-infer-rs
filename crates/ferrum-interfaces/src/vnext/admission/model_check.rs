@@ -198,6 +198,7 @@ struct StateModelReport {
     seed: u64,
     seed_derivation: &'static str,
     seeded_state_sequence_count: usize,
+    unique_seed_count: usize,
     scripted_state_sequence_count: usize,
     transition_count: u64,
     minimum_transitions_per_seeded_sequence: usize,
@@ -1183,6 +1184,7 @@ fn seeded_admission_state_model_checks_one_hundred_thousand_state_sequences() {
     let mut max_final_active_sequences = 0_u32;
     let mut max_final_active_child_claims = 0_u64;
     let mut max_final_used = [0_u64; 2];
+    let mut unique_seeds = BTreeSet::new();
 
     let mut absorb = |run: StateModelRunReport| {
         assert_eq!(run.leaked_resources, 0);
@@ -1202,7 +1204,12 @@ fn seeded_admission_state_model_checks_one_hundred_thousand_state_sequences() {
 
     absorb(scripted_boundary_sequence());
     for ordinal in 0..SEEDED_STATE_SEQUENCE_COUNT {
-        let mut rng = DeterministicRng::new(state_sequence_seed(ordinal));
+        let seed = state_sequence_seed(ordinal);
+        assert!(
+            unique_seeds.insert(seed),
+            "duplicate state-model seed {seed}"
+        );
+        let mut rng = DeterministicRng::new(seed);
         let transition_limit = MIN_TRANSITIONS_PER_SEQUENCE
             + rng.index(MAX_TRANSITIONS_PER_SEQUENCE - MIN_TRANSITIONS_PER_SEQUENCE + 1);
         let mut model = AdmissionStateModel::new();
@@ -1283,6 +1290,7 @@ fn seeded_admission_state_model_checks_one_hundred_thousand_state_sequences() {
         seed: SEED,
         seed_derivation: "splitmix64(base_seed xor ordinal*golden_ratio) | 1",
         seeded_state_sequence_count: SEEDED_STATE_SEQUENCE_COUNT,
+        unique_seed_count: unique_seeds.len(),
         scripted_state_sequence_count: 1,
         transition_count,
         minimum_transitions_per_seeded_sequence: MIN_TRANSITIONS_PER_SEQUENCE,
