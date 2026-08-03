@@ -25,11 +25,11 @@ use super::{
     LogicalBackingSliceAllocationEvidence, LogicalBackingSliceAuthority,
     LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard, PlanNode,
     PlannedDynamicGrowth, PreparedBackingClaim, PreparedBackingExtent, PreparedLaneBackingClaim,
-    ProgramBindingLayout, QuarantinedDynamicChunk, ResidentChunkBacking, ResidentChunkState,
-    ResourceId, ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId,
-    Sha256, StateInitialization, StaticProvisioningBinding, StepResourceSlotKind,
-    SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout, TransactionId, VNextError,
-    NEXT_DYNAMIC_POOL_INSTANCE_ID,
+    ProgramBindingLayout, QuarantinedDynamicChunk, RequestStateHazardCoordinator,
+    ResidentChunkBacking, ResidentChunkState, ResourceId, ResourceReservation,
+    ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Sha256, StateInitialization,
+    StaticProvisioningBinding, StepResourceSlotKind, SubmissionWaveDomainCapacityLayout,
+    SubmissionWaveDomainLayout, TransactionId, VNextError, NEXT_DYNAMIC_POOL_INSTANCE_ID,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
@@ -50,6 +50,7 @@ where
     pub(in crate::vnext::resource) program_binding_layouts:
         BTreeMap<ReusableExecutionBucketId, Arc<ProgramBindingLayout>>,
     pub(in crate::vnext::resource) reusable_execution: Option<ReusableExecutionMemoryPlan>,
+    pub(in crate::vnext::resource) request_state_hazards: Arc<RequestStateHazardCoordinator>,
     pub(in crate::vnext::resource) logical_admission: LogicalAdmissionCoordinator,
     pub(in crate::vnext::resource) budget: Arc<DeviceCapacityBudget>,
     lane_stable_arenas: Arc<Mutex<LaneStableArenaState>>,
@@ -71,6 +72,7 @@ where
         nodes: Arc<[PlanNode]>,
         reusable_execution: Option<ReusableExecutionMemoryPlan>,
     ) -> Result<Self, VNextError> {
+        let request_state_hazards = RequestStateHazardCoordinator::compile(&nodes)?;
         let submission_wave_layouts = domains
             .iter()
             .map(|domain| compile_submission_wave_domain_layout(domain, &nodes))
@@ -133,6 +135,7 @@ where
             submission_wave_reusable_capacity_layouts,
             program_binding_layouts,
             reusable_execution,
+            request_state_hazards,
             lane_stable_arenas: Arc::new(Mutex::new(LaneStableArenaState::default())),
         })
     }

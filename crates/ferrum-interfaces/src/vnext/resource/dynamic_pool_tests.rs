@@ -4,9 +4,10 @@ use crate::vnext::{
     DefinitelyNotSubmitted, DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch,
     DeviceErrorReport, DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand,
     ExecutionResourceMaintenanceStage, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec, ReusableExecutionCapacity,
-    ReusableExecutionClassId, ReusableExecutionMemoryPlan, ReusablePoolWorkspaceBudget,
-    TrustedActiveSequenceBinding, EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION,
+    ProgramValueId, ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec,
+    ReusableExecutionCapacity, ReusableExecutionClassId, ReusableExecutionMemoryPlan,
+    ReusablePoolWorkspaceBudget, StateId, TrustedActiveSequenceBinding,
+    EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION,
 };
 use serde_json::{json, Value};
 use std::error::Error;
@@ -807,6 +808,295 @@ fn admitted_sequence_with_ceiling(
         SequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
         _ => panic!("test sequence must be admitted from resident backing"),
     }
+}
+
+fn request_state_hazard_harness(access: TensorAccess) -> Harness {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Request,
+        'e',
+        1,
+        64,
+        TestDemand::Fixed,
+    );
+    let resource_id = catalog.descriptors[0].base_resource_id().clone();
+    let runtime = new_runtime(&catalog, 64);
+    harness_with_nodes(
+        runtime,
+        catalog,
+        64,
+        false,
+        Arc::from(vec![PlanNode::resource_test_node_with_state_effect(
+            NodeId::new("node/request-state-hazard").unwrap(),
+            StateId::new("state/request-state-hazard").unwrap(),
+            ProgramValueId::new("value/request-state-hazard").unwrap(),
+            AllocationLifetime::Request,
+            access,
+            vec![resource_id],
+        )]),
+    )
+}
+
+fn admitted_child_sequence(
+    request: &Arc<AdmittedRequestResources<TestRuntime>>,
+) -> Arc<AdmittedSequenceResources<TestRuntime>> {
+    let admission = SequenceResourceAdmissionRequest::new(
+        work(1),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    match request.try_admit_sequence(admission).unwrap() {
+        SequenceResourceAdmissionDecision::Admitted(sequence) => sequence,
+        _ => panic!("request-state test child sequence must admit"),
+    }
+}
+
+fn begin_request_state_test_step(
+    sessions: Vec<Arc<SequenceSession<TestRuntime>>>,
+    lane: &Arc<ExecutionLane<TestRuntime>>,
+) -> (
+    ExecutionBatchParticipants<TestRuntime>,
+    Arc<StepResourceLease<TestRuntime>>,
+) {
+    let batch = ExecutionBatchParticipants::new(sessions).unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch
+            .bind_work_shape((0..batch.len()).map(|_| token_span(1)).collect())
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let step = match batch.try_begin_step(request, lane).unwrap() {
+        StepResourceAdmissionDecision::Admitted(step) => step,
+        _ => panic!("request-state test step must admit"),
+    };
+    (batch, step)
+}
+
+fn request_state_invocation_request(
+    step: &StepResourceLease<TestRuntime>,
+) -> InvocationResourceAdmissionRequest {
+    InvocationResourceAdmissionRequest::for_all_step_participants(
+        NodeId::new("node/request-state-hazard").unwrap(),
+        step.work_shape().clone(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap()
+}
+
+#[test]
+fn request_state_read_permits_parallel_sibling_waves() {
+    let harness = request_state_hazard_harness(TensorAccess::Read);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let lane = harness.root.create_execution_lane().unwrap();
+    let request = admitted_request(&harness.root, "request-state-read-siblings");
+    let first = admitted_child_sequence(&request);
+    let second = admitted_child_sequence(&request);
+    let first_session = first.open_session().unwrap();
+    let second_session = second.open_session().unwrap();
+    let (first_batch, first_step) =
+        begin_request_state_test_step(vec![Arc::clone(&first_session)], &lane);
+    let (second_batch, second_step) =
+        begin_request_state_test_step(vec![Arc::clone(&second_session)], &lane);
+
+    let first_invocation = match first_step
+        .try_admit_invocation(request_state_invocation_request(&first_step))
+        .unwrap()
+    {
+        InvocationResourceAdmissionDecision::Admitted(invocation) => invocation,
+        _ => panic!("first read wave must acquire its request-state permit"),
+    };
+    let second_invocation = match second_step
+        .try_admit_invocation(request_state_invocation_request(&second_step))
+        .unwrap()
+    {
+        InvocationResourceAdmissionDecision::Admitted(invocation) => invocation,
+        _ => panic!("second read wave must run concurrently with the first"),
+    };
+
+    drop(second_invocation);
+    drop(first_invocation);
+    second_step.try_retire_normal().unwrap();
+    first_step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(first_batch);
+    drop(second_batch);
+    drop(first_session);
+    drop(second_session);
+    drop(first);
+    drop(second);
+    drop(request);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn request_state_write_defers_sibling_until_prepared_owner_releases() {
+    let harness = request_state_hazard_harness(TensorAccess::ReadWrite);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let lane = harness.root.create_execution_lane().unwrap();
+    let request = admitted_request(&harness.root, "request-state-write-siblings");
+    let first = admitted_child_sequence(&request);
+    let second = admitted_child_sequence(&request);
+    let first_session = first.open_session().unwrap();
+    let second_session = second.open_session().unwrap();
+    let (first_batch, first_step) =
+        begin_request_state_test_step(vec![Arc::clone(&first_session)], &lane);
+    let (second_batch, second_step) =
+        begin_request_state_test_step(vec![Arc::clone(&second_session)], &lane);
+
+    let first_invocation = match first_step
+        .try_admit_invocation(request_state_invocation_request(&first_step))
+        .unwrap()
+    {
+        InvocationResourceAdmissionDecision::Admitted(invocation) => invocation,
+        _ => panic!("first write wave must acquire its request-state permit"),
+    };
+    let deferred = match second_step
+        .try_admit_invocation(request_state_invocation_request(&second_step))
+        .unwrap()
+    {
+        InvocationResourceAdmissionDecision::RequestStateDeferred(deferred) => deferred,
+        _ => panic!("second write wave must defer behind the first"),
+    };
+    assert_eq!(deferred.blockers().len(), 1);
+    assert!(deferred.blockers()[0].active_writer());
+    let waiter = deferred.register_waiter().unwrap();
+    drop(first_invocation);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(waiter.wait_for_change())
+        .unwrap();
+    let second_invocation = match second_step
+        .try_admit_invocation(request_state_invocation_request(&second_step))
+        .unwrap()
+    {
+        InvocationResourceAdmissionDecision::Admitted(invocation) => invocation,
+        _ => panic!("released prepared permit must make the sibling retry eligible"),
+    };
+
+    drop(second_invocation);
+    second_step.try_retire_normal().unwrap();
+    first_step.try_retire_normal().unwrap();
+    first_session.try_complete().unwrap();
+    second_session.try_complete().unwrap();
+    drop(first_batch);
+    drop(second_batch);
+    drop(first_session);
+    drop(second_session);
+    drop(first);
+    drop(second);
+    drop(request);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn request_state_write_requires_sibling_split_within_one_wave() {
+    let harness = request_state_hazard_harness(TensorAccess::Write);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let lane = harness.root.create_execution_lane().unwrap();
+    let request = admitted_request(&harness.root, "request-state-write-split");
+    let first = admitted_child_sequence(&request);
+    let second = admitted_child_sequence(&request);
+    let first_session = first.open_session().unwrap();
+    let second_session = second.open_session().unwrap();
+    let (batch, step) = begin_request_state_test_step(
+        vec![Arc::clone(&first_session), Arc::clone(&second_session)],
+        &lane,
+    );
+
+    let split = match step
+        .try_admit_invocation(request_state_invocation_request(&step))
+        .unwrap()
+    {
+        InvocationResourceAdmissionDecision::RequestStateSplitRequired(split) => split,
+        _ => panic!("mutable sibling participants must require a physical wave split"),
+    };
+    assert_eq!(split.request(), request.request_authority());
+    assert_eq!(split.sibling_count(), 2);
+    assert_eq!(split.resource_ids().len(), 1);
+
+    step.try_rollback_unsubmitted().unwrap();
+    first_session.try_abort_if_quiescent().unwrap();
+    second_session.try_abort_if_quiescent().unwrap();
+    drop(batch);
+    drop(first_session);
+    drop(second_session);
+    drop(first);
+    drop(second);
+    drop(request);
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn request_state_failed_write_poison_is_generation_aware() {
+    let harness = request_state_hazard_harness(TensorAccess::Write);
+    harness
+        .root
+        .maintenance_controller
+        .initialize_pool(&harness.pool_ids[0])
+        .unwrap();
+    let request = admitted_request(&harness.root, "request-state-write-poison");
+    let coordinator = &harness.root.dynamic_pools.request_state_hazards;
+
+    let mut succeeded = match coordinator
+        .try_acquire(std::slice::from_ref(&request), &[0])
+        .unwrap()
+    {
+        RequestStateHazardAcquireDecision::Acquired(Some(permit)) => permit,
+        _ => panic!("healthy request state must acquire"),
+    };
+    succeeded.mark_submission_fence_installed().unwrap();
+    succeeded
+        .finish(RequestStateHazardTerminalDisposition::Succeeded)
+        .unwrap();
+
+    let mut failed = match coordinator
+        .try_acquire(std::slice::from_ref(&request), &[0])
+        .unwrap()
+    {
+        RequestStateHazardAcquireDecision::Acquired(Some(permit)) => permit,
+        _ => panic!("successful write release must allow the next write"),
+    };
+    failed.mark_submission_fence_installed().unwrap();
+    failed
+        .finish(RequestStateHazardTerminalDisposition::FailedButQuiescent)
+        .unwrap();
+    let poison = match coordinator
+        .try_acquire(std::slice::from_ref(&request), &[0])
+        .unwrap()
+    {
+        RequestStateHazardAcquireDecision::Poisoned(poison) => poison,
+        _ => panic!("failed mutable state must reject every later sibling"),
+    };
+    assert_eq!(
+        poison.cause(),
+        RequestStateHazardPoisonCause::FailedButQuiescent
+    );
+    assert_eq!(poison.value_generation(), 1);
+
+    drop(request);
+    close_dynamic_test_root(harness.root);
 }
 
 fn expect_authority_source_rejection<T>(result: Result<T, VNextError>, selected: &str) {
