@@ -93,6 +93,11 @@ impl EngineTokenTimingEvidence {
 pub struct InferenceExecutionEvidence {
     #[serde(default)]
     pub prompt_token_ids: Vec<TokenId>,
+    /// Complete generated-token history at the engine boundary. Streaming
+    /// chunks cannot reconstruct this reliably because special tokens and
+    /// deferred multi-byte pieces may not produce a visible text delta.
+    #[serde(default)]
+    pub output_token_ids: Vec<TokenId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_token_timing: Option<EngineTokenTimingEvidence>,
 }

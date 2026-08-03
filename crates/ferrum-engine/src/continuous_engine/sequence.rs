@@ -689,6 +689,7 @@ impl SequenceState {
                 } else {
                     Vec::new()
                 },
+                output_token_ids: self.generated_tokens.clone(),
                 engine_token_timing: timing,
             }),
         )

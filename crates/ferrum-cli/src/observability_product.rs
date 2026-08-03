@@ -2370,6 +2370,10 @@ mod tests {
                         ferrum_types::TokenId::new(8),
                         ferrum_types::TokenId::new(9),
                     ],
+                    output_token_ids: vec![
+                        ferrum_types::TokenId::new(10),
+                        ferrum_types::TokenId::new(11),
+                    ],
                     engine_token_timing: Some(ferrum_types::EngineTokenTimingEvidence {
                         clock_source: "rust_std_instant".to_string(),
                         wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
