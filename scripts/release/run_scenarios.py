@@ -1936,7 +1936,10 @@ class ScenarioRunner:
         messages.append({"role": "user", "content": second})
         second_data = self.post_chat_messages("serve_multiturn_2", messages, out / "turn2.json", scenario)
         text = message_text(second_data)
-        require(secret in text, f"serve multiturn did not recall {secret!r}: {text[:500]}")
+        require(
+            exact_text_matches(text, secret),
+            f"serve multiturn did not exactly recall {secret!r}: {text[:500]}",
+        )
         require(finish_reason(second_data) != "length", "serve multiturn finish_reason is length")
         return {"status": "pass", "assistant_turns": 2, "recalled_secret": True}
 
@@ -3754,8 +3757,10 @@ class MockOpenAIHandler(http.server.BaseHTTPRequestHandler):
             )
         elif response_format:
             self.send_chat('{"answer":"scenario-ok"}')
-        elif "remembered code" in last_user.lower() or "secret code" in last_user.lower():
-            self.send_chat("ferrum-blue ferrum-loop-blue")
+        elif "reply with only the secret code" in last_user.lower():
+            self.send_chat("ferrum-blue")
+        elif "remembered code" in last_user.lower():
+            self.send_chat("ferrum-loop-blue")
         elif "remember code" in last_user.lower() or "secret" in last_user.lower():
             self.send_chat("OK")
         elif "paris" in last_user.lower():
