@@ -10528,7 +10528,8 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
     request.sampling_params.frequency_penalty = 0.5;
     let mut state = SequenceState::new(request, vec![TokenId::new(0)]);
     state.generated_tokens = vec![TokenId::new(1), TokenId::new(1)];
-    state.token_frequencies.insert(TokenId::new(1), 2);
+    state.sampling_history.record(TokenId::new(1));
+    state.sampling_history.record(TokenId::new(1));
 
     assert_eq!(
         state.sampling_plan.processor_chain.processor_names(),
@@ -10540,7 +10541,13 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
 
     assert_eq!(token, TokenId::new(2));
     assert!((logits[1] - 0.5).abs() < 1e-6);
-    assert_eq!(state.token_frequencies.get(&TokenId::new(2)), Some(&1));
+    assert_eq!(
+        state
+            .sampling_history
+            .token_frequencies()
+            .get(&TokenId::new(2)),
+        Some(&1)
+    );
 }
 
 #[test]
@@ -10680,7 +10687,13 @@ fn model_greedy_argmax_output_accepts_masked_policy_token_and_tracks_frequency()
     state
         .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
         .unwrap();
-    assert_eq!(state.token_frequencies.get(&TokenId::new(0)), Some(&1));
+    assert_eq!(
+        state
+            .sampling_history
+            .token_frequencies()
+            .get(&TokenId::new(0)),
+        Some(&1)
+    );
     let err = state
         .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(2))
         .unwrap_err()
@@ -10899,6 +10912,126 @@ fn schema_guided_sampling_preserves_required_reasoning_delimiter_control() {
 }
 
 #[test]
+fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
+    let mut tokenizer = PolicyTokenizer::new(
+        6,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("</s>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("</think>", 7),
+            ("<think>", 8),
+        ],
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let mut request = policy_request();
+    request.sampling_params.repetition_penalty = 2.0;
+    request.sampling_params.presence_penalty = 1.5;
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+    request.sampling_params.structured_output_start =
+        ferrum_types::StructuredOutputStart::AfterDelimiter("</think>".to_string());
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(9),
+    );
+
+    // The hidden reasoning domain deliberately emits the same opening token
+    // that the visible JSON grammar will need later.
+    let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
+    reasoning_logits[0] = 3.0;
+    let reasoning_token = state
+        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(reasoning_token, TokenId::new(0));
+    state.generated_tokens.push(reasoning_token);
+
+    let mut delimiter_logits = vec![f32::NEG_INFINITY; 9];
+    delimiter_logits[7] = 3.0;
+    let delimiter = state
+        .sample_with_processors_with_tokenizer(&mut delimiter_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(delimiter, TokenId::new(7));
+    state.generated_tokens.push(delimiter);
+    assert_eq!(
+        state
+            .sampling_history
+            .token_frequencies()
+            .get(&TokenId::new(0)),
+        Some(&1)
+    );
+
+    let mut grammar_logits = vec![f32::NEG_INFINITY; 9];
+    grammar_logits[0] = 1.0;
+    let first_json_token = state
+        .sample_with_processors_with_tokenizer(&mut grammar_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(first_json_token, TokenId::new(0));
+    assert_eq!(
+        grammar_logits[0], 1.0,
+        "hidden reasoning must not apply repetition or presence penalty to visible JSON"
+    );
+    assert_eq!(state.sampling_history.start_token_index(), 2);
+    assert_eq!(
+        state.sampling_history.token_frequencies().len(),
+        1,
+        "the active penalty table must contain only visible JSON tokens"
+    );
+    assert_eq!(
+        state
+            .sampling_history
+            .token_frequencies()
+            .get(&TokenId::new(0)),
+        Some(&1)
+    );
+    assert!(!state
+        .sampling_history
+        .token_frequencies()
+        .contains_key(&TokenId::new(7)));
+    state.generated_tokens.push(first_json_token);
+
+    // A replay reset reconstructs the same typed scope from generated history
+    // instead of leaking hidden-token counts back into the visible domain.
+    state.reset_guided_processors().unwrap();
+    assert_eq!(state.sampling_history.start_token_index(), 0);
+    let mut close_logits = vec![f32::NEG_INFINITY; 9];
+    close_logits[4] = 1.0;
+    let close = state
+        .sample_with_processors_with_tokenizer(&mut close_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(close, TokenId::new(4));
+    assert_eq!(state.sampling_history.start_token_index(), 2);
+    assert_eq!(
+        state
+            .sampling_history
+            .previous_tokens(&state.generated_tokens)
+            .unwrap(),
+        &[TokenId::new(0)]
+    );
+    assert_eq!(
+        state
+            .sampling_history
+            .token_frequencies()
+            .get(&TokenId::new(0)),
+        Some(&1)
+    );
+    assert_eq!(
+        state
+            .sampling_history
+            .token_frequencies()
+            .get(&TokenId::new(4)),
+        Some(&1)
+    );
+}
+
+#[test]
 fn schema_guided_sampling_forces_reasoning_delimiter_at_budget() {
     let mut tokenizer = PolicyTokenizer::new(
         6,
@@ -11038,6 +11171,12 @@ fn structured_output_terminal_error_reports_privacy_safe_lexical_progress() {
         .to_string();
 
     assert!(error.contains("grammar_tokens=14"), "{error}");
+    assert!(error.contains("sampling_history_start=0"), "{error}");
+    assert!(error.contains("sampling_history_tokens=14"), "{error}");
+    assert!(
+        error.contains("sampling_history_unique_tokens=0"),
+        "{error}"
+    );
     assert!(error.contains("trailing_class=Some(Number)"), "{error}");
     assert!(error.contains("trailing_class_tokens=5"), "{error}");
     assert!(

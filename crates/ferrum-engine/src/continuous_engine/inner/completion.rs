@@ -33,7 +33,7 @@ impl SequenceState {
                 "structured-output generation failed after reaching an accepting state",
             )),
             Ok(progress) => Some(FerrumError::model(format!(
-                "structured-output generation ended with {finish_reason:?} before a complete valid value: phase={:?}, generated_tokens={}, consumed_tokens={}, delimiter_tokens={:?}, delimiter_prefix_tokens={}, reasoning_tokens={:?}, boundary_forced={}, budget={:?}, grammar_tokens={}, trailing_class={:?}, trailing_class_tokens={}, trailing_token_id={:?}, trailing_identical_tokens={}, liveness_identical_token_limit={}, liveness_interventions={}",
+                "structured-output generation ended with {finish_reason:?} before a complete valid value: phase={:?}, generated_tokens={}, consumed_tokens={}, delimiter_tokens={:?}, delimiter_prefix_tokens={}, reasoning_tokens={:?}, boundary_forced={}, budget={:?}, grammar_tokens={}, sampling_history_start={}, sampling_history_tokens={}, sampling_history_unique_tokens={}, trailing_class={:?}, trailing_class_tokens={}, trailing_token_id={:?}, trailing_identical_tokens={}, liveness_identical_token_limit={}, liveness_interventions={}",
                 progress.phase,
                 progress.generated_token_count,
                 progress.consumed_token_count,
@@ -43,6 +43,9 @@ impl SequenceState {
                 progress.boundary_forced,
                 progress.budget,
                 progress.grammar_token_count,
+                self.sampling_history.start_token_index(),
+                self.sampling_history.token_count(&self.generated_tokens),
+                self.sampling_history.unique_token_count(),
                 progress.trailing_token_class,
                 progress.trailing_token_class_count,
                 progress.trailing_token_id,

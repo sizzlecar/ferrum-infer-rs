@@ -387,6 +387,11 @@ pub struct StructuredOutputMaskOutcome {
     pub phase: StructuredOutputPhase,
     pub accepting: bool,
     pub liveness_intervention: bool,
+    /// Generated-token index at which the visible grammar-owned output starts.
+    /// `None` means the processor is still in the hidden pre-grammar domain.
+    /// The execution engine uses this boundary to scope request-local sampling
+    /// history without teaching the grammar about penalty policy.
+    pub grammar_start_token_index: Option<usize>,
     /// Exact delimiter token authorized for the next sampling step while the
     /// processor is waiting to activate. The engine uses this typed grant to
     /// avoid rejecting an intentionally hidden special token during output
@@ -523,9 +528,16 @@ impl StructuredOutputProcessor {
                 },
                 accepting: false,
                 liveness_intervention: false,
+                grammar_start_token_index: None,
                 required_delimiter_token_id: Some(required_delimiter_token),
             });
         }
+
+        let grammar_start_token_index = state.grammar_start.ok_or_else(|| {
+            FerrumError::internal(
+                "active structured-output processor has no grammar start token index",
+            )
+        })?;
 
         let accepting = state.matcher.is_accepting().map_err(|error| {
             FerrumError::model(format!(
@@ -583,6 +595,7 @@ impl StructuredOutputProcessor {
             phase: StructuredOutputPhase::EnforcingGrammar,
             accepting,
             liveness_intervention,
+            grammar_start_token_index: Some(grammar_start_token_index),
             required_delimiter_token_id: None,
         })
     }
@@ -1233,6 +1246,7 @@ mod tests {
             .mask_logits_with_terminals(&mut logits, &generated, &terminals, &HashSet::new())
             .unwrap();
         assert!(outcome.accepting);
+        assert_eq!(outcome.grammar_start_token_index, Some(0));
         assert!(!logits[MergedObjectTokenizer::OBJECT as usize].is_finite());
         assert!(logits[MergedObjectTokenizer::EOS as usize].is_finite());
     }
@@ -1634,6 +1648,7 @@ mod tests {
             .unwrap();
         assert_eq!(waiting.phase, StructuredOutputPhase::WaitingForDelimiter);
         assert!(!waiting.accepting);
+        assert_eq!(waiting.grammar_start_token_index, None);
         assert_eq!(waiting.required_delimiter_token_id, Some(b'<' as u32));
         assert!(waiting_logits[b'<' as usize].is_finite());
         assert!(!waiting_logits[b'>' as usize].is_finite());
@@ -1652,6 +1667,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(partial.phase, StructuredOutputPhase::WaitingForDelimiter);
+        assert_eq!(partial.grammar_start_token_index, None);
         assert_eq!(partial.required_delimiter_token_id, Some(b'>' as u32));
         assert!(!partial_logits[b'<' as usize].is_finite());
         assert!(partial_logits[b'>' as usize].is_finite());
@@ -1665,7 +1681,11 @@ mod tests {
 
         assert_and_append(&processor, &mut generated, "reasoning [is free]</think>");
         let mut logits = vec![0.0; EOS as usize + 1];
-        processor.mask_logits(&mut logits, &generated).unwrap();
+        let active = processor
+            .mask_logits_with_terminals(&mut logits, &generated, &HashSet::new(), &HashSet::new())
+            .unwrap();
+        assert_eq!(active.phase, StructuredOutputPhase::EnforcingGrammar);
+        assert_eq!(active.grammar_start_token_index, Some(27));
         assert!(logits[b'{' as usize].is_finite());
         assert!(!logits[b'[' as usize].is_finite());
         assert!(!logits[EOS as usize].is_finite());
@@ -1710,6 +1730,7 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(outcome.phase, StructuredOutputPhase::ForcingDelimiter);
+            assert_eq!(outcome.grammar_start_token_index, None);
             assert_eq!(outcome.required_delimiter_token_id, Some(expected as u32));
             assert_eq!(
                 logits
