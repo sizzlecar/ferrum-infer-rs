@@ -4,6 +4,32 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-08-04，clean、已推送 production source
+`04699472d17b72a5368692bacb81a4b38cdae04f` 已关闭 S2 CUDA API/modality
+checkpoint。真实 Qwen3.5-4B/RTX 4090 产品回归覆盖 C16 negative API `30/30` 和
+C20 text-only modality `50/50`；其中 `40` 个 media 请求按 text-only contract 拒绝，
+`10` 个 text-array 请求实际推理成功。release build bounded duration 为 `503.040129s`，
+binary SHA256 为
+`c76002ba57203182dedc76e258225f057f148878800aa722d3215ce2febd8494`；正式执行
+bounded duration 为 `36.07631s`，峰值为 `2` processes、`12` group threads 和 `11`
+per-process threads，无 violation。正式 validator 和统一 gate 打印：
+
+```text
+FERRUM RUNTIME VNEXT S2 API MODALITY PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-api-modality-04699472-20260804/gate-r2
+FERRUM GATE vnext-s2-api-modality PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-api-modality-04699472-20260804/gate-r2
+```
+
+完整 archive `runtime-vnext-s2-api-modality-04699472-cuda-pass-20260804.tar.zst` 为
+`625833` bytes，SHA256 为
+`8943583fcf9c846767345b9777f425fe31272844f04bbfa93e5008ab1e5b6317`，位于 draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-37f92b8e7c62a636b72c)。
+本机从 GitHub 回下载后完成 size/SHA256、`zstd -t` 和 required-member 复验。
+
+这只关闭 S2 API/modality 子门，不等于完整 S2、G05、G08、Metal、性能或 release PASS。
+8 个 S2 child lane 当前正式 artifact 状态为 `6/8 PASS`；剩余 M1 CUDA determinism 真实
+硬件 witness 和 response-format。两个子门关闭后，仍须在同一最终 source identity 上执行
+change-impact 复验和 S2 aggregate。G00-G10 总目标 PASS 仍为 `0/11`。
+
 截至 2026-08-04，clean、已推送 source
 `04699472d17b72a5368692bacb81a4b38cdae04f` 已关闭 S2 CUDA latency/first-failure
 checkpoint。真实 Qwen3.5-4B/RTX 4090 artifact 同时覆盖 `ferrum run` success/failure 和
@@ -33,7 +59,7 @@ SHA256、`zstd -t` 和 required-member 复验，并打印
 `FERRUM S2 LATENCY GITHUB ROUNDTRIP PASS`。
 
 这只关闭 S2 latency/first-failure 子门，不等于完整 S2、G05、G06、性能、Metal 或 release
-PASS。8 个 S2 child lane 当前正式 artifact 状态为 `5/8 PASS`；剩余 M1 CUDA determinism
+PASS。该 checkpoint 当时的 S2 child lane 正式 artifact 状态为 `5/8 PASS`；剩余 M1 CUDA determinism
 真实硬件 witness、response-format 和 API/modality。`dcf8e46c` 只完成 determinism collector/gate
 接线，没有真实 4090 PASS artifact，不能计入完成。三个子门关闭后，仍须在同一最终 source
 identity 上执行 change-impact 复验和 S2 aggregate。G00-G10 总目标 PASS 仍为 `0/11`。
