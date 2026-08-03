@@ -3,6 +3,8 @@ use thiserror::Error;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use crate::model_executor::PlanRuntimeResourceSnapshot;
+
 use super::execution::DynamicBackingPoolId;
 
 /// Maximum encoded size accepted by the untrusted failure-envelope decoder.
@@ -28,6 +30,8 @@ pub struct FailureEnvelope {
     code: String,
     message: String,
     retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_snapshot: Option<PlanRuntimeResourceSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,6 +40,8 @@ pub struct UnvalidatedFailureEnvelope {
     code: String,
     message: String,
     retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resource_snapshot: Option<PlanRuntimeResourceSnapshot>,
 }
 
 #[derive(Deserialize)]
@@ -45,6 +51,8 @@ pub(crate) struct FailureEnvelopeWire {
     code: String,
     message: String,
     retryable: bool,
+    #[serde(default)]
+    resource_snapshot: Option<PlanRuntimeResourceSnapshot>,
 }
 
 impl From<FailureEnvelopeWire> for UnvalidatedFailureEnvelope {
@@ -54,6 +62,7 @@ impl From<FailureEnvelopeWire> for UnvalidatedFailureEnvelope {
             code: wire.code,
             message: wire.message,
             retryable: wire.retryable,
+            resource_snapshot: wire.resource_snapshot,
         }
     }
 }
@@ -68,7 +77,12 @@ impl UnvalidatedFailureEnvelope {
                 ),
             });
         }
-        FailureEnvelope::new(self.domain, self.code, self.message, self.retryable)
+        let resource_snapshot = self.resource_snapshot;
+        let envelope = FailureEnvelope::new(self.domain, self.code, self.message, self.retryable)?;
+        match resource_snapshot {
+            Some(snapshot) => envelope.with_resource_snapshot(snapshot),
+            None => Ok(envelope),
+        }
     }
 }
 
@@ -84,6 +98,7 @@ impl FailureEnvelope {
             code: code.into(),
             message: message.into(),
             retryable,
+            resource_snapshot: None,
         };
         envelope.validate()?;
         Ok(envelope)
@@ -107,7 +122,30 @@ impl FailureEnvelope {
                 reason: "failure code or message is empty, oversized, or non-portable".to_owned(),
             });
         }
+        if let Some(snapshot) = &self.resource_snapshot {
+            if self.domain != FailureDomain::Resource {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason:
+                        "only resource-domain failures may carry a plan runtime resource snapshot"
+                            .to_owned(),
+                });
+            }
+            snapshot
+                .validate()
+                .map_err(|error| VNextError::InvalidExecutionPlan {
+                    reason: format!("invalid plan runtime resource snapshot: {error}"),
+                })?;
+        }
         Ok(())
+    }
+
+    pub fn with_resource_snapshot(
+        mut self,
+        snapshot: PlanRuntimeResourceSnapshot,
+    ) -> Result<Self, VNextError> {
+        self.resource_snapshot = Some(snapshot);
+        self.validate()?;
+        Ok(self)
     }
 
     pub const fn domain(&self) -> FailureDomain {
@@ -126,6 +164,10 @@ impl FailureEnvelope {
         self.retryable
     }
 
+    pub const fn resource_snapshot(&self) -> Option<&PlanRuntimeResourceSnapshot> {
+        self.resource_snapshot.as_ref()
+    }
+
     pub fn decode_untrusted(bytes: &[u8]) -> Result<UnvalidatedFailureEnvelope, VNextError> {
         if bytes.len() > MAX_FAILURE_ENVELOPE_WIRE_BYTES {
             return Err(VNextError::Serialization {
@@ -142,6 +184,84 @@ impl FailureEnvelope {
                 context: "decode untrusted failure envelope",
                 message: error.to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod failure_envelope_tests {
+    use super::{FailureDomain, FailureEnvelope};
+    use crate::model_executor::PlanRuntimeResourceSnapshot;
+
+    fn snapshot() -> PlanRuntimeResourceSnapshot {
+        PlanRuntimeResourceSnapshot::new(1_000, 900, 700, 700, 400, 300, 200, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn resource_snapshot_round_trips_only_after_revalidation() {
+        let envelope = FailureEnvelope::new(
+            FailureDomain::Resource,
+            "diagnostic_resource_failure",
+            "injected resource failure",
+            false,
+        )
+        .unwrap()
+        .with_resource_snapshot(snapshot())
+        .unwrap();
+        let encoded = serde_json::to_vec(&envelope).unwrap();
+
+        let decoded = FailureEnvelope::decode_untrusted(&encoded)
+            .unwrap()
+            .revalidate(FailureDomain::Resource)
+            .unwrap();
+
+        assert_eq!(decoded, envelope);
+        assert_eq!(
+            decoded
+                .resource_snapshot()
+                .unwrap()
+                .available_bytes()
+                .unwrap(),
+            400
+        );
+    }
+
+    #[test]
+    fn non_resource_failure_rejects_resource_snapshot() {
+        let envelope = FailureEnvelope::new(
+            FailureDomain::Operation,
+            "operation_failure",
+            "operation failure",
+            false,
+        )
+        .unwrap();
+
+        assert!(envelope.with_resource_snapshot(snapshot()).is_err());
+    }
+
+    #[test]
+    fn untrusted_resource_snapshot_fails_closed_when_capacity_is_incoherent() {
+        let wire = serde_json::json!({
+            "domain": "resource",
+            "code": "forged_resource_failure",
+            "message": "forged resource failure",
+            "retryable": false,
+            "resource_snapshot": {
+                "device_capacity_bytes": 1_000,
+                "usable_capacity_bytes": 1_001,
+                "process_claimed_bytes": 700,
+                "plan_claimed_bytes": 700,
+                "static_bytes": 400,
+                "dynamic_resident_bytes": 300,
+                "dynamic_free_bytes": 200,
+                "pending_growth_bytes": 0,
+                "quarantined_bytes": 0
+            }
+        });
+
+        let unvalidated = FailureEnvelope::decode_untrusted(&serde_json::to_vec(&wire).unwrap())
+            .expect("wire shape should decode before trust validation");
+
+        assert!(unvalidated.revalidate(FailureDomain::Resource).is_err());
     }
 }
 

@@ -775,6 +775,10 @@ pub struct RunCommand {
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
+    /// Inject one typed vNext diagnostic fault. Requires a latency profile.
+    #[arg(long, value_enum)]
+    pub vnext_diagnostic_fault: Option<crate::commands::VNextDiagnosticFaultArg>,
+
     /// Write product memory profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub memory_profile_jsonl: Option<PathBuf>,
@@ -2366,6 +2370,12 @@ fn run_startup_cli_runtime_entries(
         cmd.sequence_fit_policy
             .map(crate::commands::SequenceFitPolicyArg::as_runtime_value),
     );
+    crate::runtime_env::push_cli_runtime_entry(
+        &mut entries,
+        "FERRUM_VNEXT_DIAGNOSTIC_FAULT",
+        cmd.vnext_diagnostic_fault
+            .map(crate::commands::VNextDiagnosticFaultArg::as_runtime_value),
+    );
     crate::runtime_env::push_cli_runtime_usize(
         &mut entries,
         "FERRUM_RUNTIME_MEMORY_BUDGET_BYTES",
@@ -2594,6 +2604,7 @@ mod tests {
             vnext_checkpoint: Default::default(),
             profile_jsonl: None,
             profile_detail: crate::observability_product::ProfileDetailArg::Off,
+            vnext_diagnostic_fault: None,
             memory_profile_jsonl: None,
             scheduler_trace_jsonl: None,
             request_dump_dir: None,
@@ -2643,6 +2654,36 @@ mod tests {
             .find(|entry| entry.key == "FERRUM_KV_DTYPE")
             .expect("missing kv dtype entry");
         assert_eq!(entry.effective_value, "int8");
+        assert_eq!(entry.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
+    fn run_exposes_typed_diagnostic_fault_and_records_cli_authority() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            run: RunCommand,
+        }
+
+        let parsed = TestCli::parse_from([
+            "ferrum",
+            "Qwen/Qwen3.5-4B",
+            "--vnext-diagnostic-fault",
+            "prefill-resource-after-submit-once",
+        ]);
+        let entries = run_startup_cli_runtime_entries(&parsed.run, None);
+        let entry = entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_VNEXT_DIAGNOSTIC_FAULT")
+            .expect("diagnostic fault CLI entry");
+
+        assert_eq!(
+            parsed.run.vnext_diagnostic_fault,
+            Some(crate::commands::VNextDiagnosticFaultArg::PrefillResourceAfterSubmitOnce)
+        );
+        assert_eq!(entry.effective_value, "prefill-resource-after-submit-once");
         assert_eq!(entry.source, RuntimeConfigSource::Cli);
     }
 

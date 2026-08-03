@@ -250,6 +250,10 @@ pub struct ServeCommand {
     #[arg(long, value_enum, default_value_t = crate::observability_product::ProfileDetailArg::Off)]
     pub profile_detail: crate::observability_product::ProfileDetailArg,
 
+    /// Inject one typed vNext diagnostic fault. Requires a latency profile.
+    #[arg(long, value_enum)]
+    pub vnext_diagnostic_fault: Option<crate::commands::VNextDiagnosticFaultArg>,
+
     /// Write product memory profile events to this JSONL path.
     #[arg(long, value_name = "PATH")]
     pub memory_profile_jsonl: Option<PathBuf>,
@@ -347,6 +351,7 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         vnext_checkpoint,
         profile_jsonl,
         profile_detail,
+        vnext_diagnostic_fault,
         memory_profile_jsonl,
         scheduler_trace_jsonl,
         request_dump_dir,
@@ -745,6 +750,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         profile_detail.as_str(),
         RuntimeConfigSource::Cli,
     ));
+    push_cli_runtime_entry(
+        &mut startup_cli_runtime_entries,
+        "FERRUM_VNEXT_DIAGNOSTIC_FAULT",
+        vnext_diagnostic_fault.map(crate::commands::VNextDiagnosticFaultArg::as_runtime_value),
+    );
     push_sequence_fit_policy_cli_entry(&mut startup_cli_runtime_entries, sequence_fit_policy);
     if let Some(enabled) = batched_graph_cli_override(batched_graph, disable_batched_graph) {
         startup_cli_runtime_entries.push(RuntimeConfigEntry::new(
@@ -2240,6 +2250,30 @@ fn to_candle_device(device: &ferrum_types::Device) -> ferrum_types::Result<candl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serve_exposes_typed_diagnostic_fault() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCommand,
+        }
+
+        let parsed = TestCli::parse_from([
+            "ferrum",
+            "--model",
+            "Qwen/Qwen3.5-4B",
+            "--vnext-diagnostic-fault",
+            "prefill-resource-after-submit-once",
+        ]);
+
+        assert_eq!(
+            parsed.serve.vnext_diagnostic_fault,
+            Some(crate::commands::VNextDiagnosticFaultArg::PrefillResourceAfterSubmitOnce)
+        );
+    }
 
     #[test]
     fn serve_rejects_removed_qwen35_flag() {

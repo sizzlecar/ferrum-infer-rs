@@ -949,6 +949,7 @@ fn validate_failure_identity(
         && !has_completed(ids)
         && !has_aborted(ids)
         && (ids.resource_id.is_some() ^ ids.resource_batch_fingerprint.is_some());
+    let active_operation_resource_shape = operation_shape && has_pool(ids);
     let plan_shape = exact_plan(ids)
         && ids.frame_id.is_none()
         && ids.node_id.is_none()
@@ -974,7 +975,7 @@ fn validate_failure_identity(
         && no_resource_item(ids);
     let valid = match domain {
         FailureDomain::Operation => operation_shape,
-        FailureDomain::Resource => resource_shape,
+        FailureDomain::Resource => resource_shape || active_operation_resource_shape,
         FailureDomain::Device => device_only || plan_shape || operation_shape || resource_shape,
         FailureDomain::Planning => plan_shape,
         FailureDomain::ModelResolution | FailureDomain::Product => pre_plan || plan_shape,
