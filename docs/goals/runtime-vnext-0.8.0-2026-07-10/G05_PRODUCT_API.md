@@ -135,6 +135,18 @@ The exact PASS lines, binary identity, GitHub-verified archives, and hashes are 
 [`GOAL.md`](GOAL.md). These checkpoints do not close response format, API/modality, determinism,
 historical resource, latency attribution, the S2 aggregate, or canonical G05.
 
+## 2026-08-04 S2 API/Modality Checkpoint
+
+Clean pushed production source `04699472d17b72a5368692bacb81a4b38cdae04f` passes the real
+Qwen3.5-4B CUDA C16/C20 slice. C16 validates `30/30` unique negative API payloads and failure
+contracts across tool, schema, stream options, model identity, and context limits. C20 validates
+the text-only model declaration and `50/50` modality cases: `40` image/data/video/mixed-media
+requests are rejected before model execution and `10` text-array requests complete successfully.
+
+The canonical gate, binary identity, bounded receipts, GitHub-verified archive, and SHA256 are
+recorded in [`GOAL.md`](GOAL.md). This checkpoint closes only S2 API/modality; response format,
+M1 CUDA determinism, the S2 aggregate, and canonical G05 remain Open.
+
 ## 兼容性
 
 保持已发布 CLI flag 和 OpenAI-compatible request shape，除非 migration guide 明确列为
