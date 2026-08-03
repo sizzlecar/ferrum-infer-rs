@@ -777,10 +777,7 @@ mod cuda {
         engine.backend.enable_reusable_execution = true;
         engine.scheduler.max_running_requests = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
         engine.batching.max_batch_size = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
-        engine.batching.max_num_batched_tokens = engine
-            .batching
-            .max_num_batched_tokens
-            .max(MAX_VNEXT_DETERMINISM_PARTICIPANTS);
+        engine.batching.max_num_batched_tokens = MAX_VNEXT_DETERMINISM_PARTICIPANTS;
         engine.runtime.model_path = Some(binding.directory.display().to_string());
         engine
     }
