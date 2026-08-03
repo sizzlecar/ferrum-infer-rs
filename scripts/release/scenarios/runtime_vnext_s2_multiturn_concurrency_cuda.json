@@ -26,8 +26,8 @@
       "type": "run_multiturn",
       "backend": "cuda",
       "enable_thinking": false,
-      "secret": "ferrum-s2-blue",
-      "expected_recall": "ferrum-s2-blue",
+      "secret": "banana",
+      "expected_recall": "banana",
       "historical_case_ids": [
         "H02.1"
       ],
@@ -35,19 +35,19 @@
       "use_default_max_tokens": true,
       "temperature": 0.0,
       "prompts": [
-        "Remember the exact code ferrum-s2-blue. Reply with only OK.",
+        "Remember the codeword banana. Reply exactly OK.",
         "Reply with only TWO.",
         "Reply with only THREE.",
         "Reply with only FOUR.",
-        "What was the exact code? Reply with only the code."
+        "What codeword did I ask you to remember? Answer with only the codeword."
       ]
     },
     {
       "name": "m1_s2_serve_multiturn_recall",
       "type": "serve_multiturn_recall",
-      "secret": "ferrum-s2-blue",
-      "first_prompt": "Remember the exact code ferrum-s2-blue. Reply with only OK.",
-      "second_prompt": "What was the exact code? Reply with only the code.",
+      "secret": "banana",
+      "first_prompt": "Remember the codeword banana. Reply exactly OK.",
+      "second_prompt": "What codeword did I ask you to remember? Answer with only the codeword.",
       "enable_thinking": false,
       "max_tokens": 128,
       "temperature": 0.0

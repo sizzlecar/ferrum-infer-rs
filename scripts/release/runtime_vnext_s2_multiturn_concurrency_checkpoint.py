@@ -45,17 +45,17 @@ RUNNER_PATH = ROOT / "run_scenarios.py"
 HELPER_PATH = ROOT / "openai_concurrency_quality_regression.py"
 SCENARIO_MANIFEST_PATH = ROOT / "scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json"
 MODEL = "Qwen/Qwen3.5-4B"
-SECRET = "ferrum-s2-blue"
+SECRET = "banana"
 HISTORICAL_CASE_ID = "H02.1"
 RUN_NAME = "m1_s2_run_multiturn_recall"
 SERVE_NAME = "m1_s2_serve_multiturn_recall"
 CONCURRENCY_NAME = "m1_s2_serve_concurrency_quality"
 RUN_PROMPTS = (
-    "Remember the exact code ferrum-s2-blue. Reply with only OK.",
+    "Remember the codeword banana. Reply exactly OK.",
     "Reply with only TWO.",
     "Reply with only THREE.",
     "Reply with only FOUR.",
-    "What was the exact code? Reply with only the code.",
+    "What codeword did I ask you to remember? Answer with only the codeword.",
 )
 RUN_ANSWERS = ("OK", "TWO", "THREE", "FOUR", SECRET)
 SCENARIOS = (
@@ -571,8 +571,8 @@ def validate_serve_multiturn(source: Path, row: dict[str, Any]) -> dict[str, Any
     require(row.get("assistant_turns") == 2 and row.get("recalled_secret") is True, "serve multi-turn result mismatch")
     first_request = read_json(root / "turn1.request.json")
     second_request = read_json(root / "turn2.request.json")
-    expected_first = "Remember the exact code ferrum-s2-blue. Reply with only OK."
-    expected_second = "What was the exact code? Reply with only the code."
+    expected_first = "Remember the codeword banana. Reply exactly OK."
+    expected_second = "What codeword did I ask you to remember? Answer with only the codeword."
     require(first_request.get("model") == MODEL and first_request.get("temperature") == 0.0, "serve turn1 request mismatch")
     require(first_request.get("max_tokens") == 128 and first_request.get("chat_template_kwargs") == {"enable_thinking": False}, "serve turn1 typed options mismatch")
     require(first_request.get("messages") == [{"role": "user", "content": expected_first}], "serve turn1 messages mismatch")
@@ -1172,8 +1172,8 @@ def create_fixture(root: Path) -> None:
 
     serve_root = root / SERVE_NAME
     serve_root.mkdir()
-    first_prompt = "Remember the exact code ferrum-s2-blue. Reply with only OK."
-    second_prompt = "What was the exact code? Reply with only the code."
+    first_prompt = "Remember the codeword banana. Reply exactly OK."
+    second_prompt = "What codeword did I ask you to remember? Answer with only the codeword."
     first_request = {"model": MODEL, "messages": [{"role": "user", "content": first_prompt}], "max_tokens": 128, "temperature": 0.0, "chat_template_kwargs": {"enable_thinking": False}}
     second_request = {"model": MODEL, "messages": [{"role": "user", "content": first_prompt}, {"role": "assistant", "content": "OK"}, {"role": "user", "content": second_prompt}], "max_tokens": 128, "temperature": 0.0, "chat_template_kwargs": {"enable_thinking": False}}
     write_json(serve_root / "turn1.request.json", first_request)
