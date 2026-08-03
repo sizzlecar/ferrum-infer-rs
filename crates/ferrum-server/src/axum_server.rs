@@ -1595,11 +1595,7 @@ fn write_chat_request_profile_event(
             .map(ResolvedFerrumConfig::runtime_env_hash)
             .unwrap_or_else(|| format!("sha256:{}", sha256_hex(b"serve-profile"))),
         phase: phase.to_string(),
-        event_kind: if status == ProfileStatus::Failure {
-            ProfileEventKind::Error
-        } else {
-            ProfileEventKind::TimedSpan
-        },
+        event_kind: ProfileEventKind::TimedSpan,
         timestamp,
         status,
         model: Some(model.to_string()),
@@ -6152,6 +6148,20 @@ mod tests {
         .build_router()
     }
 
+    fn router_with_failing_llm_request_dump_and_profile(
+        request_dump_dir: PathBuf,
+        profile_jsonl: PathBuf,
+    ) -> Router {
+        AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(FailingLlm::new()))
+                .with_request_dump_dir(Some(request_dump_dir))
+                .with_profile_detail(ferrum_types::ObservabilityProfileDetail::Latency)
+                .with_profile_jsonl(Some(profile_jsonl)),
+        )
+        .build_router()
+    }
+
     fn router_with_resource_exhausted_llm_and_request_dump_dir(
         request_dump_dir: PathBuf,
     ) -> Router {
@@ -8888,8 +8898,9 @@ mod tests {
     #[tokio::test]
     async fn route_chat_generation_failure_writes_replay_diagnostics() {
         let root = unique_request_dump_dir("chat-sync-failure");
+        let profile = unique_profile_jsonl("chat-sync-failure");
         let response = post_json(
-            router_with_failing_llm_and_request_dump_dir(root.clone()),
+            router_with_failing_llm_request_dump_and_profile(root.clone(), profile.clone()),
             "/v1/chat/completions",
             json!({
                 "model": "failing-model",
@@ -8904,7 +8915,17 @@ mod tests {
             "internal",
             "stub generation failed",
         );
+        let event = read_profile_events(&profile)
+            .into_iter()
+            .find(|event| event["phase"] == "chat_completions_sync")
+            .expect("sync failure profile event");
+        assert_eq!(event["event_kind"], "timed_span");
+        assert_eq!(event["status"], "failure");
+        assert!(event["duration_us"].as_u64().is_some());
+        assert_eq!(event["attributes"]["terminal_failure_event"], true);
+        assert_eq!(event["error"]["kind"], "internal");
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(profile);
     }
 
     #[tokio::test]
