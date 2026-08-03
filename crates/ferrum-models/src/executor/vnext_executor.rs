@@ -6,7 +6,7 @@
 //! admit exact live work, submit immutable-plan waves, and retire resources
 //! only after a terminal fence.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -196,7 +196,64 @@ fn resolve_reusable_execution_policy(
     ReusableExecutionPolicy::new(1, buckets).map_err(|error| FerrumError::config(error.to_string()))
 }
 
-/// Typed product policy resolved before plan compilation. None of these
+/// Typed lifetime policy for values observed after a terminal device fence.
+/// Product plans do not pay for all-node diagnostic retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VNextPlanObservationPolicy {
+    Product,
+    /// Derives a diagnostic observation plan from the same family, catalog,
+    /// policy, providers, and dispatch contracts. Its memory layout and plan
+    /// hash intentionally differ from the product plan because outputs remain
+    /// live until terminal readback.
+    DeterminismTerminalWitnesses,
+}
+
+impl VNextPlanObservationPolicy {
+    fn apply(
+        self,
+        family: &PreparedModelFamily,
+        options: &mut ProgramPlanCompileOptions,
+    ) -> Result<()> {
+        match self {
+            Self::Product => Ok(()),
+            Self::DeterminismTerminalWitnesses => options
+                .retain_all_outputs_for_determinism(family)
+                .map_err(|error| {
+                    FerrumError::model(format!(
+                        "vNext determinism terminal-witness retention: {error}"
+                    ))
+                }),
+        }
+    }
+
+    fn validate_compilation(
+        self,
+        family: &PreparedModelFamily,
+        compilation: &ProgramPlanCompilation,
+    ) -> Result<()> {
+        if self == Self::Product {
+            return Ok(());
+        }
+        let expected = CompletionRetentionSpec::for_determinism_outputs(family)
+            .map_err(|error| FerrumError::model(error.to_string()))?;
+        let retained = compilation
+            .executable()
+            .execution_plan()
+            .payload()
+            .retained_completion_values()
+            .iter()
+            .map(|value| value.value_id().clone())
+            .collect::<BTreeSet<_>>();
+        if compilation.completion_retention() != &expected || retained != *expected.values() {
+            return Err(FerrumError::internal(
+                "vNext determinism compilation did not retain every operation output exactly once",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Typed executor policy resolved before plan compilation. None of these
 /// values are inferred from a model name, GPU name, or hidden environment
 /// combination.
 #[derive(Debug, Clone)]
@@ -207,6 +264,7 @@ pub struct VNextExecutorConfig {
     pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
     pub diagnostic_fault: Option<VNextDiagnosticFault>,
+    plan_observation: VNextPlanObservationPolicy,
 }
 
 impl VNextExecutorConfig {
@@ -215,7 +273,13 @@ impl VNextExecutorConfig {
         info: &ModelInfo,
         runtime: &R,
     ) -> Result<Self> {
-        Self::from_engine_config_with_prefill_chunks(engine, info, runtime, &[])
+        Self::from_engine_config_with_prefill_chunks(
+            engine,
+            info,
+            runtime,
+            &[],
+            VNextPlanObservationPolicy::Product,
+        )
     }
 
     pub fn for_determinism_collection<R: DeviceRuntime>(
@@ -228,8 +292,13 @@ impl VNextExecutorConfig {
             PrefillChunk::new(0, 4, 4)?,
             PrefillChunk::new(4, 4, 8)?,
         ];
-        let config =
-            Self::from_engine_config_with_prefill_chunks(engine, info, runtime, &required_chunks)?;
+        let config = Self::from_engine_config_with_prefill_chunks(
+            engine,
+            info,
+            runtime,
+            &required_chunks,
+            VNextPlanObservationPolicy::DeterminismTerminalWitnesses,
+        )?;
         if config.runtime_policy.memory().maximum_active_sequences
             < u32::try_from(MAX_VNEXT_DETERMINISM_PARTICIPANTS)
                 .map_err(|_| FerrumError::config("determinism width exceeds u32"))?
@@ -249,6 +318,7 @@ impl VNextExecutorConfig {
         info: &ModelInfo,
         runtime: &R,
         additional_prefill_chunks: &[PrefillChunk],
+        plan_observation: VNextPlanObservationPolicy,
     ) -> Result<Self> {
         let descriptor = runtime.descriptor();
         descriptor
@@ -406,6 +476,7 @@ impl VNextExecutorConfig {
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_chunks,
             diagnostic_fault,
+            plan_observation,
         })
     }
 }
@@ -3660,6 +3731,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             ),
         ]))
         .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?;
+        config
+            .plan_observation
+            .apply(family, &mut compile_options)?;
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut compile_options);
         }
@@ -3674,6 +3748,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &compile_options,
         )
         .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;
+        config
+            .plan_observation
+            .validate_compilation(family, &compilation)?;
         compile_phase.finish();
         let resolve_bind_phase = StartupPhaseTimer::start("plan_resolve_and_bind");
         let resolved_plan = resolve_plan(prepared, &config.runtime_policy, &catalog, &compilation)?;
