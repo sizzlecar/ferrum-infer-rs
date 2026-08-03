@@ -1,8 +1,9 @@
 use super::super::{
-    classify_device_error, BufferDescriptor, BufferUsage, CompletionReservation,
-    DefinitelyNotSubmittedWaveRetryAuthority, DeviceBatchingForm, DeviceCommandBatch,
-    DeviceCommandLogicalWork, DeviceRuntime, ExecutablePlanView, HostTransferLayout,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ResourceWorkShape,
+    classify_device_error, AllocationLifetime, BufferDescriptor, BufferUsage,
+    CompletionReservation, DefinitelyNotSubmittedWaveRetryAuthority, DeviceBatchingForm,
+    DeviceCommandBatch, DeviceCommandLogicalWork, DeviceRuntime, ExecutablePlanView,
+    HostTransferLayout, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ResourceWorkShape,
 };
 use super::buffer_view::OperationBufferView;
 use super::dispatch_contract::{
@@ -226,10 +227,17 @@ where
             usage: backing.usage(),
             element_type: backing.element_type(),
         };
+        let allocation_lifetime = match requirement.scope() {
+            ProviderWorkspaceScope::Plan => AllocationLifetime::Plan,
+            ProviderWorkspaceScope::Request => AllocationLifetime::Request,
+            ProviderWorkspaceScope::Sequence => AllocationLifetime::Sequence,
+            ProviderWorkspaceScope::Step => AllocationLifetime::Step,
+            ProviderWorkspaceScope::Invocation => AllocationLifetime::Invocation,
+        };
         let view = if backing.capacity_size_bytes() > backing.size_bytes() {
-            OperationBufferView::from_backing_prefix(descriptor, backing)
+            OperationBufferView::from_backing_prefix(descriptor, backing, allocation_lifetime)
         } else {
-            OperationBufferView::from_backing_exact(descriptor, backing)
+            OperationBufferView::from_backing_exact(descriptor, backing, allocation_lifetime)
         };
         let node_index = u32::try_from(node_index).map_err(|_| {
             SubmissionWaveDispatchError::Contract(invalid_operation(

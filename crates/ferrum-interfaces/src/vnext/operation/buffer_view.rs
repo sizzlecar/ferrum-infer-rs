@@ -1,7 +1,8 @@
 use super::super::{
-    BufferDescriptor, BufferUsage, DeviceBufferRetention, DeviceRuntime, DynamicResourceDemand,
-    DynamicResourceShape, LeasedBufferView, LogicalBackingBufferView, LogicalBackingSegmentBinding,
-    NodeWorkContract, ResourceId, ResourceTransactionIdentity, VNextError,
+    AllocationLifetime, BufferDescriptor, BufferUsage, DeviceBufferRetention, DeviceRuntime,
+    DynamicResourceDemand, DynamicResourceShape, LeasedBufferView, LogicalBackingBufferView,
+    LogicalBackingSegmentBinding, NodeWorkContract, ResourceId, ResourceTransactionIdentity,
+    VNextError,
 };
 use super::foundation::invalid_operation;
 use super::{DynamicStorageView, ResolvedStorageComponent, ResolvedValueBinding};
@@ -345,6 +346,7 @@ pub struct OperationBufferView<'a, B> {
     descriptor: BufferDescriptor,
     source: OperationBufferSource<'a, B>,
     coverage: OperationBufferCoverage,
+    allocation_lifetime: AllocationLifetime,
 }
 
 impl<'a, B> OperationBufferView<'a, B> {
@@ -356,32 +358,47 @@ impl<'a, B> OperationBufferView<'a, B> {
             descriptor: view.committed_descriptor().clone(),
             source: OperationBufferSource::Static { view, retention },
             coverage: OperationBufferCoverage::Exact,
+            allocation_lifetime: AllocationLifetime::Plan,
         }
     }
 
     pub(super) fn from_backing_exact(
         descriptor: BufferDescriptor,
         backing: LogicalBackingBufferView<'a, B>,
+        allocation_lifetime: AllocationLifetime,
     ) -> Self {
-        Self::from_backing(descriptor, backing, OperationBufferCoverage::Exact)
+        Self::from_backing(
+            descriptor,
+            backing,
+            OperationBufferCoverage::Exact,
+            allocation_lifetime,
+        )
     }
 
     pub(super) fn from_backing_prefix(
         descriptor: BufferDescriptor,
         backing: LogicalBackingBufferView<'a, B>,
+        allocation_lifetime: AllocationLifetime,
     ) -> Self {
-        Self::from_backing(descriptor, backing, OperationBufferCoverage::BackingPrefix)
+        Self::from_backing(
+            descriptor,
+            backing,
+            OperationBufferCoverage::BackingPrefix,
+            allocation_lifetime,
+        )
     }
 
     fn from_backing(
         descriptor: BufferDescriptor,
         backing: LogicalBackingBufferView<'a, B>,
         coverage: OperationBufferCoverage,
+        allocation_lifetime: AllocationLifetime,
     ) -> Self {
         Self {
             descriptor,
             source: OperationBufferSource::Backing(backing),
             coverage,
+            allocation_lifetime,
         }
     }
 
@@ -441,6 +458,10 @@ impl<'a, B> OperationBufferView<'a, B> {
 
     pub fn descriptor(&self) -> &BufferDescriptor {
         &self.descriptor
+    }
+
+    pub const fn allocation_lifetime(&self) -> AllocationLifetime {
+        self.allocation_lifetime
     }
 
     pub fn storage_kind(&self) -> OperationBufferStorageKind {

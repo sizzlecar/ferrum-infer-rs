@@ -553,33 +553,14 @@ pub(crate) fn shared_token_region(
     Ok(region)
 }
 
-pub(crate) fn token_binding_is_shared(
+pub(crate) fn token_binding_is_packed(
     invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
     role: ResolvedValueRole,
     ordinal: u32,
-    element_type: ElementType,
 ) -> Result<bool, String> {
-    let first = &invocation.participants()[0];
-    let region = contiguous_token_region(
-        first,
-        binding(first.bindings(), role, ordinal)?,
-        element_type,
-        0,
-        1,
-    )?;
-    for participant in &invocation.participants()[1..] {
-        let candidate = contiguous_token_region(
-            participant,
-            binding(participant.bindings(), role, ordinal)?,
-            element_type,
-            0,
-            1,
-        )?;
-        if !region.same_physical_region(&candidate) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    invocation
+        .binding_uses_packed_batch_coordinates(role, ordinal)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn shared_full_region(

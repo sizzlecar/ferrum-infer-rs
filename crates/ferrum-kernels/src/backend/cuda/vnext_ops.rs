@@ -888,12 +888,8 @@ fn encode_last_token_dense_linear(
     let first = &invocation.participants()[0];
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
     let out_features = unsigned_attribute(first.attributes(), "out_features")?;
-    let input_shared = transformer::token_binding_is_shared(
-        &invocation,
-        ResolvedValueRole::Input,
-        0,
-        ElementType::F16,
-    )?;
+    let input_packed =
+        transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
     let mut regions = vec![transformer::shared_full_region(
         &invocation,
         ResolvedValueRole::Input,
@@ -919,7 +915,7 @@ fn encode_last_token_dense_linear(
         )?;
         let source_range = token_range.source_token_range();
         let packed_range = token_range.immediate_token_range();
-        let selected_range = if input_shared {
+        let selected_range = if input_packed {
             packed_range
         } else {
             source_range

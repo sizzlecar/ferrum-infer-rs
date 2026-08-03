@@ -753,10 +753,8 @@ fn encode_dense_linear(
     if token_ranges.len() != invocation.participants().len() {
         return Err("CUDA dense linear participant ranges are incomplete".to_owned());
     }
-    let input_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
-    let output_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Output, 0, ElementType::F16)?;
+    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
+    let output_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
     let mut regions = vec![shared_full_region(
         &invocation,
         ResolvedValueRole::Input,
@@ -764,7 +762,7 @@ fn encode_dense_linear(
         ElementType::F16,
     )?];
     let mut launches = Vec::new();
-    if input_shared && output_shared {
+    if input_packed && output_packed {
         let rows = invocation.work_shape().immediate_tokens();
         let input_region = regions.len();
         regions.push(shared_token_region(
@@ -799,7 +797,7 @@ fn encode_dense_linear(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
                 ElementType::F16,
-                if input_shared {
+                if input_packed {
                     packed.start
                 } else {
                     source.start
@@ -811,7 +809,7 @@ fn encode_dense_linear(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
                 ElementType::F16,
-                if output_shared {
+                if output_packed {
                     packed.start
                 } else {
                     source.start
@@ -832,7 +830,7 @@ fn encode_dense_linear(
         "dense linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let batching_form = if input_shared && output_shared {
+    let batching_form = if input_packed && output_packed {
         DeviceBatchingForm::Packed
     } else {
         DeviceBatchingForm::ParticipantLoop
@@ -938,12 +936,10 @@ fn encode_marlin_fp8_dense_linear(
     if token_ranges.len() != invocation.participants().len() {
         return Err("CUDA Marlin FP8 dense linear participant ranges are incomplete".to_owned());
     }
-    let input_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
-    let output_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Output, 0, ElementType::F16)?;
+    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
+    let output_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
     let mut launches = Vec::new();
-    if input_shared && output_shared {
+    if input_packed && output_packed {
         let rows = invocation.work_shape().immediate_tokens();
         let input_region = regions.len();
         regions.push(shared_token_region(
@@ -978,7 +974,7 @@ fn encode_marlin_fp8_dense_linear(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
                 ElementType::F16,
-                if input_shared {
+                if input_packed {
                     packed.start
                 } else {
                     source.start
@@ -990,7 +986,7 @@ fn encode_marlin_fp8_dense_linear(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
                 ElementType::F16,
-                if output_shared {
+                if output_packed {
                     packed.start
                 } else {
                     source.start
@@ -1012,7 +1008,7 @@ fn encode_marlin_fp8_dense_linear(
         "Marlin FP8 dense linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let batching_form = if input_shared && output_shared {
+    let batching_form = if input_packed && output_packed {
         DeviceBatchingForm::Packed
     } else {
         DeviceBatchingForm::ParticipantLoop
@@ -1624,33 +1620,14 @@ fn shared_token_region(
     Ok(region)
 }
 
-pub(super) fn token_binding_is_shared(
+pub(super) fn token_binding_is_packed(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     role: ResolvedValueRole,
     ordinal: u32,
-    element_type: ElementType,
 ) -> Result<bool, String> {
-    let first = &invocation.participants()[0];
-    let region = contiguous_token_region(
-        first,
-        binding(first.bindings(), role, ordinal)?,
-        element_type,
-        0,
-        1,
-    )?;
-    for participant in &invocation.participants()[1..] {
-        let candidate = contiguous_token_region(
-            participant,
-            binding(participant.bindings(), role, ordinal)?,
-            element_type,
-            0,
-            1,
-        )?;
-        if !same_physical_region(&region, &candidate) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    invocation
+        .binding_uses_packed_batch_coordinates(role, ordinal)
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn shared_full_region(

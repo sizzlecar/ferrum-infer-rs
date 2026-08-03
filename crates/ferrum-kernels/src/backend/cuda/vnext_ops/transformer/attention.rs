@@ -964,15 +964,9 @@ fn encode_attention(
     if token_ranges.len() != invocation.participants().len() {
         return Err("CUDA recurrent attention participant ranges are incomplete".to_owned());
     }
-    let input_shared =
-        super::token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
-    let output_shared = super::token_binding_is_shared(
-        &invocation,
-        ResolvedValueRole::Output,
-        0,
-        ElementType::F16,
-    )?;
-    let use_packed = participant_count_usize > 1 && input_shared && output_shared;
+    let input_packed = super::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
+    let output_packed = super::token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
+    let use_packed = participant_count_usize > 1 && input_packed && output_packed;
 
     let mut compute_regions = Vec::new();
     let shared = SharedRegions {
@@ -1121,7 +1115,7 @@ fn encode_attention(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
                 ElementType::F16,
-                if input_shared {
+                if input_packed {
                     packed.start
                 } else {
                     source.start
@@ -1133,7 +1127,7 @@ fn encode_attention(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
                 ElementType::F16,
-                if output_shared {
+                if output_packed {
                     packed.start
                 } else {
                     source.start
