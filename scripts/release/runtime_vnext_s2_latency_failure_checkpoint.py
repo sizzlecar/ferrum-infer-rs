@@ -397,6 +397,30 @@ def event_order(event: dict[str, Any]) -> tuple[int, int]:
     )
 
 
+def validate_cuda_execution_identity(
+    event: dict[str, Any], identity: dict[str, Any], context: str
+) -> None:
+    backend = event.get("backend_detail")
+    require(isinstance(backend, dict), f"{context}: backend detail missing")
+    require(
+        isinstance(backend.get("backend_type"), str) and backend["backend_type"],
+        f"{context}: runtime backend type missing",
+    )
+    require(
+        backend.get("backend_device") == "CUDA(0)",
+        f"{context}: CUDA backend device missing",
+    )
+    require(
+        identity.get("device_id") == "device.cuda.0",
+        f"{context}: typed CUDA device identity missing",
+    )
+    require(
+        isinstance(identity.get("provider_id"), str)
+        and identity["provider_id"].startswith("provider.cuda."),
+        f"{context}: CUDA provider identity missing",
+    )
+
+
 def validate_success_attribution(
     events: list[dict[str, Any]],
     product_event: dict[str, Any],
@@ -450,8 +474,7 @@ def validate_success_attribution(
             require(isinstance(identity.get(key), str) and identity[key], f"submitted operation identity.{key} missing")
         require(type(identity.get("sequence")) is int and identity["sequence"] >= 0, "submitted operation sequence missing")
         require(type(identity.get("resource_pool_id")) is int and identity["resource_pool_id"] >= 0, "submitted operation resource identity missing")
-        backend = event.get("backend_detail")
-        require(isinstance(backend, dict) and backend.get("backend_type") == "cuda", "submitted operation CUDA backend identity missing")
+        validate_cuda_execution_identity(event, identity, "submitted operation")
         operation_identities.append(identity)
     request_completed = by_phase["vnext.request_completed"][-1]
     shape = request_completed.get("shape")
@@ -591,8 +614,7 @@ def validate_failure_profile(path: Path, entrypoint: str) -> dict[str, Any]:
         require(type(identity.get(key)) is int and identity[key] >= 0, f"{path}: identity.{key} missing")
     require(isinstance(identity.get("resource_pool_identity_fingerprint"), str) and SHA256_RE.fullmatch(identity["resource_pool_identity_fingerprint"]), f"{path}: resource pool fingerprint invalid")
     require(isinstance(identity.get("runtime_implementation_fingerprint"), str) and SHA256_RE.fullmatch(identity["runtime_implementation_fingerprint"]), f"{path}: runtime fingerprint invalid")
-    backend = failure.get("backend_detail")
-    require(isinstance(backend, dict) and backend.get("backend_type") == "cuda", f"{path}: CUDA backend identity missing")
+    validate_cuda_execution_identity(failure, identity, f"{path}: first failure")
     snapshot = validate_snapshot(attrs.get("plan_runtime_resource_snapshot"), str(path))
     resource = failure.get("resource")
     require(isinstance(resource, dict), f"{path}: first failure resource event missing")
@@ -617,6 +639,9 @@ def validate_failure_profile(path: Path, entrypoint: str) -> dict[str, Any]:
             matching_submission = event
             break
     require(matching_submission is not None, f"{path}: first failure identity is not owned by a submitted operation")
+    validate_cuda_execution_identity(
+        matching_submission, identity, f"{path}: submitted operation"
+    )
     require(event_order(matching_submission) < event_order(failure), f"{path}: failure precedes operation submission")
     aborted_matches = [
         event for event in same_request if event.get("phase") == "vnext.sequence_aborted"
@@ -1121,7 +1146,7 @@ def base_event(request_id: str, entrypoint: str, phase: str, sequence: int, *, k
         "timestamp": "2026-08-03T00:00:00Z",
         "status": status,
         "shape": {"execution_sequence": sequence},
-        "backend_detail": {"backend_type": "cuda", "backend_device": "cuda:0"},
+        "backend_detail": {"backend_type": "Candle", "backend_device": "CUDA(0)"},
         "attributes": {"profile_detail": "latency", "diagnostic_only": False, "run_id": "run.fixture", "monotonic_nanos_since_run_start": sequence, **(attributes or {})},
     }
     if duration_us is not None:
@@ -1145,8 +1170,8 @@ def identity(request_id: str, sequence: int) -> dict[str, Any]:
         "node_invocation_id": 1,
         "node_id": "node/fixture",
         "operation_id": "operation/fixture",
-        "provider_id": "provider/cuda/fixture",
-        "device_id": "cuda:0",
+        "provider_id": "provider.cuda.fixture",
+        "device_id": "device.cuda.0",
         "resource_pool_id": 7,
         "resource_pool_identity_fingerprint": "2" * 64,
         "provisioning_run_id": "run.pool.fixture",
@@ -1632,6 +1657,9 @@ def self_test() -> int:
     mutations: list[tuple[str, Callable[[Path], None]]] = [
         ("clock-error", lambda root: mutate_jsonl(root / "run-success/profile.jsonl", lambda row: row.get("phase") == "actual_run_generation", lambda row: row["attributes"].update({"clock_conversion_max_error_nanos": 10_000, "clock_conversion_error_ppm": 12_500}))),
         ("missing-operation-identity", lambda root: mutate_jsonl(root / "run-failure/profile.jsonl", lambda row: row.get("phase") == "vnext.failure_observed", lambda row: row["attributes"]["execution_identity"].pop("operation_id"))),
+        ("wrong-cuda-backend-device", lambda root: mutate_jsonl(root / "run-success/profile.jsonl", lambda row: row.get("phase") == "vnext.operation_submitted", lambda row: row["backend_detail"].update({"backend_device": "CPU"}))),
+        ("wrong-cuda-device-identity", lambda root: mutate_jsonl(root / "run-success/profile.jsonl", lambda row: row.get("phase") == "vnext.operation_submitted", lambda row: row["attributes"]["execution_identity"].update({"device_id": "device.cpu.0"}))),
+        ("wrong-cuda-provider-identity", lambda root: mutate_jsonl(root / "run-success/profile.jsonl", lambda row: row.get("phase") == "vnext.operation_submitted", lambda row: row["attributes"]["execution_identity"].update({"provider_id": "provider.cpu.fixture"}))),
         ("forged-snapshot", lambda root: mutate_jsonl(root / "serve-failure/profile.jsonl", lambda row: row.get("phase") == "vnext.failure_observed", lambda row: row["attributes"]["plan_runtime_resource_snapshot"].update({"process_claimed_bytes": 901}))),
         ("duplicate-first-failure", lambda root: write_jsonl(root / "run-failure/profile.jsonl", read_jsonl(root / "run-failure/profile.jsonl") + [copy.deepcopy(next(row for row in read_jsonl(root / "run-failure/profile.jsonl") if row.get("phase") == "vnext.failure_observed"))])),
         ("stale-analyzer", lambda root: write_text(root / "inputs/analyze_ferrum_profile.py", "# stale\n")),
