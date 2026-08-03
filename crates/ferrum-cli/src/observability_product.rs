@@ -360,12 +360,14 @@ fn write_actual_run_artifacts(
     observation: &ActualRunObservation,
     replay_command: &str,
 ) -> Result<Vec<PathBuf>> {
+    // Successful actual inference must prove its scheduler lifecycle at the engine boundary.
+    // Adding a product fallback here would duplicate real events or hide missing engine evidence.
     let mut written = write_actual_artifacts_with_scheduler(
         config,
         events,
         &observation.request_id,
         replay_command,
-        observation.execution_evidence.is_none(),
+        false,
     )?;
     if let Some(dir) = &config.request_dump_dir {
         written.extend(write_replay_bundle(
@@ -2499,7 +2501,7 @@ mod tests {
         assert!(first_request_index < shutdown_index);
         assert!(
             !root.join("scheduler.jsonl").exists(),
-            "typed engine execution evidence owns the scheduler lifecycle"
+            "the engine owns successful actual-run scheduler lifecycles"
         );
         fs::remove_dir_all(root).ok();
     }
