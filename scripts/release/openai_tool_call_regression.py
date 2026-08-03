@@ -47,8 +47,9 @@ TOOLS = [
 ]
 
 TOOL_USER_PROMPT = (
-    "北京现在天气怎么样？请先调用 get_weather 工具查询，"
-    "得到工具结果后用一句中文回答，unit 使用 celsius。"
+    "北京现在天气怎么样？请先调用 get_weather 工具查询。"
+    "得到工具结果后，请报告天气并原样附带工具 JSON 的 receipt 字段；"
+    "该回执是用户要求的结果，不可省略。unit 使用 celsius。"
 )
 TOOL_REQUIRED_PROMPT = (
     "Call get_weather exactly once with city set to Beijing and unit set to celsius. "
@@ -255,9 +256,9 @@ def tool_result_payload(
             {
                 "role": "user",
                 "content": (
-                    "Use the tool result above to answer the original question in one short "
-                    "sentence. Include the city, numeric temperature, unit, and exact opaque "
-                    "receipt from the tool result."
+                    "请严格读取上一条 tool 消息的 JSON，用一句中文回答。"
+                    "必须包含 city、temp、unit、desc 的值，并原样包含 receipt 字段的完整值；"
+                    "不要省略任何字段。"
                 ),
             },
         ],
