@@ -456,6 +456,7 @@ impl EngineInner {
                         "wait_condition": deferral.wait_condition(),
                         "shortfalls": deferral.shortfalls(),
                         "backing_blockers": deferral.backing_blockers(),
+                        "typed_evidence": deferral.evidence(),
                         "maintenance_retry": retry,
                         "not_before_iteration": receipt.not_before_iteration(),
                         "latest_capacity_epoch": receipt.latest_capacity_epoch(),
@@ -488,6 +489,7 @@ impl EngineInner {
                         "wait_condition": deferral.wait_condition(),
                         "shortfalls": deferral.shortfalls(),
                         "backing_blockers": deferral.backing_blockers(),
+                        "typed_evidence": deferral.evidence(),
                         "reason": "minimum_frontier_has_no_external_releaser",
                         "scheduler": self.scheduler.trace_snapshot(),
                     }));
@@ -539,6 +541,7 @@ impl EngineInner {
                     "wait_condition": deferral.wait_condition(),
                     "shortfalls": deferral.shortfalls(),
                     "backing_blockers": deferral.backing_blockers(),
+                    "typed_evidence": deferral.evidence(),
                     "scheduler": self.scheduler.trace_snapshot(),
                 }));
                 return Ok(());
@@ -847,6 +850,7 @@ impl EngineInner {
                         "wait_condition": deferral.wait_condition(),
                         "shortfalls": deferral.shortfalls(),
                         "backing_blockers": deferral.backing_blockers(),
+                        "typed_evidence": deferral.evidence(),
                         "maintenance_retry": retry,
                         "not_before_iteration": receipt.not_before_iteration(),
                         "latest_capacity_epoch": receipt.latest_capacity_epoch(),
@@ -864,6 +868,7 @@ impl EngineInner {
                     "wait_condition": deferral.wait_condition(),
                     "shortfalls": deferral.shortfalls(),
                     "backing_blockers": deferral.backing_blockers(),
+                    "typed_evidence": deferral.evidence(),
                     "scheduler": self.scheduler.trace_snapshot(),
                 }));
                 return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(

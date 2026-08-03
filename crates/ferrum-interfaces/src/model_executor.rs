@@ -1816,22 +1816,162 @@ impl ExecutorExecutionMaintenanceRetry {
 /// This value owns no resource authority. The executor retains the committed
 /// request/sequence authority and has already retired any unsubmitted step or
 /// submission-wave authority before returning it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorExecutionCapacityEvidenceOwner {
+    Logical,
+    Backing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExecutorExecutionCapacityEvidenceKind {
+    Logical {
+        shortfalls: Vec<crate::vnext::CapacityShortfall>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pressure: Option<crate::vnext::DynamicBackingPressure>,
+    },
+    BackingDeferred {
+        blockers: Vec<crate::vnext::DynamicBackingBlocker>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pressure: Option<crate::vnext::DynamicBackingPressure>,
+    },
+    BackingPressure {
+        pressure: crate::vnext::DynamicBackingPressure,
+    },
+}
+
+/// Exactly one typed owner for an execution-capacity deferral.
+///
+/// Its fields are private so callers cannot construct an empty or ambiguous
+/// logical/backing evidence combination.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutorExecutionCapacityEvidence {
+    owner: ExecutorExecutionCapacityEvidenceOwner,
+    #[serde(flatten)]
+    kind: ExecutorExecutionCapacityEvidenceKind,
+}
+
+impl ExecutorExecutionCapacityEvidence {
+    fn logical(shortfalls: Vec<crate::vnext::CapacityShortfall>) -> Result<Self> {
+        Self::logical_with_pressure(shortfalls, None)
+    }
+
+    fn logical_with_pressure(
+        shortfalls: Vec<crate::vnext::CapacityShortfall>,
+        pressure: Option<crate::vnext::DynamicBackingPressure>,
+    ) -> Result<Self> {
+        if shortfalls.is_empty() {
+            return Err(FerrumError::internal(
+                "logical execution deferral requires at least one shortfall",
+            ));
+        }
+        Ok(Self {
+            owner: ExecutorExecutionCapacityEvidenceOwner::Logical,
+            kind: ExecutorExecutionCapacityEvidenceKind::Logical {
+                shortfalls,
+                pressure,
+            },
+        })
+    }
+
+    fn backing_deferred(blockers: Vec<crate::vnext::DynamicBackingBlocker>) -> Result<Self> {
+        Self::backing_deferred_with_pressure(blockers, None)
+    }
+
+    fn backing_deferred_with_pressure(
+        blockers: Vec<crate::vnext::DynamicBackingBlocker>,
+        pressure: Option<crate::vnext::DynamicBackingPressure>,
+    ) -> Result<Self> {
+        if blockers.is_empty() {
+            return Err(FerrumError::internal(
+                "physical execution deferral requires at least one backing blocker",
+            ));
+        }
+        Ok(Self {
+            owner: ExecutorExecutionCapacityEvidenceOwner::Backing,
+            kind: ExecutorExecutionCapacityEvidenceKind::BackingDeferred { blockers, pressure },
+        })
+    }
+
+    fn direct_backing_pressure(pressure: crate::vnext::DynamicBackingPressure) -> Self {
+        Self {
+            owner: ExecutorExecutionCapacityEvidenceOwner::Backing,
+            kind: ExecutorExecutionCapacityEvidenceKind::BackingPressure { pressure },
+        }
+    }
+
+    pub const fn owner(&self) -> ExecutorExecutionCapacityEvidenceOwner {
+        self.owner
+    }
+
+    pub fn shortfalls(&self) -> &[crate::vnext::CapacityShortfall] {
+        match &self.kind {
+            ExecutorExecutionCapacityEvidenceKind::Logical { shortfalls, .. } => shortfalls,
+            ExecutorExecutionCapacityEvidenceKind::BackingDeferred { .. }
+            | ExecutorExecutionCapacityEvidenceKind::BackingPressure { .. } => &[],
+        }
+    }
+
+    pub fn backing_blockers(&self) -> &[crate::vnext::DynamicBackingBlocker] {
+        match &self.kind {
+            ExecutorExecutionCapacityEvidenceKind::BackingDeferred { blockers, .. } => blockers,
+            ExecutorExecutionCapacityEvidenceKind::Logical { .. }
+            | ExecutorExecutionCapacityEvidenceKind::BackingPressure { .. } => &[],
+        }
+    }
+
+    pub const fn backing_pressure(&self) -> Option<&crate::vnext::DynamicBackingPressure> {
+        match &self.kind {
+            ExecutorExecutionCapacityEvidenceKind::Logical { pressure, .. }
+            | ExecutorExecutionCapacityEvidenceKind::BackingDeferred { pressure, .. } => {
+                pressure.as_ref()
+            }
+            ExecutorExecutionCapacityEvidenceKind::BackingPressure { pressure } => Some(pressure),
+        }
+    }
+
+    fn has_relevant_mutation(&self, mutation: &ExecutorExecutionMaintenanceMutation) -> bool {
+        let logical_matches = |shortfalls: &[crate::vnext::CapacityShortfall]| {
+            shortfalls.iter().any(|shortfall| {
+                shortfall.kind() == crate::vnext::CapacityShortfallKind::BackingGrowthRequired
+                    && shortfall.domain() == Some(mutation.domain_id())
+            })
+        };
+        let backing_matches = |blockers: &[crate::vnext::DynamicBackingBlocker]| {
+            blockers.iter().any(|blocker| {
+                blocker.pool_id() == mutation.pool_id()
+                    && blocker.domain_id() == mutation.domain_id()
+            })
+        };
+        match &self.kind {
+            ExecutorExecutionCapacityEvidenceKind::Logical { shortfalls, .. } => {
+                logical_matches(shortfalls)
+            }
+            ExecutorExecutionCapacityEvidenceKind::BackingDeferred { blockers, .. } => {
+                backing_matches(blockers)
+            }
+            ExecutorExecutionCapacityEvidenceKind::BackingPressure { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ExecutorExecutionCapacityDeferral {
     observed: ExecutorAdmissionEpochs,
     wait_condition: crate::vnext::CapacityWaitCondition,
     stage: ExecutorExecutionCapacityStage,
-    shortfalls: Vec<crate::vnext::CapacityShortfall>,
-    backing_blockers: Vec<crate::vnext::DynamicBackingBlocker>,
+    evidence: ExecutorExecutionCapacityEvidence,
     #[serde(skip_serializing_if = "Option::is_none")]
     maintenance_retry: Option<ExecutorExecutionMaintenanceRetry>,
 }
 
 impl ExecutorExecutionCapacityDeferral {
-    pub fn new(
+    fn with_evidence(
         observed: ExecutorAdmissionEpochs,
         wait_condition: crate::vnext::CapacityWaitCondition,
         stage: ExecutorExecutionCapacityStage,
+        evidence: ExecutorExecutionCapacityEvidence,
     ) -> Result<Self> {
         if wait_condition.coordinator_id().get() != observed.coordinator_id.get() {
             return Err(ferrum_types::FerrumError::request_validation(
@@ -1842,10 +1982,25 @@ impl ExecutorExecutionCapacityDeferral {
             observed,
             wait_condition,
             stage,
-            shortfalls: Vec::new(),
-            backing_blockers: Vec::new(),
+            evidence,
             maintenance_retry: None,
         })
+    }
+
+    /// Construct a physical deferral for an executor that observes device or
+    /// pool pressure directly rather than through Ferrum's backing allocator.
+    pub fn from_backing_pressure(
+        observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        pressure: crate::vnext::DynamicBackingPressure,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        Self::with_evidence(
+            observed,
+            wait_condition,
+            stage,
+            ExecutorExecutionCapacityEvidence::direct_backing_pressure(pressure),
+        )
     }
 
     pub fn from_admission(
@@ -1857,13 +2012,13 @@ impl ExecutorExecutionCapacityDeferral {
                 "execution capacity deferral must be reduced to WaitForRelease before export",
             ));
         }
-        let mut result = Self::new(
+        let evidence = ExecutorExecutionCapacityEvidence::logical(deferred.blockers().to_vec())?;
+        Self::with_evidence(
             ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
             deferred.wait_condition().clone(),
             stage,
-        )?;
-        result.shortfalls = deferred.blockers().to_vec();
-        Ok(result)
+            evidence,
+        )
     }
 
     /// Export an unresolved logical backing-growth decision after the
@@ -1881,13 +2036,13 @@ impl ExecutorExecutionCapacityDeferral {
                 "pending execution maintenance must await backing growth",
             ));
         }
-        let mut result = Self::new(
+        let evidence = ExecutorExecutionCapacityEvidence::logical(deferred.blockers().to_vec())?;
+        Self::with_evidence(
             ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
             deferred.wait_condition().clone(),
             stage,
-        )?;
-        result.shortfalls = deferred.blockers().to_vec();
-        Ok(result)
+            evidence,
+        )
     }
 
     /// Export unresolved physical backing pressure without discarding its
@@ -1896,13 +2051,14 @@ impl ExecutorExecutionCapacityDeferral {
         deferred: &crate::vnext::DynamicBackingDeferred,
         stage: ExecutorExecutionCapacityStage,
     ) -> Result<Self> {
-        let mut result = Self::new(
+        let evidence =
+            ExecutorExecutionCapacityEvidence::backing_deferred(deferred.blockers().to_vec())?;
+        Self::with_evidence(
             ExecutorAdmissionEpochs::from_capacity(deferred.epochs()),
             deferred.wait_condition().clone(),
             stage,
-        )?;
-        result.backing_blockers = deferred.blockers().to_vec();
-        Ok(result)
+            evidence,
+        )
     }
 
     /// Attach a scheduler retry only when this call produced at least one real
@@ -1932,21 +2088,10 @@ impl ExecutorExecutionCapacityDeferral {
                 "execution maintenance progress does not match the exported deferral",
             ));
         }
-        let relevant_mutation = if self.backing_blockers.is_empty() {
-            progress.mutations().iter().any(|mutation| {
-                self.shortfalls.iter().any(|shortfall| {
-                    shortfall.kind() == crate::vnext::CapacityShortfallKind::BackingGrowthRequired
-                        && shortfall.domain() == Some(mutation.domain_id())
-                })
-            })
-        } else {
-            progress.mutations().iter().any(|mutation| {
-                self.backing_blockers.iter().any(|blocker| {
-                    blocker.pool_id() == mutation.pool_id()
-                        && blocker.domain_id() == mutation.domain_id()
-                })
-            })
-        };
+        let relevant_mutation = progress
+            .mutations()
+            .iter()
+            .any(|mutation| self.evidence.has_relevant_mutation(mutation));
         if !relevant_mutation {
             return Ok(self);
         }
@@ -1962,10 +2107,11 @@ impl ExecutorExecutionCapacityDeferral {
         Ok(self)
     }
 
-    pub fn from_maintenance(
+    pub fn from_admission_maintenance(
         source: &crate::vnext::AdmissionDeferred,
         observed: ExecutorAdmissionEpochs,
         wait_condition: crate::vnext::CapacityWaitCondition,
+        pressure: crate::vnext::DynamicBackingPressure,
         stage: ExecutorExecutionCapacityStage,
     ) -> Result<Self> {
         if source.action() != crate::vnext::DeferredAction::AwaitBackingGrowth {
@@ -1973,9 +2119,25 @@ impl ExecutorExecutionCapacityDeferral {
                 "execution maintenance source must await backing growth",
             ));
         }
-        let mut result = Self::new(observed, wait_condition, stage)?;
-        result.shortfalls = source.blockers().to_vec();
-        Ok(result)
+        let evidence = ExecutorExecutionCapacityEvidence::logical_with_pressure(
+            source.blockers().to_vec(),
+            Some(pressure),
+        )?;
+        Self::with_evidence(observed, wait_condition, stage, evidence)
+    }
+
+    pub fn from_backing_maintenance(
+        source: &crate::vnext::DynamicBackingDeferred,
+        observed: ExecutorAdmissionEpochs,
+        wait_condition: crate::vnext::CapacityWaitCondition,
+        pressure: crate::vnext::DynamicBackingPressure,
+        stage: ExecutorExecutionCapacityStage,
+    ) -> Result<Self> {
+        let evidence = ExecutorExecutionCapacityEvidence::backing_deferred_with_pressure(
+            source.blockers().to_vec(),
+            Some(pressure),
+        )?;
+        Self::with_evidence(observed, wait_condition, stage, evidence)
     }
 
     pub const fn observed(&self) -> ExecutorAdmissionEpochs {
@@ -1990,12 +2152,20 @@ impl ExecutorExecutionCapacityDeferral {
         self.stage
     }
 
+    pub const fn evidence(&self) -> &ExecutorExecutionCapacityEvidence {
+        &self.evidence
+    }
+
     pub fn shortfalls(&self) -> &[crate::vnext::CapacityShortfall] {
-        &self.shortfalls
+        self.evidence.shortfalls()
     }
 
     pub fn backing_blockers(&self) -> &[crate::vnext::DynamicBackingBlocker] {
-        &self.backing_blockers
+        self.evidence.backing_blockers()
+    }
+
+    pub const fn backing_pressure(&self) -> Option<&crate::vnext::DynamicBackingPressure> {
+        self.evidence.backing_pressure()
     }
 
     pub fn maintenance_retry(&self) -> Option<&ExecutorExecutionMaintenanceRetry> {
@@ -2058,7 +2228,7 @@ impl ExecutorExecutionCapacityDeferral {
             .saturating_sub(attempted_tokens.div_ceil(4))
             .max(1);
         let proportional = self
-            .shortfalls
+            .shortfalls()
             .iter()
             .filter_map(|shortfall| {
                 let requested = shortfall.requested().get();
@@ -2187,11 +2357,13 @@ impl From<ExecutorRequestStateDeferral> for ExecutorExecutionDeferral {
 #[cfg(test)]
 mod execution_capacity_deferral_tests {
     use super::{
-        ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral, ExecutorExecutionCapacityStage,
+        ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral,
+        ExecutorExecutionCapacityEvidenceOwner, ExecutorExecutionCapacityStage,
         ExecutorExecutionMaintenanceProgress, ExecutorExecutionMaintenanceRetry,
     };
     use crate::vnext::{
         CapacityAvailabilityEpoch, CapacityAvailabilitySource, CapacityWaitCondition,
+        DeviceCapacityPressure, DeviceCapacityPressureScope, DynamicBackingPressure,
     };
     use ferrum_types::RequestId;
     use std::num::NonZeroU64;
@@ -2210,12 +2382,27 @@ mod execution_capacity_deferral_tests {
             CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 7)
                 .unwrap();
         let condition = CapacityWaitCondition::from_observation(19, vec![observed]).unwrap();
-        ExecutorExecutionCapacityDeferral::new(
+        ExecutorExecutionCapacityDeferral::from_backing_pressure(
             ExecutorAdmissionEpochs::new(NonZeroU64::new(19).unwrap(), 3, 5),
             condition,
+            test_pressure(),
             stage,
         )
         .unwrap()
+    }
+
+    fn test_pressure() -> DynamicBackingPressure {
+        DeviceCapacityPressure::new(
+            DeviceCapacityPressureScope::PlanBudget,
+            "device.execution-capacity-test".to_owned(),
+            1,
+            1,
+            1,
+            1,
+            1,
+        )
+        .unwrap()
+        .into()
     }
 
     #[test]
@@ -2224,9 +2411,10 @@ mod execution_capacity_deferral_tests {
             CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 7)
                 .unwrap();
         let condition = CapacityWaitCondition::from_observation(19, vec![observed]).unwrap();
-        let deferred = ExecutorExecutionCapacityDeferral::new(
+        let deferred = ExecutorExecutionCapacityDeferral::from_backing_pressure(
             ExecutorAdmissionEpochs::new(NonZeroU64::new(19).unwrap(), 3, 5),
             condition,
+            test_pressure(),
             ExecutorExecutionCapacityStage::StepAdmission,
         )
         .unwrap();
@@ -2234,6 +2422,23 @@ mod execution_capacity_deferral_tests {
         assert_eq!(deferred.narrower_prefill_tokens(342), Some(171));
         assert_eq!(deferred.narrower_prefill_tokens(2), Some(1));
         assert_eq!(deferred.narrower_prefill_tokens(1), None);
+    }
+
+    #[test]
+    fn backing_pressure_serializes_one_typed_evidence_owner() {
+        let deferred = test_deferral(ExecutorExecutionCapacityStage::SequenceExtension);
+        let serialized = serde_json::to_value(&deferred).unwrap();
+
+        assert_eq!(
+            deferred.evidence().owner(),
+            ExecutorExecutionCapacityEvidenceOwner::Backing
+        );
+        assert!(deferred.shortfalls().is_empty());
+        assert!(deferred.backing_blockers().is_empty());
+        assert!(deferred.backing_pressure().is_some());
+        assert_eq!(serialized["evidence"]["owner"], "backing");
+        assert_eq!(serialized["evidence"]["kind"], "backing_pressure");
+        assert!(serialized["evidence"]["pressure"].is_object());
     }
 
     #[test]

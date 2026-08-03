@@ -928,6 +928,7 @@ impl EngineInner {
                     "wait_condition": deferral.wait_condition(),
                     "shortfalls": deferral.shortfalls(),
                     "backing_blockers": deferral.backing_blockers(),
+                    "typed_evidence": deferral.evidence(),
                     "maintenance_retry": deferral.maintenance_retry(),
                 }),
             ),

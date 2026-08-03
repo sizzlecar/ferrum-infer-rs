@@ -348,7 +348,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
-                        Some(&deferred),
+                        VNextExecutionMaintenanceSource::Logical(&deferred),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
                     )? {
@@ -370,7 +370,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
-                        None,
+                        VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
                     )? {

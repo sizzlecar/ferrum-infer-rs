@@ -232,6 +232,7 @@ impl EngineInner {
                         "wait_condition": deferral.wait_condition(),
                         "shortfalls": deferral.shortfalls(),
                         "backing_blockers": deferral.backing_blockers(),
+                        "typed_evidence": deferral.evidence(),
                         "maintenance_retry": retry,
                         "not_before_iteration": receipt.not_before_iteration(),
                         "latest_capacity_epoch": receipt.latest_capacity_epoch(),
