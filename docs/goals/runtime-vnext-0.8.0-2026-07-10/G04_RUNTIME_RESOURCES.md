@@ -451,6 +451,39 @@ artifacts are source-level KEEP evidence, not a G04 or CUDA product PASS. Curren
 dense CUDA product-path correctness remain required before this pressure repair is accepted on
 hardware.
 
+## 2026-08-03 Shared Synthetic Lifecycle Checkpoint
+
+Commit `b6458ef3` adds one bounded ownership analyzer over the real device-operation planning,
+resource admission, submission-wave, completion-reaper, and plan-root close path. The three inputs
+are resource-shape proxies, not substitutes for model-math correctness:
+
+- dense declares token-scaled paged KV state;
+- MoE declares the same KV state plus token-scaled Invocation workspace for both sequential nodes;
+- hybrid declares paged KV, a separate fixed contiguous recurrent state, and the same Invocation
+  workspace.
+
+All three execute one shared analyzer implementation with one Request, three distinct child
+Sequence authorities, one Step, a two-node wave, one lane, one physical submit/fence, successful
+participant completion projections, ordered teardown, empty live occupancy, and exact root close.
+The analyzer checks logical identities independently from physical backing counters. Observed
+per-child Sequence claims/bytes are dense=`1/16`, MoE=`1/16`, hybrid=`2/32`; Request claims remain
+`2` while child count grows from one to three. The two sequential workspace formulas produce one
+Invocation peak claim of `48` bytes rather than a two-node `96`-byte sum, remain owned through
+in-flight submission, and return to `0` only after the fence terminal state.
+
+Bounded local evidence is under
+`/Users/chejinxuan/ferrum-artifacts/runtime-vnext-g04-synthetic-586d53df-20260803/`:
+
+- `focused-r5.receipt.json`: shared dense/MoE/hybrid lifecycle `1/1` PASS with a serialized
+  contract/occupancy report in `focused-r5.stdout.log`;
+- `affected-r1.receipt.json`: device-operation batch `3/3`, wave execution `11/11`, and workspace
+  `6/6` PASS;
+- `interface-tests-check-r1.receipt.json`: all `ferrum-interfaces` test targets compile PASS.
+
+This is G04 L1 KEEP evidence, not canonical G04 PASS. The seeded 100,000-transition state model,
+remaining failure/cancel/recovery aggregation, canonical artifact tree, and final `vnext-g04`
+validator remain Open.
+
 ## 性能约束
 
 - L1 reference workload scheduler bookkeeping 占 runtime wall time `<=5%`；真实 CUDA c32
