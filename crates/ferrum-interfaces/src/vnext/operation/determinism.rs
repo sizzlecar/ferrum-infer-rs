@@ -691,7 +691,6 @@ fn prepared_location_range<R: DeviceRuntime>(
                 })?;
             if binding.usage() != BufferUsage::Activations
                 || component.offset_bytes() != 0
-                || projection.canonical_extent() > maximum_tokens
                 || component.length_bytes()
                     != bytes_per_token
                         .checked_mul(projection.canonical_extent())
@@ -708,16 +707,12 @@ fn prepared_location_range<R: DeviceRuntime>(
             } else {
                 token_range.source_token_range().start
             };
-            (
-                bytes_per_token.checked_mul(token_start).ok_or_else(|| {
-                    invalid_operation("determinism immediate byte offset overflows")
-                })?,
-                bytes_per_token
-                    .checked_mul(token_range.immediate_tokens())
-                    .ok_or_else(|| {
-                        invalid_operation("determinism immediate byte length overflows")
-                    })?,
-            )
+            immediate_token_logical_range(
+                token_start,
+                token_range.immediate_tokens(),
+                bytes_per_token,
+                maximum_tokens,
+            )?
         }
         ExecutionDeterminismValueExtent::ActiveTokenPrefix {
             bytes_per_token,
@@ -767,6 +762,30 @@ fn prepared_location_range<R: DeviceRuntime>(
         logical_offset_bytes,
         length_bytes,
     })
+}
+
+fn immediate_token_logical_range(
+    token_start: u64,
+    immediate_tokens: u64,
+    bytes_per_token: u64,
+    maximum_tokens: u64,
+) -> Result<(u64, u64), VNextError> {
+    let token_end = token_start
+        .checked_add(immediate_tokens)
+        .ok_or_else(|| invalid_operation("determinism immediate token range overflows"))?;
+    if immediate_tokens == 0 || token_end > maximum_tokens {
+        return Err(invalid_operation(
+            "determinism immediate token range exceeds its scheduled resource capacity",
+        ));
+    }
+    Ok((
+        bytes_per_token
+            .checked_mul(token_start)
+            .ok_or_else(|| invalid_operation("determinism immediate byte offset overflows"))?,
+        bytes_per_token
+            .checked_mul(immediate_tokens)
+            .ok_or_else(|| invalid_operation("determinism immediate byte length overflows"))?,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1453,5 +1472,20 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
             physical_readbacks,
             witnesses,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::immediate_token_logical_range;
+
+    #[test]
+    fn immediate_token_range_uses_scheduled_capacity_not_canonical_extent() {
+        assert_eq!(
+            immediate_token_logical_range(1, 3, 16, 4).unwrap(),
+            (16, 48)
+        );
+        assert!(immediate_token_logical_range(2, 3, 16, 4).is_err());
+        assert!(immediate_token_logical_range(u64::MAX, 1, 16, u64::MAX).is_err());
     }
 }
