@@ -755,10 +755,49 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         isinstance(backing_blockers, list),
         f"{label}: physical backing blockers are missing",
     )
+    typed_evidence = evidence.get("typed_evidence")
+    require(isinstance(typed_evidence, dict), f"{label}: typed capacity evidence is missing")
+    evidence_owner = typed_evidence.get("owner")
+    evidence_kind = typed_evidence.get("kind")
     require(
-        bool(shortfalls) != bool(backing_blockers),
-        f"{label}: capacity evidence has no unique logical/backing owner",
+        evidence_owner in {"logical", "backing"},
+        f"{label}: typed capacity evidence owner is invalid",
     )
+    if evidence_owner == "logical":
+        require(evidence_kind == "logical", f"{label}: logical evidence kind is invalid")
+        require(bool(shortfalls), f"{label}: logical evidence has no shortfall")
+        require(not backing_blockers, f"{label}: logical evidence also owns backing blockers")
+        require(
+            typed_evidence.get("shortfalls") == shortfalls,
+            f"{label}: typed and compatibility logical evidence differ",
+        )
+    elif evidence_kind == "backing_deferred":
+        require(not shortfalls, f"{label}: backing evidence also owns logical shortfalls")
+        require(bool(backing_blockers), f"{label}: backing evidence has no blocker")
+        require(
+            typed_evidence.get("blockers") == backing_blockers,
+            f"{label}: typed and compatibility backing evidence differ",
+        )
+    else:
+        require(
+            evidence_kind == "backing_pressure",
+            f"{label}: backing evidence kind is invalid",
+        )
+        require(
+            not shortfalls and not backing_blockers,
+            f"{label}: direct backing pressure also owns compatibility blockers",
+        )
+    if evidence_kind in {"logical", "backing_deferred"}:
+        pressure = typed_evidence.get("pressure")
+        require(
+            pressure is None or isinstance(pressure, dict),
+            f"{label}: maintenance pressure evidence is invalid",
+        )
+    else:
+        require(
+            isinstance(typed_evidence.get("pressure"), dict),
+            f"{label}: direct backing pressure evidence is missing",
+        )
     scheduler_snapshot = attributes.get("scheduler_snapshot")
     require(isinstance(scheduler_snapshot, dict), f"{label}: scheduler snapshot is missing")
     return {
@@ -775,7 +814,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "yield_kind": yield_kind,
         "observed": observed,
         "wait_condition": wait_condition,
-        "evidence_owner": "backing" if backing_blockers else "logical",
+        "evidence_owner": evidence_owner,
     }
 
 
@@ -3332,20 +3371,26 @@ def self_test() -> int:
         "coordinator_id": 7,
         "observed": [{"source": {"domain": 5}, "epoch": 3}],
     }
+    logical_shortfalls = [
+        {
+            "domain": 5,
+            "kind": "fit_availability",
+            "requested": 2,
+            "available": 1,
+            "current_total": 1,
+            "maximum_total": 2,
+        }
+    ]
     capacity_evidence = {
         "observed": {"coordinator_id": 7, "release_epoch": 11, "capacity_epoch": 13},
         "wait_condition": wait_condition,
-        "shortfalls": [
-            {
-                "domain": 5,
-                "kind": "fit_availability",
-                "requested": 2,
-                "available": 1,
-                "current_total": 1,
-                "maximum_total": 2,
-            }
-        ],
+        "shortfalls": logical_shortfalls,
         "backing_blockers": [],
+        "typed_evidence": {
+            "owner": "logical",
+            "kind": "logical",
+            "shortfalls": logical_shortfalls,
+        },
     }
 
     def deferral(
@@ -3790,7 +3835,7 @@ def self_test() -> int:
             continue
         evidence = row["attributes"]["capacity_evidence"]
         evidence["shortfalls"] = []
-        evidence["backing_blockers"] = [
+        blockers = [
             {
                 "pool_id": "dynamic-pool/sha256/" + "a" * 64,
                 "domain_id": 5,
@@ -3801,6 +3846,12 @@ def self_test() -> int:
                 "free_extent_layout_fingerprint": "sha256/" + "b" * 64,
             }
         ]
+        evidence["backing_blockers"] = blockers
+        evidence["typed_evidence"] = {
+            "owner": "backing",
+            "kind": "backing_deferred",
+            "blockers": blockers,
+        }
     backing_counter_provenance = validate_decode_counter_provenance(
         backing_rows,
         started_wall_ns=90,
@@ -3816,6 +3867,45 @@ def self_test() -> int:
         backing_counter_provenance["device_backing_trace_events"]
         == summary["deferral_events"],
         "self-test lost device-backing counter provenance",
+    )
+    direct_pressure_rows = json.loads(json.dumps(rows))
+    for row in direct_pressure_rows:
+        if row.get("phase") != "vnext.decode_capacity_deferred":
+            continue
+        evidence = row["attributes"]["capacity_evidence"]
+        evidence["shortfalls"] = []
+        evidence["backing_blockers"] = []
+        evidence["typed_evidence"] = {
+            "owner": "backing",
+            "kind": "backing_pressure",
+            "pressure": {
+                "kind": "device_capacity",
+                "evidence": {
+                    "scope": "plan_budget",
+                    "device_id": "device.self-test",
+                    "requested_bytes": 1,
+                    "plan_claimed_bytes": 1,
+                    "plan_usable_bytes": 1,
+                    "process_claimed_bytes": 1,
+                    "process_usable_bytes": 1,
+                },
+            },
+        }
+    direct_pressure_provenance = validate_decode_counter_provenance(
+        direct_pressure_rows,
+        started_wall_ns=90,
+        finished_wall_ns=170,
+        counters={
+            "extension_deferrals": 0,
+            "step_deferrals": 0,
+            "wave_deferrals": 0,
+            "backing_deferrals": summary["deferral_events"],
+        },
+    )
+    require(
+        direct_pressure_provenance["device_backing_trace_events"]
+        == summary["deferral_events"],
+        "self-test lost direct backing-pressure provenance",
     )
     expect_reject(
         lambda: validate_decode_counter_provenance(
@@ -3855,6 +3945,24 @@ def self_test() -> int:
             },
         ),
         "ambiguous logical/backing deferral ownership",
+    )
+    untyped_rows = json.loads(json.dumps(rows))
+    untyped_rows[0]["attributes"]["capacity_evidence"].pop("typed_evidence")
+    expect_reject(
+        lambda: validate_decode_counter_provenance(
+            untyped_rows,
+            started_wall_ns=90,
+            finished_wall_ns=170,
+            counters={
+                "extension_deferrals": summary["pressure_yield_events"],
+                "step_deferrals": (
+                    summary["deferral_events"] - summary["pressure_yield_events"]
+                ),
+                "wave_deferrals": 0,
+                "backing_deferrals": 0,
+            },
+        ),
+        "missing typed deferral ownership",
     )
     rebalance_summary = validate_rebalance_trace(
         rebalance_rows, started_wall_ns=80, finished_wall_ns=89

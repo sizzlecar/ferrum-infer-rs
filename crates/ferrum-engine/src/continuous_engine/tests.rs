@@ -27,6 +27,30 @@ use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
 use std::time::Duration;
 
+fn test_execution_capacity_deferral(
+    observed: ExecutorAdmissionEpochs,
+    wait_condition: ferrum_interfaces::vnext::CapacityWaitCondition,
+    stage: ExecutorExecutionCapacityStage,
+) -> ExecutorExecutionCapacityDeferral {
+    let pressure = ferrum_interfaces::vnext::DeviceCapacityPressure::new(
+        ferrum_interfaces::vnext::DeviceCapacityPressureScope::PlanBudget,
+        "device.test-execution-capacity".to_owned(),
+        1,
+        1,
+        1,
+        1,
+        1,
+    )
+    .unwrap();
+    ExecutorExecutionCapacityDeferral::from_backing_pressure(
+        observed,
+        wait_condition,
+        pressure.into(),
+        stage,
+    )
+    .unwrap()
+}
+
 struct PlanRuntimeAdmissionTestExecutor {
     inner: MockModelExecutor,
     retained: std::sync::Mutex<HashSet<RequestId>>,
@@ -305,12 +329,14 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
             .push(chunk);
 
         if self.defer_next_prefill.swap(false, Ordering::AcqRel) {
-            return ExecutorExecutionCapacityDeferral::new(
-                self.epochs(),
-                self.wait_condition(),
-                ExecutorExecutionCapacityStage::StepAdmission,
-            )
-            .map(|deferral| ExecutorPrefillOutcome::Deferred(deferral.into()));
+            return Ok(ExecutorPrefillOutcome::Deferred(
+                test_execution_capacity_deferral(
+                    self.epochs(),
+                    self.wait_condition(),
+                    ExecutorExecutionCapacityStage::StepAdmission,
+                )
+                .into(),
+            ));
         }
 
         let completed_chunk = if self.narrow_next_prefill.swap(false, Ordering::AcqRel) {
@@ -549,12 +575,14 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         let wait_condition =
             ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(47, vec![observed])
                 .map_err(|error| FerrumError::internal(error.to_string()))?;
-        ExecutorExecutionCapacityDeferral::new(
-            ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
-            wait_condition,
-            ExecutorExecutionCapacityStage::StepAdmission,
-        )
-        .map(|deferral| ExecutorBatchDecodeOutcome::Deferred(deferral.into()))
+        Ok(ExecutorBatchDecodeOutcome::Deferred(
+            test_execution_capacity_deferral(
+                ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
+                wait_condition,
+                ExecutorExecutionCapacityStage::StepAdmission,
+            )
+            .into(),
+        ))
     }
 
     async fn plan_runtime_batch_decode_with_capacity(
@@ -622,12 +650,14 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         let wait_condition =
             ferrum_interfaces::vnext::CapacityWaitCondition::from_observation(47, vec![observed])
                 .map_err(|error| FerrumError::internal(error.to_string()))?;
-        ExecutorExecutionCapacityDeferral::new(
-            ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
-            wait_condition,
-            ExecutorExecutionCapacityStage::StepAdmission,
-        )
-        .map(|deferral| PlanRuntimeBatchDecodeOutcome::Deferred(deferral.into()))
+        Ok(PlanRuntimeBatchDecodeOutcome::Deferred(
+            test_execution_capacity_deferral(
+                ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
+                wait_condition,
+                ExecutorExecutionCapacityStage::StepAdmission,
+            )
+            .into(),
+        ))
     }
 
     fn release_cache(&self, cache_id: &str) {
@@ -857,12 +887,14 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
     ) -> Result<ExecutorBatchPrefillOutcome> {
         self.batch_prefill_calls.fetch_add(1, Ordering::Relaxed);
         if self.defer_batch_prefill_once.swap(false, Ordering::AcqRel) {
-            return ExecutorExecutionCapacityDeferral::new(
-                self.capacity_epochs(),
-                self.capacity_wait_condition(),
-                ExecutorExecutionCapacityStage::SubmissionWave,
-            )
-            .map(|deferral| ExecutorBatchPrefillOutcome::NotSubmitted(deferral.into()));
+            return Ok(ExecutorBatchPrefillOutcome::NotSubmitted(
+                test_execution_capacity_deferral(
+                    self.capacity_epochs(),
+                    self.capacity_wait_condition(),
+                    ExecutorExecutionCapacityStage::SubmissionWave,
+                )
+                .into(),
+            ));
         }
         let mut completions = Vec::with_capacity(inputs.len());
         for input in inputs {

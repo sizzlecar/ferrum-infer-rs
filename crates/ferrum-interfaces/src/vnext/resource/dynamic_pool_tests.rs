@@ -1,4 +1,8 @@
 use super::*;
+use crate::model_executor::{
+    ExecutorAdmissionEpochs, ExecutorExecutionCapacityDeferral,
+    ExecutorExecutionCapacityEvidenceOwner, ExecutorExecutionCapacityStage,
+};
 use crate::vnext::{
     BoundExecutionResourceMaintenance, CapacityAvailabilitySource, CopyRegion, DeferredAction,
     DefinitelyNotSubmitted, DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch,
@@ -2221,13 +2225,35 @@ fn busy_eager_backing_returns_pool_wait_then_retries_after_release() {
         _ => panic!("busy alternate eager layout must defer physical backing"),
     };
     let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        current_epochs,
         wait_condition,
         pressure,
-        ..
     } = deferred.maintain().unwrap()
     else {
         panic!("busy eager backing must become typed pool pressure")
     };
+    let execution_deferral = ExecutorExecutionCapacityDeferral::from_backing_maintenance(
+        deferred.evidence(),
+        ExecutorAdmissionEpochs::from_capacity(current_epochs),
+        wait_condition.clone(),
+        pressure.clone(),
+        ExecutorExecutionCapacityStage::StepAdmission,
+    )
+    .unwrap();
+    assert_eq!(
+        execution_deferral.evidence().owner(),
+        ExecutorExecutionCapacityEvidenceOwner::Backing
+    );
+    assert!(execution_deferral.shortfalls().is_empty());
+    assert_eq!(
+        execution_deferral.backing_blockers(),
+        deferred.evidence().blockers()
+    );
+    assert_eq!(execution_deferral.backing_pressure(), Some(&pressure));
+    let serialized = serde_json::to_value(execution_deferral.evidence()).unwrap();
+    assert_eq!(serialized["owner"], "backing");
+    assert_eq!(serialized["kind"], "backing_deferred");
+    assert!(serialized["pressure"].is_object());
     let pool_pressure = pressure
         .pool_resident()
         .expect("busy cache pressure must identify its resident pool");

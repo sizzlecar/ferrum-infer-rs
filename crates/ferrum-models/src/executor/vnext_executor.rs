@@ -2435,6 +2435,11 @@ enum VNextExecutionCapacityDecision<T> {
     RequestStateDeferred(ExecutorRequestStateDeferral),
 }
 
+enum VNextExecutionMaintenanceSource<'a> {
+    Logical(&'a AdmissionDeferred),
+    Backing(&'a DynamicBackingDeferred),
+}
+
 enum VNextSequenceAdmissionDecision<R: DeviceRuntime> {
     Admitted(Arc<SequenceSession<R>>),
     Deferred(AdmissionDeferred),
@@ -4706,7 +4711,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         stage: ExecutorExecutionCapacityStage,
         outcome: DynamicDeferredMaintenanceOutcome,
-        source: Option<&AdmissionDeferred>,
+        source: VNextExecutionMaintenanceSource<'_>,
         participants: impl IntoIterator<Item = &'a VNextSequence<R>>,
         progress_receipts: &mut Vec<DynamicPoolGrowthBatchReceipt>,
     ) -> Result<Option<ExecutorExecutionCapacityDeferral>> {
@@ -4754,19 +4759,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             DynamicDeferredMaintenanceOutcome::WaitForRelease {
                 current_epochs,
                 wait_condition,
-                ..
+                pressure,
             } => match source {
-                Some(source) => ExecutorExecutionCapacityDeferral::from_maintenance(
-                    source,
-                    ExecutorAdmissionEpochs::from_capacity(current_epochs),
-                    wait_condition,
-                    stage,
-                ),
-                None => ExecutorExecutionCapacityDeferral::new(
-                    ExecutorAdmissionEpochs::from_capacity(current_epochs),
-                    wait_condition,
-                    stage,
-                ),
+                VNextExecutionMaintenanceSource::Logical(source) => {
+                    ExecutorExecutionCapacityDeferral::from_admission_maintenance(
+                        source,
+                        ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                        wait_condition,
+                        pressure,
+                        stage,
+                    )
+                }
+                VNextExecutionMaintenanceSource::Backing(source) => {
+                    ExecutorExecutionCapacityDeferral::from_backing_maintenance(
+                        source,
+                        ExecutorAdmissionEpochs::from_capacity(current_epochs),
+                        wait_condition,
+                        pressure,
+                        stage,
+                    )
+                }
             }
             .map(Some),
         }
@@ -4890,7 +4902,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SequenceExtension,
                         outcome,
-                        Some(&deferred),
+                        VNextExecutionMaintenanceSource::Logical(&deferred),
                         std::iter::once(sequence),
                         &mut maintenance_receipts,
                     )? {
@@ -4922,7 +4934,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SequenceExtension,
                         outcome,
-                        None,
+                        VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         std::iter::once(sequence),
                         &mut maintenance_receipts,
                     )? {
@@ -5141,7 +5153,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::StepAdmission,
                         outcome,
-                        Some(&deferred),
+                        VNextExecutionMaintenanceSource::Logical(&deferred),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
                     )? {
@@ -5176,7 +5188,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::StepAdmission,
                         outcome,
-                        None,
+                        VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
                     )? {
@@ -5340,7 +5352,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
-                        Some(&deferred),
+                        VNextExecutionMaintenanceSource::Logical(&deferred),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
                     )? {
@@ -5375,7 +5387,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     if let Some(deferred) = self.execution_maintenance_decision(
                         ExecutorExecutionCapacityStage::SubmissionWave,
                         outcome,
-                        None,
+                        VNextExecutionMaintenanceSource::Backing(deferred.evidence()),
                         sequences.iter().map(Arc::as_ref),
                         &mut maintenance_receipts,
                     )? {
