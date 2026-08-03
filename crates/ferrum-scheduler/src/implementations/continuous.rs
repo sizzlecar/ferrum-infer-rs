@@ -11,6 +11,9 @@
 
 mod pressure;
 
+#[cfg(test)]
+mod historical_replay_tests;
+
 use pressure::{
     LogicalWorkFrontier, PressureCandidate, PressureCoordinator, PressureDecision,
     PressureHoldStatus, PressureReleaseFenceDisposition,
