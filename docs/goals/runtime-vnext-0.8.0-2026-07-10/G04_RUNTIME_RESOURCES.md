@@ -484,6 +484,43 @@ This is G04 L1 KEEP evidence, not canonical G04 PASS. The seeded 100,000-transit
 remaining failure/cancel/recovery aggregation, canonical artifact tree, and final `vnext-g04`
 validator remain Open.
 
+## 2026-08-03 Current-Source CUDA Decode-Capacity PASS
+
+Clean pushed source `61399d69` closes the hardware-backed S1 decode-capacity failure exposed after
+the dynamic maintenance retry work. The defect was at the executor/engine evidence boundary: a
+physical backing maintenance deferral was represented as `source=None`, so trace consumers saw
+neither a logical shortfall nor a backing blocker even though the scheduler had performed a typed
+peer handoff. The corrected boundary has one typed evidence owner, distinguishes logical,
+backing, and direct-pressure kinds, requires non-empty source evidence, and emits that evidence in
+the production scheduler trace while retaining compatibility summaries.
+
+Bounded local evidence is archived as
+`runtime-vnext-g04-typed-evidence-61399d69-local-focused-pass-20260803.tar.zst` with SHA256
+`2b6e41578f605eea1204785edb08115a30fedfdcfe647c600d8f03d55fe8991b`. It covers the
+interface evidence contracts `5/5`, PlanRuntime tests `27/27`, real backing-pressure `1/1`,
+submission-wave regression `1/1`, and execution-capacity deferral `5/5`.
+
+The same clean source was then rebuilt and exercised on one RTX 4090 with real Qwen3.5-4B
+`ferrum run` and `ferrum serve`. The forced pressure event now records
+`owner=backing`, `kind=backing_deferred`, `backing_blockers=1`,
+`pressure=device_capacity`, and `yield_kind=peer_handoff`. The validator and unified gate print:
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS: /workspace/ferrum-artifacts/runtime-vnext-g04-typed-evidence-61399d69-20260803/decode-capacity-r3/validation-r1
+FERRUM GATE vnext-s1-cuda-decode-capacity PASS: /workspace/ferrum-artifacts/runtime-vnext-g04-typed-evidence-61399d69-20260803/decode-capacity-r3/gate
+```
+
+The CUDA evidence archive is
+`runtime-vnext-g04-typed-evidence-61399d69-cuda-pass-20260803.tar.zst`, SHA256
+`ede721013129a07aca0b18ce8e9e84a6e44fe5fcad2972bbf0620ac9503cbdde`. Both archives are
+stored in the draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-b0701503cde3cb34993b)
+and were downloaded back and verified by SHA256, `zstd -t`, and required members.
+
+This is a formal PASS for the S1 CUDA decode-capacity supplemental lane, not the canonical G04
+PASS. The 100,000-transition state model, aggregate failure/cancel/recovery artifact, canonical
+G04 tree, final `vnext-g04` validator, S2 product matrix, and performance gates remain Open.
+
 ## 性能约束
 
 - L1 reference workload scheduler bookkeeping 占 runtime wall time `<=5%`；真实 CUDA c32

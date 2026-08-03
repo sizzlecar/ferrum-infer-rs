@@ -4,6 +4,39 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-08-03，clean、已推送 source
+`61399d6907677af3373f543c01b5f0cad720dbe4` 已关闭当前 source 的 S1 CUDA
+decode execution-capacity 子门。此前物理 backing maintenance deferral 在 executor 到
+engine 的边界被折叠成 `None`，导致 scheduler trace 同时缺少 logical shortfall 和
+backing blocker；本次将 pressure evidence 收敛为唯一 typed owner/kind/source，并在生产
+trace 中保留同一证据。真实 Qwen3.5-4B CUDA `ferrum run` 和 `ferrum serve` 强制
+decode-pressure 序列中，原失败事件现在为 `owner=backing`、
+`kind=backing_deferred`、`backing_blockers=1`、`pressure=device_capacity`、
+`yield_kind=peer_handoff`，不再产生无因果来源的 capacity deferral。正式 validator 和
+统一 gate 分别打印：
+
+```text
+FERRUM RUNTIME VNEXT S1 CUDA DECODE CAPACITY PASS: /workspace/ferrum-artifacts/runtime-vnext-g04-typed-evidence-61399d69-20260803/decode-capacity-r3/validation-r1
+FERRUM GATE vnext-s1-cuda-decode-capacity PASS: /workspace/ferrum-artifacts/runtime-vnext-g04-typed-evidence-61399d69-20260803/decode-capacity-r3/gate
+```
+
+CUDA catalog 保持 `12` 个 provider，fingerprint
+`a1d87c8ba2714fbb012897c28939d2f88dc3e2214ae20673d62fc1d491f02f96`；因此 native
+object/archive 复用既有 content-addressed artifact，仅重新链接 Rust 生产二进制。release
+build bounded duration 为 `463.95347s`，binary SHA256 为
+`5f8a370e1bb8db183608ae6c63c89e440060f059e82b44ea01aded142ec05e76`。CUDA 和本地
+focused artifact 均已上传到 draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-b0701503cde3cb34993b)，
+archive SHA256 分别为
+`ede721013129a07aca0b18ce8e9e84a6e44fe5fcad2972bbf0620ac9503cbdde` 和
+`2b6e41578f605eea1204785edb08115a30fedfdcfe647c600d8f03d55fe8991b`；两者均已从
+GitHub 回下载并通过 SHA256、`zstd -t` 和 required-member 复验。
+
+该证据只关闭 S1 decode-capacity 补充 lane，不等于 G04、S1、G08B 或总 Goal PASS，
+也不是性能证据。G00-G10 总目标 PASS 仍为 `0/11`；下一条产品关键路径为 S2 CUDA
+实际 `run`/`serve` 正确性，先执行受影响场景和 multi-turn/concurrency gate，达到阶段
+milestone 后才执行完整 matrix。
+
 截至 2026-07-30，当前分支最新 clean、已推送的 production-source checkpoint 为
 `e229ccadeb852a9198a26f5d21eecc61c543ff7f`，tree
 `5618341821cf41ff41d504c9534416c4b608989b`。该 G07 checkpoint 将 native package
