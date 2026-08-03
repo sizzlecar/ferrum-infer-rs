@@ -85,11 +85,10 @@ impl EngineInner {
                         .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
                     seq.reset_guided_processors()?;
                     let mut logits = cached_logits;
-                    let token = seq.sample_with_processors_with_tokenizer(
+                    let token = seq.sample_and_commit_with_processors_and_tokenizer(
                         &mut logits,
                         Some(self.tokenizer.as_ref()),
                     )?;
-                    seq.generated_tokens.push(token);
                     let model_cache_update =
                         seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                     seq.record_generated_token_commit();
@@ -314,11 +313,10 @@ impl EngineInner {
                 .ok_or_else(|| FerrumError::internal("Sequence not found"))?;
             seq.reset_guided_processors()?;
             let mut logits = logits_vec;
-            let token = seq.sample_with_processors_with_tokenizer(
+            let token = seq.sample_and_commit_with_processors_and_tokenizer(
                 &mut logits,
                 Some(self.tokenizer.as_ref()),
             )?;
-            seq.generated_tokens.push(token);
             let recurrent_state = prefill_output
                 .recurrent_state
                 .clone()
@@ -637,11 +635,10 @@ impl EngineInner {
                 return Ok(None);
             };
             seq.reset_guided_processors()?;
-            let token = seq.sample_with_processors_with_tokenizer(
+            let token = seq.sample_and_commit_with_processors_and_tokenizer(
                 &mut logits,
                 Some(self.tokenizer.as_ref()),
             )?;
-            seq.generated_tokens.push(token);
             let update = seq.commit_plan_runtime_prefill_chunk_resources(
                 Arc::clone(authority.kv_cache()),
                 chunk.end(),
@@ -1026,11 +1023,10 @@ impl EngineInner {
                         };
                         seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
-                        let token = seq.sample_with_processors_with_tokenizer(
+                        let token = seq.sample_and_commit_with_processors_and_tokenizer(
                             &mut logits,
                             Some(self.tokenizer.as_ref()),
                         )?;
-                        seq.generated_tokens.push(token);
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                         seq.record_generated_token_commit();
@@ -1209,11 +1205,10 @@ impl EngineInner {
                 };
                 seq.reset_guided_processors()?;
                 let mut logits = logits_vec;
-                let token = seq.sample_with_processors_with_tokenizer(
+                let token = seq.sample_and_commit_with_processors_and_tokenizer(
                     &mut logits,
                     Some(self.tokenizer.as_ref()),
                 )?;
-                seq.generated_tokens.push(token);
                 let recurrent_state = prefill_output
                     .recurrent_state
                     .clone()

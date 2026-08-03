@@ -10113,17 +10113,16 @@ fn response_completion_boundary_masks_eos_until_delimiter_and_payload() {
         logits[3] = 100.0;
         logits[token_id as usize] = 10.0;
         let token = state
-            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
             .unwrap();
         assert_eq!(token, TokenId::new(token_id));
         assert_eq!(logits[3], f32::NEG_INFINITY);
-        state.generated_tokens.push(token);
     }
 
     let mut eos_logits = vec![f32::NEG_INFINITY; 8];
     eos_logits[3] = 100.0;
     let eos = state
-        .sample_with_processors_with_tokenizer(&mut eos_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(&mut eos_logits, Some(tokenizer.as_ref()))
         .unwrap();
     assert_eq!(eos, TokenId::new(3));
 }
@@ -10142,11 +10141,10 @@ fn response_completion_boundary_accepts_complete_typed_tool_envelope() {
         logits[3] = 100.0;
         logits[token_id as usize] = 10.0;
         let token = state
-            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
             .unwrap();
         assert_eq!(token, TokenId::new(token_id));
         assert_eq!(logits[3], f32::NEG_INFINITY);
-        state.generated_tokens.push(token);
     }
 
     assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
@@ -10163,7 +10161,7 @@ fn response_completion_boundary_accepts_complete_typed_tool_envelope() {
     second_envelope_logits[3] = 10.0;
     second_envelope_logits[7] = 100.0;
     let second_open = state
-        .sample_with_processors_with_tokenizer(
+        .sample_and_commit_with_processors_and_tokenizer(
             &mut second_envelope_logits,
             Some(tokenizer.as_ref()),
         )
@@ -10173,7 +10171,6 @@ fn response_completion_boundary_accepts_complete_typed_tool_envelope() {
         TokenId::new(7),
         "completion capability must not force-stop a legal following envelope"
     );
-    state.generated_tokens.push(second_open);
 
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(open_mask),
@@ -10189,20 +10186,18 @@ fn response_completion_boundary_accepts_complete_typed_tool_envelope() {
         logits[3] = 100.0;
         logits[token_id as usize] = 10.0;
         let token = state
-            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
             .unwrap();
         assert_eq!(token, TokenId::new(token_id));
         assert_eq!(logits[3], f32::NEG_INFINITY);
-        state.generated_tokens.push(token);
     }
 
     let mut eos_logits = vec![f32::NEG_INFINITY; 10];
     eos_logits[3] = 100.0;
     let eos = state
-        .sample_with_processors_with_tokenizer(&mut eos_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(&mut eos_logits, Some(tokenizer.as_ref()))
         .unwrap();
     assert_eq!(eos, TokenId::new(3));
-    state.generated_tokens.push(eos);
     assert!(matches!(
         state.stop_reason(Some(tokenizer.as_ref())),
         Some(FinishReason::Stop | FinishReason::EOS)
@@ -10223,7 +10218,7 @@ fn response_completion_boundary_keeps_eos_masked_inside_tool_after_reasoning_clo
         logits[3] = 100.0;
         logits[token_id as usize] = 10.0;
         let token = state
-            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
             .unwrap();
         assert_eq!(token, TokenId::new(token_id));
         assert_eq!(
@@ -10231,18 +10226,19 @@ fn response_completion_boundary_keeps_eos_masked_inside_tool_after_reasoning_clo
             f32::NEG_INFINITY,
             "EOS must remain masked until the opened tool envelope closes"
         );
-        state.generated_tokens.push(token);
     }
 
     let mut close_logits = vec![f32::NEG_INFINITY; 10];
     close_logits[3] = 100.0;
     close_logits[8] = 10.0;
     let close = state
-        .sample_with_processors_with_tokenizer(&mut close_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut close_logits,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
     assert_eq!(close, TokenId::new(8));
     assert_eq!(close_logits[3], f32::NEG_INFINITY);
-    state.generated_tokens.push(close);
 
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(mask),
@@ -10279,11 +10275,10 @@ fn response_completion_boundary_tracks_multitoken_envelope_without_false_payload
         logits[3] = 100.0;
         logits[token_id as usize] = 10.0;
         let token = state
-            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
             .unwrap();
         assert_eq!(token, TokenId::new(token_id));
         assert_eq!(logits[3], f32::NEG_INFINITY);
-        state.generated_tokens.push(token);
     }
 
     let LogitsReturnPolicy::GreedyArgmax {
@@ -10298,7 +10293,7 @@ fn response_completion_boundary_tracks_multitoken_envelope_without_false_payload
 
 #[test]
 fn response_completion_boundary_rejects_tool_envelopes_beyond_typed_limit() {
-    let tokenizer = response_completion_tool_tokenizer();
+    let tokenizer = response_completion_multitoken_tool_tokenizer();
     let mut request =
         response_completion_tool_request(ferrum_types::ApiToolChoice::Mode("auto".to_string()));
     let ferrum_types::ResponseCompletionBoundary::AfterDelimiterAndPayload {
@@ -10308,6 +10303,8 @@ fn response_completion_boundary_rejects_tool_envelopes_beyond_typed_limit() {
     else {
         panic!("tool request must carry its typed completion envelope");
     };
+    envelope.open_token_text = "OPEN START".to_string();
+    envelope.close_token_text = "CLOSE FINISH".to_string();
     envelope.max_envelopes = 1;
     let mut state = SequenceState::new_with_tokenizer(
         request,
@@ -10315,24 +10312,35 @@ fn response_completion_boundary_rejects_tool_envelopes_beyond_typed_limit() {
         Some(Arc::clone(&tokenizer)),
     );
 
-    for token_id in [7u32, 0, 8] {
-        let mut logits = vec![f32::NEG_INFINITY; 10];
+    for token_id in [7u32, 8, 0, 9, 10, 7] {
+        let mut logits = vec![f32::NEG_INFINITY; 12];
         logits[token_id as usize] = 100.0;
         let token = state
-            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
             .unwrap();
-        state.generated_tokens.push(token);
+        assert_eq!(token, TokenId::new(token_id));
     }
 
-    let mut repeated_open = vec![f32::NEG_INFINITY; 10];
-    repeated_open[7] = 100.0;
-    let error = state
-        .sample_with_processors_with_tokenizer(&mut repeated_open, Some(tokenizer.as_ref()))
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("1-envelope protocol limit"),
-        "{error}"
-    );
+    let committed_len = state.generated_tokens.len();
+    for _ in 0..2 {
+        let mut repeated_open_finish = vec![f32::NEG_INFINITY; 12];
+        repeated_open_finish[8] = 100.0;
+        let error = state
+            .sample_and_commit_with_processors_and_tokenizer(
+                &mut repeated_open_finish,
+                Some(tokenizer.as_ref()),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("1-envelope protocol limit"),
+            "{error}"
+        );
+        assert_eq!(
+            state.generated_tokens.len(),
+            committed_len,
+            "a rejected envelope token must not commit or advance its matcher"
+        );
+    }
 }
 
 #[test]
@@ -10347,17 +10355,22 @@ fn response_completion_boundary_rejects_unopened_or_disabled_tool_envelope() {
     close_logits[3] = 100.0;
     close_logits[8] = 10.0;
     let close = unopened
-        .sample_with_processors_with_tokenizer(&mut close_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut close_logits,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
     assert_eq!(close, TokenId::new(8));
     assert_eq!(close_logits[3], f32::NEG_INFINITY);
-    unopened.generated_tokens.push(close);
 
     let mut still_blocked = vec![f32::NEG_INFINITY; 10];
     still_blocked[3] = 100.0;
     still_blocked[0] = 10.0;
     let fallback = unopened
-        .sample_with_processors_with_tokenizer(&mut still_blocked, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut still_blocked,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
     assert_eq!(fallback, TokenId::new(0));
     assert_eq!(still_blocked[3], f32::NEG_INFINITY);
@@ -10372,11 +10385,10 @@ fn response_completion_boundary_rejects_unopened_or_disabled_tool_envelope() {
         logits[3] = 100.0;
         logits[token_id as usize] = 10.0;
         let token = disabled
-            .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
             .unwrap();
         assert_eq!(token, TokenId::new(token_id));
         assert_eq!(logits[3], f32::NEG_INFINITY);
-        disabled.generated_tokens.push(token);
     }
 }
 
@@ -10414,19 +10426,33 @@ fn response_completion_boundary_updates_greedy_mask_at_phase_transition() {
         panic!("completion boundary must preserve model-side greedy argmax");
     };
     assert_eq!(initial_mask.valid_token_mask[3], 0);
+    assert!(state.generated_tokens.is_empty());
+    assert!(state.sampling_history.token_frequencies().is_empty());
     assert!(state
-        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
+        .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
         .unwrap_err()
         .to_string()
         .contains("before satisfying the response completion boundary"));
+    assert!(
+        state.generated_tokens.is_empty(),
+        "a rejected greedy token must not partially commit generated history"
+    );
+    assert!(
+        state.sampling_history.token_frequencies().is_empty(),
+        "a rejected greedy token must not partially commit sampling history"
+    );
 
     for token_id in [0u32, 5, 6, 7] {
         let token = TokenId::new(token_id);
         state
-            .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), token)
+            .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), token)
             .unwrap();
-        state.generated_tokens.push(token);
     }
+    assert_eq!(state.generated_tokens, [0u32, 5, 6, 7].map(TokenId::new));
+    assert_eq!(
+        state.sampling_history.token_count(&state.generated_tokens),
+        state.generated_tokens.len()
+    );
 
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(completed_mask),
@@ -10438,7 +10464,7 @@ fn response_completion_boundary_updates_greedy_mask_at_phase_transition() {
     assert_eq!(completed_mask.valid_token_mask[3], 1);
     assert_ne!(completed_mask.fingerprint, initial_mask.fingerprint);
     state
-        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
+        .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
         .unwrap();
 }
 
@@ -10457,10 +10483,9 @@ fn response_completion_boundary_preserves_explicit_user_stop() {
     logits[0] = 10.0;
     logits[3] = 100.0;
     let token = state
-        .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
         .unwrap();
     assert_eq!(token, TokenId::new(0));
-    state.generated_tokens.push(token);
     assert_eq!(
         state.stop_reason(Some(tokenizer.as_ref())),
         Some(FinishReason::Stop)
@@ -10489,9 +10514,8 @@ fn response_completion_boundary_preserves_ignore_eos() {
     };
     assert_eq!(mask.valid_token_mask[3], 1);
     state
-        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
+        .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(3))
         .unwrap();
-    state.generated_tokens.push(TokenId::new(3));
     assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
 }
 
@@ -10537,9 +10561,15 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
     );
 
     let mut logits = vec![0.0, 3.0, 2.0];
-    let token = state.sample_with_processors(&mut logits).unwrap();
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token, TokenId::new(2));
+    assert_eq!(
+        state.generated_tokens,
+        [TokenId::new(1), TokenId::new(1), token]
+    );
     assert!((logits[1] - 0.5).abs() < 1e-6);
     assert_eq!(
         state
@@ -10732,7 +10762,7 @@ fn model_greedy_argmax_output_accepts_masked_policy_token_and_tracks_frequency()
 
     assert!(state.requires_full_logits_for_sampling());
     state
-        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
+        .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
         .unwrap();
     assert_eq!(
         state
@@ -10742,7 +10772,7 @@ fn model_greedy_argmax_output_accepts_masked_policy_token_and_tracks_frequency()
         Some(&1)
     );
     let err = state
-        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(2))
+        .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(2))
         .unwrap_err()
         .to_string();
     assert!(
@@ -10768,7 +10798,7 @@ fn model_greedy_argmax_output_rejects_non_greedy_request() {
         SequenceState::new_with_tokenizer(request, vec![TokenId::new(0)], Some(tokenizer.clone()));
 
     assert!(state
-        .accept_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
+        .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), TokenId::new(0))
         .is_err());
 }
 
@@ -10835,7 +10865,9 @@ fn schema_guided_sampling_masks_extended_stop_tokens_before_accept() {
     logits[1] = 0.5;
     logits[8] = 100.0;
 
-    let token = state.sample_with_processors(&mut logits).unwrap();
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token.get(), 0);
     assert!(
@@ -10891,7 +10923,9 @@ fn schema_guided_sampling_masks_extended_control_tokens_before_accept() {
     logits[7] = 100.0;
     logits[8] = 90.0;
 
-    let token = state.sample_with_processors(&mut logits).unwrap();
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token.get(), 0);
     assert!(
@@ -10939,19 +10973,21 @@ fn schema_guided_sampling_preserves_required_reasoning_delimiter_control() {
     reasoning_logits[7] = 100.0;
     reasoning_logits[8] = 90.0;
     let delimiter = state
-        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut reasoning_logits,
+            Some(tokenizer.as_ref()),
+        )
         .expect("the activation delimiter must remain selectable");
     assert_eq!(delimiter, TokenId::new(7));
     assert_eq!(reasoning_logits[7], 100.0);
     assert_eq!(reasoning_logits[8], f32::NEG_INFINITY);
 
-    state.generated_tokens.push(delimiter);
     let mut grammar_logits = vec![0.0; 9];
     grammar_logits[0] = 1.0;
     grammar_logits[7] = 100.0;
     grammar_logits[8] = 90.0;
     let first_json_token = state
-        .sample_with_processors(&mut grammar_logits)
+        .sample_and_commit_with_processors(&mut grammar_logits)
         .expect("the grammar must activate after the delimiter");
     assert_eq!(first_json_token, TokenId::new(0));
     assert_eq!(grammar_logits[7], f32::NEG_INFINITY);
@@ -10997,7 +11033,10 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
         let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
         reasoning_logits[0] = 3.0;
         let reasoning_token = state
-            .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(
+                &mut reasoning_logits,
+                Some(tokenizer.as_ref()),
+            )
             .unwrap();
         assert_eq!(reasoning_token, TokenId::new(0));
         assert_eq!(reasoning_logits[0], 3.0);
@@ -11006,28 +11045,35 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
             SequenceSamplingHistoryScope::HiddenStructuredOutput
         );
         assert!(state.sampling_history.token_frequencies().is_empty());
-        state.generated_tokens.push(reasoning_token);
     }
+    assert_eq!(state.generated_tokens.len(), 2);
 
     let mut delimiter_logits = vec![f32::NEG_INFINITY; 9];
     delimiter_logits[7] = 3.0;
     let delimiter = state
-        .sample_with_processors_with_tokenizer(&mut delimiter_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut delimiter_logits,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
     assert_eq!(delimiter, TokenId::new(7));
-    state.generated_tokens.push(delimiter);
     assert_eq!(
         state.sampling_history.scope(),
         SequenceSamplingHistoryScope::HiddenStructuredOutput
     );
     assert!(state.sampling_history.token_frequencies().is_empty());
+    assert_eq!(state.generated_tokens.len(), 3);
 
     let mut grammar_logits = vec![f32::NEG_INFINITY; 9];
     grammar_logits[0] = 1.0;
     let first_json_token = state
-        .sample_with_processors_with_tokenizer(&mut grammar_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut grammar_logits,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
     assert_eq!(first_json_token, TokenId::new(0));
+    assert_eq!(state.generated_tokens.len(), 4);
     assert_eq!(
         grammar_logits[0], 1.0,
         "hidden reasoning must not apply repetition or presence penalty to visible JSON"
@@ -11054,7 +11100,6 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
         .sampling_history
         .token_frequencies()
         .contains_key(&TokenId::new(7)));
-    state.generated_tokens.push(first_json_token);
 
     // A replay reset reconstructs the same typed scope from generated history
     // instead of leaking hidden-token counts back into the visible domain.
@@ -11067,9 +11112,13 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
     let mut close_logits = vec![f32::NEG_INFINITY; 9];
     close_logits[4] = 1.0;
     let close = state
-        .sample_with_processors_with_tokenizer(&mut close_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut close_logits,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
     assert_eq!(close, TokenId::new(4));
+    assert_eq!(state.generated_tokens.len(), 5);
     assert_eq!(
         state.sampling_history.scope(),
         SequenceSamplingHistoryScope::VisibleStructuredOutput {
@@ -11081,7 +11130,7 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
             .sampling_history
             .previous_tokens(&state.generated_tokens)
             .unwrap(),
-        &[TokenId::new(0)]
+        &[TokenId::new(0), TokenId::new(4)]
     );
     assert_eq!(
         state
@@ -11096,6 +11145,14 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
             .token_frequencies()
             .get(&TokenId::new(4)),
         Some(&1)
+    );
+    assert_eq!(
+        state
+            .sampling_history
+            .token_frequencies()
+            .values()
+            .sum::<usize>(),
+        2
     );
 }
 
@@ -11134,15 +11191,21 @@ fn schema_guided_sampling_suppresses_penalties_through_multi_token_delimiter() {
     let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
     reasoning_logits[0] = 3.0;
     let reasoning = state
-        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut reasoning_logits,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
-    state.generated_tokens.push(reasoning);
+    assert_eq!(reasoning, TokenId::new(0));
 
     for delimiter_token in [TokenId::new(7), TokenId::new(8)] {
         let mut delimiter_logits = vec![f32::NEG_INFINITY; 9];
         delimiter_logits[delimiter_token.get() as usize] = 3.0;
         let token = state
-            .sample_with_processors_with_tokenizer(&mut delimiter_logits, Some(tokenizer.as_ref()))
+            .sample_and_commit_with_processors_and_tokenizer(
+                &mut delimiter_logits,
+                Some(tokenizer.as_ref()),
+            )
             .unwrap();
         assert_eq!(token, delimiter_token);
         assert_eq!(
@@ -11150,13 +11213,15 @@ fn schema_guided_sampling_suppresses_penalties_through_multi_token_delimiter() {
             SequenceSamplingHistoryScope::HiddenStructuredOutput
         );
         assert!(state.sampling_history.token_frequencies().is_empty());
-        state.generated_tokens.push(token);
     }
 
     let mut grammar_logits = vec![f32::NEG_INFINITY; 9];
     grammar_logits[0] = 1.0;
     let first_json_token = state
-        .sample_with_processors_with_tokenizer(&mut grammar_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut grammar_logits,
+            Some(tokenizer.as_ref()),
+        )
         .unwrap();
     assert_eq!(first_json_token, TokenId::new(0));
     assert_eq!(grammar_logits[0], 1.0);
@@ -11208,7 +11273,10 @@ fn schema_guided_sampling_forces_reasoning_delimiter_at_budget() {
     let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
     reasoning_logits[0] = 100.0;
     let delimiter = state
-        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(
+            &mut reasoning_logits,
+            Some(tokenizer.as_ref()),
+        )
         .expect("the output budget must force the reasoning delimiter");
     assert_eq!(delimiter, TokenId::new(7));
     assert_eq!(reasoning_logits[7], 0.0);
@@ -11217,13 +11285,12 @@ fn schema_guided_sampling_forces_reasoning_delimiter_at_budget() {
         .enumerate()
         .all(|(token, logit)| token == 7 || !logit.is_finite()));
 
-    state.generated_tokens.push(delimiter);
     let mut grammar_logits = vec![0.0; 9];
     grammar_logits[0] = 1.0;
     grammar_logits[7] = 100.0;
     grammar_logits[8] = 90.0;
     let first_json_token = state
-        .sample_with_processors(&mut grammar_logits)
+        .sample_and_commit_with_processors(&mut grammar_logits)
         .expect("the grammar must activate after the forced delimiter");
     assert_eq!(first_json_token, TokenId::new(0));
     assert_eq!(grammar_logits[7], f32::NEG_INFINITY);
@@ -11265,8 +11332,9 @@ fn schema_guided_sampling_allows_extended_stop_after_accept() {
     logits[7] = 100.0;
     logits[8] = 90.0;
 
-    let token = state.sample_with_processors(&mut logits).unwrap();
-    state.generated_tokens.push(token);
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token.get(), 8);
     assert!(state
@@ -11357,7 +11425,9 @@ fn sample_masks_unknown_pad_reserved_and_bos_tokens() {
     logits[9] = 95.0;
     logits[6] = 1.0;
 
-    let token = state.sample_with_processors(&mut logits).unwrap();
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token.get(), 6);
     for token_id in [1usize, 2, 4, 5, 8, 9] {
@@ -11384,7 +11454,9 @@ fn sample_masks_tokenizer_vocab_holes() {
     logits[11] = 100.0;
     logits[6] = 1.0;
 
-    let token = state.sample_with_processors(&mut logits).unwrap();
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token.get(), 6);
     assert_eq!(logits[11], f32::NEG_INFINITY);
@@ -11409,7 +11481,7 @@ fn sampling_rejects_when_engine_masks_remove_the_last_finite_candidate() {
     logits[2] = 100.0;
 
     let error = state
-        .sample_with_processors(&mut logits)
+        .sample_and_commit_with_processors(&mut logits)
         .expect_err("a forbidden token must not become an arbitrary greedy fallback");
 
     assert_eq!(logits[2], f32::NEG_INFINITY);
@@ -11464,21 +11536,19 @@ fn structured_sampling_preserves_split_utf8_fragments_and_masks_model_vocab_hole
     head_logits[usize::from(fire_head)] = 10.0;
     head_logits[hole] = 100.0;
     let sampled_head = state
-        .sample_with_processors_with_tokenizer(&mut head_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(&mut head_logits, Some(tokenizer.as_ref()))
         .expect("the legal UTF-8 head fragment must remain selectable");
     assert_eq!(sampled_head, fire_head);
     assert_eq!(head_logits[hole], f32::NEG_INFINITY);
-    state.generated_tokens.push(sampled_head);
 
     let mut tail_logits = vec![f32::NEG_INFINITY; FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE];
     tail_logits[usize::from(fire_tail)] = 10.0;
     tail_logits[hole] = 100.0;
     let sampled_tail = state
-        .sample_with_processors_with_tokenizer(&mut tail_logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(&mut tail_logits, Some(tokenizer.as_ref()))
         .expect("the legal UTF-8 tail fragment must remain selectable");
     assert_eq!(sampled_tail, fire_tail);
     assert_eq!(tail_logits[hole], f32::NEG_INFINITY);
-    state.generated_tokens.push(sampled_tail);
 
     assert_eq!(
         tokenizer.decode(&state.generated_tokens, true).unwrap(),
@@ -11539,7 +11609,7 @@ fn sample_resamples_candidate_that_would_flush_replacement_char() {
     logits[7] = 1.0;
 
     let token = state
-        .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
         .unwrap();
 
     assert_eq!(token.get(), 7);
@@ -11601,7 +11671,9 @@ fn sample_allows_generated_control_tokens_above_base_vocab() {
     logits[5] = 90.0;
     logits[6] = 100.0;
 
-    let token = state.sample_with_processors(&mut logits).unwrap();
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token.get(), 5);
     assert_eq!(logits[5], 90.0);
@@ -11647,7 +11719,9 @@ fn tool_protocol_allows_only_its_added_tokens_for_auto_calls() {
     logits[7] = 90.0;
     logits[9] = 100.0;
 
-    let token = state.sample_with_processors(&mut logits).unwrap();
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
 
     assert_eq!(token.get(), 7);
     assert_eq!(logits[7], 90.0);
@@ -11753,7 +11827,7 @@ fn sample_resamples_hidden_non_stop_control_tokens_above_base_vocab() {
     logits[7] = 100.0;
 
     let token = state
-        .sample_with_processors_with_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
         .unwrap();
 
     assert_eq!(token.get(), 5);
@@ -11792,11 +11866,12 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
     let mut first_logits = vec![0.0f32; 6];
     first_logits[0] = 1.0;
     first_logits[5] = 100.0;
-    let first = state.sample_with_processors(&mut first_logits).unwrap();
+    let first = state
+        .sample_and_commit_with_processors(&mut first_logits)
+        .unwrap();
     assert_eq!(first.get(), 0);
     assert_eq!(first_logits[5], f32::NEG_INFINITY);
 
-    state.generated_tokens.push(first);
     let LogitsReturnPolicy::GreedyArgmax {
         token_mask: Some(mask),
         repetition_penalty: None,
@@ -11808,7 +11883,9 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
     let mut next_logits = vec![0.0f32; 6];
     next_logits[0] = 1.0;
     next_logits[5] = 100.0;
-    let next = state.sample_with_processors(&mut next_logits).unwrap();
+    let next = state
+        .sample_and_commit_with_processors(&mut next_logits)
+        .unwrap();
     assert_eq!(next.get(), 5);
     assert_eq!(next_logits[5], 100.0);
 }

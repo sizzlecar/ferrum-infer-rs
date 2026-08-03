@@ -1280,7 +1280,7 @@ impl SequenceState {
         Ok(())
     }
 
-    pub fn accept_model_greedy_argmax_token(
+    pub fn validate_and_commit_model_greedy_argmax_token(
         &mut self,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         token: TokenId,
@@ -1329,7 +1329,16 @@ impl SequenceState {
             )));
         }
 
+        self.commit_generated_token(tokenizer, token)
+    }
+
+    pub(super) fn commit_generated_token(
+        &mut self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+    ) -> Result<()> {
         self.accept_response_completion_token(tokenizer, token)?;
+        self.generated_tokens.push(token);
         self.sampling_history.record(token);
         Ok(())
     }
@@ -1462,13 +1471,12 @@ impl SequenceState {
         self.stop_reason(None).is_some()
     }
 
-    /// Sample next token with full processor chain (temperature, top-k/p,
-    /// repetition penalty and tokenizer-aware structured-output mask).
-    pub fn sample_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
-        self.sample_with_processors_with_tokenizer(logits, None)
+    /// Sample and commit the next token with the full processor chain.
+    pub fn sample_and_commit_with_processors(&mut self, logits: &mut [f32]) -> Result<TokenId> {
+        self.sample_and_commit_with_processors_and_tokenizer(logits, None)
     }
 
-    pub fn sample_with_processors_with_tokenizer(
+    pub fn sample_and_commit_with_processors_and_tokenizer(
         &mut self,
         logits: &mut [f32],
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
@@ -1603,8 +1611,7 @@ impl SequenceState {
             }
         };
 
-        self.accept_response_completion_token(tokenizer, token)?;
-        self.sampling_history.record(token);
+        self.commit_generated_token(tokenizer, token)?;
 
         Ok(token)
     }

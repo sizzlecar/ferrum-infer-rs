@@ -93,19 +93,18 @@ impl EngineInner {
                 sequences.get_mut(rid).map(|sequence| {
                     let token = match output.sampling_output {
                         ExecutorSamplingOutput::GreedyToken(token) => {
-                            sequence.accept_model_greedy_argmax_token(
+                            sequence.validate_and_commit_model_greedy_argmax_token(
                                 Some(self.tokenizer.as_ref()),
                                 token,
                             )?;
                             token
                         }
                         ExecutorSamplingOutput::FullLogits(mut logits) => sequence
-                            .sample_with_processors_with_tokenizer(
+                            .sample_and_commit_with_processors_and_tokenizer(
                                 &mut logits,
                                 Some(self.tokenizer.as_ref()),
                             )?,
                     };
-                    sequence.generated_tokens.push(token);
                     sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
                     sequence.record_generated_token_commit();
                     Ok::<TokenId, FerrumError>(token)
@@ -538,15 +537,17 @@ impl EngineInner {
                 // returned token satisfies the same hard token-quality masks.
                 let token = if logits.len() == 1 {
                     let token = TokenId::new(logits[0] as u32);
-                    seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                    seq.validate_and_commit_model_greedy_argmax_token(
+                        Some(self.tokenizer.as_ref()),
+                        token,
+                    )?;
                     token
                 } else {
-                    seq.sample_with_processors_with_tokenizer(
+                    seq.sample_and_commit_with_processors_and_tokenizer(
                         &mut logits,
                         Some(self.tokenizer.as_ref()),
                     )?
                 };
-                seq.generated_tokens.push(token);
                 let cache_id = seq.decode_model_cache_id_or_request_id(rid);
                 let kv_len = seq.decode_model_kv_len_after_last_generated_token();
                 let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
@@ -699,15 +700,17 @@ impl EngineInner {
             let mut logits = logits_vec;
             let token = if logits.len() == 1 {
                 let token = TokenId::new(logits[0] as u32);
-                seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                seq.validate_and_commit_model_greedy_argmax_token(
+                    Some(self.tokenizer.as_ref()),
+                    token,
+                )?;
                 token
             } else {
-                seq.sample_with_processors_with_tokenizer(
+                seq.sample_and_commit_with_processors_and_tokenizer(
                     &mut logits,
                     Some(self.tokenizer.as_ref()),
                 )?
             };
-            seq.generated_tokens.push(token);
             seq.commit_decode_step_physical_resources(decode_output.kv_cache.clone())?;
             seq.commit_decode_recurrent_state(
                 decode_output
@@ -965,12 +968,14 @@ impl EngineInner {
         for &tok in &outcome.tokens {
             {
                 let mut sequences = self.sequences.write();
-                if let Some(seq) = sequences.get_mut(request_id) {
-                    seq.generated_tokens.push(tok);
-                    seq.sampling_history.record(tok);
-                    seq.tokens_this_iteration += 1;
-                    seq.record_generated_token_commit();
-                }
+                let seq = sequences.get_mut(request_id).ok_or_else(|| {
+                    FerrumError::internal(format!(
+                        "speculative decode sequence disappeared before token commit: {request_id}"
+                    ))
+                })?;
+                seq.commit_generated_token(Some(self.tokenizer.as_ref()), tok)?;
+                seq.tokens_this_iteration += 1;
+                seq.record_generated_token_commit();
             }
             last_emitted = tok;
             self.total_decode_tokens.fetch_add(1, Ordering::Relaxed);

@@ -359,11 +359,10 @@ impl EngineInner {
                         };
                         seq.reset_guided_processors()?;
                         let mut logits = cached_logits;
-                        let token = seq.sample_with_processors_with_tokenizer(
+                        let token = seq.sample_and_commit_with_processors_and_tokenizer(
                             &mut logits,
                             Some(self.tokenizer.as_ref()),
                         )?;
-                        seq.generated_tokens.push(token);
                         let model_cache_update =
                             seq.commit_cached_prefill_physical_resources(cloned_kv, num_tokens);
                         seq.record_generated_token_commit();
@@ -807,15 +806,17 @@ impl EngineInner {
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
                     let token = TokenId::new(logits[0] as u32);
-                    seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                    seq.validate_and_commit_model_greedy_argmax_token(
+                        Some(self.tokenizer.as_ref()),
+                        token,
+                    )?;
                     token
                 } else {
-                    seq.sample_with_processors_with_tokenizer(
+                    seq.sample_and_commit_with_processors_and_tokenizer(
                         &mut logits,
                         Some(self.tokenizer.as_ref()),
                     )?
                 };
-                seq.generated_tokens.push(token);
                 let model_cache_update = seq.commit_prefill_chunk_physical_resources(
                     model_kv,
                     work.legacy_kv_allocation.clone(),
@@ -927,15 +928,17 @@ impl EngineInner {
                 let mut logits = logits_vec;
                 let token = if logits.len() == 1 {
                     let token = TokenId::new(logits[0] as u32);
-                    seq.accept_model_greedy_argmax_token(Some(self.tokenizer.as_ref()), token)?;
+                    seq.validate_and_commit_model_greedy_argmax_token(
+                        Some(self.tokenizer.as_ref()),
+                        token,
+                    )?;
                     token
                 } else {
-                    seq.sample_with_processors_with_tokenizer(
+                    seq.sample_and_commit_with_processors_and_tokenizer(
                         &mut logits,
                         Some(self.tokenizer.as_ref()),
                     )?
                 };
-                seq.generated_tokens.push(token);
                 let cache_id = seq.decode_model_cache_id_or_request_id(&rid);
                 let kv_len = seq.decode_model_kv_len_after_last_generated_token();
                 let model_kv = self.make_model_kv_handle_with_seq(cache_id, kv_len);
