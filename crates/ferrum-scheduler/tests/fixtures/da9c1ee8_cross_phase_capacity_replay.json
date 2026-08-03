@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "name": "da9c1ee8_cross_phase_capacity_deadlock",
+  "source": {
+    "git_sha": "da9c1ee8363c686e71420fd5df8042c496e69757",
+    "binary_sha256": "19fe1907e1d74c199fb34da4990297109e5e05257600f1299426f3e9eb6d50c4",
+    "trace_sha256": "5360a85b49423e094400c5cf39f6e6b3df85b1254b62ec841925ee63c539011e",
+    "artifact": "runtime-vnext-s1-progress-lease-da9c1ee8-20260717/raw/target/scheduler-trace.jsonl",
+    "failure_class": "cross_phase_capacity_progress_deadlock",
+    "terminal_event_ids": [
+      "evt-engine-vnext-admission-531",
+      "evt-engine-vnext-admission-532",
+      "evt-engine-vnext-admission-533",
+      "evt-engine-vnext-admission-534",
+      "evt-engine-vnext-admission-535",
+      "evt-engine-vnext-admission-536",
+      "evt-engine-vnext-admission-537"
+    ]
+  },
+  "coordinator_id": 1,
+  "wake_epochs": {
+    "release": 182,
+    "capacity": 515,
+    "policy": 0
+  },
+  "requests": [
+    {
+      "role": "recompute_prefill",
+      "request_id": "2c0cbe46-0e60-49f8-9fd8-841f52205ea6"
+    },
+    {
+      "role": "decode",
+      "request_id": "5ea9181c-abd4-4ec7-90a8-20e8c1548825"
+    }
+  ],
+  "wait_sources": [
+    {
+      "kind": "domain",
+      "domain": 4,
+      "epoch": 73
+    },
+    {
+      "kind": "plan_device_budget",
+      "epoch": 1
+    }
+  ],
+  "rejected_terminal": {
+    "active": 2,
+    "prefill": 1,
+    "decode": 1,
+    "blocked_prefill": 1,
+    "blocked_decode": 1,
+    "pending_release_fences": 0
+  },
+  "steps": [
+    {
+      "action": "submit_and_admit",
+      "max_batch_size": 2
+    },
+    {
+      "action": "promote_all_to_decode",
+      "tokens": 1
+    },
+    {
+      "action": "evict_decode_for_recompute",
+      "role": "recompute_prefill",
+      "attempted_decode_width": 2
+    },
+    {
+      "action": "readmit_recompute",
+      "max_batch_size": 2
+    },
+    {
+      "action": "defer_for_capacity",
+      "role": "recompute_prefill",
+      "expected": "deferred"
+    },
+    {
+      "action": "defer_for_capacity",
+      "role": "decode",
+      "expected": "yield_planned"
+    },
+    {
+      "action": "arm_and_complete_yield",
+      "attempted_decode_width": 1,
+      "observed_free_blocks": 0
+    },
+    {
+      "action": "cancel_all"
+    }
+  ]
+}
