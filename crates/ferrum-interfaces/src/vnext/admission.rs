@@ -4631,3 +4631,7 @@ mod tests {
         assert_eq!(snapshot.domains()[0].used().get(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "admission/model_check.rs"]
+mod model_check;
