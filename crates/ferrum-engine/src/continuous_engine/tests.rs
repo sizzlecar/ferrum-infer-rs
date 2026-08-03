@@ -10551,6 +10551,53 @@ fn request_sampling_plan_applies_presence_and_frequency_penalties() {
 }
 
 #[test]
+fn sampling_history_transitions_keep_scope_and_frequency_table_consistent() {
+    let mut history = SequenceSamplingHistory::default();
+    let generated = vec![
+        TokenId::new(1),
+        TokenId::new(1),
+        TokenId::new(2),
+        TokenId::new(3),
+    ];
+    for &token in &generated {
+        history.record(token);
+    }
+    assert_eq!(
+        history.scope(),
+        SequenceSamplingHistoryScope::FullGeneration
+    );
+    assert_eq!(history.previous_tokens(&generated).unwrap(), &generated);
+    assert_eq!(history.token_frequencies().get(&TokenId::new(1)), Some(&2));
+
+    assert!(history.enter_hidden_structured_output());
+    assert_eq!(history.previous_tokens(&generated).unwrap(), &[]);
+    assert!(history.token_frequencies().is_empty());
+    history.record(TokenId::new(4));
+    assert!(history.token_frequencies().is_empty());
+
+    assert!(history
+        .activate_visible_structured_output(2, &generated)
+        .unwrap());
+    assert_eq!(
+        history.scope(),
+        SequenceSamplingHistoryScope::VisibleStructuredOutput {
+            start_token_index: 2
+        }
+    );
+    assert_eq!(
+        history.previous_tokens(&generated).unwrap(),
+        &[TokenId::new(2), TokenId::new(3)]
+    );
+    assert_eq!(history.token_frequencies().len(), 2);
+    assert!(!history
+        .activate_visible_structured_output(2, &generated)
+        .unwrap());
+    assert!(history
+        .activate_visible_structured_output(generated.len() + 1, &generated)
+        .is_err());
+}
+
+#[test]
 fn speculative_decode_requires_a_raw_greedy_sampling_contract() {
     let raw_greedy = SequenceState::new(policy_request(), vec![TokenId::new(0)]);
     assert!(raw_greedy.supports_raw_speculative_decode());
@@ -10943,15 +10990,24 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
         Some(9),
     );
 
-    // The hidden reasoning domain deliberately emits the same opening token
-    // that the visible JSON grammar will need later.
-    let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
-    reasoning_logits[0] = 3.0;
-    let reasoning_token = state
-        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
-        .unwrap();
-    assert_eq!(reasoning_token, TokenId::new(0));
-    state.generated_tokens.push(reasoning_token);
+    // The hidden reasoning domain deliberately repeats the same opening token
+    // that the visible JSON grammar will need later. User-facing penalties are
+    // scoped away from hidden reasoning, so neither hidden step is changed.
+    for _ in 0..2 {
+        let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
+        reasoning_logits[0] = 3.0;
+        let reasoning_token = state
+            .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(reasoning_token, TokenId::new(0));
+        assert_eq!(reasoning_logits[0], 3.0);
+        assert_eq!(
+            state.sampling_history.scope(),
+            SequenceSamplingHistoryScope::HiddenStructuredOutput
+        );
+        assert!(state.sampling_history.token_frequencies().is_empty());
+        state.generated_tokens.push(reasoning_token);
+    }
 
     let mut delimiter_logits = vec![f32::NEG_INFINITY; 9];
     delimiter_logits[7] = 3.0;
@@ -10961,12 +11017,10 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
     assert_eq!(delimiter, TokenId::new(7));
     state.generated_tokens.push(delimiter);
     assert_eq!(
-        state
-            .sampling_history
-            .token_frequencies()
-            .get(&TokenId::new(0)),
-        Some(&1)
+        state.sampling_history.scope(),
+        SequenceSamplingHistoryScope::HiddenStructuredOutput
     );
+    assert!(state.sampling_history.token_frequencies().is_empty());
 
     let mut grammar_logits = vec![f32::NEG_INFINITY; 9];
     grammar_logits[0] = 1.0;
@@ -10978,7 +11032,12 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
         grammar_logits[0], 1.0,
         "hidden reasoning must not apply repetition or presence penalty to visible JSON"
     );
-    assert_eq!(state.sampling_history.start_token_index(), 2);
+    assert_eq!(
+        state.sampling_history.scope(),
+        SequenceSamplingHistoryScope::VisibleStructuredOutput {
+            start_token_index: 3
+        }
+    );
     assert_eq!(
         state.sampling_history.token_frequencies().len(),
         1,
@@ -11000,14 +11059,23 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
     // A replay reset reconstructs the same typed scope from generated history
     // instead of leaking hidden-token counts back into the visible domain.
     state.reset_guided_processors().unwrap();
-    assert_eq!(state.sampling_history.start_token_index(), 0);
+    assert_eq!(
+        state.sampling_history.scope(),
+        SequenceSamplingHistoryScope::HiddenStructuredOutput
+    );
+    assert!(state.sampling_history.token_frequencies().is_empty());
     let mut close_logits = vec![f32::NEG_INFINITY; 9];
     close_logits[4] = 1.0;
     let close = state
         .sample_with_processors_with_tokenizer(&mut close_logits, Some(tokenizer.as_ref()))
         .unwrap();
     assert_eq!(close, TokenId::new(4));
-    assert_eq!(state.sampling_history.start_token_index(), 2);
+    assert_eq!(
+        state.sampling_history.scope(),
+        SequenceSamplingHistoryScope::VisibleStructuredOutput {
+            start_token_index: 3
+        }
+    );
     assert_eq!(
         state
             .sampling_history
@@ -11028,6 +11096,75 @@ fn schema_guided_sampling_scopes_penalties_to_visible_output_after_reasoning() {
             .token_frequencies()
             .get(&TokenId::new(4)),
         Some(&1)
+    );
+}
+
+#[test]
+fn schema_guided_sampling_suppresses_penalties_through_multi_token_delimiter() {
+    let mut tokenizer = PolicyTokenizer::new(
+        9,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("</s>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("END", 7),
+            ("THINK", 8),
+        ],
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let mut request = policy_request();
+    request.sampling_params.repetition_penalty = 2.0;
+    request.sampling_params.presence_penalty = 1.5;
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonObject;
+    request.sampling_params.structured_output_start =
+        ferrum_types::StructuredOutputStart::AfterDelimiter("END THINK".to_string());
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(9),
+    );
+
+    let mut reasoning_logits = vec![f32::NEG_INFINITY; 9];
+    reasoning_logits[0] = 3.0;
+    let reasoning = state
+        .sample_with_processors_with_tokenizer(&mut reasoning_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    state.generated_tokens.push(reasoning);
+
+    for delimiter_token in [TokenId::new(7), TokenId::new(8)] {
+        let mut delimiter_logits = vec![f32::NEG_INFINITY; 9];
+        delimiter_logits[delimiter_token.get() as usize] = 3.0;
+        let token = state
+            .sample_with_processors_with_tokenizer(&mut delimiter_logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, delimiter_token);
+        assert_eq!(
+            state.sampling_history.scope(),
+            SequenceSamplingHistoryScope::HiddenStructuredOutput
+        );
+        assert!(state.sampling_history.token_frequencies().is_empty());
+        state.generated_tokens.push(token);
+    }
+
+    let mut grammar_logits = vec![f32::NEG_INFINITY; 9];
+    grammar_logits[0] = 1.0;
+    let first_json_token = state
+        .sample_with_processors_with_tokenizer(&mut grammar_logits, Some(tokenizer.as_ref()))
+        .unwrap();
+    assert_eq!(first_json_token, TokenId::new(0));
+    assert_eq!(grammar_logits[0], 1.0);
+    assert_eq!(
+        state.sampling_history.scope(),
+        SequenceSamplingHistoryScope::VisibleStructuredOutput {
+            start_token_index: 3
+        }
     );
 }
 
@@ -11171,7 +11308,10 @@ fn structured_output_terminal_error_reports_privacy_safe_lexical_progress() {
         .to_string();
 
     assert!(error.contains("grammar_tokens=14"), "{error}");
-    assert!(error.contains("sampling_history_start=0"), "{error}");
+    assert!(
+        error.contains("sampling_history_scope=FullGeneration"),
+        "{error}"
+    );
     assert!(error.contains("sampling_history_tokens=14"), "{error}");
     assert!(
         error.contains("sampling_history_unique_tokens=0"),

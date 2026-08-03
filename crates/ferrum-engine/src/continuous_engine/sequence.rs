@@ -68,20 +68,31 @@ fn system_time_unix_nanos(time: SystemTime) -> Result<i64> {
         .map_err(|_| FerrumError::internal("system clock Unix nanos exceed i64"))
 }
 
+/// Selects which generated-token domain is visible to logits processors.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum SequenceSamplingHistoryScope {
+    #[default]
+    FullGeneration,
+    HiddenStructuredOutput,
+    VisibleStructuredOutput {
+        start_token_index: usize,
+    },
+}
+
 /// Request-local token history visible to logits processors and samplers.
 ///
 /// Hidden reasoning and the visible structured result are distinct output
-/// domains. Keeping the boundary and frequency table together prevents a
-/// caller from slicing `previous_tokens` without also rebuilding additive and
-/// multiplicative penalty counts.
+/// domains. Keeping the typed scope and frequency table together prevents a
+/// caller from changing `previous_tokens` without also rebuilding additive
+/// and multiplicative penalty counts.
 #[derive(Debug, Default)]
 pub(super) struct SequenceSamplingHistory {
-    start_token_index: usize,
+    scope: SequenceSamplingHistoryScope,
     token_frequencies: HashMap<TokenId, usize>,
 }
 
 impl SequenceSamplingHistory {
-    pub(super) fn align_to(
+    pub(super) fn activate_visible_structured_output(
         &mut self,
         start_token_index: usize,
         generated_tokens: &[TokenId],
@@ -92,27 +103,35 @@ impl SequenceSamplingHistory {
                 generated_tokens.len()
             )));
         }
-        if self.start_token_index == start_token_index {
+        let scope = SequenceSamplingHistoryScope::VisibleStructuredOutput { start_token_index };
+        if self.scope == scope {
             return Ok(false);
         }
-        self.start_token_index = start_token_index;
-        self.rebuild(generated_tokens);
+        self.scope = scope;
+        self.rebuild_from(start_token_index, generated_tokens);
         Ok(true)
     }
 
-    pub(super) fn reset_to_full_generation(&mut self, generated_tokens: &[TokenId]) {
-        self.start_token_index = 0;
-        self.rebuild(generated_tokens);
+    pub(super) fn enter_hidden_structured_output(&mut self) -> bool {
+        if self.scope == SequenceSamplingHistoryScope::HiddenStructuredOutput {
+            return false;
+        }
+        self.scope = SequenceSamplingHistoryScope::HiddenStructuredOutput;
+        self.token_frequencies.clear();
+        true
     }
 
-    fn rebuild(&mut self, generated_tokens: &[TokenId]) {
+    fn rebuild_from(&mut self, start_token_index: usize, generated_tokens: &[TokenId]) {
         self.token_frequencies.clear();
-        for &token in &generated_tokens[self.start_token_index..] {
+        for &token in &generated_tokens[start_token_index..] {
             *self.token_frequencies.entry(token).or_insert(0) += 1;
         }
     }
 
     pub(super) fn record(&mut self, token: TokenId) {
+        if self.scope == SequenceSamplingHistoryScope::HiddenStructuredOutput {
+            return;
+        }
         *self.token_frequencies.entry(token).or_insert(0) += 1;
     }
 
@@ -120,29 +139,35 @@ impl SequenceSamplingHistory {
         &self,
         generated_tokens: &'a [TokenId],
     ) -> Result<&'a [TokenId]> {
-        generated_tokens
-            .get(self.start_token_index..)
-            .ok_or_else(|| {
-                FerrumError::internal(format!(
-                    "sampling history starts at token {}, beyond generated length {}",
-                    self.start_token_index,
-                    generated_tokens.len()
-                ))
-            })
+        let start_token_index = match self.scope {
+            SequenceSamplingHistoryScope::FullGeneration => 0,
+            SequenceSamplingHistoryScope::HiddenStructuredOutput => {
+                return Ok(&generated_tokens[..0]);
+            }
+            SequenceSamplingHistoryScope::VisibleStructuredOutput { start_token_index } => {
+                start_token_index
+            }
+        };
+        generated_tokens.get(start_token_index..).ok_or_else(|| {
+            FerrumError::internal(format!(
+                "sampling history starts at token {}, beyond generated length {}",
+                start_token_index,
+                generated_tokens.len()
+            ))
+        })
     }
 
     pub(super) fn token_frequencies(&self) -> &HashMap<TokenId, usize> {
         &self.token_frequencies
     }
 
-    pub(super) fn start_token_index(&self) -> usize {
-        self.start_token_index
+    pub(super) fn scope(&self) -> SequenceSamplingHistoryScope {
+        self.scope
     }
 
     pub(super) fn token_count(&self, generated_tokens: &[TokenId]) -> usize {
-        generated_tokens
-            .len()
-            .saturating_sub(self.start_token_index)
+        self.previous_tokens(generated_tokens)
+            .map_or(0, <[TokenId]>::len)
     }
 
     pub(super) fn unique_token_count(&self) -> usize {
@@ -1388,8 +1413,10 @@ impl SequenceState {
     pub fn reset_guided_processors(&mut self) -> Result<()> {
         if let Some(processor) = &self.structured_output_processor {
             processor.reset()?;
-            self.sampling_history
-                .reset_to_full_generation(&self.generated_tokens);
+            // Replay has not resolved the hidden/visible boundary yet. Keep
+            // penalties disabled until the grammar mask reports the exact
+            // visible-output start, then rebuild that suffix once.
+            self.sampling_history.enter_hidden_structured_output();
         }
         Ok(())
     }
@@ -1453,6 +1480,7 @@ impl SequenceState {
         // return malformed JSON.
         let mut required_structured_delimiter_token_id = None;
         let mut grammar_start_token_index = None;
+        let has_structured_output = self.structured_output_processor.is_some();
         if let Some(processor) = &self.structured_output_processor {
             let constraint = processor.mask_logits_with_terminals(
                 logits,
@@ -1466,9 +1494,17 @@ impl SequenceState {
                 mask_stop_token_logits(logits, &self.stop_token_ids);
             }
         }
-        if let Some(start_token_index) = grammar_start_token_index {
-            self.sampling_history
-                .align_to(start_token_index, &self.generated_tokens)?;
+        match (has_structured_output, grammar_start_token_index) {
+            (true, Some(start_token_index)) => {
+                self.sampling_history.activate_visible_structured_output(
+                    start_token_index,
+                    &self.generated_tokens,
+                )?;
+            }
+            (true, None) => {
+                self.sampling_history.enter_hidden_structured_output();
+            }
+            (false, _) => {}
         }
         if !self.response_completion_state.allows_model_eos() {
             for &token_id in &self.model_eos_token_ids {
