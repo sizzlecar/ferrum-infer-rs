@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import copy
 import hashlib
 import json
@@ -29,6 +30,10 @@ SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT S2 LATENCY FIRST FAILURE SELFTEST PAS
 CHECKPOINT_ID = "runtime-vnext-s2-latency-first-failure"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ANALYZER_PATH = Path(profile_analyzer.__file__).resolve()
+COLLECTOR_PATH = (
+    Path(__file__).resolve().parent
+    / "runtime_vnext_s2_latency_failure_collector.py"
+)
 SCENARIOS = {
     "run-success": ("run", False),
     "serve-success": ("serve", False),
@@ -176,6 +181,10 @@ def validate_artifact_tree(root: Path) -> dict[str, Any]:
         for path in root.rglob("*")
         if path.is_file() and not path.is_symlink() and path.name != "artifact_tree.json"
     }
+    require(
+        not any(path.is_symlink() for path in root.rglob("*")),
+        "artifact tree contains a symlink",
+    )
     require(recorded == actual, "artifact_tree does not exactly cover regular files")
     unsigned = dict(tree)
     fingerprint = unsigned.pop("canonical_sha256", None)
@@ -188,6 +197,7 @@ def validate_bound_inputs(root: Path, collection: dict[str, Any]) -> dict[str, s
     inputs = collection.get("inputs")
     require(isinstance(inputs, dict), "collection.inputs must be an object")
     current = {
+        "collector": COLLECTOR_PATH,
         "collector_validator": Path(__file__).resolve(),
         "profile_analyzer": ANALYZER_PATH,
     }
@@ -210,9 +220,44 @@ def validate_bound_inputs(root: Path, collection: dict[str, Any]) -> dict[str, s
     return result
 
 
-def validate_model(collection: dict[str, Any]) -> dict[str, Any]:
+def recorded_artifact_root(collection: dict[str, Any]) -> Path:
+    value = collection.get("artifact_root")
+    require(isinstance(value, str) and value, "collection.artifact_root missing")
+    root = Path(value)
+    require(root.is_absolute() and ".." not in root.parts, "collection.artifact_root must be absolute")
+    return root
+
+
+def resolve_recorded_artifact_path(
+    root: Path,
+    recorded_root: Path,
+    value: str,
+    context: str,
+) -> Path:
+    raw = Path(value)
+    require(".." not in raw.parts, f"{context} contains parent traversal")
+    if raw.is_absolute():
+        try:
+            relative = raw.relative_to(recorded_root)
+        except ValueError as error:
+            raise ValidationError(f"{context} is outside recorded artifact root") from error
+    else:
+        relative = raw
+    resolved = (root / relative).resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as error:
+        raise ValidationError(f"{context} escapes current artifact root") from error
+    return resolved
+
+
+def validate_model(root: Path, collection: dict[str, Any]) -> dict[str, Any]:
     model = collection.get("model")
     require(isinstance(model, dict), "collection.model must be an object")
+    require(
+        read_json(root / "model-closure.json") == model,
+        "collection model differs from model-closure.json",
+    )
     require(model.get("id") == "Qwen/Qwen3.5-4B", "S2 latency lane requires Qwen/Qwen3.5-4B")
     snapshot = model.get("snapshot_path")
     require(isinstance(snapshot, str), "model.snapshot_path missing")
@@ -265,11 +310,33 @@ def command_value(tokens: list[str], flag: str) -> str | None:
     return tokens[index + 1]
 
 
-def validate_command(directory: Path, entrypoint: str, failure: bool) -> list[str]:
+def validate_command(
+    root: Path,
+    directory: Path,
+    entrypoint: str,
+    failure: bool,
+    collection: dict[str, Any],
+) -> list[str]:
     command_text = read_text(directory / "command.txt").strip()
     tokens = shlex.split(command_text)
-    require(tokens and Path(tokens[0]).name == "ferrum", "scenario command does not invoke ferrum")
+    require(tokens, "scenario command is empty")
+    recorded_root = recorded_artifact_root(collection)
+    binary_receipt = collection.get("binary")
+    require(isinstance(binary_receipt, dict), "collection binary receipt missing")
+    expected_binary = resolve_recorded_artifact_path(
+        root,
+        recorded_root,
+        str(binary_receipt.get("path", "")),
+        "collection.binary.path",
+    )
+    actual_binary = resolve_recorded_artifact_path(
+        root, recorded_root, tokens[0], "scenario executable"
+    )
+    require(actual_binary == expected_binary, "scenario command did not execute the staged binary")
     require(len(tokens) > 2 and tokens[1] == entrypoint, f"scenario command does not invoke ferrum {entrypoint}")
+    model = collection.get("model")
+    require(isinstance(model, dict), "collection model receipt missing")
+    require(tokens[2] == model.get("snapshot_path"), "scenario command model snapshot mismatch")
     require(not any(token.startswith("FERRUM_") for token in tokens), "scenario command uses hidden FERRUM environment")
     require(command_value(tokens, "--backend") == "cuda", "scenario command backend must be cuda")
     require(command_value(tokens, "--profile-detail") == "latency", "scenario command profile detail must be latency")
@@ -280,9 +347,22 @@ def validate_command(directory: Path, entrypoint: str, failure: bool) -> list[st
         ("--profile-jsonl", "profile.jsonl"),
         ("--effective-config-json", "effective-config.json"),
         ("--decision-trace-jsonl", "decision-trace.jsonl"),
+        ("--scheduler-trace-jsonl", "scheduler-trace.jsonl"),
     ):
         value = command_value(tokens, flag)
-        require(isinstance(value, str) and Path(value).name == filename, f"scenario {flag} must name {filename}")
+        require(isinstance(value, str), f"scenario {flag} is missing")
+        require(
+            resolve_recorded_artifact_path(root, recorded_root, value, f"scenario {flag}")
+            == directory / filename,
+            f"scenario {flag} does not name its owned artifact",
+        )
+    dump = command_value(tokens, "--request-dump-dir")
+    require(isinstance(dump, str), "scenario --request-dump-dir is missing")
+    require(
+        resolve_recorded_artifact_path(root, recorded_root, dump, "scenario request dump")
+        == directory / "request-dump",
+        "scenario request dump path mismatch",
+    )
     return tokens
 
 
@@ -317,6 +397,99 @@ def event_order(event: dict[str, Any]) -> tuple[int, int]:
     )
 
 
+def validate_success_attribution(
+    events: list[dict[str, Any]],
+    product_event: dict[str, Any],
+    entrypoint: str,
+    completion_tokens: int,
+) -> dict[str, Any]:
+    product_attrs = event_attributes(product_event)
+    execution_request_id = product_attrs.get("execution_request_id")
+    require(
+        isinstance(execution_request_id, str) and execution_request_id,
+        "successful product event lacks execution_request_id",
+    )
+    engine_events = [
+        event
+        for event in events
+        if event.get("entrypoint") == entrypoint
+        and (
+            event.get("request_id") == execution_request_id
+            or event_attributes(event).get("execution_request_id")
+            == execution_request_id
+        )
+        and str(event.get("phase", "")).startswith("vnext.")
+    ]
+    by_phase: dict[str, list[dict[str, Any]]] = {}
+    for event in engine_events:
+        by_phase.setdefault(str(event.get("phase")), []).append(event)
+    for phase in (
+        "vnext.request_accepted",
+        "vnext.plan_built",
+        "vnext.operation_submitted",
+        "vnext.sequence_completed",
+        "vnext.request_completed",
+    ):
+        require(by_phase.get(phase), f"successful request lacks {phase} attribution")
+    operations = by_phase["vnext.operation_submitted"]
+    operation_identities: list[dict[str, Any]] = []
+    for event in operations:
+        identity = event_attributes(event).get("execution_identity")
+        require(isinstance(identity, dict), "submitted operation lacks canonical identity")
+        require(identity.get("request_id") == execution_request_id, "submitted operation request identity mismatch")
+        for key in (
+            "run_id",
+            "plan_id",
+            "plan_hash",
+            "node_id",
+            "operation_id",
+            "provider_id",
+            "device_id",
+            "span_id",
+        ):
+            require(isinstance(identity.get(key), str) and identity[key], f"submitted operation identity.{key} missing")
+        require(type(identity.get("sequence")) is int and identity["sequence"] >= 0, "submitted operation sequence missing")
+        require(type(identity.get("resource_pool_id")) is int and identity["resource_pool_id"] >= 0, "submitted operation resource identity missing")
+        backend = event.get("backend_detail")
+        require(isinstance(backend, dict) and backend.get("backend_type") == "cuda", "submitted operation CUDA backend identity missing")
+        operation_identities.append(identity)
+    request_completed = by_phase["vnext.request_completed"][-1]
+    shape = request_completed.get("shape")
+    require(isinstance(shape, dict), "request_completed shape missing")
+    require(
+        shape.get("event_output_count") == completion_tokens,
+        "request_completed output count differs from product completion",
+    )
+    ordered = [
+        by_phase[phase][0]
+        for phase in (
+            "vnext.request_accepted",
+            "vnext.plan_built",
+            "vnext.operation_submitted",
+            "vnext.sequence_completed",
+            "vnext.request_completed",
+        )
+    ]
+    require(
+        all(event_order(left) < event_order(right) for left, right in zip(ordered, ordered[1:])),
+        "successful execution lifecycle is out of order",
+    )
+    return {
+        "execution_request_id": execution_request_id,
+        "required_phases": list(by_phase),
+        "operation_count": len(operation_identities),
+        "resource_pool_ids": sorted(
+            {int(identity["resource_pool_id"]) for identity in operation_identities}
+        ),
+        "provider_ids": sorted(
+            {str(identity["provider_id"]) for identity in operation_identities}
+        ),
+        "device_ids": sorted(
+            {str(identity["device_id"]) for identity in operation_identities}
+        ),
+    }
+
+
 def validate_success_profile(path: Path, entrypoint: str) -> dict[str, Any]:
     try:
         analyzer = profile_analyzer.validate_profile_jsonl(path)
@@ -340,6 +513,9 @@ def validate_success_profile(path: Path, entrypoint: str) -> dict[str, Any]:
     require(type(attrs.get("e2e_duration_us")) is int and attrs["e2e_duration_us"] > 0, f"{path}: E2E duration missing")
     if entrypoint == "serve":
         require(attrs.get("stream") is True, f"{path}: serve sample must be streaming")
+    attribution = validate_success_attribution(
+        events, event, entrypoint, completion
+    )
     return {
         "analyzer": analyzer,
         "request_id": event.get("request_id"),
@@ -351,6 +527,7 @@ def validate_success_profile(path: Path, entrypoint: str) -> dict[str, Any]:
         "ttft_us": attrs.get("ttft_us"),
         "itl_us_avg": attrs.get("itl_us_avg"),
         "clock_conversion_error_ppm": attrs.get("clock_conversion_error_ppm"),
+        "attribution": attribution,
     }
 
 
@@ -389,7 +566,8 @@ def validate_failure_profile(path: Path, entrypoint: str) -> dict[str, Any]:
     first = [
         event
         for event in events
-        if event.get("phase") == "vnext.failure_observed"
+        if event.get("entrypoint") == entrypoint
+        and event.get("phase") == "vnext.failure_observed"
         and event.get("status") == "failure"
         and isinstance(event.get("error"), dict)
         and event["error"].get("blocking") is True
@@ -424,6 +602,10 @@ def validate_failure_profile(path: Path, entrypoint: str) -> dict[str, Any]:
     require(resource.get("capacity") == snapshot["usable_capacity_bytes"], f"{path}: resource capacity differs from snapshot")
     require(resource.get("before") == resource.get("after") == snapshot["available_bytes"], f"{path}: reject mutated or forged available capacity")
     same_request = [event for event in events if event.get("request_id") == request_id]
+    require(
+        all(event.get("entrypoint") == entrypoint for event in same_request),
+        f"{path}: first-failure request crosses product entrypoints",
+    )
     submitted = [event for event in same_request if event.get("phase") == "vnext.operation_submitted"]
     require(submitted, f"{path}: no real operation submission precedes failure")
     matching_submission = None
@@ -436,17 +618,49 @@ def validate_failure_profile(path: Path, entrypoint: str) -> dict[str, Any]:
             break
     require(matching_submission is not None, f"{path}: first failure identity is not owned by a submitted operation")
     require(event_order(matching_submission) < event_order(failure), f"{path}: failure precedes operation submission")
-    terminals: dict[str, dict[str, Any]] = {}
-    for phase in ("vnext.sequence_aborted", "vnext.request_failed"):
-        matches = [event for event in same_request if event.get("phase") == phase]
-        require(len(matches) == 1, f"{path}: requires exactly one {phase}")
-        terminal = matches[0]
-        terminal_attrs = event_attributes(terminal)
-        require(terminal_attrs.get("terminal_failure_event") is True, f"{path}: {phase} terminal marker missing")
-        require(terminal_attrs.get("first_failure_fingerprint") == fingerprint, f"{path}: {phase} fingerprint mismatch")
-        require(event_order(terminal) > event_order(failure), f"{path}: {phase} precedes first failure")
-        terminals[phase] = terminal
-    require(event_order(terminals["vnext.sequence_aborted"]) < event_order(terminals["vnext.request_failed"]), f"{path}: request failed before sequence aborted")
+    aborted_matches = [
+        event for event in same_request if event.get("phase") == "vnext.sequence_aborted"
+    ]
+    require(len(aborted_matches) == 1, f"{path}: requires exactly one vnext.sequence_aborted")
+    sequence_aborted = aborted_matches[0]
+    aborted_attrs = event_attributes(sequence_aborted)
+    require(sequence_aborted.get("status") == "ok", f"{path}: sequence_aborted should be a lifecycle event")
+    require("terminal_failure_event" not in aborted_attrs, f"{path}: sequence_aborted forged a terminal marker")
+    require("first_failure_fingerprint" not in aborted_attrs, f"{path}: sequence_aborted forged a failure fingerprint")
+    aborted_identity = aborted_attrs.get("execution_identity")
+    require(isinstance(aborted_identity, dict), f"{path}: sequence_aborted identity missing")
+    require(
+        isinstance(aborted_identity.get("aborted_sequence_fingerprint"), str)
+        and SHA256_RE.fullmatch(aborted_identity["aborted_sequence_fingerprint"]),
+        f"{path}: aborted sequence fingerprint missing",
+    )
+    failed_matches = [
+        event for event in same_request if event.get("phase") == "vnext.request_failed"
+    ]
+    require(len(failed_matches) == 1, f"{path}: requires exactly one vnext.request_failed")
+    request_failed = failed_matches[0]
+    failed_attrs = event_attributes(request_failed)
+    require(failed_attrs.get("terminal_failure_event") is True, f"{path}: request_failed terminal marker missing")
+    require(failed_attrs.get("first_failure_fingerprint") == fingerprint, f"{path}: request_failed fingerprint mismatch")
+    require(event_order(failure) < event_order(sequence_aborted) < event_order(request_failed), f"{path}: failure/abort/request terminal order is invalid")
+    product_phase = (
+        "actual_run_generation_failed"
+        if entrypoint == "run"
+        else "chat_completions_stream_next"
+    )
+    product_terminals = []
+    for event in events:
+        if event.get("entrypoint") != entrypoint or event.get("phase") != product_phase:
+            continue
+        attributes = event_attributes(event)
+        if attributes.get("execution_request_id") == request_id:
+            product_terminals.append(event)
+    require(len(product_terminals) == 1, f"{path}: product terminal {product_phase} is missing or duplicated")
+    product_terminal = product_terminals[0]
+    require(product_terminal.get("status") == "failure", f"{path}: product terminal is not a failure")
+    product_error = product_terminal.get("error")
+    require(isinstance(product_error, dict) and product_error.get("blocking") is False, f"{path}: product terminal error classification missing")
+    require(isinstance(product_error.get("kind"), str) and product_error["kind"], f"{path}: product terminal error kind missing")
     for event in events:
         event_attrs = event.get("attributes")
         if not isinstance(event_attrs, dict):
@@ -462,6 +676,8 @@ def validate_failure_profile(path: Path, entrypoint: str) -> dict[str, Any]:
         "first_failure_fingerprint": fingerprint,
         "identity": {key: identity.get(key) for key in ("request_id", "sequence", "plan_id", "node_id", "operation_id", "resource_pool_id", "provider_id", "device_id")},
         "snapshot": snapshot,
+        "product_terminal_phase": product_phase,
+        "product_terminal_error_kind": product_error["kind"],
     }
 
 
@@ -486,7 +702,9 @@ def parse_sse(path: Path) -> dict[str, Any]:
     return {"payloads": payloads, "done_count": done}
 
 
-def validate_scenario(root: Path, name: str) -> dict[str, Any]:
+def validate_scenario(
+    root: Path, name: str, collection: dict[str, Any]
+) -> dict[str, Any]:
     entrypoint, failure = SCENARIOS[name]
     directory = root / name
     require(directory.is_dir() and not directory.is_symlink(), f"missing scenario directory: {name}")
@@ -495,13 +713,15 @@ def validate_scenario(root: Path, name: str) -> dict[str, Any]:
         require((exit_code != 0) is failure, f"{name}: process exit does not match expected outcome")
     else:
         require(exit_code == 0, f"{name}: server did not shut down cleanly")
-    validate_command(directory, entrypoint, failure)
+    validate_command(root, directory, entrypoint, failure, collection)
     config = validate_effective_config(directory / "effective-config.json", failure=failure)
     read_jsonl(directory / "decision-trace.jsonl")
+    read_jsonl(directory / "scheduler-trace.jsonl")
     read_text(directory / "stderr.log")
     if entrypoint == "run":
         stdout = read_text(directory / "stdout.log", allow_failure_text=False)
-        require(bool(stdout.strip()), f"{name}: stdout is empty")
+        if not failure:
+            require(bool(stdout.strip()), f"{name}: successful run stdout is empty")
     result: dict[str, Any] = {"entrypoint": entrypoint, "failure_injected": failure, "effective_config": config}
     if failure:
         result["failure"] = validate_failure_profile(directory / "profile.jsonl", entrypoint)
@@ -522,9 +742,21 @@ def validate_scenario(root: Path, name: str) -> dict[str, Any]:
             require(int(read_text(directory / "recovery.http_status").strip()) == 200, f"{name}: recovery HTTP status must be 200")
             recovery = parse_sse(directory / "recovery.response.sse")
             require(not any(isinstance(row.get("error"), dict) for row in recovery["payloads"]), f"{name}: recovery request failed")
-            require(any(isinstance(row.get("usage"), dict) for row in recovery["payloads"]), f"{name}: recovery stream lacks usage")
+            recovery_usage = [
+                row["usage"]
+                for row in recovery["payloads"]
+                if isinstance(row.get("usage"), dict)
+            ]
+            require(len(recovery_usage) == 1, f"{name}: recovery stream must contain one usage payload")
             success = validate_success_profile(directory / "profile.jsonl", entrypoint)
             require(success["request_id"] != result["failure"]["request_id"], f"{name}: recovery reused failed request identity")
+            require(
+                recovery_usage[0].get("prompt_tokens") == success["prompt_tokens"]
+                and recovery_usage[0].get("completion_tokens")
+                == success["completion_tokens"]
+                and recovery_usage[0].get("total_tokens") == success["total_tokens"],
+                f"{name}: recovery profile/usage token counts differ",
+            )
             result["recovery"] = success
         else:
             usage = [row["usage"] for row in sse["payloads"] if isinstance(row.get("usage"), dict)]
@@ -543,8 +775,121 @@ def scalar_stats(values: list[float]) -> dict[str, Any]:
     return {"values": values, "n": len(values), "mean": mean, "median": statistics.median(values), "sample_stddev": deviation, "cv": deviation / mean}
 
 
-def validate_overhead(root: Path) -> dict[str, Any]:
+def validate_overhead_slot(
+    root: Path,
+    recorded_root: Path,
+    collection: dict[str, Any],
+    directory: Path,
+    slot: str,
+    mode: str,
+) -> float:
+    binary = collection.get("binary")
+    model = collection.get("model")
+    require(isinstance(binary, dict) and isinstance(model, dict), "overhead provenance missing")
+    expected_binary = resolve_recorded_artifact_path(
+        root, recorded_root, str(binary.get("path", "")), "overhead binary"
+    )
+    server_tokens = shlex.split(read_text(directory / "command.txt").strip())
+    require(len(server_tokens) > 2 and server_tokens[1] == "serve", f"overhead {slot} server command invalid")
+    require(
+        resolve_recorded_artifact_path(root, recorded_root, server_tokens[0], f"overhead {slot} executable")
+        == expected_binary,
+        f"overhead {slot} did not execute staged binary",
+    )
+    require(server_tokens[2] == model.get("snapshot_path"), f"overhead {slot} model mismatch")
+    require(command_value(server_tokens, "--backend") == "cuda", f"overhead {slot} backend mismatch")
+    require(command_value(server_tokens, "--profile-detail") == mode, f"overhead {slot} profile mode mismatch")
+    for flag, filename in (
+        ("--effective-config-json", "effective-config.json"),
+        ("--decision-trace-jsonl", "decision-trace.jsonl"),
+    ):
+        value = command_value(server_tokens, flag)
+        require(isinstance(value, str), f"overhead {slot} lacks {flag}")
+        require(
+            resolve_recorded_artifact_path(root, recorded_root, value, f"overhead {slot} {flag}")
+            == directory / filename,
+            f"overhead {slot} {flag} path mismatch",
+        )
+    config = read_json(directory / "effective-config.json")
+    require(config.get("backend") == "cuda", f"overhead {slot} effective backend mismatch")
+    entries = config_entries(config)
+    detail = entries.get("FERRUM_PROFILE_DETAIL")
+    require(
+        isinstance(detail, dict)
+        and detail.get("effective_value") == mode
+        and detail.get("source") == "cli",
+        f"overhead {slot} typed profile mode mismatch",
+    )
+    profile_value = command_value(server_tokens, "--profile-jsonl")
+    if mode == "latency":
+        require(command_value(server_tokens, "--profile-sample-rate") == "1.0", f"overhead {slot} sample rate mismatch")
+        require(isinstance(profile_value, str), f"overhead {slot} profile path missing")
+        require(
+            resolve_recorded_artifact_path(root, recorded_root, profile_value, f"overhead {slot} profile")
+            == directory / "profile.jsonl",
+            f"overhead {slot} profile path mismatch",
+        )
+        try:
+            profile_analyzer.validate_profile_jsonl(directory / "profile.jsonl")
+        except profile_analyzer.ValidationError as error:
+            raise ValidationError(f"overhead {slot} profile rejected: {error}") from error
+    else:
+        require(profile_value is None, f"overhead {slot} off mode wrote a profile")
+        require(not (directory / "profile.jsonl").exists(), f"overhead {slot} off profile artifact exists")
+    bench_tokens = shlex.split(read_text(directory / "bench.command").strip())
+    require(len(bench_tokens) > 1 and bench_tokens[1] == "bench-serve", f"overhead {slot} bench command invalid")
+    require(
+        resolve_recorded_artifact_path(root, recorded_root, bench_tokens[0], f"overhead {slot} bench executable")
+        == expected_binary,
+        f"overhead {slot} bench did not use staged binary",
+    )
+    expected_values = {
+        "--target-backend": "cuda",
+        "--concurrency": "1",
+        "--n-repeats": "3",
+        "--seed": "9271",
+        "--enable-thinking": "false",
+    }
+    for flag, expected in expected_values.items():
+        require(command_value(bench_tokens, flag) == expected, f"overhead {slot} {flag} mismatch")
+    require(bench_tokens.count("--fail-on-error") == 1, f"overhead {slot} lacks --fail-on-error")
+    require(bench_tokens.count("--require-ci") == 1, f"overhead {slot} lacks --require-ci")
+    out_value = command_value(bench_tokens, "--out")
+    require(isinstance(out_value, str), f"overhead {slot} --out missing")
+    require(
+        resolve_recorded_artifact_path(root, recorded_root, out_value, f"overhead {slot} bench out")
+        == directory / "bench.json",
+        f"overhead {slot} bench output path mismatch",
+    )
+    require(int(read_text(directory / "bench.exit_code").strip()) == 0, f"overhead {slot} bench failed")
+    require(int(read_text(directory / "exit_code").strip()) == 0, f"overhead {slot} server failed")
+    read_text(directory / "stderr.log")
+    read_text(directory / "bench.stderr.log")
+    health = read_json(directory / "health.after.json")
+    require(health.get("status") == "healthy", f"overhead {slot} post-bench health failed")
+    bench = read_json(directory / "bench.json")
+    require(bench.get("n_repeats") == 3, f"overhead {slot} report repeat count mismatch")
+    require(bench.get("concurrency") == 1, f"overhead {slot} report concurrency mismatch")
+    require(bench.get("output_token_count_source") == "usage", f"overhead {slot} token source mismatch")
+    repeats = bench.get("repeat_metrics")
+    require(isinstance(repeats, list) and len(repeats) == 3, f"overhead {slot} requires exactly three repeats")
+    throughput: list[float] = []
+    for index, repeat in enumerate(repeats):
+        require(isinstance(repeat, dict), f"overhead {slot} repeat {index} invalid")
+        require(repeat.get("completed_requests") == repeat.get("expected_requests"), f"overhead {slot} repeat {index} incomplete")
+        require(repeat.get("errored_requests") == 0 and repeat.get("warmup_errored") == 0, f"overhead {slot} repeat {index} errors")
+        require(repeat.get("output_token_count_source") == "usage", f"overhead {slot} repeat {index} token source mismatch")
+        quality = repeat.get("quality_issues")
+        require(isinstance(quality, dict) and all(value == 0 for value in quality.values()), f"overhead {slot} repeat {index} quality failure")
+        value = repeat.get("output_throughput_tps")
+        require(type(value) in (int, float) and math.isfinite(float(value)) and float(value) > 0, f"overhead {slot} repeat {index} throughput invalid")
+        throughput.append(float(value))
+    return statistics.fmean(throughput)
+
+
+def validate_overhead(root: Path, collection: dict[str, Any]) -> dict[str, Any]:
     directory = root / "profile-overhead"
+    recorded_root = recorded_artifact_root(collection)
     report = read_json(directory / "report.json")
     require(report.get("schema_version") == 1, "overhead report schema_version must be 1")
     require(report.get("comparison") == "ABBA-BAAB", "overhead comparison must be ABBA-BAAB")
@@ -556,12 +901,14 @@ def validate_overhead(root: Path) -> dict[str, Any]:
         require(isinstance(row, dict) and row.get("slot") == expected, f"overhead slot identity mismatch: {expected}")
         expected_mode = "latency" if expected.startswith("latency") else "off"
         require(row.get("mode") == expected_mode, f"overhead slot mode mismatch: {expected}")
-        bench = read_json(directory / expected / "bench.json")
-        repeats = bench.get("repeat_metrics")
-        require(isinstance(repeats, list) and len(repeats) >= 3, f"overhead {expected} requires at least three repeats")
-        values = [repeat.get("output_throughput_tps") for repeat in repeats if isinstance(repeat, dict)]
-        require(len(values) == len(repeats) and all(type(value) in (int, float) for value in values), f"overhead {expected} throughput missing")
-        throughput = statistics.fmean(float(value) for value in values)
+        throughput = validate_overhead_slot(
+            root,
+            recorded_root,
+            collection,
+            directory / expected,
+            expected,
+            expected_mode,
+        )
         require(math.isclose(float(row.get("output_throughput_tps", -1)), throughput, rel_tol=1e-12, abs_tol=1e-12), f"overhead {expected} report drifted from bench")
         grouped[expected_mode].append(throughput)
     off = scalar_stats(grouped["off"])
@@ -578,6 +925,106 @@ def validate_overhead(root: Path) -> dict[str, Any]:
     return {"off": off, "latency": latency, "mean_overhead_fraction": mean_overhead, "median_overhead_fraction": median_overhead, "target_met": target_met, "classification": classification, "blocking": False}
 
 
+def git_output(*args: str) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(result.returncode == 0, f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def validate_provenance(
+    root: Path,
+    collection: dict[str, Any],
+    expected_git_sha: str | None,
+) -> dict[str, Any]:
+    git_sha = collection.get("git_sha")
+    git_tree = collection.get("git_tree")
+    require(isinstance(git_sha, str) and GIT_SHA_RE.fullmatch(git_sha), "collection git_sha invalid")
+    require(isinstance(git_tree, str) and GIT_SHA_RE.fullmatch(git_tree), "collection git_tree invalid")
+    require(read_text(root / "source/git.sha").strip() == git_sha, "raw git SHA receipt mismatch")
+    require(read_text(root / "source/git.tree").strip() == git_tree, "raw git tree receipt mismatch")
+    require(read_text(root / "source/git.status") == "", "raw git status is dirty")
+    require(collection.get("dirty_status") == {"is_dirty": False, "status_short": []}, "collection source checkout is dirty")
+    if expected_git_sha is not None:
+        require(git_sha == expected_git_sha, "artifact git SHA differs from validation candidate")
+        require(git_output("rev-parse", "HEAD") == expected_git_sha, "validator checkout HEAD differs from expected source")
+        require(git_output("rev-parse", "HEAD^{tree}") == git_tree, "artifact git tree differs from validation checkout")
+    recorded_root = recorded_artifact_root(collection)
+    binary = collection.get("binary")
+    require(isinstance(binary, dict), "collection.binary missing")
+    digest = binary.get("sha256")
+    require(isinstance(digest, str) and SHA256_RE.fullmatch(digest), "binary SHA256 invalid")
+    binary_path = resolve_recorded_artifact_path(
+        root, recorded_root, str(binary.get("path", "")), "collection.binary.path"
+    )
+    require(binary_path.is_file() and not binary_path.is_symlink(), "staged binary is missing")
+    require(file_sha256(binary_path) == digest, "staged binary SHA256 mismatch")
+    hardware = collection.get("hardware")
+    require(isinstance(hardware, dict), "collection.hardware missing")
+    require(
+        read_text(root / "hardware.command").strip()
+        == shlex.join(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,uuid,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ]
+        ),
+        "hardware probe command mismatch",
+    )
+    rows = list(csv.reader(read_text(root / "hardware.csv").strip().splitlines()))
+    require(len(rows) == 1 and len(rows[0]) == 4, "hardware probe must contain exactly one GPU")
+    name, uuid, memory, driver = [value.strip() for value in rows[0]]
+    try:
+        memory_total_mib = int(memory)
+    except ValueError as error:
+        raise ValidationError("hardware memory total is not an integer") from error
+    raw_hardware = {
+        "gpu_count": 1,
+        "name": name,
+        "uuid": uuid,
+        "memory_total_mib": memory_total_mib,
+        "driver_version": driver,
+    }
+    require(hardware == raw_hardware, "collection hardware differs from raw nvidia-smi receipt")
+    require("RTX 4090" in name, "S2 latency lane requires RTX 4090")
+    require(uuid.startswith("GPU-") and memory_total_mib >= 24000, "GPU identity is invalid")
+    environment = collection.get("environment")
+    require(isinstance(environment, dict), "collection sanitized environment receipt missing")
+    removed = environment.get("removed_hidden_ferrum_env_names")
+    require(
+        isinstance(removed, list)
+        and all(isinstance(name, str) and name.startswith("FERRUM_") for name in removed),
+        "removed hidden environment names receipt is invalid",
+    )
+    protocol = collection.get("protocol")
+    require(isinstance(protocol, dict), "collection protocol receipt missing")
+    require(
+        protocol.get("profile_detail") == "latency"
+        and protocol.get("profile_sample_rate") == 1.0
+        and protocol.get("diagnostic_fault") == FAULT_VALUE
+        and protocol.get("overhead_comparison") == "ABBA-BAAB"
+        and protocol.get("overhead_target_fraction") == 0.05
+        and protocol.get("overhead_blocking") is False
+        and protocol.get("bench_concurrency") == 1
+        and protocol.get("bench_repeats") == 3
+        and protocol.get("bench_seed") == 9271,
+        "collection protocol differs from the S2 contract",
+    )
+    return {
+        "git_sha": git_sha,
+        "git_tree": git_tree,
+        "binary_sha256": digest,
+        "hardware": hardware,
+    }
+
+
 def validate_source(source: Path, expected_git_sha: str | None) -> dict[str, Any]:
     require(source.is_dir() and not source.is_symlink(), f"source root is not a real directory: {source}")
     root = source.resolve(strict=True)
@@ -585,33 +1032,17 @@ def validate_source(source: Path, expected_git_sha: str | None) -> dict[str, Any
     collection = read_json(root / "collection.json")
     require(collection.get("schema_version") == 1, "collection schema_version must be 1")
     require(collection.get("artifact_type") == CHECKPOINT_ID, "collection artifact type mismatch")
-    git_sha = collection.get("git_sha")
-    git_tree = collection.get("git_tree")
-    require(isinstance(git_sha, str) and GIT_SHA_RE.fullmatch(git_sha), "collection git_sha invalid")
-    require(isinstance(git_tree, str) and GIT_SHA_RE.fullmatch(git_tree), "collection git_tree invalid")
-    require(collection.get("dirty_status") == {"is_dirty": False, "status_short": []}, "collection source checkout is dirty")
-    if expected_git_sha is not None:
-        require(git_sha == expected_git_sha, "artifact git SHA differs from validation candidate")
-    binary = collection.get("binary")
-    require(isinstance(binary, dict), "collection.binary missing")
-    require(isinstance(binary.get("sha256"), str) and SHA256_RE.fullmatch(binary["sha256"]), "binary SHA256 invalid")
-    hardware = collection.get("hardware")
-    require(isinstance(hardware, dict), "collection.hardware missing")
-    require(hardware.get("gpu_count") == 1, "S2 latency lane requires exactly one GPU")
-    require("RTX 4090" in str(hardware.get("name", "")), "S2 latency lane requires RTX 4090")
-    require(isinstance(hardware.get("uuid"), str) and hardware["uuid"].startswith("GPU-"), "GPU UUID missing")
-    require(type(hardware.get("memory_total_mib")) is int and hardware["memory_total_mib"] >= 24000, "GPU memory identity invalid")
+    provenance = validate_provenance(root, collection, expected_git_sha)
     inputs = validate_bound_inputs(root, collection)
-    model = validate_model(collection)
+    model = validate_model(root, collection)
     expected_scenarios = collection.get("scenarios")
     require(expected_scenarios == list(SCENARIOS), "collection scenario set/order mismatch")
-    scenarios = {name: validate_scenario(root, name) for name in SCENARIOS}
-    overhead = validate_overhead(root)
+    scenarios = {
+        name: validate_scenario(root, name, collection) for name in SCENARIOS
+    }
+    overhead = validate_overhead(root, collection)
     return {
-        "git_sha": git_sha,
-        "git_tree": git_tree,
-        "binary_sha256": binary["sha256"],
-        "hardware": hardware,
+        **provenance,
         "model": model,
         "inputs": inputs,
         "artifact_tree": artifact_tree,
@@ -691,7 +1122,7 @@ def base_event(request_id: str, entrypoint: str, phase: str, sequence: int, *, k
         "status": status,
         "shape": {"execution_sequence": sequence},
         "backend_detail": {"backend_type": "cuda", "backend_device": "cuda:0"},
-        "attributes": {"profile_detail": "latency", "diagnostic_only": False, "run_id": f"run.{entrypoint}.fixture", "monotonic_nanos_since_run_start": sequence, **(attributes or {})},
+        "attributes": {"profile_detail": "latency", "diagnostic_only": False, "run_id": "run.fixture", "monotonic_nanos_since_run_start": sequence, **(attributes or {})},
     }
     if duration_us is not None:
         event["duration_us"] = duration_us
@@ -739,7 +1170,48 @@ def identity(request_id: str, sequence: int) -> dict[str, Any]:
 
 def fixture_success_profile(entrypoint: str, request_id: str) -> list[dict[str, Any]]:
     phase = "actual_run_generation" if entrypoint == "run" else "chat_completions_stream_complete"
-    return [base_event(request_id, entrypoint, phase, 1, kind="timed_span", duration_us=5_000, attributes=timing_attributes(entrypoint))]
+    execution_request_id = f"request.product.{request_id}"
+    common = {
+        "execution_trace_source": "vnext",
+        "execution_request_id": execution_request_id,
+    }
+    phases = (
+        "vnext.request_accepted",
+        "vnext.plan_built",
+        "vnext.operation_submitted",
+        "vnext.sequence_completed",
+        "vnext.request_completed",
+    )
+    events = []
+    for sequence, lifecycle_phase in enumerate(phases, start=1):
+        event = base_event(
+            execution_request_id,
+            entrypoint,
+            lifecycle_phase,
+            sequence,
+            attributes={
+                **common,
+                "execution_identity": identity(execution_request_id, sequence),
+            },
+        )
+        if lifecycle_phase == "vnext.request_completed":
+            event["shape"]["event_output_count"] = 2
+        events.append(event)
+    events.append(
+        base_event(
+            request_id,
+            entrypoint,
+            phase,
+            100,
+            kind="timed_span",
+            duration_us=5_000,
+            attributes={
+                **timing_attributes(entrypoint),
+                "execution_request_id": execution_request_id,
+            },
+        )
+    )
+    return events
 
 
 def fixture_failure_events(entrypoint: str, request_id: str, *, recovery: bool) -> list[dict[str, Any]]:
@@ -770,10 +1242,75 @@ def fixture_failure_events(entrypoint: str, request_id: str, *, recovery: bool) 
         error={"kind": FAULT_ERROR_KIND, "message": "injected resource failure after operation submission", "blocking": True},
         resource={"owner_kind": "resource_pool", "owner_id": "resource-pool:7", "resource_kind": "plan_runtime_memory", "action": "reject", "before": 400, "after": 400, "capacity": 900, "reason": "injected resource failure after operation submission"},
     )
-    terminals = []
-    for sequence, phase in ((4, "vnext.sequence_aborted"), (5, "vnext.request_failed")):
-        terminals.append(base_event(request_id, entrypoint, phase, sequence, kind="error", status="failure", attributes={**common, "execution_identity": identity(request_id, sequence), "terminal_failure_event": True, "first_failure_fingerprint": fingerprint}, error={"kind": "request_aborted_after_failure", "message": f"request terminated after failure {fingerprint}", "blocking": False}))
-    events = [base_event(request_id, entrypoint, "request_execution_started", 1, kind="timed_span", duration_us=1), submitted, failure, *terminals]
+    aborted_identity = identity(request_id, 4)
+    aborted_identity["aborted_sequence_fingerprint"] = "6" * 64
+    sequence_aborted = base_event(
+        request_id,
+        entrypoint,
+        "vnext.sequence_aborted",
+        4,
+        attributes={**common, "execution_identity": aborted_identity},
+    )
+    failed_identity = identity(request_id, 5)
+    failed_identity["aborted_sequence_fingerprint"] = "6" * 64
+    request_failed = base_event(
+        request_id,
+        entrypoint,
+        "vnext.request_failed",
+        5,
+        kind="error",
+        status="failure",
+        attributes={
+            **common,
+            "execution_identity": failed_identity,
+            "terminal_failure_event": True,
+            "first_failure_fingerprint": fingerprint,
+        },
+        error={
+            "kind": "vnext_request_failed",
+            "message": f"request terminated after failure {fingerprint}",
+            "blocking": False,
+        },
+    )
+    raw_request_id = request_id.removeprefix("request.product.")
+    product_phase = (
+        "actual_run_generation_failed"
+        if entrypoint == "run"
+        else "chat_completions_stream_next"
+    )
+    product_terminal = base_event(
+        raw_request_id,
+        entrypoint,
+        product_phase,
+        101,
+        kind="error",
+        status="failure",
+        attributes={
+            "execution_request_id": request_id,
+            "terminal_failure_event": True,
+        },
+        error={
+            "kind": "resource_exhausted",
+            "message": "injected resource failure after operation submission",
+            "blocking": False,
+        },
+        resource={
+            "owner_kind": "request",
+            "owner_id": raw_request_id,
+            "resource_kind": "chat_request" if entrypoint == "serve" else "request_slot",
+            "action": "reject",
+            "capacity": 1,
+            "reason": "injected resource failure after operation submission",
+        },
+    )
+    events = [
+        base_event(request_id, entrypoint, "request_execution_started", 1, kind="timed_span", duration_us=1),
+        submitted,
+        failure,
+        sequence_aborted,
+        request_failed,
+        product_terminal,
+    ]
     if recovery:
         events.extend(fixture_success_profile(entrypoint, f"{request_id}.recovery"))
     return events
@@ -783,8 +1320,10 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     write_text(path, "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
 
 
-def fixture_effective_config(failure: bool) -> dict[str, Any]:
-    entries = [{"key": "FERRUM_PROFILE_DETAIL", "effective_value": "latency", "source": "cli", "affects": ["diagnostics"]}]
+def fixture_effective_config(
+    failure: bool, *, profile_detail: str = "latency"
+) -> dict[str, Any]:
+    entries = [{"key": "FERRUM_PROFILE_DETAIL", "effective_value": profile_detail, "source": "cli", "affects": ["diagnostics"]}]
     if failure:
         entries.append({"key": "FERRUM_VNEXT_DIAGNOSTIC_FAULT", "effective_value": FAULT_VALUE, "source": "cli", "affects": ["diagnostics"]})
     return {"schema_version": 1, "backend": "cuda", "env_hash": "sha256:" + "6" * 64, "entries": entries}
@@ -801,26 +1340,89 @@ def write_fixture_tree(root: Path) -> None:
     write_json(root / "artifact_tree.json", tree)
 
 
+def fixture_bench_report(repeats: list[float]) -> dict[str, Any]:
+    return {
+        "n_repeats": 3,
+        "concurrency": 1,
+        "output_token_count_source": "usage",
+        "repeat_metrics": [
+            {
+                "expected_requests": 4,
+                "completed_requests": 4,
+                "errored_requests": 0,
+                "warmup_errored": 0,
+                "output_token_count_source": "usage",
+                "quality_issues": {
+                    "malformed_sse_json": 0,
+                    "missing_done": 0,
+                    "stream_errors": 0,
+                },
+                "output_throughput_tps": value,
+            }
+            for value in repeats
+        ],
+    }
+
+
 def create_fixture(root: Path, *, overhead_scale: float = 0.98) -> None:
     root.mkdir(parents=True)
+    recorded_root = root.resolve()
+    git_sha = git_output("rev-parse", "HEAD")
+    git_tree = git_output("rev-parse", "HEAD^{tree}")
+    source = root / "source"
+    source.mkdir()
+    write_text(source / "git.sha", git_sha + "\n")
+    write_text(source / "git.tree", git_tree + "\n")
+    write_text(source / "git.status", "")
+    binary = root / "binary" / "ferrum"
+    write_text(binary, "#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    model_snapshot = (
+        "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/"
+        + "a" * 40
+    )
     inputs = root / "inputs"
     inputs.mkdir()
+    collector_copy = inputs / COLLECTOR_PATH.name
     validator_copy = inputs / Path(__file__).name
     analyzer_copy = inputs / ANALYZER_PATH.name
+    shutil.copyfile(COLLECTOR_PATH, collector_copy)
     shutil.copyfile(Path(__file__).resolve(), validator_copy)
     shutil.copyfile(ANALYZER_PATH, analyzer_copy)
     for name, (entrypoint, failure) in SCENARIOS.items():
         directory = root / name
         directory.mkdir()
-        argv = ["/workspace/target/release/ferrum", entrypoint, "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/" + "a" * 40, "--backend", "cuda", "--profile-detail", "latency", "--profile-sample-rate", "1.0", "--profile-jsonl", str(directory / "profile.jsonl"), "--effective-config-json", str(directory / "effective-config.json"), "--decision-trace-jsonl", str(directory / "decision-trace.jsonl")]
+        argv = [
+            str(binary.resolve()),
+            entrypoint,
+            model_snapshot,
+            "--backend",
+            "cuda",
+            "--profile-detail",
+            "latency",
+            "--profile-sample-rate",
+            "1.0",
+            "--profile-jsonl",
+            str((directory / "profile.jsonl").resolve()),
+            "--effective-config-json",
+            str((directory / "effective-config.json").resolve()),
+            "--decision-trace-jsonl",
+            str((directory / "decision-trace.jsonl").resolve()),
+            "--scheduler-trace-jsonl",
+            str((directory / "scheduler-trace.jsonl").resolve()),
+            "--request-dump-dir",
+            str((directory / "request-dump").resolve()),
+        ]
         if failure:
             argv.extend(["--vnext-diagnostic-fault", FAULT_VALUE])
         write_text(directory / "command.txt", shlex.join(argv) + "\n")
         write_json(directory / "effective-config.json", fixture_effective_config(failure))
         write_jsonl(directory / "decision-trace.jsonl", [{"selected": "cuda", "source": "cli"}])
+        write_jsonl(directory / "scheduler-trace.jsonl", [{"phase": "fixture", "request_id": f"request.{name}"}])
+        write_json(directory / "request-dump" / "fixture.json", {"request_id": f"request.{name}"})
         write_text(directory / "stderr.log", "fixture completed without panic\n")
         if entrypoint == "run":
-            write_text(directory / "stdout.log", '{"type":"completion","text":"Paris"}\n' if not failure else '{"type":"error","kind":"resource_exhausted"}\n')
+            write_text(directory / "stdout.log", '{"type":"completion","text":"Paris"}\n' if not failure else "")
             write_text(directory / "exit_code", "1\n" if failure else "0\n")
             events = fixture_failure_events(entrypoint, f"request.{name}", recovery=False) if failure else fixture_success_profile(entrypoint, f"request.{name}")
         else:
@@ -843,10 +1445,69 @@ def create_fixture(root: Path, *, overhead_scale: float = 0.98) -> None:
     slots = []
     for index, slot in enumerate(OVERHEAD_SLOT_ORDER):
         mode = "latency" if slot.startswith("latency") else "off"
+        directory = overhead / slot
         base = 100.0 + (index % 2) * 0.2
         throughput = base * (overhead_scale if mode == "latency" else 1.0)
         repeats = [throughput - 0.1, throughput, throughput + 0.1]
-        write_json(overhead / slot / "bench.json", {"repeat_metrics": [{"output_throughput_tps": value} for value in repeats]})
+        server_argv = [
+            str(binary.resolve()),
+            "serve",
+            model_snapshot,
+            "--backend",
+            "cuda",
+            "--profile-detail",
+            mode,
+            "--effective-config-json",
+            str((directory / "effective-config.json").resolve()),
+            "--decision-trace-jsonl",
+            str((directory / "decision-trace.jsonl").resolve()),
+        ]
+        if mode == "latency":
+            server_argv.extend(
+                [
+                    "--profile-sample-rate",
+                    "1.0",
+                    "--profile-jsonl",
+                    str((directory / "profile.jsonl").resolve()),
+                ]
+            )
+            write_jsonl(
+                directory / "profile.jsonl",
+                fixture_success_profile("serve", f"request.overhead.{slot}"),
+            )
+        write_text(directory / "command.txt", shlex.join(server_argv) + "\n")
+        write_json(
+            directory / "effective-config.json",
+            fixture_effective_config(False, profile_detail=mode),
+        )
+        write_jsonl(directory / "decision-trace.jsonl", [{"selected": "cuda", "source": "cli"}])
+        bench_argv = [
+            str(binary.resolve()),
+            "bench-serve",
+            "--target-backend",
+            "cuda",
+            "--concurrency",
+            "1",
+            "--n-repeats",
+            "3",
+            "--seed",
+            "9271",
+            "--enable-thinking",
+            "false",
+            "--fail-on-error",
+            "--require-ci",
+            "--out",
+            str((directory / "bench.json").resolve()),
+        ]
+        write_text(directory / "bench.command", shlex.join(bench_argv) + "\n")
+        write_text(directory / "exit_code", "0\n")
+        write_text(directory / "bench.exit_code", "0\n")
+        write_text(directory / "stdout.log", "server fixture\n")
+        write_text(directory / "stderr.log", "")
+        write_text(directory / "bench.stdout.log", "bench fixture\n")
+        write_text(directory / "bench.stderr.log", "")
+        write_json(directory / "health.after.json", {"status": "healthy"})
+        write_json(directory / "bench.json", fixture_bench_report(repeats))
         slots.append({"slot": slot, "mode": mode, "output_throughput_tps": statistics.fmean(repeats)})
     off_values = [row["output_throughput_tps"] for row in slots if row["mode"] == "off"]
     latency_values = [row["output_throughput_tps"] for row in slots if row["mode"] == "latency"]
@@ -862,20 +1523,70 @@ def create_fixture(root: Path, *, overhead_scale: float = 0.98) -> None:
         {"path": "tokenizer_config.json", "size_bytes": 200, "sha256": "8" * 64},
         {"path": "model-00001-of-00001.safetensors", "size_bytes": 1_000, "sha256": "9" * 64},
     ]
+    model = {
+        "id": "Qwen/Qwen3.5-4B",
+        "snapshot_path": model_snapshot,
+        "revision": "a" * 40,
+        "files": model_files,
+        "closure_sha256": canonical_sha256(model_files),
+    }
+    hardware = {
+        "gpu_count": 1,
+        "name": "NVIDIA GeForce RTX 4090",
+        "uuid": "GPU-fixture",
+        "memory_total_mib": 24564,
+        "driver_version": "fixture",
+    }
+    write_text(
+        root / "hardware.command",
+        shlex.join(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,uuid,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ]
+        )
+        + "\n",
+    )
+    write_text(root / "hardware.csv", "NVIDIA GeForce RTX 4090, GPU-fixture, 24564, fixture\n")
+    write_text(root / "hardware.stderr.log", "")
+    write_json(root / "model-closure.json", model)
     collection = {
         "schema_version": 1,
         "artifact_type": CHECKPOINT_ID,
-        "git_sha": "a" * 40,
-        "git_tree": "b" * 40,
+        "artifact_root": str(recorded_root),
+        "git_sha": git_sha,
+        "git_tree": git_tree,
         "dirty_status": {"is_dirty": False, "status_short": []},
-        "binary": {"path": "/workspace/target/release/ferrum", "sha256": "c" * 64},
-        "hardware": {"gpu_count": 1, "name": "NVIDIA GeForce RTX 4090", "uuid": "GPU-fixture", "memory_total_mib": 24564, "driver_version": "fixture"},
-        "model": {"id": "Qwen/Qwen3.5-4B", "snapshot_path": "/workspace/hf-cache/hub/models--Qwen--Qwen3.5-4B/snapshots/" + "a" * 40, "revision": "a" * 40, "files": model_files, "closure_sha256": canonical_sha256(model_files)},
+        "binary": {
+            "path": binary.relative_to(root).as_posix(),
+            "source_path": "/workspace/target/release/ferrum",
+            "sha256": file_sha256(binary),
+        },
+        "hardware": hardware,
+        "model": model,
         "inputs": {
+            "collector": {"path": collector_copy.relative_to(root).as_posix(), "sha256": file_sha256(collector_copy)},
             "collector_validator": {"path": validator_copy.relative_to(root).as_posix(), "sha256": file_sha256(validator_copy)},
             "profile_analyzer": {"path": analyzer_copy.relative_to(root).as_posix(), "sha256": file_sha256(analyzer_copy)},
         },
         "scenarios": list(SCENARIOS),
+        "environment": {
+            "removed_hidden_ferrum_env_names": [],
+            "cuda_visible_devices": "0",
+            "ld_library_path": "/usr/local/cuda/lib64",
+        },
+        "protocol": {
+            "profile_detail": "latency",
+            "profile_sample_rate": 1.0,
+            "diagnostic_fault": FAULT_VALUE,
+            "overhead_comparison": "ABBA-BAAB",
+            "overhead_target_fraction": 0.05,
+            "overhead_blocking": False,
+            "bench_concurrency": 1,
+            "bench_repeats": 3,
+            "bench_seed": 9271,
+        },
     }
     write_json(root / "collection.json", collection)
     write_fixture_tree(root)
@@ -889,8 +1600,32 @@ def mutate_jsonl(path: Path, predicate: Callable[[dict[str, Any]], bool], mutate
     write_jsonl(path, rows)
 
 
+def mutate_json(
+    path: Path, mutate: Callable[[dict[str, Any]], None]
+) -> None:
+    value = read_json(path)
+    mutate(value)
+    write_json(path, value)
+
+
+def remove_jsonl_event(
+    path: Path, predicate: Callable[[dict[str, Any]], bool]
+) -> None:
+    rows = read_jsonl(path)
+    kept = [row for row in rows if not predicate(row)]
+    require(len(kept) + 1 == len(rows), f"self-test removal target is not unique: {path}")
+    write_jsonl(path, kept)
+
+
+def remove_command_switch(path: Path, switch: str) -> None:
+    tokens = shlex.split(read_text(path).strip())
+    require(tokens.count(switch) == 1, f"self-test command switch is not unique: {switch}")
+    tokens.remove(switch)
+    write_text(path, shlex.join(tokens) + "\n")
+
+
 def self_test_process(source: Path, out: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([sys.executable, str(Path(__file__).resolve()), "--source", str(source), "--expected-git-sha", "a" * 40, "--out", str(out)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    return subprocess.run([sys.executable, str(Path(__file__).resolve()), "--source", str(source), "--expected-git-sha", git_output("rev-parse", "HEAD"), "--out", str(out)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
 
 def self_test() -> int:
@@ -900,6 +1635,11 @@ def self_test() -> int:
         ("forged-snapshot", lambda root: mutate_jsonl(root / "serve-failure/profile.jsonl", lambda row: row.get("phase") == "vnext.failure_observed", lambda row: row["attributes"]["plan_runtime_resource_snapshot"].update({"process_claimed_bytes": 901}))),
         ("duplicate-first-failure", lambda root: write_jsonl(root / "run-failure/profile.jsonl", read_jsonl(root / "run-failure/profile.jsonl") + [copy.deepcopy(next(row for row in read_jsonl(root / "run-failure/profile.jsonl") if row.get("phase") == "vnext.failure_observed"))])),
         ("stale-analyzer", lambda root: write_text(root / "inputs/analyze_ferrum_profile.py", "# stale\n")),
+        ("binary-tamper", lambda root: write_text(root / "binary/ferrum", read_text(root / "binary/ferrum") + "# tamper\n")),
+        ("hardware-mismatch", lambda root: mutate_json(root / "collection.json", lambda value: value["hardware"].update({"uuid": "GPU-forged"}))),
+        ("model-closure-mismatch", lambda root: mutate_json(root / "model-closure.json", lambda value: value.update({"revision": "f" * 40}))),
+        ("bench-without-require-ci", lambda root: remove_command_switch(root / "profile-overhead/latency1/bench.command", "--require-ci")),
+        ("missing-success-lifecycle", lambda root: remove_jsonl_event(root / "run-success/profile.jsonl", lambda row: row.get("phase") == "vnext.plan_built")),
     ]
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-s2-latency-") as temporary:
         temporary_root = Path(temporary)
