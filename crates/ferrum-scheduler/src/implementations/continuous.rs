@@ -576,6 +576,45 @@ impl<'a> WaitingAdmissionMode<'a> {
     }
 }
 
+#[derive(Debug, Default)]
+struct DecodeQueueState {
+    requests: IndexMap<RequestId, ContinuousBatchRequest>,
+    selection_cursor: Option<RequestId>,
+}
+
+impl DecodeQueueState {
+    fn remove(&mut self, request_id: &RequestId) -> Option<ContinuousBatchRequest> {
+        let removed_index = self.requests.get_index_of(request_id)?;
+        let old_len = self.requests.len();
+        let cursor_was_removed = self.selection_cursor.as_ref() == Some(request_id);
+        let successor = if cursor_was_removed && old_len > 1 {
+            Some(
+                self.requests
+                    .get_index((removed_index + 1) % old_len)
+                    .expect("decode successor remains in bounds before removal")
+                    .0
+                    .clone(),
+            )
+        } else {
+            None
+        };
+
+        let removed = self.requests.swap_remove(request_id);
+        if self.requests.is_empty() {
+            self.selection_cursor = None;
+        } else if cursor_was_removed {
+            self.selection_cursor = successor;
+        } else if self
+            .selection_cursor
+            .as_ref()
+            .is_some_and(|cursor_id| !self.requests.contains_key(cursor_id))
+        {
+            self.selection_cursor = self.requests.get_index(0).map(|(id, _)| id.clone());
+        }
+        removed
+    }
+}
+
 /// Read-only scheduler counters for explicit engine diagnostics.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ContinuousSchedulerTraceSnapshot {
@@ -583,6 +622,7 @@ pub struct ContinuousSchedulerTraceSnapshot {
     pub waiting_queue_len: usize,
     pub prefill_queue_len: usize,
     pub decode_queue_len: usize,
+    pub decode_selection_cursor: Option<RequestId>,
     pub preempted_queue_len: usize,
     pub active_len: usize,
     pub completed_total: u64,
@@ -647,10 +687,7 @@ pub struct ContinuousBatchScheduler {
     prefill_queue: RwLock<VecDeque<ContinuousBatchRequest>>,
 
     /// Decode queue (requests in decode phase)
-    decode_queue: RwLock<IndexMap<RequestId, ContinuousBatchRequest>>,
-
-    /// Stable round-robin origin for constrained decode batches.
-    decode_selection_cursor: AtomicUsize,
+    decode_queue: RwLock<DecodeQueueState>,
 
     /// Preempted requests (can be resumed)
     preempted_requests: RwLock<HashMap<RequestId, ContinuousBatchRequest>>,
@@ -805,8 +842,7 @@ impl ContinuousBatchScheduler {
                 DynamicAdmissionQueuePolicy::default(),
             )),
             prefill_queue: RwLock::new(VecDeque::new()),
-            decode_queue: RwLock::new(IndexMap::new()),
-            decode_selection_cursor: AtomicUsize::new(0),
+            decode_queue: RwLock::new(DecodeQueueState::default()),
             preempted_requests: RwLock::new(HashMap::new()),
             admission_failed_requests: RwLock::new(HashMap::new()),
             admission_failures: Mutex::new(VecDeque::new()),
@@ -848,7 +884,7 @@ impl ContinuousBatchScheduler {
 
     /// Get number of active requests (prefilling + decoding)
     pub fn active_count(&self) -> usize {
-        self.prefill_queue.read().len() + self.decode_queue.read().len()
+        self.prefill_queue.read().len() + self.decode_queue.read().requests.len()
     }
 
     /// Get number of waiting requests
@@ -881,7 +917,7 @@ impl ContinuousBatchScheduler {
         }
         {
             let decode = self.decode_queue.read();
-            for request in decode.values() {
+            for request in decode.requests.values() {
                 if request
                     .execution_readiness_block
                     .as_ref()
@@ -965,24 +1001,27 @@ impl ContinuousBatchScheduler {
     pub fn all_active_execution_readiness_blocked(&self) -> bool {
         let prefill = self.prefill_queue.read();
         let decode = self.decode_queue.read();
-        let active = prefill.len() + decode.len();
+        let active = prefill.len() + decode.requests.len();
         active != 0
-            && prefill.iter().chain(decode.values()).all(|request| {
-                request
-                    .execution_readiness_block
-                    .as_ref()
-                    .is_some_and(|block| {
-                        matches!(
-                            block.status(),
-                            EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
-                        )
-                    })
-            })
+            && prefill
+                .iter()
+                .chain(decode.requests.values())
+                .all(|request| {
+                    request
+                        .execution_readiness_block
+                        .as_ref()
+                        .is_some_and(|block| {
+                            matches!(
+                                block.status(),
+                                EXECUTION_READINESS_PENDING | EXECUTION_READINESS_FAILED
+                            )
+                        })
+                })
     }
 
     /// Get number of decoding requests
     pub fn decoding_count(&self) -> usize {
-        self.decode_queue.read().len()
+        self.decode_queue.read().requests.len()
     }
 
     /// Get number of prefilling requests
@@ -994,7 +1033,13 @@ impl ContinuousBatchScheduler {
     pub fn trace_snapshot(&self) -> ContinuousSchedulerTraceSnapshot {
         let waiting_queue_len = self.waiting_queue.read().len();
         let prefill_queue_len = self.prefill_queue.read().len();
-        let decode_queue_len = self.decode_queue.read().len();
+        let (decode_queue_len, decode_selection_cursor) = {
+            let decode_queue = self.decode_queue.read();
+            (
+                decode_queue.requests.len(),
+                decode_queue.selection_cursor.clone(),
+            )
+        };
         let preempted_queue_len = self.preempted_requests.read().len();
         let pressure = self.pressure_coordinator.lock().stats();
 
@@ -1003,6 +1048,7 @@ impl ContinuousBatchScheduler {
             waiting_queue_len,
             prefill_queue_len,
             decode_queue_len,
+            decode_selection_cursor,
             preempted_queue_len,
             active_len: prefill_queue_len + decode_queue_len,
             completed_total: self.completed_counter.load(Ordering::Relaxed),
@@ -1023,6 +1069,7 @@ impl ContinuousBatchScheduler {
             execution_capacity_blocked_decode_len: self
                 .decode_queue
                 .read()
+                .requests
                 .values()
                 .filter(|request| request.execution_capacity_deferral.is_some())
                 .count(),
@@ -1038,6 +1085,7 @@ impl ContinuousBatchScheduler {
             execution_readiness_blocked_decode_len: self
                 .decode_queue
                 .read()
+                .requests
                 .values()
                 .filter(|request| request.execution_readiness_block.is_some())
                 .count(),
@@ -1781,10 +1829,13 @@ impl ContinuousBatchScheduler {
 
         let mut prefill = self.prefill_queue.write();
         let mut decode = self.decode_queue.write();
-        let existing = prefill.iter().chain(decode.values()).find(|request| {
-            requested.contains(&request.inner.request.id)
-                && request.execution_readiness_block.is_some()
-        });
+        let existing = prefill
+            .iter()
+            .chain(decode.requests.values())
+            .find(|request| {
+                requested.contains(&request.inner.request.id)
+                    && request.execution_readiness_block.is_some()
+            });
         if let Some(request) = existing {
             return Err(FerrumError::scheduler(format!(
                 "request {} already owns an execution readiness ticket",
@@ -1792,7 +1843,7 @@ impl ContinuousBatchScheduler {
             )));
         }
         let mut installed = 0usize;
-        for request in prefill.iter_mut().chain(decode.values_mut()) {
+        for request in prefill.iter_mut().chain(decode.requests.values_mut()) {
             if requested.contains(&request.inner.request.id) {
                 request.execution_readiness_block = Some(block.clone());
                 installed += 1;
@@ -1817,7 +1868,7 @@ impl ContinuousBatchScheduler {
 
     fn rollback_execution_readiness_install(
         prefill: &mut VecDeque<ContinuousBatchRequest>,
-        decode: &mut IndexMap<RequestId, ContinuousBatchRequest>,
+        decode: &mut DecodeQueueState,
         block: &ExecutionReadinessBlock,
     ) {
         for request in prefill.iter_mut() {
@@ -1829,7 +1880,7 @@ impl ContinuousBatchScheduler {
                 request.execution_readiness_block = None;
             }
         }
-        for request in decode.values_mut() {
+        for request in decode.requests.values_mut() {
             if request
                 .execution_readiness_block
                 .as_ref()
@@ -1901,7 +1952,7 @@ impl ContinuousBatchScheduler {
                 .iter()
                 .filter(|request| request.inner.request.id == *request_id)
                 .count();
-            let decode_request = decode.get(request_id);
+            let decode_request = decode.requests.get(request_id);
             let request = match request_index.get(request_id) {
                 Some(RequestPhase::Prefilling)
                     if prefill_matches == 1 && decode_request.is_none() =>
@@ -1944,7 +1995,7 @@ impl ContinuousBatchScheduler {
                 deferred_count += 1;
             }
         }
-        for request in decode.values_mut() {
+        for request in decode.requests.values_mut() {
             if requested.contains(&request.inner.request.id) {
                 request.execution_maintenance_retry = Some(ticket);
                 request.last_execution_maintenance_capacity_epoch = Some(latest_capacity_epoch);
@@ -2060,7 +2111,7 @@ impl ContinuousBatchScheduler {
         }
         {
             let decode = self.decode_queue.read();
-            candidates.extend(decode.values().map(|request| {
+            candidates.extend(decode.requests.values().map(|request| {
                 PressureCandidate {
                     request_id: request.inner.request.id.clone(),
                     work_kind: request.logical_work_frontier.work_kind(),
@@ -2116,7 +2167,7 @@ impl ContinuousBatchScheduler {
         }
         {
             let mut decode = self.decode_queue.write();
-            for request in decode.values_mut() {
+            for request in decode.requests.values_mut() {
                 let request_id = &request.inner.request.id;
                 if requested.contains(request_id) && yielding != Some(request_id) {
                     request.execution_capacity_deferral = Some(deferral.clone());
@@ -2295,7 +2346,7 @@ impl ContinuousBatchScheduler {
                 .capacity_release_epoch
                 .load(Ordering::Relaxed)
                 .saturating_add(1);
-            if !self.decode_queue.read().is_empty() {
+            if !self.decode_queue.read().requests.is_empty() {
                 req.capacity_deferred_mixed_attempt_epoch =
                     Some(self.capacity_mixed_recompute_epoch.load(Ordering::Relaxed));
             }
@@ -2452,6 +2503,7 @@ impl ContinuousBatchScheduler {
         if let Some(condition) = self
             .decode_queue
             .read()
+            .requests
             .get(request_id)
             .and_then(|request| request.execution_capacity_deferral.as_ref())
             .map(|deferral| deferral.wait_condition().clone())
@@ -2490,7 +2542,7 @@ impl ContinuousBatchScheduler {
                 request.execution_capacity_deferral = None;
             }
         }
-        for request in self.decode_queue.write().values_mut() {
+        for request in self.decode_queue.write().requests.values_mut() {
             if participants.contains(&request.inner.request.id) {
                 request.execution_capacity_deferral = None;
             }
@@ -2517,7 +2569,10 @@ impl ContinuousBatchScheduler {
                 .position(|request| request.inner.request.id == *request_id)
                 .and_then(|position| prefill.remove(position))
         }
-        .or_else(|| self.decode_queue.write().swap_remove(request_id));
+        .or_else(|| {
+            let mut decode = self.decode_queue.write();
+            decode.remove(request_id)
+        });
 
         let mut requeued = false;
         if let Some(mut request) = request {
@@ -2566,7 +2621,7 @@ impl ContinuousBatchScheduler {
         let mut waiting_queue = self.waiting_queue.write();
         let mut request_index = self.request_index.write();
 
-        if let Some(mut req) = decode_queue.swap_remove(request_id) {
+        if let Some(mut req) = decode_queue.remove(request_id) {
             req.phase = RequestPhase::Waiting;
             req.inner.state = RequestState::Waiting;
             req.inner.started_at = None;
@@ -2621,7 +2676,7 @@ impl ContinuousBatchScheduler {
             req.logical_work_frontier.begin_decode();
 
             request_index.insert(request_id.clone(), RequestPhase::Decoding);
-            decode_queue.insert(request_id.clone(), req);
+            decode_queue.requests.insert(request_id.clone(), req);
 
             debug!("Promoted request {} to decode queue", request_id);
             true
@@ -3179,13 +3234,23 @@ impl ContinuousBatchScheduler {
                 .unwrap_or(hint.max_batch_size)
         };
         let mut decode_queue = self.decode_queue.write();
-        let decode_len = decode_queue.len();
-        let start = if decode_len == 0 {
-            0
-        } else {
-            self.decode_selection_cursor.load(Ordering::Relaxed) % decode_len
-        };
-        let mut next_cursor = start;
+        let decode_len = decode_queue.requests.len();
+        if decode_len == 0 {
+            decode_queue.selection_cursor = None;
+        } else if decode_queue
+            .selection_cursor
+            .as_ref()
+            .is_none_or(|cursor_id| !decode_queue.requests.contains_key(cursor_id))
+        {
+            decode_queue.selection_cursor =
+                decode_queue.requests.get_index(0).map(|(id, _)| id.clone());
+        }
+        let start = decode_queue
+            .selection_cursor
+            .as_ref()
+            .and_then(|cursor_id| decode_queue.requests.get_index_of(cursor_id))
+            .unwrap_or(0);
+        let mut next_cursor_index = start;
         let mut scheduled_count = 0usize;
         for offset in 0..decode_len {
             if batch_requests.len() >= decode_batch_limit || *total_tokens >= hint.max_tokens {
@@ -3193,6 +3258,7 @@ impl ContinuousBatchScheduler {
             }
             let index = (start + offset) % decode_len;
             let (_, req) = decode_queue
+                .requests
                 .get_index_mut(index)
                 .expect("decode round-robin index remains in bounds");
             if scheduled_request_ids.contains(&req.inner.request.id) {
@@ -3220,11 +3286,13 @@ impl ContinuousBatchScheduler {
             batch_requests.push(scheduled);
             *total_tokens += 1;
             scheduled_count += 1;
-            next_cursor = (index + 1) % decode_len;
+            next_cursor_index = (index + 1) % decode_len;
         }
         if scheduled_count > 0 {
-            self.decode_selection_cursor
-                .store(next_cursor, Ordering::Relaxed);
+            decode_queue.selection_cursor = decode_queue
+                .requests
+                .get_index(next_cursor_index)
+                .map(|(id, _)| id.clone());
         }
         Ok(())
     }
@@ -3455,7 +3523,7 @@ impl ContinuousBatchScheduler {
             static SOME_PROF_N: AtomicU64 = AtomicU64::new(0);
             let n = SOME_PROF_N.fetch_add(1, Ordering::Relaxed);
             if n.is_multiple_of(64) {
-                let d_len = self.decode_queue.read().len();
+                let d_len = self.decode_queue.read().requests.len();
                 let p_len = self.prefill_queue.read().len();
                 let w_len = self.waiting_queue.read().len();
                 eprintln!(
@@ -3475,7 +3543,7 @@ impl ContinuousBatchScheduler {
                 static NONE_PROF_N: AtomicU64 = AtomicU64::new(0);
                 let n = NONE_PROF_N.fetch_add(1, Ordering::Relaxed);
                 if n.is_multiple_of(512) {
-                    let d_len = self.decode_queue.read().len();
+                    let d_len = self.decode_queue.read().requests.len();
                     let p_len = self.prefill_queue.read().len();
                     let w_len = self.waiting_queue.read().len();
                     let d_count = self.decoding_count();
@@ -3659,7 +3727,7 @@ impl ContinuousBatchScheduler {
     pub fn update_decode_progress(&self, request_id: &RequestId, tokens_generated: usize) {
         let mut decode_queue = self.decode_queue.write();
         let mut progress = None;
-        if let Some(req) = decode_queue.get_mut(request_id) {
+        if let Some(req) = decode_queue.requests.get_mut(request_id) {
             req.decode_tokens = tokens_generated;
             req.logical_work_frontier.commit_decode(tokens_generated);
             progress = Some(req.logical_work_frontier.progress_generation());
@@ -3783,7 +3851,7 @@ impl Scheduler for ContinuousBatchScheduler {
 
         // Remove from decode queue
         let mut decode_queue = self.decode_queue.write();
-        if let Some(req) = decode_queue.swap_remove(&request_id) {
+        if let Some(req) = decode_queue.remove(&request_id) {
             // Record metrics
             self.metrics_tracker.record_completion(&req);
 
@@ -3895,7 +3963,7 @@ impl Scheduler for ContinuousBatchScheduler {
         // Check and remove from decode queue
         {
             let mut decode_queue = self.decode_queue.write();
-            if decode_queue.swap_remove(&request_id).is_some() {
+            if decode_queue.remove(&request_id).is_some() {
                 self.request_index.write().remove(&request_id);
                 self.record_pressure_frontier_terminal(&request_id);
                 self.cancelled_counter.fetch_add(1, Ordering::Relaxed);
@@ -3953,7 +4021,7 @@ impl Scheduler for ContinuousBatchScheduler {
         // Update in decode queue
         {
             let mut decode_queue = self.decode_queue.write();
-            if let Some(req) = decode_queue.get_mut(&request_id) {
+            if let Some(req) = decode_queue.requests.get_mut(&request_id) {
                 req.inner.request.priority = priority;
                 return Ok(());
             }
@@ -4031,7 +4099,7 @@ impl Scheduler for ContinuousBatchScheduler {
 
         // Remove from decode queue
         let mut decode_queue = self.decode_queue.write();
-        if let Some(mut req) = decode_queue.swap_remove(&request_id) {
+        if let Some(mut req) = decode_queue.remove(&request_id) {
             req.phase = RequestPhase::Preempted;
 
             // Save preemption state
@@ -4073,7 +4141,10 @@ impl Scheduler for ContinuousBatchScheduler {
         if let Some(mut req) = preempted.remove(&request_id) {
             req.phase = RequestPhase::Decoding;
 
-            self.decode_queue.write().insert(request_id.clone(), req);
+            self.decode_queue
+                .write()
+                .requests
+                .insert(request_id.clone(), req);
             self.request_index
                 .write()
                 .insert(request_id, RequestPhase::Decoding);
@@ -5057,6 +5128,16 @@ mod tests {
     async fn constrained_decode_membership_is_stable_and_fair_one_hundred_of_one_hundred() {
         const EXECUTION_COUNT: usize = 100;
         let expected = collect_constrained_decode_membership().await;
+        let mut selection_counts = HashMap::<RequestId, usize>::new();
+        for request_id in expected.iter().flatten() {
+            *selection_counts.entry(request_id.clone()).or_default() += 1;
+        }
+        let min_count = selection_counts.values().copied().min().unwrap();
+        let max_count = selection_counts.values().copied().max().unwrap();
+        assert!(
+            max_count - min_count <= 1,
+            "constrained round-robin selection must remain balanced"
+        );
         for ordinal in 1..EXECUTION_COUNT {
             assert_eq!(
                 collect_constrained_decode_membership().await,
@@ -5067,6 +5148,99 @@ mod tests {
         println!(
             "FERRUM G04 CONSTRAINED DECODE DETERMINISM KEEP: deterministic_executions={EXECUTION_COUNT}/{EXECUTION_COUNT} requests=8 batch_limit=3 rounds=4"
         );
+    }
+
+    #[tokio::test]
+    async fn decode_cursor_keeps_stable_successor_after_swap_remove() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            ..SchedulerConfig::default()
+        });
+        let request_ids = activate_decode_requests(&scheduler, 4);
+        let first = scheduler
+            .create_iteration_batch(BatchHint::simple(3))
+            .expect("first constrained decode batch must be scheduled");
+        assert_eq!(
+            first
+                .requests
+                .iter()
+                .map(|request| request.request.id.clone())
+                .collect::<Vec<_>>(),
+            request_ids[..3]
+        );
+        assert_eq!(
+            scheduler.trace_snapshot().decode_selection_cursor,
+            Some(request_ids[3].clone())
+        );
+
+        assert!(scheduler.cancel(request_ids[1].clone()).await.unwrap());
+        assert_eq!(
+            scheduler.trace_snapshot().decode_selection_cursor,
+            Some(request_ids[3].clone()),
+            "removing an earlier slot must not move the stable round-robin frontier"
+        );
+        let next = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .expect("cursor successor must remain runnable");
+        assert_eq!(next.requests[0].request.id, request_ids[3]);
+    }
+
+    #[tokio::test]
+    async fn empty_decode_queue_resets_cursor_before_new_cohort() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            ..SchedulerConfig::default()
+        });
+        let old_ids = activate_decode_requests(&scheduler, 4);
+        let first = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .expect("old cohort must establish a nonzero cursor");
+        assert_eq!(first.requests[0].request.id, old_ids[0]);
+        assert_eq!(
+            scheduler.trace_snapshot().decode_selection_cursor,
+            Some(old_ids[1].clone())
+        );
+        for request_id in old_ids {
+            assert!(scheduler.cancel(request_id).await.unwrap());
+        }
+        assert_eq!(scheduler.trace_snapshot().decode_selection_cursor, None);
+
+        let new_ids = activate_decode_requests(&scheduler, 3);
+        let new_first = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .expect("new cohort must start from its first admission");
+        assert_eq!(new_first.requests[0].request.id, new_ids[0]);
+    }
+
+    #[test]
+    fn readiness_blocked_decode_rejoins_within_one_round_robin_rotation() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 4,
+            ..SchedulerConfig::default()
+        });
+        let request_ids = activate_decode_requests(&scheduler, 4);
+        let first = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .expect("first decode frontier must run");
+        assert_eq!(first.requests[0].request.id, request_ids[0]);
+        scheduler.update_decode_progress(&request_ids[0], 1);
+
+        let blocked = scheduler
+            .defer_for_execution_readiness(std::slice::from_ref(&request_ids[1]))
+            .unwrap();
+        for expected_id in [&request_ids[2], &request_ids[3], &request_ids[0]] {
+            let batch = scheduler
+                .create_iteration_batch(BatchHint::simple(1))
+                .expect("an eligible peer must keep decode progressing");
+            assert_eq!(&batch.requests[0].request.id, expected_id);
+            scheduler.update_decode_progress(expected_id, 2);
+        }
+
+        assert!(blocked.wake().mark_ready());
+        let resumed = scheduler
+            .create_iteration_batch(BatchHint::simple(1))
+            .expect("ready frontier must rejoin at its preserved cursor");
+        assert_eq!(resumed.requests[0].request.id, request_ids[1]);
     }
 
     #[tokio::test]
