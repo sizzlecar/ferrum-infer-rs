@@ -461,6 +461,96 @@ async fn collect_run_stream(
     })
 }
 
+async fn collect_run_text_stream(
+    mut stream: RunResponseStream,
+    trace_tokens: bool,
+    turn: usize,
+    expected_request_id: &RequestId,
+    stdin_is_tty: bool,
+    capture_token_ids: bool,
+) -> Result<CollectedRunGeneration> {
+    let mut first_token_indicator = start_first_token_indicator(stdin_is_tty);
+    let mut request_id = None;
+    let mut raw_text = String::new();
+    let mut finish_reason = None;
+    let mut latest_usage = None;
+    let mut token_count = 0usize;
+    let mut token_ids = Vec::new();
+    let mut chunk_count = 0usize;
+    let mut execution_evidence = None;
+    while let Some(chunk) = stream.next().await {
+        let mut chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                clear_first_token_indicator(&mut first_token_indicator);
+                return Err(error);
+            }
+        };
+        if &chunk.request_id != expected_request_id {
+            clear_first_token_indicator(&mut first_token_indicator);
+            return Err(FerrumError::internal(format!(
+                "run stream request id drift: expected {expected_request_id}, got {}",
+                chunk.request_id
+            )));
+        }
+        request_id.get_or_insert_with(|| chunk.request_id.clone());
+        let token_id = chunk.token.map(|token| token.get());
+        if first_token_indicator.is_some()
+            && (!chunk.text.is_empty() || token_id.is_some() || chunk.finish_reason.is_some())
+        {
+            clear_first_token_indicator(&mut first_token_indicator);
+        }
+        if trace_tokens {
+            if let Some(token_id) = token_id {
+                eprintln!(
+                    "[run-token-trace] turn={turn} token={} text={:?}",
+                    token_id, chunk.text
+                );
+            }
+        }
+        if !chunk.text.is_empty() {
+            raw_text.push_str(&chunk.text);
+            print!("{}", chunk.text);
+            io::stdout().flush().ok();
+            chunk_count += 1;
+        }
+        if let Some(token_id) = token_id {
+            if capture_token_ids {
+                token_ids.push(token_id);
+            }
+            token_count += 1;
+        }
+        if let Some(usage) = chunk.usage.as_ref() {
+            token_count = usage.completion_tokens;
+            latest_usage = Some(usage.clone());
+        }
+        if chunk.finish_reason.is_some() {
+            finish_reason = chunk.finish_reason;
+        }
+        if let Some(evidence) = chunk.execution_evidence.take() {
+            if execution_evidence.replace(evidence).is_some() {
+                clear_first_token_indicator(&mut first_token_indicator);
+                return Err(FerrumError::internal(
+                    "run stream emitted engine execution evidence more than once",
+                ));
+            }
+        }
+    }
+    clear_first_token_indicator(&mut first_token_indicator);
+    Ok(CollectedRunGeneration {
+        request_id: request_id
+            .unwrap_or_else(|| expected_request_id.clone())
+            .to_string(),
+        raw_text,
+        finish_reason,
+        usage: latest_usage,
+        token_count,
+        token_ids,
+        chunk_count,
+        execution_evidence,
+    })
+}
+
 #[derive(Args)]
 pub struct RunCommand {
     /// Model name (alias like `qwen3:8b`, HF repo id, or path to a `.gguf` file).
@@ -1335,8 +1425,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 )?;
                 maybe_warn_context_shift(&plan, format);
                 let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
+                let observability_sampling_params =
+                    product_memory_enabled.then(|| plan.sampling_params.clone());
+                let prompt_token_ids = plan.prompt_token_ids;
+                let prompt_token_count = plan.prompt_tokens;
+                let prompt_chars = plan.prompt.chars().count();
                 let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
                 let request_id = RequestId(Uuid::new_v4());
+                let expected_request_id = request_id.clone();
                 let request_id_text = request_id.to_string();
                 if format == OutputFormat::Jsonl {
                     emit_jsonl_user(
@@ -1369,115 +1465,135 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     metadata,
                 };
 
+                let memory_before = product_memory_enabled
+                    .then(|| memory_sampler.sample())
+                    .flatten();
+                let memory_stages = if product_memory_enabled && history_epoch == 0 && turn == 0 {
+                    let mut stages = actual_run_memory_stages(
+                        product_memory_enabled,
+                        process_start_memory.clone(),
+                        backend_initialized_memory.clone(),
+                        model_loaded_memory.clone(),
+                        model_loaded_duration_us,
+                        profile_run_done_memory.clone(),
+                        cache_allocated_memory.clone(),
+                        cache_allocated_status.clone(),
+                        None,
+                    );
+                    stages.retain(|stage| stage.stage != "shutdown");
+                    stages
+                } else {
+                    Vec::new()
+                };
                 let start = std::time::Instant::now();
                 let trace_tokens = crate::runtime_env::runtime_snapshot_value(
                     &runtime_config,
                     "FERRUM_RUN_TRACE_TOKENS",
                 )
                 .is_some();
-                let (
-                    raw_response,
-                    clean_response,
-                    reasoning,
+                let generation_result = match format {
+                    OutputFormat::Text => match engine.infer_stream(request).await {
+                        Ok(stream) => {
+                            collect_run_text_stream(
+                                stream,
+                                trace_tokens,
+                                turn,
+                                &expected_request_id,
+                                stdin_is_tty,
+                                product_memory_enabled,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    },
+                    OutputFormat::Jsonl => match engine.infer_stream(request).await {
+                        Ok(stream) => {
+                            collect_run_stream(
+                                stream,
+                                trace_tokens,
+                                turn,
+                                &run_session_id,
+                                history_epoch,
+                                &request_id_text,
+                            )
+                            .await
+                        }
+                        Err(error) => Err(error),
+                    },
+                };
+                let generation = match generation_result {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        let memory_after = product_memory_enabled
+                            .then(|| memory_sampler.sample())
+                            .flatten();
+                        let memory =
+                            process_memory_observation_between(memory_before, memory_after);
+                        let elapsed = start.elapsed().as_secs_f64();
+                        if product_memory_enabled {
+                            if let Err(observability_error) =
+                                crate::observability_product::write_actual_run_failure_observability(
+                                    &product_observability,
+                                    &crate::observability_product::ActualRunFailureObservation {
+                                        request_id: request_id_text,
+                                        duration_us: (elapsed * 1_000_000.0).max(0.0) as u64,
+                                        sampling_params: observability_sampling_params.expect(
+                                            "enabled run observability must capture sampling parameters",
+                                        ),
+                                        prompt_token_ids,
+                                        prompt_token_count,
+                                        prompt_chars,
+                                        failure_kind: error
+                                            .observability_failure_kind()
+                                            .to_string(),
+                                        error_kind: error.observability_error_kind().to_string(),
+                                        error_message: error.to_string(),
+                                        memory,
+                                        memory_stages,
+                                    },
+                                )
+                            {
+                                eprintln!(
+                                    "failed to write interactive run failure observability: {observability_error}"
+                                );
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
+                let memory_after = product_memory_enabled
+                    .then(|| memory_sampler.sample())
+                    .flatten();
+                let memory = process_memory_observation_between(memory_before, memory_after);
+                let CollectedRunGeneration {
+                    request_id: response_request_id,
+                    raw_text,
                     finish_reason,
                     usage,
                     token_count,
+                    token_ids: output_token_ids,
                     chunk_count,
-                ) = match format {
-                    OutputFormat::Text => {
-                        let mut first_token_indicator = start_first_token_indicator(stdin_is_tty);
-                        let mut stream = match engine.infer_stream(request).await {
-                            Ok(stream) => stream,
-                            Err(e) => {
-                                clear_first_token_indicator(&mut first_token_indicator);
-                                return Err(e);
-                            }
-                        };
-                        let mut raw_response_text = String::new();
-                        let mut finish_reason = None;
-                        let mut latest_usage = None;
-                        let mut token_count = 0usize;
-                        let mut chunk_count = 0usize;
-                        while let Some(chunk) = stream.next().await {
-                            let chunk = match chunk {
-                                Ok(chunk) => chunk,
-                                Err(e) => {
-                                    clear_first_token_indicator(&mut first_token_indicator);
-                                    return Err(e);
-                                }
-                            };
-                            if first_token_indicator.is_some()
-                                && (!chunk.text.is_empty()
-                                    || chunk.token.is_some()
-                                    || chunk.finish_reason.is_some())
-                            {
-                                clear_first_token_indicator(&mut first_token_indicator);
-                            }
-                            if trace_tokens {
-                                if let Some(token) = chunk.token {
-                                    eprintln!(
-                                        "[run-token-trace] turn={turn} token={} text={:?}",
-                                        token.get(),
-                                        chunk.text
-                                    );
-                                }
-                            }
-                            if !chunk.text.is_empty() {
-                                raw_response_text.push_str(&chunk.text);
-                                print!("{}", chunk.text);
-                                io::stdout().flush().ok();
-                                chunk_count += 1;
-                            }
-                            if chunk.token.is_some() {
-                                token_count += 1;
-                            }
-                            if let Some(usage) = chunk.usage.as_ref() {
-                                token_count = usage.completion_tokens;
-                                latest_usage = Some(usage.clone());
-                            }
-                            if chunk.finish_reason.is_some() {
-                                finish_reason = chunk.finish_reason;
-                            }
-                        }
-                        clear_first_token_indicator(&mut first_token_indicator);
-                        let raw_response = display_response_text(&raw_response_text);
-                        (
-                            raw_response.clone(),
-                            raw_response,
-                            None,
-                            finish_reason,
-                            latest_usage,
-                            token_count,
-                            chunk_count,
-                        )
-                    }
+                    execution_evidence,
+                } = generation;
+                if response_request_id != request_id_text {
+                    return Err(FerrumError::internal(format!(
+                        "run response request id drift: expected {request_id_text}, got {response_request_id}"
+                    )));
+                }
+                let raw_response = display_response_text(&raw_text);
+                let (clean_response, reasoning) = match format {
+                    OutputFormat::Text => (raw_response.clone(), None),
                     OutputFormat::Jsonl => {
-                        let stream = engine.infer_stream(request).await?;
-                        let generation = collect_run_stream(
-                            stream,
-                            trace_tokens,
-                            turn,
-                            &run_session_id,
-                            history_epoch,
-                            &request_id_text,
-                        )
-                        .await?;
-                        let raw_response = display_response_text(&generation.raw_text);
                         let parsed = parse_reasoning_response_for_prompt(
                             &raw_response,
                             prompt_opened_thinking,
                         );
                         (
-                            raw_response,
                             display_response_text(&parsed.content),
                             parsed
                                 .reasoning
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty()),
-                            generation.finish_reason,
-                            generation.usage,
-                            generation.token_count,
-                            generation.chunk_count,
                         )
                     }
                 };
@@ -1517,6 +1633,31 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             elapsed_s * 1000.0,
                         );
                     }
+                }
+
+                if product_memory_enabled {
+                    crate::observability_product::write_actual_run_observability(
+                        &product_observability,
+                        &crate::observability_product::ActualRunObservation {
+                            request_id: request_id_text.clone(),
+                            duration_us: (elapsed_s * 1_000_000.0).max(0.0) as u64,
+                            sampling_params: observability_sampling_params.expect(
+                                "enabled run observability must capture sampling parameters",
+                            ),
+                            prompt_token_ids,
+                            prompt_token_count,
+                            output_tokens: token_count,
+                            output_token_ids,
+                            chunk_count,
+                            finish_reason: finish_reason.map(finish_reason_str).map(str::to_string),
+                            prompt_chars,
+                            response_chars: raw_response.chars().count(),
+                            response_text: raw_response.clone(),
+                            execution_evidence,
+                            memory,
+                            memory_stages,
+                        },
+                    )?;
                 }
 
                 // In non-interactive mode, don't wait for terminal formatting/spacing.
