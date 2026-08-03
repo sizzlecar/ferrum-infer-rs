@@ -5,7 +5,7 @@ pub(in crate::continuous_engine) enum PlanRuntimeDecodeBatchOutcome {
     Completed,
     Deferred {
         request_ids: Vec<RequestId>,
-        deferral: ExecutorExecutionCapacityDeferral,
+        deferral: ExecutorExecutionDeferral,
     },
 }
 
@@ -179,7 +179,27 @@ impl EngineInner {
                 PlanRuntimeDecodeBatchOutcome::Completed => {}
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,
-                    deferral,
+                    deferral: ExecutorExecutionDeferral::RequestState(deferral),
+                } => {
+                    let affected_request_ids = deferral.request_ids();
+                    if affected_request_ids
+                        .iter()
+                        .any(|request_id| !request_ids.contains(request_id))
+                    {
+                        return Err(FerrumError::internal(
+                            "Request-state deferral names a frontier outside its decode cohort",
+                        ));
+                    }
+                    let unaffected_request_ids =
+                        unaffected_maintenance_retry_frontiers(&request_ids, affected_request_ids);
+                    self.defer_for_request_state_readiness(deferral).await?;
+                    if !unaffected_request_ids.is_empty() {
+                        stack.push(unaffected_request_ids);
+                    }
+                }
+                PlanRuntimeDecodeBatchOutcome::Deferred {
+                    request_ids,
+                    deferral: ExecutorExecutionDeferral::Capacity(deferral),
                 } if deferral.maintenance_retry().is_some() => {
                     let retry = deferral
                         .validated_maintenance_retry_scope(&request_ids)?
@@ -223,7 +243,7 @@ impl EngineInner {
                 }
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,
-                    deferral,
+                    deferral: ExecutorExecutionDeferral::Capacity(deferral),
                 } if request_ids.len() > 1 => {
                     self.trace_executor_decode_capacity_decision(
                         &request_ids,
@@ -239,7 +259,7 @@ impl EngineInner {
                 }
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,
-                    deferral,
+                    deferral: ExecutorExecutionDeferral::Capacity(deferral),
                 } => {
                     let observed = deferral.observed();
                     let scheduler_deferral = AdmissionDeferral::new(

@@ -1365,6 +1365,67 @@ impl EngineInner {
         Ok(())
     }
 
+    async fn defer_for_request_state_readiness(
+        &self,
+        deferral: ExecutorRequestStateDeferral,
+    ) -> Result<()> {
+        let slot = self.execution_readiness_waiters.reserve().await?;
+        let registration = deferral.register_waiter()?;
+        let receipt = self
+            .scheduler
+            .defer_for_execution_readiness(deferral.request_ids())?;
+        if receipt.deferred_count() != deferral.request_ids().len() {
+            receipt.wake().cancel();
+            return Err(FerrumError::scheduler(format!(
+                "Request-state readiness retained {} of {} frontiers",
+                receipt.deferred_count(),
+                deferral.request_ids().len()
+            )));
+        }
+        let ticket_id = receipt.wake().ticket_id().get();
+        self.execution_readiness_waiters.track(
+            receipt.into_wake(),
+            async move {
+                registration
+                    .wait_for_change()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            },
+            deferral.request_ids().to_vec(),
+            Arc::clone(&self.work_notify),
+            slot,
+        )?;
+        self.write_scheduler_trace_event(serde_json::json!({
+            "event": "scheduler_execution_request_state_defer",
+            "ticket_id": ticket_id,
+            "request_ids": deferral.request_ids(),
+            "stage": deferral.stage(),
+            "observed_change_epoch": deferral.hazard().observed_change_epoch(),
+            "blockers": deferral.hazard().blockers(),
+            "pending_waiters": self.execution_readiness_waiters.pending_count(),
+            "scheduler": self.scheduler.trace_snapshot(),
+        }));
+        Ok(())
+    }
+
+    async fn complete_execution_readiness_failures(&self) -> Result<()> {
+        self.execution_readiness_waiters.reap_finished();
+        for failure in self.execution_readiness_waiters.take_failures() {
+            for request_id in failure.request_ids {
+                self.complete_request_with_error(
+                    &request_id,
+                    FerrumError::backend(format!(
+                        "Request-state readiness ticket {} failed: {}",
+                        failure.ticket_id, failure.message
+                    )),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     // ── tensor helper ──────────────────────────────────────────────────
 
     pub(super) fn tokens_to_tensor(&self, token_ids: &[u32]) -> Result<TensorRef> {
@@ -1563,6 +1624,7 @@ impl EngineInner {
         let iteration_guard = self.iteration_lock.lock().await;
         self.record_iteration_lock_wait(lock_wait_start.elapsed());
         self.cancel_abandoned_requests().await?;
+        self.complete_execution_readiness_failures().await?;
 
         let iteration = self.iteration_count.fetch_add(1, Ordering::Relaxed);
         counter!("ferrum.engine.iterations_total").increment(1);
@@ -1761,6 +1823,9 @@ impl EngineInner {
                                 )
                             })?;
                         return Ok(EngineIterationOutcome::CapacityBlocked(registration));
+                    }
+                    if self.scheduler.all_active_execution_readiness_blocked() {
+                        return Ok(EngineIterationOutcome::Idle);
                     }
                 }
                 if self.scheduler.active_count() > 0 {

@@ -690,6 +690,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             VNextExecutionCapacityDecision::Deferred(deferred) => {
                 return Err(Self::execution_capacity_error(&deferred))
             }
+            VNextExecutionCapacityDecision::RequestStateDeferred(_) => {
+                return Err(FerrumError::internal(
+                    "determinism step admission unexpectedly produced a Request-state deferral",
+                ))
+            }
         };
         let wave = match self.prepare_determinism_wave(&step, &sequences, &spans) {
             Ok(wave) => wave,

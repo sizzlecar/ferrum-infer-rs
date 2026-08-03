@@ -20,15 +20,16 @@ use ferrum_interfaces::model_executor::{
     ExecutorCapacityWaitRegistration, ExecutorExecutionCapacityDeferral,
     ExecutorExecutionCapacityPreemption, ExecutorExecutionCapacityPreemptionAuthority,
     ExecutorExecutionCapacityPreemptionReceipt, ExecutorExecutionCapacityStage,
-    ExecutorMemoryUsage, ExecutorPrefillAdmission, ExecutorPrefillAdmissionDecision,
-    ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion, ExecutorPrefillMaintenanceDeferral,
-    ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome, ExecutorRequestOrigin,
-    ExecutorSamplingOutput, ExecutorSequenceCompletion, ExecutorState, ExecutorStatus,
-    LogitsReturnPolicy, MemoryRequirements, PlanRuntimeBatchDecodeOutcome,
-    PlanRuntimeBatchPrefillOutcome, PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput,
-    PlanRuntimePrefillAuthority, PlanRuntimePrefillCompletion, PlanRuntimePrefillInput,
-    PlanRuntimePrefillOutcome, PlanRuntimePrefillOutput, PlanRuntimePrefillProduct,
-    PlanRuntimeResourceSnapshot, PrefillChunk, PrefillInput, PrefillOutput,
+    ExecutorExecutionDeferral, ExecutorMemoryUsage, ExecutorPrefillAdmission,
+    ExecutorPrefillAdmissionDecision, ExecutorPrefillAdmissionReceipt, ExecutorPrefillCompletion,
+    ExecutorPrefillMaintenanceDeferral, ExecutorPrefillMaintenanceOutcome, ExecutorPrefillOutcome,
+    ExecutorRequestOrigin, ExecutorRequestStateDeferral, ExecutorSamplingOutput,
+    ExecutorSequenceCompletion, ExecutorState, ExecutorStatus, LogitsReturnPolicy,
+    MemoryRequirements, PlanRuntimeBatchDecodeOutcome, PlanRuntimeBatchPrefillOutcome,
+    PlanRuntimeDecodeInput, PlanRuntimeDecodeOutput, PlanRuntimePrefillAuthority,
+    PlanRuntimePrefillCompletion, PlanRuntimePrefillInput, PlanRuntimePrefillOutcome,
+    PlanRuntimePrefillOutput, PlanRuntimePrefillProduct, PlanRuntimeResourceSnapshot, PrefillChunk,
+    PrefillInput, PrefillOutput,
 };
 use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
@@ -2425,6 +2426,7 @@ enum DispatchOutcome<R: DeviceRuntime> {
 enum VNextExecutionCapacityDecision<T> {
     Ready(T),
     Deferred(ExecutorExecutionCapacityDeferral),
+    RequestStateDeferred(ExecutorRequestStateDeferral),
 }
 
 enum VNextSequenceAdmissionDecision<R: DeviceRuntime> {
@@ -4802,6 +4804,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ))
     }
 
+    fn execution_deferral_error(deferral: &ExecutorExecutionDeferral) -> FerrumError {
+        match deferral {
+            ExecutorExecutionDeferral::Capacity(deferral) => {
+                Self::execution_capacity_error(deferral)
+            }
+            ExecutorExecutionDeferral::RequestState(deferral) => {
+                FerrumError::resource_exhausted(format!(
+                    "vNext {:?} is waiting for Request-state hazards: {:?}",
+                    deferral.stage(),
+                    deferral.hazard().blockers()
+                ))
+            }
+        }
+    }
+
     fn extend_sequence_with_capacity(
         &self,
         sequence: &VNextSequence<R>,
@@ -4933,6 +4950,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             VNextExecutionCapacityDecision::Deferred(deferred) => {
                 Err(Self::execution_capacity_error(&deferred))
             }
+            VNextExecutionCapacityDecision::RequestStateDeferred(_) => Err(FerrumError::internal(
+                "sequence extension unexpectedly produced a Request-state deferral",
+            )),
         }
     }
 
@@ -5054,6 +5074,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             VNextExecutionCapacityDecision::Deferred(deferred) => {
                 Err(Self::execution_capacity_error(&deferred))
             }
+            VNextExecutionCapacityDecision::RequestStateDeferred(_) => Err(FerrumError::internal(
+                "step admission unexpectedly produced a Request-state deferral",
+            )),
         }
     }
 
@@ -5242,6 +5265,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             VNextExecutionCapacityDecision::Deferred(deferred) => {
                 Err(Self::execution_capacity_error(&deferred))
             }
+            VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                Err(FerrumError::resource_exhausted(format!(
+                    "vNext synchronous submission wave is waiting for Request-state hazards: {:?}",
+                    deferred.hazard().blockers()
+                )))
+            }
         }
     }
 
@@ -5361,10 +5390,24 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )))
                 }
                 StepSubmissionWaveAdmissionDecision::RequestStateDeferred(deferred) => {
-                    return Err(FerrumError::resource_exhausted(format!(
-                        "vNext submission wave is waiting for Request-state hazards: {:?}",
-                        deferred.blockers()
-                    )))
+                    let mut request_ids = Vec::new();
+                    for sequence in sequences {
+                        let request_authority = sequence.session.resources().request_authority();
+                        if deferred
+                            .blockers()
+                            .iter()
+                            .any(|blocker| blocker.request() == request_authority)
+                            && !request_ids.contains(&sequence.request_id)
+                        {
+                            request_ids.push(sequence.request_id.clone());
+                        }
+                    }
+                    return ExecutorRequestStateDeferral::new(
+                        ExecutorExecutionCapacityStage::SubmissionWave,
+                        request_ids,
+                        deferred,
+                    )
+                    .map(VNextExecutionCapacityDecision::RequestStateDeferred);
                 }
                 StepSubmissionWaveAdmissionDecision::RequestStateSplitRequired(split) => {
                     return Err(FerrumError::request_validation(format!(
@@ -5963,6 +6006,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     VNextExecutionCapacityDecision::Deferred(deferred) => {
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred))
                     }
+                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                            deferred,
+                        ))
+                    }
                 };
             let wave =
                 match self.prepare_wave_for_spans_with_capacity(&step, sequences, spans, kind)? {
@@ -5975,6 +6023,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                             ))
                         })?;
                         return Ok(VNextExecutionCapacityDecision::Deferred(deferred));
+                    }
+                    VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                        step.try_rollback_unsubmitted().map_err(|failure| {
+                            FerrumError::backend(format!(
+                                "vNext readiness-deferred unsubmitted step rollback failed: {}",
+                                failure.error()
+                            ))
+                        })?;
+                        return Ok(VNextExecutionCapacityDecision::RequestStateDeferred(
+                            deferred,
+                        ));
                     }
                 };
             PreparedVNextPrefill { step, wave }
@@ -6741,7 +6800,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             match self.extend_sequence_with_capacity(&candidate.sequence, extension) {
                 Ok(VNextExecutionCapacityDecision::Ready(())) => {}
                 Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                    return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred));
+                    return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
+                }
+                Ok(VNextExecutionCapacityDecision::RequestStateDeferred(_)) => {
+                    return Err(FerrumError::internal(
+                        "sequence extension unexpectedly produced a Request-state deferral",
+                    ));
                 }
                 Err(error) => {
                     if DecodeFailureDisposition::from_error(&error)
@@ -6780,7 +6844,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         {
             Ok(VNextExecutionCapacityDecision::Ready(logits)) => logits,
             Ok(VNextExecutionCapacityDecision::Deferred(deferred)) => {
-                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred));
+                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
+            }
+            Ok(VNextExecutionCapacityDecision::RequestStateDeferred(deferred)) => {
+                return Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferred.into()));
             }
             Err(error) => {
                 if DecodeFailureDisposition::from_error(&error)
@@ -6973,7 +7040,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
                 else {
                     execution.restore_ready()?;
-                    return Ok(PlanRuntimePrefillOutcome::Deferred(deferred));
+                    return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
                 };
                 capacity_probe_count = capacity_probe_count.checked_add(1).ok_or_else(|| {
                     FerrumError::internal("vNext prefill capacity probe count overflow")
@@ -7012,7 +7079,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         deferred.narrower_prefill_tokens(completed_chunk.tokens_to_process())
                     else {
                         execution.restore_ready()?;
-                        return Ok(PlanRuntimePrefillOutcome::Deferred(deferred));
+                        return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
                     };
                     capacity_probe_count =
                         capacity_probe_count.checked_add(1).ok_or_else(|| {
@@ -7026,6 +7093,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         next_tokens,
                         completed_chunk.total_prompt_tokens(),
                     )?;
+                }
+                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                    execution.restore_ready()?;
+                    return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
                 }
             }
         };
@@ -7268,7 +7339,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     for guard in &mut execution_guards {
                         guard.disarm();
                     }
-                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferred));
+                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(
+                        deferred.into(),
+                    ));
                 }
             }
 
@@ -7329,7 +7402,24 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     for guard in &mut execution_guards {
                         guard.disarm();
                     }
-                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferred));
+                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(
+                        deferred.into(),
+                    ));
+                }
+                VNextExecutionCapacityDecision::RequestStateDeferred(deferred) => {
+                    let authority = candidates
+                        .iter()
+                        .map(|candidate| (&candidate.slot, &candidate.sequence))
+                        .collect::<Vec<_>>();
+                    self.sequences
+                        .lock()
+                        .restore_prefill_batch_ready(&authority)?;
+                    for guard in &mut execution_guards {
+                        guard.disarm();
+                    }
+                    return Ok(PlanRuntimeBatchPrefillOutcome::NotSubmitted(
+                        deferred.into(),
+                    ));
                 }
             }
         };
@@ -8045,7 +8135,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 Ok(output)
             }
             ExecutorPrefillOutcome::Deferred(deferred) => {
-                Err(Self::execution_capacity_error(&deferred))
+                Err(Self::execution_deferral_error(&deferred))
             }
         }
     }
@@ -8067,7 +8157,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 })
                 .collect(),
             ExecutorBatchPrefillOutcome::NotSubmitted(deferred) => {
-                Err(Self::execution_capacity_error(&deferred))
+                Err(Self::execution_deferral_error(&deferred))
             }
             ExecutorBatchPrefillOutcome::Unsupported => Err(FerrumError::internal(
                 "vNext batch prefill returned its own unsupported marker",
@@ -8193,7 +8283,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
         match self.execute_legacy_decode_batch(inputs).await? {
             ExecutorBatchDecodeOutcome::Completed(outputs) => Ok(outputs),
             ExecutorBatchDecodeOutcome::Deferred(deferred) => {
-                Err(Self::execution_capacity_error(&deferred))
+                Err(Self::execution_deferral_error(&deferred))
             }
         }
     }

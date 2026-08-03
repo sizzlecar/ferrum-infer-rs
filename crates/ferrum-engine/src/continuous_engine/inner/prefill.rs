@@ -422,7 +422,18 @@ impl EngineInner {
                     )
                     .await;
             }
-            PlanRuntimePrefillOutcome::Deferred(deferral) => {
+            PlanRuntimePrefillOutcome::Deferred(ExecutorExecutionDeferral::RequestState(
+                deferral,
+            )) => {
+                if deferral.request_ids() != std::slice::from_ref(request_id) {
+                    return Err(FerrumError::internal(
+                        "single prefill Request-state deferral names another frontier",
+                    ));
+                }
+                self.defer_for_request_state_readiness(deferral).await?;
+                return Ok(());
+            }
+            PlanRuntimePrefillOutcome::Deferred(ExecutorExecutionDeferral::Capacity(deferral)) => {
                 if let Some(retry) =
                     deferral.validated_maintenance_retry_scope(std::slice::from_ref(request_id))?
                 {
@@ -783,7 +794,32 @@ impl EngineInner {
             .await?
         {
             PlanRuntimeBatchPrefillOutcome::Completed(completions) => completions,
-            PlanRuntimeBatchPrefillOutcome::NotSubmitted(deferral) => {
+            PlanRuntimeBatchPrefillOutcome::NotSubmitted(
+                ExecutorExecutionDeferral::RequestState(deferral),
+            ) => {
+                let request_ids = work
+                    .iter()
+                    .map(|item| item.request_id.clone())
+                    .collect::<Vec<_>>();
+                if deferral
+                    .request_ids()
+                    .iter()
+                    .any(|request_id| !request_ids.contains(request_id))
+                {
+                    return Err(FerrumError::internal(
+                        "batch prefill Request-state deferral names another frontier",
+                    ));
+                }
+                let fallback_request_ids =
+                    unaffected_maintenance_retry_frontiers(&request_ids, deferral.request_ids());
+                self.defer_for_request_state_readiness(deferral).await?;
+                return Ok(PlanRuntimeBatchPrefillDisposition::PerRequestFallback(
+                    fallback_request_ids,
+                ));
+            }
+            PlanRuntimeBatchPrefillOutcome::NotSubmitted(ExecutorExecutionDeferral::Capacity(
+                deferral,
+            )) => {
                 let request_ids = work
                     .iter()
                     .map(|item| item.request_id.clone())

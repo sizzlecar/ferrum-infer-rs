@@ -2081,6 +2081,109 @@ impl ExecutorExecutionCapacityDeferral {
     }
 }
 
+/// Scheduler-visible proof that execution is temporarily blocked by a
+/// Request-lifetime state hazard rather than by physical capacity.
+///
+/// The embedded hazard evidence retains the exact plan-local coordinator and
+/// supports subscribe-before-recheck waiter registration. The request cohort
+/// is the product identity projection used by the scheduler; it must stay
+/// separate from the allocator's internal request-authority ids.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExecutorRequestStateDeferral {
+    stage: ExecutorExecutionCapacityStage,
+    request_ids: Vec<RequestId>,
+    hazard: crate::vnext::RequestStateHazardDeferral,
+}
+
+impl ExecutorRequestStateDeferral {
+    pub fn new(
+        stage: ExecutorExecutionCapacityStage,
+        request_ids: Vec<RequestId>,
+        hazard: crate::vnext::RequestStateHazardDeferral,
+    ) -> Result<Self> {
+        let unique = request_ids.iter().collect::<HashSet<_>>();
+        if request_ids.is_empty() || unique.len() != request_ids.len() {
+            return Err(FerrumError::internal(
+                "request-state execution deferral requires a non-empty unique product cohort",
+            ));
+        }
+        if hazard.blockers().is_empty() {
+            return Err(FerrumError::internal(
+                "request-state execution deferral requires exact blockers",
+            ));
+        }
+        Ok(Self {
+            stage,
+            request_ids,
+            hazard,
+        })
+    }
+
+    pub const fn stage(&self) -> ExecutorExecutionCapacityStage {
+        self.stage
+    }
+
+    pub fn request_ids(&self) -> &[RequestId] {
+        &self.request_ids
+    }
+
+    pub const fn hazard(&self) -> &crate::vnext::RequestStateHazardDeferral {
+        &self.hazard
+    }
+
+    pub fn register_waiter(&self) -> Result<crate::vnext::RequestStateHazardWaitRegistration> {
+        self.hazard
+            .register_waiter()
+            .map_err(|error| FerrumError::backend(error.to_string()))
+    }
+}
+
+/// A pre-submit execution frontier can be blocked by independently evolving
+/// sources. Capacity waits participate in scheduler pressure/yield policy;
+/// Request-state waits never do and resume only from their exact hazard
+/// coordinator.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "reason", content = "evidence", rename_all = "snake_case")]
+pub enum ExecutorExecutionDeferral {
+    Capacity(ExecutorExecutionCapacityDeferral),
+    RequestState(ExecutorRequestStateDeferral),
+}
+
+impl ExecutorExecutionDeferral {
+    pub const fn stage(&self) -> ExecutorExecutionCapacityStage {
+        match self {
+            Self::Capacity(deferral) => deferral.stage(),
+            Self::RequestState(deferral) => deferral.stage(),
+        }
+    }
+
+    pub const fn as_capacity(&self) -> Option<&ExecutorExecutionCapacityDeferral> {
+        match self {
+            Self::Capacity(deferral) => Some(deferral),
+            Self::RequestState(_) => None,
+        }
+    }
+
+    pub const fn as_request_state(&self) -> Option<&ExecutorRequestStateDeferral> {
+        match self {
+            Self::Capacity(_) => None,
+            Self::RequestState(deferral) => Some(deferral),
+        }
+    }
+}
+
+impl From<ExecutorExecutionCapacityDeferral> for ExecutorExecutionDeferral {
+    fn from(deferral: ExecutorExecutionCapacityDeferral) -> Self {
+        Self::Capacity(deferral)
+    }
+}
+
+impl From<ExecutorRequestStateDeferral> for ExecutorExecutionDeferral {
+    fn from(deferral: ExecutorRequestStateDeferral) -> Self {
+        Self::RequestState(deferral)
+    }
+}
+
 #[cfg(test)]
 mod execution_capacity_deferral_tests {
     use super::{
@@ -2199,13 +2302,13 @@ mod execution_capacity_deferral_tests {
 /// fence/recovery authority inside the executor.
 pub enum ExecutorBatchDecodeOutcome {
     Completed(Vec<DecodeOutput>),
-    Deferred(ExecutorExecutionCapacityDeferral),
+    Deferred(ExecutorExecutionDeferral),
 }
 
 /// Capacity-aware, tensor-free batch decode result for a plan runtime.
 pub enum PlanRuntimeBatchDecodeOutcome {
     Completed(Vec<PlanRuntimeDecodeOutput>),
-    Deferred(ExecutorExecutionCapacityDeferral),
+    Deferred(ExecutorExecutionDeferral),
 }
 
 /// Capacity-aware result for one tensor-free plan-runtime prefill frontier.
@@ -2294,12 +2397,12 @@ impl PlanRuntimePrefillCompletion {
 
 pub enum PlanRuntimePrefillOutcome {
     Completed(PlanRuntimePrefillCompletion),
-    Deferred(ExecutorExecutionCapacityDeferral),
+    Deferred(ExecutorExecutionDeferral),
 }
 
 pub enum PlanRuntimeBatchPrefillOutcome {
     Completed(Vec<PlanRuntimePrefillCompletion>),
-    NotSubmitted(ExecutorExecutionCapacityDeferral),
+    NotSubmitted(ExecutorExecutionDeferral),
     Unsupported,
 }
 
@@ -2385,7 +2488,7 @@ fn validate_prefill_completion_shape(
 
 pub enum ExecutorPrefillOutcome {
     Completed(ExecutorPrefillCompletion),
-    Deferred(ExecutorExecutionCapacityDeferral),
+    Deferred(ExecutorExecutionDeferral),
 }
 
 /// Transactional result of attempting one physical prefill batch.
@@ -2397,7 +2500,7 @@ pub enum ExecutorPrefillOutcome {
 /// executors while plan-runtime implementations provide the real batch edge.
 pub enum ExecutorBatchPrefillOutcome {
     Completed(Vec<ExecutorPrefillCompletion>),
-    NotSubmitted(ExecutorExecutionCapacityDeferral),
+    NotSubmitted(ExecutorExecutionDeferral),
     Unsupported,
 }
 

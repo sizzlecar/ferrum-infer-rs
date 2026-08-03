@@ -310,7 +310,7 @@ impl ModelExecutor for PlanRuntimeChunkedPrefillTestExecutor {
                 self.wait_condition(),
                 ExecutorExecutionCapacityStage::StepAdmission,
             )
-            .map(ExecutorPrefillOutcome::Deferred);
+            .map(|deferral| ExecutorPrefillOutcome::Deferred(deferral.into()));
         }
 
         let completed_chunk = if self.narrow_next_prefill.swap(false, Ordering::AcqRel) {
@@ -554,7 +554,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             wait_condition,
             ExecutorExecutionCapacityStage::StepAdmission,
         )
-        .map(ExecutorBatchDecodeOutcome::Deferred)
+        .map(|deferral| ExecutorBatchDecodeOutcome::Deferred(deferral.into()))
     }
 
     async fn plan_runtime_batch_decode_with_capacity(
@@ -627,7 +627,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             wait_condition,
             ExecutorExecutionCapacityStage::StepAdmission,
         )
-        .map(PlanRuntimeBatchDecodeOutcome::Deferred)
+        .map(|deferral| PlanRuntimeBatchDecodeOutcome::Deferred(deferral.into()))
     }
 
     fn release_cache(&self, cache_id: &str) {
@@ -862,7 +862,7 @@ impl ModelExecutor for PlanRuntimeAdmissionTestExecutor {
                 self.capacity_wait_condition(),
                 ExecutorExecutionCapacityStage::SubmissionWave,
             )
-            .map(ExecutorBatchPrefillOutcome::NotSubmitted);
+            .map(|deferral| ExecutorBatchPrefillOutcome::NotSubmitted(deferral.into()));
         }
         let mut completions = Vec::with_capacity(inputs.len());
         for input in inputs {
@@ -1598,6 +1598,181 @@ fn policy_request() -> InferenceRequest {
         evidence_request: Default::default(),
         metadata: HashMap::new(),
     }
+}
+
+async fn install_execution_readiness_wake(
+    scheduler: &ContinuousBatchScheduler,
+) -> (RequestId, ExecutionReadinessWake) {
+    let request = policy_request();
+    let request_id = request.id.clone();
+    scheduler.submit(request).await.unwrap();
+    let initial = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .expect("request should enter prefill before readiness deferral");
+    assert_eq!(initial.requests.len(), 1);
+    scheduler.mark_prefill_complete(&request_id, 1);
+    let receipt = scheduler
+        .defer_for_execution_readiness(std::slice::from_ref(&request_id))
+        .unwrap();
+    (request_id, receipt.into_wake())
+}
+
+#[test]
+fn execution_readiness_registry_enforces_an_independent_fixed_cap() {
+    let registry = ExecutionReadinessWaitRegistry::new();
+    assert_eq!(MAX_EXECUTION_READINESS_WAITERS, 64);
+    let mut slots = Vec::with_capacity(MAX_EXECUTION_READINESS_WAITERS);
+    for _ in 0..MAX_EXECUTION_READINESS_WAITERS {
+        slots.push(Arc::clone(&registry.slots).try_acquire_owned().unwrap());
+    }
+    assert!(Arc::clone(&registry.slots).try_acquire_owned().is_err());
+}
+
+#[tokio::test]
+async fn execution_readiness_registry_resumes_only_after_successful_wait() {
+    let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
+    let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
+    let registry = ExecutionReadinessWaitRegistry::new();
+    let work_notify = Arc::new(Notify::new());
+    let notified = work_notify.notified();
+    tokio::pin!(notified);
+    let slot = registry.reserve().await.unwrap();
+    registry
+        .track(
+            wake,
+            async { Ok(()) },
+            vec![request_id.clone()],
+            Arc::clone(&work_notify),
+            slot,
+        )
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), &mut notified)
+        .await
+        .expect("successful waiter must wake the engine");
+    assert_eq!(registry.pending_count(), 0);
+    assert!(registry.take_failures().is_empty());
+    let resumed = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .expect("successful readiness must authorize an exact reprobe");
+    assert_eq!(resumed.requests[0].request.id, request_id);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            registry.reap_finished();
+            if registry.tasks.lock().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("finished waiter must be reapable");
+}
+
+#[tokio::test]
+async fn execution_readiness_registry_reports_wait_errors_without_rescheduling() {
+    let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
+    let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
+    let registry = ExecutionReadinessWaitRegistry::new();
+    let work_notify = Arc::new(Notify::new());
+    let notified = work_notify.notified();
+    tokio::pin!(notified);
+    let slot = registry.reserve().await.unwrap();
+    registry
+        .track(
+            wake,
+            async { Err("hazard channel closed".to_string()) },
+            vec![request_id.clone()],
+            Arc::clone(&work_notify),
+            slot,
+        )
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), &mut notified)
+        .await
+        .expect("failed waiter must wake the terminal owner");
+    let failures = registry.take_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].request_ids, vec![request_id]);
+    assert_eq!(failures[0].message, "hazard channel closed");
+    assert!(scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn execution_readiness_registry_converts_waiter_panic_to_terminal_failure() {
+    let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
+    let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
+    let registry = ExecutionReadinessWaitRegistry::new();
+    let work_notify = Arc::new(Notify::new());
+    let notified = work_notify.notified();
+    tokio::pin!(notified);
+    let slot = registry.reserve().await.unwrap();
+    registry
+        .track(
+            wake,
+            async {
+                panic!("synthetic readiness panic");
+                #[allow(unreachable_code)]
+                Ok::<(), String>(())
+            },
+            vec![request_id.clone()],
+            Arc::clone(&work_notify),
+            slot,
+        )
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), &mut notified)
+        .await
+        .expect("panicked waiter must wake the terminal owner");
+    let failures = registry.take_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].request_ids, vec![request_id]);
+    assert_eq!(
+        failures[0].message,
+        "Request-state readiness waiter panicked"
+    );
+    assert!(scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn execution_readiness_registry_cancels_ticket_before_shutdown_join() {
+    let scheduler = ContinuousBatchScheduler::new(ferrum_types::SchedulerConfig::default());
+    let (request_id, wake) = install_execution_readiness_wake(&scheduler).await;
+    let registry = ExecutionReadinessWaitRegistry::new();
+    let work_notify = Arc::new(Notify::new());
+    let slot = registry.reserve().await.unwrap();
+    registry
+        .track(
+            wake,
+            std::future::pending::<std::result::Result<(), String>>(),
+            vec![request_id.clone()],
+            work_notify,
+            slot,
+        )
+        .unwrap();
+    assert_eq!(registry.pending_count(), 1);
+
+    tokio::time::timeout(Duration::from_secs(1), registry.abort_and_join())
+        .await
+        .expect("shutdown must not leak readiness waiter tasks")
+        .unwrap();
+    assert_eq!(registry.pending_count(), 0);
+    assert!(registry.tasks.lock().is_empty());
+    assert!(registry.take_failures().is_empty());
+    let resumed = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .expect("cancelled shutdown ticket must not strand the frontier");
+    assert_eq!(resumed.requests[0].request.id, request_id);
 }
 
 fn policy_tool_request(
