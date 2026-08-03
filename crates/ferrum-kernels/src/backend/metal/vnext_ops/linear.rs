@@ -32,7 +32,7 @@ use super::{
     authorize_reusable_topology, binding, checked_u32, contiguous_bindings, contiguous_region,
     contiguous_token_region, ensure_invocation, estimate_without_workspace, f16_contiguous,
     implementation_fingerprint, invalid_plan, provider_descriptor, provider_failure,
-    shared_scratch_region, shared_token_region, token_binding_is_shared, unsigned_attribute,
+    shared_scratch_region, shared_token_region, token_binding_is_packed, unsigned_attribute,
     DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
     Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
 };
@@ -517,16 +517,14 @@ fn encode_dense_linear(
     };
     let part = *part;
     let mut regions = prepared.regions;
-    let input_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
-    let output_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Output, 0, ElementType::F16)?;
+    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
+    let output_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
         return Err("Metal dense linear participant ranges are incomplete".to_owned());
     }
     let mut launches = Vec::new();
-    if input_shared && output_shared {
+    if input_packed && output_packed {
         let rows = invocation.work_shape().immediate_tokens();
         let input_region = regions.len();
         regions.push(shared_token_region(
@@ -557,12 +555,12 @@ fn encode_dense_linear(
     } else {
         for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
             let rows = token_range.immediate_tokens();
-            let input_start = if input_shared {
+            let input_start = if input_packed {
                 token_range.immediate_token_range().start
             } else {
                 token_range.source_token_range().start
             };
-            let output_start = if output_shared {
+            let output_start = if output_packed {
                 token_range.immediate_token_range().start
             } else {
                 token_range.source_token_range().start
@@ -662,8 +660,7 @@ fn encode_last_token_dense_linear(
     if token_ranges.len() != invocation.participants().len() {
         return Err("Metal last-token linear participant ranges are incomplete".to_owned());
     }
-    let input_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
+    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
     let participant_count = invocation.participants().len();
     let participant_count_u32 = checked_u32(
         participant_count as u64,
@@ -673,7 +670,7 @@ fn encode_last_token_dense_linear(
     let scratch_layout =
         LastTokenPackedScratchLayout::new(participant_count as u64, hidden_size, out_features)?;
     let shared_packed_input = packed_last_token_rows(
-        input_shared,
+        input_packed,
         participant_count,
         token_ranges
             .iter()
@@ -692,7 +689,7 @@ fn encode_last_token_dense_linear(
                 .iter()
                 .zip(token_ranges)
                 .map(|(participant, token_range)| {
-                    let selected = if input_shared {
+                    let selected = if input_packed {
                         token_range.immediate_token_range()
                     } else {
                         token_range.source_token_range()
@@ -819,7 +816,7 @@ fn encode_last_token_dense_linear(
 
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
-        let selected = if input_shared {
+        let selected = if input_packed {
             token_range.immediate_token_range()
         } else {
             token_range.source_token_range()
@@ -940,11 +937,11 @@ fn align_up_bytes(value: u64, alignment: u64) -> Result<u64, String> {
 }
 
 fn packed_last_token_rows(
-    input_shared: bool,
+    input_packed: bool,
     participant_count: usize,
     ranges: impl IntoIterator<Item = Range<u64>>,
 ) -> bool {
-    if !input_shared || participant_count < 2 {
+    if !input_packed || participant_count < 2 {
         return false;
     }
     let mut next_row = 0_u64;

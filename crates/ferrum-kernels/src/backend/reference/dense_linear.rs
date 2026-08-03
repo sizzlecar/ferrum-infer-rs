@@ -154,12 +154,10 @@ fn encode_dense_linear(
             return Err("reference dense-linear participants do not share one weight".to_owned());
         }
     }
-    let input_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
-    let output_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Output, 0, ElementType::F16)?;
+    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
+    let output_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
     let mut launches = Vec::new();
-    if input_shared && output_shared {
+    if input_packed && output_packed {
         let rows = invocation.work_shape().immediate_tokens();
         launches.push(reference_launch(
             shared_token_region(
@@ -184,12 +182,12 @@ fn encode_dense_linear(
     } else {
         for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
             let rows = token_range.immediate_tokens();
-            let input_start = if input_shared {
+            let input_start = if input_packed {
                 token_range.immediate_token_range().start
             } else {
                 token_range.source_token_range().start
             };
-            let output_start = if output_shared {
+            let output_start = if output_packed {
                 token_range.immediate_token_range().start
             } else {
                 token_range.source_token_range().start
@@ -455,33 +453,14 @@ fn shared_token_region(
     Ok(region)
 }
 
-fn token_binding_is_shared(
+fn token_binding_is_packed(
     invocation: &BatchedOperationInvocation<'_, ReferenceDeviceBuffer>,
     role: ResolvedValueRole,
     ordinal: u32,
-    element_type: ElementType,
 ) -> Result<bool, String> {
-    let first = &invocation.participants()[0];
-    let region = contiguous_token_region(
-        first,
-        binding(first.bindings(), role, ordinal)?,
-        element_type,
-        0,
-        1,
-    )?;
-    for participant in &invocation.participants()[1..] {
-        let candidate = contiguous_token_region(
-            participant,
-            binding(participant.bindings(), role, ordinal)?,
-            element_type,
-            0,
-            1,
-        )?;
-        if !region.same_physical_region(&candidate) {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    invocation
+        .binding_uses_packed_batch_coordinates(role, ordinal)
+        .map_err(|error| error.to_string())
 }
 
 fn binding(

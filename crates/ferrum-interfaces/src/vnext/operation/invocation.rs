@@ -20,6 +20,7 @@ use super::foundation::invalid_operation;
 use super::{
     AttributeId, BatchOperationIdentity, BatchOperationNodeIdentity, ElementType,
     OperationBufferView, OperationDescriptor, OperationProviderDescriptor, ResolvedValueBinding,
+    ResolvedValueRole,
 };
 
 pub(super) enum OperationInvocationResources<'a, R: DeviceRuntime> {
@@ -604,6 +605,7 @@ impl<'a, B> OperationInvocation<'a, B> {
                                 "prepared dynamic resource index differs from the memory plan",
                             )
                         })?;
+                    let descriptor_lifetime = descriptor.lifetime();
                     let backing = resources.backing_view(resource_id).or_else(|_| {
                         resources.participant_backing_view(participant_index, resource_id)
                     })?;
@@ -663,9 +665,17 @@ impl<'a, B> OperationInvocation<'a, B> {
                         element_type: backing.element_type(),
                     };
                     views.push(if backing.capacity_size_bytes() > expected_bytes {
-                        OperationBufferView::from_backing_prefix(descriptor, backing)
+                        OperationBufferView::from_backing_prefix(
+                            descriptor,
+                            backing,
+                            descriptor_lifetime,
+                        )
                     } else {
-                        OperationBufferView::from_backing_exact(descriptor, backing)
+                        OperationBufferView::from_backing_exact(
+                            descriptor,
+                            backing,
+                            descriptor_lifetime,
+                        )
                     });
                 }
             }
@@ -1036,6 +1046,54 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
 
     pub fn participant_token_ranges(&self) -> &[BatchParticipantTokenRange] {
         self.work_shape().participant_token_ranges()
+    }
+
+    /// Returns whether one exact resolved binding uses the packed token
+    /// coordinate space of this physical batch. This is deliberately distinct
+    /// from physical sharing: Request backing can be shared by child sequences
+    /// while still using source-token coordinates.
+    pub fn binding_uses_packed_batch_coordinates(
+        &self,
+        role: ResolvedValueRole,
+        ordinal: u32,
+    ) -> Result<bool, VNextError> {
+        let mut lifetime = None;
+        for participant in &self.participants {
+            let binding = participant
+                .bindings()
+                .iter()
+                .find(|binding| binding.role() == role && binding.ordinal() == ordinal)
+                .ok_or_else(|| {
+                    invalid_operation(format!(
+                        "operation participant lacks {role:?} binding {ordinal}"
+                    ))
+                })?;
+            let [component] = binding.storage().components() else {
+                return Err(invalid_operation(
+                    "batch sharing requires a single-resource value binding",
+                ));
+            };
+            let view = participant
+                .views()
+                .iter()
+                .find(|view| view.resource_id() == component.resource_id())
+                .ok_or_else(|| {
+                    invalid_operation("operation value binding has no physical resource view")
+                })?;
+            match lifetime {
+                Some(expected) if expected != view.allocation_lifetime() => {
+                    return Err(invalid_operation(
+                        "operation participants disagree on value allocation lifetime",
+                    ));
+                }
+                None => lifetime = Some(view.allocation_lifetime()),
+                Some(_) => {}
+            }
+        }
+        Ok(matches!(
+            lifetime.expect("batched operation invocations are non-empty"),
+            AllocationLifetime::Step | AllocationLifetime::Invocation
+        ))
     }
 }
 

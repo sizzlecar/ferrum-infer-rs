@@ -205,6 +205,7 @@ L1_TEST = TestSpec(
         "ferrum-models",
         "--test",
         "vnext_l1_reference_runtime",
+        "tiny_real_safetensors_executes_through_reference_vnext_runtime",
         "--",
         "--test-threads=1",
         "--nocapture",

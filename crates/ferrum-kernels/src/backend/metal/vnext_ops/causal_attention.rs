@@ -35,7 +35,7 @@ use super::{
     authorize_reusable_topology, binding, checked_u32, contract_error, ensure_invocation,
     f16_contiguous, implementation_fingerprint, invalid_plan, provider_descriptor,
     provider_failure, rational_attribute, shared_binding_region, shared_full_region,
-    shared_scratch_region, shared_token_region, token_binding_is_shared, unsigned_attribute,
+    shared_scratch_region, shared_token_region, token_binding_is_packed, unsigned_attribute,
     DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
     Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, VALUE_ALIGNMENT_BYTES, VNEXT_KV_PAGE_BYTES,
 };
@@ -767,10 +767,8 @@ fn encode_attention(
             index
         },
     };
-    let input_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Input, 0, ElementType::F16)?;
-    let output_shared =
-        token_binding_is_shared(&invocation, ResolvedValueRole::Output, 0, ElementType::F16)?;
+    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
+    let output_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Output, 0)?;
 
     let mut binding_regions = vec![regions[shared.binding].clone()];
     let mut page_bindings = Vec::with_capacity(invocation.participants().len());
@@ -796,7 +794,7 @@ fn encode_attention(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
             ElementType::F16,
-            if input_shared {
+            if input_packed {
                 packed_start
             } else {
                 source.start
@@ -808,7 +806,7 @@ fn encode_attention(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
             ElementType::F16,
-            if output_shared {
+            if output_packed {
                 packed_start
             } else {
                 source.start
@@ -927,7 +925,7 @@ fn encode_attention(
         });
     }
 
-    let packed = if input_shared && output_shared && launches.len() > 1 {
+    let packed = if input_packed && output_packed && launches.len() > 1 {
         let input = regions.len();
         regions.push(shared_token_region(
             &invocation,
