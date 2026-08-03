@@ -4,6 +4,40 @@
 
 Open。创建于 2026-07-10。
 
+截至 2026-08-04，clean、已推送 source
+`04699472d17b72a5368692bacb81a4b38cdae04f` 已关闭 S2 CUDA latency/first-failure
+checkpoint。真实 Qwen3.5-4B/RTX 4090 artifact 同时覆盖 `ferrum run` success/failure 和
+`ferrum serve` success/failure/recovery；失败终态保留真实 wall duration、typed failure status、
+error detail 和统一 request identity，不再因为 `event_kind=error` 被通用 analyzer 丢掉。聚焦
+`run` 注入失败的首个终态为 `actual_run_generation_failed`、`event_kind=timed_span`、
+`duration_us=256196`，随后正式 validator 和统一 gate 打印：
+
+```text
+FERRUM RUNTIME VNEXT S2 LATENCY FIRST FAILURE PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-latency-04699472-20260803/gate-r1
+FERRUM GATE vnext-s2-latency-first-failure PASS: /workspace/ferrum-artifacts/runtime-vnext-s2-latency-04699472-20260803/gate-r1
+```
+
+CUDA release build bounded duration 为 `456.63442s`，binary SHA256 为
+`c76002ba57203182dedc76e258225f057f148878800aa722d3215ce2febd8494`。同硬件
+ABBA-BAAB profile-overhead 结果为 off `67.473362 tok/s`、latency `52.720071 tok/s`，
+mean overhead `21.8654%`、median overhead `21.7777%`，两组 CV 分别为 `0.6297%` 和
+`0.8774%`。该结果按 G06 合同标记 `target_miss`、`blocking=false`：它关闭 attribution
+正确性边界，但没有达到 latency profile `<=5%` 的报告目标，也不是默认关闭路径的性能证据。
+
+完整 archive
+`runtime-vnext-s2-latency-04699472-cuda-pass-20260803.tar.zst` 为 `198342023` bytes，
+SHA256 为 `59429fbe22bff760ecc5dab866227c356c359b60a80bb6809d63f5566e84dff5`，位于 draft
+[GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-7b3e03ffaf497735b17d)。
+远端原包与 12 个分片均为 uploaded；本机从 GitHub 回下载后完成 `12/12` 分片 SHA256、整体
+SHA256、`zstd -t` 和 required-member 复验，并打印
+`FERRUM S2 LATENCY GITHUB ROUNDTRIP PASS`。
+
+这只关闭 S2 latency/first-failure 子门，不等于完整 S2、G05、G06、性能、Metal 或 release
+PASS。8 个 S2 child lane 当前正式 artifact 状态为 `5/8 PASS`；剩余 M1 CUDA determinism
+真实硬件 witness、response-format 和 API/modality。`dcf8e46c` 只完成 determinism collector/gate
+接线，没有真实 4090 PASS artifact，不能计入完成。三个子门关闭后，仍须在同一最终 source
+identity 上执行 change-impact 复验和 S2 aggregate。G00-G10 总目标 PASS 仍为 `0/11`。
+
 截至 2026-08-03，S2 CUDA 又关闭两个 focused product checkpoint。clean、已推送 source
 `a4e8472cc1aa3fa46cf8f95d89e8b6385f09576f` 的真实 Qwen3.5-4B Unicode stream/C09
 artifact 中，stream/non-stream exact content、finish reason、usage 和 multibyte split 为
@@ -40,8 +74,9 @@ tool/schema archive `runtime-vnext-s2-tool-schema-e894c59e-cuda-pass-20260803.ta
 确认 `actual_status=exited`。
 
 这些证据只关闭 Unicode stream/C09 和 tool/schema 子门，不等于完整 S2、G04、G05、性能、
-Metal 或 release PASS。S2 仍需 response-format、API/modality、M1 determinism、五项 historical
-resource、latency/first-failure attribution，以及最终同一 source identity 的 aggregate。
+Metal 或 release PASS。在该 checkpoint 当时，尚未完成 response-format、API/modality、M1
+determinism、五项 historical resource、latency/first-failure attribution 和最终 aggregate；
+当前剩余项以本文件顶部最新状态为准。
 
 截至 2026-08-03，clean、已推送 source
 `cc2556610d30749e761f85fafe25ccf1a13ce116` 已关闭当前 source 的 S2 CUDA
@@ -70,9 +105,9 @@ CUDA release build bounded duration 为 `403.82842s`，binary SHA256 为
 并经 GitHub 回下载、SHA256、`zstd -t` 和 required-member 复验。
 
 该证据只关闭 S2 multi-turn/concurrency 子门，不等于完整 S2、G02、G04、G05、G06、性能、
-Metal 或 release PASS。S2 aggregate 仍须在同一 source identity 上收齐或按 change-impact 复验
-S1 inputs、determinism、response-format、API/modality、五项 historical resource、latency
-attribution，最后才能打印 S2 aggregate PASS。
+Metal 或 release PASS。在该 checkpoint 当时，aggregate 尚须收齐或按 change-impact 复验 S1
+inputs、determinism、response-format、API/modality、五项 historical resource 和 latency
+attribution；当前剩余项以本文件顶部最新状态为准。
 
 截至 2026-08-03，clean、已推送 source
 `61399d6907677af3373f543c01b5f0cad720dbe4` 已关闭当前 source 的 S1 CUDA
