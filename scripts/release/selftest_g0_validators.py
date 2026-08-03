@@ -154,6 +154,10 @@ RUNTIME_VNEXT_S2_MULTITURN_CONCURRENCY_CHECKPOINT = (
     REPO_ROOT
     / "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py"
 )
+RUNTIME_VNEXT_S2_LATENCY_FAILURE_CHECKPOINT = (
+    REPO_ROOT
+    / "scripts/release/runtime_vnext_s2_latency_failure_checkpoint.py"
+)
 RUNTIME_VNEXT_S2_HISTORICAL_RESOURCE_SOURCE = (
     REPO_ROOT
     / "scripts/release/runtime_vnext_s2_historical_resource_source.py"
@@ -1109,6 +1113,22 @@ def test_runtime_vnext_s2_multiturn_concurrency_checkpoint_selftest() -> None:
     )
 
 
+def test_runtime_vnext_s2_latency_failure_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_S2_LATENCY_FAILURE_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 LATENCY FIRST FAILURE SELFTEST PASS"
+        in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_s2_historical_resource_source_selftest() -> None:
     ok = run(
         [
@@ -1355,6 +1375,7 @@ def main() -> int:
     test_runtime_vnext_s2_stream_disconnect_checkpoint_selftest()
     test_runtime_vnext_s2_tool_schema_checkpoint_selftest()
     test_runtime_vnext_s2_multiturn_concurrency_checkpoint_selftest()
+    test_runtime_vnext_s2_latency_failure_checkpoint_selftest()
     test_runtime_vnext_s2_historical_resource_source_selftest()
     test_runtime_vnext_g02_core_selftest()
     test_product_backend_sentinel_selftest()
