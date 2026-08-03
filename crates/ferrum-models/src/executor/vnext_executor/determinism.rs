@@ -561,8 +561,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         error: SubmissionWaveDispatchError<R>,
     ) -> FerrumError {
         match error {
-            error @ (SubmissionWaveDispatchError::DefinitelyNotSubmitted { .. }
-            | SubmissionWaveDispatchError::Contract(_)
+            SubmissionWaveDispatchError::DefinitelyNotSubmitted { failures, retry } => {
+                let message = format!(
+                    "operation attempt {} with {} participants was definitely not submitted: {}",
+                    retry.prior_attempt(),
+                    failures.len(),
+                    failures
+                        .first()
+                        .map(|failure| failure.failure().message())
+                        .unwrap_or("missing classified participant failure")
+                );
+                drop(retry);
+                self.abort_unsubmitted_step(step, FerrumError::backend(message))
+            }
+            error @ (SubmissionWaveDispatchError::Contract(_)
             | SubmissionWaveDispatchError::Provider(_)
             | SubmissionWaveDispatchError::Initialization(_)
             | SubmissionWaveDispatchError::InputUpload(_)) => {
@@ -603,6 +615,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 self.abort_step(step, message).await
             }
         }
+    }
+
+    fn abort_prepared_unsubmitted_step(
+        &self,
+        step: Arc<StepResourceLease<R>>,
+        wave: PreparedStepSubmissionWave<R>,
+        error: FerrumError,
+    ) -> FerrumError {
+        drop(wave);
+        self.abort_unsubmitted_step(step, error)
     }
 
     pub async fn collect_determinism_execution(
@@ -712,9 +734,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         ) {
             Ok(identity) => identity,
             Err(error) => {
-                return Err(
-                    self.abort_unsubmitted_step(step, FerrumError::backend(error.to_string()))
-                )
+                return Err(self.abort_prepared_unsubmitted_step(
+                    step,
+                    wave,
+                    FerrumError::backend(error.to_string()),
+                ))
             }
         };
         let restore = match self.bind_determinism_restore(
@@ -725,7 +749,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &wave,
         ) {
             Ok(restore) => restore,
-            Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
+            Err(error) => {
+                return Err(self.abort_prepared_unsubmitted_step(step, wave, error));
+            }
         };
 
         let submission = match spec.mode {
@@ -744,33 +770,37 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 )
             }
             VNextDeterminismExecutionMode::Replayed => {
-                let program_id = match OperationDispatch::reusable_execution_program_id_for_wave(
-                    self.providers.providers(),
-                    &self.resolved_plan,
-                    &wave,
-                    &self.lane,
-                ) {
-                    Ok(Some(program_id)) => program_id,
-                    Ok(None) => {
-                        return Err(self.abort_unsubmitted_step(
+                let program_id =
+                    match OperationDispatch::reusable_execution_program_id_for_wave(
+                        self.providers.providers(),
+                        &self.resolved_plan,
+                        &wave,
+                        &self.lane,
+                    ) {
+                        Ok(Some(program_id)) => program_id,
+                        Ok(None) => return Err(self.abort_prepared_unsubmitted_step(
                             step,
+                            wave,
                             FerrumError::backend(
                                 "vNext determinism replay has no exact reusable program identity",
                             ),
-                        ))
-                    }
-                    Err(error) => {
-                        return Err(self
-                            .abort_unsubmitted_step(step, FerrumError::backend(error.to_string())))
-                    }
-                };
+                        )),
+                        Err(error) => {
+                            return Err(self.abort_prepared_unsubmitted_step(
+                                step,
+                                wave,
+                                FerrumError::backend(error.to_string()),
+                            ))
+                        }
+                    };
                 let catalog = match self.reusable_execution_catalog.get() {
                     Some(catalog) if catalog.lane_epoch == self.lane.reusable_execution_epoch() => {
                         catalog
                     }
                     _ => {
-                        return Err(self.abort_unsubmitted_step(
+                        return Err(self.abort_prepared_unsubmitted_step(
                             step,
+                            wave,
                             FerrumError::backend(
                                 "vNext determinism replay catalog is absent or stale",
                             ),
@@ -780,8 +810,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 let reusable_program = match catalog.programs.get(&program_id) {
                     Some(program) => program,
                     None => {
-                        return Err(self.abort_unsubmitted_step(
+                        return Err(self.abort_prepared_unsubmitted_step(
                             step,
+                            wave,
                             FerrumError::backend(
                                 "vNext determinism replay program is absent from the sealed exact catalog",
                             ),

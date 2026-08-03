@@ -192,11 +192,10 @@ impl ExecutionDeterminismValueLocation {
                         let (bytes_per_token, maximum_tokens) =
                             descriptor_tokens.unwrap_or((projected_bytes, projected_tokens));
                         if bytes_per_token != projected_bytes
-                            || maximum_tokens < projected_tokens
                             || bytes_per_token % component.element_type().size_bytes() != 0
                         {
                             return Err(invalid_plan(format!(
-                                "node `{}` determinism value `{}` has inconsistent token extent evidence",
+                                "node `{}` determinism value `{}` has inconsistent token extent evidence: projected_bytes={projected_bytes}, projected_tokens={projected_tokens}, descriptor_bytes={bytes_per_token}, descriptor_maximum_tokens={maximum_tokens}",
                                 node.id(),
                                 binding.value_id()
                             )));
@@ -724,11 +723,44 @@ fn validate_determinism_location(
             .logical_offset_bytes
             .checked_add(location.declared_length_bytes)
             .is_none()
-        || location.maximum_bound_length_bytes()? < location.declared_length_bytes
     {
         return Err(invalid_plan(
             "execution determinism value location has an invalid byte range",
         ));
+    }
+    match location.extent {
+        ExecutionDeterminismValueExtent::Fixed => {}
+        ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+            bytes_per_token,
+            maximum_tokens,
+        } => {
+            if bytes_per_token == 0
+                || maximum_tokens == 0
+                || bytes_per_token % element_bytes != 0
+                || location.declared_length_bytes % bytes_per_token != 0
+                || location.maximum_bound_length_bytes()? == 0
+            {
+                return Err(invalid_plan(
+                    "execution determinism immediate-token location has an invalid dynamic extent",
+                ));
+            }
+        }
+        ExecutionDeterminismValueExtent::ActiveTokenPrefix {
+            bytes_per_token,
+            maximum_tokens,
+            maximum_storage_bytes,
+        } => {
+            if bytes_per_token == 0
+                || maximum_tokens == 0
+                || bytes_per_token % element_bytes != 0
+                || maximum_storage_bytes < bytes_per_token
+                || maximum_storage_bytes < location.declared_length_bytes
+            {
+                return Err(invalid_plan(
+                    "execution determinism active-prefix location has an invalid dynamic extent",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -1062,13 +1094,43 @@ impl ExecutionPlan {
 
 #[cfg(test)]
 mod tests {
+    use super::validate_determinism_location;
     use crate::vnext::{
-        AliasPolicy, BufferUsage, ElementType, ExecutionDeterminismValueExtent,
+        AliasPolicy, AllocationKind, AllocationLifetime, BufferUsage, DynamicResourceDemand,
+        DynamicResourceDescriptor, DynamicStorageAllocator, DynamicStorageContract,
+        DynamicStorageProfile, DynamicStorageView, ElementType, ExecutionDeterminismValueExtent,
         ExecutionDeterminismWitnessKind, ExecutionDeterminismWitnessSpec, NodeId,
         NodeTokenBindingProjection, NodeWorkContract, PlanNode, ProgramValueId,
         ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
-        ResolvedValueStorage, ResourceId, TensorAccess, TokenSpanWork,
+        ResolvedValueStorage, ResourceId, StateInitialization, TensorAccess, TokenSpanWork,
     };
+
+    fn dynamic_activation_descriptor(
+        resource_id: ResourceId,
+        bytes_per_token: u64,
+        maximum_tokens: u64,
+    ) -> DynamicResourceDescriptor {
+        let profile = DynamicStorageProfile::new(
+            DynamicStorageAllocator::LinearArena,
+            DynamicStorageView::Contiguous,
+        )
+        .unwrap();
+        let storage =
+            DynamicStorageContract::resource_test_contract(profile, "1".repeat(64)).unwrap();
+        DynamicResourceDescriptor::new(
+            resource_id,
+            DynamicResourceDemand::tokens(bytes_per_token, maximum_tokens).unwrap(),
+            16,
+            BufferUsage::Activations,
+            ElementType::F16,
+            AllocationLifetime::Step,
+            AllocationKind::Value,
+            storage,
+            StateInitialization::None,
+            32,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn token_witness_uses_immediate_span_and_rejects_capacity_overrun() {
@@ -1145,6 +1207,81 @@ mod tests {
             .bound_length_bytes_for_source_end(
                 &TokenSpanWork::from_token_ids(&[1, 2, 3, 4, 5, 6, 7, 8, 9], 0..9).unwrap(),
                 9,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn token_witness_accepts_scheduler_capacity_below_canonical_extent() {
+        let value_id = ProgramValueId::new("value/scheduled-output").unwrap();
+        let resource_id = ResourceId::new("resource/scheduled-output").unwrap();
+        let projection = NodeTokenBindingProjection {
+            value_id: value_id.clone(),
+            role: ResolvedValueRole::Output,
+            ordinal: 0,
+            axis: 0,
+            rank: 2,
+            canonical_extent: 8,
+        };
+        let mut node = PlanNode::resource_test_node(NodeId::new("node/scheduled-output").unwrap());
+        node.work = NodeWorkContract::Tokens {
+            source: projection.clone(),
+            projections: vec![projection],
+        };
+        let binding = ResolvedValueBinding::new(
+            value_id.clone(),
+            ResolvedValueRole::Output,
+            0,
+            ResolvedTensorSpec::new(
+                vec![8, 8],
+                ElementType::F16,
+                ResolvedTensorLayout::Contiguous,
+            )
+            .unwrap(),
+            TensorAccess::Write,
+            AliasPolicy::NoAlias,
+            BufferUsage::Activations,
+            None,
+            ResolvedValueStorage::single(resource_id.clone(), 0, 128, ElementType::F16).unwrap(),
+        )
+        .unwrap();
+        let descriptor = dynamic_activation_descriptor(resource_id, 16, 4);
+
+        let witnesses = ExecutionDeterminismWitnessSpec::from_binding(
+            &node,
+            ExecutionDeterminismWitnessKind::Output {
+                value_id,
+                output_ordinal: 0,
+            },
+            &binding,
+            &[descriptor],
+        )
+        .unwrap();
+        let witness = &witnesses[0];
+        validate_determinism_location(witness.location()).unwrap();
+        assert_eq!(
+            witness.extent(),
+            ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+                bytes_per_token: 16,
+                maximum_tokens: 4,
+            }
+        );
+        assert_eq!(witness.maximum_bound_length_bytes().unwrap(), 64);
+        assert_eq!(
+            witness
+                .location()
+                .bound_length_bytes_for_source_end(
+                    &TokenSpanWork::from_token_ids(&[1, 2, 3, 4], 0..4).unwrap(),
+                    4,
+                )
+                .unwrap(),
+            64
+        );
+        assert!(witness
+            .location()
+            .bound_length_bytes_for_source_end(
+                &TokenSpanWork::from_token_ids(&[1, 2, 3, 4, 5], 0..5).unwrap(),
+                5,
             )
             .is_err());
     }
