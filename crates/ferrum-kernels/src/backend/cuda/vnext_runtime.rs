@@ -25,12 +25,12 @@ use ferrum_interfaces::vnext::{
     DeviceReusableAddressScope, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
-    DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
-    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
-    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ProgramBindingNodeBinding, StreamState, VNextError,
+    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionTrim, DeviceRuntime,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
+    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
+    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
+    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, StreamState, VNextError,
 };
 use ferrum_types::AttentionExecutionPolicy;
 
@@ -311,6 +311,7 @@ pub struct CudaDeviceCommand {
     fence_dependencies: Vec<CudaBufferRegion>,
     replay_key: Option<CudaCommandReplayKey>,
     reusable_address_scope: Option<DeviceReusableAddressScope>,
+    replay_gap_reason: Option<DeviceReusableExecutionProgramGapReason>,
     program_binding_patch: Option<CudaProgramBindingPatch>,
     reusable_execution: Option<DeviceReusableExecutionInvocation>,
 }
@@ -549,7 +550,7 @@ impl CudaDeviceCommand {
                 "CUDA operation host storage contains an empty region",
             ));
         }
-        let (replay_key, reusable_address_scope) =
+        let (replay_key, reusable_address_scope, replay_gap_reason) =
             bind_replay_contract(replay_key, operation, &regions, &host_storage);
         Ok(Self {
             runtime_instance,
@@ -567,6 +568,7 @@ impl CudaDeviceCommand {
             fence_dependencies,
             replay_key,
             reusable_address_scope,
+            replay_gap_reason,
             program_binding_patch: None,
             reusable_execution: None,
         })
@@ -589,7 +591,7 @@ impl CudaDeviceCommand {
         let runtime_instance = common_runtime_instance(&regions)?;
         validate_fence_dependencies(runtime_instance, &fence_dependencies)?;
         let host_storage = Vec::new();
-        let (replay_key, reusable_address_scope) =
+        let (replay_key, reusable_address_scope, replay_gap_reason) =
             bind_replay_contract(replay_key, operation, &regions, &host_storage);
         Ok(Self {
             runtime_instance,
@@ -607,6 +609,7 @@ impl CudaDeviceCommand {
             fence_dependencies,
             replay_key,
             reusable_address_scope,
+            replay_gap_reason,
             program_binding_patch: None,
             reusable_execution: None,
         })
@@ -636,6 +639,7 @@ impl CudaDeviceCommand {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
         }
@@ -702,6 +706,7 @@ impl CudaDeviceCommand {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            replay_gap_reason: None,
             program_binding_patch: Some(CudaProgramBindingPatch {
                 binding,
                 destination,
@@ -775,6 +780,7 @@ impl CudaDeviceCommand {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: Some(invocation),
         }
@@ -975,6 +981,7 @@ impl CudaDeviceCommand {
             fence_dependencies,
             replay_key: None,
             reusable_address_scope: None,
+            replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
         }])
@@ -1031,6 +1038,7 @@ impl CudaDeviceCommand {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
         }])
@@ -1087,6 +1095,12 @@ impl CudaDeviceCommand {
         self.reusable_address_scope
     }
 
+    pub(crate) const fn replay_gap_reason(
+        &self,
+    ) -> Option<DeviceReusableExecutionProgramGapReason> {
+        self.replay_gap_reason
+    }
+
     pub(crate) fn executable(&self) -> Arc<CudaCommandExecutable> {
         Arc::clone(&self.executable)
     }
@@ -1100,24 +1114,39 @@ fn bind_replay_contract(
 ) -> (
     Option<CudaCommandReplayKey>,
     Option<DeviceReusableAddressScope>,
+    Option<DeviceReusableExecutionProgramGapReason>,
 ) {
     let Some(key) = replay_key else {
-        return (None, None);
+        return (
+            None,
+            None,
+            Some(DeviceReusableExecutionProgramGapReason::ProviderReplayKeyMissing),
+        );
     };
     let mut scope = DeviceReusableAddressScope::Plan;
     for region in regions {
         let Some(region_scope) = region.reusable_address_scope else {
-            return (None, None);
+            return (
+                None,
+                None,
+                Some(DeviceReusableExecutionProgramGapReason::ReusableAddressScopeMissing),
+            );
         };
         match region_scope {
             DeviceReusableAddressScope::Plan => {}
-            DeviceReusableAddressScope::ExecutionLane(lane_id) => match scope {
-                DeviceReusableAddressScope::Plan => {
-                    scope = DeviceReusableAddressScope::ExecutionLane(lane_id);
+            DeviceReusableAddressScope::ExecutionLane(lane_id) => {
+                match scope {
+                    DeviceReusableAddressScope::Plan => {
+                        scope = DeviceReusableAddressScope::ExecutionLane(lane_id);
+                    }
+                    DeviceReusableAddressScope::ExecutionLane(current) if current == lane_id => {}
+                    DeviceReusableAddressScope::ExecutionLane(_) => return (
+                        None,
+                        None,
+                        Some(DeviceReusableExecutionProgramGapReason::ReusableAddressScopeConflict),
+                    ),
                 }
-                DeviceReusableAddressScope::ExecutionLane(current) if current == lane_id => {}
-                DeviceReusableAddressScope::ExecutionLane(_) => return (None, None),
-            },
+            }
         }
     }
     (
@@ -1131,6 +1160,7 @@ fn bind_replay_contract(
             ),
         ),
         Some(scope),
+        None,
     )
 }
 
@@ -2263,51 +2293,50 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 replay_observation.observe_candidate_segment();
             }
         }
-        let preparation = stream.executable_cache.prepare_all(
+        let preparation = match stream.executable_cache.prepare_all(
             &self.context,
             &stream.stream,
             &stream.blas,
             &commands,
             &executable_candidates,
             capture_allowed,
-        );
-        match preparation {
-            Ok(preparation) if S::ENABLED => {
-                for _ in 0..preparation.captured_segments() {
-                    replay_observation.observe_captured_segment();
-                }
-                for _ in 0..preparation.uploaded_segments() {
-                    replay_observation.observe_uploaded_segment();
-                }
-                for _ in 0..preparation.cache_hit_segments() {
-                    replay_observation.observe_cache_hit_segment();
-                }
-                for _ in 0..preparation.cached_rejected_segments() {
-                    replay_observation.observe_cached_rejected_segment();
-                }
-                for _ in 0..preparation.capture_rejected_segments() {
-                    replay_observation.observe_capture_rejection();
-                }
-                for _ in 0..preparation.quiescence_deferred_segments() {
-                    replay_observation.observe_quiescence_deferred_segment();
-                }
-                for _ in 0..preparation.capacity_deferred_segments() {
-                    replay_observation.observe_capacity_deferred_segment();
-                }
-                for _ in 0..preparation.outside_preparation_segments() {
-                    replay_observation.observe_outside_preparation_segment();
-                }
-                for _ in 0..preparation.evicted_segments() {
-                    replay_observation.observe_evicted_segment();
-                }
-            }
-            Ok(_) => {}
+        ) {
+            Ok(preparation) => preparation,
             Err(error) => {
                 stream.state.fail();
                 self.quarantine(stream, commands);
                 panic!(
                     "CUDA submission became indeterminate while preparing reusable executables: {error}"
                 );
+            }
+        };
+        if S::ENABLED {
+            for _ in 0..preparation.captured_segments() {
+                replay_observation.observe_captured_segment();
+            }
+            for _ in 0..preparation.uploaded_segments() {
+                replay_observation.observe_uploaded_segment();
+            }
+            for _ in 0..preparation.cache_hit_segments() {
+                replay_observation.observe_cache_hit_segment();
+            }
+            for _ in 0..preparation.cached_rejected_segments() {
+                replay_observation.observe_cached_rejected_segment();
+            }
+            for _ in 0..preparation.capture_rejected_segments() {
+                replay_observation.observe_capture_rejection();
+            }
+            for _ in 0..preparation.quiescence_deferred_segments() {
+                replay_observation.observe_quiescence_deferred_segment();
+            }
+            for _ in 0..preparation.capacity_deferred_segments() {
+                replay_observation.observe_capacity_deferred_segment();
+            }
+            for _ in 0..preparation.outside_preparation_segments() {
+                replay_observation.observe_outside_preparation_segment();
+            }
+            for _ in 0..preparation.evicted_segments() {
+                replay_observation.observe_evicted_segment();
             }
         }
         if let Some(capture) = reusable_execution_capture.as_ref() {
@@ -2317,8 +2346,10 @@ impl DeviceRuntime for CudaDeviceRuntime {
             if let Err(error) = stream.executable_cache.register_program(
                 capture,
                 &executable_candidates,
+                &command_phases,
                 command_node_indices,
                 &commands,
+                &preparation,
             ) {
                 stream.state.fail();
                 self.quarantine(stream, commands);
@@ -2854,6 +2885,7 @@ mod tests {
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
+            replay_gap_reason: None,
             program_binding_patch: None,
             reusable_execution: None,
         }

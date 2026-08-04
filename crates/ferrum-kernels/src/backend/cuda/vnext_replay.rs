@@ -20,7 +20,8 @@ use ferrum_interfaces::vnext::{
     DeviceCommandPhase, DeviceReplayedLogicalCommandAttribution, DeviceReusableAddressScope,
     DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionPreparationState,
-    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGap,
+    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionSegment, DeviceTimingMode, ElementType,
 };
 use sha2::{Digest, Sha256};
@@ -583,7 +584,7 @@ impl CudaExecutableLaunch {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CudaExecutablePreparation {
     cache_hit_segments: usize,
     captured_segments: usize,
@@ -594,43 +595,51 @@ pub(crate) struct CudaExecutablePreparation {
     capacity_deferred_segments: usize,
     outside_preparation_segments: usize,
     evicted_segments: usize,
+    candidate_gaps: HashMap<CudaExecutableSegmentKey, DeviceReusableExecutionProgramGapReason>,
 }
 
 impl CudaExecutablePreparation {
-    pub(crate) fn cache_hit_segments(self) -> usize {
+    pub(crate) fn cache_hit_segments(&self) -> usize {
         self.cache_hit_segments
     }
 
-    pub(crate) fn captured_segments(self) -> usize {
+    pub(crate) fn captured_segments(&self) -> usize {
         self.captured_segments
     }
 
-    pub(crate) fn uploaded_segments(self) -> usize {
+    pub(crate) fn uploaded_segments(&self) -> usize {
         self.uploaded_segments
     }
 
-    pub(crate) fn capture_rejected_segments(self) -> usize {
+    pub(crate) fn capture_rejected_segments(&self) -> usize {
         self.capture_rejected_segments
     }
 
-    pub(crate) fn cached_rejected_segments(self) -> usize {
+    pub(crate) fn cached_rejected_segments(&self) -> usize {
         self.cached_rejected_segments
     }
 
-    pub(crate) fn quiescence_deferred_segments(self) -> usize {
+    pub(crate) fn quiescence_deferred_segments(&self) -> usize {
         self.quiescence_deferred_segments
     }
 
-    pub(crate) fn capacity_deferred_segments(self) -> usize {
+    pub(crate) fn capacity_deferred_segments(&self) -> usize {
         self.capacity_deferred_segments
     }
 
-    pub(crate) fn outside_preparation_segments(self) -> usize {
+    pub(crate) fn outside_preparation_segments(&self) -> usize {
         self.outside_preparation_segments
     }
 
-    pub(crate) fn evicted_segments(self) -> usize {
+    pub(crate) fn evicted_segments(&self) -> usize {
         self.evicted_segments
+    }
+
+    fn candidate_gap(
+        &self,
+        key: CudaExecutableSegmentKey,
+    ) -> Option<DeviceReusableExecutionProgramGapReason> {
+        self.candidate_gaps.get(&key).copied()
     }
 }
 
@@ -694,10 +703,16 @@ impl CudaExecutableCache {
                 report.cache_hit_segments += 1;
             }
         }
-        report.cached_rejected_segments = candidates
+        for candidate in candidates
             .iter()
             .filter(|candidate| self.rejected.contains_key(&candidate.key))
-            .count();
+        {
+            report.cached_rejected_segments += 1;
+            report.candidate_gaps.insert(
+                candidate.key,
+                DeviceReusableExecutionProgramGapReason::CachedCaptureRejected,
+            );
+        }
 
         if candidates.is_empty() {
             return Ok(report);
@@ -707,6 +722,15 @@ impl CudaExecutableCache {
                 .len()
                 .saturating_sub(report.cache_hit_segments)
                 .saturating_sub(report.cached_rejected_segments);
+            for candidate in candidates.iter().filter(|candidate| {
+                !self.entries.contains_key(&candidate.key)
+                    && !self.rejected.contains_key(&candidate.key)
+            }) {
+                report.candidate_gaps.insert(
+                    candidate.key,
+                    DeviceReusableExecutionProgramGapReason::OutsidePreparation,
+                );
+            }
             return Ok(report);
         }
         if !capture_allowed {
@@ -714,6 +738,15 @@ impl CudaExecutableCache {
                 .len()
                 .saturating_sub(report.cache_hit_segments)
                 .saturating_sub(report.cached_rejected_segments);
+            for candidate in candidates.iter().filter(|candidate| {
+                !self.entries.contains_key(&candidate.key)
+                    && !self.rejected.contains_key(&candidate.key)
+            }) {
+                report.candidate_gaps.insert(
+                    candidate.key,
+                    DeviceReusableExecutionProgramGapReason::QuiescenceDeferred,
+                );
+            }
             return Ok(report);
         }
 
@@ -736,6 +769,12 @@ impl CudaExecutableCache {
                 .expect("open reusable execution preparation has a capacity"),
         );
         report.capacity_deferred_segments = plan.capacity_deferred_misses().len();
+        for key in plan.capacity_deferred_misses() {
+            report.candidate_gaps.insert(
+                *key,
+                DeviceReusableExecutionProgramGapReason::CapacityDeferred,
+            );
+        }
 
         let mut captured = Vec::with_capacity(plan.admitted_misses().len());
         for key in plan.admitted_misses().iter().copied() {
@@ -756,6 +795,10 @@ impl CudaExecutableCache {
                 Err(error) if error.eager_fallback_safe() => {
                     self.remember_rejected(key, now);
                     report.capture_rejected_segments += 1;
+                    report.candidate_gaps.insert(
+                        key,
+                        DeviceReusableExecutionProgramGapReason::CaptureRejected,
+                    );
                     tracing::debug!(
                         error = %error,
                         command_count = candidate.end() - candidate.start(),
@@ -784,6 +827,16 @@ impl CudaExecutableCache {
                 .expect("captured CUDA executable was committed before upload")
                 .upload(stream)?;
             report.uploaded_segments += 1;
+        }
+        if candidates.iter().any(|candidate| {
+            !self.entries.contains_key(&candidate.key)
+                && !report.candidate_gaps.contains_key(&candidate.key)
+        }) {
+            return Err(CudaReplayError {
+                stage: "prepare reusable executables",
+                detail: "non-resident candidate has no typed preparation disposition".to_owned(),
+                eager_fallback_safe: false,
+            });
         }
         self.preparation
             .record_batch(
@@ -828,11 +881,23 @@ impl CudaExecutableCache {
         &mut self,
         capture: &DeviceReusableExecutionCapture,
         candidates: &[CudaExecutableCandidate],
+        command_phases: &[DeviceCommandPhase],
         command_node_indices: &[Option<u32>],
         commands: &[CudaDeviceCommand],
+        preparation: &CudaExecutablePreparation,
     ) -> Result<(), CudaReplayError> {
         if !self.preparation.capture_is_open() {
             return Ok(());
+        }
+        if command_phases.len() != command_node_indices.len()
+            || command_phases.len() != commands.len()
+        {
+            return Err(CudaReplayError {
+                stage: "register reusable execution program",
+                detail: "command phases, node attribution, and commands differ in length"
+                    .to_owned(),
+                eager_fallback_safe: false,
+            });
         }
         let mut segments = Vec::new();
         for candidate in candidates
@@ -940,8 +1005,58 @@ impl CudaExecutableCache {
                 logical_commands,
             });
         }
-        if segments.is_empty() {
-            return Ok(());
+        let resident_node_indices = segments
+            .iter()
+            .flat_map(|segment| {
+                segment.descriptor.start_node_index()..segment.descriptor.end_node_index()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let eager_boundary_node_indices = capture
+            .eager_boundary_node_indices()
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let mut gaps = Vec::new();
+        for node_index in 0..capture.node_count() {
+            if resident_node_indices.contains(&node_index)
+                || eager_boundary_node_indices.contains(&node_index)
+            {
+                continue;
+            }
+            let compute_command_indices = command_phases
+                .iter()
+                .zip(command_node_indices)
+                .enumerate()
+                .filter_map(|(command_index, (phase, attributed_node_index))| {
+                    (*phase == DeviceCommandPhase::Compute
+                        && *attributed_node_index == Some(node_index))
+                    .then_some(command_index)
+                })
+                .collect::<Vec<_>>();
+            let reason = if compute_command_indices.is_empty() {
+                DeviceReusableExecutionProgramGapReason::MissingComputeCommand
+            } else if let Some(reason) = compute_command_indices
+                .iter()
+                .find_map(|command_index| commands[*command_index].replay_gap_reason())
+            {
+                reason
+            } else if let Some(reason) = candidates
+                .iter()
+                .filter(|candidate| {
+                    compute_command_indices
+                        .iter()
+                        .any(|command_index| candidate.range.contains(command_index))
+                })
+                .find_map(|candidate| preparation.candidate_gap(candidate.key))
+            {
+                reason
+            } else {
+                // Every command supplied a replay key and address scope but no
+                // candidate owns the node. The only remaining discovery
+                // failure is an incompatible combined address scope.
+                DeviceReusableExecutionProgramGapReason::ReusableAddressScopeConflict
+            };
+            gaps.push(DeviceReusableExecutionProgramGap::new(node_index, reason));
         }
         let binding_node_indices = capture
             .per_wave_binding_node_indices()
@@ -954,12 +1069,13 @@ impl CudaExecutableCache {
             })
             .collect::<Vec<_>>();
         let descriptor = DeviceReusableExecutionProgram::new(
-            capture.program_id().clone(),
+            capture,
             segments
                 .iter()
                 .map(|segment| segment.descriptor.clone())
                 .collect(),
             binding_node_indices,
+            gaps,
         )
         .map_err(|error| CudaReplayError {
             stage: "register reusable execution program",
@@ -970,18 +1086,11 @@ impl CudaExecutableCache {
             descriptor,
             segments,
         };
-        match self.programs.get(capture.program_id()) {
-            Some(current) if current == &program => Ok(()),
-            Some(_) => Err(CudaReplayError {
-                stage: "register reusable execution program",
-                detail: "one typed program id resolved to different resident segments".to_owned(),
-                eager_fallback_safe: false,
-            }),
-            None => {
-                self.programs.insert(capture.program_id().clone(), program);
-                Ok(())
-            }
-        }
+        // The catalog is private while preparation is open. Replacing this row
+        // allows deferred/captured candidates to converge before seal; the
+        // typed program id already fixes the logical topology.
+        self.programs.insert(capture.program_id().clone(), program);
+        Ok(())
     }
 
     pub(crate) fn catalog(&self) -> Result<Vec<DeviceReusableExecutionProgram>, String> {
