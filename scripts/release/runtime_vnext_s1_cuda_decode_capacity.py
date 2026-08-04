@@ -409,6 +409,7 @@ def derive_target_budget_envelope(
     pool_storage_profiles: dict[str, Any] = {}
     pool_contracts: dict[str, Any] = {}
     token_scaled_sequence_pool_ids: list[str] = []
+    token_scaled_sequence_pressure_quanta: dict[str, int] = {}
     for pool_id in sorted(calibration_pools):
         calibration_bytes = calibration_pools[pool_id]
         sizing_bytes = sizing_pools[pool_id]
@@ -454,12 +455,20 @@ def derive_target_budget_envelope(
             <= sizing_contract["provisioning"]["maximum_resident_bytes"],
             f"typed initial bundle floor exceeds the pool ceiling for {pool_id}",
         )
-        if any(
-            resource.get("lifetime") == "sequence"
-            and demand_is_token_scaled(resource.get("demand"))
+        token_scaled_sequence_resources = [
+            resource
             for resource in sizing_contract["resources"]
-        ):
+            if (
+                resource.get("lifetime") == "sequence"
+                and demand_is_token_scaled(resource.get("demand"))
+            )
+        ]
+        if token_scaled_sequence_resources:
             token_scaled_sequence_pool_ids.append(pool_id)
+            token_scaled_sequence_pressure_quanta[pool_id] = max(
+                resource["physical_allocation_quantum_bytes"]
+                for resource in token_scaled_sequence_resources
+            )
         sizing_observed_pool_resident_bytes[pool_id] = sizing_bytes
         observed_or_floor_pool_bytes[pool_id] = observed_or_floor_bytes
         initial_bundle_floor_bytes_by_pool[pool_id] = initial_bundle_floor
@@ -503,15 +512,35 @@ def derive_target_budget_envelope(
         "typed initial bundles do not fit the calibrated resident budget",
     )
     observed_or_floor_resident_bytes = sum(observed_or_floor_pool_bytes.values())
-    observed_or_floor_budget_gap_bytes = max(
-        0, observed_or_floor_resident_bytes - calibration_resident_bytes
+    pressure_quantum_bytes = max(token_scaled_sequence_pressure_quanta.values())
+    require(
+        observed_or_floor_resident_bytes > pressure_quantum_bytes,
+        "target sizing cannot reserve one typed sequence allocation quantum",
     )
-    resident_bytes = calibration_resident_bytes
-    exact_budget = calibration_budget
+    pressure_budget_candidate_resident_bytes = (
+        observed_or_floor_resident_bytes - pressure_quantum_bytes
+    )
+    resident_bytes = min(
+        calibration_resident_bytes,
+        pressure_budget_candidate_resident_bytes,
+    )
+    require(
+        resident_bytes >= minimum_initial_bundle_resident_bytes,
+        "typed initial bundles do not fit after reserving decode pressure",
+    )
+    observed_or_floor_budget_gap_bytes = (
+        observed_or_floor_resident_bytes - resident_bytes
+    )
+    require(
+        observed_or_floor_budget_gap_bytes >= pressure_quantum_bytes,
+        "decode pressure budget did not reserve one typed sequence allocation quantum",
+    )
+    exact_budget = static_bytes + resident_bytes
     return {
         "static_bytes": static_bytes,
         "resident_bytes": resident_bytes,
         "budget_claimed_bytes": exact_budget,
+        "calibration_resident_bytes": calibration_resident_bytes,
         "maximum_active_sequences": maximum_active_sequences,
         "sizing_observed_resident_bytes": sizing_resident_bytes,
         "sizing_observed_pool_resident_bytes": sizing_observed_pool_resident_bytes,
@@ -519,10 +548,18 @@ def derive_target_budget_envelope(
         "observed_or_floor_resident_bytes": observed_or_floor_resident_bytes,
         "observed_or_floor_budget_gap_bytes": observed_or_floor_budget_gap_bytes,
         "requires_cross_pool_rebalance": observed_or_floor_budget_gap_bytes > 0,
+        "pressure_quantum_bytes": pressure_quantum_bytes,
+        "pressure_quantum_bytes_by_pool": token_scaled_sequence_pressure_quanta,
+        "pressure_budget_candidate_resident_bytes": (
+            pressure_budget_candidate_resident_bytes
+        ),
+        "pressure_budget_reduction_from_calibration_bytes": (
+            calibration_resident_bytes - resident_bytes
+        ),
         "initial_bundle_floor_bytes_by_pool": initial_bundle_floor_bytes_by_pool,
         "minimum_initial_bundle_resident_bytes": minimum_initial_bundle_resident_bytes,
         "initial_bundle_headroom_bytes": (
-            calibration_resident_bytes - minimum_initial_bundle_resident_bytes
+            resident_bytes - minimum_initial_bundle_resident_bytes
         ),
         "token_scaled_sequence_pool_ids": token_scaled_sequence_pool_ids,
         "pool_storage_profiles": pool_storage_profiles,
@@ -3305,14 +3342,36 @@ def self_test() -> int:
         and target_envelope["observed_or_floor_resident_bytes"] == 37
         and target_envelope["observed_or_floor_budget_gap_bytes"] == 1
         and target_envelope["requires_cross_pool_rebalance"] is True
+        and target_envelope["pressure_quantum_bytes"] == 1
+        and target_envelope["pressure_quantum_bytes_by_pool"]
+        == {"sequence": 1}
+        and target_envelope["pressure_budget_candidate_resident_bytes"] == 36
+        and target_envelope["pressure_budget_reduction_from_calibration_bytes"] == 0
         and target_envelope["initial_bundle_floor_bytes_by_pool"]
         == {"sequence": 30, "workspace": 4}
         and target_envelope["minimum_initial_bundle_resident_bytes"] == 34
         and target_envelope["initial_bundle_headroom_bytes"] == 2
         and target_envelope["token_scaled_sequence_pool_ids"] == ["sequence"]
         and target_envelope["pool_contracts"] == pool_contracts
+        and target_envelope["calibration_resident_bytes"] == 36
         and target_envelope["bootstrap_headroom_bytes"] == 9,
         "self-test lost typed target-sizing provenance",
+    )
+    wider_calibration_pool = pool_snapshot(
+        {"sequence": 34, "workspace": 6}, calibration_contracts
+    )
+    pressure_envelope = derive_target_budget_envelope(
+        wider_calibration_pool, sizing_pool
+    )
+    require(
+        pressure_envelope["calibration_resident_bytes"] == 40
+        and pressure_envelope["pressure_budget_candidate_resident_bytes"] == 36
+        and pressure_envelope["resident_bytes"] == 36
+        and pressure_envelope["budget_claimed_bytes"] == 136
+        and pressure_envelope["pressure_budget_reduction_from_calibration_bytes"] == 4
+        and pressure_envelope["observed_or_floor_budget_gap_bytes"] == 1
+        and pressure_envelope["requires_cross_pool_rebalance"] is True,
+        "self-test let calibration headroom erase typed decode pressure",
     )
     require_target_pool_within_budget_contract(
         pool_snapshot({"sequence": 32, "workspace": 4}), target_envelope, 136
