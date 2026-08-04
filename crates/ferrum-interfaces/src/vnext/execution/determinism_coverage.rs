@@ -14,7 +14,7 @@ use super::{invalid_plan, ExecutionDeterminismWitnessPlan};
 
 pub const EXECUTION_DETERMINISM_COVERAGE_VERSION: ContractVersion = ContractVersion::new(1, 0);
 pub const EXECUTION_DETERMINISM_EVIDENCE_DENOMINATOR_VERSION: ContractVersion =
-    ContractVersion::new(1, 0);
+    ContractVersion::new(1, 1);
 
 const MAX_COVERAGE_WIRE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVIDENCE_DENOMINATOR_WIRE_BYTES: usize = 128 * 1024 * 1024;
@@ -29,6 +29,13 @@ pub enum ExecutionDeterminismComparisonKind {
     EagerEager,
     ReplayReplay,
     EagerReplay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionDeterminismProviderCoverage {
+    AllCatalogProviders,
+    SelectedPlanProviders,
 }
 
 impl ExecutionDeterminismComparisonKind {
@@ -620,6 +627,7 @@ impl ExecutionDeterminismProviderEvidenceDenominator {
 #[serde(deny_unknown_fields)]
 pub struct ExecutionDeterminismEvidenceDenominator {
     schema_version: ContractVersion,
+    provider_coverage: ExecutionDeterminismProviderCoverage,
     coverage: ExecutionDeterminismCoverageRegistry,
     provider_evidence: Vec<ExecutionDeterminismProviderEvidenceDenominator>,
 }
@@ -628,6 +636,18 @@ impl ExecutionDeterminismEvidenceDenominator {
     pub fn from_catalog_and_resolved_plans(
         catalog: &CapabilityCatalog,
         plans: &[(&str, &ResolvedModelPlan)],
+    ) -> Result<Self, VNextError> {
+        Self::from_catalog_and_resolved_plans_with_provider_coverage(
+            catalog,
+            plans,
+            ExecutionDeterminismProviderCoverage::AllCatalogProviders,
+        )
+    }
+
+    pub fn from_catalog_and_resolved_plans_with_provider_coverage(
+        catalog: &CapabilityCatalog,
+        plans: &[(&str, &ResolvedModelPlan)],
+        provider_coverage: ExecutionDeterminismProviderCoverage,
     ) -> Result<Self, VNextError> {
         if plans.is_empty() || plans.len() > MAX_COVERAGE_MODELS {
             return Err(invalid_plan(
@@ -645,7 +665,9 @@ impl ExecutionDeterminismEvidenceDenominator {
             }
             coverage.try_add_resolved_model_plan(*model_key, plan)?;
         }
-        if coverage.unselected_provider_requirements().next().is_some() {
+        if provider_coverage == ExecutionDeterminismProviderCoverage::AllCatalogProviders
+            && coverage.unselected_provider_requirements().next().is_some()
+        {
             return Err(invalid_plan(
                 "execution determinism live catalog contains a provider absent from all resolved plans",
             ));
@@ -684,6 +706,7 @@ impl ExecutionDeterminismEvidenceDenominator {
         provider_evidence.sort_by(|left, right| left.canonical_key().cmp(&right.canonical_key()));
         let denominator = Self {
             schema_version: EXECUTION_DETERMINISM_EVIDENCE_DENOMINATOR_VERSION,
+            provider_coverage,
             coverage,
             provider_evidence,
         };
@@ -693,6 +716,10 @@ impl ExecutionDeterminismEvidenceDenominator {
 
     pub const fn schema_version(&self) -> ContractVersion {
         self.schema_version
+    }
+
+    pub const fn provider_coverage(&self) -> ExecutionDeterminismProviderCoverage {
+        self.provider_coverage
     }
 
     pub fn coverage(&self) -> &ExecutionDeterminismCoverageRegistry {
@@ -736,11 +763,12 @@ impl ExecutionDeterminismEvidenceDenominator {
             || self.provider_evidence.is_empty()
             || self.provider_evidence.len()
                 > MAX_COVERAGE_MODELS.saturating_mul(MAX_COVERAGE_PROVIDERS)
-            || self
-                .coverage
-                .unselected_provider_requirements()
-                .next()
-                .is_some()
+            || (self.provider_coverage == ExecutionDeterminismProviderCoverage::AllCatalogProviders
+                && self
+                    .coverage
+                    .unselected_provider_requirements()
+                    .next()
+                    .is_some())
             || self
                 .provider_evidence
                 .windows(2)
