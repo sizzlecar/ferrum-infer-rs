@@ -21,8 +21,9 @@ use ferrum_interfaces::vnext::{
     OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
     ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
     ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
-    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
-    VNextError, WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
+    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
+    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, SemanticValue, VNextError,
+    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
     RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
 };
@@ -116,35 +117,24 @@ pub(super) fn captured_contiguous_addresses_are_reusable(
     input_count: u32,
     workspaces: &[CapturedProviderWorkspace],
 ) -> Result<bool, VNextError> {
-    for ordinal in 0..input_count {
-        if request
-            .binding_reusable_address_scope(ResolvedValueRole::Input, ordinal)?
-            .is_none()
-        {
-            return Ok(false);
-        }
-    }
-    if request
-        .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
-        .is_none()
-    {
-        return Ok(false);
-    }
-    for workspace in workspaces {
-        let scope = match workspace {
-            CapturedProviderWorkspace::Scratch => request.scratch_reusable_address_scope()?,
-            CapturedProviderWorkspace::Binding => {
-                request.binding_workspace_reusable_address_scope()?
-            }
-            CapturedProviderWorkspace::Persistent => {
-                request.persistent_workspace_reusable_address_scope()?
-            }
-        };
-        if scope.is_none() {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    let mut values = (0..input_count)
+        .map(|ordinal| ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal))
+        .collect::<Vec<_>>();
+    values.push(ReusableExecutionValueAddress::captured(
+        ResolvedValueRole::Output,
+        0,
+    ));
+    let workspaces = workspaces
+        .iter()
+        .map(|workspace| match workspace {
+            CapturedProviderWorkspace::Scratch => ReusableExecutionWorkspaceAddress::Scratch,
+            CapturedProviderWorkspace::Binding => ReusableExecutionWorkspaceAddress::Binding,
+            CapturedProviderWorkspace::Persistent => ReusableExecutionWorkspaceAddress::Persistent,
+        })
+        .collect::<Vec<_>>();
+    request
+        .reusable_address_scope(&values, &workspaces)
+        .map(|scope| scope.is_some())
 }
 
 pub(super) fn static_contiguous_reusable_topology(

@@ -763,12 +763,42 @@ impl OperationProvider<TestRuntime> for TestProvider {
                 };
             }
             ProviderBehavior::ProgramBinding | ProviderBehavior::ProgramBindingWithScratchTail => {
-                request
-                    .binding_workspace_reusable_address_scope()?
+                let program_bound_identity = if request.node_id().as_str() == "node.main" {
+                    (ResolvedValueRole::Input, 0)
+                } else {
+                    (ResolvedValueRole::Output, 0)
+                };
+                let addresses = request
+                    .bindings()
+                    .iter()
+                    .map(|binding| {
+                        if (binding.role(), binding.ordinal()) == program_bound_identity {
+                            ReusableExecutionValueAddress::program_binding(
+                                binding.role(),
+                                binding.ordinal(),
+                            )
+                        } else {
+                            ReusableExecutionValueAddress::captured(
+                                binding.role(),
+                                binding.ordinal(),
+                            )
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let scope = request
+                    .reusable_address_scope(
+                        &addresses,
+                        &[ReusableExecutionWorkspaceAddress::Binding],
+                    )?
                     .ok_or_else(|| VNextError::InvalidExecutionPlan {
-                        reason: "program-binding test workspace lacks reusable address authority"
+                        reason: "program-binding test captured address lacks reusable authority"
                             .to_owned(),
                     })?;
+                if matches!(scope, DeviceReusableAddressScope::Plan) {
+                    return Err(VNextError::InvalidExecutionPlan {
+                        reason: "program-binding test unexpectedly used plan scope".to_owned(),
+                    });
+                }
             }
             ProviderBehavior::ProgramBindingFirstNodeEagerBoundary
                 if request.node_id().as_str() == "node.main" =>
@@ -787,26 +817,7 @@ impl OperationProvider<TestRuntime> for TestProvider {
             .max()
             .unwrap_or_default();
         fingerprint[8..16].copy_from_slice(&source_frontier.to_le_bytes());
-        let activation_role = if request.node_id().as_str() == "node.main" {
-            ResolvedValueRole::Output
-        } else {
-            ResolvedValueRole::Input
-        };
-        let activation_scope = request
-            .binding_reusable_address_scope(activation_role, 0)?
-            .ok_or_else(|| VNextError::InvalidExecutionPlan {
-                reason: "program-binding test activation lacks reusable address authority"
-                    .to_owned(),
-            })?;
-        fingerprint[16] = match activation_scope {
-            DeviceReusableAddressScope::ExecutionLane(_) => 2,
-            DeviceReusableAddressScope::Plan => {
-                return Err(VNextError::InvalidExecutionPlan {
-                    reason: "program-binding test activation unexpectedly used plan scope"
-                        .to_owned(),
-                });
-            }
-        };
+        fingerprint[16] = 2;
         Ok(ReusableExecutionTopology::Dynamic(
             DeviceReusableExecutionTopologyFingerprint::from_sha256(fingerprint),
         ))

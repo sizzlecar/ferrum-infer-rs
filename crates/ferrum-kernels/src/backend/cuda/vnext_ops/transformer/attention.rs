@@ -17,16 +17,17 @@ use ferrum_interfaces::vnext::{
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
     ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
     ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
-    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
-    VNextError, WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
+    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
+    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, SemanticValue, VNextError,
+    WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
     GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
 use super::{
-    attach_invocation_binding, captured_contiguous_addresses_are_reusable, contiguous_bindings,
-    ensure_estimator_request, estimate, launch_gemm_f16, CapturedProviderWorkspace,
+    attach_invocation_binding, contiguous_bindings, ensure_estimator_request, estimate,
+    launch_gemm_f16,
 };
 #[cfg(feature = "vllm-marlin")]
 use super::{
@@ -290,14 +291,26 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        if !captured_contiguous_addresses_are_reusable(
-            &request,
-            10,
-            &[
-                CapturedProviderWorkspace::Scratch,
-                CapturedProviderWorkspace::Binding,
-            ],
-        )? {
+        let mut values = (0..8)
+            .map(|ordinal| {
+                ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
+            })
+            .collect::<Vec<_>>();
+        values.extend([
+            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 8),
+            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 9),
+            ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
+        ]);
+        if request
+            .reusable_address_scope(
+                &values,
+                &[
+                    ReusableExecutionWorkspaceAddress::Scratch,
+                    ReusableExecutionWorkspaceAddress::Binding,
+                ],
+            )?
+            .is_none()
+        {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
         reusable_attention_topology(&request, self.execution_capabilities)
