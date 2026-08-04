@@ -312,6 +312,26 @@ impl BatchWorkShape {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_only(token_spans: Vec<TokenSpanWork>) -> Result<Self, VNextError> {
+        let participant_work = token_spans
+            .into_iter()
+            .enumerate()
+            .map(|(index, token_span)| {
+                let sparse_id =
+                    u32::try_from(index + 1).expect("bounded test participant index fits u32");
+                BatchParticipantTokenSpan::new(
+                    BatchParticipantAuthority::new(
+                        SequenceAuthorityId::test_only(sparse_id, 1),
+                        RequestAuthorityId::test_only(sparse_id, 1),
+                    ),
+                    token_span,
+                )
+            })
+            .collect();
+        Self::new(participant_work)
+    }
+
     pub fn participants(&self) -> &[BatchParticipantAuthority] {
         &self.participants
     }

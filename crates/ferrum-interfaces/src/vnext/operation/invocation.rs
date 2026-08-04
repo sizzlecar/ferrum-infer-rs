@@ -2,15 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use super::super::{
-    AdmittedSequenceResources, AllocationLifetime, BatchInvocationId, BatchParticipantAuthority,
-    BatchParticipantTokenRange, BatchStepId, BatchWorkShape, BufferDescriptor, BufferUsage,
-    DeviceId, DeviceRuntime, EncodedDeviceOperation, ExecutablePlanView, ExecutionIdentityEnvelope,
-    InvocationResourceLease, LogicalAdmissionCoordinatorId, LogicalBackingBufferView, NodeId,
-    NodeWorkContract, PlanHash, PlanId, PlanNode, PreparedStepSubmissionNode,
-    PreparedStepSubmissionWave, ProgramBindingNodeBinding, ProviderId,
-    ProviderWorkspaceRequirement, ResourceId, SemanticValue, SequenceBackingSnapshot,
-    SequenceSessionEpoch, SequenceSessionFingerprint, StepParticipantFrameAssignment,
-    StepResourceLease, TrustedActiveSequenceBinding, TrustedPlanRuntimeEvidence, VNextError,
+    AdmittedSequenceResources, AllocationKind, AllocationLifetime, BatchInvocationId,
+    BatchParticipantAuthority, BatchParticipantTokenRange, BatchStepId, BatchWorkShape,
+    BufferDescriptor, BufferUsage, DeviceId, DeviceRuntime, DynamicResourceDemand,
+    EncodedDeviceOperation, ExecutablePlanView, ExecutionIdentityEnvelope, InvocationResourceLease,
+    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, NodeId, NodeWorkContract, PlanHash,
+    PlanId, PlanNode, PreparedStepSubmissionNode, PreparedStepSubmissionWave,
+    ProgramBindingNodeBinding, ProviderId, ProviderWorkspaceRequirement, ResourceId, SemanticValue,
+    SequenceBackingSnapshot, SequenceSessionEpoch, SequenceSessionFingerprint,
+    StepParticipantFrameAssignment, StepResourceLease, TrustedActiveSequenceBinding,
+    TrustedPlanRuntimeEvidence, VNextError,
 };
 use super::buffer_view::{
     sequence_execution_shape, validate_value_binding_physical_coverage,
@@ -606,10 +607,16 @@ impl<'a, B> OperationInvocation<'a, B> {
                             )
                         })?;
                     let descriptor_lifetime = descriptor.lifetime();
+                    let packed_batch_coordinates =
+                        matches!(descriptor.demand(), DynamicResourceDemand::Tokens { .. })
+                            && matches!(
+                                descriptor_lifetime,
+                                AllocationLifetime::Step | AllocationLifetime::Invocation
+                            );
                     let backing = resources.backing_view(resource_id).or_else(|_| {
                         resources.participant_backing_view(participant_index, resource_id)
                     })?;
-                    let expected_bytes = match descriptor.lifetime() {
+                    let expected_backing_bytes = match descriptor.lifetime() {
                         AllocationLifetime::Invocation => descriptor
                             .evaluate_request_bytes_for_shape(
                                 resources.work_shape()?.immediate_shape(),
@@ -643,8 +650,10 @@ impl<'a, B> OperationInvocation<'a, B> {
                         }
                     };
                     let size_matches = match descriptor.lifetime() {
-                        AllocationLifetime::Sequence => backing.size_bytes() >= expected_bytes,
-                        _ => backing.size_bytes() == expected_bytes,
+                        AllocationLifetime::Sequence => {
+                            backing.size_bytes() >= expected_backing_bytes
+                        }
+                        _ => backing.size_bytes() == expected_backing_bytes,
                     };
                     if !size_matches
                         || backing.capacity_size_bytes() < backing.size_bytes()
@@ -657,14 +666,60 @@ impl<'a, B> OperationInvocation<'a, B> {
                             "logical backing extent differs from plan descriptor `{resource_id}`"
                         )));
                     }
+                    let participant_window = match (
+                        descriptor.lifetime(),
+                        descriptor.kind(),
+                        descriptor.demand(),
+                    ) {
+                        (
+                            AllocationLifetime::Step,
+                            AllocationKind::Value,
+                            DynamicResourceDemand::ActualSequences {
+                                bytes_per_sequence,
+                                maximum_sequences,
+                            },
+                        ) => {
+                            let work_shape = resources.step_resources().work_shape();
+                            if work_shape.immediate_sequences() > *maximum_sequences
+                                || participant_index >= work_shape.participants().len()
+                            {
+                                return Err(invalid_operation(
+                                    "participant fixed resource exceeds its Step work shape",
+                                ));
+                            }
+                            let offset = bytes_per_sequence
+                                .checked_mul(u64::try_from(participant_index).map_err(|_| {
+                                    invalid_operation(
+                                        "participant fixed resource index exceeds u64",
+                                    )
+                                })?)
+                                .ok_or_else(|| {
+                                    invalid_operation(
+                                        "participant fixed resource offset overflows u64",
+                                    )
+                                })?;
+                            Some((offset, *bytes_per_sequence))
+                        }
+                        _ => None,
+                    };
+                    let view_bytes = participant_window
+                        .map(|(_, bytes_per_sequence)| bytes_per_sequence)
+                        .unwrap_or(expected_backing_bytes);
                     let descriptor = BufferDescriptor {
                         resource_id: resource_id.clone(),
-                        size_bytes: expected_bytes,
+                        size_bytes: view_bytes,
                         alignment_bytes: backing.alignment_bytes(),
                         usage: backing.usage(),
                         element_type: backing.element_type(),
                     };
-                    views.push(if backing.capacity_size_bytes() > expected_bytes {
+                    let view = if let Some((offset, _)) = participant_window {
+                        OperationBufferView::from_backing_window(
+                            descriptor,
+                            backing,
+                            offset,
+                            descriptor_lifetime,
+                        )
+                    } else if backing.capacity_size_bytes() > expected_backing_bytes {
                         OperationBufferView::from_backing_prefix(
                             descriptor,
                             backing,
@@ -676,7 +731,8 @@ impl<'a, B> OperationInvocation<'a, B> {
                             backing,
                             descriptor_lifetime,
                         )
-                    });
+                    };
+                    views.push(view.with_packed_batch_coordinates(packed_batch_coordinates));
                 }
             }
         }
@@ -1057,7 +1113,7 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
         role: ResolvedValueRole,
         ordinal: u32,
     ) -> Result<bool, VNextError> {
-        let mut lifetime = None;
+        let mut packed_batch_coordinates = None;
         for participant in &self.participants {
             let binding = participant
                 .bindings()
@@ -1080,20 +1136,17 @@ impl<'a, B> BatchedOperationInvocation<'a, B> {
                 .ok_or_else(|| {
                     invalid_operation("operation value binding has no physical resource view")
                 })?;
-            match lifetime {
-                Some(expected) if expected != view.allocation_lifetime() => {
+            match packed_batch_coordinates {
+                Some(expected) if expected != view.uses_packed_batch_coordinates() => {
                     return Err(invalid_operation(
-                        "operation participants disagree on value allocation lifetime",
+                        "operation participants disagree on value coordinate space",
                     ));
                 }
-                None => lifetime = Some(view.allocation_lifetime()),
+                None => packed_batch_coordinates = Some(view.uses_packed_batch_coordinates()),
                 Some(_) => {}
             }
         }
-        Ok(matches!(
-            lifetime.expect("batched operation invocations are non-empty"),
-            AllocationLifetime::Step | AllocationLifetime::Invocation
-        ))
+        Ok(packed_batch_coordinates.expect("batched operation invocations are non-empty"))
     }
 }
 

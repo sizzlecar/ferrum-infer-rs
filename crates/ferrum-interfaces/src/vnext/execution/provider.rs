@@ -40,6 +40,7 @@ pub struct ExecutionPlanPayload {
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
+    pub(super) terminal_output_resources: Vec<ResourceId>,
     pub(super) nodes: Vec<PlanNode>,
     pub(super) memory: MemoryPlan,
 }
@@ -105,6 +106,10 @@ impl ExecutionPlanPayload {
         &self.retained_completion_values
     }
 
+    pub fn terminal_output_resources(&self) -> &[ResourceId] {
+        &self.terminal_output_resources
+    }
+
     pub fn nodes(&self) -> &[PlanNode] {
         &self.nodes
     }
@@ -130,6 +135,7 @@ pub(super) struct PlanHashMaterial<'a> {
     pub(super) weight_format: &'a WeightFormatId,
     pub(super) quantization_formats: &'a BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: &'a [RetainedCompletionValue],
+    pub(super) terminal_output_resources: &'a [ResourceId],
     pub(super) nodes: &'a [PlanNode],
     pub(super) memory: &'a MemoryPlan,
 }
@@ -152,6 +158,7 @@ impl<'a> From<&'a ExecutionPlanPayload> for PlanHashMaterial<'a> {
             weight_format: &payload.weight_format,
             quantization_formats: &payload.quantization_formats,
             retained_completion_values: &payload.retained_completion_values,
+            terminal_output_resources: &payload.terminal_output_resources,
             nodes: &payload.nodes,
             memory: &payload.memory,
         }
@@ -217,6 +224,7 @@ pub(super) struct UnvalidatedExecutionPlanPayload {
     pub(super) weight_format: WeightFormatId,
     pub(super) quantization_formats: BTreeSet<QuantizationFormatId>,
     pub(super) retained_completion_values: Vec<RetainedCompletionValue>,
+    pub(super) terminal_output_resources: Vec<ResourceId>,
     pub(super) nodes: Vec<UnvalidatedPlanNode>,
     pub(super) memory: MemoryPlan,
 }

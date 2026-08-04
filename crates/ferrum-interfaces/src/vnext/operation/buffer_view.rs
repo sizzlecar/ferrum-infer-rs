@@ -1,8 +1,10 @@
+use std::ops::Range;
+
 use super::super::{
-    AllocationLifetime, BufferDescriptor, BufferUsage, DeviceBufferRetention, DeviceRuntime,
-    DynamicResourceDemand, DynamicResourceShape, LeasedBufferView, LogicalBackingBufferView,
-    LogicalBackingSegmentBinding, NodeWorkContract, ResourceId, ResourceTransactionIdentity,
-    VNextError,
+    AllocationLifetime, BatchWorkShape, BufferDescriptor, BufferUsage, DeviceBufferRetention,
+    DeviceRuntime, DynamicResourceDemand, DynamicResourceShape, LeasedBufferView,
+    LogicalBackingBufferView, LogicalBackingSegmentBinding, NodeWorkContract, ResourceId,
+    ResourceTransactionIdentity, VNextError,
 };
 use super::foundation::invalid_operation;
 use super::{DynamicStorageView, ResolvedStorageComponent, ResolvedValueBinding};
@@ -80,6 +82,147 @@ pub(super) fn validate_value_binding_physical_coverage(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepParticipantRangeCoordinates {
+    SourceToken,
+    ParticipantLocal,
+}
+
+/// Maps source-token coordinates used by product input uploads into shared
+/// Step backing. Fixed participant values already use local coordinates.
+pub(crate) fn translate_step_participant_upload_range(
+    demand: &DynamicResourceDemand,
+    work_shape: &BatchWorkShape,
+    participant_index: usize,
+    semantic_range: Range<u64>,
+) -> Result<Range<u64>, VNextError> {
+    translate_step_participant_range(
+        demand,
+        work_shape,
+        participant_index,
+        semantic_range,
+        StepParticipantRangeCoordinates::SourceToken,
+    )
+}
+
+/// Maps participant-local completion coordinates into shared Step backing.
+pub(crate) fn translate_step_participant_readback_range(
+    demand: &DynamicResourceDemand,
+    work_shape: &BatchWorkShape,
+    participant_index: usize,
+    semantic_range: Range<u64>,
+) -> Result<Range<u64>, VNextError> {
+    translate_step_participant_range(
+        demand,
+        work_shape,
+        participant_index,
+        semantic_range,
+        StepParticipantRangeCoordinates::ParticipantLocal,
+    )
+}
+
+fn translate_step_participant_range(
+    demand: &DynamicResourceDemand,
+    work_shape: &BatchWorkShape,
+    participant_index: usize,
+    semantic_range: Range<u64>,
+    coordinates: StepParticipantRangeCoordinates,
+) -> Result<Range<u64>, VNextError> {
+    if semantic_range.start >= semantic_range.end {
+        return Err(invalid_operation(
+            "participant resource projection has an empty semantic range",
+        ));
+    }
+    if participant_index >= work_shape.participant_token_ranges().len() {
+        return Err(invalid_operation(
+            "participant resource projection is out of range",
+        ));
+    }
+    match demand {
+        DynamicResourceDemand::ActualSequences {
+            bytes_per_sequence,
+            maximum_sequences,
+        } => {
+            if work_shape.immediate_sequences() > *maximum_sequences
+                || semantic_range.end > *bytes_per_sequence
+            {
+                return Err(invalid_operation(
+                    "participant fixed resource projection exceeds its planned stride",
+                ));
+            }
+            let base = bytes_per_sequence
+                .checked_mul(u64::try_from(participant_index).map_err(|_| {
+                    invalid_operation("participant resource projection exceeds u64")
+                })?)
+                .ok_or_else(|| {
+                    invalid_operation("participant fixed resource projection overflows u64")
+                })?;
+            let translated_start = base
+                .checked_add(semantic_range.start)
+                .ok_or_else(|| invalid_operation("participant fixed range overflows u64"))?;
+            let translated_end = base
+                .checked_add(semantic_range.end)
+                .ok_or_else(|| invalid_operation("participant fixed range overflows u64"))?;
+            Ok(translated_start..translated_end)
+        }
+        DynamicResourceDemand::Tokens {
+            bytes_per_token,
+            maximum_tokens,
+        } => {
+            if work_shape.immediate_tokens() > *maximum_tokens {
+                return Err(invalid_operation(
+                    "participant token resource projection exceeds its planned ceiling",
+                ));
+            }
+            let token_range = &work_shape.participant_token_ranges()[participant_index];
+            let source = token_range.source_token_range();
+            let packed = token_range.immediate_token_range();
+            let source_start = source
+                .start
+                .checked_mul(*bytes_per_token)
+                .ok_or_else(|| invalid_operation("source token byte offset overflows u64"))?;
+            let source_end = source
+                .end
+                .checked_mul(*bytes_per_token)
+                .ok_or_else(|| invalid_operation("source token byte range overflows u64"))?;
+            let packed_start = packed
+                .start
+                .checked_mul(*bytes_per_token)
+                .ok_or_else(|| invalid_operation("packed token byte offset overflows u64"))?;
+            let relative_range = match coordinates {
+                StepParticipantRangeCoordinates::SourceToken => {
+                    if semantic_range.start < source_start || semantic_range.end > source_end {
+                        return Err(invalid_operation(
+                            "participant token resource projection is outside its source span",
+                        ));
+                    }
+                    semantic_range.start - source_start..semantic_range.end - source_start
+                }
+                StepParticipantRangeCoordinates::ParticipantLocal => {
+                    let span_bytes = source_end - source_start;
+                    if semantic_range.end > span_bytes {
+                        return Err(invalid_operation(
+                            "participant token readback exceeds its immediate span",
+                        ));
+                    }
+                    semantic_range
+                }
+            };
+            let translated_start = packed_start
+                .checked_add(relative_range.start)
+                .ok_or_else(|| invalid_operation("packed token projection overflows u64"))?;
+            let translated_end = translated_start
+                .checked_add(relative_range.end - relative_range.start)
+                .ok_or_else(|| invalid_operation("packed token range overflows u64"))?;
+            Ok(translated_start..translated_end)
+        }
+        // Fixed/page-shaped internal activations are batch-wide resources. The
+        // planner gives product-fixed I/O an ActualSequences demand, so only
+        // that typed demand is participant-local here.
+        _ => Ok(semantic_range),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperationBufferStorageKind {
     StaticContiguous,
     DynamicContiguous,
@@ -99,7 +242,9 @@ enum OperationBufferCoverage {
     Exact,
     /// The operation sees an exact logical prefix while resource authority
     /// retains wider physical capacity for a frontier or reusable bucket.
-    BackingPrefix,
+    BackingWindow {
+        offset_bytes: u64,
+    },
 }
 
 enum OperationRegionSource<'a, B> {
@@ -110,6 +255,7 @@ enum OperationRegionSource<'a, B> {
     },
     Paged {
         bindings: &'a [LogicalBackingSegmentBinding<B>],
+        logical_origin_bytes: u64,
     },
 }
 
@@ -156,11 +302,19 @@ impl<'a, B> OperationBufferRegions<'a, B> {
                     retention: retention.clone(),
                 })),
             },
-            OperationRegionSource::Paged { bindings } => OperationBufferRegionIter {
+            OperationRegionSource::Paged {
+                bindings,
+                logical_origin_bytes,
+            } => OperationBufferRegionIter {
                 state: OperationBufferRegionIterState::Paged {
                     bindings: *bindings,
-                    requested_start_bytes: self.logical_offset_bytes,
-                    requested_end_bytes: logical_end_bytes,
+                    logical_origin_bytes: *logical_origin_bytes,
+                    requested_start_bytes: logical_origin_bytes
+                        .checked_add(self.logical_offset_bytes)
+                        .expect("validated paged window start does not overflow"),
+                    requested_end_bytes: logical_origin_bytes
+                        .checked_add(logical_end_bytes)
+                        .expect("validated paged window end does not overflow"),
                     next_segment: 0,
                     next_segment_logical_offset_bytes: 0,
                 },
@@ -211,6 +365,7 @@ enum OperationBufferRegionIterState<'a, B> {
     Contiguous(Option<OperationPhysicalRegion<'a, B>>),
     Paged {
         bindings: &'a [LogicalBackingSegmentBinding<B>],
+        logical_origin_bytes: u64,
         requested_start_bytes: u64,
         requested_end_bytes: u64,
         next_segment: usize,
@@ -226,6 +381,7 @@ impl<'a, B> Iterator for OperationBufferRegionIter<'a, B> {
             OperationBufferRegionIterState::Contiguous(region) => region.take(),
             OperationBufferRegionIterState::Paged {
                 bindings,
+                logical_origin_bytes,
                 requested_start_bytes,
                 requested_end_bytes,
                 next_segment,
@@ -243,8 +399,12 @@ impl<'a, B> Iterator for OperationBufferRegionIter<'a, B> {
                         *requested_end_bytes,
                     );
                     *next_segment_logical_offset_bytes = segment_logical_end;
-                    if region.is_some() {
-                        return region;
+                    if let Some(mut region) = region {
+                        region.logical_offset_bytes = region
+                            .logical_offset_bytes
+                            .checked_sub(*logical_origin_bytes)
+                            .expect("paged region is inside its validated backing window");
+                        return Some(region);
                     }
                 }
                 None
@@ -313,7 +473,14 @@ fn validate_dynamic_binding_layout(
             .checked_add(length_bytes)
             .ok_or_else(|| invalid_operation("backing segment coverage overflows u64"))
     })?;
-    if covered < logical_size_bytes
+    let window_offset = match coverage {
+        OperationBufferCoverage::Exact => 0,
+        OperationBufferCoverage::BackingWindow { offset_bytes } => offset_bytes,
+    };
+    let required_end = window_offset
+        .checked_add(logical_size_bytes)
+        .ok_or_else(|| invalid_operation("operation backing window overflows u64"))?;
+    if covered < required_end
         || (coverage == OperationBufferCoverage::Exact && covered != logical_size_bytes)
     {
         return Err(invalid_operation(
@@ -347,6 +514,7 @@ pub struct OperationBufferView<'a, B> {
     source: OperationBufferSource<'a, B>,
     coverage: OperationBufferCoverage,
     allocation_lifetime: AllocationLifetime,
+    packed_batch_coordinates: bool,
 }
 
 impl<'a, B> OperationBufferView<'a, B> {
@@ -359,6 +527,7 @@ impl<'a, B> OperationBufferView<'a, B> {
             source: OperationBufferSource::Static { view, retention },
             coverage: OperationBufferCoverage::Exact,
             allocation_lifetime: AllocationLifetime::Plan,
+            packed_batch_coordinates: false,
         }
     }
 
@@ -383,7 +552,21 @@ impl<'a, B> OperationBufferView<'a, B> {
         Self::from_backing(
             descriptor,
             backing,
-            OperationBufferCoverage::BackingPrefix,
+            OperationBufferCoverage::BackingWindow { offset_bytes: 0 },
+            allocation_lifetime,
+        )
+    }
+
+    pub(super) fn from_backing_window(
+        descriptor: BufferDescriptor,
+        backing: LogicalBackingBufferView<'a, B>,
+        offset_bytes: u64,
+        allocation_lifetime: AllocationLifetime,
+    ) -> Self {
+        Self::from_backing(
+            descriptor,
+            backing,
+            OperationBufferCoverage::BackingWindow { offset_bytes },
             allocation_lifetime,
         )
     }
@@ -399,7 +582,13 @@ impl<'a, B> OperationBufferView<'a, B> {
             source: OperationBufferSource::Backing(backing),
             coverage,
             allocation_lifetime,
+            packed_batch_coordinates: false,
         }
+    }
+
+    pub(super) fn with_packed_batch_coordinates(mut self, packed: bool) -> Self {
+        self.packed_batch_coordinates = packed;
+        self
     }
 
     pub(super) fn validate_runtime<R>(
@@ -464,6 +653,10 @@ impl<'a, B> OperationBufferView<'a, B> {
         self.allocation_lifetime
     }
 
+    pub const fn uses_packed_batch_coordinates(&self) -> bool {
+        self.packed_batch_coordinates
+    }
+
     pub fn storage_kind(&self) -> OperationBufferStorageKind {
         match &self.source {
             OperationBufferSource::Static { .. } => OperationBufferStorageKind::StaticContiguous,
@@ -511,6 +704,10 @@ impl<'a, B> OperationBufferView<'a, B> {
                     ));
                 }
                 let storage_kind = operation_storage_kind(view.storage_profile().view());
+                let backing_window_offset = match self.coverage {
+                    OperationBufferCoverage::Exact => 0,
+                    OperationBufferCoverage::BackingWindow { offset_bytes } => offset_bytes,
+                };
                 validate_dynamic_binding_layout(
                     storage_kind,
                     self.descriptor.size_bytes,
@@ -524,13 +721,22 @@ impl<'a, B> OperationBufferView<'a, B> {
                         let binding = &bindings[0];
                         OperationRegionSource::Contiguous {
                             buffer: binding.buffer(),
-                            physical_base_offset_bytes: binding.segment().offset_bytes(),
+                            physical_base_offset_bytes: binding
+                                .segment()
+                                .offset_bytes()
+                                .checked_add(backing_window_offset)
+                                .ok_or_else(|| {
+                                    invalid_operation(
+                                        "participant backing physical offset overflows u64",
+                                    )
+                                })?,
                             retention: binding.retention(),
                         }
                     }
-                    OperationBufferStorageKind::DynamicPaged => {
-                        OperationRegionSource::Paged { bindings }
-                    }
+                    OperationBufferStorageKind::DynamicPaged => OperationRegionSource::Paged {
+                        bindings,
+                        logical_origin_bytes: backing_window_offset,
+                    },
                     OperationBufferStorageKind::StaticContiguous => unreachable!(
                         "dynamic storage kind was validated before region construction"
                     ),
@@ -549,15 +755,17 @@ impl<'a, B> OperationBufferView<'a, B> {
 #[cfg(test)]
 mod operation_buffer_region_tests {
     use super::{
-        sequence_execution_shape, translate_paged_segment, validate_dynamic_binding_layout,
-        validate_value_binding_physical_coverage, OperationBufferCoverage, OperationBufferRegions,
-        OperationBufferStorageKind, OperationRegionSource, ValueBindingPhysicalCoverage,
+        sequence_execution_shape, translate_paged_segment,
+        translate_step_participant_readback_range, translate_step_participant_upload_range,
+        validate_dynamic_binding_layout, validate_value_binding_physical_coverage,
+        OperationBufferCoverage, OperationBufferRegions, OperationBufferStorageKind,
+        OperationRegionSource, ValueBindingPhysicalCoverage,
     };
     use crate::vnext::{
-        AliasPolicy, BufferDescriptor, BufferUsage, DeviceBufferRetention, DynamicResourceDemand,
-        DynamicResourceShape, ElementType, NodeWorkContract, ProgramValueId, ResolvedTensorLayout,
-        ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole, ResolvedValueStorage,
-        ResourceId, TensorAccess,
+        AliasPolicy, BatchWorkShape, BufferDescriptor, BufferUsage, DeviceBufferRetention,
+        DynamicResourceDemand, DynamicResourceShape, ElementType, NodeWorkContract, ProgramValueId,
+        ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding, ResolvedValueRole,
+        ResolvedValueStorage, ResourceId, TensorAccess, TokenSpanWork,
     };
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -722,14 +930,14 @@ mod operation_buffer_region_tests {
             OperationBufferStorageKind::DynamicPaged,
             64,
             [64_u64, 64].into_iter(),
-            OperationBufferCoverage::BackingPrefix,
+            OperationBufferCoverage::BackingWindow { offset_bytes: 0 },
         )
         .unwrap();
         validate_dynamic_binding_layout(
             OperationBufferStorageKind::DynamicContiguous,
             64,
             [128_u64].into_iter(),
-            OperationBufferCoverage::BackingPrefix,
+            OperationBufferCoverage::BackingWindow { offset_bytes: 0 },
         )
         .unwrap();
 
@@ -744,9 +952,70 @@ mod operation_buffer_region_tests {
             OperationBufferStorageKind::DynamicPaged,
             128,
             [64_u64].into_iter(),
-            OperationBufferCoverage::BackingPrefix,
+            OperationBufferCoverage::BackingWindow { offset_bytes: 0 },
         )
         .is_err());
+    }
+
+    #[test]
+    fn participant_step_projection_keeps_upload_and_readback_coordinate_spaces_distinct() {
+        let first_tokens = vec![1_u32; 20];
+        let second_tokens = vec![2_u32; 9];
+        let work = BatchWorkShape::test_only(vec![
+            TokenSpanWork::from_token_ids(&first_tokens, 17..18).unwrap(),
+            TokenSpanWork::from_token_ids(&second_tokens, 7..9).unwrap(),
+        ])
+        .unwrap();
+        let tokens = DynamicResourceDemand::tokens(4, 32).unwrap();
+
+        assert_eq!(
+            translate_step_participant_upload_range(&tokens, &work, 0, 68..72).unwrap(),
+            0..4
+        );
+        assert_eq!(
+            translate_step_participant_upload_range(&tokens, &work, 1, 28..36).unwrap(),
+            4..12
+        );
+        assert_eq!(
+            translate_step_participant_readback_range(&tokens, &work, 1, 0..8).unwrap(),
+            4..12
+        );
+        assert!(translate_step_participant_readback_range(&tokens, &work, 1, 28..36).is_err());
+    }
+
+    #[test]
+    fn fixed_participant_step_projection_uses_disjoint_aligned_strides() {
+        let tokens = [1_u32];
+        let work = BatchWorkShape::test_only(vec![
+            TokenSpanWork::from_token_ids(&tokens, 0..1).unwrap(),
+            TokenSpanWork::from_token_ids(&tokens, 0..1).unwrap(),
+        ])
+        .unwrap();
+        let fixed = DynamicResourceDemand::actual_sequences(16, 4).unwrap();
+
+        assert_eq!(
+            translate_step_participant_upload_range(&fixed, &work, 0, 0..4).unwrap(),
+            0..4
+        );
+        assert_eq!(
+            translate_step_participant_upload_range(&fixed, &work, 1, 0..4).unwrap(),
+            16..20
+        );
+        assert_eq!(
+            translate_step_participant_readback_range(&fixed, &work, 1, 0..4).unwrap(),
+            16..20
+        );
+        assert!(translate_step_participant_upload_range(&fixed, &work, 1, 0..17).is_err());
+        assert_eq!(
+            translate_step_participant_upload_range(
+                &DynamicResourceDemand::fixed(16).unwrap(),
+                &work,
+                1,
+                0..4,
+            )
+            .unwrap(),
+            0..4
+        );
     }
 
     #[test]

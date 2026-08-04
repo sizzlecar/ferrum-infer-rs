@@ -311,10 +311,7 @@ impl MemoryPlan {
                 ));
             }
             actual_theoretical_dynamic = actual_theoretical_dynamic
-                .checked_add(
-                    u128::from(descriptor.theoretical_maximum_request_bytes()?)
-                        * u128::from(descriptor.theoretical_maximum_instances),
-                )
+                .checked_add(descriptor.theoretical_maximum_resident_bytes()?)
                 .ok_or_else(|| invalid_plan("dynamic ceiling total overflows u128"))?;
         }
         let reusable_workspace_ceilings = self
@@ -488,10 +485,7 @@ impl MemoryPlan {
                 let theoretical_ceiling_bytes =
                     descriptors.iter().try_fold(0_u128, |total, descriptor| {
                         total
-                            .checked_add(
-                                u128::from(descriptor.theoretical_maximum_request_bytes()?)
-                                    * u128::from(descriptor.theoretical_maximum_instances),
-                            )
+                            .checked_add(descriptor.theoretical_maximum_resident_bytes()?)
                             .ok_or_else(|| {
                                 invalid_plan("dynamic pool theoretical ceiling overflows u128")
                             })
@@ -1036,10 +1030,7 @@ impl MemoryPlan {
             )?;
             let theoretical = members.iter().try_fold(0_u128, |total, descriptor| {
                 total
-                    .checked_add(
-                        u128::from(descriptor.theoretical_maximum_request_bytes()?)
-                            * u128::from(descriptor.theoretical_maximum_instances),
-                    )
+                    .checked_add(descriptor.theoretical_maximum_resident_bytes()?)
                     .ok_or_else(|| invalid_plan("pool theoretical ceiling overflows u128"))
             })?;
             let invocation_ids = members

@@ -2,17 +2,18 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::Arc};
 
 use super::super::{
-    classify_device_error, BackingInitializationEncodeError, BufferUsage, CompletionHandle,
-    CompletionReaper, CompletionReservation, DefinitelyNotSubmittedRetryAuthority,
-    DeviceBatchingForm, DeviceCommandBatch, DeviceCommandLogicalWork, DeviceComputePathRequirement,
-    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
-    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
-    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceTimingMode,
-    ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
-    HostTransferLayout, InvocationResourceLease, LaneSubmitOutcome, LogicalBackingBufferView,
-    NodeId, NodeInvocationId, OperationId, ParticipantNodeKey, PreparedStepSubmissionWave,
-    ProgramBindingNodeBinding, ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment,
-    SubmissionWavePurpose, TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
+    classify_device_error, AllocationKind, AllocationLifetime, BackingInitializationEncodeError,
+    BufferUsage, CompletionHandle, CompletionReaper, CompletionReservation,
+    DefinitelyNotSubmittedRetryAuthority, DeviceBatchingForm, DeviceCommandBatch,
+    DeviceCommandLogicalWork, DeviceComputePathRequirement, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram,
+    DeviceReusableExecutionProgramId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
+    DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
+    ExecutionLane, HostTransferLayout, InvocationResourceLease, LaneSubmitOutcome,
+    LogicalBackingBufferView, NodeId, NodeInvocationId, OperationId, ParticipantNodeKey,
+    PreparedStepSubmissionWave, ProgramBindingNodeBinding, ProviderId, ResourceId, SpanId,
+    StepParticipantFrameAssignment, SubmissionWavePurpose, TrustedActiveSequenceBinding,
+    VNextError, EXECUTION_IDENTITY_VERSION,
 };
 use super::determinism::{
     SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
@@ -31,10 +32,10 @@ use super::workspace_encoding::{
     encode_provider_workspace_initialization, encode_submission_wave_workspace_initializations,
 };
 use super::{
-    BatchOperationIdentity, BatchOperationNodeIdentity, BatchOperationParticipantIdentity,
-    BatchedOperationInvocation, BoundOperationProvider, ElementType, OperationInvocation,
-    ProviderReplayEquivalence, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, TensorAccess,
+    translate_step_participant_upload_range, BatchOperationIdentity, BatchOperationNodeIdentity,
+    BatchOperationParticipantIdentity, BatchedOperationInvocation, BoundOperationProvider,
+    ElementType, OperationInvocation, ProviderReplayEquivalence, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, TensorAccess,
 };
 
 /// The only public path from a resolved plan to an operation kernel.
@@ -2332,13 +2333,14 @@ where
         let node_identity = batch_identity
             .materialize_node(identity_node_index)
             .map_err(SubmissionWaveDispatchError::Contract)?;
+        let participant_index = usize::try_from(upload.participant_index()).map_err(|_| {
+            SubmissionWaveDispatchError::Contract(invalid_operation(
+                "submission input upload participant index exceeds host address space",
+            ))
+        })?;
         let participant = node_identity
             .participants()
-            .get(usize::try_from(upload.participant_index()).map_err(|_| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "submission input upload participant index exceeds host address space",
-                ))
-            })?)
+            .get(participant_index)
             .ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
                     "submission input upload participant is absent from its plan node",
@@ -2382,7 +2384,7 @@ where
                 "submission input upload differs from its resolved activation binding",
             )));
         }
-        let destination_start = component
+        let semantic_destination_start = component
             .offset_bytes()
             .checked_add(upload.logical_offset_bytes())
             .ok_or_else(|| {
@@ -2390,11 +2392,44 @@ where
                     "submission input upload destination overflows",
                 ))
             })?;
-        let destination_end = destination_start.checked_add(byte_len).ok_or_else(|| {
-            SubmissionWaveDispatchError::Contract(invalid_operation(
-                "submission input upload destination range overflows",
-            ))
-        })?;
+        let semantic_destination_end = semantic_destination_start
+            .checked_add(byte_len)
+            .ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "submission input upload destination range overflows",
+                ))
+            })?;
+        let descriptor = completion
+            .wave()
+            .step_resources()
+            .dynamic_descriptor(component.resource_id())
+            .map_err(SubmissionWaveDispatchError::Contract)?;
+        let destination = if descriptor.lifetime() == AllocationLifetime::Step
+            && descriptor.kind() == &AllocationKind::Value
+        {
+            let work_shape = completion
+                .wave()
+                .nodes()
+                .iter()
+                .find(|wave_node| wave_node.node_id() == upload.node_id())
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "submission input upload has no prepared wave node",
+                    ))
+                })?
+                .work_shape();
+            translate_step_participant_upload_range(
+                descriptor.demand(),
+                work_shape,
+                participant_index,
+                semantic_destination_start..semantic_destination_end,
+            )
+            .map_err(SubmissionWaveDispatchError::Contract)?
+        } else {
+            semantic_destination_start..semantic_destination_end
+        };
+        let destination_start = destination.start;
+        let destination_end = destination.end;
         let backing = completion
             .backing_view(
                 upload.node_id(),
