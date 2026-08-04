@@ -61,8 +61,8 @@ Current maxima before the clean aggregate gate are:
 
 | Category | Largest file | Physical lines | Limit |
 |---|---|---:|---:|
-| Facade | `operation.rs` | 102 | 500 |
-| Production owner | `operation/dispatch.rs` | 2,409 | 2,500 |
+| Facade | `operation.rs` | 108 | 500 |
+| Production owner | `execution/plan.rs` | 2,435 | 2,500 |
 | Test/support owner | `tests/vnext_device_operation_contract/mod.rs` | 1,971 | 2,000 |
 
 The final gate recomputes these values from the committed tree. These are ownership and
