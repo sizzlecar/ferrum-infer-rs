@@ -1864,6 +1864,8 @@ pub struct ExecutorExecutionCapacityEvidence {
     owner: ExecutorExecutionCapacityEvidenceOwner,
     #[serde(flatten)]
     kind: ExecutorExecutionCapacityEvidenceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maintenance_boundary: Option<crate::vnext::DynamicPoolMaintenanceBoundaryReceipt>,
 }
 
 impl ExecutorExecutionCapacityEvidence {
@@ -1886,6 +1888,7 @@ impl ExecutorExecutionCapacityEvidence {
                 shortfalls,
                 pressure,
             },
+            maintenance_boundary: None,
         })
     }
 
@@ -1905,6 +1908,7 @@ impl ExecutorExecutionCapacityEvidence {
         Ok(Self {
             owner: ExecutorExecutionCapacityEvidenceOwner::Backing,
             kind: ExecutorExecutionCapacityEvidenceKind::BackingDeferred { blockers, pressure },
+            maintenance_boundary: None,
         })
     }
 
@@ -1912,6 +1916,7 @@ impl ExecutorExecutionCapacityEvidence {
         Self {
             owner: ExecutorExecutionCapacityEvidenceOwner::Backing,
             kind: ExecutorExecutionCapacityEvidenceKind::BackingPressure { pressure },
+            maintenance_boundary: None,
         }
     }
 
@@ -1943,6 +1948,37 @@ impl ExecutorExecutionCapacityEvidence {
             }
             ExecutorExecutionCapacityEvidenceKind::BackingPressure { pressure } => Some(pressure),
         }
+    }
+
+    pub const fn maintenance_boundary(
+        &self,
+    ) -> Option<&crate::vnext::DynamicPoolMaintenanceBoundaryReceipt> {
+        self.maintenance_boundary.as_ref()
+    }
+
+    fn with_maintenance_boundary(
+        mut self,
+        boundary: Option<crate::vnext::DynamicPoolMaintenanceBoundaryReceipt>,
+    ) -> Result<Self> {
+        match (self.backing_pressure(), boundary.as_ref()) {
+            (
+                Some(crate::vnext::DynamicBackingPressure::DeviceCapacity(pressure)),
+                Some(boundary),
+            ) if pressure == boundary.pressure() && !boundary.reclaim_sufficient() => {}
+            (Some(crate::vnext::DynamicBackingPressure::PoolResident(_)), None) | (None, None) => {}
+            (Some(crate::vnext::DynamicBackingPressure::DeviceCapacity(_)), None) => {
+                return Err(FerrumError::internal(
+                    "device-capacity execution maintenance lost its boundary receipt",
+                ));
+            }
+            _ => {
+                return Err(FerrumError::internal(
+                    "execution maintenance boundary differs from its blocked pressure",
+                ));
+            }
+        }
+        self.maintenance_boundary = boundary;
+        Ok(self)
     }
 
     fn has_relevant_mutation(&self, mutation: &ExecutorExecutionMaintenanceMutation) -> bool {
@@ -2126,6 +2162,7 @@ impl ExecutorExecutionCapacityDeferral {
         observed: ExecutorAdmissionEpochs,
         wait_condition: crate::vnext::CapacityWaitCondition,
         pressure: crate::vnext::DynamicBackingPressure,
+        maintenance_boundary: Option<crate::vnext::DynamicPoolMaintenanceBoundaryReceipt>,
         stage: ExecutorExecutionCapacityStage,
     ) -> Result<Self> {
         if source.action() != crate::vnext::DeferredAction::AwaitBackingGrowth {
@@ -2136,7 +2173,15 @@ impl ExecutorExecutionCapacityDeferral {
         let evidence = ExecutorExecutionCapacityEvidence::logical_with_pressure(
             source.blockers().to_vec(),
             Some(pressure),
-        )?;
+        )?
+        .with_maintenance_boundary(maintenance_boundary)?;
+        if evidence.maintenance_boundary().is_some_and(|boundary| {
+            boundary.coordinator_id().get() != observed.coordinator_id.get()
+        }) {
+            return Err(FerrumError::internal(
+                "execution maintenance boundary belongs to another coordinator",
+            ));
+        }
         Self::with_evidence(observed, wait_condition, stage, evidence)
     }
 
@@ -2145,12 +2190,21 @@ impl ExecutorExecutionCapacityDeferral {
         observed: ExecutorAdmissionEpochs,
         wait_condition: crate::vnext::CapacityWaitCondition,
         pressure: crate::vnext::DynamicBackingPressure,
+        maintenance_boundary: Option<crate::vnext::DynamicPoolMaintenanceBoundaryReceipt>,
         stage: ExecutorExecutionCapacityStage,
     ) -> Result<Self> {
         let evidence = ExecutorExecutionCapacityEvidence::backing_deferred_with_pressure(
             source.blockers().to_vec(),
             Some(pressure),
-        )?;
+        )?
+        .with_maintenance_boundary(maintenance_boundary)?;
+        if evidence.maintenance_boundary().is_some_and(|boundary| {
+            boundary.coordinator_id().get() != observed.coordinator_id.get()
+        }) {
+            return Err(FerrumError::internal(
+                "execution maintenance boundary belongs to another coordinator",
+            ));
+        }
         Self::with_evidence(observed, wait_condition, stage, evidence)
     }
 
@@ -2180,6 +2234,12 @@ impl ExecutorExecutionCapacityDeferral {
 
     pub const fn backing_pressure(&self) -> Option<&crate::vnext::DynamicBackingPressure> {
         self.evidence.backing_pressure()
+    }
+
+    pub const fn maintenance_boundary(
+        &self,
+    ) -> Option<&crate::vnext::DynamicPoolMaintenanceBoundaryReceipt> {
+        self.evidence.maintenance_boundary()
     }
 
     pub fn maintenance_retry(&self) -> Option<&ExecutorExecutionMaintenanceRetry> {

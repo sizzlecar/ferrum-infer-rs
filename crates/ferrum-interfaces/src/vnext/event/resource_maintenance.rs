@@ -8,7 +8,7 @@ use crate::vnext::{
 
 use super::{canonical_fingerprint, invalid_event};
 
-pub const EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTION_RESOURCE_MAINTENANCE_EVENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +136,29 @@ impl BoundExecutionResourceMaintenance {
                     "execution resource maintenance contains invalid rebalance evidence",
                 ));
             }
+            let boundary = receipt.maintenance_boundary().ok_or_else(|| {
+                invalid_event(
+                    "execution resource rebalance requires its pre-mutation boundary receipt",
+                )
+            })?;
+            let selected = boundary
+                .selected_chunks()
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !boundary.reclaim_sufficient()
+                || boundary.selected_bytes() != rebalance.reclaimed_bytes()
+                || selected.len() != boundary.selected_chunks().len()
+                || selected != reclaimed_chunk_ids
+            {
+                return Err(invalid_event(
+                    "execution resource rebalance differs from its maintenance boundary",
+                ));
+            }
+        } else if receipt.maintenance_boundary().is_some() {
+            return Err(invalid_event(
+                "successful execution maintenance boundary requires a rebalance receipt",
+            ));
         }
 
         let mut plan = None;

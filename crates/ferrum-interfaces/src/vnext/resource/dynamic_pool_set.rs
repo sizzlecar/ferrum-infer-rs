@@ -10,17 +10,19 @@ use super::{
     BackingChunkIdentity, BackingClaimCertificate, BackingPrepareDecision, BackingSegment,
     BufferRequest, CapacityAvailabilityEpoch, CapacityDomainId, CapacityEntry, CapacityEpochs,
     CapacityUnits, CapacityVector, DeviceAllocationPermit, DeviceBufferRetention,
-    DeviceCapacityBudget, DeviceCapacityReservation, DeviceRuntime, Digest, DynamicBackingBlocker,
-    DynamicBackingClaimOccupancy, DynamicBackingClaimResidency, DynamicBackingClaimScope,
-    DynamicBackingDeferralReason, DynamicBackingDeferred, DynamicBackingPackingEnvelope,
-    DynamicBackingPool, DynamicBackingPoolId, DynamicBackingPoolState,
-    DynamicChunkQuarantineReason, DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec,
-    DynamicPoolGrowthBatchReceipt, DynamicPoolGrowthIntent, DynamicPoolGrowthReceipt,
-    DynamicPoolIdleReclaim, DynamicPoolLiveOccupancyStatus, DynamicPoolRebalanceReceipt,
-    DynamicResourceShape, DynamicStorageView, EvaluatedBackingRequest, ExecutionLane,
-    FreeExtentIndex, IdleChunkReclaimCandidate, InvocationLivenessMode, LaneBackingPrepareDecision,
-    LaneStableArenaEntry, LaneStableArenaEvictionCandidate, LaneStableArenaLane,
-    LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
+    DeviceCapacityAvailabilitySnapshot, DeviceCapacityBudget, DeviceCapacityReservation,
+    DeviceRuntime, Digest, DynamicBackingBlocker, DynamicBackingClaimOccupancy,
+    DynamicBackingClaimResidency, DynamicBackingClaimScope, DynamicBackingDeferralReason,
+    DynamicBackingDeferred, DynamicBackingPackingEnvelope, DynamicBackingPool,
+    DynamicBackingPoolId, DynamicBackingPoolState, DynamicChunkQuarantineReason,
+    DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec, DynamicPoolGrowthBatchReceipt,
+    DynamicPoolGrowthIntent, DynamicPoolGrowthReceipt, DynamicPoolIdleReclaim,
+    DynamicPoolLiveOccupancyStatus, DynamicPoolMaintenanceBoundaryChunk,
+    DynamicPoolMaintenanceBoundaryPool, DynamicPoolMaintenanceBoundaryReceipt,
+    DynamicPoolRebalanceReceipt, DynamicResourceShape, DynamicStorageView, EvaluatedBackingRequest,
+    ExecutionLane, FreeExtentIndex, IdleChunkReclaimCandidate, InvocationLivenessMode,
+    LaneBackingPrepareDecision, LaneStableArenaEntry, LaneStableArenaEvictionCandidate,
+    LaneStableArenaLane, LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
     LogicalAdmissionCoordinator, LogicalBackingBufferView, LogicalBackingSegmentBinding,
     LogicalBackingSliceAllocationEvidence, LogicalBackingSliceAuthority,
     LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard, PlanNode,
@@ -29,7 +31,8 @@ use super::{
     ResidentChunkBacking, ResidentChunkState, ResourceId, ResourceReservation,
     ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Sha256, StateInitialization,
     StaticProvisioningBinding, StepResourceSlotKind, SubmissionWaveDomainCapacityLayout,
-    SubmissionWaveDomainLayout, TransactionId, VNextError, NEXT_DYNAMIC_POOL_INSTANCE_ID,
+    SubmissionWaveDomainLayout, TransactionId, VNextError,
+    DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION, NEXT_DYNAMIC_POOL_INSTANCE_ID,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
@@ -57,6 +60,11 @@ where
     binding: StaticProvisioningBinding,
     // Backend context must outlive every resident/quarantined buffer above.
     runtime: Arc<R>,
+}
+
+pub(in crate::vnext::resource) struct DynamicPoolRebalanceAttempt {
+    pub(in crate::vnext::resource) boundary: DynamicPoolMaintenanceBoundaryReceipt,
+    pub(in crate::vnext::resource) rebalance: Option<DynamicPoolRebalanceReceipt>,
 }
 
 impl<R> DynamicPoolSet<R>
@@ -169,10 +177,11 @@ where
     pub(in crate::vnext::resource) fn reclaim_idle_chunks_for_pressure(
         &self,
         pressure: &DeviceCapacityPressure,
+        capacity_availability: DeviceCapacityAvailabilitySnapshot,
         excluded_domains: &[CapacityDomainId],
         protected_immediate: &CapacityVector,
         protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
-    ) -> Result<Option<DynamicPoolRebalanceReceipt>, VNextError> {
+    ) -> Result<DynamicPoolRebalanceAttempt, VNextError> {
         if pressure.device_id() != self.runtime.descriptor().id.to_string() {
             return Err(invalid_resource(
                 "dynamic pool rebalance received pressure for another device",
@@ -231,15 +240,13 @@ where
         }
 
         let mut candidates = Vec::new();
+        let mut boundary_pools = Vec::with_capacity(pools.len());
         let mut reclaimable_by_pool = vec![0_u64; pools.len()];
         for (pool_index, (pool, state)) in pools.iter().zip(states.iter()).enumerate() {
             if state.poisoned {
                 return Err(invalid_resource("dynamic backing pool is fail-closed"));
             }
-            if excluded_domains.contains(&pool.domain.domain_id) || state.pending_growth_bytes != 0
-            {
-                continue;
-            }
+            let excluded_from_reclaim = excluded_domains.contains(&pool.domain.domain_id);
             let used = used_by_domain
                 .get(&pool.domain.domain_id)
                 .copied()
@@ -259,6 +266,7 @@ where
                 .get(&pool.domain.domain_id)
                 .copied()
                 .unwrap_or(0);
+            let mut protected_packing_satisfied = true;
             let protected_chunks = match protected_packing_by_domain.get(&pool.domain.domain_id) {
                 Some(envelope) => {
                     if envelope.pool_id() != pool.domain.pool_id()
@@ -285,7 +293,7 @@ where
                         chunks.extend(segments.iter().map(BackingSegment::chunk_ordinal));
                     }
                     if chunks.is_empty() && protected != 0 {
-                        continue;
+                        protected_packing_satisfied = false;
                     }
                     chunks
                 }
@@ -308,32 +316,72 @@ where
                 .max(coherent_runnable_floor);
             let reclaimable = state.resident_bytes.saturating_sub(resident_floor);
             reclaimable_by_pool[pool_index] = reclaimable;
-            if reclaimable == 0 {
-                continue;
-            }
+            let mut boundary_chunks = Vec::with_capacity(state.chunks.len());
             for (&ordinal, chunk) in &state.chunks {
                 let chunk_bytes = chunk.backing._grant.bytes();
                 let full_extent = state.allocator.by_offset.get(&(ordinal, 0));
-                if chunk.live_segments != 0
-                    || Arc::strong_count(&chunk.backing) != 1
-                    || protected_chunks.contains(&ordinal)
-                    || chunk_bytes > reclaimable
-                    || chunk.backing.descriptor.size_bytes != chunk_bytes
-                    || full_extent.is_none_or(|extent| {
-                        extent.chunk_generation != chunk.backing.identity.generation()
-                            || extent.length_bytes != chunk_bytes
-                    })
-                {
-                    continue;
-                }
-                candidates.push(IdleChunkReclaimCandidate {
-                    pool_index,
-                    chunk: chunk.backing.identity.clone(),
-                    chunk_bytes,
+                let external_references = Arc::strong_count(&chunk.backing).saturating_sub(1);
+                let protected_packing = protected_chunks.contains(&ordinal);
+                let full_extent_available = chunk.backing.descriptor.size_bytes == chunk_bytes
+                    && full_extent.is_some_and(|extent| {
+                        extent.chunk_generation == chunk.backing.identity.generation()
+                            && extent.length_bytes == chunk_bytes
+                    });
+                let resident_floor_allows_reclaim = chunk_bytes <= reclaimable;
+                let reclaim_candidate = !excluded_from_reclaim
+                    && state.pending_growth_bytes == 0
+                    && protected_packing_satisfied
+                    && chunk.live_segments == 0
+                    && external_references == 0
+                    && !protected_packing
+                    && resident_floor_allows_reclaim
+                    && full_extent_available;
+                boundary_chunks.push(DynamicPoolMaintenanceBoundaryChunk {
+                    identity: chunk.backing.identity.clone(),
+                    bytes: chunk_bytes,
+                    live_segments: chunk.live_segments,
+                    external_references,
+                    protected_packing,
+                    full_extent_available,
+                    resident_floor_allows_reclaim,
+                    reclaim_candidate,
                 });
+                if reclaim_candidate {
+                    candidates.push(IdleChunkReclaimCandidate {
+                        pool_index,
+                        chunk: chunk.backing.identity.clone(),
+                        chunk_bytes,
+                    });
+                }
             }
+            boundary_pools.push(DynamicPoolMaintenanceBoundaryPool {
+                pool_id: pool.domain.pool_id().clone(),
+                domain_id: pool.domain.domain_id,
+                excluded_from_reclaim,
+                resident_bytes: state.resident_bytes,
+                pending_growth_bytes: state.pending_growth_bytes,
+                free_bytes: state.allocator.free_bytes,
+                largest_contiguous_bytes: state.allocator.largest_contiguous_bytes(),
+                free_extent_layout_fingerprint: free_extent_layout_fingerprint(&state.allocator),
+                logical_used_bytes: used,
+                live_occupancy: state.live_occupancy,
+                minimum_resident_bytes: pool.domain.pool.provisioning().minimum_resident_bytes(),
+                maximum_resident_bytes: pool.domain.pool.provisioning().maximum_resident_bytes(),
+                protected_immediate_bytes: protected,
+                protected_packing_satisfied,
+                coherent_runnable_floor_bytes: coherent_runnable_floor,
+                resident_floor_bytes: resident_floor,
+                reclaimable_bytes: reclaimable,
+                chunks: boundary_chunks,
+            });
         }
 
+        let reclaim_candidate_chunks = candidates.len();
+        let reclaim_candidate_bytes = candidates.iter().try_fold(0_u64, |total, candidate| {
+            total
+                .checked_add(candidate.chunk_bytes)
+                .ok_or_else(|| invalid_resource("dynamic reclaim candidate bytes overflow u64"))
+        })?;
         let mut selected = Vec::<IdleChunkReclaimCandidate>::new();
         let mut selected_by_pool = vec![0_u64; pools.len()];
         let mut reclaimed_bytes = 0_u64;
@@ -376,14 +424,42 @@ where
                 }
             }
         }
-        if reclaimed_bytes < deficit {
-            return Ok(None);
-        }
         selected.sort_by(|left, right| {
             left.pool_index
                 .cmp(&right.pool_index)
                 .then_with(|| left.chunk.ordinal().cmp(&right.chunk.ordinal()))
         });
+        let mut planned_domains = excluded_domains.iter().copied().collect::<Vec<_>>();
+        planned_domains.sort_unstable();
+        let mut protected_packing_envelopes = protected_packing_envelopes.to_vec();
+        protected_packing_envelopes.sort_by_key(DynamicBackingPackingEnvelope::domain_id);
+        let boundary = DynamicPoolMaintenanceBoundaryReceipt {
+            schema_version: DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION,
+            coordinator_id: logical.coordinator_id(),
+            logical_release_epoch: logical.release_epoch(),
+            logical_capacity_epoch: logical.capacity_epoch(),
+            plan_device_capacity_epoch: capacity_availability.plan_epoch(),
+            process_device_capacity_epoch: capacity_availability.process_epoch(),
+            pressure: pressure.clone(),
+            planned_domains,
+            protected_immediate: protected_immediate.clone(),
+            protected_packing_envelopes,
+            pools: boundary_pools,
+            reclaim_candidate_chunks,
+            reclaim_candidate_bytes,
+            selected_chunks: selected
+                .iter()
+                .map(|candidate| candidate.chunk.clone())
+                .collect(),
+            selected_bytes: reclaimed_bytes,
+            reclaim_sufficient: reclaimed_bytes >= deficit,
+        };
+        if reclaimed_bytes < deficit {
+            return Ok(DynamicPoolRebalanceAttempt {
+                boundary,
+                rebalance: None,
+            });
+        }
 
         for candidate in &selected {
             let state = &states[candidate.pool_index];
@@ -491,14 +567,17 @@ where
         drop(maintenance);
         drop(removed);
         let availability = self.budget.availability_snapshot()?;
-        Ok(Some(DynamicPoolRebalanceReceipt {
-            pools: pool_receipts,
-            reclaimed_chunks,
-            reclaimed_bytes,
-            logical_capacity_epoch: epochs.capacity_epoch(),
-            plan_device_capacity_epoch: availability.plan_epoch(),
-            process_device_capacity_epoch: availability.process_epoch(),
-        }))
+        Ok(DynamicPoolRebalanceAttempt {
+            boundary,
+            rebalance: Some(DynamicPoolRebalanceReceipt {
+                pools: pool_receipts,
+                reclaimed_chunks,
+                reclaimed_bytes,
+                logical_capacity_epoch: epochs.capacity_epoch(),
+                plan_device_capacity_epoch: availability.plan_epoch(),
+                process_device_capacity_epoch: availability.process_epoch(),
+            }),
+        })
     }
 
     pub(in crate::vnext::resource) fn maintain_pools(
@@ -657,6 +736,7 @@ where
                 growths: Vec::new(),
                 capacity_epoch: self.logical_admission.epochs()?.capacity_epoch(),
                 rebalance: None,
+                maintenance_boundary: None,
             });
         }
 
@@ -910,6 +990,7 @@ where
                 .collect(),
             capacity_epoch: epochs.capacity_epoch(),
             rebalance: None,
+            maintenance_boundary: None,
         })
     }
 

@@ -3,10 +3,11 @@ use super::{
     BackingChunkIdentity, BackingSegment, BufferDescriptor, BufferUsage, CapacityDomainId,
     CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector, CapacityWaitCondition,
     DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot, DeviceCapacityGrant, DeviceRuntime,
-    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicResourceShape,
-    DynamicStorageAllocator, DynamicStorageProfile, ElementType, ExecutionLaneId, FreeExtentIndex,
-    InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
-    Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError,
+    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicPoolMaintenanceBoundaryReceipt,
+    DynamicResourceDescriptor, DynamicResourceShape, DynamicStorageAllocator,
+    DynamicStorageProfile, ElementType, ExecutionLaneId, FreeExtentIndex, InvocationLivenessMode,
+    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, Ordering, PlanNode,
+    ResourceId, Serialize, StateInitialization, VNextError,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolProvisioningPolicy,
@@ -1126,6 +1127,8 @@ pub struct DynamicPoolGrowthBatchReceipt {
     pub(super) capacity_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) rebalance: Option<DynamicPoolRebalanceReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) maintenance_boundary: Option<DynamicPoolMaintenanceBoundaryReceipt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1548,6 +1551,10 @@ impl DynamicPoolGrowthBatchReceipt {
 
     pub const fn rebalance(&self) -> Option<&DynamicPoolRebalanceReceipt> {
         self.rebalance.as_ref()
+    }
+
+    pub const fn maintenance_boundary(&self) -> Option<&DynamicPoolMaintenanceBoundaryReceipt> {
+        self.maintenance_boundary.as_ref()
     }
 }
 

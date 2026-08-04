@@ -5016,6 +5016,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 current_epochs,
                 wait_condition,
                 pressure,
+                maintenance_boundary,
             } => match source {
                 VNextExecutionMaintenanceSource::Logical(source) => {
                     ExecutorExecutionCapacityDeferral::from_admission_maintenance(
@@ -5023,6 +5024,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ExecutorAdmissionEpochs::from_capacity(current_epochs),
                         wait_condition,
                         pressure,
+                        maintenance_boundary,
                         stage,
                     )
                 }
@@ -5032,6 +5034,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         ExecutorAdmissionEpochs::from_capacity(current_epochs),
                         wait_condition,
                         pressure,
+                        maintenance_boundary,
                         stage,
                     )
                 }
@@ -8446,6 +8449,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
                 current_epochs,
                 wait_condition,
                 pressure,
+                maintenance_boundary: _,
             } => Ok(ExecutorPrefillMaintenanceOutcome::WaitForRelease {
                 current: ExecutorAdmissionEpochs::from_capacity(current_epochs),
                 wait_condition,

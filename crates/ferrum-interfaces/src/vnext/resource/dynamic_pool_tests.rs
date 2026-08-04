@@ -2234,6 +2234,7 @@ fn busy_eager_backing_returns_pool_wait_then_retries_after_release() {
         current_epochs,
         wait_condition,
         pressure,
+        maintenance_boundary,
     } = deferred.maintain().unwrap()
     else {
         panic!("busy eager backing must become typed pool pressure")
@@ -2243,6 +2244,7 @@ fn busy_eager_backing_returns_pool_wait_then_retries_after_release() {
         ExecutorAdmissionEpochs::from_capacity(current_epochs),
         wait_condition.clone(),
         pressure.clone(),
+        maintenance_boundary.clone(),
         ExecutorExecutionCapacityStage::StepAdmission,
     )
     .unwrap();
@@ -2256,6 +2258,10 @@ fn busy_eager_backing_returns_pool_wait_then_retries_after_release() {
         deferred.evidence().blockers()
     );
     assert_eq!(execution_deferral.backing_pressure(), Some(&pressure));
+    assert_eq!(
+        execution_deferral.maintenance_boundary(),
+        maintenance_boundary.as_ref()
+    );
     let serialized = serde_json::to_value(execution_deferral.evidence()).unwrap();
     assert_eq!(serialized["owner"], "backing");
     assert_eq!(serialized["kind"], "backing_deferred");
@@ -2366,6 +2372,34 @@ fn plan_budget_pressure_rebalances_idle_chunks_across_pools() {
         std::slice::from_ref(donor_growth.chunk())
     );
     assert_eq!(rebalance.pools()[0].published_capacity_bytes(), 64);
+    let boundary = growth
+        .maintenance_boundary()
+        .expect("pressure-driven growth must retain its pre-mutation boundary");
+    assert_eq!(boundary.schema_version(), 1);
+    assert!(boundary.reclaim_sufficient());
+    assert_eq!(boundary.selected_bytes(), rebalance.reclaimed_bytes());
+    assert_eq!(boundary.selected_chunks(), rebalance.pools()[0].chunks());
+    assert_eq!(boundary.pressure().requested_bytes(), 64);
+    assert_eq!(boundary.pressure().available_bytes(), 0);
+    assert_eq!(boundary.reclaim_candidate_chunks(), 2);
+    assert_eq!(boundary.reclaim_candidate_bytes(), 128);
+    let donor_boundary = boundary
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &donor_pool_id)
+        .unwrap();
+    assert!(!donor_boundary.excluded_from_reclaim());
+    assert_eq!(donor_boundary.logical_used_bytes(), 0);
+    assert_eq!(donor_boundary.reclaimable_bytes(), 64);
+    let donor_chunk = donor_boundary
+        .chunks()
+        .iter()
+        .find(|chunk| chunk.identity() == donor_growth.chunk())
+        .unwrap();
+    assert!(donor_chunk.reclaim_candidate());
+    assert_eq!(donor_chunk.external_references(), 0);
+    assert!(donor_chunk.full_extent_available());
+    assert!(donor_chunk.resident_floor_allows_reclaim());
     let serialized_rebalance = serde_json::to_value(rebalance).unwrap();
     assert_eq!(
         serialized_rebalance["pools"][0]["pool_id"],
@@ -2475,10 +2509,27 @@ fn rebalance_preserves_physical_occupancy_plus_pending_bundle_demand() {
     );
     let before = maintenance.status().unwrap();
 
-    assert!(matches!(
-        maintenance.maintain_for_live_deferred(&deferred).unwrap(),
-        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
-    ));
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        maintenance_boundary: Some(blocked_boundary),
+        ..
+    } = maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("live donor must expose the exact blocked maintenance boundary")
+    };
+    assert!(!blocked_boundary.reclaim_sufficient());
+    assert_eq!(blocked_boundary.selected_bytes(), 0);
+    assert_eq!(blocked_boundary.reclaim_candidate_chunks(), 0);
+    let live_excess = blocked_boundary
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &second_pool_id)
+        .unwrap()
+        .chunks()
+        .iter()
+        .find(|chunk| chunk.live_segments() != 0 && chunk.bytes() == 64)
+        .unwrap();
+    assert!(!live_excess.reclaim_candidate());
+    assert!(live_excess.live_segments() > 0);
     assert_eq!(maintenance.status().unwrap(), before);
 
     drop(held_second);
@@ -2562,10 +2613,27 @@ fn rebalance_preserves_contiguous_packability_for_pending_bundle() {
     assert_eq!(deferred.blockers()[0].pool_id(), &target_pool_id);
     let before = maintenance.status().unwrap();
 
-    assert!(matches!(
-        maintenance.maintain_for_live_deferred(&deferred).unwrap(),
-        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
-    ));
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        maintenance_boundary: Some(blocked_boundary),
+        ..
+    } = maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("live donor must expose the exact blocked maintenance boundary")
+    };
+    assert!(!blocked_boundary.reclaim_sufficient());
+    assert_eq!(blocked_boundary.selected_bytes(), 0);
+    assert_eq!(blocked_boundary.reclaim_candidate_chunks(), 0);
+    let live_excess = blocked_boundary
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &donor_pool_id)
+        .unwrap()
+        .chunks()
+        .iter()
+        .find(|chunk| chunk.live_segments() != 0 && chunk.bytes() == 64)
+        .unwrap();
+    assert!(!live_excess.reclaim_candidate());
+    assert!(live_excess.live_segments() > 0);
     assert_eq!(maintenance.status().unwrap(), before);
 
     drop(held_target);
@@ -2712,10 +2780,27 @@ fn live_idle_donor_boundary_waits_then_rebalances_after_exact_release() {
         panic!("full target pool must defer")
     };
 
-    assert!(matches!(
-        maintenance.maintain_for_live_deferred(&deferred).unwrap(),
-        DynamicDeferredMaintenanceOutcome::WaitForRelease { .. }
-    ));
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        maintenance_boundary: Some(blocked_boundary),
+        ..
+    } = maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    else {
+        panic!("live donor must expose the exact blocked maintenance boundary")
+    };
+    assert!(!blocked_boundary.reclaim_sufficient());
+    assert_eq!(blocked_boundary.selected_bytes(), 0);
+    assert_eq!(blocked_boundary.reclaim_candidate_chunks(), 0);
+    let live_excess = blocked_boundary
+        .pools()
+        .iter()
+        .find(|pool| pool.pool_id() == &donor_pool_id)
+        .unwrap()
+        .chunks()
+        .iter()
+        .find(|chunk| chunk.live_segments() != 0 && chunk.bytes() == 64)
+        .unwrap();
+    assert!(!live_excess.reclaim_candidate());
+    assert!(live_excess.live_segments() > 0);
     let blocked = maintenance.status().unwrap();
     assert_eq!(blocked.budget_claimed_bytes(), 192);
     assert_eq!(
@@ -2736,6 +2821,10 @@ fn live_idle_donor_boundary_waits_then_rebalances_after_exact_release() {
     };
     assert_eq!(growth.rebalance().unwrap().reclaimed_chunks(), 1);
     assert_eq!(growth.rebalance().unwrap().reclaimed_bytes(), 64);
+    let released_boundary = growth.maintenance_boundary().unwrap();
+    assert!(released_boundary.reclaim_sufficient());
+    assert_eq!(released_boundary.selected_bytes(), 64);
+    assert_eq!(released_boundary.reclaim_candidate_chunks(), 1);
     assert_eq!(maintenance.status().unwrap().budget_claimed_bytes(), 192);
 
     drop(donor_minimum);
@@ -2788,13 +2877,42 @@ fn insufficient_idle_reclaim_keeps_all_residency_and_returns_typed_wait() {
         .availability_snapshot()
         .unwrap();
 
-    let DynamicDeferredMaintenanceOutcome::WaitForRelease { pressure, .. } =
-        maintenance.maintain_for_live_deferred(&deferred).unwrap()
+    let DynamicDeferredMaintenanceOutcome::WaitForRelease {
+        current_epochs,
+        wait_condition,
+        pressure,
+        maintenance_boundary: Some(boundary),
+    } = maintenance.maintain_for_live_deferred(&deferred).unwrap()
     else {
         panic!("a partial donor chunk must not be reclaimed without satisfying the deficit")
     };
     assert_eq!(pressure.requested_bytes(), 64);
     assert_eq!(pressure.available_bytes(), 0);
+    assert_eq!(boundary.pressure().requested_bytes(), 64);
+    assert_eq!(boundary.reclaim_candidate_chunks(), 1);
+    assert_eq!(boundary.reclaim_candidate_bytes(), 32);
+    assert_eq!(boundary.selected_bytes(), 32);
+    assert_eq!(boundary.selected_chunks().len(), 1);
+    assert!(!boundary.reclaim_sufficient());
+    assert!(ExecutorExecutionCapacityDeferral::from_backing_maintenance(
+        &deferred,
+        ExecutorAdmissionEpochs::from_capacity(current_epochs),
+        wait_condition.clone(),
+        pressure.clone(),
+        None,
+        ExecutorExecutionCapacityStage::StepAdmission,
+    )
+    .is_err());
+    let execution_deferral = ExecutorExecutionCapacityDeferral::from_backing_maintenance(
+        &deferred,
+        ExecutorAdmissionEpochs::from_capacity(current_epochs),
+        wait_condition,
+        pressure,
+        Some(boundary.clone()),
+        ExecutorExecutionCapacityStage::StepAdmission,
+    )
+    .unwrap();
+    assert_eq!(execution_deferral.maintenance_boundary(), Some(&boundary));
     let after = maintenance.status().unwrap();
     assert_eq!(after.pools(), before.pools());
     assert_eq!(after.budget_claimed_bytes(), before.budget_claimed_bytes());
