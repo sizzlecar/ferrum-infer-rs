@@ -156,13 +156,24 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
 
 #[test]
 fn determinism_logical_restore_identity_ignores_fresh_physical_authority() {
-    fn collect(fill_byte: u8) -> String {
-        let (fixture, sequence, session, batch, step) = setup_with_fixture(
-            fixture_with_determinism_provider_behavior(false, ProviderBehavior::ScratchOverwrite),
+    fn collect(
+        fixture: &Fixture,
+        run_id: &str,
+        request_id: &str,
+        fill_byte: u8,
+    ) -> (String, String) {
+        let sequence = logical_resources(&fixture.plan_resources, run_id, request_id);
+        let session = sequence.open_session().unwrap();
+        let batch = ExecutionBatchParticipants::new(vec![Arc::clone(&session)]).unwrap();
+        let lane = fixture.plan_resources.create_execution_lane().unwrap();
+        let step = begin_single_participant_step_on_lane_with_bucket(
+            &batch,
+            &lane,
+            fixture.reusable_execution_bucket.as_ref(),
         );
         let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let physical_work_fingerprint = wave.nodes()[0].work_shape().fingerprint().to_owned();
         let active_bindings = wave_active_bindings(&wave, &session);
-        let lane = Arc::clone(step.execution_lane());
         let providers = fixture
             .plan
             .payload()
@@ -197,16 +208,34 @@ fn determinism_logical_restore_identity_ignores_fresh_physical_authority() {
         drop(providers);
         drop(active_bindings);
         drop(wave);
+        step.try_retire_normal().unwrap();
+        drop(batch);
+        session.try_complete().unwrap();
+        drop(session);
+        drop(sequence);
         drop(lane);
-        teardown(fixture, sequence, session, batch, step);
-        fingerprint
+        (physical_work_fingerprint, fingerprint)
     }
 
-    let first = collect(0x31);
-    let second = collect(0x31);
-    let changed_payload = collect(0x32);
-    assert_eq!(first, second);
-    assert_ne!(first, changed_payload);
+    let fixture =
+        fixture_with_determinism_provider_behavior(false, ProviderBehavior::ScratchOverwrite);
+    let (first_physical, first_logical) =
+        collect(&fixture, "run.restore.1", "request.restore.1", 0x31);
+    let (second_physical, second_logical) =
+        collect(&fixture, "run.restore.2", "request.restore.2", 0x31);
+    let (_, changed_payload_logical) =
+        collect(&fixture, "run.restore.3", "request.restore.3", 0x32);
+    assert_ne!(first_physical, second_physical);
+    assert_eq!(first_logical, second_logical);
+    assert_ne!(first_logical, changed_payload_logical);
+
+    drop(fixture.registry);
+    drop(fixture.impostor_registry);
+    drop(fixture.runtime);
+    assert!(matches!(
+        PlanRuntimeResources::close(fixture.plan_resources),
+        Ok(PlanRuntimeCloseOutcome::Closed(_))
+    ));
 }
 
 #[test]
