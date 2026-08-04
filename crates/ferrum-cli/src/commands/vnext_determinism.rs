@@ -1007,13 +1007,36 @@ mod cuda {
         right: &SubmissionWaveDeterminismArtifactExecution,
         comparison_kind: &str,
     ) -> Result<()> {
-        if left.restore_sha256() != right.restore_sha256()
-            || left.initialization_identity() != right.initialization_identity()
+        let left_initialization = left.initialization_identity();
+        let right_initialization = right.initialization_identity();
+        let mut restore_mismatches = Vec::with_capacity(4);
+        if left.restore_sha256() != right.restore_sha256() {
+            restore_mismatches.push("logical_restore");
+        }
+        if left_initialization.input_sha256() != right_initialization.input_sha256() {
+            restore_mismatches.push("external_input");
+        }
+        if left_initialization.rng_sha256() != right_initialization.rng_sha256() {
+            restore_mismatches.push("rng");
+        }
+        if left_initialization.initial_state_sha256() != right_initialization.initial_state_sha256()
         {
+            restore_mismatches.push("initial_state");
+        }
+        if !restore_mismatches.is_empty() {
             return Err(FerrumError::backend(format!(
-                "{comparison_kind} restored different input/RNG/initial-state bytes between {} and {}",
+                "{comparison_kind} restored different input/RNG/initial-state bytes between {} and {}: mismatch_fields={} left_restore_sha256={} right_restore_sha256={} left_input_sha256={} right_input_sha256={} left_rng_sha256={} right_rng_sha256={} left_initial_state_sha256={} right_initial_state_sha256={}",
                 left.execution_id(),
-                right.execution_id()
+                right.execution_id(),
+                restore_mismatches.join(","),
+                left.restore_sha256(),
+                right.restore_sha256(),
+                left_initialization.input_sha256(),
+                right_initialization.input_sha256(),
+                left_initialization.rng_sha256(),
+                right_initialization.rng_sha256(),
+                left_initialization.initial_state_sha256(),
+                right_initialization.initial_state_sha256(),
             )));
         }
         if left.witnesses().len() != right.witnesses().len() {
