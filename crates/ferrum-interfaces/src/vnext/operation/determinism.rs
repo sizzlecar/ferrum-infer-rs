@@ -12,7 +12,8 @@ use crate::vnext::{
     BatchInvocationId, BufferUsage, CompletionHandle, CompletionReadbackBatchRequest,
     CompletionReadbackCollectionObservation, CompletionReadbackCollectionRequest,
     CompletionReadbackDisposition, CompletionReadbackRequest, DeviceCommandPhase,
-    DeviceExecutionPath, DeviceRuntime, ExecutablePlanView, ExecutionDeterminismInitializationKind,
+    DeviceComputePathRequirement, DeviceExecutionPath, DeviceReusableExecutionProgramId,
+    DeviceRuntime, ExecutablePlanView, ExecutionDeterminismInitializationKind,
     ExecutionDeterminismInitializationSpec, ExecutionDeterminismValueExtent,
     ExecutionDeterminismValueLocation, ExecutionDeterminismWitnessKind,
     ExecutionDeterminismWitnessPlan, ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId,
@@ -1126,6 +1127,75 @@ impl SubmissionWaveDeterminismWitnessReadback {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SubmissionWaveDeterminismComputeExpectation {
+    EagerOnly,
+    Replayed {
+        program_id: DeviceReusableExecutionProgramId,
+        declared_eager_boundary_node_ids: Vec<NodeId>,
+    },
+}
+
+impl SubmissionWaveDeterminismComputeExpectation {
+    fn replayed(
+        program_id: DeviceReusableExecutionProgramId,
+        declared_eager_boundary_node_ids: Vec<NodeId>,
+    ) -> Result<Self, VNextError> {
+        if declared_eager_boundary_node_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid_operation(
+                "determinism eager boundary node ids are not canonical",
+            ));
+        }
+        Ok(Self::Replayed {
+            program_id,
+            declared_eager_boundary_node_ids,
+        })
+    }
+
+    const fn execution_path(&self) -> DeviceExecutionPath {
+        match self {
+            Self::EagerOnly => DeviceExecutionPath::Eager,
+            Self::Replayed { .. } => DeviceExecutionPath::Replayed,
+        }
+    }
+
+    const fn compute_path_requirement(&self) -> DeviceComputePathRequirement {
+        match self {
+            Self::EagerOnly => DeviceComputePathRequirement::EagerOnly,
+            Self::Replayed {
+                declared_eager_boundary_node_ids,
+                ..
+            } if declared_eager_boundary_node_ids.is_empty() => {
+                DeviceComputePathRequirement::ReplayedOnly
+            }
+            Self::Replayed { .. } => {
+                DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+            }
+        }
+    }
+
+    fn reusable_program_id(&self) -> Option<&DeviceReusableExecutionProgramId> {
+        match self {
+            Self::EagerOnly => None,
+            Self::Replayed { program_id, .. } => Some(program_id),
+        }
+    }
+
+    fn declared_eager_boundary_node_ids(&self) -> &[NodeId] {
+        match self {
+            Self::EagerOnly => &[],
+            Self::Replayed {
+                declared_eager_boundary_node_ids,
+                ..
+            } => declared_eager_boundary_node_ids,
+        }
+    }
+}
+
 /// Fail-closed terminal evidence for one forced eager or replay execution.
 ///
 /// The physical buffers retain raw bytes for in-process comparison. Their
@@ -1135,7 +1205,7 @@ impl SubmissionWaveDeterminismWitnessReadback {
 pub struct SubmissionWaveDeterminismEvidence {
     restore_fingerprint: String,
     initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
-    expected_execution_path: DeviceExecutionPath,
+    compute_expectation: SubmissionWaveDeterminismComputeExpectation,
     submission_receipt_fingerprint: String,
     terminal_receipt_fingerprint: String,
     attribution: BoundDeviceSubmissionAttribution,
@@ -1153,7 +1223,21 @@ impl SubmissionWaveDeterminismEvidence {
     }
 
     pub const fn expected_execution_path(&self) -> DeviceExecutionPath {
-        self.expected_execution_path
+        self.compute_expectation.execution_path()
+    }
+
+    pub const fn expected_compute_path_requirement(&self) -> DeviceComputePathRequirement {
+        self.compute_expectation.compute_path_requirement()
+    }
+
+    pub fn reusable_program_fingerprint(&self) -> Option<String> {
+        self.compute_expectation
+            .reusable_program_id()
+            .map(DeviceReusableExecutionProgramId::fingerprint)
+    }
+
+    pub fn declared_eager_boundary_node_ids(&self) -> &[NodeId] {
+        self.compute_expectation.declared_eager_boundary_node_ids()
     }
 
     pub fn submission_receipt_fingerprint(&self) -> &str {
@@ -1180,11 +1264,20 @@ impl SubmissionWaveDeterminismEvidence {
 fn validate_determinism_attribution(
     attribution: &BoundDeviceSubmissionAttribution,
     node_ids: &[NodeId],
-    expected_execution_path: DeviceExecutionPath,
+    compute_expectation: &SubmissionWaveDeterminismComputeExpectation,
 ) -> Result<(), VNextError> {
     let expected_nodes = node_ids.iter().collect::<BTreeSet<_>>();
+    let declared_eager_boundary_nodes = compute_expectation
+        .declared_eager_boundary_node_ids()
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if !declared_eager_boundary_nodes.is_subset(&expected_nodes) {
+        return Err(invalid_operation(
+            "determinism eager boundary is absent from the requested plan nodes",
+        ));
+    }
     let mut observed_nodes = BTreeSet::new();
-    match expected_execution_path {
+    match compute_expectation.execution_path() {
         DeviceExecutionPath::Eager => {
             for replayed_segment in attribution.device().replayed_segments() {
                 for command in replayed_segment.logical_commands() {
@@ -1234,10 +1327,23 @@ fn validate_determinism_attribution(
                         "determinism node `{node_id}` did not execute through the required eager path"
                     )));
                 }
-                observed_nodes.insert(node_id);
+                if !observed_nodes.insert(node_id) {
+                    return Err(invalid_operation(format!(
+                        "determinism node `{node_id}` has duplicate eager compute attribution"
+                    )));
+                }
             }
         }
         DeviceExecutionPath::Replayed => {
+            let expected_program_id =
+                compute_expectation.reusable_program_id().ok_or_else(|| {
+                    invalid_operation("determinism replay expectation lacks a reusable program")
+                })?;
+            if attribution.device().replayed_segments().is_empty() {
+                return Err(invalid_operation(
+                    "determinism replay attribution contains no resident segment",
+                ));
+            }
             for command in attribution.device().commands() {
                 if command.command_phase() != DeviceCommandPhase::Compute {
                     continue;
@@ -1256,15 +1362,34 @@ fn validate_determinism_attribution(
                             "determinism attribution references a node absent from its batch",
                         )
                     })?;
-                if expected_nodes.contains(node_id)
-                    && command.execution_path() != DeviceExecutionPath::Replayed
-                {
+                if !expected_nodes.contains(node_id) {
+                    continue;
+                }
+                if declared_eager_boundary_nodes.contains(node_id) {
+                    if command.execution_path() != DeviceExecutionPath::Eager
+                        || command.reusable_graph_node_count().is_some()
+                    {
+                        return Err(invalid_operation(format!(
+                            "determinism declared eager boundary `{node_id}` did not execute eagerly"
+                        )));
+                    }
+                    if !observed_nodes.insert(node_id) {
+                        return Err(invalid_operation(format!(
+                            "determinism declared eager boundary `{node_id}` has duplicate compute attribution"
+                        )));
+                    }
+                } else if command.execution_path() != DeviceExecutionPath::Replayed {
                     return Err(invalid_operation(format!(
-                        "determinism node `{node_id}` executed eagerly while replay was required"
+                        "determinism node `{node_id}` executed eagerly without a declared topology boundary"
                     )));
                 }
             }
             for replayed_segment in attribution.device().replayed_segments() {
+                if replayed_segment.program_id() != expected_program_id {
+                    return Err(invalid_operation(
+                        "determinism replay attribution references another reusable program",
+                    ));
+                }
                 for command in replayed_segment.logical_commands() {
                     let node_index = usize::try_from(command.node_index()).map_err(|_| {
                         invalid_operation("determinism replay node index exceeds usize")
@@ -1277,8 +1402,15 @@ fn validate_determinism_attribution(
                                 "determinism replay attribution references a node absent from its batch",
                             )
                         })?;
-                    if expected_nodes.contains(node_id) {
-                        observed_nodes.insert(node_id);
+                    if declared_eager_boundary_nodes.contains(node_id) {
+                        return Err(invalid_operation(format!(
+                            "determinism declared eager boundary `{node_id}` appeared in replay attribution"
+                        )));
+                    }
+                    if expected_nodes.contains(node_id) && !observed_nodes.insert(node_id) {
+                        return Err(invalid_operation(format!(
+                            "determinism node `{node_id}` has duplicate replay attribution"
+                        )));
                     }
                 }
             }
@@ -1301,16 +1433,52 @@ pub struct SubmissionWaveDeterminismHandle<R: DeviceRuntime> {
     readback_plan: SubmissionWaveDeterminismReadbackPlan,
     restore_fingerprint: String,
     initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
-    expected_execution_path: DeviceExecutionPath,
+    compute_expectation: SubmissionWaveDeterminismComputeExpectation,
 }
 
 impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
-    pub(super) fn from_profiled(
+    pub(super) fn from_profiled_eager(
         profiled: ProfiledSubmissionHandle<R>,
         readback_plan: SubmissionWaveDeterminismReadbackPlan,
         restore_fingerprint: String,
         initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
-        expected_execution_path: DeviceExecutionPath,
+    ) -> Self {
+        Self::from_profiled(
+            profiled,
+            readback_plan,
+            restore_fingerprint,
+            initialization_identity,
+            SubmissionWaveDeterminismComputeExpectation::EagerOnly,
+        )
+    }
+
+    pub(super) fn from_profiled_replayed(
+        profiled: ProfiledSubmissionHandle<R>,
+        readback_plan: SubmissionWaveDeterminismReadbackPlan,
+        restore_fingerprint: String,
+        initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
+        program_id: DeviceReusableExecutionProgramId,
+        declared_eager_boundary_node_ids: Vec<NodeId>,
+    ) -> Result<Self, VNextError> {
+        let expectation = SubmissionWaveDeterminismComputeExpectation::replayed(
+            program_id,
+            declared_eager_boundary_node_ids,
+        )?;
+        Ok(Self::from_profiled(
+            profiled,
+            readback_plan,
+            restore_fingerprint,
+            initialization_identity,
+            expectation,
+        ))
+    }
+
+    fn from_profiled(
+        profiled: ProfiledSubmissionHandle<R>,
+        readback_plan: SubmissionWaveDeterminismReadbackPlan,
+        restore_fingerprint: String,
+        initialization_identity: SubmissionWaveDeterminismInitializationIdentity,
+        compute_expectation: SubmissionWaveDeterminismComputeExpectation,
     ) -> Self {
         let (completion, attribution) = profiled.into_parts();
         Self {
@@ -1319,7 +1487,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
             readback_plan,
             restore_fingerprint,
             initialization_identity,
-            expected_execution_path,
+            compute_expectation,
         }
     }
 
@@ -1357,7 +1525,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
             readback_plan,
             restore_fingerprint,
             initialization_identity,
-            expected_execution_path,
+            compute_expectation,
         } = self;
         let submission_receipt_fingerprint = completion.receipt().fingerprint().to_owned();
         let observation =
@@ -1387,7 +1555,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         validate_determinism_attribution(
             &attribution,
             readback_plan.node_ids(),
-            expected_execution_path,
+            &compute_expectation,
         )?;
 
         let expected_readbacks = readback_plan
@@ -1465,7 +1633,7 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
         Ok(SubmissionWaveDeterminismEvidence {
             restore_fingerprint,
             initialization_identity,
-            expected_execution_path,
+            compute_expectation,
             submission_receipt_fingerprint,
             terminal_receipt_fingerprint,
             attribution,

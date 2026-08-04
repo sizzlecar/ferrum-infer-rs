@@ -1,8 +1,8 @@
 use serde::Serialize;
 
 use crate::vnext::{
-    BufferUsage, DeviceCommandPhase, DeviceExecutionPath, ElementType,
-    ExecutionDeterminismWitnessKind, TensorAccess, VNextError,
+    BufferUsage, DeviceCommandPhase, DeviceComputePathRequirement, DeviceExecutionPath,
+    ElementType, ExecutionDeterminismWitnessKind, TensorAccess, VNextError,
 };
 
 use super::foundation::invalid_operation;
@@ -62,6 +62,7 @@ pub struct SubmissionWaveDeterminismArtifactLogicalCommand {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SubmissionWaveDeterminismArtifactReplayedSegment {
     physical_command_index: u32,
+    reusable_program_fingerprint: String,
     reusable_executable_fingerprint: String,
     logical_commands: Vec<SubmissionWaveDeterminismArtifactLogicalCommand>,
 }
@@ -134,6 +135,9 @@ impl SubmissionWaveDeterminismArtifactWitness {
 pub struct SubmissionWaveDeterminismArtifactExecution {
     execution_id: String,
     mode: String,
+    compute_path_requirement: String,
+    reusable_program_fingerprint: Option<String>,
+    declared_eager_boundary_node_ids: Vec<String>,
     restore_sha256: String,
     initialization_identity: SubmissionWaveDeterminismArtifactInitializationIdentity,
     submission_fingerprint: String,
@@ -149,6 +153,18 @@ impl SubmissionWaveDeterminismArtifactExecution {
 
     pub fn mode(&self) -> &str {
         &self.mode
+    }
+
+    pub fn compute_path_requirement(&self) -> &str {
+        &self.compute_path_requirement
+    }
+
+    pub fn reusable_program_fingerprint(&self) -> Option<&str> {
+        self.reusable_program_fingerprint.as_deref()
+    }
+
+    pub fn declared_eager_boundary_node_ids(&self) -> &[String] {
+        &self.declared_eager_boundary_node_ids
     }
 
     pub fn restore_sha256(&self) -> &str {
@@ -255,6 +271,7 @@ impl SubmissionWaveDeterminismEvidence {
                     .collect::<Result<Vec<_>, VNextError>>()?;
                 Ok(SubmissionWaveDeterminismArtifactReplayedSegment {
                     physical_command_index: segment.physical_command_index(),
+                    reusable_program_fingerprint: segment.program_id().fingerprint(),
                     reusable_executable_fingerprint: segment
                         .reusable_executable_fingerprint()
                         .to_owned(),
@@ -345,6 +362,12 @@ impl SubmissionWaveDeterminismEvidence {
         });
 
         let initialization = self.initialization_identity();
+        let reusable_program_fingerprint = self.reusable_program_fingerprint();
+        let declared_eager_boundary_node_ids = self
+            .declared_eager_boundary_node_ids()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         Ok(SubmissionWaveDeterminismArtifactExecution {
             execution_id,
             mode: match self.expected_execution_path() {
@@ -352,6 +375,12 @@ impl SubmissionWaveDeterminismEvidence {
                 DeviceExecutionPath::Replayed => "replay",
             }
             .to_owned(),
+            compute_path_requirement: compute_path_requirement_label(
+                self.expected_compute_path_requirement(),
+            )
+            .to_owned(),
+            reusable_program_fingerprint,
+            declared_eager_boundary_node_ids,
             restore_sha256: self.restore_fingerprint().to_owned(),
             initialization_identity: SubmissionWaveDeterminismArtifactInitializationIdentity {
                 input_sha256: initialization.input_sha256().to_owned(),
@@ -368,6 +397,17 @@ impl SubmissionWaveDeterminismEvidence {
             },
             witnesses,
         })
+    }
+}
+
+const fn compute_path_requirement_label(value: DeviceComputePathRequirement) -> &'static str {
+    match value {
+        DeviceComputePathRequirement::Adaptive => "adaptive",
+        DeviceComputePathRequirement::EagerOnly => "eager_only",
+        DeviceComputePathRequirement::ReplayedOnly => "replayed_only",
+        DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => {
+            "replayed_with_declared_eager_boundaries"
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::num::NonZeroU64;
@@ -724,6 +725,9 @@ pub enum DeviceComputePathRequirement {
     Adaptive,
     EagerOnly,
     ReplayedOnly,
+    /// Every replay-eligible node must execute from a sealed resident segment,
+    /// while only core-declared topology boundaries may remain eager.
+    ReplayedWithDeclaredEagerBoundaries,
 }
 
 /// Backend evidence required for one physical submission.
@@ -1120,6 +1124,36 @@ impl DeviceReusableExecutionProgramId {
 
     pub const fn topology_fingerprint(&self) -> DeviceReusableExecutionTopologyFingerprint {
         self.topology_fingerprint
+    }
+
+    /// Stable identity used by detached execution evidence. This hashes every
+    /// field that selects one exact resident program without serializing
+    /// backend-private executable contents.
+    pub fn fingerprint(&self) -> String {
+        const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-id.v1\0";
+        let mut digest = Sha256::new();
+        digest.update(DOMAIN);
+        for value in [
+            self.plan_hash.as_str(),
+            self.runtime_implementation_fingerprint.as_str(),
+            self.bucket_id.as_str(),
+            self.program_binding_layout_fingerprint.as_str(),
+            self.lane_stable_layout_fingerprint.as_str(),
+        ] {
+            digest.update(
+                u64::try_from(value.len())
+                    .expect("validated reusable program identity strings fit u64")
+                    .to_le_bytes(),
+            );
+            digest.update(value.as_bytes());
+        }
+        digest.update(self.lane_id.get().to_le_bytes());
+        digest.update(self.lane_slot_id.to_le_bytes());
+        digest.update(self.immediate_sequences.to_le_bytes());
+        digest.update(self.immediate_tokens.to_le_bytes());
+        digest.update(self.immediate_pages.to_le_bytes());
+        digest.update(self.topology_fingerprint.as_bytes());
+        format!("{:x}", digest.finalize())
     }
 }
 
@@ -2681,6 +2715,7 @@ pub struct DeviceCommandBatch<C> {
     commands: Vec<DeviceCommandEntry<C>>,
     timing_mode: DeviceTimingMode,
     compute_path_requirement: DeviceComputePathRequirement,
+    declared_eager_compute_node_indices: Vec<u32>,
     attribution_requirement: DeviceSubmissionAttributionRequirement,
     reusable_execution_capture: Option<DeviceReusableExecutionCapture>,
 }
@@ -2696,6 +2731,7 @@ impl<C> DeviceCommandBatch<C> {
             }],
             timing_mode: DeviceTimingMode::Off,
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
@@ -2706,6 +2742,7 @@ impl<C> DeviceCommandBatch<C> {
             commands: Vec::with_capacity(capacity),
             timing_mode: DeviceTimingMode::Off,
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
@@ -2716,6 +2753,7 @@ impl<C> DeviceCommandBatch<C> {
             commands: Vec::with_capacity(capacity),
             timing_mode,
             compute_path_requirement: DeviceComputePathRequirement::Adaptive,
+            declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
@@ -2730,9 +2768,29 @@ impl<C> DeviceCommandBatch<C> {
             commands: Vec::with_capacity(capacity),
             timing_mode,
             compute_path_requirement,
+            declared_eager_compute_node_indices: Vec::new(),
             attribution_requirement: DeviceSubmissionAttributionRequirement::None,
             reusable_execution_capture: None,
         }
+    }
+
+    pub(crate) fn set_declared_eager_compute_node_indices(
+        &mut self,
+        node_indices: Vec<u32>,
+    ) -> Result<(), VNextError> {
+        if self.compute_path_requirement
+            != DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+            || node_indices.is_empty()
+            || node_indices.windows(2).any(|pair| pair[0] >= pair[1])
+            || !self.declared_eager_compute_node_indices.is_empty()
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "declared eager compute boundaries are absent, unordered, duplicated, or attached to the wrong path requirement"
+                    .to_owned(),
+            });
+        }
+        self.declared_eager_compute_node_indices = node_indices;
+        Ok(())
     }
 
     pub(crate) fn require_logical_execution_path_attribution(&mut self) {
@@ -2869,6 +2927,10 @@ impl<C> DeviceCommandBatch<C> {
 
     pub const fn compute_path_requirement(&self) -> DeviceComputePathRequirement {
         self.compute_path_requirement
+    }
+
+    pub fn declared_eager_compute_node_indices(&self) -> &[u32] {
+        &self.declared_eager_compute_node_indices
     }
 
     pub const fn attribution_requirement(&self) -> DeviceSubmissionAttributionRequirement {
@@ -3174,6 +3236,36 @@ mod execution_timing_tests {
             DeviceSubmissionAttributionRequirement::LogicalExecutionPath
         );
         assert_eq!(batch.timing_mode(), DeviceTimingMode::Replay);
+    }
+
+    #[test]
+    fn mixed_replay_boundaries_are_explicit_canonical_batch_metadata() {
+        let mut batch = DeviceCommandBatch::<()>::with_capacity_timing_and_compute_path(
+            2,
+            DeviceTimingMode::Replay,
+            DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries,
+        );
+        batch
+            .set_declared_eager_compute_node_indices(vec![0, 3])
+            .unwrap();
+        assert_eq!(batch.declared_eager_compute_node_indices(), &[0, 3]);
+        assert_eq!(
+            serde_json::to_value(batch.compute_path_requirement()).unwrap(),
+            "replayed_with_declared_eager_boundaries"
+        );
+
+        let mut duplicate = DeviceCommandBatch::<()>::with_capacity_timing_and_compute_path(
+            2,
+            DeviceTimingMode::Replay,
+            DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries,
+        );
+        assert!(duplicate
+            .set_declared_eager_compute_node_indices(vec![1, 1])
+            .is_err());
+        let mut wrong_mode = DeviceCommandBatch::<()>::with_capacity(1);
+        assert!(wrong_mode
+            .set_declared_eager_compute_node_indices(vec![0])
+            .is_err());
     }
 
     #[test]

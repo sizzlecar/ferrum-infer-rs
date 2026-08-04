@@ -977,7 +977,13 @@ mod cuda {
                     ))
                 })?;
                 ensure_execution_equivalence(left, right, kind)?;
-                if kind == "replay_replay" && left.replayed_segments() != right.replayed_segments()
+                if kind == "replay_replay"
+                    && (left.compute_path_requirement() != right.compute_path_requirement()
+                        || left.reusable_program_fingerprint()
+                            != right.reusable_program_fingerprint()
+                        || left.declared_eager_boundary_node_ids()
+                            != right.declared_eager_boundary_node_ids()
+                        || left.replayed_segments() != right.replayed_segments())
                 {
                     return Err(FerrumError::backend(format!(
                         "{kind} replay shape mismatch between {left_id} and {right_id}"
@@ -1155,7 +1161,7 @@ mod cuda {
                     .initial_state_sha256()
                     .to_owned();
                 let case = CaseArtifact {
-                    schema_version: 1,
+                    schema_version: 2,
                     case_id: pending.case_id.clone(),
                     denominator_fingerprint: denominator_fingerprint.to_owned(),
                     binary_sha256: binary_sha256.clone(),
