@@ -23,11 +23,11 @@ MODEL_CACHE_COMPONENT = "models--Qwen--Qwen3.5-4B"
 CALIBRATION_TOKEN_BUDGET = 3
 TARGET_TOKEN_BUDGET = 1024
 MAX_NUM_SEQS = 3
-MAX_MODEL_LEN = 512
+MAX_MODEL_LEN = 2048
 PREFILL_FIRST_UNTIL_ACTIVE = 3
 DECODE_SEQUENCE_FIT_POLICY = "immediate-only"
 CALIBRATION_MAX_TOKENS = {"A": 128, "B": 1, "C": 16}
-TARGET_MAX_TOKENS = {"A": 384, "B": 384, "C": 384}
+TARGET_MAX_TOKENS = {"A": 1536, "B": 1536, "C": 1536}
 PRESSURE_DECODE_SLOTS = ("A", "B", "C")
 REBALANCE_PRIME_MAX_TOKENS = CALIBRATION_MAX_TOKENS
 REBALANCE_PROBE_MAX_TOKENS = 1
@@ -57,7 +57,8 @@ CANONICAL_DECODE_PROMPT_SHA256_BY_SLOT = {
 MAX_DECODE_CAPACITY_EVENTS = 2048
 PREFILL_MAINTENANCE_PHASE = "vnext.prefill_backing_maintenance"
 EXECUTION_MAINTENANCE_PHASE = "vnext.execution_backing_maintenance"
-EXECUTION_MAINTENANCE_SCHEMA_VERSION = 1
+EXECUTION_MAINTENANCE_SCHEMA_VERSION = 2
+MAINTENANCE_BOUNDARY_SCHEMA_VERSION = 1
 ALLOWED_EXECUTION_STAGES = {
     "sequence_extension",
     "step_admission",
@@ -171,6 +172,32 @@ def require_executor_identity_shape(executor: dict[str, Any], label: str) -> Non
         and admission.get("sequence_fit_policy") == "immediate_only",
         f"{label}: decode lane did not use ImmediateOnly sequence fit",
     )
+
+
+def runtime_memory_usable_bytes(policy: Any, label: str) -> int:
+    require(isinstance(policy, dict), f"{label}: runtime memory policy is missing")
+    capacity = policy.get("capacity_bytes")
+    reserve = policy.get("reserve_bytes")
+    require(
+        isinstance(capacity, int)
+        and not isinstance(capacity, bool)
+        and capacity > 0
+        and isinstance(reserve, int)
+        and not isinstance(reserve, bool)
+        and 0 <= reserve < capacity,
+        f"{label}: runtime memory capacity/reserve is invalid",
+    )
+    maximum_active_sequences = policy.get("maximum_active_sequences")
+    require(
+        maximum_active_sequences == MAX_NUM_SEQS,
+        f"{label}: runtime memory sequence ceiling changed",
+    )
+    profiles = policy.get("dynamic_storage_profile_order")
+    require(
+        isinstance(profiles, list) and profiles,
+        f"{label}: runtime memory storage-profile order is missing",
+    )
+    return capacity - reserve
 
 
 def require_same_fields(
@@ -1262,6 +1289,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
             not shortfalls and not backing_blockers,
             f"{label}: direct backing pressure also owns compatibility blockers",
         )
+    maintenance_boundary = None
     if evidence_kind in {"logical", "backing_deferred"}:
         pressure = typed_evidence.get("pressure")
         require(
@@ -1272,6 +1300,31 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         require(
             isinstance(typed_evidence.get("pressure"), dict),
             f"{label}: direct backing pressure evidence is missing",
+        )
+        pressure = typed_evidence["pressure"]
+    if isinstance(pressure, dict) and pressure.get("kind") == "device_capacity":
+        boundary = typed_evidence.get("maintenance_boundary")
+        if evidence_kind in {"logical", "backing_deferred"}:
+            require(
+                isinstance(boundary, dict),
+                f"{label}: device maintenance deferral lost its boundary receipt",
+            )
+        if boundary is not None:
+            maintenance_boundary = validate_maintenance_boundary(
+                boundary,
+                [],
+                coordinator_id=observed["coordinator_id"],
+                label=label,
+                expect_sufficient=False,
+            )
+            require(
+                maintenance_boundary["pressure"] == pressure.get("evidence"),
+                f"{label}: deferred maintenance boundary differs from typed pressure",
+            )
+    else:
+        require(
+            typed_evidence.get("maintenance_boundary") is None,
+            f"{label}: non-device pressure contains a maintenance boundary",
         )
     scheduler_snapshot = attributes.get("scheduler_snapshot")
     require(isinstance(scheduler_snapshot, dict), f"{label}: scheduler snapshot is missing")
@@ -1290,6 +1343,7 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "observed": observed,
         "wait_condition": wait_condition,
         "evidence_owner": evidence_owner,
+        "maintenance_boundary": maintenance_boundary,
     }
 
 
@@ -1629,7 +1683,11 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
 
 
 def validate_decode_trace(
-    rows: list[dict[str, Any]], *, started_wall_ns: int, finished_wall_ns: int
+    rows: list[dict[str, Any]],
+    *,
+    started_wall_ns: int,
+    finished_wall_ns: int,
+    require_maintenance_boundary: bool = False,
 ) -> dict[str, Any]:
     require(started_wall_ns > 0 and finished_wall_ns >= started_wall_ns, "invalid trace window")
     window = [
@@ -1648,6 +1706,14 @@ def validate_decode_trace(
         validate_decode_deferral(row, f"decode deferral {index}")
         for index, row in enumerate(deferral_rows)
     ]
+    boundary_deferrals = [
+        event for event in deferrals if event["maintenance_boundary"] is not None
+    ]
+    if require_maintenance_boundary:
+        require(
+            boundary_deferrals,
+            "target decode pressure has no event-bound resource maintenance receipt",
+        )
     splits = [event for event in deferrals if event["decision"] == "split_cohort"]
     parks = [event for event in deferrals if event["decision"] == "wait_for_release"]
     yields = [
@@ -2044,6 +2110,11 @@ def validate_decode_trace(
         )
     return {
         "deferral_events": len(deferrals),
+        "maintenance_boundary_events": len(boundary_deferrals),
+        "maintenance_boundary_deficits": [
+            event["maintenance_boundary"]["deficit_bytes"]
+            for event in boundary_deferrals
+        ],
         "split_events": len(splits),
         "park_events": len(parks),
         "pressure_yield_events": len(yields),
@@ -2344,10 +2415,18 @@ def validate_execution_maintenance_receipt(
         receipt.get("rebalance") == evidence.get("rebalance"),
         f"{label}: allocator and event rebalance receipts differ",
     )
+    require(
+        receipt.get("maintenance_boundary") == evidence.get("maintenance_boundary"),
+        f"{label}: allocator and event maintenance boundaries differ",
+    )
     normalized_reclaims: list[dict[str, Any]] = []
     rebalance = evidence.get("rebalance")
     if exact_rebalance["pools_reclaimed"] == 0:
-        require(rebalance is None, f"{label}: empty reclaim has an exact receipt")
+        require(
+            rebalance is None and evidence.get("maintenance_boundary") is None,
+            f"{label}: unpressured growth has reclaim-boundary evidence",
+        )
+        maintenance_boundary = None
     else:
         require(isinstance(rebalance, dict), f"{label}: exact reclaim receipt is missing")
         reclaim_pools = rebalance.get("pools")
@@ -2405,6 +2484,12 @@ def validate_execution_maintenance_receipt(
             )
             == exact_rebalance["reclaimed_bytes"],
             f"{label}: normalized reclaim receipt differs from exact evidence",
+        )
+        maintenance_boundary = validate_maintenance_boundary(
+            evidence.get("maintenance_boundary"),
+            normalized_reclaims,
+            coordinator_id=coordinator_id,
+            label=label,
         )
     require(
         {growth["pool_id"] for growth in normalized_growths}.isdisjoint(
@@ -2470,9 +2555,314 @@ def validate_execution_maintenance_receipt(
         "growths": normalized_growths,
         "reclaimed_bytes": exact_rebalance["reclaimed_bytes"],
         "reclaims": normalized_reclaims,
+        "maintenance_boundary": maintenance_boundary,
         "growth_chunk_identities": growth_identities,
         "participant_identities": participant_identities,
         "event_fingerprint": fingerprint,
+    }
+
+
+def validate_maintenance_boundary(
+    boundary: Any,
+    reclaims: list[dict[str, Any]],
+    *,
+    coordinator_id: int,
+    label: str,
+    expect_sufficient: bool = True,
+) -> dict[str, Any]:
+    require(isinstance(boundary, dict), f"{label}: maintenance boundary is missing")
+    require(
+        boundary.get("schema_version") == MAINTENANCE_BOUNDARY_SCHEMA_VERSION
+        and boundary.get("coordinator_id") == coordinator_id,
+        f"{label}: maintenance boundary schema or coordinator is invalid",
+    )
+    for key in (
+        "logical_release_epoch",
+        "logical_capacity_epoch",
+        "plan_device_capacity_epoch",
+        "process_device_capacity_epoch",
+    ):
+        require(
+            isinstance(boundary.get(key), int)
+            and not isinstance(boundary[key], bool)
+            and boundary[key] > 0,
+            f"{label}: maintenance boundary {key} is invalid",
+        )
+    pressure = boundary.get("pressure")
+    require(isinstance(pressure, dict), f"{label}: maintenance pressure is missing")
+    require(
+        pressure.get("scope") in {"plan_budget", "process_wide"}
+        and isinstance(pressure.get("device_id"), str)
+        and pressure["device_id"],
+        f"{label}: maintenance pressure authority is invalid",
+    )
+    pressure_bytes: dict[str, int] = {}
+    for key in (
+        "requested_bytes",
+        "plan_claimed_bytes",
+        "plan_usable_bytes",
+        "process_claimed_bytes",
+        "process_usable_bytes",
+    ):
+        value = pressure.get(key)
+        require(
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0,
+            f"{label}: maintenance pressure {key} is invalid",
+        )
+        pressure_bytes[key] = value
+    require(
+        pressure_bytes["requested_bytes"] > 0
+        and pressure_bytes["plan_claimed_bytes"]
+        <= pressure_bytes["plan_usable_bytes"]
+        and pressure_bytes["process_claimed_bytes"]
+        <= pressure_bytes["process_usable_bytes"],
+        f"{label}: maintenance pressure byte envelope is inconsistent",
+    )
+    available_bytes = min(
+        pressure_bytes["plan_usable_bytes"]
+        - pressure_bytes["plan_claimed_bytes"],
+        pressure_bytes["process_usable_bytes"]
+        - pressure_bytes["process_claimed_bytes"],
+    )
+    require(
+        available_bytes < pressure_bytes["requested_bytes"],
+        f"{label}: maintenance boundary does not contain a capacity deficit",
+    )
+    deficit_bytes = pressure_bytes["requested_bytes"] - available_bytes
+
+    planned_domains = boundary.get("planned_domains")
+    require(
+        isinstance(planned_domains, list)
+        and planned_domains
+        and all(
+            isinstance(domain, int) and not isinstance(domain, bool) and domain > 0
+            for domain in planned_domains
+        )
+        and planned_domains == sorted(set(planned_domains)),
+        f"{label}: maintenance planned domains are invalid or non-canonical",
+    )
+    require(
+        isinstance(boundary.get("protected_immediate"), list)
+        and isinstance(boundary.get("protected_packing_envelopes"), list),
+        f"{label}: maintenance protection evidence is missing",
+    )
+    pools = boundary.get("pools")
+    require(isinstance(pools, list) and pools, f"{label}: maintenance pools are missing")
+    pool_ids: list[str] = []
+    candidates: dict[tuple[str, int, int], int] = {}
+    for pool_index, pool in enumerate(pools):
+        pool_id = pool.get("pool_id") if isinstance(pool, dict) else None
+        domain_id = pool.get("domain_id") if isinstance(pool, dict) else None
+        require(
+            isinstance(pool_id, str)
+            and pool_id.startswith("dynamic-pool/sha256/")
+            and common.SHA256_RE.fullmatch(
+                pool_id.removeprefix("dynamic-pool/sha256/")
+            )
+            is not None
+            and isinstance(domain_id, int)
+            and not isinstance(domain_id, bool)
+            and domain_id > 0,
+            f"{label}: maintenance pool {pool_index} identity is invalid",
+        )
+        pool_ids.append(pool_id)
+        require(
+            pool.get("excluded_from_reclaim") == (domain_id in planned_domains),
+            f"{label}: maintenance pool {pool_id} exclusion differs from planned domains",
+        )
+        byte_fields: dict[str, int] = {}
+        for key in (
+            "resident_bytes",
+            "pending_growth_bytes",
+            "free_bytes",
+            "largest_contiguous_bytes",
+            "logical_used_bytes",
+            "minimum_resident_bytes",
+            "maximum_resident_bytes",
+            "protected_immediate_bytes",
+            "coherent_runnable_floor_bytes",
+            "resident_floor_bytes",
+            "reclaimable_bytes",
+        ):
+            value = pool.get(key)
+            require(
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and value >= 0,
+                f"{label}: maintenance pool {pool_id} {key} is invalid",
+            )
+            byte_fields[key] = value
+        live = pool.get("live_occupancy")
+        live_total = live.get("total") if isinstance(live, dict) else None
+        live_physical = (
+            live_total.get("physical_bytes") if isinstance(live_total, dict) else None
+        )
+        require(
+            isinstance(live_physical, int)
+            and not isinstance(live_physical, bool)
+            and live_physical >= 0
+            and byte_fields["free_bytes"] <= byte_fields["resident_bytes"]
+            and byte_fields["resident_bytes"] - byte_fields["free_bytes"]
+            == live_physical,
+            f"{label}: maintenance pool {pool_id} live occupancy is inconsistent",
+        )
+        coherent_floor = max(byte_fields["logical_used_bytes"], live_physical) + byte_fields[
+            "protected_immediate_bytes"
+        ]
+        resident_floor = max(byte_fields["minimum_resident_bytes"], coherent_floor)
+        require(
+            byte_fields["coherent_runnable_floor_bytes"] == coherent_floor
+            and byte_fields["resident_floor_bytes"] == resident_floor
+            and byte_fields["reclaimable_bytes"]
+            == max(0, byte_fields["resident_bytes"] - resident_floor)
+            and byte_fields["minimum_resident_bytes"]
+            <= byte_fields["maximum_resident_bytes"],
+            f"{label}: maintenance pool {pool_id} runnable floor is inconsistent",
+        )
+        fingerprint = pool.get("free_extent_layout_fingerprint")
+        require(
+            isinstance(fingerprint, str)
+            and fingerprint.startswith("sha256/")
+            and common.SHA256_RE.fullmatch(fingerprint.removeprefix("sha256/"))
+            is not None
+            and isinstance(pool.get("protected_packing_satisfied"), bool),
+            f"{label}: maintenance pool {pool_id} layout evidence is invalid",
+        )
+        chunks = pool.get("chunks")
+        require(isinstance(chunks, list), f"{label}: maintenance chunks are missing")
+        chunk_bytes_total = 0
+        chunk_identities: set[tuple[str, int, int]] = set()
+        for chunk_index, chunk in enumerate(chunks):
+            identity = chunk.get("identity") if isinstance(chunk, dict) else None
+            chunk_bytes = chunk.get("bytes") if isinstance(chunk, dict) else None
+            chunk_identity = (
+                identity.get("pool_id") if isinstance(identity, dict) else None,
+                identity.get("ordinal") if isinstance(identity, dict) else None,
+                identity.get("generation") if isinstance(identity, dict) else None,
+            )
+            require(
+                chunk_identity[0] == pool_id
+                and isinstance(chunk_identity[1], int)
+                and not isinstance(chunk_identity[1], bool)
+                and chunk_identity[1] > 0
+                and isinstance(chunk_identity[2], int)
+                and not isinstance(chunk_identity[2], bool)
+                and chunk_identity[2] > 0
+                and chunk_identity not in chunk_identities
+                and isinstance(chunk_bytes, int)
+                and not isinstance(chunk_bytes, bool)
+                and chunk_bytes > 0,
+                f"{label}: maintenance chunk {pool_id}/{chunk_index} is invalid",
+            )
+            chunk_identities.add(chunk_identity)
+            chunk_bytes_total += chunk_bytes
+            live_segments = chunk.get("live_segments")
+            external_references = chunk.get("external_references")
+            require(
+                isinstance(live_segments, int)
+                and not isinstance(live_segments, bool)
+                and live_segments >= 0
+                and isinstance(external_references, int)
+                and not isinstance(external_references, bool)
+                and external_references >= 0
+                and all(
+                    isinstance(chunk.get(key), bool)
+                    for key in (
+                        "protected_packing",
+                        "full_extent_available",
+                        "resident_floor_allows_reclaim",
+                        "reclaim_candidate",
+                    )
+                ),
+                f"{label}: maintenance chunk {pool_id}/{chunk_index} state is invalid",
+            )
+            expected_candidate = (
+                not pool["excluded_from_reclaim"]
+                and byte_fields["pending_growth_bytes"] == 0
+                and pool["protected_packing_satisfied"]
+                and live_segments == 0
+                and external_references == 0
+                and not chunk["protected_packing"]
+                and chunk["full_extent_available"]
+                and chunk["resident_floor_allows_reclaim"]
+            )
+            require(
+                chunk["resident_floor_allows_reclaim"]
+                == (chunk_bytes <= byte_fields["reclaimable_bytes"])
+                and chunk["reclaim_candidate"] == expected_candidate,
+                f"{label}: maintenance chunk {pool_id}/{chunk_index} eligibility drifted",
+            )
+            if expected_candidate:
+                candidates[chunk_identity] = chunk_bytes
+        require(
+            chunk_bytes_total == byte_fields["resident_bytes"],
+            f"{label}: maintenance pool {pool_id} chunk residency does not reconcile",
+        )
+    require(
+        pool_ids == sorted(set(pool_ids)),
+        f"{label}: maintenance pool order is not canonical",
+    )
+    require(
+        boundary.get("reclaim_candidate_chunks") == len(candidates)
+        and boundary.get("reclaim_candidate_bytes") == sum(candidates.values()),
+        f"{label}: maintenance candidate aggregate is inconsistent",
+    )
+    selected = boundary.get("selected_chunks")
+    require(isinstance(selected, list), f"{label}: selected reclaim chunks are missing")
+    selected_identities = [
+        (chunk.get("pool_id"), chunk.get("ordinal"), chunk.get("generation"))
+        for chunk in selected
+        if isinstance(chunk, dict)
+    ]
+    require(
+        len(selected_identities) == len(selected)
+        and len(set(selected_identities)) == len(selected_identities)
+        and all(identity in candidates for identity in selected_identities),
+        f"{label}: selected reclaim chunks are invalid",
+    )
+    selected_bytes = sum(candidates[identity] for identity in selected_identities)
+    require(
+        boundary.get("selected_bytes") == selected_bytes,
+        f"{label}: maintenance selected-byte aggregate is inconsistent",
+    )
+    if expect_sufficient:
+        reclaimed_identities = [
+            tuple(identity)
+            for reclaim in reclaims
+            for identity in reclaim["chunk_identities"]
+        ]
+        require(
+            boundary.get("reclaim_sufficient") is True
+            and selected_bytes >= deficit_bytes
+            and selected_identities == reclaimed_identities
+            and selected_bytes
+            == sum(reclaim["reclaimed_bytes"] for reclaim in reclaims),
+            f"{label}: maintenance selection differs from its published rebalance",
+        )
+    else:
+        require(
+            not reclaims
+            and boundary.get("reclaim_sufficient") is False
+            and selected_bytes < deficit_bytes,
+            f"{label}: blocked maintenance boundary incorrectly claims sufficient reclaim",
+        )
+    return {
+        "schema_version": boundary["schema_version"],
+        "coordinator_id": coordinator_id,
+        "logical_release_epoch": boundary["logical_release_epoch"],
+        "logical_capacity_epoch": boundary["logical_capacity_epoch"],
+        "plan_device_capacity_epoch": boundary["plan_device_capacity_epoch"],
+        "process_device_capacity_epoch": boundary["process_device_capacity_epoch"],
+        "pressure": pressure,
+        "deficit_bytes": deficit_bytes,
+        "planned_domains": planned_domains,
+        "pool_ids": pool_ids,
+        "reclaim_candidate_chunks": len(candidates),
+        "reclaim_candidate_bytes": sum(candidates.values()),
+        "selected_chunk_identities": [list(identity) for identity in selected_identities],
+        "selected_bytes": selected_bytes,
     }
 
 
@@ -3230,6 +3620,7 @@ def collect(args: argparse.Namespace) -> int:
             target_rows,
             started_wall_ns=target_started,
             finished_wall_ns=target_finished,
+            require_maintenance_boundary=True,
         )
         collection["target"]["decode_summary"] = decode_summary
 
@@ -3574,17 +3965,22 @@ def validate(root: Path, out: Path) -> int:
         rebalance_prime.get("budget_receipt") == prime_budget_receipt,
         "rebalance prime budget receipt differs from raw backing",
     )
+    calibration_policy = calibration_executor.get("runtime_memory_policy")
     sizing_policy = sizing_executor.get("runtime_memory_policy")
-    require(isinstance(sizing_policy, dict), "target sizing runtime memory policy is missing")
+    calibration_usable = runtime_memory_usable_bytes(
+        calibration_policy, "calibration"
+    )
+    sizing_usable = runtime_memory_usable_bytes(sizing_policy, "target sizing")
     require(
-        sizing_policy.get("capacity_bytes", 0) - sizing_policy.get("reserve_bytes", 0)
-        == calibration_budget,
-        "target sizing runtime did not use the narrow calibration budget",
+        calibration_policy == sizing_policy
+        and calibration_usable == sizing_usable
+        and calibration_usable >= calibration_pool["budget_claimed_bytes"]
+        and sizing_usable >= sizing_probe_pool["budget_claimed_bytes"],
+        "calibration and target sizing did not share a sufficient product-default runtime budget",
     )
     policy = target_executor.get("runtime_memory_policy")
-    require(isinstance(policy, dict), "target runtime memory policy is missing")
     require(
-        policy.get("capacity_bytes", 0) - policy.get("reserve_bytes", 0) == exact_budget,
+        runtime_memory_usable_bytes(policy, "target") == exact_budget,
         "target runtime did not use the calibrated exact budget",
     )
 
@@ -3719,6 +4115,7 @@ def validate(root: Path, out: Path) -> int:
         target_rows,
         started_wall_ns=target_started,
         finished_wall_ns=target_finished,
+        require_maintenance_boundary=True,
     )
     require(target.get("decode_summary") == decode_summary, "decode summary differs from raw trace")
     probe_maintenance_summary = validate_rebalance_trace(
@@ -3953,6 +4350,9 @@ def self_test() -> int:
                 "capacity_bytes": 1000,
                 "reserve_bytes": reserve_bytes,
                 "maximum_active_sequences": MAX_NUM_SEQS,
+                "dynamic_storage_profile_order": [
+                    {"allocator": "linear_arena", "view": "contiguous"}
+                ],
             },
             "runtime_admission_policy": {
                 "sequence_fit_policy": "immediate_only",
@@ -3962,6 +4362,23 @@ def self_test() -> int:
     calibration_executor = executor_fixture("a", "5", 100)
     sizing_executor = executor_fixture("b", "6", 200)
     target_executor = executor_fixture("c", "7", 300)
+    require(
+        runtime_memory_usable_bytes(
+            calibration_executor["runtime_memory_policy"], "self-test calibration"
+        )
+        == 900,
+        "self-test runtime usable budget drifted",
+    )
+    invalid_runtime_policy = json.loads(
+        json.dumps(calibration_executor["runtime_memory_policy"])
+    )
+    invalid_runtime_policy["reserve_bytes"] = invalid_runtime_policy["capacity_bytes"]
+    expect_reject(
+        lambda: runtime_memory_usable_bytes(
+            invalid_runtime_policy, "self-test invalid runtime policy"
+        ),
+        "invalid runtime reserve",
+    )
     validate_executor_identity_contract(
         {
             "calibration": [
@@ -5204,6 +5621,108 @@ def self_test() -> int:
         "plan_device_capacity_epoch": 16,
         "process_device_capacity_epoch": 17,
     }
+    maintenance_boundary = {
+        "schema_version": MAINTENANCE_BOUNDARY_SCHEMA_VERSION,
+        "coordinator_id": 7,
+        "logical_release_epoch": 13,
+        "logical_capacity_epoch": 14,
+        "plan_device_capacity_epoch": 15,
+        "process_device_capacity_epoch": 15,
+        "pressure": {
+            "scope": "plan_budget",
+            "device_id": "device.self-test",
+            "requested_bytes": 32,
+            "plan_claimed_bytes": 192,
+            "plan_usable_bytes": 192,
+            "process_claimed_bytes": 192,
+            "process_usable_bytes": 192,
+        },
+        "planned_domains": [2],
+        "protected_immediate": [],
+        "protected_packing_envelopes": [],
+        "pools": [
+            {
+                "pool_id": donor_pool_id,
+                "domain_id": 1,
+                "excluded_from_reclaim": False,
+                "resident_bytes": 192,
+                "pending_growth_bytes": 0,
+                "free_bytes": 192,
+                "largest_contiguous_bytes": 128,
+                "free_extent_layout_fingerprint": "sha256/" + "1" * 64,
+                "logical_used_bytes": 0,
+                "live_occupancy": {"total": {"physical_bytes": 0}},
+                "minimum_resident_bytes": 128,
+                "maximum_resident_bytes": 192,
+                "protected_immediate_bytes": 0,
+                "protected_packing_satisfied": True,
+                "coherent_runnable_floor_bytes": 0,
+                "resident_floor_bytes": 128,
+                "reclaimable_bytes": 64,
+                "chunks": [
+                    {
+                        "identity": {
+                            "pool_id": donor_pool_id,
+                            "ordinal": 1,
+                            "generation": 2,
+                        },
+                        "bytes": 64,
+                        "live_segments": 0,
+                        "external_references": 0,
+                        "protected_packing": False,
+                        "full_extent_available": True,
+                        "resident_floor_allows_reclaim": True,
+                        "reclaim_candidate": True,
+                    },
+                    {
+                        "identity": {
+                            "pool_id": donor_pool_id,
+                            "ordinal": 2,
+                            "generation": 3,
+                        },
+                        "bytes": 128,
+                        "live_segments": 0,
+                        "external_references": 0,
+                        "protected_packing": False,
+                        "full_extent_available": True,
+                        "resident_floor_allows_reclaim": False,
+                        "reclaim_candidate": False,
+                    },
+                ],
+            },
+            {
+                "pool_id": growth_pool_id,
+                "domain_id": 2,
+                "excluded_from_reclaim": True,
+                "resident_bytes": 0,
+                "pending_growth_bytes": 0,
+                "free_bytes": 0,
+                "largest_contiguous_bytes": 0,
+                "free_extent_layout_fingerprint": "sha256/" + "2" * 64,
+                "logical_used_bytes": 0,
+                "live_occupancy": {"total": {"physical_bytes": 0}},
+                "minimum_resident_bytes": 0,
+                "maximum_resident_bytes": 32,
+                "protected_immediate_bytes": 0,
+                "protected_packing_satisfied": True,
+                "coherent_runnable_floor_bytes": 0,
+                "resident_floor_bytes": 0,
+                "reclaimable_bytes": 0,
+                "chunks": [],
+            },
+        ],
+        "reclaim_candidate_chunks": 1,
+        "reclaim_candidate_bytes": 64,
+        "selected_chunks": [
+            {
+                "pool_id": donor_pool_id,
+                "ordinal": 1,
+                "generation": 2,
+            }
+        ],
+        "selected_bytes": 64,
+        "reclaim_sufficient": True,
+    }
     rebalance_rows = [
         {
             "ts_unix_nanos": 85,
@@ -5238,6 +5757,7 @@ def self_test() -> int:
                     "chunks_reclaimed": 1,
                     "reclaimed_bytes": 64,
                     "rebalance": exact_rebalance_receipt,
+                    "maintenance_boundary": maintenance_boundary,
                     "receipt": {
                         "coordinator_id": 7,
                         "growths": [
@@ -5255,6 +5775,7 @@ def self_test() -> int:
                         ],
                         "capacity_epoch": 18,
                         "rebalance": exact_rebalance_receipt,
+                        "maintenance_boundary": maintenance_boundary,
                     },
                     "event_fingerprint": event_fingerprint,
                     "participants": [
@@ -5273,6 +5794,42 @@ def self_test() -> int:
         }
     ]
     summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=170)
+    insufficient_boundary = json.loads(json.dumps(maintenance_boundary))
+    insufficient_boundary["pressure"]["requested_bytes"] = 96
+    insufficient_boundary["reclaim_sufficient"] = False
+    boundary_rows = json.loads(json.dumps(rows))
+    boundary_evidence = boundary_rows[0]["attributes"]["capacity_evidence"]
+    boundary_evidence["typed_evidence"]["pressure"] = {
+        "kind": "device_capacity",
+        "evidence": insufficient_boundary["pressure"],
+    }
+    boundary_evidence["typed_evidence"][
+        "maintenance_boundary"
+    ] = insufficient_boundary
+    boundary_summary = validate_decode_trace(
+        boundary_rows,
+        started_wall_ns=90,
+        finished_wall_ns=170,
+        require_maintenance_boundary=True,
+    )
+    require(
+        boundary_summary["maintenance_boundary_events"] == 1
+        and boundary_summary["maintenance_boundary_deficits"] == [96],
+        "self-test lost the event-bound insufficient-reclaim receipt",
+    )
+    missing_decode_boundary = json.loads(json.dumps(boundary_rows))
+    missing_decode_boundary[0]["attributes"]["capacity_evidence"][
+        "typed_evidence"
+    ].pop("maintenance_boundary")
+    expect_reject(
+        lambda: validate_decode_trace(
+            missing_decode_boundary,
+            started_wall_ns=90,
+            finished_wall_ns=170,
+            require_maintenance_boundary=True,
+        ),
+        "decode pressure without an event-bound maintenance receipt",
+    )
     direct_counter_provenance = validate_decode_counter_provenance(
         rows,
         started_wall_ns=90,
@@ -5485,6 +6042,22 @@ def self_test() -> int:
                         "published_capacity_bytes": 128,
                     }
                 ],
+                "maintenance_boundary": {
+                    "schema_version": MAINTENANCE_BOUNDARY_SCHEMA_VERSION,
+                    "coordinator_id": 7,
+                    "logical_release_epoch": 13,
+                    "logical_capacity_epoch": 14,
+                    "plan_device_capacity_epoch": 15,
+                    "process_device_capacity_epoch": 15,
+                    "pressure": maintenance_boundary["pressure"],
+                    "deficit_bytes": 32,
+                    "planned_domains": [2],
+                    "pool_ids": [donor_pool_id, growth_pool_id],
+                    "reclaim_candidate_chunks": 1,
+                    "reclaim_candidate_bytes": 64,
+                    "selected_chunk_identities": [[donor_pool_id, 1, 2]],
+                    "selected_bytes": 64,
+                },
                 "growth_chunk_identities": [[growth_pool_id, 2, 3]],
                 "participant_identities": [
                     ["run.self-test", "request.self-test", 0, 1]
@@ -5535,6 +6108,34 @@ def self_test() -> int:
         raise AssertionError("growth with a mismatched capacity epoch unexpectedly passed")
     except common.CapacityGateError:
         pass
+    missing_boundary = json.loads(json.dumps(rebalance_rows))
+    missing_boundary[-1]["attributes"]["maintenance_evidence"].pop(
+        "maintenance_boundary"
+    )
+    missing_boundary[-1]["attributes"]["maintenance_evidence"]["receipt"].pop(
+        "maintenance_boundary"
+    )
+    expect_reject(
+        lambda: validate_rebalance_trace(
+            missing_boundary, started_wall_ns=80, finished_wall_ns=89
+        ),
+        "rebalance without maintenance boundary",
+    )
+    invalid_boundary_candidate = json.loads(json.dumps(rebalance_rows))
+    invalid_boundary_candidate[-1]["attributes"]["maintenance_evidence"][
+        "maintenance_boundary"
+    ]["pools"][0]["chunks"][0]["reclaim_candidate"] = False
+    invalid_boundary_candidate[-1]["attributes"]["maintenance_evidence"][
+        "receipt"
+    ]["maintenance_boundary"]["pools"][0]["chunks"][0][
+        "reclaim_candidate"
+    ] = False
+    expect_reject(
+        lambda: validate_rebalance_trace(
+            invalid_boundary_candidate, started_wall_ns=80, finished_wall_ns=89
+        ),
+        "maintenance boundary candidate drift",
+    )
     mismatched_receipt_rebalance = json.loads(json.dumps(rebalance_rows))
     mismatched_receipt_rebalance[-1]["attributes"]["maintenance_evidence"][
         "receipt"
@@ -5554,10 +6155,14 @@ def self_test() -> int:
             "chunks_reclaimed": 0,
             "reclaimed_bytes": 0,
             "rebalance": None,
+            "maintenance_boundary": None,
         }
     )
     missing_rebalance[-1]["attributes"]["maintenance_evidence"]["receipt"].pop(
         "rebalance"
+    )
+    missing_rebalance[-1]["attributes"]["maintenance_evidence"]["receipt"].pop(
+        "maintenance_boundary"
     )
     growth_only_summary = validate_maintenance_trace(
         missing_rebalance,
