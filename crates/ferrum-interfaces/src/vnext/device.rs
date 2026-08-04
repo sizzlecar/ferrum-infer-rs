@@ -1524,9 +1524,14 @@ impl DeviceReusableExecutionInvocation {
         participant_count: u32,
         token_count: u64,
     ) -> Result<Self, VNextError> {
-        if participant_count == 0 || token_count == 0 {
+        if participant_count == 0
+            || token_count == 0
+            || program_id.immediate_sequences() != participant_count
+            || program_id.immediate_tokens() != token_count
+        {
             return Err(VNextError::InvalidExecutionPlan {
-                reason: "reusable execution invocation has no participants or tokens".to_owned(),
+                reason: "reusable execution invocation differs from its program work shape"
+                    .to_owned(),
             });
         }
         Ok(Self {
@@ -2804,7 +2809,6 @@ impl DeviceSubmissionAttribution {
                 })
                 .ok()?;
             let physical = commands.get(physical_index)?;
-            let first_logical = segment.logical_commands().first()?;
             let logical_graph_node_count = segment
                 .logical_commands()
                 .iter()
@@ -2816,12 +2820,13 @@ impl DeviceSubmissionAttribution {
                 || physical.execution_path() != DeviceExecutionPath::Replayed
                 || physical.reusable_graph_node_count() != Some(logical_graph_node_count)
                 || physical.node_index() != Some(segment.segment().start_node_index())
-                || physical.participant_count() != first_logical.participant_count()
-                || physical.token_count() != first_logical.token_count()
-                || segment.logical_commands().iter().any(|logical| {
-                    logical.participant_count() != physical.participant_count()
-                        || logical.token_count() != physical.token_count()
-                })
+                || physical.participant_start() != 0
+                || physical.participant_count() != segment.program_id().immediate_sequences()
+                || physical.token_count() != segment.program_id().immediate_tokens()
+                || segment
+                    .logical_commands()
+                    .iter()
+                    .any(|logical| logical.participant_count() != physical.participant_count())
             {
                 return None;
             }
@@ -3889,13 +3894,22 @@ mod execution_timing_tests {
         node_index: u32,
         graph_node_count: u64,
     ) -> DeviceReplayedLogicalCommandAttribution {
+        replay_test_logical_with_tokens(ordinal, node_index, 3, graph_node_count)
+    }
+
+    fn replay_test_logical_with_tokens(
+        ordinal: u32,
+        node_index: u32,
+        token_count: u64,
+        graph_node_count: u64,
+    ) -> DeviceReplayedLogicalCommandAttribution {
         DeviceReplayedLogicalCommandAttribution::new(
             ordinal,
             node_index,
             DeviceNativeOperationId::new("test.logical.compute").unwrap(),
             DeviceBatchingForm::ParticipantLoop,
             2,
-            3,
+            token_count,
             1,
             0,
             graph_node_count,
@@ -3905,22 +3919,23 @@ mod execution_timing_tests {
 
     #[test]
     fn replayed_segment_separates_one_physical_launch_from_logical_plan_nodes() {
-        let segment = DeviceReusableExecutionSegment::new(0, 4, 6, 2).unwrap();
-        let replayed = DeviceReplayedSegmentAttribution::new(
-            0,
-            replay_test_program_id(),
-            segment,
-            "e".repeat(64),
-            vec![replay_test_logical(0, 4, 2), replay_test_logical(1, 5, 3)],
-        )
-        .unwrap();
         let attribution = DeviceSubmissionAttribution::with_replayed_segments(
             vec![replay_test_physical(
                 DeviceExecutionPath::Replayed,
                 4,
                 Some(5),
             )],
-            vec![replayed],
+            vec![DeviceReplayedSegmentAttribution::new(
+                0,
+                replay_test_program_id(),
+                DeviceReusableExecutionSegment::new(0, 4, 6, 2).unwrap(),
+                "e".repeat(64),
+                vec![
+                    replay_test_logical_with_tokens(0, 4, 3, 2),
+                    replay_test_logical_with_tokens(1, 5, 1, 3),
+                ],
+            )
+            .unwrap()],
         )
         .unwrap();
 

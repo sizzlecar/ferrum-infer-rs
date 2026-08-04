@@ -127,17 +127,16 @@ impl BoundDeviceSubmissionAttribution {
                         )
                         .map_or(true, |count| count != command.participant_count())
                 })
-                || replayed_segment
-                    .logical_commands()
-                    .first()
-                    .is_none_or(|command| {
-                        usize::try_from(replayed_segment.physical_command_index())
-                            .ok()
-                            .and_then(|index| device.commands().get(index))
-                            .is_none_or(|physical| physical.participant_start() != 0)
-                            || program_id.immediate_sequences() != command.participant_count()
-                            || program_id.immediate_tokens() != command.token_count()
-                    })
+                || replayed_segment.logical_commands().first().is_none_or(|_| {
+                    usize::try_from(replayed_segment.physical_command_index())
+                        .ok()
+                        .and_then(|index| device.commands().get(index))
+                        .is_none_or(|physical| {
+                            physical.participant_start() != 0
+                                || program_id.immediate_sequences() != physical.participant_count()
+                                || program_id.immediate_tokens() != physical.token_count()
+                        })
+                })
             {
                 return Err(invalid_operation(
                     "replayed segment attribution differs from its batch or sealed program identity",
