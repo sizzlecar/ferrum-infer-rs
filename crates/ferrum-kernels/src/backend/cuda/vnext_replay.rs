@@ -135,7 +135,7 @@ impl CudaCommandReplayKeyBuilder {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CudaExecutableSegmentKey([u8; 32]);
 
 impl CudaExecutableSegmentKey {
