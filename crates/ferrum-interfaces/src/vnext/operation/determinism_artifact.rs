@@ -302,7 +302,7 @@ impl SubmissionWaveDeterminismEvidence {
                 let spec = witness.witness();
                 if request.node_id() != spec.node_id()
                     || request.resource_id() != spec.resource_id()
-                    || request.participant_index() != witness.participant_index()
+                    || request.participant_index() != witness.physical_participant_index()
                     || request.expected_usage() != spec.location().usage()
                 {
                     return Err(invalid_operation(
@@ -322,6 +322,12 @@ impl SubmissionWaveDeterminismEvidence {
                         "determinism state witness readback does not use state backing",
                     ));
                 }
+                let logical_range = witness.logical_range();
+                if logical_range.length_bytes() != request.output_layout().byte_len()? {
+                    return Err(invalid_operation(
+                        "determinism semantic witness length differs from its physical readback",
+                    ));
+                }
                 Ok(SubmissionWaveDeterminismArtifactWitness {
                     kind: kind.to_owned(),
                     semantic_id,
@@ -329,8 +335,8 @@ impl SubmissionWaveDeterminismEvidence {
                     resource_id: spec.resource_id().to_string(),
                     access: tensor_access_label(access).to_owned(),
                     participant_index: witness.participant_index(),
-                    logical_offset_bytes: request.logical_offset_bytes(),
-                    length_bytes: request.output_layout().byte_len()?,
+                    logical_offset_bytes: logical_range.logical_offset_bytes(),
+                    length_bytes: logical_range.length_bytes(),
                     element_type: element_type_label(spec.element_type()).to_owned(),
                     raw_sha256: physical.raw_sha256().to_owned(),
                 })

@@ -225,13 +225,49 @@ fn determinism_restore_attributes_each_participant_without_losing_node_scope() {
         &lane,
     )
     .unwrap();
-    let restore = determinism_restore(
-        &fixture,
+    let identity_layout = SubmissionWaveDeterminismRestoreLayout::from_prepared_wave(
+        fixture.runtime.as_ref(),
         &providers,
+        &fixture.resolved,
         &batch_identity,
-        &active_bindings,
+        active_bindings.iter(),
         &wave,
-        0x37,
+    )
+    .unwrap();
+    let mut identity_payloads = determinism_payloads(&identity_layout, 0x37);
+    for (logical_index, payloads) in identity_payloads.iter_mut().enumerate() {
+        for payload in payloads {
+            payload.fill(0x37 + u8::try_from(logical_index).unwrap());
+        }
+    }
+    let identity_restore = identity_layout.bind(identity_payloads.clone()).unwrap();
+    let logical_sessions = batch.sessions().iter().rev().cloned().collect::<Vec<_>>();
+    let participant_order =
+        SubmissionWaveDeterminismParticipantOrder::from_logical_participant_sessions(
+            &wave,
+            &logical_sessions,
+        )
+        .unwrap();
+    let mapped_layout =
+        SubmissionWaveDeterminismRestoreLayout::from_prepared_wave_with_participant_order(
+            fixture.runtime.as_ref(),
+            &providers,
+            &fixture.resolved,
+            &batch_identity,
+            active_bindings.iter(),
+            participant_order,
+            &wave,
+        )
+        .unwrap();
+    let mapped_payloads = identity_payloads.into_iter().rev().collect::<Vec<_>>();
+    let restore = mapped_layout.bind(mapped_payloads).unwrap();
+    assert_eq!(
+        restore.logical_fingerprint().unwrap(),
+        identity_restore.logical_fingerprint().unwrap()
+    );
+    assert_eq!(
+        restore.initialization_identity().unwrap(),
+        identity_restore.initialization_identity().unwrap()
     );
     let reaper = CompletionReaper::new();
     let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
@@ -267,12 +303,237 @@ fn determinism_restore_attributes_each_participant_without_losing_node_scope() {
             || command.participant_start() == 0
                 && command.participant_count() as usize == PARTICIPANTS
     }));
-    handle.wait_into_evidence().unwrap();
+    let artifact = serde_json::to_value(
+        handle
+            .wait_into_evidence()
+            .unwrap()
+            .into_artifact_execution("mapped-participants")
+            .unwrap(),
+    )
+    .unwrap();
+    let witnesses = artifact["witnesses"].as_array().unwrap();
+    let logical_participants = witnesses
+        .iter()
+        .map(|witness| witness["participant_index"].as_u64().unwrap())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(logical_participants, BTreeSet::from([0, 1, 2, 3]));
 
     drop(providers);
     drop(active_bindings);
     drop(reaper);
+    drop(logical_sessions);
     step.try_retire_normal().unwrap();
+    drop(batch);
+    for session in sessions {
+        session.try_complete().unwrap();
+    }
+    drop(sequences);
+    drop(lane);
+    drop(fixture.registry);
+    drop(fixture.impostor_registry);
+    drop(fixture.runtime);
+    assert!(matches!(
+        PlanRuntimeResources::close(fixture.plan_resources),
+        Ok(PlanRuntimeCloseOutcome::Closed(_))
+    ));
+}
+
+#[test]
+fn determinism_witness_identity_survives_unequal_physical_participant_reordering() {
+    const PARTICIPANTS: usize = 4;
+
+    fn witness_rows(
+        artifact: &SubmissionWaveDeterminismArtifactExecution,
+    ) -> Vec<(u32, u64, u64, String)> {
+        let mut rows = artifact
+            .witnesses()
+            .iter()
+            .map(|witness| {
+                (
+                    witness.participant_index(),
+                    witness.logical_offset_bytes(),
+                    witness.length_bytes(),
+                    witness.raw_sha256().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    let fixture =
+        fixture_with_determinism_provider_behavior(false, ProviderBehavior::ScratchOverwrite);
+    let sequences = (0..PARTICIPANTS)
+        .map(|index| {
+            logical_resources(
+                &fixture.plan_resources,
+                &format!("run.device-operation.determinism-unequal.{index}"),
+                &format!("request.device-operation.determinism-unequal.{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sessions = sequences
+        .iter()
+        .map(|sequence| sequence.open_session().unwrap())
+        .collect::<Vec<_>>();
+    let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+    let lane = fixture.plan_resources.create_execution_lane().unwrap();
+    let active_bindings = batch
+        .sessions()
+        .iter()
+        .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
+        .collect::<Vec<_>>();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let reaper = CompletionReaper::new();
+
+    let collect = |physical_spans: Vec<TokenSpanWork>,
+                   logical_physical_indices: Vec<usize>,
+                   execution_id: &str| {
+        let request = StepResourceAdmissionRequest::new(
+            batch.bind_work_shape(physical_spans).unwrap(),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+        let request = fixture.reusable_execution_bucket.as_ref().map_or_else(
+            || request.clone(),
+            |bucket| {
+                request
+                    .clone()
+                    .with_reusable_execution_bucket(bucket.bucket_id().clone())
+            },
+        );
+        let step = (0..=3)
+            .find_map(
+                |attempt| match batch.try_begin_step(request.clone(), &lane).unwrap() {
+                    StepResourceAdmissionDecision::Admitted(step) => Some(step),
+                    StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
+                        deferred.maintain().unwrap();
+                        None
+                    }
+                    _ => panic!("unequal determinism step admission did not converge"),
+                },
+            )
+            .expect("bounded unequal determinism admission must converge");
+        let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
+        let logical_sessions = logical_physical_indices
+            .iter()
+            .map(|index| Arc::clone(&batch.sessions()[*index]))
+            .collect::<Vec<_>>();
+        let participant_order =
+            SubmissionWaveDeterminismParticipantOrder::from_logical_participant_sessions(
+                &wave,
+                &logical_sessions,
+            )
+            .unwrap();
+        let batch_identity = OperationDispatch::bind_submission_wave_identity(
+            &fixture.resolved,
+            active_bindings.iter(),
+            &wave,
+            &lane,
+        )
+        .unwrap();
+        let layout =
+            SubmissionWaveDeterminismRestoreLayout::from_prepared_wave_with_participant_order(
+                fixture.runtime.as_ref(),
+                &providers,
+                &fixture.resolved,
+                &batch_identity,
+                active_bindings.iter(),
+                participant_order,
+                &wave,
+            )
+            .unwrap();
+        let mut payloads = determinism_payloads(&layout, 0);
+        for (physical_index, participant_payloads) in payloads.iter_mut().enumerate() {
+            let logical_index = layout
+                .participant_order()
+                .logical_index_for_physical(u32::try_from(physical_index).unwrap())
+                .unwrap();
+            for payload in participant_payloads {
+                payload.fill(0x41 + u8::try_from(logical_index).unwrap());
+            }
+        }
+        let restore = layout.bind(payloads).unwrap();
+        {
+            let mut trace = fixture.runtime_trace.lock().unwrap();
+            trace.readback_fill_pattern = (0..PARTICIPANTS)
+                .map(|physical_index| {
+                    let logical_index = restore
+                        .layout()
+                        .participant_order()
+                        .logical_index_for_physical(u32::try_from(physical_index).unwrap())
+                        .unwrap();
+                    0x51 + u8::try_from(logical_index).unwrap()
+                })
+                .collect();
+            trace.readback_fill_index = 0;
+        }
+        let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
+            &providers,
+            &fixture.resolved,
+            &batch_identity,
+            active_bindings.iter(),
+            DeviceTimingMode::Kernel,
+            &restore,
+            0x5a,
+            wave,
+            &lane,
+            &reaper,
+        )
+        .unwrap();
+        let artifact = handle
+            .wait_into_evidence()
+            .unwrap()
+            .into_artifact_execution(execution_id)
+            .unwrap();
+        drop(batch_identity);
+        step.try_retire_normal().unwrap();
+        artifact
+    };
+
+    let logical_spans = vec![
+        TokenSpanWork::from_token_ids(&[11], 0..1).unwrap(),
+        TokenSpanWork::from_token_ids(&[21, 22], 0..2).unwrap(),
+        TokenSpanWork::from_token_ids(&[31, 32, 33], 0..3).unwrap(),
+        TokenSpanWork::from_token_ids(&[41, 42, 43, 44], 0..4).unwrap(),
+    ];
+    let identity = collect(
+        logical_spans.clone(),
+        (0..PARTICIPANTS).collect(),
+        "unequal-identity",
+    );
+    let reordered = collect(
+        logical_spans.into_iter().rev().collect(),
+        (0..PARTICIPANTS).rev().collect(),
+        "unequal-reordered",
+    );
+    assert_eq!(identity.restore_sha256(), reordered.restore_sha256());
+    assert_eq!(
+        identity.initialization_identity(),
+        reordered.initialization_identity()
+    );
+    let identity_rows = witness_rows(&identity);
+    assert_eq!(identity_rows, witness_rows(&reordered));
+    assert!(
+        identity_rows
+            .iter()
+            .map(|(_, _, _, raw_sha256)| raw_sha256)
+            .collect::<BTreeSet<_>>()
+            .len()
+            > 1,
+        "the regression must cover distinguishable participant witness digests"
+    );
+
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
     drop(batch);
     for session in sessions {
         session.try_complete().unwrap();
