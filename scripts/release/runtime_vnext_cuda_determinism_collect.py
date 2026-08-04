@@ -730,7 +730,7 @@ def validate_collector(
 
     denominator = read_json(root / collector["denominator"]["path"])
     normalized_denominator = validator.validate_denominator(
-        denominator, expected_models
+        denominator, expected_models, scope
     )
     for key, row in model_index.items():
         denominator_model = normalized_denominator["models"][key]
