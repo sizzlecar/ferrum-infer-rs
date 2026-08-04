@@ -1,6 +1,6 @@
 use super::{
-    invalid_resource, AdmittedRequestResources, AllocationLifetime, Arc, BTreeMap, Mutex, PlanNode,
-    RequestAuthorityId, ResourceId, Serialize, TensorAccess, VNextError,
+    invalid_resource, AllocationLifetime, Arc, BTreeMap, Mutex, PlanNode, RequestAuthorityId,
+    ResourceId, Serialize, TensorAccess, VNextError,
 };
 use std::mem;
 use tokio::sync::watch;
@@ -233,6 +233,26 @@ pub(super) struct RequestStateHazardCoordinator {
     changed: watch::Sender<u64>,
 }
 
+pub(super) struct RequestStateHazardParticipant<O> {
+    coordinator: Arc<RequestStateHazardCoordinator>,
+    request: RequestAuthorityId,
+    owner: O,
+}
+
+impl<O> RequestStateHazardParticipant<O> {
+    pub(super) fn new(
+        coordinator: Arc<RequestStateHazardCoordinator>,
+        request: RequestAuthorityId,
+        owner: O,
+    ) -> Self {
+        Self {
+            coordinator,
+            request,
+            owner,
+        }
+    }
+}
+
 impl RequestStateHazardCoordinator {
     pub(super) fn compile(nodes: &[PlanNode]) -> Result<Arc<Self>, VNextError> {
         let layout = RequestStateHazardLayout::compile(nodes)?;
@@ -335,34 +355,33 @@ impl RequestStateHazardCoordinator {
         Ok(())
     }
 
-    pub(super) fn try_acquire<R>(
+    pub(super) fn try_acquire<O>(
         self: &Arc<Self>,
-        participants: &[Arc<AdmittedRequestResources<R>>],
+        participants: &[RequestStateHazardParticipant<O>],
         node_indices: &[usize],
-    ) -> Result<RequestStateHazardAcquireDecision<R>, VNextError>
+    ) -> Result<RequestStateHazardAcquireDecision<O>, VNextError>
     where
-        R: super::DeviceRuntime,
+        O: Clone,
     {
         let selected = self.layout.selected(node_indices)?;
         let claims = selected.as_slice();
         if claims.is_empty() {
             return Ok(RequestStateHazardAcquireDecision::Acquired(None));
         }
-        let mut requests =
-            BTreeMap::<RequestAuthorityId, (Arc<AdmittedRequestResources<R>>, u32)>::new();
-        for request in participants {
-            if !Arc::ptr_eq(&request.plan.dynamic_pools().request_state_hazards, self) {
+        let mut requests = BTreeMap::<RequestAuthorityId, (O, u32)>::new();
+        for participant in participants {
+            if !Arc::ptr_eq(&participant.coordinator, self) {
                 return Err(invalid_resource(
                     "request-state hazard participant belongs to another plan coordinator",
                 ));
             }
-            let request_authority = request.request_authority();
+            let request_authority = participant.request;
             if let Some((_, sibling_count)) = requests.get_mut(&request_authority) {
                 *sibling_count = sibling_count
                     .checked_add(1)
                     .ok_or_else(|| invalid_resource("request-state sibling count exceeds u32"))?;
             } else {
-                requests.insert(request_authority, (Arc::clone(request), 1));
+                requests.insert(request_authority, (participant.owner.clone(), 1));
             }
         }
         if requests.is_empty() {
@@ -858,21 +877,15 @@ struct ActiveRequestStateHazardClaim {
 }
 
 #[must_use = "request-state hazards must remain owned through the device fence"]
-pub struct RequestStateHazardPermit<R>
-where
-    R: super::DeviceRuntime,
-{
+pub struct RequestStateHazardPermit<O> {
     coordinator: Arc<RequestStateHazardCoordinator>,
-    requests: Option<Vec<Arc<AdmittedRequestResources<R>>>>,
+    requests: Option<Vec<O>>,
     claims: Vec<ActiveRequestStateHazardClaim>,
     phase: RequestStateHazardPermitPhase,
     finished: bool,
 }
 
-impl<R> RequestStateHazardPermit<R>
-where
-    R: super::DeviceRuntime,
-{
+impl<O> RequestStateHazardPermit<O> {
     pub fn claim_count(&self) -> usize {
         self.claims.len()
     }
@@ -928,10 +941,7 @@ where
     }
 }
 
-impl<R> Drop for RequestStateHazardPermit<R>
-where
-    R: super::DeviceRuntime,
-{
+impl<O> Drop for RequestStateHazardPermit<O> {
     fn drop(&mut self) {
         if self.finished {
             return;
@@ -953,11 +963,8 @@ where
     }
 }
 
-pub(super) enum RequestStateHazardAcquireDecision<R>
-where
-    R: super::DeviceRuntime,
-{
-    Acquired(Option<RequestStateHazardPermit<R>>),
+pub(super) enum RequestStateHazardAcquireDecision<O> {
+    Acquired(Option<RequestStateHazardPermit<O>>),
     Deferred(RequestStateHazardDeferral),
     SplitRequired(RequestStateHazardSplitRequired),
     Poisoned(RequestStateHazardPoison),

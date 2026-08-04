@@ -50,6 +50,8 @@ This cycle was not visible in a pairwise-only audit.
 | Cross-pool growth, claim, reclaim and lane-stable arena orchestration | `dynamic_pool_set` | Depends on backing/pool contracts without making the lower-level pool owner depend on orchestration |
 | Program binding layout | `program_binding` | Immutable reusable-execution binding layout is compiled separately from pool lifecycle |
 | Dynamic pool maintenance API | `dynamic_pool_maintenance` | Pressure handling and retry policy consume the pool-set boundary without owning allocation state |
+| Request-state hazard arbitration | `request_state_hazard` | Low-level claims retain caller-supplied typed owners without depending on request or sequence lifecycle types |
+| Backing initialization transaction | `backing_initialization` | Zero-fill prepare, encode, fence, terminalization, and rollback remain one fail-closed owner below invocation orchestration |
 | Core resource failure constructor and dispatch poison bit | `contracts` | Shared wire/state encoding with no higher-level owner dependency |
 | Step lease storage | `batch` | A step owns one exact continuous-batch frame and its participants |
 | Sequence slot/dispatch state machine | `sequence` | Sequence lifecycle owns the encoded slot and dispatch gate |
@@ -64,7 +66,7 @@ Sibling-only implementation access uses `pub(super)` and does not widen the crat
 
 ## Final Result
 
-The final production graph contains twenty-three modules and zero strongly connected components with
+The final production graph contains twenty-five modules and zero strongly connected components with
 more than one member:
 
 ```text
@@ -75,10 +77,10 @@ One valid dependencies-first topological order is:
 
 ```text
 contracts -> backing_extent -> capacity -> dynamic_pool -> lane_stable_identity
--> lane_stable_arena -> ledger -> allocation -> program_binding -> dynamic_pool_set
--> dynamic_pool_maintenance -> provisioning -> runtime_driver -> sequence_state
--> static_lease -> plan_runtime -> recovery -> transaction -> work -> sequence -> batch
--> invocation -> execution_session
+-> lane_stable_arena -> ledger -> allocation -> program_binding -> request_state_hazard
+-> dynamic_pool_set -> dynamic_pool_maintenance -> provisioning -> runtime_driver
+-> sequence_state -> static_lease -> plan_runtime -> recovery -> transaction -> work
+-> sequence -> batch -> backing_initialization -> invocation -> execution_session
 ```
 
 This order is evidence that the graph is acyclic, not a requirement that unrelated modules share
@@ -89,6 +91,11 @@ evidence remains in `dynamic_pool`; `dynamic_pool_set` imports it and never expo
 back into the lower-level owner. Likewise, `execution_session` consumes `invocation`; invocation
 does not consume session typestate. This keeps both new edges one-way and makes every source owner
 visible to the canonical inventory.
+
+Request-state hazard permits are generic over the typed owner retained through the device fence.
+The invocation owner supplies `Arc<AdmittedRequestResources<R>>`, while the lower-level hazard
+arbiter knows only request authority and coordinator identity. This preserves fail-closed RAII
+retention without recreating a `request_state_hazard -> sequence` dependency.
 
 Lane-stable identity and arena ownership are separate leaf/orchestration owners, and sequence slot
 state is independent of recovery. Model-aware static initialization is now a vNext root composition

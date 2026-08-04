@@ -34,7 +34,8 @@ INVENTORY_DOCUMENT = (
 )
 ADR_DOCUMENT = GOAL_ROOT / "S0A_CONTRACT_SPLIT_MAP.md"
 PUBLIC_API_MIGRATIONS = GOAL_ROOT / "S0A_PUBLIC_API_MIGRATIONS.json"
-PUBLIC_API_ADDED_SHA256 = "9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d"
+PUBLIC_API_ADDED_SHA256 = "557dec231957692d7e9e727ad4da20d33441b00c788eaee76fdf2de398a0ef5a"
+PUBLIC_API_ADDED_COUNT = 1157
 
 PRODUCTION_GROUPS = {
     "resource": {
@@ -223,7 +224,7 @@ def validate_public_api_migrations() -> dict[str, Any]:
     require(
         document.get("schema_version") == 1
         and document.get("baseline_commit") == BASELINE_COMMIT
-        and document.get("expected_added_items") == 1068
+        and document.get("expected_added_items") == PUBLIC_API_ADDED_COUNT
         and document.get("expected_added_items_sha256") == PUBLIC_API_ADDED_SHA256,
         "S0A public API migration manifest header drifted",
     )
@@ -778,7 +779,7 @@ def contract_map(
                 "intentional migrations are manifest-bound"
             ),
             "semantic_change_count": 14,
-            "added_public_item_count": 1068,
+            "added_public_item_count": PUBLIC_API_ADDED_COUNT,
             "added_public_item_sha256": PUBLIC_API_ADDED_SHA256,
         },
     }
@@ -847,7 +848,8 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
     require(result.returncode == 0, "public owner map command failed")
     expected_line = (
         f"{OWNER_MAP_PASS_PREFIX}: mapped=1852/1866 migrated=14 lost=0 ambiguous=0 "
-        f"inaccessible=0 added=1068 added_sha256={PUBLIC_API_ADDED_SHA256} unsupported=0 "
+        f"inaccessible=0 added={PUBLIC_API_ADDED_COUNT} "
+        f"added_sha256={PUBLIC_API_ADDED_SHA256} unsupported=0 "
         f"output={output_path}"
     )
     require(result.stdout.splitlines().count(expected_line) == 1, "public owner map exact PASS line mismatch")
@@ -861,7 +863,7 @@ def run_public_owner_map(checkpoint_root: Path) -> dict[str, Any]:
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 1068,
+            "added_items": PUBLIC_API_ADDED_COUNT,
             "added_items_sha256": PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,
