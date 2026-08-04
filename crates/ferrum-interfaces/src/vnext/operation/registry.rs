@@ -11,6 +11,7 @@ use super::super::{
 };
 use super::foundation::{canonical_sha256, invalid_operation};
 use super::invocation::PreparedOperationDispatchBinding;
+use super::resolved_value::resource_uses_packed_batch_coordinates;
 use super::{
     AttributeId, BatchedOperationInvocation, CapabilityCatalog, EngineProviderDescriptor,
     OperationContract, OperationDescriptor, OperationFailure, OperationProviderDescriptor,
@@ -145,6 +146,30 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
 
     pub fn work_shape(&self) -> &BatchWorkShape {
         self.work_shape
+    }
+
+    /// Returns whether one resolved value uses the packed token coordinates of
+    /// the physical submission wave. Providers must use the same coordinate
+    /// authority here that runtime invocation construction uses when selecting
+    /// captured buffer regions.
+    pub fn binding_uses_packed_batch_coordinates(
+        &self,
+        role: ResolvedValueRole,
+        ordinal: u32,
+    ) -> Result<bool, VNextError> {
+        let binding = self
+            .bindings
+            .iter()
+            .find(|binding| binding.role() == role && binding.ordinal() == ordinal)
+            .ok_or_else(|| {
+                invalid_operation("reusable topology requested an unknown value binding")
+            })?;
+        let [component] = binding.storage().components() else {
+            return Err(invalid_operation(
+                "reusable topology coordinate ownership requires one resource component",
+            ));
+        };
+        resource_uses_packed_batch_coordinates(self.memory, component.resource_id())
     }
 
     /// Resolves one complete provider address contract. Every value binding

@@ -18,6 +18,7 @@ use super::buffer_view::{
     ValueBindingPhysicalCoverage,
 };
 use super::foundation::invalid_operation;
+use super::resolved_value::resource_uses_packed_batch_coordinates;
 use super::{
     AttributeId, BatchOperationIdentity, BatchOperationNodeIdentity, ElementType,
     OperationBufferView, OperationDescriptor, OperationProviderDescriptor, ResolvedValueBinding,
@@ -607,12 +608,10 @@ impl<'a, B> OperationInvocation<'a, B> {
                             )
                         })?;
                     let descriptor_lifetime = descriptor.lifetime();
-                    let packed_batch_coordinates =
-                        matches!(descriptor.demand(), DynamicResourceDemand::Tokens { .. })
-                            && matches!(
-                                descriptor_lifetime,
-                                AllocationLifetime::Step | AllocationLifetime::Invocation
-                            );
+                    let packed_batch_coordinates = resource_uses_packed_batch_coordinates(
+                        memory,
+                        descriptor.base_resource_id(),
+                    )?;
                     let backing = resources.backing_view(resource_id).or_else(|_| {
                         resources.participant_backing_view(participant_index, resource_id)
                     })?;

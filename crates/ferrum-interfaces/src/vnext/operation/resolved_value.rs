@@ -2,7 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::super::{BufferUsage, ProgramValueId, ResourceId, VNextError, WeightId};
+use super::super::{
+    AllocationLifetime, BufferUsage, DynamicResourceDemand, MemoryPlan, ProgramValueId, ResourceId,
+    VNextError, WeightId,
+};
 use super::foundation::invalid_operation;
 use super::{
     AliasPolicy, DynamicStorageRequirement, ElementType, ResolvedTensorSpec, ResolvedWeightBinding,
@@ -434,6 +437,32 @@ impl ResolvedValueBinding {
     pub fn storage(&self) -> &ResolvedValueStorage {
         &self.storage
     }
+}
+
+pub(super) fn resource_uses_packed_batch_coordinates(
+    memory: &MemoryPlan,
+    resource_id: &ResourceId,
+) -> Result<bool, VNextError> {
+    if memory
+        .static_allocations()
+        .binary_search_by(|allocation| allocation.resource_id().cmp(resource_id))
+        .is_ok()
+    {
+        return Ok(false);
+    }
+    let descriptor = memory
+        .dynamic_descriptors()
+        .binary_search_by(|descriptor| descriptor.base_resource_id().cmp(resource_id))
+        .ok()
+        .and_then(|index| memory.dynamic_descriptors().get(index))
+        .ok_or_else(|| invalid_operation("value binding references an unknown memory resource"))?;
+    Ok(
+        matches!(descriptor.demand(), DynamicResourceDemand::Tokens { .. })
+            && matches!(
+                descriptor.lifetime(),
+                AllocationLifetime::Step | AllocationLifetime::Invocation
+            ),
+    )
 }
 
 fn validate_resolved_weight_storage(

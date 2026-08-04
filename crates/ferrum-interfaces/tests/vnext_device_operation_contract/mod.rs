@@ -658,6 +658,7 @@ impl ProviderBehavior {
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
     pub(crate) reusable_topology_calls: u64,
+    pub(crate) reusable_topology_packed_input_coordinates: Vec<bool>,
     pub(crate) encode_calls: u64,
     pub(crate) reusable_binding_encode_calls: u64,
     pub(crate) last_participant_count: usize,
@@ -744,7 +745,15 @@ impl OperationProvider<TestRuntime> for TestProvider {
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        self.trace.lock().unwrap().reusable_topology_calls += 1;
+        let packed_input =
+            request.binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)?;
+        {
+            let mut trace = self.trace.lock().unwrap();
+            trace.reusable_topology_calls += 1;
+            trace
+                .reusable_topology_packed_input_coordinates
+                .push(packed_input);
+        }
         match *self.behavior.lock().unwrap() {
             ProviderBehavior::ProgramBindingWithScratchTail
                 if request.node_id().as_str() == "node.tail" =>
@@ -772,7 +781,9 @@ impl OperationProvider<TestRuntime> for TestProvider {
                     .bindings()
                     .iter()
                     .map(|binding| {
-                        if (binding.role(), binding.ordinal()) == program_bound_identity {
+                        if packed_input
+                            || (binding.role(), binding.ordinal()) == program_bound_identity
+                        {
                             ReusableExecutionValueAddress::program_binding(
                                 binding.role(),
                                 binding.ordinal(),
