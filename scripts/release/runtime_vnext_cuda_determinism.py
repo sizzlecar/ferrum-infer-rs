@@ -319,6 +319,7 @@ MODEL_SELECTION_FIELDS = frozenset(
 DENOMINATOR_FIELDS = frozenset(
     {
         "schema_version",
+        "provider_coverage",
         "coverage",
         "provider_evidence",
     }
@@ -1073,7 +1074,7 @@ def validate_collector_manifest(
 
 
 def validate_coverage(
-    value: dict[str, Any], expected_models: set[str]
+    value: dict[str, Any], expected_models: set[str], *, allow_unselected: bool
 ) -> dict[str, Any]:
     coverage = exact_object(value, COVERAGE_FIELDS, "coverage")
     require(validate_version(coverage["schema_version"], "coverage.schema_version") == (1, 0),
@@ -1160,8 +1161,9 @@ def validate_coverage(
         )
         selections_raw = requirement["model_selections"]
         require(
-            isinstance(selections_raw, list) and bool(selections_raw),
-            f"{label}.model_selections cannot be empty",
+            isinstance(selections_raw, list)
+            and (bool(selections_raw) or allow_unselected),
+            f"{label}.model_selections cannot be empty for full catalog coverage",
         )
         selection_keys: list[str] = []
         for selection_index, selection_raw in enumerate(selections_raw):
@@ -1444,15 +1446,28 @@ def validate_witness_plan(
 
 
 def validate_denominator(
-    value: dict[str, Any], expected_models: set[str]
+    value: dict[str, Any], expected_models: set[str], scope: str
 ) -> dict[str, Any]:
     denominator = exact_object(value, DENOMINATOR_FIELDS, "denominator")
     require(
         validate_version(denominator["schema_version"], "denominator.schema_version")
-        == (1, 0),
-        "denominator.schema_version must be 1.0",
+        == (1, 1),
+        "denominator.schema_version must be 1.1",
     )
-    coverage = validate_coverage(denominator["coverage"], expected_models)
+    expected_provider_coverage = (
+        "selected_plan_providers"
+        if scope == M1_S2_FOCUSED_SCOPE
+        else "all_catalog_providers"
+    )
+    require(
+        denominator["provider_coverage"] == expected_provider_coverage,
+        "denominator.provider_coverage differs from the selected scope",
+    )
+    coverage = validate_coverage(
+        denominator["coverage"],
+        expected_models,
+        allow_unselected=expected_provider_coverage == "selected_plan_providers",
+    )
     evidence_rows = denominator["provider_evidence"]
     require(
         isinstance(evidence_rows, list)
@@ -1534,6 +1549,7 @@ def validate_denominator(
     )
     return {
         **coverage,
+        "provider_coverage": expected_provider_coverage,
         "scopes": scopes,
     }
 
@@ -2845,6 +2861,7 @@ def validate_artifact(
     denominator = validate_denominator(
         read_json(denominator_path, max_bytes=MAX_DENOMINATOR_JSON_BYTES),
         expected_models,
+        expected_scope,
     )
 
     models_raw = manifest["models"]
@@ -3453,6 +3470,7 @@ def selftest_witness_plan(
 def make_selftest_denominator(
     root: Path,
     model_keys: set[str],
+    scope: str,
 ) -> tuple[dict[str, Any], str, dict[tuple[str, str], str]]:
     models = []
     primary_selections = []
@@ -3586,7 +3604,12 @@ def make_selftest_denominator(
         )
     )
     denominator = {
-        "schema_version": {"major": 1, "minor": 0},
+        "schema_version": {"major": 1, "minor": 1},
+        "provider_coverage": (
+            "selected_plan_providers"
+            if scope == M1_S2_FOCUSED_SCOPE
+            else "all_catalog_providers"
+        ),
         "coverage": coverage,
         "provider_evidence": provider_evidence,
     }
@@ -4038,7 +4061,7 @@ def make_selftest_artifact(
     selected_models = set(contract["models"])
     selected_partitions = set(contract["partitions"])
     denominator, denominator_fingerprint, witness_fingerprints = (
-        make_selftest_denominator(root, selected_models)
+        make_selftest_denominator(root, selected_models, scope)
     )
     denominator_ref = selftest_file_ref(root, root / "denominator.json")
     binary_path = root / "binary" / "ferrum"
@@ -4362,6 +4385,29 @@ def run_self_test() -> None:
             and focused_summary["comparison_count"] == 300,
             "focused self-test denominator drifted",
         )
+        focused_denominator = read_json(focused / "denominator.json")
+        validate_denominator(
+            focused_denominator,
+            {M1_MODEL},
+            M1_S2_FOCUSED_SCOPE,
+        )
+        wrong_provider_coverage = copy.deepcopy(focused_denominator)
+        wrong_provider_coverage["provider_coverage"] = "all_catalog_providers"
+        try:
+            validate_denominator(
+                wrong_provider_coverage,
+                {M1_MODEL},
+                M1_S2_FOCUSED_SCOPE,
+            )
+        except DeterminismArtifactError as error:
+            require(
+                "provider_coverage differs" in str(error),
+                f"focused provider coverage was rejected for the wrong reason: {error}",
+            )
+        else:
+            raise AssertionError(
+                "focused denominator accepted release-full provider coverage"
+            )
         try:
             validate_artifact(
                 focused,

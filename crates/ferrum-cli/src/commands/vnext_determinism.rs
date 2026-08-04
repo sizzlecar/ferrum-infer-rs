@@ -322,8 +322,9 @@ mod cuda {
     };
     use ferrum_interfaces::vnext::{
         CapabilityCatalog, ContractVersion, ExecutionDeterminismEvidenceDenominator,
-        ProviderReplayEquivalence, ResolvedModelPlan, SubmissionWaveDeterminismArtifactExecution,
-        SubmissionWaveDeterminismArtifactWitness, VNextError,
+        ExecutionDeterminismProviderCoverage, ProviderReplayEquivalence, ResolvedModelPlan,
+        SubmissionWaveDeterminismArtifactExecution, SubmissionWaveDeterminismArtifactWitness,
+        VNextError,
     };
     use ferrum_models::vnext::{
         open_registered_colocated_safetensors, resolve_registered_model_from_sources,
@@ -710,10 +711,21 @@ mod cuda {
             .iter()
             .map(|model| (model.key.as_str(), &model.plan))
             .collect::<Vec<_>>();
-        let denominator = ExecutionDeterminismEvidenceDenominator::from_catalog_and_resolved_plans(
-            &catalog, &plan_refs,
-        )
-        .map_err(vnext_backend_error)?;
+        let provider_coverage = match command.scope {
+            VNextDeterminismScope::ReleaseFull => {
+                ExecutionDeterminismProviderCoverage::AllCatalogProviders
+            }
+            VNextDeterminismScope::M1S2Focused => {
+                ExecutionDeterminismProviderCoverage::SelectedPlanProviders
+            }
+        };
+        let denominator =
+            ExecutionDeterminismEvidenceDenominator::from_catalog_and_resolved_plans_with_provider_coverage(
+                &catalog,
+                &plan_refs,
+                provider_coverage,
+            )
+            .map_err(vnext_backend_error)?;
         let denominator_bytes = denominator.to_json().map_err(vnext_backend_error)?;
         let denominator_fingerprint = denominator.fingerprint().map_err(vnext_backend_error)?;
         let device_runtime_fingerprint = denominator

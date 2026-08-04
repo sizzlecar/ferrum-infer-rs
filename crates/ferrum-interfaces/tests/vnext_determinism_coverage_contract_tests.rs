@@ -79,6 +79,10 @@ fn live_catalog_and_resolved_plans_form_one_typed_witness_denominator() {
     )
     .unwrap();
 
+    assert_eq!(
+        denominator.provider_coverage(),
+        ExecutionDeterminismProviderCoverage::AllCatalogProviders
+    );
     assert_eq!(denominator.coverage().models().len(), 1);
     assert_eq!(
         denominator.provider_evidence().len(),
@@ -122,6 +126,37 @@ fn live_catalog_and_resolved_plans_form_one_typed_witness_denominator() {
     )
     .is_err());
 
+    close_fixture(fixture);
+}
+
+#[test]
+fn focused_denominator_allows_unselected_catalog_rows_without_weakening_full_coverage() {
+    let fixture =
+        fixture_with_determinism_provider_behavior(false, ProviderBehavior::ProgramBinding);
+    let denominator = ExecutionDeterminismEvidenceDenominator::from_catalog_and_resolved_plans_with_provider_coverage(
+        &fixture.resolved.parts().capabilities,
+        &[("M1", &fixture.resolved)],
+        ExecutionDeterminismProviderCoverage::SelectedPlanProviders,
+    )
+    .unwrap();
+    let mut encoded: serde_json::Value =
+        serde_json::from_slice(&denominator.to_json().unwrap()).unwrap();
+    let mut unselected = encoded["coverage"]["provider_requirements"][0].clone();
+    unselected["operation_id"] = serde_json::json!("operation.zzz-unselected");
+    unselected["provider_id"] = serde_json::json!("provider.zzz-unselected");
+    unselected["model_selections"] = serde_json::json!([]);
+    encoded["coverage"]["provider_requirements"]
+        .as_array_mut()
+        .unwrap()
+        .push(unselected);
+    let focused = serde_json::to_vec(&encoded).unwrap();
+    assert!(ExecutionDeterminismEvidenceDenominator::decode_untrusted(&focused).is_ok());
+
+    encoded["provider_coverage"] = serde_json::json!("all_catalog_providers");
+    assert!(ExecutionDeterminismEvidenceDenominator::decode_untrusted(
+        &serde_json::to_vec(&encoded).unwrap()
+    )
+    .is_err());
     close_fixture(fixture);
 }
 
