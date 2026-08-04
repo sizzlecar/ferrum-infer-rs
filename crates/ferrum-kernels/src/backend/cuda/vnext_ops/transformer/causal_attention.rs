@@ -23,7 +23,10 @@ use ferrum_interfaces::vnext::{
 use ferrum_types::{AttentionExecutionPolicy, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use sha2::{Digest, Sha256};
 
-use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
+use super::{
+    attach_invocation_binding, captured_contiguous_addresses_are_reusable,
+    ensure_estimator_request, estimate, launch_gemm_f16, CapturedProviderWorkspace,
+};
 #[cfg(feature = "vllm-marlin")]
 use super::{
     moe_weights::{
@@ -366,13 +369,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        if request
-            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
-            .is_none()
-            || request
-                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
-                .is_none()
-        {
+        if !captured_contiguous_addresses_are_reusable(
+            &request,
+            9,
+            &[
+                CapturedProviderWorkspace::Scratch,
+                CapturedProviderWorkspace::Binding,
+            ],
+        )? {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
         reusable_attention_topology(&request, self.attention_policy)

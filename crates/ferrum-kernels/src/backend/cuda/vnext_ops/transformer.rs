@@ -104,6 +104,61 @@ fn attach_invocation_binding<C>(
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum CapturedProviderWorkspace {
+    Scratch,
+    Binding,
+    Persistent,
+}
+
+pub(super) fn captured_contiguous_addresses_are_reusable(
+    request: &ReusableExecutionTopologyRequest<'_>,
+    input_count: u32,
+    workspaces: &[CapturedProviderWorkspace],
+) -> Result<bool, VNextError> {
+    for ordinal in 0..input_count {
+        if request
+            .binding_reusable_address_scope(ResolvedValueRole::Input, ordinal)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    if request
+        .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    for workspace in workspaces {
+        let scope = match workspace {
+            CapturedProviderWorkspace::Scratch => request.scratch_reusable_address_scope()?,
+            CapturedProviderWorkspace::Binding => {
+                request.binding_workspace_reusable_address_scope()?
+            }
+            CapturedProviderWorkspace::Persistent => {
+                request.persistent_workspace_reusable_address_scope()?
+            }
+        };
+        if scope.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn static_contiguous_reusable_topology(
+    request: &ReusableExecutionTopologyRequest<'_>,
+    input_count: u32,
+    workspaces: &[CapturedProviderWorkspace],
+) -> Result<ReusableExecutionTopology, VNextError> {
+    if captured_contiguous_addresses_are_reusable(request, input_count, workspaces)? {
+        Ok(ReusableExecutionTopology::Static)
+    } else {
+        Ok(ReusableExecutionTopology::EagerBoundary)
+    }
+}
+
 pub(super) struct CudaRmsNormProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
@@ -155,9 +210,9 @@ impl OperationResourceEstimator for CudaRmsNormProvider {
 impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
     fn reusable_execution_topology(
         &self,
-        _request: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        static_contiguous_reusable_topology(&request, 2, &[])
     }
 
     fn encode_selected(
@@ -214,9 +269,9 @@ impl OperationResourceEstimator for CudaDenseLinearProvider {
 impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
     fn reusable_execution_topology(
         &self,
-        _request: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        static_contiguous_reusable_topology(&request, 2, &[])
     }
 
     fn encode_selected(
@@ -340,9 +395,9 @@ impl OperationResourceEstimator for CudaMarlinFp8DenseLinearProvider {
 impl OperationProvider<CudaDeviceRuntime> for CudaMarlinFp8DenseLinearProvider {
     fn reusable_execution_topology(
         &self,
-        _request: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        static_contiguous_reusable_topology(&request, 2, &[CapturedProviderWorkspace::Scratch])
     }
 
     fn encode_selected(
@@ -431,9 +486,9 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
 impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
     fn reusable_execution_topology(
         &self,
-        _request: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        static_contiguous_reusable_topology(&request, 3, &[CapturedProviderWorkspace::Scratch])
     }
 
     fn encode_selected(
@@ -502,9 +557,9 @@ impl OperationResourceEstimator for CudaResidualAddProvider {
 impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
     fn reusable_execution_topology(
         &self,
-        _request: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        static_contiguous_reusable_topology(&request, 2, &[])
     }
 
     fn encode_selected(

@@ -25,8 +25,8 @@ use ferrum_interfaces::vnext::{
 use sha2::{Digest, Sha256};
 
 use super::{
-    attach_invocation_binding, contiguous_bindings, ensure_estimator_request, estimate,
-    launch_gemm_f16,
+    attach_invocation_binding, captured_contiguous_addresses_are_reusable, contiguous_bindings,
+    ensure_estimator_request, estimate, launch_gemm_f16, CapturedProviderWorkspace,
 };
 #[cfg(feature = "vllm-marlin")]
 use super::{
@@ -290,13 +290,14 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        if request
-            .binding_reusable_address_scope(ResolvedValueRole::Input, 0)?
-            .is_none()
-            || request
-                .binding_reusable_address_scope(ResolvedValueRole::Output, 0)?
-                .is_none()
-        {
+        if !captured_contiguous_addresses_are_reusable(
+            &request,
+            10,
+            &[
+                CapturedProviderWorkspace::Scratch,
+                CapturedProviderWorkspace::Binding,
+            ],
+        )? {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
         reusable_attention_topology(&request, self.execution_capabilities)
