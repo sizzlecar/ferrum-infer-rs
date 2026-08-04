@@ -4992,12 +4992,18 @@ async fn plan_runtime_one_token_prefill_without_external_releaser_fails_closed()
     request.prompt = "one two three four".to_string();
     request.sampling_params.max_tokens = 1;
 
-    let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
+    let error = tokio::time::timeout(Duration::from_secs(2), engine.infer(request))
         .await
         .expect("minimum prefill frontier must not wait on itself")
-        .unwrap();
+        .expect_err("a minimum prefill frontier without an external releaser must fail closed");
 
-    assert_eq!(response.finish_reason, FinishReason::Error);
+    assert!(
+        matches!(error, FerrumError::ResourceExhausted { .. }),
+        "unexpected terminal error: {error:?}"
+    );
+    assert!(error
+        .to_string()
+        .contains("has no runnable one-token frontier and no external capacity releaser"));
     assert_eq!(
         executor.capacity_wait_registrations.load(Ordering::Relaxed),
         0,
