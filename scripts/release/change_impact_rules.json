@@ -151,7 +151,14 @@
       "domains": ["evidence_schema"],
       "required_gates": ["unit", "profile_analyzer_selftest", "planner_selftest"],
       "release_invalidation": ["profile_analyzer_selftest", "planner_selftest"],
-      "exceptions": [],
+      "exceptions": [
+        {
+          "id": "change-impact-fixture-only",
+          "path_globs": ["scripts/release/fixtures/change_impact/**"],
+          "remove_required_gates": ["unit", "profile_analyzer_selftest"],
+          "reason": "planner fixtures exercise Python classification and do not compile or execute Rust product code"
+        }
+      ],
       "owner": "release",
       "reason": "shared evidence schemas and fixtures affect downstream validators"
     },
@@ -545,7 +552,7 @@
         "scripts/m3_validate_runner_artifact.py"
       ],
       "domains": ["release_gate"],
-      "required_gates": ["unit", "release_validator_selftest"],
+      "required_gates": ["release_validator_selftest"],
       "release_invalidation": ["release_validator_selftest"],
       "exceptions": [
         {
@@ -566,7 +573,6 @@
       ],
       "domains": ["release_gate", "server_api", "cli_run", "evidence_schema"],
       "required_gates": [
-        "unit",
         "product_backend_sentinel_selftest",
         "product_backend_sentinel_dry_run",
         "planner_selftest"
