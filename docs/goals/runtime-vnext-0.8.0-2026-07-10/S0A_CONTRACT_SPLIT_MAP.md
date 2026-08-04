@@ -4,7 +4,7 @@
 
 S0A now covers four production contract groups: `resource`, `execution`, `event`, and
 `operation`, plus the root `static_initialization.rs` composition owner. The four domain groups
-contain 75 production owners and 286 importer-to-owner edges. The syntax-tree graph reports zero
+contain 77 production owners and 297 importer-to-owner edges. The syntax-tree graph reports zero
 multi-owner strongly connected components and zero diagnostics; the composition owner is bounded
 and identity-checked separately because it intentionally joins otherwise independent domains.
 
@@ -16,8 +16,8 @@ migrated=14
 lost=0
 ambiguous=0
 inaccessible=0
-added=1068
-added_sha256=9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d
+added=1157
+added_sha256=557dec231957692d7e9e727ad4da20d33441b00c788eaee76fdf2de398a0ef5a
 unsupported=0
 ```
 
@@ -25,6 +25,11 @@ The 14 migrations are not omissions. Each entry in `S0A_PUBLIC_API_MIGRATIONS.js
 path and kind, public replacement targets, rationale, and introducing commit. Any unexplained
 loss, redundant migration, inaccessible target, unsupported syntax, or added-item digest drift is
 a gate failure.
+
+The added-item ledger includes 46 request-state hazard contract items introduced by `5626fd2b`
+and 43 determinism, replay, and packed-coordinate contract items introduced afterward. This
+refresh changes no public paths or runtime semantics; it binds the gate to the public owner
+surface already present at `fd694d4a`.
 
 This document records the implemented ownership design. It is not a G01A PASS artifact. Canonical
 completion requires a clean-source `vnext-g01a` run and both exact PASS lines documented below.
@@ -57,7 +62,7 @@ Current maxima before the clean aggregate gate are:
 | Category | Largest file | Physical lines | Limit |
 |---|---|---:|---:|
 | Facade | `operation.rs` | 101 | 500 |
-| Production owner | `resource/invocation.rs` | 2,455 | 2,500 |
+| Production owner | `resource/dynamic_pool.rs` | 2,383 | 2,500 |
 | Test/support owner | `tests/vnext_device_operation_contract/mod.rs` | 1,839 | 2,000 |
 
 The final gate recomputes these values from the committed tree. These are ownership and
@@ -72,7 +77,7 @@ checkout so it cannot escape the production-owner limit.
 
 ### Resource
 
-Resource has 23 owners and 97 edges. It owns capacity publication, physical backing, pool growth
+Resource has 25 owners and 106 edges. It owns capacity publication, physical backing, pool growth
 and reclaim, request/sequence/session/step/invocation lifetimes, transactions, fences, recovery,
 and runtime close. Model-aware static initialization was lifted to the vNext composition root;
 `StateInitialization` remains a low-level resource contract.
@@ -81,10 +86,10 @@ Valid dependencies-first order:
 
 ```text
 contracts -> backing_extent -> capacity -> dynamic_pool -> lane_stable_identity
--> lane_stable_arena -> ledger -> allocation -> program_binding -> dynamic_pool_set
--> dynamic_pool_maintenance -> provisioning -> runtime_driver -> sequence_state
--> static_lease -> plan_runtime -> recovery -> transaction -> work -> sequence -> batch
--> invocation -> execution_session
+-> lane_stable_arena -> ledger -> allocation -> program_binding -> request_state_hazard
+-> dynamic_pool_set -> dynamic_pool_maintenance -> provisioning -> runtime_driver
+-> sequence_state -> static_lease -> plan_runtime -> recovery -> transaction -> work
+-> sequence -> batch -> backing_initialization -> invocation -> execution_session
 ```
 
 Detailed rationale is in `S0A_RESOURCE_DEPENDENCY_AUDIT.md`.

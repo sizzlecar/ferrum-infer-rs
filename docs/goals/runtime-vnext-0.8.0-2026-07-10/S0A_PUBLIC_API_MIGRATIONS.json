@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "baseline_commit": "b5377b12464b60203a3fe57a6de4c9952ed2474b",
-  "expected_added_items": 1068,
-  "expected_added_items_sha256": "9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d",
+  "expected_added_items": 1157,
+  "expected_added_items_sha256": "557dec231957692d7e9e727ad4da20d33441b00c788eaee76fdf2de398a0ef5a",
   "migrations": [
     {
       "old_path": "ferrum_interfaces::vnext::AdmittedSequenceResources::backing_slices",

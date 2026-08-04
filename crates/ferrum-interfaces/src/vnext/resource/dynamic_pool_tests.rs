@@ -1062,9 +1062,14 @@ fn request_state_failed_write_poison_is_generation_aware() {
         .unwrap();
     let request = admitted_request(&harness.root, "request-state-write-poison");
     let coordinator = &harness.root.dynamic_pools.request_state_hazards;
+    let participant = RequestStateHazardParticipant::new(
+        Arc::clone(coordinator),
+        request.request_authority(),
+        Arc::clone(&request),
+    );
 
     let mut succeeded = match coordinator
-        .try_acquire(std::slice::from_ref(&request), &[0])
+        .try_acquire(std::slice::from_ref(&participant), &[0])
         .unwrap()
     {
         RequestStateHazardAcquireDecision::Acquired(Some(permit)) => permit,
@@ -1076,7 +1081,7 @@ fn request_state_failed_write_poison_is_generation_aware() {
         .unwrap();
 
     let mut failed = match coordinator
-        .try_acquire(std::slice::from_ref(&request), &[0])
+        .try_acquire(std::slice::from_ref(&participant), &[0])
         .unwrap()
     {
         RequestStateHazardAcquireDecision::Acquired(Some(permit)) => permit,
@@ -1087,7 +1092,7 @@ fn request_state_failed_write_poison_is_generation_aware() {
         .finish(RequestStateHazardTerminalDisposition::FailedButQuiescent)
         .unwrap();
     let poison = match coordinator
-        .try_acquire(std::slice::from_ref(&request), &[0])
+        .try_acquire(std::slice::from_ref(&participant), &[0])
         .unwrap()
     {
         RequestStateHazardAcquireDecision::Poisoned(poison) => poison,
@@ -1099,6 +1104,7 @@ fn request_state_failed_write_poison_is_generation_aware() {
     );
     assert_eq!(poison.value_generation(), 1);
 
+    drop(participant);
     drop(request);
     close_dynamic_test_root(harness.root);
 }
