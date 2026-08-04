@@ -2118,10 +2118,14 @@ impl DeviceRuntime for MetalDeviceRuntime {
         S: DeviceSubmissionTimingSink,
     {
         let timing_mode = commands.timing_mode();
-        if commands.compute_path_requirement() == DeviceComputePathRequirement::ReplayedOnly {
+        if matches!(
+            commands.compute_path_requirement(),
+            DeviceComputePathRequirement::ReplayedOnly
+                | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+        ) {
             return Err(DefinitelyNotSubmitted::new(
                 MetalDeviceRuntimeError::contract(
-                    "Metal cannot satisfy a replayed-only compute submission",
+                    "Metal cannot satisfy a replay-required compute submission",
                 ),
             ));
         }

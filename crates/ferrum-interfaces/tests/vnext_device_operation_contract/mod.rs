@@ -1609,16 +1609,33 @@ impl DeviceRuntime for TestRuntime {
         assert!(!commands.is_empty(), "core must not submit an empty batch");
         let timing_mode = commands.timing_mode();
         let compute_path_requirement = commands.compute_path_requirement();
+        let declared_eager_compute_node_count =
+            commands.declared_eager_compute_node_indices().len();
+        let declared_eager_compute_node_indices = commands
+            .declared_eager_compute_node_indices()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let attribution_requirement = commands.attribution_requirement();
         let reusable_execution_capture = commands.reusable_execution_capture().cloned();
         let entries = commands.into_entries();
         let mut compute_command_count = 0_usize;
         let mut replayed_compute_command_count = 0_usize;
+        let mut observed_eager_compute_node_indices = BTreeSet::new();
+        let mut exact_boundary_shape = true;
         for entry in &entries {
             if entry.phase() == DeviceCommandPhase::Compute {
                 compute_command_count += 1;
-                replayed_compute_command_count +=
-                    usize::from(*entry.command() == TestCommand::ReusableExecution);
+                if *entry.command() == TestCommand::ReusableExecution {
+                    replayed_compute_command_count += 1;
+                } else if compute_path_requirement
+                    == DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+                {
+                    exact_boundary_shape &= entry.node_index().is_some_and(|node_index| {
+                        declared_eager_compute_node_indices.contains(&node_index)
+                            && observed_eager_compute_node_indices.insert(node_index)
+                    });
+                }
             }
         }
         let reusable_invocations = {
@@ -1636,6 +1653,15 @@ impl DeviceRuntime for TestRuntime {
             DeviceComputePathRequirement::EagerOnly => replayed_compute_command_count == 0,
             DeviceComputePathRequirement::ReplayedOnly => {
                 compute_command_count > 0 && replayed_compute_command_count == compute_command_count
+            }
+            DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => {
+                !declared_eager_compute_node_indices.is_empty()
+                    && declared_eager_compute_node_count
+                        == declared_eager_compute_node_indices.len()
+                    && exact_boundary_shape
+                    && replayed_compute_command_count > 0
+                    && replayed_compute_command_count < compute_command_count
+                    && observed_eager_compute_node_indices == declared_eager_compute_node_indices
             }
         };
         if !compute_path_matches {

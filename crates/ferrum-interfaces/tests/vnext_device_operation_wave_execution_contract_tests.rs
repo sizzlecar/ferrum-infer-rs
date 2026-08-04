@@ -839,6 +839,209 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
 }
 
 #[test]
+fn determinism_replay_accepts_only_live_declared_eager_boundaries() {
+    let (fixture, sequence, session, batch, step) =
+        setup_with_fixture(fixture_with_determinism_provider_behavior(
+            false,
+            ProviderBehavior::ProgramBindingFirstNodeEagerBoundary,
+        ));
+    let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(providers.len(), 2);
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x42,
+    );
+    let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("partial determinism wave has reusable authority");
+    let program_fingerprint = program_id.fingerprint();
+    let program = DeviceReusableExecutionProgram::new(
+        program_id,
+        vec![DeviceReusableExecutionSegment::new(0, 1, 2, 1).unwrap()],
+        vec![1],
+    )
+    .unwrap();
+
+    let handle = OperationDispatch::encode_and_submit_determinism_replayed_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Replay,
+        &restore,
+        0xa5,
+        &program,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        assert_eq!(
+            trace.submitted_compute_path_requirements,
+            vec![DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries]
+        );
+        assert!(trace.submitted_commands.last().is_some_and(|commands| {
+            commands.ends_with(&[
+                TestCommand::CoalescedProgramBinding,
+                TestCommand::Provider,
+                TestCommand::ReusableExecution,
+            ])
+        }));
+    }
+    {
+        let trace = fixture.provider_trace.lock().unwrap();
+        assert_eq!(trace.encode_calls, 1);
+        assert_eq!(trace.reusable_binding_encode_calls, 1);
+    }
+
+    let evidence = handle.wait_into_evidence().unwrap();
+    assert_eq!(
+        evidence.expected_compute_path_requirement(),
+        DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+    );
+    assert_eq!(
+        evidence
+            .declared_eager_boundary_node_ids()
+            .iter()
+            .map(NodeId::as_str)
+            .collect::<Vec<_>>(),
+        vec!["node.main"]
+    );
+    assert_eq!(
+        evidence.reusable_program_fingerprint().as_deref(),
+        Some(program_fingerprint.as_str())
+    );
+    let artifact =
+        serde_json::to_value(evidence.into_artifact_execution("replay-00").unwrap()).unwrap();
+    assert_eq!(
+        artifact["compute_path_requirement"],
+        "replayed_with_declared_eager_boundaries"
+    );
+    assert_eq!(
+        artifact["declared_eager_boundary_node_ids"],
+        json!(["node.main"])
+    );
+    assert_eq!(
+        artifact["reusable_program_fingerprint"],
+        program_fingerprint
+    );
+    assert_eq!(
+        artifact["attribution"]["replayed_segments"][0]["reusable_program_fingerprint"],
+        artifact["reusable_program_fingerprint"]
+    );
+
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn determinism_replay_rejects_an_unresident_non_boundary_gap_before_submission() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_determinism_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x42,
+    );
+    let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("determinism wave has reusable authority");
+    let incomplete_program = DeviceReusableExecutionProgram::new(
+        program_id,
+        vec![DeviceReusableExecutionSegment::new(0, 1, 2, 1).unwrap()],
+        vec![1],
+    )
+    .unwrap();
+
+    let error = match OperationDispatch::encode_and_submit_determinism_replayed_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Replay,
+        &restore,
+        0xa5,
+        &incomplete_program,
+        wave,
+        &lane,
+        &reaper,
+    ) {
+        Ok(_) => panic!("an undeclared eager gap must fail before submission"),
+        Err(error) => error,
+    };
+    assert!(error
+        .to_string()
+        .contains("does not cover every replay-eligible node"));
+    assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
+    assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
+
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn reusable_topology_states_cannot_alias_resident_program_authority() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),

@@ -2058,6 +2058,13 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         let timing_mode = commands.timing_mode();
         let compute_path_requirement = commands.compute_path_requirement();
+        let declared_eager_compute_node_indices = commands
+            .declared_eager_compute_node_indices()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let declared_eager_compute_node_count =
+            commands.declared_eager_compute_node_indices().len();
         let logical_attribution = commands
             .attribution_requirement()
             .logical_execution_path_required();
@@ -2075,6 +2082,40 @@ impl DeviceRuntime for CudaDeviceRuntime {
             })
             .collect::<Result<Vec<_>, CudaDeviceRuntimeError>>()
             .map_err(DefinitelyNotSubmitted::new)?;
+        let declaration_shape_matches = match compute_path_requirement {
+            DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => {
+                !declared_eager_compute_node_indices.is_empty()
+                    && declared_eager_compute_node_indices.len()
+                        == declared_eager_compute_node_count
+            }
+            _ => declared_eager_compute_node_indices.is_empty(),
+        };
+        let mut compute_command_count = 0_usize;
+        let mut direct_compute_command_count = 0_usize;
+        let mut observed_eager_compute_node_indices = BTreeSet::new();
+        let mut exact_boundary_shape = true;
+        for (phase, node_index, command) in &entries {
+            if *phase != DeviceCommandPhase::Compute {
+                continue;
+            }
+            compute_command_count += 1;
+            if let Some(invocation) = command.reusable_execution_invocation() {
+                direct_compute_command_count += 1;
+                if declared_eager_compute_node_indices
+                    .iter()
+                    .any(|node_index| invocation.segment().contains_node(*node_index))
+                {
+                    exact_boundary_shape = false;
+                }
+            } else if compute_path_requirement
+                == DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+            {
+                exact_boundary_shape &= node_index.is_some_and(|node_index| {
+                    declared_eager_compute_node_indices.contains(&node_index)
+                        && observed_eager_compute_node_indices.insert(node_index)
+                });
+            }
+        }
         let command_count = u32::try_from(entries.len()).map_err(|_| {
             DefinitelyNotSubmitted::new(CudaDeviceRuntimeError::contract(
                 "CUDA command count exceeds u32",
@@ -2116,23 +2157,19 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 ),
             ));
         }
-        let contains_direct_execution = commands
-            .iter()
-            .any(|command| command.reusable_execution_invocation().is_some());
-        let mut compute_command_count = 0_usize;
-        let mut direct_compute_command_count = 0_usize;
-        for (phase, command) in command_phases.iter().zip(&commands) {
-            if *phase == DeviceCommandPhase::Compute {
-                compute_command_count += 1;
-                direct_compute_command_count +=
-                    usize::from(command.reusable_execution_invocation().is_some());
-            }
-        }
+        let contains_direct_execution = direct_compute_command_count != 0;
         let compute_path_matches = match compute_path_requirement {
             DeviceComputePathRequirement::Adaptive => true,
             DeviceComputePathRequirement::EagerOnly => direct_compute_command_count == 0,
             DeviceComputePathRequirement::ReplayedOnly => {
                 compute_command_count > 0 && direct_compute_command_count == compute_command_count
+            }
+            DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => {
+                declaration_shape_matches
+                    && exact_boundary_shape
+                    && direct_compute_command_count > 0
+                    && direct_compute_command_count < compute_command_count
+                    && observed_eager_compute_node_indices == declared_eager_compute_node_indices
             }
         };
         if !compute_path_matches {
@@ -2213,7 +2250,8 @@ impl DeviceRuntime for CudaDeviceRuntime {
                 }
             }
             DeviceComputePathRequirement::EagerOnly
-            | DeviceComputePathRequirement::ReplayedOnly => Vec::new(),
+            | DeviceComputePathRequirement::ReplayedOnly
+            | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries => Vec::new(),
         };
         let capture_allowed = stream.state.is_quiescent();
         if let Err(error) = stream.state.begin_submission() {

@@ -482,6 +482,9 @@ EXECUTION_FIELDS = frozenset(
     {
         "execution_id",
         "mode",
+        "compute_path_requirement",
+        "reusable_program_fingerprint",
+        "declared_eager_boundary_node_ids",
         "restore_sha256",
         "initialization_identity",
         "submission_fingerprint",
@@ -519,6 +522,7 @@ COMMAND_FIELDS = frozenset(
 REPLAYED_SEGMENT_FIELDS = frozenset(
     {
         "physical_command_index",
+        "reusable_program_fingerprint",
         "reusable_executable_fingerprint",
         "logical_commands",
     }
@@ -2097,6 +2101,59 @@ def validate_execution(
     text(execution["execution_id"], f"{label}.execution_id", portable=True)
     mode = text(execution["mode"], f"{label}.mode")
     require(mode in {"eager", "replay"}, f"{label}.mode is invalid")
+    compute_path_requirement = text(
+        execution["compute_path_requirement"],
+        f"{label}.compute_path_requirement",
+    )
+    reusable_program_fingerprint = execution["reusable_program_fingerprint"]
+    boundaries_raw = execution["declared_eager_boundary_node_ids"]
+    require(
+        isinstance(boundaries_raw, list),
+        f"{label}.declared_eager_boundary_node_ids must be a list",
+    )
+    declared_eager_boundary_nodes = [
+        text(
+            node_id,
+            f"{label}.declared_eager_boundary_node_ids[{index}]",
+            portable=True,
+        )
+        for index, node_id in enumerate(boundaries_raw)
+    ]
+    require(
+        declared_eager_boundary_nodes
+        == sorted(set(declared_eager_boundary_nodes)),
+        f"{label}.declared_eager_boundary_node_ids are not canonical",
+    )
+    declared_eager_boundary_node_set = set(declared_eager_boundary_nodes)
+    require(
+        declared_eager_boundary_node_set <= target_nodes,
+        f"{label}.declared_eager_boundary_node_ids contain a non-target node",
+    )
+    if mode == "eager":
+        require(
+            compute_path_requirement == "eager_only"
+            and reusable_program_fingerprint is None
+            and not declared_eager_boundary_nodes,
+            f"{label} eager execution has an invalid compute-path contract",
+        )
+    else:
+        reusable_program_fingerprint = sha256_text(
+            reusable_program_fingerprint,
+            f"{label}.reusable_program_fingerprint",
+        )
+        if compute_path_requirement == "replayed_only":
+            require(
+                not declared_eager_boundary_nodes,
+                f"{label} replayed-only execution declares eager boundaries",
+            )
+        elif compute_path_requirement == "replayed_with_declared_eager_boundaries":
+            require(
+                declared_eager_boundary_nodes
+                and declared_eager_boundary_node_set < target_nodes,
+                f"{label} mixed replay execution lacks both eager and replay nodes",
+            )
+        else:
+            require(False, f"{label} replay execution has an invalid compute-path contract")
     sha256_text(execution["restore_sha256"], f"{label}.restore_sha256")
     initialization_identity = exact_object(
         execution["initialization_identity"],
@@ -2130,6 +2187,7 @@ def validate_execution(
     )
     physical_commands: dict[int, dict[str, Any]] = {}
     compute_nodes: set[str] = set()
+    observed_eager_boundary_nodes: set[str] = set()
     for index, raw in enumerate(commands_raw):
         command_label = f"{label}.attribution.physical_commands[{index}]"
         command = exact_object(raw, COMMAND_FIELDS, command_label)
@@ -2164,16 +2222,37 @@ def validate_execution(
         graph_nodes = command["reusable_graph_node_count"]
         if graph_nodes is not None:
             integer(graph_nodes, f"{command_label}.reusable_graph_node_count", minimum=1)
-        if mode == "eager" and phase == "compute" and node_id in target_nodes:
+        if phase == "compute" and node_id in target_nodes:
             require(
                 command_participants == participant_count,
                 f"{command_label} participant count differs from the case",
             )
-            require(
-                execution_path == "eager" and graph_nodes is None,
-                f"{command_label} eager proof did not use the eager path",
-            )
-            compute_nodes.add(node_id)
+            if mode == "eager":
+                require(
+                    execution_path == "eager" and graph_nodes is None,
+                    f"{command_label} eager proof did not use the eager path",
+                )
+                require(
+                    node_id not in compute_nodes,
+                    f"{command_label} duplicates eager compute attribution",
+                )
+                compute_nodes.add(node_id)
+            elif node_id in declared_eager_boundary_node_set:
+                require(
+                    execution_path == "eager" and graph_nodes is None,
+                    f"{command_label} declared eager boundary did not execute eagerly",
+                )
+                require(
+                    node_id not in observed_eager_boundary_nodes,
+                    f"{command_label} duplicates a declared eager boundary",
+                )
+                observed_eager_boundary_nodes.add(node_id)
+                compute_nodes.add(node_id)
+            else:
+                require(
+                    execution_path == "replayed",
+                    f"{command_label} executed eagerly without a declared topology boundary",
+                )
 
     replayed_segments_raw = attribution["replayed_segments"]
     require(
@@ -2221,6 +2300,15 @@ def validate_execution(
             )
             segment_physical_indices.add(physical_index)
             sha256_text(
+                segment["reusable_program_fingerprint"],
+                f"{segment_label}.reusable_program_fingerprint",
+            )
+            require(
+                segment["reusable_program_fingerprint"]
+                == reusable_program_fingerprint,
+                f"{segment_label} references another reusable program",
+            )
+            sha256_text(
                 segment["reusable_executable_fingerprint"],
                 f"{segment_label}.reusable_executable_fingerprint",
             )
@@ -2255,6 +2343,10 @@ def validate_execution(
                 require(
                     node_id in target_nodes,
                     f"{logical_label}.node_id is not a target node",
+                )
+                require(
+                    node_id not in declared_eager_boundary_node_set,
+                    f"{logical_label}.node_id is a declared eager boundary",
                 )
                 require(
                     node_id not in compute_nodes,
@@ -2313,6 +2405,10 @@ def validate_execution(
         require(
             replayed_physical_indices == segment_physical_indices,
             f"{label} replay physical commands and replayed segments differ",
+        )
+        require(
+            observed_eager_boundary_nodes == declared_eager_boundary_node_set,
+            f"{label} actual eager compute nodes differ from declared boundaries",
         )
     require(compute_nodes == target_nodes, f"{label} attribution does not cover every target node")
 
@@ -2403,7 +2499,7 @@ def validate_case(
     denominator: dict[str, Any],
 ) -> dict[str, Any]:
     case = exact_object(case, CASE_FIELDS, label)
-    require(case["schema_version"] == 1, f"{label}.schema_version must be 1")
+    require(case["schema_version"] == 2, f"{label}.schema_version must be 2")
     case_id = text(case["case_id"], f"{label}.case_id", portable=True)
     require(
         case["denominator_fingerprint"] == root_identity["denominator_fingerprint"],
@@ -2508,7 +2604,20 @@ def validate_case(
             canonical_topology = topology
         require(topology == canonical_topology, f"{label} execution witness topology drifted")
         if execution["mode"] == "replay":
-            current = structural_sha256(execution["attribution"]["replayed_segments"])
+            current = structural_sha256(
+                {
+                    "compute_path_requirement": execution["compute_path_requirement"],
+                    "reusable_program_fingerprint": execution[
+                        "reusable_program_fingerprint"
+                    ],
+                    "declared_eager_boundary_node_ids": execution[
+                        "declared_eager_boundary_node_ids"
+                    ],
+                    "replayed_segments": execution["attribution"][
+                        "replayed_segments"
+                    ],
+                }
+            )
             if replay_shape_fingerprint is None:
                 replay_shape_fingerprint = current
             require(
@@ -3532,19 +3641,34 @@ def make_selftest_execution(
                 expanded.append(item)
         witnesses = sorted(expanded, key=witness_topology)
     replay = mode == "replay"
+    mixed_replay = replay and model_key == "m1-qwen35-4b"
+    declared_eager_boundary_node_ids = [node_ids[-1]] if mixed_replay else []
+    reusable_program_fingerprint = (
+        hashlib.sha256(f"{model_key}/{partition}/program".encode()).hexdigest()
+        if replay
+        else None
+    )
     physical_commands = [
         {
             "command_index": command_index,
             "node_id": node_id,
             "command_phase": "compute",
             "native_op_id": "native.test",
-            "execution_path": "replayed" if replay else "eager",
+            "execution_path": (
+                "eager"
+                if not replay or node_id in declared_eager_boundary_node_ids
+                else "replayed"
+            ),
             "batching_form": "scalar",
             "participant_count": participant_count,
             "token_count": participant_count,
             "compute_dispatch_count": 1,
             "transfer_command_count": 0,
-            "reusable_graph_node_count": 1 if replay else None,
+            "reusable_graph_node_count": (
+                1
+                if replay and node_id not in declared_eager_boundary_node_ids
+                else None
+            ),
         }
         for command_index, node_id in enumerate(node_ids)
     ]
@@ -3552,6 +3676,7 @@ def make_selftest_execution(
         [
             {
                 "physical_command_index": command_index,
+                "reusable_program_fingerprint": reusable_program_fingerprint,
                 "reusable_executable_fingerprint": hashlib.sha256(
                     f"{model_key}/{partition}/segment/{command_index}".encode()
                 ).hexdigest(),
@@ -3570,6 +3695,7 @@ def make_selftest_execution(
                 ],
             }
             for command_index, node_id in enumerate(node_ids)
+            if node_id not in declared_eager_boundary_node_ids
         ]
         if replay
         else []
@@ -3577,6 +3703,15 @@ def make_selftest_execution(
     return {
         "execution_id": execution_id,
         "mode": mode,
+        "compute_path_requirement": (
+            "replayed_with_declared_eager_boundaries"
+            if mixed_replay
+            else "replayed_only"
+            if replay
+            else "eager_only"
+        ),
+        "reusable_program_fingerprint": reusable_program_fingerprint,
+        "declared_eager_boundary_node_ids": declared_eager_boundary_node_ids,
         "restore_sha256": "1" * 64,
         "initialization_identity": {
             "input_sha256": "4" * 64,
@@ -3688,7 +3823,7 @@ def make_selftest_case(
         )
     comparisons.sort(key=lambda item: (item["kind"], item["ordinal"]))
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": f"{model_key}.{phase}.{partition}.{state_kind}.{poison}",
         "denominator_fingerprint": denominator_fingerprint,
         "binary_sha256": binary_sha256,
@@ -4376,6 +4511,42 @@ def run_self_test() -> None:
             evidence["denominator"] = {**ref, "fingerprint": ref["sha256"]}
             write_json(root / "evidence.json", evidence)
 
+        def mutate_replay_fallback(value: dict[str, Any]) -> None:
+            execution = value["executions"][-1]
+            for command in execution["attribution"]["physical_commands"]:
+                if (
+                    command["command_phase"] == "compute"
+                    and command["execution_path"] == "replayed"
+                ):
+                    command.update(
+                        {
+                            "execution_path": "eager",
+                            "reusable_graph_node_count": None,
+                        }
+                    )
+                    return
+            raise AssertionError("self-test fixture has no physical replay command")
+
+        def mutate_boundary_replayed(value: dict[str, Any]) -> None:
+            execution = value["executions"][-1]
+            boundary = execution["declared_eager_boundary_node_ids"][0]
+            for command in execution["attribution"]["physical_commands"]:
+                if command["node_id"] == boundary:
+                    command.update(
+                        {
+                            "execution_path": "replayed",
+                            "reusable_graph_node_count": 1,
+                        }
+                    )
+                    return
+            raise AssertionError("self-test fixture has no declared eager boundary")
+
+        def mutate_segment_program_fingerprint(value: dict[str, Any]) -> None:
+            execution = value["executions"][-1]
+            execution["attribution"]["replayed_segments"][0][
+                "reusable_program_fingerprint"
+            ] = "0" * 64
+
         mutations.extend(
             [
                 (
@@ -4510,13 +4681,29 @@ def run_self_test() -> None:
                     "replay-fallback",
                     mutate_case(
                         replay_case,
-                        lambda value: value["executions"][-1]["attribution"][
-                            "physical_commands"
-                        ][0].update(
-                            {"execution_path": "eager", "reusable_graph_node_count": None}
+                        mutate_replay_fallback,
+                    ),
+                    "executed eagerly without a declared topology boundary",
+                ),
+                (
+                    "missing-eager-boundary-declaration",
+                    mutate_case(
+                        replay_case,
+                        lambda value: value["executions"][-1].update(
+                            {"declared_eager_boundary_node_ids": []}
                         ),
                     ),
-                    "physical replay command",
+                    "lacks both eager and replay nodes",
+                ),
+                (
+                    "declared-boundary-replayed",
+                    mutate_case(replay_case, mutate_boundary_replayed),
+                    "declared eager boundary did not execute eagerly",
+                ),
+                (
+                    "segment-program-drift",
+                    mutate_case(replay_case, mutate_segment_program_fingerprint),
+                    "references another reusable program",
                 ),
                 (
                     "tolerance-field",
@@ -4611,6 +4798,16 @@ def run_self_test() -> None:
             secondary_nodes = set(value["coverage_targets"][1]["node_ids"])
             value["coverage_targets"] = value["coverage_targets"][:1]
             for execution in value["executions"]:
+                execution["declared_eager_boundary_node_ids"] = [
+                    node_id
+                    for node_id in execution["declared_eager_boundary_node_ids"]
+                    if node_id not in secondary_nodes
+                ]
+                if (
+                    execution["mode"] == "replay"
+                    and not execution["declared_eager_boundary_node_ids"]
+                ):
+                    execution["compute_path_requirement"] = "replayed_only"
                 attribution = execution["attribution"]
                 commands = []
                 command_index_map = {}

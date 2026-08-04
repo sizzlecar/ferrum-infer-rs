@@ -906,9 +906,13 @@ fn validate_submission_requirements(
             "reference runtime does not provide device timing evidence",
         ));
     }
-    if compute_path == DeviceComputePathRequirement::ReplayedOnly {
+    if matches!(
+        compute_path,
+        DeviceComputePathRequirement::ReplayedOnly
+            | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+    ) {
         return Err(ReferenceDeviceRuntimeError::contract(
-            "reference runtime cannot satisfy a replayed-only compute submission",
+            "reference runtime cannot satisfy a replay-required compute submission",
         ));
     }
     if has_reusable_capture {
@@ -1009,6 +1013,12 @@ mod tests {
         assert!(validate_submission_requirements(
             DeviceTimingMode::Off,
             DeviceComputePathRequirement::ReplayedOnly,
+            false,
+        )
+        .is_err());
+        assert!(validate_submission_requirements(
+            DeviceTimingMode::Off,
+            DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries,
             false,
         )
         .is_err());

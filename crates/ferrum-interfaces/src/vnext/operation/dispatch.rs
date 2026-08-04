@@ -5,7 +5,7 @@ use super::super::{
     classify_device_error, BackingInitializationEncodeError, BufferUsage, CompletionHandle,
     CompletionReaper, CompletionReservation, DefinitelyNotSubmittedRetryAuthority,
     DeviceBatchingForm, DeviceCommandBatch, DeviceCommandLogicalWork, DeviceComputePathRequirement,
-    DeviceExecutionPath, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
+    DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionProgram, DeviceReusableExecutionProgramId,
     DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceTimingMode,
     ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
@@ -81,6 +81,62 @@ fn validate_program_binding_patch(
         ));
     }
     Ok(())
+}
+
+fn validate_determinism_replay_coverage(
+    program: &DeviceReusableExecutionProgram,
+    node_count: usize,
+    eager_boundary_node_indices: &[u32],
+) -> Result<(), VNextError> {
+    if node_count == 0
+        || eager_boundary_node_indices
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(invalid_operation(
+            "determinism replay topology has no nodes or non-canonical eager boundaries",
+        ));
+    }
+    let mut coverage = vec![0_u8; node_count];
+    for node_index in eager_boundary_node_indices {
+        let node_index = usize::try_from(*node_index)
+            .map_err(|_| invalid_operation("determinism eager boundary exceeds usize"))?;
+        let marker = coverage.get_mut(node_index).ok_or_else(|| {
+            invalid_operation("determinism eager boundary is outside the submission wave")
+        })?;
+        *marker = 1;
+    }
+    for segment in program.segments() {
+        let start = usize::try_from(segment.start_node_index())
+            .map_err(|_| invalid_operation("determinism replay segment start exceeds usize"))?;
+        let end = usize::try_from(segment.end_node_index())
+            .map_err(|_| invalid_operation("determinism replay segment end exceeds usize"))?;
+        let range = coverage.get_mut(start..end).ok_or_else(|| {
+            invalid_operation("determinism replay segment is outside the submission wave")
+        })?;
+        if range.iter().any(|marker| *marker != 0) {
+            return Err(invalid_operation(
+                "determinism replay segment overlaps another segment or a declared eager boundary",
+            ));
+        }
+        range.fill(2);
+    }
+    if coverage.iter().any(|marker| *marker == 0) {
+        return Err(invalid_operation(
+            "determinism reusable program does not cover every replay-eligible node",
+        ));
+    }
+    if !coverage.iter().any(|marker| *marker == 2) {
+        return Err(invalid_operation(
+            "determinism replay topology contains no resident replay node",
+        ));
+    }
+    Ok(())
+}
+
+struct ReusableExecutionWaveAuthority {
+    program_id: DeviceReusableExecutionProgramId,
+    eager_boundary_node_indices: Vec<u32>,
 }
 
 pub struct OperationDispatch;
@@ -497,6 +553,21 @@ impl OperationDispatch {
     where
         R: DeviceRuntime,
     {
+        Ok(
+            Self::reusable_execution_wave_authority(providers, resolved, wave, lane)?
+                .map(|authority| authority.program_id),
+        )
+    }
+
+    fn reusable_execution_wave_authority<R>(
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        wave: &PreparedStepSubmissionWave<R>,
+        lane: &Arc<ExecutionLane<R>>,
+    ) -> Result<Option<ReusableExecutionWaveAuthority>, VNextError>
+    where
+        R: DeviceRuntime,
+    {
         let plan = resolved.execution_plan();
         let plan_nodes = plan.payload().nodes();
         if providers.is_empty()
@@ -518,6 +589,7 @@ impl OperationDispatch {
 
         const DOMAIN: &[u8] = b"ferrum.runtime-vnext.reusable-program-topology.v3\0";
         let mut digest = Sha256::new();
+        let mut eager_boundary_node_indices = Vec::new();
         digest.update(DOMAIN);
         digest.update(
             u64::try_from(wave.nodes().len())
@@ -550,6 +622,11 @@ impl OperationDispatch {
             )?;
             let declared = node.provider_execution_semantics().replay_equivalence();
             let topology = provider.provider().reusable_execution_topology(request)?;
+            if topology == ReusableExecutionTopology::EagerBoundary {
+                eager_boundary_node_indices.push(u32::try_from(wave_node_index).map_err(|_| {
+                    invalid_operation("reusable topology wave node index exceeds u32")
+                })?);
+            }
             let (topology_kind, topology_bytes) = match (
                 declared,
                 &topology,
@@ -595,9 +672,12 @@ impl OperationDispatch {
             digest.update(topology_len.to_le_bytes());
             digest.update(topology_bytes);
         }
-        Ok(Some(program_id.with_topology_fingerprint(
-            DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
-        )))
+        Ok(Some(ReusableExecutionWaveAuthority {
+            program_id: program_id.with_topology_fingerprint(
+                DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
+            ),
+            eager_boundary_node_indices,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -947,12 +1027,11 @@ impl OperationDispatch {
             lane,
             reaper,
         )?;
-        Ok(SubmissionWaveDeterminismHandle::from_profiled(
+        Ok(SubmissionWaveDeterminismHandle::from_profiled_eager(
             profiled,
             readback_plan,
             restore_fingerprint,
             initialization_identity,
-            DeviceExecutionPath::Eager,
         ))
     }
 
@@ -989,6 +1068,35 @@ impl OperationDispatch {
         let initialization_identity = restore
             .initialization_identity()
             .map_err(SubmissionWaveDispatchError::Contract)?;
+        let replay_authority =
+            Self::reusable_execution_wave_authority(providers, resolved, &wave, lane)
+                .map_err(SubmissionWaveDispatchError::Contract)?
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "determinism replay wave has no reusable execution authority",
+                    ))
+                })?;
+        if &replay_authority.program_id != reusable_program.program_id() {
+            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                "determinism replay program differs from the live wave topology",
+            )));
+        }
+        let mut declared_eager_boundary_node_ids = replay_authority
+            .eager_boundary_node_indices
+            .iter()
+            .map(|node_index| {
+                usize::try_from(*node_index)
+                    .ok()
+                    .and_then(|node_index| batch_identity.node_id_at(node_index))
+                    .cloned()
+                    .ok_or_else(|| {
+                        SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "determinism eager boundary is absent from the batch identity",
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        declared_eager_boundary_node_ids.sort();
         let profiled = Self::encode_and_submit_wave_with_inputs_timed(
             providers,
             resolved,
@@ -1004,13 +1112,15 @@ impl OperationDispatch {
             lane,
             reaper,
         )?;
-        Ok(SubmissionWaveDeterminismHandle::from_profiled(
+        SubmissionWaveDeterminismHandle::from_profiled_replayed(
             profiled,
             readback_plan,
             restore_fingerprint,
             initialization_identity,
-            DeviceExecutionPath::Replayed,
-        ))
+            replay_authority.program_id,
+            declared_eager_boundary_node_ids,
+        )
+        .map_err(SubmissionWaveDispatchError::Contract)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1228,9 +1338,11 @@ impl OperationDispatch {
                 )));
             }
         }
-        let reusable_execution_program_id =
-            Self::reusable_execution_program_id_for_wave(providers, resolved, &wave, lane)
+        let reusable_execution_authority =
+            Self::reusable_execution_wave_authority(providers, resolved, &wave, lane)
                 .map_err(SubmissionWaveDispatchError::Contract)?;
+        let mut effective_compute_path = execution_policy.compute_path();
+        let mut declared_eager_compute_node_indices = Vec::new();
         if let Some(reusable_program) = reusable_program {
             if !timing_mode.direct_reusable_execution_allowed()
                 || execution_policy.compute_path() == DeviceComputePathRequirement::EagerOnly
@@ -1239,12 +1351,12 @@ impl OperationDispatch {
                     "submission timing or compute-path policy requires eager provider encoding",
                 )));
             }
-            let actual_program_id = reusable_execution_program_id.as_ref().ok_or_else(|| {
+            let actual_authority = reusable_execution_authority.as_ref().ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
                     "reusable execution program has no live program binding authority",
                 ))
             })?;
-            if actual_program_id != reusable_program.program_id()
+            if &actual_authority.program_id != reusable_program.program_id()
                 || reusable_program.segments().iter().any(|segment| {
                     segment.end_node_index() as usize > providers.len()
                         || segment.logical_command_count()
@@ -1255,9 +1367,27 @@ impl OperationDispatch {
                     "reusable execution program differs from the exact wave topology",
                 )));
             }
-        } else if execution_policy.compute_path() == DeviceComputePathRequirement::ReplayedOnly {
+            if execution_policy.compute_path() == DeviceComputePathRequirement::ReplayedOnly {
+                validate_determinism_replay_coverage(
+                    reusable_program,
+                    providers.len(),
+                    &actual_authority.eager_boundary_node_indices,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+                if !actual_authority.eager_boundary_node_indices.is_empty() {
+                    effective_compute_path =
+                        DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries;
+                    declared_eager_compute_node_indices =
+                        actual_authority.eager_boundary_node_indices.clone();
+                }
+            }
+        } else if matches!(
+            execution_policy.compute_path(),
+            DeviceComputePathRequirement::ReplayedOnly
+                | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+        ) {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                "replayed-only submission requires one sealed reusable execution program",
+                "replay-required submission requires one sealed reusable execution program",
             )));
         }
         wave.begin_dispatch()
@@ -1289,8 +1419,15 @@ impl OperationDispatch {
                 .saturating_add(input_uploads.len())
                 .saturating_add(restore_capacity),
             timing_mode,
-            execution_policy.compute_path(),
+            effective_compute_path,
         );
+        if effective_compute_path
+            == DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
+        {
+            commands
+                .set_declared_eager_compute_node_indices(declared_eager_compute_node_indices)
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+        }
         if determinism_restore.is_some() {
             commands.require_logical_execution_path_attribution();
         }
@@ -1696,10 +1833,10 @@ impl OperationDispatch {
             commands.push_operation_parts(node_index, dynamic_bindings, compute, result_bindings);
         }
         if reusable_program.is_none() {
-            if let Some(program_id) = reusable_execution_program_id {
+            if let Some(authority) = reusable_execution_authority {
                 commands
                     .set_reusable_execution_capture(DeviceReusableExecutionCapture::new(
-                        program_id,
+                        authority.program_id,
                         reusable_execution_binding_nodes,
                     ))
                     .map_err(SubmissionWaveDispatchError::Contract)?;
