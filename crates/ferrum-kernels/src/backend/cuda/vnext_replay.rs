@@ -193,14 +193,28 @@ impl CudaExecutableCandidate {
 pub(crate) fn cuda_executable_candidates(
     phases: &[DeviceCommandPhase],
     commands: &[CudaDeviceCommand],
+    command_node_indices: Option<&[Option<u32>]>,
+    eager_boundary_node_indices: &[u32],
 ) -> Result<Vec<CudaExecutableCandidate>, CudaDeviceRuntimeError> {
-    if phases.len() != commands.len() {
+    if phases.len() != commands.len()
+        || command_node_indices.is_some_and(|node_indices| node_indices.len() != commands.len())
+        || (!eager_boundary_node_indices.is_empty() && command_node_indices.is_none())
+    {
         return Err(CudaDeviceRuntimeError::contract(
-            "CUDA command phase count differs from its command count",
+            "CUDA replay discovery phase, command, or node attribution count differs",
         ));
     }
     Ok(discover_reusable_segments(phases, |index| {
-        commands[index].replay_key().is_some() && commands[index].reusable_address_scope().is_some()
+        let declared_eager_boundary = command_node_indices
+            .and_then(|node_indices| node_indices[index])
+            .is_some_and(|node_index| {
+                eager_boundary_node_indices
+                    .binary_search(&node_index)
+                    .is_ok()
+            });
+        !declared_eager_boundary
+            && commands[index].replay_key().is_some()
+            && commands[index].reusable_address_scope().is_some()
     })
     .into_iter()
     .filter_map(|segment| {
@@ -560,6 +574,166 @@ struct CudaExecutableProgram {
     segments: Vec<CudaExecutableProgramSegment>,
 }
 
+impl CudaExecutableProgram {
+    fn validate_monotonic_update(&self, next: &Self) -> Result<(), CudaReplayError> {
+        if self.descriptor.program_id() != next.descriptor.program_id()
+            || self.descriptor.node_count() != next.descriptor.node_count()
+            || self.descriptor.eager_boundary_node_indices()
+                != next.descriptor.eager_boundary_node_indices()
+        {
+            return Err(CudaReplayError {
+                stage: "update reusable execution program",
+                detail: "one typed program id changed its logical topology".to_owned(),
+                eager_fallback_safe: false,
+            });
+        }
+        for current_segment in &self.segments {
+            let Some(next_segment) = next.segments.iter().find(|candidate| {
+                candidate.descriptor.start_node_index()
+                    == current_segment.descriptor.start_node_index()
+                    && candidate.descriptor.end_node_index()
+                        == current_segment.descriptor.end_node_index()
+            }) else {
+                return Err(CudaReplayError {
+                    stage: "update reusable execution program",
+                    detail: "a resident segment disappeared without an explicit eviction"
+                        .to_owned(),
+                    eager_fallback_safe: false,
+                });
+            };
+            if current_segment.key != next_segment.key
+                || current_segment.descriptor.logical_command_count()
+                    != next_segment.descriptor.logical_command_count()
+                || current_segment.reusable_executable_fingerprint
+                    != next_segment.reusable_executable_fingerprint
+                || current_segment.logical_commands != next_segment.logical_commands
+            {
+                return Err(CudaReplayError {
+                    stage: "update reusable execution program",
+                    detail: "a resident segment changed executable or logical attribution identity"
+                        .to_owned(),
+                    eager_fallback_safe: false,
+                });
+            }
+            let current_bindings = self
+                .descriptor
+                .per_wave_binding_node_indices()
+                .iter()
+                .copied()
+                .filter(|node_index| current_segment.descriptor.contains_node(*node_index));
+            let next_bindings = next
+                .descriptor
+                .per_wave_binding_node_indices()
+                .iter()
+                .copied()
+                .filter(|node_index| next_segment.descriptor.contains_node(*node_index));
+            if !current_bindings.eq(next_bindings) {
+                return Err(CudaReplayError {
+                    stage: "update reusable execution program",
+                    detail: "a resident segment changed its per-wave binding nodes".to_owned(),
+                    eager_fallback_safe: false,
+                });
+            }
+        }
+        if self.descriptor.is_determinism_ready() && self != next {
+            return Err(CudaReplayError {
+                stage: "update reusable execution program",
+                detail: "a determinism-ready program changed without an explicit eviction"
+                    .to_owned(),
+                eager_fallback_safe: false,
+            });
+        }
+        Ok(())
+    }
+
+    fn with_evicted_segment(
+        &self,
+        key: CudaExecutableSegmentKey,
+    ) -> Result<Option<Self>, CudaReplayError> {
+        if !self.segments.iter().any(|segment| segment.key == key) {
+            return Ok(None);
+        }
+        let mut gaps = self.descriptor.gaps().to_vec();
+        for segment in self.segments.iter().filter(|segment| segment.key == key) {
+            gaps.extend(
+                (segment.descriptor.start_node_index()..segment.descriptor.end_node_index()).map(
+                    |node_index| {
+                        DeviceReusableExecutionProgramGap::new(
+                            node_index,
+                            DeviceReusableExecutionProgramGapReason::Evicted,
+                        )
+                    },
+                ),
+            );
+        }
+        gaps.sort_by_key(|gap| gap.node_index());
+
+        let mut segments = self
+            .segments
+            .iter()
+            .filter(|segment| segment.key != key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for (ordinal, segment) in segments.iter_mut().enumerate() {
+            segment.descriptor = DeviceReusableExecutionSegment::new(
+                u32::try_from(ordinal).map_err(|_| CudaReplayError {
+                    stage: "evict reusable execution segment",
+                    detail: "resident segment ordinal exceeds u32".to_owned(),
+                    eager_fallback_safe: false,
+                })?,
+                segment.descriptor.start_node_index(),
+                segment.descriptor.end_node_index(),
+                segment.descriptor.logical_command_count(),
+            )
+            .map_err(|error| CudaReplayError {
+                stage: "evict reusable execution segment",
+                detail: error.to_string(),
+                eager_fallback_safe: false,
+            })?;
+        }
+        let binding_node_indices = self
+            .descriptor
+            .per_wave_binding_node_indices()
+            .iter()
+            .copied()
+            .filter(|node_index| {
+                segments
+                    .iter()
+                    .any(|segment| segment.descriptor.contains_node(*node_index))
+            })
+            .collect::<Vec<_>>();
+        let capture = DeviceReusableExecutionCapture::new(
+            self.descriptor.program_id().clone(),
+            self.descriptor.node_count(),
+            self.descriptor.eager_boundary_node_indices().to_vec(),
+            binding_node_indices.clone(),
+        )
+        .map_err(|error| CudaReplayError {
+            stage: "evict reusable execution segment",
+            detail: error.to_string(),
+            eager_fallback_safe: false,
+        })?;
+        let descriptor = DeviceReusableExecutionProgram::new(
+            &capture,
+            segments
+                .iter()
+                .map(|segment| segment.descriptor.clone())
+                .collect(),
+            binding_node_indices,
+            gaps,
+        )
+        .map_err(|error| CudaReplayError {
+            stage: "evict reusable execution segment",
+            detail: error.to_string(),
+            eager_fallback_safe: false,
+        })?;
+        Ok(Some(Self {
+            descriptor,
+            segments,
+        }))
+    }
+}
+
 pub(crate) struct CudaExecutableLaunch {
     reusable_executable_fingerprint: Option<Arc<str>>,
     reusable_graph_node_counts: Option<Arc<[u32]>>,
@@ -677,13 +851,24 @@ impl CudaExecutableCache {
         self.clock
     }
 
-    fn remove_entry_and_dependent_programs(&mut self, key: CudaExecutableSegmentKey) -> bool {
-        if self.entries.remove(&key).is_none() {
-            return false;
+    fn evict_entry_and_update_programs(
+        &mut self,
+        key: CudaExecutableSegmentKey,
+    ) -> Result<bool, CudaReplayError> {
+        if !self.entries.contains_key(&key) {
+            return Ok(false);
         }
-        self.programs
-            .retain(|_, program| !program.segments.iter().any(|segment| segment.key == key));
-        true
+        let mut updates = Vec::new();
+        for (program_id, program) in &self.programs {
+            if let Some(program) = program.with_evicted_segment(key)? {
+                updates.push((program_id.clone(), program));
+            }
+        }
+        self.entries.remove(&key);
+        for (program_id, program) in updates {
+            self.programs.insert(program_id, program);
+        }
+        Ok(true)
     }
 
     pub(crate) fn prepare_all(
@@ -810,7 +995,7 @@ impl CudaExecutableCache {
         }
 
         for key in plan.required_evictions(captured.len()) {
-            if self.remove_entry_and_dependent_programs(*key) {
+            if self.evict_entry_and_update_programs(*key)? {
                 report.evicted_segments += 1;
             }
         }
@@ -898,6 +1083,9 @@ impl CudaExecutableCache {
                     .to_owned(),
                 eager_fallback_safe: false,
             });
+        }
+        if capture.eager_boundary_node_indices().len() == capture.node_count() as usize {
+            return Ok(());
         }
         let mut segments = Vec::new();
         for candidate in candidates
@@ -1086,9 +1274,12 @@ impl CudaExecutableCache {
             descriptor,
             segments,
         };
-        // The catalog is private while preparation is open. Replacing this row
-        // allows deferred/captured candidates to converge before seal; the
-        // typed program id already fixes the logical topology.
+        if let Some(current) = self.programs.get(capture.program_id()) {
+            current.validate_monotonic_update(&program)?;
+        }
+        // The catalog is private while preparation is open. A validated
+        // replacement can only retain existing resident identities or fill
+        // previously typed gaps. Explicit eviction creates its own tombstone.
         self.programs.insert(capture.program_id().clone(), program);
         Ok(())
     }

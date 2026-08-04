@@ -2274,7 +2274,16 @@ impl DeviceRuntime for CudaDeviceRuntime {
         }
         let executable_candidates = match compute_path_requirement {
             DeviceComputePathRequirement::Adaptive => {
-                match cuda_executable_candidates(&command_phases, &commands) {
+                let eager_boundary_node_indices = reusable_execution_capture
+                    .as_ref()
+                    .map(DeviceReusableExecutionCapture::eager_boundary_node_indices)
+                    .unwrap_or_default();
+                match cuda_executable_candidates(
+                    &command_phases,
+                    &commands,
+                    command_node_indices.as_deref(),
+                    eager_boundary_node_indices,
+                ) {
                     Ok(candidates) => candidates,
                     Err(error) => return Err(DefinitelyNotSubmitted::new(error)),
                 }

@@ -1034,6 +1034,11 @@ fn determinism_replay_rejects_an_unresident_non_boundary_gap_before_submission()
         ],
     );
     assert!(!incomplete_program.is_determinism_ready());
+    assert!(!incomplete_program.has_resident_segments());
+    assert_eq!(
+        incomplete_program.state(),
+        DeviceReusableExecutionProgramState::Partial
+    );
 
     let error = match OperationDispatch::encode_and_submit_determinism_replayed_wave(
         &providers,
@@ -1070,6 +1075,80 @@ fn determinism_replay_rejects_an_unresident_non_boundary_gap_before_submission()
         message.contains("reason=provider_replay_key_missing"),
         "{message}"
     );
+    assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
+    assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
+
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn product_dispatch_rejects_a_diagnostic_only_reusable_program_before_provider_encode() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("program-binding wave has reusable authority");
+    let node_count = u32::try_from(providers.len()).unwrap();
+    let diagnostic_program = test_reusable_program(
+        program_id,
+        node_count,
+        vec![],
+        vec![],
+        vec![],
+        (0..node_count)
+            .map(|node_index| {
+                DeviceReusableExecutionProgramGap::new(
+                    node_index,
+                    DeviceReusableExecutionProgramGapReason::CapacityDeferred,
+                )
+            })
+            .collect(),
+    );
+
+    let error = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        &[],
+        &diagnostic_program,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("product reusable execution requires at least one resident segment"));
     assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
     assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
 

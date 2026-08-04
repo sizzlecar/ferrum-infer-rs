@@ -1388,6 +1388,13 @@ impl OperationDispatch {
                     "submission timing or compute-path policy requires eager provider encoding",
                 )));
             }
+            if execution_policy.compute_path() == DeviceComputePathRequirement::Adaptive
+                && !reusable_program.has_resident_segments()
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "product reusable execution requires at least one resident segment",
+                )));
+            }
             let actual_authority = reusable_execution_authority.as_ref().ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
                     "reusable execution program has no live program binding authority",
