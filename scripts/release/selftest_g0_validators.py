@@ -166,6 +166,10 @@ RUNTIME_VNEXT_S2_HISTORICAL_RESOURCE_SOURCE = (
     REPO_ROOT
     / "scripts/release/runtime_vnext_s2_historical_resource_source.py"
 )
+RUNTIME_VNEXT_S2_CUDA_PRODUCT_CONTRACT = (
+    REPO_ROOT
+    / "scripts/release/runtime_vnext_s2_cuda_product_contract.py"
+)
 RUNTIME_VNEXT_G02_CORE = REPO_ROOT / "scripts/release/runtime_vnext_g02_core.py"
 PRODUCT_BACKEND_SENTINEL_GATE = REPO_ROOT / "scripts/release/product_backend_sentinel_gate.py"
 PRODUCT_OBSERVABILITY_L1_SMOKE = REPO_ROOT / "scripts/release/product_observability_l1_smoke.py"
@@ -1165,6 +1169,18 @@ def test_runtime_vnext_s2_historical_resource_source_selftest() -> None:
     )
 
 
+def test_runtime_vnext_s2_cuda_product_contract_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_S2_CUDA_PRODUCT_CONTRACT), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT S2 CUDA PRODUCT CONTRACT SELFTEST PASS"
+        in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_g02_core_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_G02_CORE), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -1398,6 +1414,7 @@ def main() -> int:
     test_runtime_vnext_s2_latency_failure_checkpoint_selftest()
     test_runtime_vnext_s2_latency_failure_collector_selftest()
     test_runtime_vnext_s2_historical_resource_source_selftest()
+    test_runtime_vnext_s2_cuda_product_contract_selftest()
     test_runtime_vnext_g02_core_selftest()
     test_product_backend_sentinel_selftest()
     test_product_observability_l1_smoke_selftest()

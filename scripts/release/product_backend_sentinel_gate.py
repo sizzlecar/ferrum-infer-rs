@@ -362,7 +362,7 @@ def write_blocker_profile_fixture(
         "error": {
             "kind": error_kind_for_fixture(fixture_kind),
             "message": f"synthetic {failure_kind} blocker fixture",
-            "blocking": fixture_kind == "panic_error",
+            "blocking": True,
         },
         "replay": {
             "command": "ferrum run synthetic/no-weight",
@@ -375,7 +375,7 @@ def write_blocker_profile_fixture(
             "profile_schema_fingerprint": "obs-v1",
         },
     }
-    if fixture_kind == "panic_error":
+    if fixture_kind in {"bad_output", "panic_error"}:
         failure_event["memory"] = {
             "scope": "process",
             "backend": "synthetic",
