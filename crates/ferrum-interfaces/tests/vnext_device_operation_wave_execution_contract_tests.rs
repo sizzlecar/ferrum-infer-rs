@@ -5,6 +5,46 @@ use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::*;
 
 #[test]
+fn reusable_topology_observes_packed_step_token_coordinates() {
+    let (fixture, sequence, session, batch, step) =
+        setup_with_fixture(fixture_with_token_scaled_paged_state_and_provider_behavior(
+            ProviderBehavior::ProgramBinding,
+        ));
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let lane = Arc::clone(step.execution_lane());
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+
+    OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("packed token wave must expose reusable identity");
+
+    assert_eq!(
+        fixture
+            .provider_trace
+            .lock()
+            .unwrap()
+            .reusable_topology_packed_input_coordinates,
+        [true, true]
+    );
+
+    drop(providers);
+    drop(wave);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn kernel_profile_binds_native_work_to_exact_plan_nodes() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);

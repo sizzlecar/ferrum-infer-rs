@@ -195,6 +195,22 @@ fn causal_replay_identity_uses_a_partition_capacity_envelope() {
 }
 
 #[test]
+fn token_replay_identity_uses_typed_coordinate_ownership() {
+    let topology = VNEXT_OPS_SOURCE
+        .split("fn reusable_token_topology(")
+        .nth(1)
+        .expect("CUDA token providers must share one reusable topology helper")
+        .split("\nfn ")
+        .next()
+        .expect("CUDA token topology helper must have a bounded body");
+    assert!(topology.contains("binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)"));
+    assert!(topology.contains("if bind_source_ranges"));
+    assert!(VNEXT_OPS_SOURCE.contains("token-embedding.reusable-topology.v2"));
+    assert!(VNEXT_OPS_SOURCE.contains("last-token-linear.reusable-topology.v2"));
+    assert!(!VNEXT_OPS_SOURCE.contains("reusable-topology.v1"));
+}
+
+#[test]
 fn dynamic_attention_addresses_use_one_hoistable_program_binding_boundary() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("attach_invocation_binding("));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("attach_invocation_binding("));

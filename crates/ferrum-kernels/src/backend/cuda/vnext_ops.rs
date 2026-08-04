@@ -498,8 +498,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaTokenEmbeddingProvider {
     ) -> Result<ReusableExecutionTopology, VNextError> {
         reusable_token_topology(
             &request,
-            b"ferrum.cuda.token-embedding.reusable-topology.v1\0",
-            true,
+            b"ferrum.cuda.token-embedding.reusable-topology.v2\0",
         )
     }
 
@@ -570,8 +569,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
     ) -> Result<ReusableExecutionTopology, VNextError> {
         reusable_token_topology(
             &request,
-            b"ferrum.cuda.last-token-linear.reusable-topology.v1\0",
-            false,
+            b"ferrum.cuda.last-token-linear.reusable-topology.v2\0",
         )
     }
 
@@ -1286,7 +1284,6 @@ fn unsigned_attribute(
 fn reusable_token_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
     domain: &'static [u8],
-    bind_source_ranges: bool,
 ) -> Result<ReusableExecutionTopology, VNextError> {
     for (role, ordinal) in [
         (ResolvedValueRole::Input, 0),
@@ -1301,6 +1298,8 @@ fn reusable_token_topology(
         }
     }
 
+    let bind_source_ranges =
+        !request.binding_uses_packed_batch_coordinates(ResolvedValueRole::Input, 0)?;
     let ranges = request.work_shape().participant_token_ranges();
     let mut digest = Sha256::new();
     digest.update(domain);
