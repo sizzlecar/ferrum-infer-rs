@@ -32,6 +32,7 @@ use super::moe_workspace::{
 use super::{
     contiguous_bindings, ensure_estimator_request, estimate, f16_contiguous, launch_gemm_f16,
     shared_full_region, shared_scratch_region, shared_token_region,
+    static_contiguous_reusable_topology, CapturedProviderWorkspace,
 };
 use crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_FORMAT_ID;
 
@@ -233,9 +234,9 @@ impl OperationResourceEstimator for CudaRoutedSwiGluMoeProvider {
 impl OperationProvider<CudaDeviceRuntime> for CudaRoutedSwiGluMoeProvider {
     fn reusable_execution_topology(
         &self,
-        _request: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        static_contiguous_reusable_topology(&request, 4, &[CapturedProviderWorkspace::Scratch])
     }
 
     fn encode_selected(

@@ -502,6 +502,71 @@ fn provider_program_bindings_are_coalesced_once_before_all_wave_compute() {
 }
 
 #[test]
+fn provider_keeps_lane_stable_scratch_in_a_reusable_segment() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBindingWithScratchTail),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+
+    let handle = OperationDispatch::encode_and_submit_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+
+    {
+        let trace = fixture.runtime_trace.lock().unwrap();
+        let capture = trace.submitted_reusable_captures[0]
+            .as_ref()
+            .expect("eager-boundary wave must preserve its reusable topology identity");
+        assert!(capture.eager_boundary_node_indices().is_empty());
+    }
+    assert_eq!(
+        fixture
+            .provider_trace
+            .lock()
+            .unwrap()
+            .reusable_topology_calls,
+        2,
+        "each provider must classify the exact workspace captured by its command"
+    );
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),

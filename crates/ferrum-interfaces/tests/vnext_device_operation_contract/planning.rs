@@ -974,7 +974,9 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
 ) -> Fixture {
     let scratch = if matches!(
         behavior,
-        ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed
+        ProviderBehavior::ProgramBindingWithScratchTail
+            | ProviderBehavior::ScratchOverwrite
+            | ProviderBehavior::ScratchZeroed
     ) {
         ResourcePresenceRequirement::Optional
     } else {

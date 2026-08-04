@@ -667,9 +667,13 @@ impl OperationResourceEstimator for CudaLastTokenMaskedArgmaxProvider {
 impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider {
     fn reusable_execution_topology(
         &self,
-        _request: ReusableExecutionTopologyRequest<'_>,
+        request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        Ok(ReusableExecutionTopology::Static)
+        transformer::static_contiguous_reusable_topology(
+            &request,
+            5,
+            &[transformer::CapturedProviderWorkspace::Scratch],
+        )
     }
 
     fn encode_selected(

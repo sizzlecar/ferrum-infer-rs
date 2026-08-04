@@ -621,6 +621,7 @@ pub(crate) enum ProviderBehavior {
     SplitPhases,
     ProgramBinding,
     ProgramBindingFirstNodeEagerBoundary,
+    ProgramBindingWithScratchTail,
     ScratchOverwrite,
     ScratchZeroed,
     WrongIdentity,
@@ -631,13 +632,16 @@ impl ProviderBehavior {
     fn uses_program_binding(self) -> bool {
         matches!(
             self,
-            Self::ProgramBinding | Self::ProgramBindingFirstNodeEagerBoundary
+            Self::ProgramBinding
+                | Self::ProgramBindingFirstNodeEagerBoundary
+                | Self::ProgramBindingWithScratchTail
         )
     }
 }
 
 #[derive(Default)]
 pub(crate) struct ProviderTrace {
+    pub(crate) reusable_topology_calls: u64,
     pub(crate) encode_calls: u64,
     pub(crate) reusable_binding_encode_calls: u64,
     pub(crate) last_participant_count: usize,
@@ -668,6 +672,11 @@ impl OperationResourceEstimator for TestProvider {
     ) -> Result<OperationResourceEstimate, VNextError> {
         let behavior = *self.behavior.lock().unwrap();
         let scratch_policy = match behavior {
+            ProviderBehavior::ProgramBindingWithScratchTail
+                if request.node_id().as_str() == "node.tail" =>
+            {
+                Some(ProviderWorkspaceReusePolicy::OverwriteBeforeRead)
+            }
             ProviderBehavior::ScratchOverwrite => {
                 Some(ProviderWorkspaceReusePolicy::OverwriteBeforeRead)
             }
@@ -695,7 +704,10 @@ impl OperationResourceEstimator for TestProvider {
             scratch,
             None,
         );
-        if behavior.uses_program_binding() {
+        let node_uses_program_binding = behavior.uses_program_binding()
+            && (!matches!(behavior, ProviderBehavior::ProgramBindingWithScratchTail)
+                || request.node_id().as_str() == "node.main");
+        if node_uses_program_binding {
             Ok(
                 estimate.with_binding(ProviderWorkspaceRequirement::from_formula(
                     ProviderWorkspaceSizeFormula::actual_sequences(16)?,
@@ -716,8 +728,32 @@ impl OperationProvider<TestRuntime> for TestProvider {
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
+        self.trace.lock().unwrap().reusable_topology_calls += 1;
         match *self.behavior.lock().unwrap() {
-            ProviderBehavior::ProgramBinding => {}
+            ProviderBehavior::ProgramBindingWithScratchTail
+                if request.node_id().as_str() == "node.tail" =>
+            {
+                return if request.scratch_reusable_address_scope()?.is_some() {
+                    Ok(ReusableExecutionTopology::Static)
+                } else {
+                    Ok(ReusableExecutionTopology::EagerBoundary)
+                };
+            }
+            ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed => {
+                return if request.scratch_reusable_address_scope()?.is_some() {
+                    Ok(ReusableExecutionTopology::Static)
+                } else {
+                    Ok(ReusableExecutionTopology::EagerBoundary)
+                };
+            }
+            ProviderBehavior::ProgramBinding | ProviderBehavior::ProgramBindingWithScratchTail => {
+                request
+                    .binding_workspace_reusable_address_scope()?
+                    .ok_or_else(|| VNextError::InvalidExecutionPlan {
+                        reason: "program-binding test workspace lacks reusable address authority"
+                            .to_owned(),
+                    })?;
+            }
             ProviderBehavior::ProgramBindingFirstNodeEagerBoundary
                 if request.node_id().as_str() == "node.main" =>
             {
@@ -815,6 +851,25 @@ impl OperationProvider<TestRuntime> for TestProvider {
                     EncodedDeviceOperation::compute(TestCommand::Provider),
                     TestCommand::ProgramBinding,
                 )),
+            ProviderBehavior::ProgramBindingWithScratchTail => {
+                if participant
+                    .identity()
+                    .parts()
+                    .node_id
+                    .as_ref()
+                    .map(NodeId::as_str)
+                    == Some("node.main")
+                {
+                    Ok(invocation.attach_binding_command(
+                        EncodedDeviceOperation::compute(TestCommand::Provider),
+                        TestCommand::ProgramBinding,
+                    ))
+                } else {
+                    Ok(EncodedDeviceOperation::compute(
+                        TestCommand::ScratchProvider,
+                    ))
+                }
+            }
             ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed => Ok(
                 EncodedDeviceOperation::compute(TestCommand::ScratchProvider),
             ),

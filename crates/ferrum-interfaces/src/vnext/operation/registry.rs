@@ -42,6 +42,9 @@ pub struct ReusableExecutionTopologyRequest<'a> {
     operation_id: &'a OperationId,
     attributes: &'a BTreeMap<AttributeId, SemanticValue>,
     bindings: &'a [ResolvedValueBinding],
+    scratch_resource: Option<&'a super::super::ResourceId>,
+    binding_resource: Option<&'a super::super::ResourceId>,
+    persistent_resource: Option<&'a super::super::ResourceId>,
     memory: &'a MemoryPlan,
     work_shape: &'a BatchWorkShape,
     claimed_backing: &'a ClaimedSubmissionWaveBacking,
@@ -54,6 +57,9 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
         operation_id: &'a OperationId,
         attributes: &'a BTreeMap<AttributeId, SemanticValue>,
         bindings: &'a [ResolvedValueBinding],
+        scratch_resource: Option<&'a super::super::ResourceId>,
+        binding_resource: Option<&'a super::super::ResourceId>,
+        persistent_resource: Option<&'a super::super::ResourceId>,
         memory: &'a MemoryPlan,
         work_shape: &'a BatchWorkShape,
         claimed_backing: &'a ClaimedSubmissionWaveBacking,
@@ -69,6 +75,9 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
             operation_id,
             attributes,
             bindings,
+            scratch_resource,
+            binding_resource,
+            persistent_resource,
             memory,
             work_shape,
             claimed_backing,
@@ -114,55 +123,97 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
             })?;
         let mut aggregate = DeviceReusableAddressScope::Plan;
         for component in binding.storage().components() {
-            let resource_id = component.resource_id();
-            let component_scope = if self
-                .memory
-                .static_allocations()
-                .binary_search_by(|allocation| allocation.resource_id().cmp(resource_id))
-                .is_ok()
-            {
-                Some(DeviceReusableAddressScope::Plan)
-            } else {
-                let mut component_scope = None;
-                for backing_slices in [self.claimed_backing.backing_slices(), self.step_backing] {
-                    let authority_start = backing_slices
-                        .partition_point(|authority| authority.resource_id() < resource_id);
-                    let authority_end = authority_start
-                        + backing_slices[authority_start..]
-                            .partition_point(|authority| authority.resource_id() == resource_id);
-                    for authority in &backing_slices[authority_start..authority_end] {
-                        let Some(authority_scope) = authority.reusable_address_scope() else {
-                            return Ok(None);
-                        };
-                        component_scope = Some(merge_reusable_address_scope(
-                            component_scope.unwrap_or(DeviceReusableAddressScope::Plan),
-                            authority_scope,
-                        )?);
-                    }
-                }
-                if component_scope.is_none() {
-                    if self
-                        .memory
-                        .dynamic_descriptors()
-                        .binary_search_by(|descriptor| {
-                            descriptor.base_resource_id().cmp(resource_id)
-                        })
-                        .is_ok()
-                    {
-                        return Ok(None);
-                    }
-                    return Err(invalid_operation(
-                        "reusable topology value references an unknown memory resource",
-                    ));
-                }
-                component_scope
+            let Some(component_scope) =
+                self.resource_reusable_address_scope(component.resource_id())?
+            else {
+                return Ok(None);
             };
-            aggregate = merge_reusable_address_scope(
-                aggregate,
-                component_scope.expect("component scope is present after early return"),
-            )?;
+            aggregate = merge_reusable_address_scope(aggregate, component_scope)?;
         }
         Ok(Some(aggregate))
+    }
+
+    /// Returns the address authority for scratch captured by the provider.
+    /// `None` means the scratch address is scoped to this submission.
+    pub fn scratch_reusable_address_scope(
+        &self,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        self.workspace_reusable_address_scope(self.scratch_resource, "scratch")
+    }
+
+    /// Returns the address authority for reusable-program binding workspace.
+    /// `None` means the binding workspace address is scoped to this submission.
+    pub fn binding_workspace_reusable_address_scope(
+        &self,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        self.workspace_reusable_address_scope(self.binding_resource, "binding")
+    }
+
+    /// Returns the address authority for persistent workspace captured by the
+    /// provider. `None` means the address is scoped to this submission.
+    pub fn persistent_workspace_reusable_address_scope(
+        &self,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        self.workspace_reusable_address_scope(self.persistent_resource, "persistent")
+    }
+
+    fn workspace_reusable_address_scope(
+        &self,
+        resource_id: Option<&super::super::ResourceId>,
+        workspace: &str,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        let resource_id = resource_id.ok_or_else(|| {
+            invalid_operation(format!(
+                "reusable topology requested absent provider {workspace} workspace"
+            ))
+        })?;
+        self.resource_reusable_address_scope(resource_id)
+    }
+
+    fn resource_reusable_address_scope(
+        &self,
+        resource_id: &super::super::ResourceId,
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        if self
+            .memory
+            .static_allocations()
+            .binary_search_by(|allocation| allocation.resource_id().cmp(resource_id))
+            .is_ok()
+        {
+            return Ok(Some(DeviceReusableAddressScope::Plan));
+        }
+
+        let mut resource_scope = None;
+        for backing_slices in [self.claimed_backing.backing_slices(), self.step_backing] {
+            let authority_start =
+                backing_slices.partition_point(|authority| authority.resource_id() < resource_id);
+            let authority_end = authority_start
+                + backing_slices[authority_start..]
+                    .partition_point(|authority| authority.resource_id() == resource_id);
+            for authority in &backing_slices[authority_start..authority_end] {
+                let Some(authority_scope) = authority.reusable_address_scope() else {
+                    return Ok(None);
+                };
+                resource_scope = Some(merge_reusable_address_scope(
+                    resource_scope.unwrap_or(DeviceReusableAddressScope::Plan),
+                    authority_scope,
+                )?);
+            }
+        }
+        if resource_scope.is_some() {
+            return Ok(resource_scope);
+        }
+        if self
+            .memory
+            .dynamic_descriptors()
+            .binary_search_by(|descriptor| descriptor.base_resource_id().cmp(resource_id))
+            .is_ok()
+        {
+            return Ok(None);
+        }
+        Err(invalid_operation(
+            "reusable topology references an unknown memory resource",
+        ))
     }
 }
 
@@ -395,7 +446,9 @@ pub trait OperationProvider<R: DeviceRuntime>: OperationResourceEstimator {
     ///
     /// This declaration is intentionally required. A new provider cannot
     /// silently inherit a static topology after adding shape-dependent kernel
-    /// selection.
+    /// selection. Providers must query the reusable address scope of every
+    /// value binding and workspace their encoded command actually captures;
+    /// an unqueried operand is not covered by this contract.
     fn reusable_execution_topology(
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
