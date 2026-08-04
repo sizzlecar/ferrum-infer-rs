@@ -1,4 +1,5 @@
 mod attribute;
+mod backing_upload;
 mod buffer_view;
 mod catalog;
 mod compiled_identity;
