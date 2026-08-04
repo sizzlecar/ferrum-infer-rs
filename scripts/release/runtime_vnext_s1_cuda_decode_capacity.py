@@ -290,11 +290,16 @@ def phase_stable_demand_contract(demand: dict[str, Any]) -> dict[str, Any]:
     return {kind: stable}
 
 
-def phase_stable_pool_contract(contract: dict[str, Any]) -> dict[str, Any]:
+def budget_stable_pool_contract(contract: dict[str, Any]) -> dict[str, Any]:
     provisioning = dict(contract["provisioning"])
     provisioning.pop("maximum_resident_bytes", None)
+    return {**contract, "provisioning": provisioning}
+
+
+def phase_stable_pool_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    stable = budget_stable_pool_contract(contract)
     return {
-        **contract,
+        **stable,
         "resources": [
             {
                 **resource,
@@ -302,7 +307,6 @@ def phase_stable_pool_contract(contract: dict[str, Any]) -> dict[str, Any]:
             }
             for resource in contract["resources"]
         ],
-        "provisioning": provisioning,
     }
 
 
@@ -917,9 +921,25 @@ def require_target_pool_within_budget_contract(
             target_envelopes[pool_id].get("storage_profile") == profiles[pool_id],
             f"target pool {pool_id} changed storage profile",
         )
+        target_contract = validate_typed_pool_contract(
+            pool_id, target_envelopes[pool_id], "target"
+        )
+        sizing_contract = contracts[pool_id]
         require(
-            target_envelopes[pool_id].get("contract") == contracts[pool_id],
-            f"target pool {pool_id} changed typed contract",
+            budget_stable_pool_contract(target_contract)
+            == budget_stable_pool_contract(sizing_contract),
+            f"target pool {pool_id} changed budget-stable typed contract",
+        )
+        target_maximum_resident_bytes = target_contract["provisioning"][
+            "maximum_resident_bytes"
+        ]
+        sizing_maximum_resident_bytes = sizing_contract["provisioning"][
+            "maximum_resident_bytes"
+        ]
+        require(
+            resident_bytes <= target_maximum_resident_bytes
+            <= sizing_maximum_resident_bytes,
+            f"target pool {pool_id} has an invalid exact-budget resident ceiling",
         )
     target_resident_bytes = target.get("resident_bytes")
     require(
@@ -975,6 +995,18 @@ def replayable_prime_layout(snapshot: dict[str, Any], label: str) -> dict[str, A
         ),
         f"{label}: replayable pool identities differ",
     )
+    replayable_pool_envelopes: dict[str, Any] = {}
+    for pool_id in sorted(pool_ids):
+        pool_envelope = pool_envelopes[pool_id]
+        require(
+            isinstance(pool_envelope, dict),
+            f"{label}: {pool_id} replayable pool envelope is invalid",
+        )
+        contract = validate_typed_pool_contract(pool_id, pool_envelope, label)
+        replayable_pool_envelopes[pool_id] = {
+            **pool_envelope,
+            "contract": budget_stable_pool_contract(contract),
+        }
     return {
         "static_bytes": snapshot.get("static_bytes"),
         "resident_bytes": snapshot.get("resident_bytes"),
@@ -984,7 +1016,7 @@ def replayable_prime_layout(snapshot: dict[str, Any], label: str) -> dict[str, A
         "pool_live_segments": pool_live_segments,
         "pool_transient_occupancy": pool_transient_occupancy,
         "pool_lane_stable_occupancy": pool_lane_stable_occupancy,
-        "pool_envelopes": pool_envelopes,
+        "pool_envelopes": replayable_pool_envelopes,
     }
 
 
@@ -4257,6 +4289,47 @@ def self_test() -> int:
     require_target_pool_within_budget_contract(
         pool_snapshot({"sequence": 34, "workspace": 6}), target_envelope, 140
     )
+    exact_budget_contracts = json.loads(json.dumps(pool_contracts))
+    exact_budget_contracts["sequence"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 34
+    exact_budget_contracts["workspace"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 6
+    exact_budget_target = pool_snapshot(
+        {"sequence": 34, "workspace": 6}, exact_budget_contracts
+    )
+    require_target_pool_within_budget_contract(
+        exact_budget_target, target_envelope, 140
+    )
+    expanded_budget_contracts = json.loads(json.dumps(exact_budget_contracts))
+    expanded_budget_contracts["sequence"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 101
+    expect_reject(
+        lambda: require_target_pool_within_budget_contract(
+            pool_snapshot(
+                {"sequence": 34, "workspace": 6}, expanded_budget_contracts
+            ),
+            target_envelope,
+            140,
+        ),
+        "target exact-budget pool expanded its sizing resident ceiling",
+    )
+    undersized_budget_contracts = json.loads(json.dumps(exact_budget_contracts))
+    undersized_budget_contracts["sequence"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 33
+    expect_reject(
+        lambda: require_target_pool_within_budget_contract(
+            pool_snapshot(
+                {"sequence": 34, "workspace": 6}, undersized_budget_contracts
+            ),
+            target_envelope,
+            140,
+        ),
+        "target exact-budget pool ceiling fell below installed residency",
+    )
     prime_receipt = rebalance_prime_budget_receipt(
         sizing_pool,
         sizing_pool,
@@ -4280,6 +4353,26 @@ def self_test() -> int:
             "replayed_prime_layout": expected_layout_receipt,
         },
         "self-test lost bounded rebalance-prime headroom evidence",
+    )
+    exact_budget_prime_contracts = json.loads(json.dumps(pool_contracts))
+    exact_budget_prime_contracts["sequence"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 40
+    exact_budget_prime_contracts["workspace"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 40
+    exact_budget_prime = pool_snapshot(
+        {"sequence": 30, "workspace": 10}, exact_budget_prime_contracts
+    )
+    require(
+        rebalance_prime_budget_receipt(
+            exact_budget_prime,
+            sizing_pool,
+            target_envelope,
+            140,
+        )
+        == prime_receipt,
+        "self-test treated the exact-budget pool ceiling as physical layout drift",
     )
     expect_reject(
         lambda: rebalance_prime_budget_receipt(
