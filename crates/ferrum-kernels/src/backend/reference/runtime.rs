@@ -217,6 +217,7 @@ enum ReferenceCommandKind {
 pub struct ReferenceDeviceCommand {
     operation: &'static str,
     batching_form: DeviceBatchingForm,
+    participant_start: u32,
     participant_count: u32,
     token_count: u64,
     compute_dispatch_count: u64,
@@ -237,6 +238,7 @@ impl fmt::Debug for ReferenceDeviceCommand {
             .field("kind", &kind)
             .field("operation", &self.operation)
             .field("batching_form", &self.batching_form)
+            .field("participant_start", &self.participant_start)
             .field("participant_count", &self.participant_count)
             .field("token_count", &self.token_count)
             .finish()
@@ -263,6 +265,7 @@ impl ReferenceDeviceCommand {
         Ok(Self {
             operation: "vnext_dense_linear",
             batching_form,
+            participant_start: 0,
             participant_count,
             token_count,
             compute_dispatch_count,
@@ -277,6 +280,7 @@ impl ReferenceDeviceCommand {
         Self {
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 0,
             token_count: 0,
             compute_dispatch_count: 0,
@@ -295,6 +299,7 @@ impl ReferenceDeviceCommand {
             ));
         }
         self.batching_form = logical_work.batching_form();
+        self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
         Ok(self)
@@ -306,13 +311,14 @@ impl ReferenceDeviceCommand {
         node_index: Option<u32>,
         phase: DeviceCommandPhase,
     ) -> Result<DeviceNativeWorkAttribution, ReferenceDeviceRuntimeError> {
-        DeviceNativeWorkAttribution::new(
+        DeviceNativeWorkAttribution::with_participant_range(
             command_index,
             node_index,
             phase,
             self.operation,
             DeviceExecutionPath::Eager,
             self.batching_form,
+            self.participant_start,
             self.participant_count,
             self.token_count,
             self.compute_dispatch_count,

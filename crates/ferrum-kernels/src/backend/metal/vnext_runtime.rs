@@ -1164,6 +1164,7 @@ pub struct MetalDeviceCommand {
     runtime_instance: u64,
     operation: &'static str,
     batching_form: DeviceBatchingForm,
+    participant_start: u32,
     participant_count: u32,
     token_count: u64,
     regions: Vec<MetalBufferRegion>,
@@ -1178,6 +1179,7 @@ impl fmt::Debug for MetalDeviceCommand {
             .field("runtime_instance", &self.runtime_instance)
             .field("operation", &self.operation)
             .field("batching_form", &self.batching_form)
+            .field("participant_start", &self.participant_start)
             .field("participant_count", &self.participant_count)
             .field("token_count", &self.token_count)
             .field("region_count", &self.regions.len())
@@ -1204,6 +1206,7 @@ impl MetalDeviceCommand {
             runtime_instance,
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 1,
             token_count: 0,
             regions,
@@ -1224,6 +1227,7 @@ impl MetalDeviceCommand {
             ));
         }
         self.batching_form = batching_form;
+        self.participant_start = 0;
         self.participant_count = participant_count;
         self.token_count = token_count;
         Ok(self)
@@ -1239,6 +1243,7 @@ impl MetalDeviceCommand {
             ));
         }
         self.batching_form = logical_work.batching_form();
+        self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
         Ok(self)
@@ -1255,6 +1260,7 @@ impl MetalDeviceCommand {
             runtime_instance,
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 0,
             token_count: 0,
             regions,
@@ -1793,13 +1799,14 @@ impl MetalDeviceRuntime {
             }
             if let Some(attribution) = attribution.as_mut() {
                 let (compute_dispatch_count, transfer_command_count) = encoder.command_counts();
-                if let Some(observation) = DeviceNativeWorkAttribution::new(
+                if let Some(observation) = DeviceNativeWorkAttribution::with_participant_range(
                     command_index,
                     *node_index,
                     *phase,
                     command.operation,
                     DeviceExecutionPath::Eager,
                     command.batching_form,
+                    command.participant_start,
                     command.participant_count,
                     command.token_count,
                     compute_dispatch_count,

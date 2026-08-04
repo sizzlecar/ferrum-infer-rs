@@ -303,6 +303,7 @@ pub struct CudaDeviceCommand {
     runtime_instance: u64,
     operation: &'static str,
     batching_form: DeviceBatchingForm,
+    participant_start: u32,
     participant_count: u32,
     token_count: u64,
     compute_dispatch_count: u64,
@@ -323,6 +324,7 @@ impl fmt::Debug for CudaDeviceCommand {
             .field("runtime_instance", &self.runtime_instance)
             .field("operation", &self.operation)
             .field("batching_form", &self.batching_form)
+            .field("participant_start", &self.participant_start)
             .field("participant_count", &self.participant_count)
             .field("token_count", &self.token_count)
             .field("compute_dispatch_count", &self.compute_dispatch_count)
@@ -556,6 +558,7 @@ impl CudaDeviceCommand {
             runtime_instance,
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 0,
             token_count: 0,
             compute_dispatch_count: 0,
@@ -597,6 +600,7 @@ impl CudaDeviceCommand {
             runtime_instance,
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 0,
             token_count: 0,
             compute_dispatch_count: 0,
@@ -631,6 +635,7 @@ impl CudaDeviceCommand {
             runtime_instance,
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 0,
             token_count: 0,
             compute_dispatch_count: 0,
@@ -698,6 +703,7 @@ impl CudaDeviceCommand {
             runtime_instance,
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 0,
             token_count: 0,
             compute_dispatch_count: 0,
@@ -731,6 +737,7 @@ impl CudaDeviceCommand {
             ));
         }
         self.batching_form = batching_form;
+        self.participant_start = 0;
         self.participant_count = participant_count;
         self.token_count = token_count;
         self.compute_dispatch_count = compute_dispatch_count;
@@ -748,6 +755,7 @@ impl CudaDeviceCommand {
             ));
         }
         self.batching_form = logical_work.batching_form();
+        self.participant_start = logical_work.participant_start();
         self.participant_count = logical_work.participant_count();
         self.token_count = logical_work.token_count();
         Ok(self)
@@ -772,6 +780,7 @@ impl CudaDeviceCommand {
             runtime_instance,
             operation: "vnext_reusable_execution",
             batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_start: 0,
             participant_count,
             token_count,
             compute_dispatch_count: 1,
@@ -809,11 +818,13 @@ impl CudaDeviceCommand {
         }
 
         let runtime_instance = commands[0].runtime_instance;
+        let participant_start = commands[0].participant_start;
         let participant_count = commands[0].participant_count;
         let token_count = commands[0].token_count;
         if participant_count == 0
             || commands.iter().any(|command| {
                 command.runtime_instance != runtime_instance
+                    || command.participant_start != participant_start
                     || command.participant_count != participant_count
                     || command.token_count != token_count
                     || command.compute_dispatch_count != 0
@@ -973,6 +984,7 @@ impl CudaDeviceCommand {
             runtime_instance,
             operation: "vnext_program_binding_prelude",
             batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_start,
             participant_count,
             token_count,
             compute_dispatch_count: 0,
@@ -991,11 +1003,13 @@ impl CudaDeviceCommand {
         commands: Vec<Self>,
     ) -> Result<Vec<Self>, CudaDeviceRuntimeError> {
         let runtime_instance = commands[0].runtime_instance;
+        let participant_start = commands[0].participant_start;
         let participant_count = commands[0].participant_count;
         let token_count = commands[0].token_count;
         if participant_count == 0
             || commands.iter().any(|command| {
                 command.runtime_instance != runtime_instance
+                    || command.participant_start != participant_start
                     || command.participant_count != participant_count
                     || command.token_count != token_count
                     || command.compute_dispatch_count != 0
@@ -1030,6 +1044,7 @@ impl CudaDeviceCommand {
             runtime_instance,
             operation: "vnext_program_binding_prelude",
             batching_form: DeviceBatchingForm::ParticipantLoop,
+            participant_start,
             participant_count,
             token_count,
             compute_dispatch_count: 0,
@@ -1218,13 +1233,14 @@ fn cuda_submission_attribution(
         .map(|(command_index, command)| {
             let command_index = u32::try_from(command_index)
                 .map_err(|_| CudaDeviceRuntimeError::contract("CUDA command index exceeds u32"))?;
-            DeviceNativeWorkAttribution::new(
+            DeviceNativeWorkAttribution::with_participant_range(
                 command_index,
                 command_node_indices[command_index as usize],
                 command_phases[command_index as usize],
                 command.operation,
                 execution_paths[command_index as usize],
                 command.batching_form,
+                command.participant_start,
                 command.participant_count,
                 command.token_count,
                 command.compute_dispatch_count,
@@ -2882,6 +2898,7 @@ mod tests {
             runtime_instance: 1,
             operation,
             batching_form: DeviceBatchingForm::Scalar,
+            participant_start: 0,
             participant_count: 1,
             token_count: 1,
             compute_dispatch_count: 1,

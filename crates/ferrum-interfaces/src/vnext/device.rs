@@ -776,6 +776,7 @@ impl DeviceBatchingForm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DeviceCommandLogicalWork {
     batching_form: DeviceBatchingForm,
+    participant_start: u32,
     participant_count: u32,
     token_count: u64,
 }
@@ -786,13 +787,24 @@ impl DeviceCommandLogicalWork {
         participant_count: u32,
         token_count: u64,
     ) -> Result<Self, super::VNextError> {
-        if participant_count == 0 {
+        Self::for_participant_range(batching_form, 0, participant_count, token_count)
+    }
+
+    pub fn for_participant_range(
+        batching_form: DeviceBatchingForm,
+        participant_start: u32,
+        participant_count: u32,
+        token_count: u64,
+    ) -> Result<Self, super::VNextError> {
+        if participant_count == 0 || participant_start.checked_add(participant_count).is_none() {
             return Err(super::VNextError::InvalidExecutionPlan {
-                reason: "node-scoped device command has zero logical participants".to_owned(),
+                reason: "node-scoped device command has an empty or overflowing logical participant range"
+                    .to_owned(),
             });
         }
         Ok(Self {
             batching_form,
+            participant_start,
             participant_count,
             token_count,
         })
@@ -802,8 +814,16 @@ impl DeviceCommandLogicalWork {
         self.batching_form
     }
 
+    pub const fn participant_start(self) -> u32 {
+        self.participant_start
+    }
+
     pub const fn participant_count(self) -> u32 {
         self.participant_count
+    }
+
+    pub const fn participant_end(self) -> u32 {
+        self.participant_start + self.participant_count
     }
 
     pub const fn token_count(self) -> u64 {
@@ -2396,6 +2416,7 @@ pub struct DeviceNativeWorkAttribution {
     native_op_id: &'static str,
     execution_path: DeviceExecutionPath,
     batching_form: DeviceBatchingForm,
+    participant_start: u32,
     participant_count: u32,
     token_count: u64,
     compute_dispatch_count: u64,
@@ -2418,9 +2439,42 @@ impl DeviceNativeWorkAttribution {
         transfer_command_count: u64,
         reusable_graph_node_count: Option<u64>,
     ) -> Option<Self> {
+        Self::with_participant_range(
+            command_index,
+            node_index,
+            command_phase,
+            native_op_id,
+            execution_path,
+            batching_form,
+            0,
+            participant_count,
+            token_count,
+            compute_dispatch_count,
+            transfer_command_count,
+            reusable_graph_node_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_participant_range(
+        command_index: u32,
+        node_index: Option<u32>,
+        command_phase: DeviceCommandPhase,
+        native_op_id: &'static str,
+        execution_path: DeviceExecutionPath,
+        batching_form: DeviceBatchingForm,
+        participant_start: u32,
+        participant_count: u32,
+        token_count: u64,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+        reusable_graph_node_count: Option<u64>,
+    ) -> Option<Self> {
         if native_op_id.is_empty()
             || (compute_dispatch_count == 0 && transfer_command_count == 0)
             || (node_index.is_some() && participant_count == 0)
+            || participant_start.checked_add(participant_count).is_none()
+            || (node_index.is_none() && participant_start != 0)
             || (reusable_graph_node_count.is_some()
                 && execution_path != DeviceExecutionPath::Replayed)
         {
@@ -2433,6 +2487,7 @@ impl DeviceNativeWorkAttribution {
             native_op_id,
             execution_path,
             batching_form,
+            participant_start,
             participant_count,
             token_count,
             compute_dispatch_count,
@@ -2465,8 +2520,16 @@ impl DeviceNativeWorkAttribution {
         self.batching_form
     }
 
+    pub const fn participant_start(&self) -> u32 {
+        self.participant_start
+    }
+
     pub const fn participant_count(&self) -> u32 {
         self.participant_count
+    }
+
+    pub const fn participant_end(&self) -> u32 {
+        self.participant_start + self.participant_count
     }
 
     pub const fn token_count(&self) -> u64 {
@@ -3668,6 +3731,43 @@ mod execution_timing_tests {
         );
     }
 
+    #[test]
+    fn native_work_attribution_preserves_bounded_participant_range() {
+        let row = DeviceNativeWorkAttribution::with_participant_range(
+            3,
+            Some(7),
+            DeviceCommandPhase::Initialization,
+            "test.restore",
+            DeviceExecutionPath::Eager,
+            DeviceBatchingForm::Scalar,
+            2,
+            1,
+            4,
+            0,
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(row.participant_start(), 2);
+        assert_eq!(row.participant_count(), 1);
+        assert_eq!(row.participant_end(), 3);
+        assert!(DeviceNativeWorkAttribution::with_participant_range(
+            3,
+            Some(7),
+            DeviceCommandPhase::Initialization,
+            "test.restore",
+            DeviceExecutionPath::Eager,
+            DeviceBatchingForm::Scalar,
+            u32::MAX,
+            2,
+            4,
+            0,
+            1,
+            None,
+        )
+        .is_none());
+    }
+
     fn replay_test_program_id() -> DeviceReusableExecutionProgramId {
         let plan_hash: PlanHash =
             serde_json::from_value(serde_json::json!("a".repeat(64))).unwrap();
@@ -3942,7 +4042,22 @@ mod deferred_cleanup_tests {
         assert_eq!(entry.node_index(), Some(7));
         assert_eq!(entry.logical_work(), Some(logical_work));
         assert_eq!(entry.command(), &"workspace-zero");
+        assert_eq!(logical_work.participant_start(), 0);
+        assert_eq!(logical_work.participant_end(), 4);
+        let scoped =
+            DeviceCommandLogicalWork::for_participant_range(DeviceBatchingForm::Scalar, 3, 1, 5)
+                .unwrap();
+        assert_eq!(scoped.participant_start(), 3);
+        assert_eq!(scoped.participant_count(), 1);
+        assert_eq!(scoped.participant_end(), 4);
         assert!(DeviceCommandLogicalWork::new(DeviceBatchingForm::Packed, 0, 17).is_err());
+        assert!(DeviceCommandLogicalWork::for_participant_range(
+            DeviceBatchingForm::Packed,
+            u32::MAX,
+            2,
+            17,
+        )
+        .is_err());
     }
 
     #[test]
