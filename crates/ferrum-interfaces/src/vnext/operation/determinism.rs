@@ -7,11 +7,12 @@ use sha2::{Digest, Sha256};
 use super::dispatch_contract::{BoundDeviceSubmissionAttribution, ProfiledSubmissionHandle};
 use super::foundation::invalid_operation;
 use super::{
-    BatchOperationIdentity, BatchedOperationInvocation, BoundOperationProvider, ElementType,
+    packed_step_token_range_to_participant_local_readback, BatchOperationIdentity,
+    BatchedOperationInvocation, BoundOperationProvider, ElementType,
 };
 use crate::vnext::{
-    BatchInvocationId, BatchParticipantAuthority, BufferUsage, CompletionHandle,
-    CompletionReadbackBatchRequest, CompletionReadbackCollectionObservation,
+    AllocationKind, AllocationLifetime, BatchInvocationId, BatchParticipantAuthority, BufferUsage,
+    CompletionHandle, CompletionReadbackBatchRequest, CompletionReadbackCollectionObservation,
     CompletionReadbackCollectionRequest, CompletionReadbackDisposition, CompletionReadbackRequest,
     DeviceCommandPhase, DeviceComputePathRequirement, DeviceExecutionPath,
     DeviceReusableExecutionProgramId, DeviceRuntime, ExecutablePlanView,
@@ -1311,6 +1312,13 @@ impl SubmissionWaveDeterminismReadbackPlan {
                             "determinism witness provider-visible range is not element aligned",
                         ));
                     }
+                    let completion_range = completion_witness_readback_range(
+                        wave,
+                        node,
+                        participant_index,
+                        witness,
+                        *range,
+                    )?;
                     CompletionReadbackRequest::new_typed(
                         witness.node_id().clone(),
                         u32::try_from(participant_index).map_err(|_| {
@@ -1318,10 +1326,10 @@ impl SubmissionWaveDeterminismReadbackPlan {
                         })?,
                         witness.resource_id().clone(),
                         witness.location().usage(),
-                        range.logical_offset_bytes(),
+                        completion_range.logical_offset_bytes(),
                         HostTransferLayout::new(
                             witness.element_type(),
-                            range.length_bytes() / element_bytes,
+                            completion_range.length_bytes() / element_bytes,
                         )?,
                     )
                 })
@@ -1444,6 +1452,58 @@ impl SubmissionWaveDeterminismReadbackPlan {
                 )
             })
     }
+}
+
+fn completion_witness_readback_range<R: DeviceRuntime>(
+    wave: &PreparedStepSubmissionWave<R>,
+    node: &crate::vnext::PreparedStepSubmissionNode<R>,
+    participant_index: usize,
+    witness: &ExecutionDeterminismWitnessSpec,
+    provider_range: SubmissionWaveDeterminismLogicalRange,
+) -> Result<SubmissionWaveDeterminismLogicalRange, VNextError> {
+    let ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+        bytes_per_token,
+        maximum_tokens,
+    } = witness.location().extent()
+    else {
+        return Ok(provider_range);
+    };
+    if !resource_is_shared(wave, witness.resource_id()) {
+        return Ok(provider_range);
+    }
+
+    let descriptor = wave
+        .step_resources()
+        .dynamic_descriptor(witness.resource_id())?;
+    if descriptor.lifetime() != AllocationLifetime::Step
+        || descriptor.kind() != &AllocationKind::Value
+        || !matches!(
+            descriptor.demand(),
+            crate::vnext::DynamicResourceDemand::Tokens {
+                bytes_per_token: descriptor_bytes_per_token,
+                maximum_tokens: descriptor_maximum_tokens,
+            } if *descriptor_bytes_per_token == bytes_per_token
+                && *descriptor_maximum_tokens == maximum_tokens
+        )
+    {
+        return Err(invalid_operation(
+            "shared immediate determinism witness lacks matching Step token backing",
+        ));
+    }
+    let provider_end = provider_range
+        .logical_offset_bytes()
+        .checked_add(provider_range.length_bytes())
+        .ok_or_else(|| invalid_operation("determinism provider readback range overflows"))?;
+    let participant_local = packed_step_token_range_to_participant_local_readback(
+        descriptor.demand(),
+        node.work_shape(),
+        participant_index,
+        provider_range.logical_offset_bytes()..provider_end,
+    )?;
+    Ok(SubmissionWaveDeterminismLogicalRange {
+        logical_offset_bytes: participant_local.start,
+        length_bytes: participant_local.end - participant_local.start,
+    })
 }
 
 fn validate_terminal_witness_stability(
