@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, BatchedOperationInvocation, DeviceBatchingForm, ElementType,
-    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    token_embedding_contract, BatchedOperationInvocation, DeviceBatchingForm,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
     ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
     LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
@@ -24,9 +26,10 @@ use super::weights::{resolve_weight, MetalResolvedWeightLayout};
 use super::{
     authorize_reusable_topology, binding, checked_u32, contiguous_bindings, contiguous_region,
     contiguous_token_region, ensure_invocation, estimate_without_workspace, f16_contiguous,
-    implementation_fingerprint, provider_descriptor, provider_failure, rational_attribute,
-    shared_full_region, shared_token_region, unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID,
-    GGUF_NATIVE_BLOCK_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP,
+    implementation_fingerprint, invalid_plan, provider_descriptor, provider_failure,
+    rational_attribute, shared_full_region, shared_scratch_region, shared_token_region,
+    unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q6_K_FORMAT_ID,
+    Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
 };
 
 const SHADER_SOURCE: &str = include_str!("primitives.metal");
@@ -333,11 +336,34 @@ impl OperationResourceEstimator for MetalLastTokenMaskedArgmaxProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(
-            &self.descriptor,
-            &request,
-            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
-        )
+        if request.operation().id.as_str() != LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
+            || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
+        {
+            return Err(invalid_plan(format!(
+                "Metal estimator `{}` received another operation",
+                self.descriptor.resource_estimator_id()
+            )));
+        }
+        let vocabulary_size =
+            unsigned_attribute(request.attributes(), "vocab_size").map_err(invalid_plan)?;
+        let scratch_bytes = masked_argmax_scratch_stride(vocabulary_size).map_err(invalid_plan)?;
+        let scratch = ProviderWorkspaceRequirement::from_formula(
+            ProviderWorkspaceSizeFormula::actual_sequences(scratch_bytes)?,
+            VALUE_ALIGNMENT_BYTES,
+            ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
+            DynamicStorageRequirement::contiguous(),
+        )?;
+        Ok(OperationResourceEstimate::new(
+            self.descriptor.resource_estimator_id(),
+            self.descriptor.resource_estimator_version(),
+            self.descriptor
+                .resource_estimator_implementation_fingerprint(),
+            request.input_fingerprint(),
+            VALUE_ALIGNMENT_BYTES,
+            Some(scratch),
+            None,
+        ))
     }
 }
 
@@ -783,6 +809,7 @@ struct LastTokenMaskedArgmaxParams {
 #[derive(Debug, Clone, Copy)]
 struct LastTokenMaskedArgmaxLaunch {
     first_region: usize,
+    scratch_offset_bytes: u64,
     params: LastTokenMaskedArgmaxParams,
 }
 
@@ -791,9 +818,15 @@ fn encode_last_token_masked_argmax(
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
     ensure_invocation(&invocation, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?;
-    let mut regions = Vec::with_capacity(invocation.participants().len() * 6);
+    let first_vocabulary_size =
+        unsigned_attribute(invocation.participants()[0].attributes(), "vocab_size")?;
+    let scratch_stride = masked_argmax_scratch_stride(first_vocabulary_size)?;
+    let required_scratch_bytes = scratch_stride
+        .checked_mul(invocation.participants().len() as u64)
+        .ok_or_else(|| "Metal masked argmax scratch size overflows".to_owned())?;
+    let mut regions = Vec::with_capacity(invocation.participants().len() * 6 + 1);
     let mut launches = Vec::with_capacity(invocation.participants().len());
-    for participant in invocation.participants() {
+    for (participant_index, participant) in invocation.participants().iter().enumerate() {
         let logits = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
         let valid_mask = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
         let repetition_token_ids = binding(participant.bindings(), ResolvedValueRole::Input, 2)?;
@@ -801,6 +834,9 @@ fn encode_last_token_masked_argmax(
         let repetition_penalty = binding(participant.bindings(), ResolvedValueRole::Input, 4)?;
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
+        if vocabulary_size != first_vocabulary_size {
+            return Err("Metal masked argmax participants disagree on vocabulary size".to_owned());
+        }
         let Some(repetition_capacity) = valid_last_token_masked_argmax(
             logits,
             valid_mask,
@@ -835,6 +871,9 @@ fn encode_last_token_masked_argmax(
         regions.push(contiguous_region(participant, output, ElementType::U32)?);
         launches.push(LastTokenMaskedArgmaxLaunch {
             first_region,
+            scratch_offset_bytes: scratch_stride
+                .checked_mul(participant_index as u64)
+                .ok_or_else(|| "Metal masked argmax scratch offset overflows".to_owned())?,
             params: LastTokenMaskedArgmaxParams {
                 vocabulary_size: checked_u32(
                     vocabulary_size,
@@ -844,6 +883,8 @@ fn encode_last_token_masked_argmax(
             },
         });
     }
+    let scratch_region = regions.len();
+    regions.push(shared_scratch_region(&invocation, required_scratch_bytes)?);
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
         "Metal masked argmax participant count",
@@ -864,6 +905,8 @@ fn encode_last_token_masked_argmax(
                     &regions[launch.first_region + 3],
                     &regions[launch.first_region + 4],
                     &regions[launch.first_region + 5],
+                    &regions[scratch_region],
+                    launch.scratch_offset_bytes,
                     launch.params,
                 );
             }
@@ -951,21 +994,35 @@ fn dispatch_last_token_masked_argmax(
     repetition_offsets: &MetalBufferRegion,
     repetition_penalty: &MetalBufferRegion,
     output: &MetalBufferRegion,
+    scratch: &MetalBufferRegion,
+    scratch_offset_bytes: u64,
     params: LastTokenMaskedArgmaxParams,
 ) {
     encoder.set_compute_pipeline_state(&pipelines.last_token_masked_argmax);
     set_region(encoder, 0, logits);
-    set_region(encoder, 1, valid_mask);
-    set_region(encoder, 2, repetition_token_ids);
-    set_region(encoder, 3, repetition_offsets);
-    set_region(encoder, 4, repetition_penalty);
-    set_region(encoder, 5, output);
+    set_region_offset(encoder, 1, scratch, scratch_offset_bytes);
+    set_region(encoder, 2, valid_mask);
+    set_region(encoder, 3, repetition_token_ids);
+    set_region(encoder, 4, repetition_offsets);
+    set_region(encoder, 5, repetition_penalty);
+    set_region(encoder, 6, output);
     encoder.set_bytes(
-        6,
+        7,
         std::mem::size_of::<LastTokenMaskedArgmaxParams>() as u64,
         &params as *const _ as *const c_void,
     );
     encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(THREADS_PER_GROUP, 1, 1));
+}
+
+fn masked_argmax_scratch_stride(vocabulary_size: u64) -> Result<u64, String> {
+    let bytes = vocabulary_size
+        .checked_mul(ElementType::F16.size_bytes())
+        .ok_or_else(|| "Metal masked argmax scratch size overflows".to_owned())?;
+    bytes
+        .checked_add(VALUE_ALIGNMENT_BYTES - 1)
+        .map(|value| value & !(VALUE_ALIGNMENT_BYTES - 1))
+        .filter(|value| *value != 0)
+        .ok_or_else(|| "Metal masked argmax scratch alignment overflows".to_owned())
 }
 
 fn dispatch_embedding(
@@ -1216,6 +1273,7 @@ mod tests {
         let argmax_repetition_disabled_penalty_buffer = shared_buffer(&device, &[1.0_f32]);
         let argmax_output = output_buffer::<u32>(&device, 1);
         let argmax_empty_output = output_buffer::<u32>(&device, 1);
+        let argmax_scratch = output_buffer::<f16>(&device, 5);
         let repetition_logits = [4.0_f32, 3.0, 2.0]
             .into_iter()
             .map(f16::from_f32)
@@ -1225,6 +1283,7 @@ mod tests {
         let repetition_offsets_buffer = shared_buffer(&device, &[0_u32, 1_u32]);
         let repetition_penalty_buffer = shared_buffer(&device, &[2.0_f32]);
         let repetition_output = output_buffer::<u32>(&device, 1);
+        let repetition_scratch = output_buffer::<f16>(&device, 3);
 
         let command = queue.new_command_buffer();
         let encoder = command.new_compute_command_encoder();
@@ -1285,6 +1344,7 @@ mod tests {
             &argmax_repetition_disabled_offsets_buffer,
             &argmax_repetition_disabled_penalty_buffer,
             &argmax_output,
+            &argmax_scratch,
             LastTokenMaskedArgmaxParams {
                 vocabulary_size: 5,
                 repetition_capacity: 1,
@@ -1299,6 +1359,7 @@ mod tests {
             &argmax_repetition_disabled_offsets_buffer,
             &argmax_repetition_disabled_penalty_buffer,
             &argmax_empty_output,
+            &argmax_scratch,
             LastTokenMaskedArgmaxParams {
                 vocabulary_size: 5,
                 repetition_capacity: 1,
@@ -1313,6 +1374,7 @@ mod tests {
             &repetition_offsets_buffer,
             &repetition_penalty_buffer,
             &repetition_output,
+            &repetition_scratch,
             LastTokenMaskedArgmaxParams {
                 vocabulary_size: 3,
                 repetition_capacity: 1,
@@ -1405,6 +1467,14 @@ mod tests {
         assert_eq!(
             repetition_selected, 1,
             "sparse positive-logit repetition penalty must apply before argmax"
+        );
+        assert_eq!(
+            read_f16(&repetition_logits_buffer, repetition_logits.len()),
+            repetition_logits
+                .iter()
+                .map(|value| value.to_f32())
+                .collect::<Vec<_>>(),
+            "masked argmax must not mutate semantic logits"
         );
     }
 
@@ -1500,17 +1570,19 @@ mod tests {
         repetition_offsets: &BufferRef,
         repetition_penalty: &BufferRef,
         output: &BufferRef,
+        scratch: &BufferRef,
         params: LastTokenMaskedArgmaxParams,
     ) {
         encoder.set_compute_pipeline_state(&pipelines.last_token_masked_argmax);
         set_raw(encoder, 0, logits);
-        set_raw(encoder, 1, valid_mask);
-        set_raw(encoder, 2, repetition_token_ids);
-        set_raw(encoder, 3, repetition_offsets);
-        set_raw(encoder, 4, repetition_penalty);
-        set_raw(encoder, 5, output);
+        set_raw(encoder, 1, scratch);
+        set_raw(encoder, 2, valid_mask);
+        set_raw(encoder, 3, repetition_token_ids);
+        set_raw(encoder, 4, repetition_offsets);
+        set_raw(encoder, 5, repetition_penalty);
+        set_raw(encoder, 6, output);
         encoder.set_bytes(
-            6,
+            7,
             std::mem::size_of::<LastTokenMaskedArgmaxParams>() as u64,
             &params as *const _ as *const c_void,
         );

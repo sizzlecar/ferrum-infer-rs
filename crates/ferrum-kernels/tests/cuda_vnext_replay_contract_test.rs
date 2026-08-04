@@ -8,9 +8,32 @@ const RUNTIME_SOURCE: &str = include_str!("../src/backend/cuda/vnext_runtime.rs"
 const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
 const GATED_DELTA_KERNEL_SOURCE: &str = include_str!("../kernels/gated_delta_rule.cu");
+const ARGMAX_KERNEL_SOURCE: &str = include_str!("../kernels/argmax_rows.cu");
 const MOE_PROVIDER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer/moe.rs");
 const MOE_ROUTER_KERNEL_SOURCE: &str = include_str!("../kernels/moe_router.cu");
 const BUILD_SCRIPT_SOURCE: &str = include_str!("../build.rs");
+
+#[test]
+fn vnext_masked_argmax_preserves_logits_and_binds_typed_scratch() {
+    let provider = VNEXT_OPS_SOURCE
+        .split("pub struct CudaLastTokenMaskedArgmaxProvider")
+        .nth(1)
+        .expect("CUDA vNext must install a masked-argmax provider")
+        .split("struct LastTokenDenseLinearLaunch")
+        .next()
+        .expect("masked-argmax provider source must have a bounded body");
+    assert!(VNEXT_OPS_SOURCE.contains("last_token_masked_argmax_preserving_logits_f16"));
+    assert!(provider.contains("MASKED_ARGMAX_PRESERVING_LOGITS_FUNCTION_NAME"));
+    assert!(provider.contains("transformer::shared_scratch_region("));
+    assert!(provider.contains("scratch_offset_bytes"));
+    assert!(provider.contains("ProviderWorkspaceSizeFormula::actual_sequences(scratch_bytes)"));
+    assert!(!provider.contains("apply_repetition_penalties_sparse_f16"));
+
+    assert!(ARGMAX_KERNEL_SOURCE.contains("const __half* __restrict__ logits"));
+    assert!(ARGMAX_KERNEL_SOURCE.contains("__half* __restrict__ scratch"));
+    assert!(ARGMAX_KERNEL_SOURCE.contains("selection_logits = scratch"));
+    assert!(TRANSFORMER_SOURCE.contains("provider_fingerprint.as_bytes()"));
+}
 
 #[test]
 fn product_build_script_has_no_native_source_compiler_surface() {

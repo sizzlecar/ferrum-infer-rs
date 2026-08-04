@@ -821,6 +821,41 @@ mod tests {
             .find(|node| node.operation_id.as_str() == ROUTED_SWIGLU_MOE_OPERATION_ID)
             .expect("fixture program must contain routed-only MoE");
         assert_eq!(moe.inputs.len(), 4);
+        let greedy = program
+            .blocks()
+            .iter()
+            .flat_map(|block| &block.nodes)
+            .find(|node| {
+                node.operation_id.as_str()
+                    == ferrum_interfaces::vnext::LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
+            })
+            .expect("fixture program must contain typed greedy selection");
+        assert_eq!(
+            greedy.required_version,
+            ferrum_interfaces::vnext::ContractVersion::new(3, 0)
+        );
+        assert_eq!(
+            greedy
+                .inputs
+                .iter()
+                .map(ferrum_interfaces::vnext::ProgramValueId::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "value.output.logits",
+                "value.input.greedy_token_mask",
+                "value.input.greedy_repetition_token_ids",
+                "value.input.greedy_repetition_offsets",
+                "value.input.greedy_repetition_penalty",
+            ]
+        );
+        assert_eq!(
+            program
+                .outputs()
+                .iter()
+                .map(ferrum_interfaces::vnext::ProgramValueId::as_str)
+                .collect::<Vec<_>>(),
+            ["value.output.logits", "value.output.greedy_token"]
+        );
         assert_eq!(program.states().len(), 1);
         assert!(schema
             .tensors
