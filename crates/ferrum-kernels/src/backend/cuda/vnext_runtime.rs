@@ -22,7 +22,7 @@ use ferrum_interfaces::vnext::{
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
     DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution,
     DeviceReplayedLogicalCommandAttribution, DeviceReplayedSegmentAttribution,
-    DeviceReusableAddressScope, DeviceReusableExecutionInvocation,
+    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
     DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
     DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
     DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionTrim, DeviceRuntime,
