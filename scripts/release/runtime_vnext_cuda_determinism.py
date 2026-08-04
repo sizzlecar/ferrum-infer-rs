@@ -753,12 +753,16 @@ def validate_string_list(
     *,
     portable: bool = False,
     nonempty: bool = True,
+    canonical_order: bool = True,
 ) -> list[str]:
     require(isinstance(value, list), f"{label} must be a list")
     if nonempty:
         require(bool(value), f"{label} must not be empty")
     result = [text(item, f"{label}[{index}]", portable=portable) for index, item in enumerate(value)]
-    require(result == sorted(set(result)), f"{label} must be sorted and unique")
+    if canonical_order:
+        require(result == sorted(set(result)), f"{label} must be sorted and unique")
+    else:
+        require(len(result) == len(set(result)), f"{label} must be unique")
     return result
 
 
@@ -1113,6 +1117,7 @@ def validate_coverage(
             model["node_ids"],
             f"coverage.models[{index}].node_ids",
             portable=True,
+            canonical_order=False,
         )
         models[key] = model
     require(list(models) == sorted(models), "coverage.models must use canonical model-key order")
@@ -1180,6 +1185,7 @@ def validate_coverage(
                 selection["node_ids"],
                 f"{selection_label}.node_ids",
                 portable=True,
+                canonical_order=False,
             )
             require(
                 set(node_ids) <= set(models[model_key]["node_ids"]),
@@ -1284,7 +1290,12 @@ def validate_witness_plan(
         f"{label}.schema_version must be 4.0",
     )
     require(plan["plan_hash"] == expected_plan_hash, f"{label}.plan_hash is stale")
-    node_ids = validate_string_list(plan["node_ids"], f"{label}.node_ids", portable=True)
+    node_ids = validate_string_list(
+        plan["node_ids"],
+        f"{label}.node_ids",
+        portable=True,
+        canonical_order=False,
+    )
     require(node_ids == expected_node_ids, f"{label}.node_ids differ from provider scope")
 
     replay_requirements = plan["replay_provider_requirements"]
@@ -2023,7 +2034,14 @@ def validate_target(
         None,
     )
     require(selection is not None, f"{label} provider is not selected by model {model_key}")
-    node_ids = set(validate_string_list(target["node_ids"], f"{label}.node_ids", portable=True))
+    node_ids = set(
+        validate_string_list(
+            target["node_ids"],
+            f"{label}.node_ids",
+            portable=True,
+            canonical_order=False,
+        )
+    )
     require(
         node_ids == set(selection["node_ids"]),
         f"{label}.node_ids differ from the exact selected provider nodes",
@@ -4369,6 +4387,24 @@ def run_self_test() -> None:
         )
         require(summary["case_count"] == 72, "self-test case denominator drifted")
         require(summary["comparison_count"] == 1080, "self-test comparison denominator drifted")
+        plan_ordered_denominator = read_json(base / "denominator.json")
+        plan_ordered_denominator["coverage"]["models"][0]["node_ids"].reverse()
+        validate_denominator(
+            plan_ordered_denominator,
+            PRIMARY_MODELS,
+            RELEASE_SCOPE,
+        )
+        plan_ordered_nodes = ["node.layer.2", "node.layer.10"]
+        require(
+            validate_string_list(
+                plan_ordered_nodes,
+                "self-test plan-ordered nodes",
+                portable=True,
+                canonical_order=False,
+            )
+            == plan_ordered_nodes,
+            "plan-ordered node validation reordered the execution topology",
+        )
 
         focused = Path(temporary) / "focused"
         focused.mkdir()
