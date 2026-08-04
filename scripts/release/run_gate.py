@@ -108,8 +108,9 @@ SAFETENSORS_SHARD_RE = re.compile(
 )
 VNEXT_FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
 VNEXT_S0A_PUBLIC_API_ADDED_SHA256 = (
-    "9f68295a0b5d7f37a4a476bed8004cd7e87c8266da1988779a0dc518e0d9739d"
+    "557dec231957692d7e9e727ad4da20d33441b00c788eaee76fdf2de398a0ef5a"
 )
+VNEXT_S0A_PUBLIC_API_ADDED_COUNT = 1157
 VNEXT_S0A_PRODUCTION_GROUPS = {"resource", "execution", "event", "operation"}
 VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS = {
     "crates/ferrum-interfaces/src/vnext/static_initialization.rs"
@@ -3549,7 +3550,7 @@ def validate_vnext_g01a_s0a_provenance(
             "lost_items": 0,
             "ambiguous_items": 0,
             "inaccessible_items": 0,
-            "added_items": 1068,
+            "added_items": VNEXT_S0A_PUBLIC_API_ADDED_COUNT,
             "added_items_sha256": VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
             "excluded_non_public_owner_members": 1,
             "unsupported_syntax_count": 0,
@@ -3582,7 +3583,8 @@ def validate_vnext_g01a_s0a_provenance(
         == {"path": "public-api-migrations.json", "sha256": migration_digest}
         and owner_map_migration.get("sha256") == migration_digest
         and owner_map_migration.get("migration_count") == 14
-        and owner_map_migration.get("expected_added_items") == 1068
+        and owner_map_migration.get("expected_added_items")
+        == VNEXT_S0A_PUBLIC_API_ADDED_COUNT
         and owner_map_migration.get("expected_added_items_sha256")
         == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
         "vnext-g01a S0A public owner migration evidence mismatch",
@@ -3726,7 +3728,8 @@ def validate_vnext_g01a_s0a_provenance(
         and contract_summary.get("multi_module_scc_count") == 0
         and contract_summary.get("test_target_count") == 28
         and contract_summary.get("semantic_change_count") == 14
-        and contract_summary.get("added_public_item_count") == 1068
+        and contract_summary.get("added_public_item_count")
+        == VNEXT_S0A_PUBLIC_API_ADDED_COUNT
         and contract_summary.get("added_public_item_sha256")
         == VNEXT_S0A_PUBLIC_API_ADDED_SHA256,
         "vnext-g01a S0A contract map acceptance mismatch",
