@@ -267,7 +267,11 @@ fn analyze(profile: SyntheticLifecycleProfile) -> LifecycleAnalysis {
         work.clone(),
     );
     let request_only = snapshot(&mut snapshots, &root, LifecycleStage::Request);
-    assert!(request_only.request > 0);
+    assert_eq!(
+        request_only.request, 0,
+        "product I/O is Step-scoped; Request authority need not retain physical backing"
+    );
+    assert_eq!(request_only.request_bytes, 0);
     assert_eq!(request_only.sequence, 0);
 
     let mut sequences = Vec::with_capacity(CHILD_SEQUENCE_COUNT);

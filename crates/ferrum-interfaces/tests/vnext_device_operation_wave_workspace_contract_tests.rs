@@ -444,13 +444,15 @@ fn replayed_only_policy_rejects_an_eager_wave_before_provider_encoding() {
         &reaper,
     )
     .unwrap_err();
-    assert!(matches!(
-        error,
-        SubmissionWaveDispatchError::Contract(ref error)
-            if error.to_string().contains(
-                "replayed-only submission requires one sealed reusable execution program"
-            )
-    ));
+    match &error {
+        SubmissionWaveDispatchError::Contract(error) => assert!(
+            error.to_string().contains(
+                "replay-required submission requires one sealed reusable execution program"
+            ),
+            "unexpected replayed-only rejection: {error}"
+        ),
+        other => panic!("unexpected replayed-only dispatch error: {other:?}"),
+    }
     assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
     assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
     assert_eq!(lane.in_flight_count(), 0);

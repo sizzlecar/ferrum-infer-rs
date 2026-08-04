@@ -845,12 +845,6 @@ impl VNextProductOutputMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VNextProductTokenMaskKey {
-    AllValid,
-    Selection { fingerprint: u64, source_len: usize },
-}
-
 #[derive(Debug, Clone, Copy)]
 struct VNextProductRepetitionInput<'a> {
     token_ids: &'a [u32],
@@ -886,52 +880,6 @@ fn product_output_mode_for_policies<'a>(
         VNextProductOutputMode::GreedyToken
     } else {
         VNextProductOutputMode::FullLogits
-    }
-}
-
-fn product_token_mask_key(
-    policy: Option<&LogitsReturnPolicy>,
-    output_mode: VNextProductOutputMode,
-) -> VNextProductTokenMaskKey {
-    if output_mode == VNextProductOutputMode::GreedyToken {
-        if let Some(LogitsReturnPolicy::GreedyArgmax {
-            token_mask: Some(token_mask),
-            ..
-        }) = policy
-        {
-            return VNextProductTokenMaskKey::Selection {
-                fingerprint: token_mask.fingerprint,
-                source_len: token_mask.len(),
-            };
-        }
-    }
-    VNextProductTokenMaskKey::AllValid
-}
-
-fn token_mask_upload_required(
-    cached: Option<VNextProductTokenMaskKey>,
-    requested: VNextProductTokenMaskKey,
-) -> bool {
-    cached != Some(requested)
-}
-
-#[derive(Debug, Default)]
-struct VNextProductTokenMaskResidency {
-    committed: Option<VNextProductTokenMaskKey>,
-}
-
-impl VNextProductTokenMaskResidency {
-    fn prepare_upload(&mut self, requested: VNextProductTokenMaskKey) -> bool {
-        let upload_required = token_mask_upload_required(self.committed, requested);
-        if upload_required {
-            // The upload is not resident until its submission reaches terminal success.
-            self.committed = None;
-        }
-        upload_required
-    }
-
-    fn commit(&mut self, key: VNextProductTokenMaskKey) {
-        self.committed = Some(key);
     }
 }
 
@@ -2422,7 +2370,6 @@ struct VNextSequence<R: DeviceRuntime> {
     product_prompt_tokens: u64,
     replayed_output_tokens: u64,
     prefill_tokens_processed: AtomicUsize,
-    product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
 }
 
 struct PreparedVNextPrefill<R: DeviceRuntime> {
@@ -4928,7 +4875,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             product_prompt_tokens,
             replayed_output_tokens,
             prefill_tokens_processed: AtomicUsize::new(0),
-            product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
         });
 
         Ok(VNextPrefillProbeResolution::Ready(sequence))
@@ -6463,24 +6409,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .and_then(VNextCheckpointCapture::claim_decode_wave),
         };
         let output_mode = Self::product_output_mode(participants, kind);
-        let token_mask_keys = participants
-            .iter()
-            .map(|participant| product_token_mask_key(participant.logits_policy, output_mode))
-            .collect::<Vec<_>>();
-        // Program inputs have Request lifetime. Their residency proof must have
-        // the same owner: an Invocation lane slot can be reused by another
-        // request whose backing has never received this mask.
-        let token_mask_uploads = participants
-            .iter()
-            .zip(&token_mask_keys)
-            .map(|(participant, requested)| {
-                participant
-                    .sequence
-                    .product_token_mask_residency
-                    .lock()
-                    .prepare_upload(*requested)
-            })
-            .collect::<Vec<_>>();
+        // Product inputs use lane-shared Step slices. Another wave may overwrite
+        // the same slice, so request-owned residency cannot prove the mask is
+        // still present. Refresh every participant before each submission.
+        let token_mask_uploads = vec![true; participants.len()];
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
         let dispatch = {
@@ -6873,23 +6805,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.metrics
             .readback_bytes
             .fetch_add(readback_bytes, Ordering::Relaxed);
-        for (participant, key) in participants.iter().zip(&token_mask_keys) {
-            participant
-                .sequence
-                .product_token_mask_residency
-                .lock()
-                .commit(*key);
-        }
-        for uploaded in token_mask_uploads {
-            if uploaded {
-                self.metrics
-                    .token_mask_upload_participants
-                    .fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.metrics
-                    .token_mask_cache_hit_participants
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+        for _ in token_mask_uploads {
+            self.metrics
+                .token_mask_upload_participants
+                .fetch_add(1, Ordering::Relaxed);
         }
         let (sparse_repetition_participants, sparse_repetition_token_ids) = participants
             .iter()
@@ -8885,14 +8804,13 @@ mod tests {
     use super::{
         decode_output_width, decode_selected_token, nonterminal_completion_message,
         normalized_product_token_mask, product_output_mode_for_policies, product_repetition_input,
-        product_token_mask_key, reported_allocated_bytes, resolve_reusable_execution_policy,
+        reported_allocated_bytes, resolve_reusable_execution_policy,
         resolve_runtime_attention_authority, resolved_sequence_fit_policy,
         reusable_executable_inventory_matches, reusable_execution_program_catalog_is_usable,
         reusable_execution_requires_eager_fallback, submission_execution_policy_for_timing,
-        token_mask_upload_required, validate_sequence_completion_accounting, AdmissionFitPolicy,
-        DecodeFailureDisposition, FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics,
-        VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics,
-        VNextProductOutputMode, VNextProductTokenMaskKey, VNextProductTokenMaskResidency,
+        validate_sequence_completion_accounting, AdmissionFitPolicy, DecodeFailureDisposition,
+        FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
+        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
         VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
         VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
@@ -9464,74 +9382,6 @@ mod tests {
         assert_eq!(
             normalized_product_token_mask(None, VNextProductOutputMode::GreedyToken, 3),
             [1, 1, 1]
-        );
-    }
-
-    #[test]
-    fn product_token_mask_key_changes_only_with_effective_policy_source() {
-        let first = LogitsReturnPolicy::GreedyArgmax {
-            token_mask: Some(TokenSelectionMask::new(vec![1, 0, 1])),
-            repetition_penalty: None,
-        };
-        let second = first.clone();
-        let changed = LogitsReturnPolicy::GreedyArgmax {
-            token_mask: Some(TokenSelectionMask::new(vec![1, 1, 1])),
-            repetition_penalty: None,
-        };
-        let first_key = product_token_mask_key(Some(&first), VNextProductOutputMode::GreedyToken);
-        assert!(matches!(
-            first_key,
-            VNextProductTokenMaskKey::Selection { source_len: 3, .. }
-        ));
-        assert_eq!(
-            first_key,
-            product_token_mask_key(Some(&second), VNextProductOutputMode::GreedyToken)
-        );
-        assert_ne!(
-            first_key,
-            product_token_mask_key(Some(&changed), VNextProductOutputMode::GreedyToken)
-        );
-        assert_eq!(
-            product_token_mask_key(Some(&first), VNextProductOutputMode::FullLogits),
-            VNextProductTokenMaskKey::AllValid
-        );
-        assert!(token_mask_upload_required(None, first_key));
-        assert!(!token_mask_upload_required(Some(first_key), first_key));
-        assert!(token_mask_upload_required(
-            Some(VNextProductTokenMaskKey::AllValid),
-            first_key
-        ));
-    }
-
-    #[test]
-    fn product_token_mask_residency_is_request_owned_and_fail_closed() {
-        let selection = VNextProductTokenMaskKey::Selection {
-            fingerprint: 7,
-            source_len: 3,
-        };
-
-        let mut request_a = VNextProductTokenMaskResidency::default();
-        assert!(request_a.prepare_upload(selection));
-        request_a.commit(selection);
-        assert!(!request_a.prepare_upload(selection));
-
-        // A new request may reuse the same Invocation lane slot, but it owns a
-        // different Request-lifetime input backing and must upload once.
-        let mut request_b = VNextProductTokenMaskResidency::default();
-        assert!(request_b.prepare_upload(selection));
-
-        let mut phase_transition = VNextProductTokenMaskResidency::default();
-        assert!(phase_transition.prepare_upload(VNextProductTokenMaskKey::AllValid));
-        phase_transition.commit(VNextProductTokenMaskKey::AllValid);
-        assert!(phase_transition.prepare_upload(selection));
-
-        let mut failed_upload = VNextProductTokenMaskResidency::default();
-        assert!(failed_upload.prepare_upload(selection));
-        failed_upload.commit(selection);
-        assert!(failed_upload.prepare_upload(VNextProductTokenMaskKey::AllValid));
-        assert!(
-            failed_upload.prepare_upload(VNextProductTokenMaskKey::AllValid),
-            "an uncommitted upload must not become resident after failure"
         );
     }
 

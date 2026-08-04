@@ -633,6 +633,17 @@ impl DynamicResourceDescriptor {
             ));
         }
         demand.validate()?;
+        if matches!(
+            &demand,
+            DynamicResourceDemand::ActualSequences {
+                maximum_sequences,
+                ..
+            } if *maximum_sequences != theoretical_maximum_instances
+        ) {
+            return Err(invalid_plan(
+                "actual-sequence demand and descriptor instance ceilings differ",
+            ));
+        }
         let pool_id = DynamicBackingPoolId::from_compatibility(&PoolCompatibilityKey::new(
             &storage,
             usage,
@@ -744,6 +755,19 @@ impl DynamicResourceDescriptor {
 
     pub fn theoretical_maximum_request_bytes(&self) -> Result<u64, VNextError> {
         self.evaluate_request_bytes_for_shape(self.demand.theoretical_maximum_shape())
+    }
+
+    /// Conservative maximum physical residency for this resource across all
+    /// live instances. Sequence-shaped claims share the plan's global active
+    /// sequence ceiling, so multiplying a full-batch claim by that ceiling
+    /// would count the same participants twice. Splitting every participant
+    /// into its own claim is the physical-padding worst case.
+    pub(super) fn theoretical_maximum_resident_bytes(&self) -> Result<u128, VNextError> {
+        let per_instance_bytes = match self.demand {
+            DynamicResourceDemand::ActualSequences { .. } => self.minimum_request_bytes()?,
+            _ => self.theoretical_maximum_request_bytes()?,
+        };
+        Ok(u128::from(per_instance_bytes) * u128::from(self.theoretical_maximum_instances))
     }
 
     pub const fn alignment_bytes(&self) -> u64 {

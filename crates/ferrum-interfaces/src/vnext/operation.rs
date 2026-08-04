@@ -21,6 +21,9 @@ mod weight_contract;
 mod workspace_encoding;
 
 pub use attribute::{AttributeConstraint, AttributeSchema, AttributeSpec};
+pub(crate) use buffer_view::{
+    translate_step_participant_readback_range, translate_step_participant_upload_range,
+};
 pub use buffer_view::{
     OperationBufferRegionIter, OperationBufferRegions, OperationBufferStorageKind,
     OperationBufferView, OperationPhysicalRegion,

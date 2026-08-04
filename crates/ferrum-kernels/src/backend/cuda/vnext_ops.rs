@@ -1077,6 +1077,8 @@ fn encode_token_embedding(
     if token_ranges.len() != invocation.participants().len() {
         return Err("CUDA token embedding participant ranges are incomplete".to_owned());
     }
+    let input_packed =
+        transformer::token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
     let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
@@ -1100,7 +1102,11 @@ fn encode_token_embedding(
             participant,
             token_ids,
             ElementType::U32,
-            source_range.start,
+            if input_packed {
+                packed_range.start
+            } else {
+                source_range.start
+            },
             token_count,
         )?);
         regions.push(contiguous_token_region(

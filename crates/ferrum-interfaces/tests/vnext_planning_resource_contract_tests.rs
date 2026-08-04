@@ -383,9 +383,25 @@ fn minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak() {
         intermediate.theoretical_maximum_request_bytes().unwrap(),
         16
     );
-    assert_eq!(memory.minimum_request_bytes(), 32);
+    for resource_id in ["resource.sequential.input", "resource.sequential.output"] {
+        let descriptor = memory
+            .dynamic_descriptors()
+            .iter()
+            .find(|descriptor| descriptor.base_resource_id().as_str() == resource_id)
+            .unwrap();
+        assert_eq!(descriptor.lifetime(), AllocationLifetime::Step);
+        assert!(matches!(
+            descriptor.demand(),
+            DynamicResourceDemand::ActualSequences {
+                bytes_per_sequence: 16,
+                maximum_sequences: 3,
+            }
+        ));
+        assert_eq!(descriptor.theoretical_maximum_instances(), 3);
+    }
+    assert_eq!(memory.minimum_request_bytes(), 0);
     assert_eq!(memory.minimum_sequence_bytes(), 16);
-    assert_eq!(memory.minimum_step_bytes(), 16);
+    assert_eq!(memory.minimum_step_bytes(), 48);
     assert_eq!(memory.minimum_invocation_peak_bytes(), 96);
     assert_eq!(memory.minimum_runnable_request_bytes(), 160);
 }

@@ -3,24 +3,25 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Instant;
 
 use super::{
-    classify_device_error, defer_device_cleanup, BackingInitializationEncodeError,
-    BatchOperationIdentity, BatchParticipantAuthority, BufferUsage, CopyRegion,
-    DeferredDeviceCleanupDisposition, DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask,
-    DefinitelyNotSubmittedRetryAuthority, DefinitelyNotSubmittedWaveRetryAuthority,
-    DeviceCommandBatch, DeviceDescriptor, DeviceExecutionTiming, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram, DeviceRuntime,
-    DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink, DeviceTerminal,
-    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
-    HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
-    NodeId, PreparedStepSubmissionWave, RequestStateHazardTerminalDisposition, ResourceId,
-    StreamState, VNextError,
+    classify_device_error, defer_device_cleanup, translate_step_participant_readback_range,
+    AllocationKind, AllocationLifetime, BackingInitializationEncodeError, BatchOperationIdentity,
+    BatchParticipantAuthority, BufferUsage, CopyRegion, DeferredDeviceCleanupDisposition,
+    DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask, DefinitelyNotSubmittedRetryAuthority,
+    DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceDescriptor,
+    DeviceExecutionTiming, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionProgram, DeviceRuntime, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId,
+    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
+    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave,
+    RequestStateHazardTerminalDisposition, ResourceId, StreamState, VNextError,
 };
 
 mod readback_collection;
@@ -1481,6 +1482,51 @@ impl<R: DeviceRuntime> CompletionResourceLease<R> {
                     resource_id,
                 )
             }
+        }
+    }
+
+    fn readback_range(
+        &self,
+        node_id: &NodeId,
+        participant_index: u32,
+        resource_id: &ResourceId,
+        semantic_range: Range<u64>,
+    ) -> Result<Range<u64>, VNextError> {
+        let participant_index = usize::try_from(participant_index).map_err(|_| {
+            invalid_completion("completion readback participant index exceeds host address space")
+        })?;
+        let (step, work_shape) = match self {
+            Self::Invocation(invocation) => {
+                if invocation.node_id() != node_id {
+                    return Err(invalid_completion(
+                        "completion readback node differs from its invocation",
+                    ));
+                }
+                (invocation.step_resources(), invocation.work_shape())
+            }
+            Self::Wave(wave) => {
+                let node = wave
+                    .nodes()
+                    .iter()
+                    .find(|node| node.node_id() == node_id)
+                    .ok_or_else(|| {
+                        invalid_completion("completion readback node is absent from its wave")
+                    })?;
+                (wave.step_resources(), node.work_shape())
+            }
+        };
+        let descriptor = step.dynamic_descriptor(resource_id)?;
+        if descriptor.lifetime() == AllocationLifetime::Step
+            && descriptor.kind() == &AllocationKind::Value
+        {
+            translate_step_participant_readback_range(
+                descriptor.demand(),
+                work_shape,
+                participant_index,
+                semantic_range,
+            )
+        } else {
+            Ok(semantic_range)
         }
     }
 }
@@ -3064,6 +3110,40 @@ fn attempt_completion_readback<R: DeviceRuntime>(
     ) {
         return CompletionReadbackDisposition::NotAttempted(request);
     }
+    let byte_len = match request.output_layout().byte_len() {
+        Ok(byte_len) => byte_len,
+        Err(error) => {
+            return CompletionReadbackDisposition::ContractFailedButQuiescent {
+                request,
+                failure: QuiescentCompletionContractFailure::new(error.to_string()),
+            };
+        }
+    };
+    let semantic_end = match request.logical_offset_bytes().checked_add(byte_len) {
+        Some(end) => end,
+        None => {
+            return CompletionReadbackDisposition::ContractFailedButQuiescent {
+                request,
+                failure: QuiescentCompletionContractFailure::new(
+                    "completion readback semantic range overflows u64",
+                ),
+            };
+        }
+    };
+    let readback_range = match resources.readback_range(
+        request.node_id(),
+        request.participant_index(),
+        request.resource_id(),
+        request.logical_offset_bytes()..semantic_end,
+    ) {
+        Ok(range) => range,
+        Err(error) => {
+            return CompletionReadbackDisposition::ContractFailedButQuiescent {
+                request,
+                failure: QuiescentCompletionContractFailure::new(error.to_string()),
+            };
+        }
+    };
     let backing = match resources.backing_view(
         request.node_id(),
         request.participant_index(),
@@ -3081,7 +3161,7 @@ fn attempt_completion_readback<R: DeviceRuntime>(
         lane.readback_buffer(
             &backing,
             request.expected_usage(),
-            request.logical_offset_bytes(),
+            readback_range.start,
             request.output_layout(),
             timing_mode,
         )

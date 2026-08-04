@@ -614,20 +614,30 @@ fn activation_resource(
     (component.resource_id().clone(), descriptor.lifetime())
 }
 
-fn token_logical_offset(lifetime: AllocationLifetime, range: &BatchParticipantTokenRange) -> u64 {
+fn token_upload_logical_offset(range: &BatchParticipantTokenRange) -> u64 {
+    let start = range.source_token_range().start;
+    start
+        .checked_mul(IN_FEATURES)
+        .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+        .expect("mixed L1 token offset must fit u64")
+}
+
+fn token_readback_logical_offset(
+    lifetime: AllocationLifetime,
+    range: &BatchParticipantTokenRange,
+) -> u64 {
     let start = match lifetime {
-        AllocationLifetime::Step | AllocationLifetime::Invocation => {
-            range.immediate_token_range().start
-        }
+        AllocationLifetime::Step => 0,
+        AllocationLifetime::Invocation => range.immediate_token_range().start,
         AllocationLifetime::Request | AllocationLifetime::Sequence => {
             range.source_token_range().start
         }
         AllocationLifetime::Plan => panic!("mixed L1 token activation cannot be plan-lifetime"),
     };
     start
-        .checked_mul(IN_FEATURES)
+        .checked_mul(OUT_FEATURES)
         .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
-        .expect("mixed L1 token offset must fit u64")
+        .expect("mixed L1 token readback offset must fit u64")
 }
 
 fn execute_reference_batch(
@@ -702,6 +712,26 @@ fn execute_reference_batch(
         activation_resource(plan, token_node, ResolvedValueRole::Input, 0);
     let (token_output_resource, token_output_lifetime) =
         activation_resource(plan, token_node, ResolvedValueRole::Output, 0);
+    assert_eq!(token_input_lifetime, AllocationLifetime::Step);
+    assert_eq!(token_output_lifetime, AllocationLifetime::Step);
+    assert!(plan
+        .payload()
+        .terminal_output_resources()
+        .contains(&token_output_resource));
+    let terminal_slots = plan
+        .payload()
+        .memory()
+        .dynamic_pools()
+        .iter()
+        .flat_map(|pool| pool.step_resource_slots())
+        .filter(|slot| slot.resource_ids().contains(&token_output_resource))
+        .collect::<Vec<_>>();
+    assert_eq!(terminal_slots.len(), 1);
+    assert_eq!(terminal_slots[0].kind(), StepResourceSlotKind::Dedicated);
+    assert_eq!(
+        terminal_slots[0].resource_ids(),
+        std::slice::from_ref(&token_output_resource)
+    );
     let fixed_bytes = encode_f16_rows(&vec![[0.25, -0.5]; MIXED_ROWS_USIZE], 0..MIXED_ROWS);
     let mut uploads = Vec::with_capacity(canonical_cases.len() * 2);
     for (participant_index, (case, token_range)) in
@@ -725,7 +755,7 @@ fn execute_reference_batch(
                 token_node.id().clone(),
                 participant_index,
                 0,
-                token_logical_offset(token_input_lifetime, token_range),
+                token_upload_logical_offset(token_range),
                 HostTransferLayout::new(
                     ElementType::F16,
                     case.span.immediate_tokens() * IN_FEATURES,
@@ -745,7 +775,7 @@ fn execute_reference_batch(
                     token_node.id().clone(),
                     u32::try_from(participant_index).unwrap(),
                     token_output_resource.clone(),
-                    token_logical_offset(token_output_lifetime, token_range),
+                    token_readback_logical_offset(token_output_lifetime, token_range),
                     HostTransferLayout::new(
                         ElementType::F16,
                         token_range.immediate_tokens() * OUT_FEATURES,

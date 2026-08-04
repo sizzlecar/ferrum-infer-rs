@@ -11,16 +11,16 @@ use super::{
     BatchInvocationId, BatchParticipantAuthority, BatchParticipantTokenSpan, BatchStepId,
     BatchWorkShape, ClaimedBackingTransaction, ClaimedSubmissionWaveBacking,
     DeferredDeviceCleanupDomainId, DeviceCommandBatch, DeviceRuntime, Digest,
-    DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, ExecutionLane, ExecutionLaneId,
-    InvocationRegistry, InvocationResourceAdmissionRequest, LaneBackingPrepareDecision,
-    LogicalAdmissionCoordinatorId, LogicalBackingBufferView, LogicalBackingSliceAuthority,
-    LogicalBatchCapacityLease, NodeId, Ordering, ParticipantFlightCandidate,
-    ParticipantFlightPhase, ParticipantNodeKey, PlanBackingDeferral, PlanCapacityWaitRegistration,
-    PreparedParticipantFlightHold, PreparedSubmissionWaveParticipantFlightHold,
-    RequestStateHazardAcquireDecision, RequestStateHazardDeferral, RequestStateHazardPermit,
-    RequestStateHazardPoison, RequestStateHazardSplitRequired,
-    RequestStateHazardTerminalDisposition, ResourceId, SequenceAuthorityId,
-    SequenceBackingSnapshot, SequenceRecoveryRegistry, SequenceSessionEpoch,
+    DynamicBackingDeferred, DynamicDeferredMaintenanceOutcome, DynamicResourceDescriptor,
+    ExecutionLane, ExecutionLaneId, InvocationRegistry, InvocationResourceAdmissionRequest,
+    LaneBackingPrepareDecision, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSliceAuthority, LogicalBatchCapacityLease, NodeId, Ordering,
+    ParticipantFlightCandidate, ParticipantFlightPhase, ParticipantNodeKey, PlanBackingDeferral,
+    PlanCapacityWaitRegistration, PreparedParticipantFlightHold,
+    PreparedSubmissionWaveParticipantFlightHold, RequestStateHazardAcquireDecision,
+    RequestStateHazardDeferral, RequestStateHazardPermit, RequestStateHazardPoison,
+    RequestStateHazardSplitRequired, RequestStateHazardTerminalDisposition, ResourceId,
+    SequenceAuthorityId, SequenceBackingSnapshot, SequenceRecoveryRegistry, SequenceSessionEpoch,
     SequenceSessionFingerprint, Serialize, Sha256, StateInitialization, StaticProvisioningLease,
     StepFinalizationFailure, StepFrameFinalization, StepParticipantFrameAssignment,
     StepParticipantRetirement, StepParticipantRetirementDisposition, StepResourceLease,
@@ -774,6 +774,36 @@ where
         Err(invalid_resource(format!(
             "resource `{resource_id}` is not step-shared backing"
         )))
+    }
+
+    pub(crate) fn dynamic_descriptor(
+        &self,
+        resource_id: &ResourceId,
+    ) -> Result<&DynamicResourceDescriptor, VNextError> {
+        let pools = self.participants[0]
+            .session
+            .resources()
+            .request
+            .plan
+            .dynamic_pools();
+        let mut matches = pools.domains.iter().filter_map(|domain| {
+            domain
+                .descriptors
+                .binary_search_by(|descriptor| descriptor.base_resource_id().cmp(resource_id))
+                .ok()
+                .map(|index| &domain.descriptors[index])
+        });
+        let descriptor = matches.next().ok_or_else(|| {
+            invalid_resource(format!(
+                "resource `{resource_id}` has no dynamic plan descriptor"
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(invalid_resource(format!(
+                "resource `{resource_id}` has duplicate dynamic plan descriptors"
+            )));
+        }
+        Ok(descriptor)
     }
 
     pub(crate) fn participant_backing_views(

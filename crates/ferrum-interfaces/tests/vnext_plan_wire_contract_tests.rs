@@ -119,15 +119,24 @@ fn legacy_schema_is_rejected_before_v8_provider_execution_validation() {
     weight.as_object_mut().unwrap().remove("weight");
 
     let error = ExecutionPlan::decode_untrusted(&serde_json::to_vec(&value).unwrap()).unwrap_err();
-    assert!(matches!(
-        error,
-        VNextError::UnsupportedPlanSchema {
-            expected_major: 8,
-            expected_minor: 0,
-            actual_major: 3,
-            actual_minor: 0,
-        }
-    ));
+    let VNextError::UnsupportedPlanSchema {
+        expected_major,
+        expected_minor,
+        actual_major,
+        actual_minor,
+    } = error
+    else {
+        panic!("legacy schema produced the wrong error: {error}");
+    };
+    assert_eq!(
+        (expected_major, expected_minor, actual_major, actual_minor),
+        (
+            EXECUTION_PLAN_SCHEMA.major,
+            EXECUTION_PLAN_SCHEMA.minor,
+            3,
+            0,
+        )
+    );
 }
 
 #[test]

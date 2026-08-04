@@ -560,6 +560,25 @@ fn completion_retention_binds_one_typed_output_and_requires_expected_wire_policy
     assert_eq!(checkpoint.producer_node_id(), &id("node.main"));
     assert_eq!(checkpoint.output_ordinal(), 0);
     assert_eq!(checkpoint.tensor().dimensions(), &[4]);
+    assert_eq!(
+        plan.payload().terminal_output_resources(),
+        std::slice::from_ref(checkpoint.resource_id())
+    );
+    let output_descriptor = plan
+        .payload()
+        .memory()
+        .dynamic_descriptors()
+        .iter()
+        .find(|descriptor| descriptor.base_resource_id() == checkpoint.resource_id())
+        .unwrap();
+    assert_eq!(output_descriptor.lifetime(), AllocationLifetime::Step);
+    assert!(matches!(
+        output_descriptor.demand(),
+        DynamicResourceDemand::ActualSequences {
+            bytes_per_sequence: 16,
+            maximum_sequences: 3,
+        }
+    ));
     let readback = checkpoint
         .readback_request(3, HostTransferLayout::new(ElementType::F32, 4).unwrap())
         .unwrap();

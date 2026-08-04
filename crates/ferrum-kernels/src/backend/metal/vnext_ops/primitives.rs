@@ -28,8 +28,9 @@ use super::{
     contiguous_token_region, ensure_invocation, estimate_without_workspace, f16_contiguous,
     implementation_fingerprint, invalid_plan, provider_descriptor, provider_failure,
     rational_attribute, shared_full_region, shared_scratch_region, shared_token_region,
-    unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q6_K_FORMAT_ID,
-    Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
+    token_binding_is_packed, unsigned_attribute, DENSE_SAFETENSORS_FORMAT_ID,
+    GGUF_NATIVE_BLOCK_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP,
+    VALUE_ALIGNMENT_BYTES,
 };
 
 const SHADER_SOURCE: &str = include_str!("primitives.metal");
@@ -421,6 +422,7 @@ fn encode_token_embedding(
     if token_ranges.len() != invocation.participants().len() {
         return Err("Metal token embedding participant ranges are incomplete".to_owned());
     }
+    let input_packed = token_binding_is_packed(&invocation, ResolvedValueRole::Input, 0)?;
     let mut regions = Vec::with_capacity(invocation.participants().len() * 3);
     let mut launches = Vec::with_capacity(invocation.participants().len());
     for (participant, token_range) in invocation.participants().iter().zip(token_ranges) {
@@ -442,7 +444,11 @@ fn encode_token_embedding(
             participant,
             token_ids,
             ElementType::U32,
-            token_range.source_token_range().start,
+            if input_packed {
+                token_range.immediate_token_range().start
+            } else {
+                token_range.source_token_range().start
+            },
             token_range.immediate_tokens(),
         )?);
         regions.push(contiguous_token_region(

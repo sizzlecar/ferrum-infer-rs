@@ -7,9 +7,9 @@ use super::{
     validate_semantic_binding, workspace_base_id, workspace_storage_layout_fingerprint,
     AliasPolicy, AllocationKind, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage,
     CanonicalValueBinding, CapabilityCatalog, CapabilityId, DimensionConstraint,
-    DynamicResourceDescriptor, DynamicStorageContract, DynamicStorageProfile,
-    DynamicStorageRequirement, ElementType, ExecutionPlanPayload, GlobalValueRange,
-    JointComponentSolution, JointPartialSelection, JointProviderCandidate,
+    DynamicResourceDemand, DynamicResourceDescriptor, DynamicStorageContract,
+    DynamicStorageProfile, DynamicStorageRequirement, ElementType, ExecutionPlanPayload,
+    GlobalValueRange, JointComponentSolution, JointPartialSelection, JointProviderCandidate,
     JointProviderStorageSelection, JointSelectionObjective, MemoryPlan, NodeId,
     NodeTokenBindingProjection, NodeWorkContract, OperationDescriptor, OperationRegistryAuthority,
     PlanBuildRequest, PlanExactAlias, PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId,
@@ -182,9 +182,19 @@ impl ExecutionPlan {
         Self::validate_global_storage_aliasing(&canonical_values, &nodes)?;
         let retained_completion_values =
             resolve_retained_completion_values(&nodes, &request.completion_retention)?;
+        let terminal_output_resources = nodes
+            .iter()
+            .flat_map(|node| node.values())
+            .filter(|binding| program_outputs.contains(binding.value_id()))
+            .flat_map(|binding| binding.storage().components())
+            .map(|component| component.resource_id().clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         let retained_completion_resources = retained_completion_values
             .iter()
             .map(|value| value.resource_id().clone())
+            .chain(terminal_output_resources.iter().cloned())
             .collect::<BTreeSet<_>>();
         let memory = Self::build_memory_plan(
             family,
@@ -215,6 +225,7 @@ impl ExecutionPlan {
             weight_format,
             quantization_formats,
             retained_completion_values,
+            terminal_output_resources,
             nodes,
             memory,
         };
@@ -1543,6 +1554,7 @@ impl ExecutionPlan {
                         binding.usage(),
                         end,
                         token_projection,
+                        maximum_active_sequences,
                         maximum_scheduled_tokens,
                         &program_inputs,
                         &program_outputs,
@@ -1796,7 +1808,8 @@ impl ExecutionPlan {
                     )?;
                     dynamic_descriptors.push(DynamicResourceDescriptor::new(
                         resource_id,
-                        demand.dynamic_demand(accumulator.end_bytes)?,
+                        demand
+                            .dynamic_demand(accumulator.end_bytes, accumulator.alignment_bytes)?,
                         accumulator.alignment_bytes,
                         accumulator.usage,
                         accumulator.element_type,
@@ -1830,6 +1843,7 @@ impl ExecutionPlan {
         usage: BufferUsage,
         minimum_bytes: u64,
         token_projection: Option<(u64, u64)>,
+        maximum_active_sequences: u32,
         maximum_scheduled_tokens: u64,
         program_inputs: &BTreeSet<ProgramValueId>,
         program_outputs: &BTreeSet<ProgramValueId>,
@@ -1853,12 +1867,9 @@ impl ExecutionPlan {
                     "non-state value `{value_id}` is not backed by activation memory"
                 )));
             }
-            let lifetime =
-                if program_inputs.contains(value_id) || program_outputs.contains(value_id) {
-                    AllocationLifetime::Request
-                } else {
-                    AllocationLifetime::Step
-                };
+            let is_product_io =
+                program_inputs.contains(value_id) || program_outputs.contains(value_id);
+            let lifetime = AllocationLifetime::Step;
             if let Some((bytes_per_token, canonical_tokens)) = token_projection {
                 if bytes_per_token == 0 || canonical_tokens == 0 {
                     return Err(invalid_plan(
@@ -1874,6 +1885,12 @@ impl ExecutionPlan {
                     lifetime,
                     bytes_per_token,
                     maximum_tokens,
+                });
+            }
+            if is_product_io {
+                return Ok(ValueResourceDemand::ParticipantFixed {
+                    lifetime,
+                    maximum_participants: maximum_active_sequences,
                 });
             }
             return Ok(ValueResourceDemand::Fixed { lifetime });
@@ -1990,11 +2007,23 @@ impl ExecutionPlan {
                 "retained completion values are not derived from plan outputs",
             ));
         }
+        if self.payload.terminal_output_resources.is_empty()
+            || self
+                .payload
+                .terminal_output_resources
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid_plan(
+                "terminal output resource evidence is empty or non-canonical",
+            ));
+        }
         let retained_completion_resources = self
             .payload
             .retained_completion_values
             .iter()
             .map(|value| value.resource_id().clone())
+            .chain(self.payload.terminal_output_resources.iter().cloned())
             .collect::<BTreeSet<_>>();
         self.payload.memory.validate()?;
         let dynamic_capacity_bytes = self
@@ -2366,7 +2395,14 @@ impl ExecutionPlan {
                 "retained completion resource element type differs from its tensor",
             ));
         }
-        let byte_len = descriptor.evaluate_logical_request_bytes(work)?;
+        let byte_len = match descriptor.demand() {
+            // ParticipantFixed uses an aligned physical stride. Completion is
+            // semantic and must not expose or copy that padding to the host.
+            DynamicResourceDemand::ActualSequences { .. } => {
+                checkpoint.tensor().minimum_storage_bytes()?
+            }
+            _ => descriptor.evaluate_logical_request_bytes(work)?,
+        };
         let element_bytes = checkpoint.tensor().element_type().size_bytes();
         if byte_len % element_bytes != 0 {
             return Err(invalid_plan(

@@ -1,9 +1,9 @@
 use super::{
-    invalid_plan, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage, DynamicBackingPoolSpec,
-    DynamicResourceDemand, DynamicResourceDescriptor, DynamicStorageProfile, ElementType,
-    InvocationLivenessMode, InvocationResourceLiveness, NodeId, PlanNode, ProgramValueId,
-    ProviderId, ProviderResourcePlan, RejectedProvider, ResolvedTensorSpec, ResolvedValueStorage,
-    ResourceId, StateId, StateInitialization, VNextError,
+    align_up, invalid_plan, AllocationLifetime, BTreeMap, BTreeSet, BufferUsage,
+    DynamicBackingPoolSpec, DynamicResourceDemand, DynamicResourceDescriptor,
+    DynamicStorageProfile, ElementType, InvocationLivenessMode, InvocationResourceLiveness, NodeId,
+    PlanNode, ProgramValueId, ProviderId, ProviderResourcePlan, RejectedProvider,
+    ResolvedTensorSpec, ResolvedValueStorage, ResourceId, StateId, StateInitialization, VNextError,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +367,10 @@ pub(super) enum ValueResourceDemand {
     Fixed {
         lifetime: AllocationLifetime,
     },
+    ParticipantFixed {
+        lifetime: AllocationLifetime,
+        maximum_participants: u32,
+    },
     TokenScaled {
         lifetime: AllocationLifetime,
         bytes_per_token: u64,
@@ -378,19 +382,29 @@ impl ValueResourceDemand {
     pub(super) fn lifetime(self) -> Option<AllocationLifetime> {
         match self {
             Self::PlanStatic => None,
-            Self::Fixed { lifetime } | Self::TokenScaled { lifetime, .. } => Some(lifetime),
+            Self::Fixed { lifetime }
+            | Self::ParticipantFixed { lifetime, .. }
+            | Self::TokenScaled { lifetime, .. } => Some(lifetime),
         }
     }
 
     pub(super) fn dynamic_demand(
         self,
         fixed_bytes: u64,
+        alignment_bytes: u64,
     ) -> Result<DynamicResourceDemand, VNextError> {
         match self {
             Self::PlanStatic => Err(invalid_plan(
                 "plan-static value cannot produce a dynamic demand",
             )),
             Self::Fixed { .. } => DynamicResourceDemand::fixed(fixed_bytes),
+            Self::ParticipantFixed {
+                maximum_participants,
+                ..
+            } => DynamicResourceDemand::actual_sequences(
+                align_up(fixed_bytes, alignment_bytes)?,
+                maximum_participants,
+            ),
             Self::TokenScaled {
                 bytes_per_token,
                 maximum_tokens,
