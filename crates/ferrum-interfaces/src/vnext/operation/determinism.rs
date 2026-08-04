@@ -87,7 +87,7 @@ pub struct SubmissionWaveDeterminismRestoreLayout {
     witness_plan: ExecutionDeterminismWitnessPlan,
     batch_invocation_id: BatchInvocationId,
     claimed_backing_fingerprint: String,
-    node_work_shape_fingerprints: Vec<String>,
+    node_logical_work_fingerprints: Vec<String>,
     participant_initialization_ranges: Vec<Vec<SubmissionWaveDeterminismLogicalRange>>,
     witness_participant_ranges: Vec<Vec<SubmissionWaveDeterminismLogicalRange>>,
 }
@@ -230,10 +230,10 @@ impl SubmissionWaveDeterminismRestoreLayout {
             witness_plan,
             batch_invocation_id: batch_identity.batch_invocation_id(),
             claimed_backing_fingerprint: batch_identity.claimed_backing_fingerprint().to_owned(),
-            node_work_shape_fingerprints: wave
+            node_logical_work_fingerprints: wave
                 .nodes()
                 .iter()
-                .map(|node| node.work_shape().fingerprint().to_owned())
+                .map(|node| node.work_shape().logical_work_fingerprint().to_owned())
                 .collect(),
             participant_initialization_ranges,
             witness_participant_ranges,
@@ -478,10 +478,10 @@ impl SubmissionWaveDeterminismRestore {
 
         hash_u64(
             &mut hasher,
-            u64::try_from(self.layout.node_work_shape_fingerprints.len())
+            u64::try_from(self.layout.node_logical_work_fingerprints.len())
                 .map_err(|_| invalid_operation("determinism restore node count exceeds u64"))?,
         );
-        for fingerprint in &self.layout.node_work_shape_fingerprints {
+        for fingerprint in &self.layout.node_logical_work_fingerprints {
             hash_bytes(&mut hasher, fingerprint.as_bytes())?;
         }
 
@@ -845,11 +845,11 @@ impl SubmissionWaveDeterminismReadbackPlan {
             || restore.layout.batch_invocation_id != batch_identity.batch_invocation_id()
             || restore.layout.claimed_backing_fingerprint
                 != batch_identity.claimed_backing_fingerprint()
-            || restore.layout.node_work_shape_fingerprints
+            || restore.layout.node_logical_work_fingerprints
                 != wave
                     .nodes()
                     .iter()
-                    .map(|node| node.work_shape().fingerprint().to_owned())
+                    .map(|node| node.work_shape().logical_work_fingerprint().to_owned())
                     .collect::<Vec<_>>()
             || wave.nodes().len() != batch_identity.node_count()
             || wave.nodes().iter().enumerate().any(|(node_index, node)| {

@@ -356,6 +356,13 @@ impl BatchWorkShape {
         &self.fingerprint
     }
 
+    /// Stable logical work identity for comparisons across fresh admissions.
+    /// Unlike [`Self::fingerprint`], this excludes request and sequence
+    /// authorities while retaining the exact token and committed-page shape.
+    pub fn logical_work_fingerprint(&self) -> &str {
+        self.resource_work.fingerprint()
+    }
+
     pub(crate) const fn immediate_shape(&self) -> DynamicResourceShape {
         self.resource_work.immediate_shape()
     }
