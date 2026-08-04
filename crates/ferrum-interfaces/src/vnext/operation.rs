@@ -22,6 +22,7 @@ mod workspace_encoding;
 
 pub use attribute::{AttributeConstraint, AttributeSchema, AttributeSpec};
 pub(crate) use buffer_view::{
+    packed_step_token_range_to_participant_local_readback,
     translate_step_participant_readback_range, translate_step_participant_upload_range,
 };
 pub use buffer_view::{

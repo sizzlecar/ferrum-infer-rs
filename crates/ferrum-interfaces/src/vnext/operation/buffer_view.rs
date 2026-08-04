@@ -120,6 +120,56 @@ pub(crate) fn translate_step_participant_readback_range(
     )
 }
 
+/// Converts one provider-visible packed token range back into the
+/// participant-local coordinates required by completion readback requests.
+/// The inverse is explicit so a packed range cannot be projected twice.
+pub(crate) fn packed_step_token_range_to_participant_local_readback(
+    demand: &DynamicResourceDemand,
+    work_shape: &BatchWorkShape,
+    participant_index: usize,
+    packed_range: Range<u64>,
+) -> Result<Range<u64>, VNextError> {
+    if packed_range.start >= packed_range.end {
+        return Err(invalid_operation(
+            "packed participant token readback range is empty",
+        ));
+    }
+    let token_range = work_shape
+        .participant_token_ranges()
+        .get(participant_index)
+        .ok_or_else(|| invalid_operation("packed participant token readback is out of range"))?;
+    let DynamicResourceDemand::Tokens {
+        bytes_per_token,
+        maximum_tokens,
+    } = demand
+    else {
+        return Err(invalid_operation(
+            "packed participant token readback requires token demand",
+        ));
+    };
+    if work_shape.immediate_tokens() > *maximum_tokens {
+        return Err(invalid_operation(
+            "packed participant token readback exceeds its planned ceiling",
+        ));
+    }
+    let participant_start = token_range
+        .immediate_token_range()
+        .start
+        .checked_mul(*bytes_per_token)
+        .ok_or_else(|| invalid_operation("packed participant token offset overflows u64"))?;
+    let participant_end = token_range
+        .immediate_token_range()
+        .end
+        .checked_mul(*bytes_per_token)
+        .ok_or_else(|| invalid_operation("packed participant token range overflows u64"))?;
+    if packed_range.start < participant_start || packed_range.end > participant_end {
+        return Err(invalid_operation(
+            "packed participant token readback is outside its immediate span",
+        ));
+    }
+    Ok(packed_range.start - participant_start..packed_range.end - participant_start)
+}
+
 fn translate_step_participant_range(
     demand: &DynamicResourceDemand,
     work_shape: &BatchWorkShape,
@@ -755,11 +805,11 @@ impl<'a, B> OperationBufferView<'a, B> {
 #[cfg(test)]
 mod operation_buffer_region_tests {
     use super::{
-        sequence_execution_shape, translate_paged_segment,
-        translate_step_participant_readback_range, translate_step_participant_upload_range,
-        validate_dynamic_binding_layout, validate_value_binding_physical_coverage,
-        OperationBufferCoverage, OperationBufferRegions, OperationBufferStorageKind,
-        OperationRegionSource, ValueBindingPhysicalCoverage,
+        packed_step_token_range_to_participant_local_readback, sequence_execution_shape,
+        translate_paged_segment, translate_step_participant_readback_range,
+        translate_step_participant_upload_range, validate_dynamic_binding_layout,
+        validate_value_binding_physical_coverage, OperationBufferCoverage, OperationBufferRegions,
+        OperationBufferStorageKind, OperationRegionSource, ValueBindingPhysicalCoverage,
     };
     use crate::vnext::{
         AliasPolicy, BatchWorkShape, BufferDescriptor, BufferUsage, DeviceBufferRetention,
@@ -980,7 +1030,16 @@ mod operation_buffer_region_tests {
             translate_step_participant_readback_range(&tokens, &work, 1, 0..8).unwrap(),
             4..12
         );
+        assert_eq!(
+            packed_step_token_range_to_participant_local_readback(&tokens, &work, 1, 4..12)
+                .unwrap(),
+            0..8
+        );
         assert!(translate_step_participant_readback_range(&tokens, &work, 1, 28..36).is_err());
+        assert!(
+            packed_step_token_range_to_participant_local_readback(&tokens, &work, 1, 28..36)
+                .is_err()
+        );
     }
 
     #[test]
