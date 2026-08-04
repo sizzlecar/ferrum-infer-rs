@@ -74,7 +74,8 @@ pub use registry::{
     BoundOperationProvider, BoundOperationProviderSet, OperationPlanningHandle,
     OperationPlanningRegistry, OperationProvider, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
+    ReusableExecutionWorkspaceAddress,
 };
 pub use resolved_value::{
     ProviderStorageBindingRequirement, ResolvedStorageComponent, ResolvedValueBinding,

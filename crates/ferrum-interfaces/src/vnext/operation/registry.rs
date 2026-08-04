@@ -51,6 +51,48 @@ pub struct ReusableExecutionTopologyRequest<'a> {
     step_backing: &'a [LogicalBackingSliceAuthority],
 }
 
+/// How one resolved value address enters a resident reusable executable.
+/// Direct captures require lane-stable address authority. Program-bound
+/// values are instead materialized into the provider's typed binding slot
+/// before every replay and therefore may remain request- or sequence-owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReusableExecutionValueAddress {
+    Captured {
+        role: ResolvedValueRole,
+        ordinal: u32,
+    },
+    ProgramBinding {
+        role: ResolvedValueRole,
+        ordinal: u32,
+    },
+}
+
+impl ReusableExecutionValueAddress {
+    pub const fn captured(role: ResolvedValueRole, ordinal: u32) -> Self {
+        Self::Captured { role, ordinal }
+    }
+
+    pub const fn program_binding(role: ResolvedValueRole, ordinal: u32) -> Self {
+        Self::ProgramBinding { role, ordinal }
+    }
+
+    const fn identity(self) -> (ResolvedValueRole, u32) {
+        match self {
+            Self::Captured { role, ordinal } | Self::ProgramBinding { role, ordinal } => {
+                (role, ordinal)
+            }
+        }
+    }
+}
+
+/// Provider workspace addresses captured by a resident executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReusableExecutionWorkspaceAddress {
+    Scratch,
+    Binding,
+    Persistent,
+}
+
 impl<'a> ReusableExecutionTopologyRequest<'a> {
     pub(super) fn new(
         node_id: &'a NodeId,
@@ -103,6 +145,78 @@ impl<'a> ReusableExecutionTopologyRequest<'a> {
 
     pub fn work_shape(&self) -> &BatchWorkShape {
         self.work_shape
+    }
+
+    /// Resolves one complete provider address contract. Every value binding
+    /// must appear exactly once, preventing a provider from gaining replay by
+    /// silently omitting a dynamic operand. Program-bound values are legal
+    /// only when the resident executable captures a lane-stable binding slot.
+    pub fn reusable_address_scope(
+        &self,
+        values: &[ReusableExecutionValueAddress],
+        workspaces: &[ReusableExecutionWorkspaceAddress],
+    ) -> Result<Option<DeviceReusableAddressScope>, VNextError> {
+        if values.len() != self.bindings.len()
+            || values.iter().enumerate().any(|(index, value)| {
+                values[..index]
+                    .iter()
+                    .any(|prior| prior.identity() == value.identity())
+            })
+            || self.bindings.iter().any(|binding| {
+                values
+                    .iter()
+                    .filter(|value| value.identity() == (binding.role(), binding.ordinal()))
+                    .count()
+                    != 1
+            })
+            || workspaces.iter().enumerate().any(|(index, workspace)| {
+                workspaces[..index].iter().any(|prior| prior == workspace)
+            })
+        {
+            return Err(invalid_operation(
+                "reusable topology address contract does not cover every value exactly once",
+            ));
+        }
+
+        let has_program_bound_values = values
+            .iter()
+            .any(|value| matches!(value, ReusableExecutionValueAddress::ProgramBinding { .. }));
+        if has_program_bound_values
+            && !workspaces.contains(&ReusableExecutionWorkspaceAddress::Binding)
+        {
+            return Err(invalid_operation(
+                "program-bound reusable values require a captured binding workspace",
+            ));
+        }
+
+        let mut aggregate = DeviceReusableAddressScope::Plan;
+        for value in values {
+            let ReusableExecutionValueAddress::Captured { role, ordinal } = value else {
+                continue;
+            };
+            let Some(scope) = self.binding_reusable_address_scope(*role, *ordinal)? else {
+                return Ok(None);
+            };
+            aggregate = merge_reusable_address_scope(aggregate, scope)?;
+        }
+        for workspace in workspaces {
+            let scope = match workspace {
+                ReusableExecutionWorkspaceAddress::Scratch => {
+                    self.scratch_reusable_address_scope()?
+                }
+                ReusableExecutionWorkspaceAddress::Binding => {
+                    self.binding_workspace_reusable_address_scope()?
+                }
+                ReusableExecutionWorkspaceAddress::Persistent => {
+                    self.persistent_workspace_reusable_address_scope()?
+                }
+            };
+            let Some(scope) = scope else {
+                return Ok(None);
+            };
+            aggregate = merge_reusable_address_scope(aggregate, scope)?;
+        }
+        Ok(Some(aggregate))
     }
 
     /// Returns the reusable address authority shared by every physical

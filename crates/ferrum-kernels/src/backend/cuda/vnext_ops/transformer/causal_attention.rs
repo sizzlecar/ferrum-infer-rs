@@ -17,16 +17,14 @@ use ferrum_interfaces::vnext::{
     ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
     ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
     ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
+    ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
+    ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
     CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use ferrum_types::{AttentionExecutionPolicy, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use sha2::{Digest, Sha256};
 
-use super::{
-    attach_invocation_binding, captured_contiguous_addresses_are_reusable,
-    ensure_estimator_request, estimate, launch_gemm_f16, CapturedProviderWorkspace,
-};
+use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
 #[cfg(feature = "vllm-marlin")]
 use super::{
     moe_weights::{
@@ -369,14 +367,25 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        if !captured_contiguous_addresses_are_reusable(
-            &request,
-            9,
-            &[
-                CapturedProviderWorkspace::Scratch,
-                CapturedProviderWorkspace::Binding,
-            ],
-        )? {
+        let mut values = (0..8)
+            .map(|ordinal| {
+                ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
+            })
+            .collect::<Vec<_>>();
+        values.extend([
+            ReusableExecutionValueAddress::program_binding(ResolvedValueRole::Input, 8),
+            ReusableExecutionValueAddress::captured(ResolvedValueRole::Output, 0),
+        ]);
+        if request
+            .reusable_address_scope(
+                &values,
+                &[
+                    ReusableExecutionWorkspaceAddress::Scratch,
+                    ReusableExecutionWorkspaceAddress::Binding,
+                ],
+            )?
+            .is_none()
+        {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
         reusable_attention_topology(&request, self.attention_policy)
