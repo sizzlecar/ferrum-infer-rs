@@ -63,7 +63,7 @@ Current maxima before the clean aggregate gate are:
 |---|---|---:|---:|
 | Facade | `operation.rs` | 102 | 500 |
 | Production owner | `operation/dispatch.rs` | 2,409 | 2,500 |
-| Test/support owner | `tests/vnext_device_operation_contract/mod.rs` | 1,839 | 2,000 |
+| Test/support owner | `tests/vnext_device_operation_contract/mod.rs` | 1,971 | 2,000 |
 
 The final gate recomputes these values from the committed tree. These are ownership and
 reviewability limits, not a target to delete useful dynamic-resource or determinism logic.
@@ -160,9 +160,12 @@ sources with resource transactions. Keeping it under `resource` would invert tha
 
 ## Test Ownership
 
-The S0A structural matrix has 28 invariant-owner integration targets and 12 explicit reusable
+The S0A structural matrix has 28 invariant-owner integration targets and 13 explicit reusable
 support owners. The removed oversized aggregate roots may not reappear. Shared fixtures are counted
 once as real owners rather than hidden through `include!` or multiplied into every consumer.
+
+The device-operation transaction driver fixture is a peer support owner. The parent support module
+re-exports it for unchanged test call sites, while both files remain independently size-bounded.
 
 The canonical aggregate does not run a curated subset. It executes:
 
