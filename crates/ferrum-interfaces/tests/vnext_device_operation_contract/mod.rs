@@ -544,7 +544,23 @@ fn catalog_with_resource_options_execution_semantics_and_storage(
     scratch: ResourcePresenceRequirement,
     execution_semantics: ProviderExecutionSemantics,
 ) -> CapabilityCatalog {
-    let operation = operation_with_resource_profile(state_profile, scratch);
+    catalog_with_resource_options_execution_semantics_storage_and_operation_version(
+        state_profile,
+        scratch,
+        execution_semantics,
+        ContractVersion::new(1, 0),
+    )
+}
+
+fn catalog_with_resource_options_execution_semantics_storage_and_operation_version(
+    state_profile: TestStateProfile,
+    scratch: ResourcePresenceRequirement,
+    execution_semantics: ProviderExecutionSemantics,
+    operation_version: ContractVersion,
+) -> CapabilityCatalog {
+    let mut operation = operation_with_resource_profile(state_profile, scratch);
+    operation.version = operation_version;
+    operation.validate().unwrap();
     let device_id: DeviceId = id("device.device-operation.0");
     let capabilities = BTreeSet::from([id("capability.compute")]);
     let provider = OperationProviderDescriptor::new(
@@ -553,7 +569,7 @@ fn catalog_with_resource_options_execution_semantics_and_storage(
         operation.fingerprint().unwrap(),
         sha('c'),
         execution_semantics,
-        ContractVersion::new(1, 0),
+        operation_version,
         device_id.clone(),
         capabilities.clone(),
         BTreeSet::from([id("weight-format.device-operation-composite")]),

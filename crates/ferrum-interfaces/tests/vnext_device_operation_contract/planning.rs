@@ -891,12 +891,13 @@ pub(crate) fn fixture_with_determinism_provider_behavior(
     zero_state: bool,
     behavior: ProviderBehavior,
 ) -> Fixture {
-    fixture_with_provider_behavior_and_execution_semantics_and_retention(
-        zero_state,
+    fixture_with_provider_behavior_execution_semantics_retention_storage_and_operation_version(
+        TestStateProfile::from_zero_state(zero_state),
         behavior,
         ProviderExecutionSemantics::bitwise_eager_and_replay(),
         ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
         true,
+        ContractVersion::new(1, 1),
     )
 }
 
@@ -972,6 +973,24 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
     execution_determinism: ExecutionDeterminismRequirement,
     retain_determinism_outputs: bool,
 ) -> Fixture {
+    fixture_with_provider_behavior_execution_semantics_retention_storage_and_operation_version(
+        state_profile,
+        behavior,
+        execution_semantics,
+        execution_determinism,
+        retain_determinism_outputs,
+        ContractVersion::new(1, 0),
+    )
+}
+
+fn fixture_with_provider_behavior_execution_semantics_retention_storage_and_operation_version(
+    state_profile: TestStateProfile,
+    behavior: ProviderBehavior,
+    execution_semantics: ProviderExecutionSemantics,
+    execution_determinism: ExecutionDeterminismRequirement,
+    retain_determinism_outputs: bool,
+    operation_version: ContractVersion,
+) -> Fixture {
     let scratch = if matches!(
         behavior,
         ProviderBehavior::ProgramBindingWithScratchTail
@@ -982,10 +1001,11 @@ fn fixture_with_provider_behavior_execution_semantics_retention_and_storage(
     } else {
         ResourcePresenceRequirement::Forbidden
     };
-    let catalog = catalog_with_resource_options_execution_semantics_and_storage(
+    let catalog = catalog_with_resource_options_execution_semantics_storage_and_operation_version(
         state_profile,
         scratch,
         execution_semantics,
+        operation_version,
     );
     let (runtime_policy, reusable_execution_bucket) = if behavior.uses_program_binding() {
         let (_, bucket) = reusable_policy();
