@@ -6,10 +6,10 @@ use std::{
 
 use super::super::{
     BatchInvocationId, CompletionHandle, DefinitelyNotSubmittedRetryAuthority,
-    DefinitelyNotSubmittedWaveRetryAuthority, DeviceComputePathRequirement, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
-    DeviceSubmissionTimingSink, DeviceTimingMeasurement, HostTransferLayout, IdentifiedFailure,
-    IndeterminateSubmissionHandle, NodeId, VNextError,
+    DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandPhase, DeviceComputePathRequirement,
+    DeviceRuntime, DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming,
+    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTimingMeasurement, HostTransferLayout,
+    IdentifiedFailure, IndeterminateSubmissionHandle, NodeId, VNextError,
 };
 use super::foundation::invalid_operation;
 use super::{BatchOperationIdentity, OperationFailure};
@@ -69,25 +69,45 @@ impl BoundDeviceSubmissionAttribution {
         submission_fingerprint: String,
         device: DeviceSubmissionAttribution,
     ) -> Result<Self, VNextError> {
-        if device.commands().iter().any(|command| {
-            command.node_index().is_some_and(|node_index| {
-                let Ok(node_index_usize) = usize::try_from(node_index) else {
-                    return true;
-                };
-                if batch_identity.node_id_at(node_index_usize).is_none() {
-                    return true;
-                }
-                u32::try_from(
-                    batch_identity
-                        .node_participant_count(node_index_usize)
-                        .unwrap_or_default(),
-                )
-                .map_or(true, |count| count != command.participant_count())
-            })
-        }) {
-            return Err(invalid_operation(
-                "device submission attribution differs from batch node identity",
-            ));
+        for command in device.commands() {
+            let Some(node_index) = command.node_index() else {
+                continue;
+            };
+            let node_index_usize = usize::try_from(node_index).map_err(|_| {
+                invalid_operation(format!(
+                    "device command {} node index exceeds host address space",
+                    command.command_index()
+                ))
+            })?;
+            let node_participant_count = batch_identity
+                .node_participant_count(node_index_usize)
+                .and_then(|count| u32::try_from(count).ok())
+                .ok_or_else(|| {
+                    invalid_operation(format!(
+                        "device command {} references absent node {}",
+                        command.command_index(),
+                        node_index
+                    ))
+                })?;
+            let participant_range_is_valid = command.participant_start() < node_participant_count
+                && command.participant_end() <= node_participant_count;
+            let command_requires_full_node =
+                command.command_phase() != DeviceCommandPhase::Initialization;
+            if !participant_range_is_valid
+                || command_requires_full_node
+                    && (command.participant_start() != 0
+                        || command.participant_count() != node_participant_count)
+            {
+                return Err(invalid_operation(format!(
+                    "device command {} phase {:?} participant range {}..{} differs from node {} participant count {}",
+                    command.command_index(),
+                    command.command_phase(),
+                    command.participant_start(),
+                    command.participant_end(),
+                    node_index,
+                    node_participant_count
+                )));
+            }
         }
         for replayed_segment in device.replayed_segments() {
             let program_id = replayed_segment.program_id();
@@ -111,7 +131,11 @@ impl BoundDeviceSubmissionAttribution {
                     .logical_commands()
                     .first()
                     .is_none_or(|command| {
-                        program_id.immediate_sequences() != command.participant_count()
+                        usize::try_from(replayed_segment.physical_command_index())
+                            .ok()
+                            .and_then(|index| device.commands().get(index))
+                            .is_none_or(|physical| physical.participant_start() != 0)
+                            || program_id.immediate_sequences() != command.participant_count()
                             || program_id.immediate_tokens() != command.token_count()
                     })
             {

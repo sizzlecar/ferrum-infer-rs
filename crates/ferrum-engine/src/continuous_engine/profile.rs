@@ -1059,11 +1059,29 @@ impl VNextProfileEventContext {
                         "device attribution node index is absent from its batch identity",
                     )
                 })?;
-                let first = node.participants().first().ok_or_else(|| {
-                    ExecutionEventSinkError::new("device attribution node has no participants")
+                let participant_start =
+                    usize::try_from(command.participant_start()).map_err(|_| {
+                        ExecutionEventSinkError::new(
+                            "device attribution participant start exceeds the host index range",
+                        )
+                    })?;
+                let participant_end = usize::try_from(command.participant_end()).map_err(|_| {
+                    ExecutionEventSinkError::new(
+                        "device attribution participant end exceeds the host index range",
+                    )
                 })?;
-                let participant_request_ids = node
+                let participants = node
                     .participants()
+                    .get(participant_start..participant_end)
+                    .ok_or_else(|| {
+                        ExecutionEventSinkError::new(
+                            "device attribution participant range is absent from its batch node",
+                        )
+                    })?;
+                let first = participants.first().ok_or_else(|| {
+                    ExecutionEventSinkError::new("device attribution participant range is empty")
+                })?;
+                let participant_request_ids = participants
                     .iter()
                     .map(|participant| participant.identity().parts().request_id.to_string())
                     .collect::<Vec<_>>();
@@ -1095,8 +1113,16 @@ impl VNextProfileEventContext {
                 ),
                 ("node_index".to_string(), serde_json::json!(node_index)),
                 (
+                    "participant_start".to_string(),
+                    serde_json::json!(command.participant_start()),
+                ),
+                (
                     "participant_count".to_string(),
                     serde_json::json!(command.participant_count()),
+                ),
+                (
+                    "participant_end".to_string(),
+                    serde_json::json!(command.participant_end()),
                 ),
                 (
                     "token_count".to_string(),

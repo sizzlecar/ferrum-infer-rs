@@ -838,6 +838,8 @@ impl OperationProvider<TestRuntime> for TestProvider {
             .map(|view| view.resource_id().clone())
             .collect();
         drop(trace);
+        let participant_count = u32::try_from(invocation.participants().len()).unwrap();
+        let token_count = invocation.work_shape().immediate_tokens();
         match *self.behavior.lock().unwrap() {
             ProviderBehavior::Success => Ok(EncodedDeviceOperation::compute(TestCommand::Provider)),
             ProviderBehavior::SplitPhases => {
@@ -870,9 +872,14 @@ impl OperationProvider<TestRuntime> for TestProvider {
                     ))
                 }
             }
-            ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed => Ok(
-                EncodedDeviceOperation::compute(TestCommand::ScratchProvider),
-            ),
+            ProviderBehavior::ScratchOverwrite | ProviderBehavior::ScratchZeroed => {
+                let command = if participant_count == 1 {
+                    TestCommand::ScratchProvider
+                } else {
+                    TestCommand::ScratchProviderWork(participant_count, token_count)
+                };
+                Ok(EncodedDeviceOperation::compute(command))
+            }
             ProviderBehavior::WrongIdentity => {
                 let mut parts = participant.identity().parts().clone();
                 parts.request_id = id("request.provider.wrong");
@@ -1186,6 +1193,7 @@ pub(crate) struct TestStream;
 pub(crate) enum TestCommand {
     Provider,
     ScratchProvider,
+    ScratchProviderWork(u32, u64),
     ReusableExecution,
     ProgramBinding,
     CoalescedProgramBinding,
@@ -1352,7 +1360,7 @@ fn test_submission_attribution(
         let (native_op_id, execution_path, compute_dispatch_count, transfer_command_count) =
             match entry.command() {
                 TestCommand::Provider => ("test_provider", DeviceExecutionPath::Eager, 1, 0),
-                TestCommand::ScratchProvider => {
+                TestCommand::ScratchProvider | TestCommand::ScratchProviderWork(_, _) => {
                     ("test_scratch_provider", DeviceExecutionPath::Eager, 1, 0)
                 }
                 TestCommand::ReusableExecution => (
@@ -1385,19 +1393,31 @@ fn test_submission_attribution(
             || logical_work.map_or(DeviceBatchingForm::Scalar, |work| work.batching_form()),
             |_| DeviceBatchingForm::ParticipantLoop,
         );
+        let encoded_work = match entry.command() {
+            TestCommand::ScratchProviderWork(participants, tokens) => {
+                Some((*participants, *tokens))
+            }
+            _ => None,
+        };
         let participant_count = invocation.as_ref().map_or_else(
             || {
-                logical_work.map_or(u32::from(entry.node_index().is_some()), |work| {
-                    work.participant_count()
-                })
+                logical_work.map_or_else(
+                    || encoded_work.map_or(u32::from(entry.node_index().is_some()), |work| work.0),
+                    |work| work.participant_count(),
+                )
             },
             DeviceReusableExecutionInvocation::participant_count,
         );
+        let participant_start = invocation.as_ref().map_or_else(
+            || logical_work.map_or(0, |work| work.participant_start()),
+            |_| 0,
+        );
         let token_count = invocation.as_ref().map_or_else(
             || {
-                logical_work.map_or(u64::from(entry.node_index().is_some()), |work| {
-                    work.token_count()
-                })
+                logical_work.map_or_else(
+                    || encoded_work.map_or(u64::from(entry.node_index().is_some()), |work| work.1),
+                    |work| work.token_count(),
+                )
             },
             DeviceReusableExecutionInvocation::token_count,
         );
@@ -1405,13 +1425,14 @@ fn test_submission_attribution(
             .as_ref()
             .map(|invocation| u64::from(invocation.segment().logical_command_count()));
         rows.push(
-            DeviceNativeWorkAttribution::new(
+            DeviceNativeWorkAttribution::with_participant_range(
                 command_index,
                 entry.node_index(),
                 entry.phase(),
                 native_op_id,
                 execution_path,
                 batching_form,
+                participant_start,
                 participant_count,
                 token_count,
                 compute_dispatch_count,
@@ -1745,7 +1766,9 @@ impl DeviceRuntime for TestRuntime {
                         DeviceCommandPhase::Initialization,
                         TestCommand::Upload(value, BufferUsage::Scratch),
                     ) => Some((node_index, *value, false)),
-                    (_, TestCommand::ScratchProvider) => Some((node_index, 0xa5, true)),
+                    (_, TestCommand::ScratchProvider | TestCommand::ScratchProviderWork(_, _)) => {
+                        Some((node_index, 0xa5, true))
+                    }
                     _ => None,
                 }
             })

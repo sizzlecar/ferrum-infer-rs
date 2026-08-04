@@ -155,6 +155,140 @@ fn determinism_eager_submission_restores_the_complete_typed_denominator() {
 }
 
 #[test]
+fn determinism_restore_attributes_each_participant_without_losing_node_scope() {
+    const PARTICIPANTS: usize = 4;
+    let fixture =
+        fixture_with_determinism_provider_behavior(false, ProviderBehavior::ScratchOverwrite);
+    let sequences = (0..PARTICIPANTS)
+        .map(|index| {
+            logical_resources(
+                &fixture.plan_resources,
+                &format!("run.device-operation.determinism-range.{index}"),
+                &format!("request.device-operation.determinism-range.{index}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sessions = sequences
+        .iter()
+        .map(|sequence| sequence.open_session().unwrap())
+        .collect::<Vec<_>>();
+    let batch = ExecutionBatchParticipants::new(sessions.clone()).unwrap();
+    let lane = fixture.plan_resources.create_execution_lane().unwrap();
+    let request = StepResourceAdmissionRequest::new(
+        batch
+            .bind_work_shape(vec![one_token_span(); PARTICIPANTS])
+            .unwrap(),
+        AdmissionFitPolicy::ImmediateOnly,
+        AdmissionPressureAction::WaitForRelease,
+    )
+    .unwrap();
+    let request = fixture.reusable_execution_bucket.as_ref().map_or_else(
+        || request.clone(),
+        |bucket| {
+            request
+                .clone()
+                .with_reusable_execution_bucket(bucket.bucket_id().clone())
+        },
+    );
+    let step = (0..=3)
+        .find_map(
+            |attempt| match batch.try_begin_step(request.clone(), &lane).unwrap() {
+                StepResourceAdmissionDecision::Admitted(step) => Some(step),
+                StepResourceAdmissionDecision::BackingDeferred(deferred) if attempt < 3 => {
+                    deferred.maintain().unwrap();
+                    None
+                }
+                _ => panic!("multi-participant determinism step admission did not converge"),
+            },
+        )
+        .expect("bounded multi-participant admission must converge");
+    let wave = prepare_determinism_wave(&fixture.plan_resources, &fixture.plan, &step);
+    assert!(wave
+        .nodes()
+        .iter()
+        .all(|node| node.participant_count() as usize == PARTICIPANTS));
+    let active_bindings = sessions
+        .iter()
+        .map(|session| TrustedActiveSequenceBinding::from_session(session).unwrap())
+        .collect::<Vec<_>>();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let restore = determinism_restore(
+        &fixture,
+        &providers,
+        &batch_identity,
+        &active_bindings,
+        &wave,
+        0x37,
+    );
+    let reaper = CompletionReaper::new();
+    let handle = OperationDispatch::encode_and_submit_determinism_eager_wave(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Kernel,
+        &restore,
+        0x5a,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    let attribution = handle.attribution().unwrap();
+    let scoped_initialization_ranges = attribution
+        .device()
+        .commands()
+        .iter()
+        .filter(|command| {
+            command.command_phase() == DeviceCommandPhase::Initialization
+                && command.participant_count() == 1
+        })
+        .map(|command| (command.participant_start(), command.participant_end()))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        scoped_initialization_ranges,
+        BTreeSet::from([(0, 1), (1, 2), (2, 3), (3, 4)])
+    );
+    assert!(attribution.device().commands().iter().all(|command| {
+        command.command_phase() == DeviceCommandPhase::Initialization
+            || command.participant_start() == 0
+                && command.participant_count() as usize == PARTICIPANTS
+    }));
+    handle.wait_into_evidence().unwrap();
+
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    step.try_retire_normal().unwrap();
+    drop(batch);
+    for session in sessions {
+        session.try_complete().unwrap();
+    }
+    drop(sequences);
+    drop(lane);
+    drop(fixture.registry);
+    drop(fixture.impostor_registry);
+    drop(fixture.runtime);
+    assert!(matches!(
+        PlanRuntimeResources::close(fixture.plan_resources),
+        Ok(PlanRuntimeCloseOutcome::Closed(_))
+    ));
+}
+
+#[test]
 fn determinism_logical_restore_identity_ignores_fresh_physical_authority() {
     fn collect(
         fixture: &Fixture,

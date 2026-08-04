@@ -2249,8 +2249,9 @@ where
                         "determinism restore participant lacks exact token work",
                     ))
                 })?;
-            let logical_work = DeviceCommandLogicalWork::new(
+            let logical_work = DeviceCommandLogicalWork::for_participant_range(
                 DeviceBatchingForm::Scalar,
+                participant_index_u32,
                 1,
                 participant_work.token_span().immediate_tokens(),
             )
