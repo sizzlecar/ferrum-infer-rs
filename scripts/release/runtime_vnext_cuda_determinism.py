@@ -2096,7 +2096,7 @@ def validate_execution(
     participant_count: int,
     expected_witnesses: list[dict[str, Any]],
     token_shape: dict[str, Any],
-) -> tuple[dict[str, Any], dict[tuple[Any, ...], str]]:
+) -> tuple[dict[str, Any], dict[tuple[Any, ...], str], set[str]]:
     execution = exact_object(value, EXECUTION_FIELDS, label)
     text(execution["execution_id"], f"{label}.execution_id", portable=True)
     mode = text(execution["mode"], f"{label}.mode")
@@ -2187,6 +2187,7 @@ def validate_execution(
     )
     physical_commands: dict[int, dict[str, Any]] = {}
     compute_nodes: set[str] = set()
+    actual_replayed_nodes: set[str] = set()
     observed_eager_boundary_nodes: set[str] = set()
     for index, raw in enumerate(commands_raw):
         command_label = f"{label}.attribution.physical_commands[{index}]"
@@ -2352,6 +2353,7 @@ def validate_execution(
                     node_id not in compute_nodes,
                     f"{logical_label}.node_id is attributed more than once",
                 )
+                actual_replayed_nodes.add(node_id)
                 text(
                     logical["native_op_id"],
                     f"{logical_label}.native_op_id",
@@ -2488,7 +2490,7 @@ def validate_execution(
             token_shape,
             f"{label}.witness[{key}]",
         )
-    return execution, witnesses
+    return execution, witnesses, actual_replayed_nodes
 
 
 def validate_case(
@@ -2588,8 +2590,9 @@ def validate_case(
     canonical_topology: set[tuple[Any, ...]] | None = None
     replay_shape_fingerprint: str | None = None
     restore_fingerprint: str | None = None
+    actual_replayed_nodes: set[str] = set()
     for index, raw in enumerate(executions_raw):
-        execution, witnesses = validate_execution(
+        execution, witnesses, execution_replayed_nodes = validate_execution(
             raw,
             f"{label}.executions[{index}]",
             target_nodes=target_nodes,
@@ -2597,6 +2600,7 @@ def validate_case(
             expected_witnesses=expected_witnesses,
             token_shape=case["token_shape"],
         )
+        actual_replayed_nodes.update(execution_replayed_nodes)
         execution_id = execution["execution_id"]
         require(execution_id not in executions, f"{label} duplicates execution {execution_id}")
         topology = set(witnesses)
@@ -2732,6 +2736,7 @@ def validate_case(
         ),
         "target_keys": set(target_node_coverage),
         "target_nodes": target_nodes,
+        "actual_replayed_nodes": actual_replayed_nodes,
         "canonical_witnesses": witness_maps[first_execution_id],
         "state_witness": state_witness,
         "execution_count": len(executions),
@@ -3094,6 +3099,7 @@ def validate_artifact(
     }
     state_by_model: dict[str, set[str]] = {key: set() for key in expected_models}
     coverage_nodes: dict[tuple[str, tuple[str, str]], set[str]] = {}
+    actual_replayed_nodes: dict[tuple[str, tuple[str, str]], set[str]] = {}
     poisons: dict[tuple[str, tuple[str, str]], set[str]] = {}
     phases: dict[tuple[str, tuple[str, str]], set[str]] = {}
     poison_pairs: dict[tuple[Any, ...], dict[str, dict[str, Any]]] = {}
@@ -3105,6 +3111,9 @@ def validate_artifact(
         for requirement_key, nodes in case["target_node_coverage"].items():
             selection_key = (model_key, requirement_key)
             coverage_nodes.setdefault(selection_key, set()).update(nodes)
+            actual_replayed_nodes.setdefault(selection_key, set()).update(
+                nodes & case["actual_replayed_nodes"]
+            )
             poisons.setdefault(selection_key, set()).add(case["workspace_poison"])
             phases.setdefault(selection_key, set()).add(case["phase"])
         poison_pair_key = (
@@ -3171,6 +3180,12 @@ def validate_artifact(
                 coverage_nodes.get(selection_key) == set(selection["node_ids"]),
                 f"provider selection {selection_key} lacks exact node proof coverage",
             )
+            if requirement["replay_equivalence"] == "bitwise_eager_equivalent":
+                require(
+                    actual_replayed_nodes.get(selection_key)
+                    == set(selection["node_ids"]),
+                    f"provider selection {selection_key} lacks actual replay coverage",
+                )
             require(
                 poisons.get(selection_key) == {"00", "a5"},
                 f"provider selection {selection_key} lacks both workspace poison patterns",
@@ -3641,7 +3656,9 @@ def make_selftest_execution(
                 expanded.append(item)
         witnesses = sorted(expanded, key=witness_topology)
     replay = mode == "replay"
-    mixed_replay = replay and model_key == "m1-qwen35-4b"
+    mixed_replay = (
+        replay and model_key == "m1-qwen35-4b" and partition == "c1"
+    )
     declared_eager_boundary_node_ids = [node_ids[-1]] if mixed_replay else []
     reusable_program_fingerprint = (
         hashlib.sha256(f"{model_key}/{partition}/program".encode()).hexdigest()
@@ -4844,6 +4861,35 @@ def run_self_test() -> None:
                     if witness["node_id"] not in secondary_nodes
                 ]
 
+        def make_m1_secondary_always_eager(value: dict[str, Any]) -> None:
+            if value["model_key"] != M1_MODEL:
+                return
+            boundary = f"node.{M1_MODEL}.secondary"
+            for execution in value["executions"]:
+                if execution["mode"] != "replay":
+                    continue
+                execution["compute_path_requirement"] = (
+                    "replayed_with_declared_eager_boundaries"
+                )
+                execution["declared_eager_boundary_node_ids"] = [boundary]
+                for command in execution["attribution"]["physical_commands"]:
+                    if command["node_id"] == boundary:
+                        command["execution_path"] = "eager"
+                        command["reusable_graph_node_count"] = None
+                retained_segments = []
+                for segment in execution["attribution"]["replayed_segments"]:
+                    segment["logical_commands"] = [
+                        command
+                        for command in segment["logical_commands"]
+                        if command["node_id"] != boundary
+                    ]
+                    if not segment["logical_commands"]:
+                        continue
+                    for ordinal, command in enumerate(segment["logical_commands"]):
+                        command["logical_command_ordinal"] = ordinal
+                    retained_segments.append(segment)
+                execution["attribution"]["replayed_segments"] = retained_segments
+
         mutations.extend(
             [
                 (
@@ -4865,6 +4911,11 @@ def run_self_test() -> None:
                     "zero-state-only",
                     remove_cases(lambda path: ".nonzero." in path),
                     "cardinality is invalid",
+                ),
+                (
+                    "missing-actual-replay-coverage",
+                    mutate_all_cases(make_m1_secondary_always_eager),
+                    "lacks actual replay coverage",
                 ),
             ]
         )
