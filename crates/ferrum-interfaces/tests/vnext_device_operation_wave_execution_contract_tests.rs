@@ -545,9 +545,14 @@ fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
     .expect("program-binding wave must have a reusable program identity");
     let node_count = u32::try_from(providers.len()).unwrap();
     let segment = DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap();
-    let program =
-        DeviceReusableExecutionProgram::new(program_id, vec![segment], (0..node_count).collect())
-            .unwrap();
+    let program = test_reusable_program(
+        program_id,
+        node_count,
+        vec![],
+        vec![segment],
+        (0..node_count).collect(),
+        vec![],
+    );
 
     let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs_and_policy(
         &providers,
@@ -647,12 +652,14 @@ fn eager_boundary_preserves_adjacent_direct_segment_execution() {
     )
     .unwrap()
     .expect("an eager boundary must retain typed partial program authority");
-    let program = DeviceReusableExecutionProgram::new(
+    let program = test_reusable_program(
         program_id,
+        2,
+        vec![0],
         vec![DeviceReusableExecutionSegment::new(0, 1, 2, 1).unwrap()],
         vec![1],
-    )
-    .unwrap();
+        vec![],
+    );
 
     let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
         &providers,
@@ -746,12 +753,14 @@ fn determinism_replay_submission_restores_state_and_enforces_replayed_compute() 
     .unwrap()
     .expect("program-binding wave has a reusable identity");
     let node_count = u32::try_from(providers.len()).unwrap();
-    let program = DeviceReusableExecutionProgram::new(
+    let program = test_reusable_program(
         program_id,
+        node_count,
+        vec![],
         vec![DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap()],
         (0..node_count).collect(),
-    )
-    .unwrap();
+        vec![],
+    );
 
     let handle = OperationDispatch::encode_and_submit_determinism_replayed_wave(
         &providers,
@@ -881,12 +890,14 @@ fn determinism_replay_accepts_only_live_declared_eager_boundaries() {
     .unwrap()
     .expect("partial determinism wave has reusable authority");
     let program_fingerprint = program_id.fingerprint();
-    let program = DeviceReusableExecutionProgram::new(
+    let program = test_reusable_program(
         program_id,
+        2,
+        vec![0],
         vec![DeviceReusableExecutionSegment::new(0, 1, 2, 1).unwrap()],
         vec![1],
-    )
-    .unwrap();
+        vec![],
+    );
 
     let handle = OperationDispatch::encode_and_submit_determinism_replayed_wave(
         &providers,
@@ -1005,12 +1016,24 @@ fn determinism_replay_rejects_an_unresident_non_boundary_gap_before_submission()
     )
     .unwrap()
     .expect("determinism wave has reusable authority");
-    let incomplete_program = DeviceReusableExecutionProgram::new(
+    let incomplete_program = test_reusable_program(
         program_id,
-        vec![DeviceReusableExecutionSegment::new(0, 1, 2, 1).unwrap()],
-        vec![1],
-    )
-    .unwrap();
+        2,
+        vec![],
+        vec![],
+        vec![],
+        vec![
+            DeviceReusableExecutionProgramGap::new(
+                0,
+                DeviceReusableExecutionProgramGapReason::ProviderReplayKeyMissing,
+            ),
+            DeviceReusableExecutionProgramGap::new(
+                1,
+                DeviceReusableExecutionProgramGapReason::CapacityDeferred,
+            ),
+        ],
+    );
+    assert!(!incomplete_program.is_determinism_ready());
 
     let error = match OperationDispatch::encode_and_submit_determinism_replayed_wave(
         &providers,
@@ -1028,9 +1051,25 @@ fn determinism_replay_rejects_an_unresident_non_boundary_gap_before_submission()
         Ok(_) => panic!("an undeclared eager gap must fail before submission"),
         Err(error) => error,
     };
-    assert!(error
-        .to_string()
-        .contains("does not cover every replay-eligible node"));
+    let message = error.to_string();
+    assert!(
+        message.contains("2 non-resident replay-eligible gap"),
+        "{message}"
+    );
+    assert!(message.contains("node_index=0"), "{message}");
+    assert!(
+        message.contains(&format!(
+            "node_id={} provider_id={} operation_id={}",
+            batch_identity.node_id_at(0).unwrap().as_str(),
+            batch_identity.provider_id_at(0).unwrap().as_str(),
+            batch_identity.operation_id_at(0).unwrap().as_str(),
+        )),
+        "{message}"
+    );
+    assert!(
+        message.contains("reason=provider_replay_key_missing"),
+        "{message}"
+    );
     assert_eq!(fixture.runtime_trace.lock().unwrap().submit_calls, 0);
     assert_eq!(fixture.provider_trace.lock().unwrap().encode_calls, 0);
 
@@ -1175,12 +1214,14 @@ fn stale_reusable_topology_is_rejected_before_dispatch_or_encoding() {
         DeviceReusableExecutionTopologyFingerprint::from_sha256([0xff; 32]),
     );
     let node_count = u32::try_from(providers.len()).unwrap();
-    let stale_program = DeviceReusableExecutionProgram::new(
+    let stale_program = test_reusable_program(
         stale_program_id,
+        node_count,
+        vec![],
         vec![DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap()],
         (0..node_count).collect(),
-    )
-    .unwrap();
+        vec![],
+    );
 
     let error = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
         &providers,

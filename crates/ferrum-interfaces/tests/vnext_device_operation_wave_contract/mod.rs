@@ -1,5 +1,24 @@
 use super::vnext_device_operation_contract::*;
 
+pub(super) fn test_reusable_program(
+    program_id: DeviceReusableExecutionProgramId,
+    node_count: u32,
+    eager_boundary_node_indices: Vec<u32>,
+    segments: Vec<DeviceReusableExecutionSegment>,
+    per_wave_binding_node_indices: Vec<u32>,
+    gaps: Vec<DeviceReusableExecutionProgramGap>,
+) -> DeviceReusableExecutionProgram {
+    let capture = DeviceReusableExecutionCapture::new(
+        program_id,
+        node_count,
+        eager_boundary_node_indices,
+        per_wave_binding_node_indices.clone(),
+    )
+    .unwrap();
+    DeviceReusableExecutionProgram::new(&capture, segments, per_wave_binding_node_indices, gaps)
+        .unwrap()
+}
+
 #[derive(Default)]
 pub(super) struct RecordingSubmissionTimingSink {
     pub(super) stages: Mutex<Vec<SubmissionWaveDispatchStage>>,

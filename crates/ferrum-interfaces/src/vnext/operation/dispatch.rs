@@ -10,9 +10,9 @@ use super::super::{
     DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DeviceTimingMode,
     ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts, ExecutionLane,
     HostTransferLayout, InvocationResourceLease, LaneSubmitOutcome, LogicalBackingBufferView,
-    NodeInvocationId, ParticipantNodeKey, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
-    ResourceId, SpanId, StepParticipantFrameAssignment, SubmissionWavePurpose,
-    TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
+    NodeId, NodeInvocationId, OperationId, ParticipantNodeKey, PreparedStepSubmissionWave,
+    ProgramBindingNodeBinding, ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment,
+    SubmissionWavePurpose, TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
 };
 use super::determinism::{
     SubmissionWaveDeterminismHandle, SubmissionWaveDeterminismReadbackPlan,
@@ -87,6 +87,7 @@ fn validate_determinism_replay_coverage(
     program: &DeviceReusableExecutionProgram,
     node_count: usize,
     eager_boundary_node_indices: &[u32],
+    batch_identity: &BatchOperationIdentity,
 ) -> Result<(), VNextError> {
     if node_count == 0
         || eager_boundary_node_indices
@@ -96,6 +97,42 @@ fn validate_determinism_replay_coverage(
         return Err(invalid_operation(
             "determinism replay topology has no nodes or non-canonical eager boundaries",
         ));
+    }
+    if program.node_count() as usize != node_count
+        || program.eager_boundary_node_indices() != eager_boundary_node_indices
+    {
+        return Err(invalid_operation(
+            "determinism reusable program coverage differs from the live provider topology",
+        ));
+    }
+    if !program.is_determinism_ready() {
+        let gaps = program
+            .gaps()
+            .iter()
+            .take(8)
+            .map(|gap| {
+                let node_index = gap.node_index() as usize;
+                format!(
+                    "node_index={} node_id={} provider_id={} operation_id={} reason={}",
+                    gap.node_index(),
+                    batch_identity
+                        .node_id_at(node_index)
+                        .map_or("<missing>", NodeId::as_str),
+                    batch_identity
+                        .provider_id_at(node_index)
+                        .map_or("<missing>", ProviderId::as_str),
+                    batch_identity
+                        .operation_id_at(node_index)
+                        .map_or("<missing>", OperationId::as_str),
+                    gap.reason().as_str(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(invalid_operation(format!(
+            "determinism reusable program has {} non-resident replay-eligible gap(s): {gaps}",
+            program.gaps().len()
+        )));
     }
     let mut coverage = vec![0_u8; node_count];
     for node_index in eager_boundary_node_indices {
@@ -1372,6 +1409,7 @@ impl OperationDispatch {
                     reusable_program,
                     providers.len(),
                     &actual_authority.eager_boundary_node_indices,
+                    batch_identity,
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
                 if !actual_authority.eager_boundary_node_indices.is_empty() {
@@ -1835,10 +1873,19 @@ impl OperationDispatch {
         if reusable_program.is_none() {
             if let Some(authority) = reusable_execution_authority {
                 commands
-                    .set_reusable_execution_capture(DeviceReusableExecutionCapture::new(
-                        authority.program_id,
-                        reusable_execution_binding_nodes,
-                    ))
+                    .set_reusable_execution_capture(
+                        DeviceReusableExecutionCapture::new(
+                            authority.program_id,
+                            u32::try_from(providers.len()).map_err(|_| {
+                                SubmissionWaveDispatchError::Contract(invalid_operation(
+                                    "reusable execution capture node count exceeds u32",
+                                ))
+                            })?,
+                            authority.eager_boundary_node_indices,
+                            reusable_execution_binding_nodes,
+                        )
+                        .map_err(SubmissionWaveDispatchError::Contract)?,
+                    )
                     .map_err(SubmissionWaveDispatchError::Contract)?;
             }
         }

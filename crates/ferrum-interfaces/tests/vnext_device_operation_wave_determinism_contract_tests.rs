@@ -813,12 +813,14 @@ fn determinism_single_node_replay_preserves_the_immutable_plan_node_index() {
     )
     .unwrap()
     .expect("single-node determinism probe has a reusable program identity");
-    let program = DeviceReusableExecutionProgram::new(
+    let program = test_reusable_program(
         program_id,
+        1,
+        vec![],
         vec![DeviceReusableExecutionSegment::new(0, 0, 1, 1).unwrap()],
         vec![0],
-    )
-    .unwrap();
+        vec![],
+    );
 
     let handle = OperationDispatch::encode_and_submit_determinism_replayed_wave(
         &providers,

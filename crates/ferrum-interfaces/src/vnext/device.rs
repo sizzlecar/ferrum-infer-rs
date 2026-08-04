@@ -1163,28 +1163,117 @@ impl DeviceReusableExecutionProgramId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceReusableExecutionCapture {
     program_id: DeviceReusableExecutionProgramId,
+    node_count: u32,
+    eager_boundary_node_indices: Box<[u32]>,
     per_wave_binding_node_indices: Box<[u32]>,
 }
 
 impl DeviceReusableExecutionCapture {
     pub fn new(
         program_id: DeviceReusableExecutionProgramId,
+        node_count: u32,
+        eager_boundary_node_indices: Vec<u32>,
         mut per_wave_binding_node_indices: Vec<u32>,
-    ) -> Self {
+    ) -> Result<Self, VNextError> {
+        if node_count == 0
+            || eager_boundary_node_indices
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || eager_boundary_node_indices
+                .iter()
+                .any(|node_index| *node_index >= node_count)
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution capture topology is empty or non-canonical".to_owned(),
+            });
+        }
         per_wave_binding_node_indices.sort_unstable();
         per_wave_binding_node_indices.dedup();
-        Self {
-            program_id,
-            per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+        if per_wave_binding_node_indices
+            .iter()
+            .any(|node_index| *node_index >= node_count)
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution binding node is outside the captured topology"
+                    .to_owned(),
+            });
         }
+        Ok(Self {
+            program_id,
+            node_count,
+            eager_boundary_node_indices: eager_boundary_node_indices.into_boxed_slice(),
+            per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+        })
     }
 
     pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
         &self.program_id
     }
 
+    pub const fn node_count(&self) -> u32 {
+        self.node_count
+    }
+
+    pub fn eager_boundary_node_indices(&self) -> &[u32] {
+        &self.eager_boundary_node_indices
+    }
+
     pub fn per_wave_binding_node_indices(&self) -> &[u32] {
         &self.per_wave_binding_node_indices
+    }
+}
+
+/// Exact reason why one replay-eligible plan node is absent from a resident
+/// reusable executable. These rows preserve the cold-path failure class after
+/// the backend publishes a partial product catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceReusableExecutionProgramGapReason {
+    MissingComputeCommand,
+    ProviderReplayKeyMissing,
+    ReusableAddressScopeMissing,
+    ReusableAddressScopeConflict,
+    CaptureRejected,
+    CachedCaptureRejected,
+    QuiescenceDeferred,
+    CapacityDeferred,
+    OutsidePreparation,
+}
+
+impl DeviceReusableExecutionProgramGapReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingComputeCommand => "missing_compute_command",
+            Self::ProviderReplayKeyMissing => "provider_replay_key_missing",
+            Self::ReusableAddressScopeMissing => "reusable_address_scope_missing",
+            Self::ReusableAddressScopeConflict => "reusable_address_scope_conflict",
+            Self::CaptureRejected => "capture_rejected",
+            Self::CachedCaptureRejected => "cached_capture_rejected",
+            Self::QuiescenceDeferred => "quiescence_deferred",
+            Self::CapacityDeferred => "capacity_deferred",
+            Self::OutsidePreparation => "outside_preparation",
+        }
+    }
+}
+
+/// One classified replay-eligible gap in a partial reusable program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DeviceReusableExecutionProgramGap {
+    node_index: u32,
+    reason: DeviceReusableExecutionProgramGapReason,
+}
+
+impl DeviceReusableExecutionProgramGap {
+    pub const fn new(node_index: u32, reason: DeviceReusableExecutionProgramGapReason) -> Self {
+        Self { node_index, reason }
+    }
+
+    pub const fn node_index(self) -> u32 {
+        self.node_index
+    }
+
+    pub const fn reason(self) -> DeviceReusableExecutionProgramGapReason {
+        self.reason
     }
 }
 
@@ -1238,23 +1327,28 @@ impl DeviceReusableExecutionSegment {
     }
 }
 
-/// Immutable catalog row published only after the backend preparation window
-/// is sealed. Product requests may reference these segments directly instead
-/// of rebuilding their provider commands.
+/// Catalog row assembled during backend preparation and published only after
+/// that preparation window is sealed. A partial row may contain only typed
+/// gaps; product requests can reference resident segments, while determinism
+/// requires [`Self::is_determinism_ready`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DeviceReusableExecutionProgram {
     program_id: DeviceReusableExecutionProgramId,
+    node_count: u32,
+    eager_boundary_node_indices: Box<[u32]>,
     segments: Box<[DeviceReusableExecutionSegment]>,
     per_wave_binding_node_indices: Box<[u32]>,
+    gaps: Box<[DeviceReusableExecutionProgramGap]>,
 }
 
 impl DeviceReusableExecutionProgram {
     pub fn new(
-        program_id: DeviceReusableExecutionProgramId,
+        capture: &DeviceReusableExecutionCapture,
         segments: Vec<DeviceReusableExecutionSegment>,
         mut per_wave_binding_node_indices: Vec<u32>,
+        gaps: Vec<DeviceReusableExecutionProgramGap>,
     ) -> Result<Self, VNextError> {
-        if segments.is_empty()
+        if (segments.is_empty() && gaps.is_empty())
             || segments
                 .iter()
                 .enumerate()
@@ -1265,6 +1359,57 @@ impl DeviceReusableExecutionProgram {
         {
             return Err(VNextError::InvalidExecutionPlan {
                 reason: "reusable execution program segments are empty, unordered, or overlap"
+                    .to_owned(),
+            });
+        }
+        let node_count = capture.node_count() as usize;
+        let mut coverage = vec![0_u8; node_count];
+        for node_index in capture.eager_boundary_node_indices() {
+            coverage[*node_index as usize] = 1;
+        }
+        for segment in &segments {
+            let start = segment.start_node_index() as usize;
+            let end = segment.end_node_index() as usize;
+            let Some(range) = coverage.get_mut(start..end) else {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: "reusable execution segment is outside the captured topology"
+                        .to_owned(),
+                });
+            };
+            if range.iter().any(|marker| *marker != 0) {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: "reusable execution segment overlaps an eager boundary or another classification"
+                        .to_owned(),
+                });
+            }
+            range.fill(2);
+        }
+        if gaps
+            .windows(2)
+            .any(|pair| pair[0].node_index() >= pair[1].node_index())
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution program gaps are unordered or duplicated".to_owned(),
+            });
+        }
+        for gap in &gaps {
+            let Some(marker) = coverage.get_mut(gap.node_index() as usize) else {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: "reusable execution program gap is outside the captured topology"
+                        .to_owned(),
+                });
+            };
+            if *marker != 0 {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: "reusable execution program gap overlaps a resident segment or eager boundary"
+                        .to_owned(),
+                });
+            }
+            *marker = 3;
+        }
+        if coverage.iter().any(|marker| *marker == 0) {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: "reusable execution program does not classify every captured topology node"
                     .to_owned(),
             });
         }
@@ -1281,14 +1426,28 @@ impl DeviceReusableExecutionProgram {
             });
         }
         Ok(Self {
-            program_id,
+            program_id: capture.program_id().clone(),
+            node_count: capture.node_count(),
+            eager_boundary_node_indices: capture
+                .eager_boundary_node_indices()
+                .to_vec()
+                .into_boxed_slice(),
             segments: segments.into_boxed_slice(),
             per_wave_binding_node_indices: per_wave_binding_node_indices.into_boxed_slice(),
+            gaps: gaps.into_boxed_slice(),
         })
     }
 
     pub fn program_id(&self) -> &DeviceReusableExecutionProgramId {
         &self.program_id
+    }
+
+    pub const fn node_count(&self) -> u32 {
+        self.node_count
+    }
+
+    pub fn eager_boundary_node_indices(&self) -> &[u32] {
+        &self.eager_boundary_node_indices
     }
 
     pub fn segments(&self) -> &[DeviceReusableExecutionSegment] {
@@ -1297,6 +1456,14 @@ impl DeviceReusableExecutionProgram {
 
     pub fn per_wave_binding_node_indices(&self) -> &[u32] {
         &self.per_wave_binding_node_indices
+    }
+
+    pub fn gaps(&self) -> &[DeviceReusableExecutionProgramGap] {
+        &self.gaps
+    }
+
+    pub fn is_determinism_ready(&self) -> bool {
+        self.gaps.is_empty()
     }
 }
 
