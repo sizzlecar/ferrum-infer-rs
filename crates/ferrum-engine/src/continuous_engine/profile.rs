@@ -17,6 +17,22 @@ fn vnext_execution_event_name(kind: VNextExecutionEventKind) -> &'static str {
     }
 }
 
+fn compact_basic_node_identity_field(field: &str) -> bool {
+    matches!(
+        field,
+        "resource_pool_identity_fingerprint"
+            | "provisioning_run_id"
+            | "provisioning_request_id"
+            | "transaction_id"
+            | "runtime_implementation_fingerprint"
+            | "active_sequence_fingerprint"
+            | "completed_sequence_fingerprint"
+            | "aborted_sequence_fingerprint"
+            | "resource_id"
+            | "resource_batch_fingerprint"
+    )
+}
+
 struct VNextProfileEventContext {
     entrypoint: ProfileEntrypoint,
     model: String,
@@ -320,6 +336,12 @@ impl VNextProfileEventContext {
             .map(|origin| self.capture_policy_for_request(origin))
             .unwrap_or(self.capture_policy);
         let event_name = vnext_execution_event_name(event.kind());
+        let compact_basic = self.profile_detail == ObservabilityProfileDetail::Basic;
+        let compact_repeated_node = compact_basic
+            && matches!(
+                event.kind(),
+                VNextExecutionEventKind::NodeStarted | VNextExecutionEventKind::NodeRetired
+            );
         let failure = match event.detail() {
             ExecutionEventDetail::Failure(failure) => Some(ProfileError {
                 kind: failure.failure().code().to_string(),
@@ -366,14 +388,6 @@ impl VNextProfileEventContext {
                 )),
             ),
             (
-                "backend_device".to_string(),
-                serde_json::json!(self.backend_device),
-            ),
-            (
-                "backend_type".to_string(),
-                serde_json::json!(self.backend_type),
-            ),
-            (
                 "diagnostic_only".to_string(),
                 serde_json::json!(self.profile_detail.diagnostic_only()),
             ),
@@ -411,30 +425,44 @@ impl VNextProfileEventContext {
                 serde_json::json!(identity.span_id.to_string()),
             ),
             (
+                "execution_identity_version".to_string(),
+                serde_json::json!(identity.version.to_string()),
+            ),
+        ]);
+        if !compact_basic {
+            attributes.insert(
+                "backend_device".to_string(),
+                serde_json::json!(self.backend_device),
+            );
+            attributes.insert(
+                "backend_type".to_string(),
+                serde_json::json!(self.backend_type),
+            );
+        }
+        if !compact_basic || failure.is_some() {
+            attributes.insert(
                 "execution_identity".to_string(),
                 serde_json::to_value(identity).map_err(|error| {
                     ExecutionEventSinkError::new(format!(
                         "failed to serialize canonical vNext execution identity: {error}"
                     ))
                 })?,
-            ),
-            (
-                "execution_identity_version".to_string(),
-                serde_json::json!(identity.version.to_string()),
-            ),
-            (
+            );
+            attributes.insert(
+                "execution_request_id".to_string(),
+                serde_json::json!(identity.request_id.to_string()),
+            );
+        }
+        if !compact_basic || !identity.async_links.is_empty() {
+            attributes.insert(
                 "async_links".to_string(),
                 serde_json::json!(identity
                     .async_links
                     .iter()
                     .map(ToString::to_string)
                     .collect::<Vec<_>>()),
-            ),
-        ]);
-        attributes.insert(
-            "execution_request_id".to_string(),
-            serde_json::json!(identity.request_id.to_string()),
-        );
+            );
+        }
         if let Some(origin) = request_origin {
             attributes.insert(
                 "execution_request_origin".to_string(),
@@ -563,6 +591,9 @@ impl VNextProfileEventContext {
                 identity.resource_batch_fingerprint.clone(),
             ),
         ] {
+            if compact_repeated_node && compact_basic_node_identity_field(key) {
+                continue;
+            }
             if let Some(value) = value {
                 attributes.insert(key.to_string(), serde_json::json!(value));
             }

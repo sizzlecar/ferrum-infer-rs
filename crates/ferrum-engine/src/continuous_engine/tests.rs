@@ -6484,6 +6484,43 @@ fn vnext_profile_test_operation_event() -> ferrum_interfaces::vnext::ExecutionEv
     .unwrap()
 }
 
+fn vnext_profile_test_node_event(
+    kind: ferrum_interfaces::vnext::ExecutionEventKind,
+) -> ferrum_interfaces::vnext::ExecutionEvent {
+    use ferrum_interfaces::vnext::{
+        ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
+        ExecutionPhase, MonotonicTimestamp, SpanId,
+    };
+
+    assert!(matches!(
+        kind,
+        ExecutionEventKind::NodeStarted | ExecutionEventKind::NodeRetired
+    ));
+    let mut identity = vnext_profile_test_operation_event()
+        .identity()
+        .parts()
+        .clone();
+    identity.sequence = if kind == ExecutionEventKind::NodeStarted {
+        2
+    } else {
+        4
+    };
+    identity.span_id = SpanId::new("vnext/request/engine-profile-test/node/1").unwrap();
+    identity.parent_span_id =
+        Some(SpanId::new("vnext/request/engine-profile-test/frame/1").unwrap());
+    identity.async_links.clear();
+    ExecutionEvent::new(
+        MonotonicTimestamp {
+            nanos_since_run_start: identity.sequence,
+        },
+        ExecutionPhase::Execution,
+        kind,
+        ExecutionIdentityEnvelope::new(identity).unwrap(),
+        ExecutionEventDetail::None,
+    )
+    .unwrap()
+}
+
 fn vnext_profile_test_resource_failure_event() -> ferrum_interfaces::vnext::ExecutionEvent {
     use ferrum_interfaces::vnext::{
         ExecutionEvent, ExecutionEventDetail, ExecutionEventKind, ExecutionIdentityEnvelope,
@@ -6554,6 +6591,141 @@ fn vnext_profile_preserves_the_complete_canonical_execution_identity() {
     assert_eq!(identity["active_sequence_slot"], 1);
     assert_eq!(identity["resource_id"], serde_json::Value::Null);
     assert_eq!(identity["async_links"], profile.attributes["async_links"]);
+
+    drop(sink);
+    journal.close().unwrap();
+    let _ = std::fs::remove_file(trace_path);
+}
+
+#[test]
+fn basic_vnext_profile_serializes_identity_once_and_stays_within_request_budget() {
+    use ferrum_interfaces::vnext::ExecutionEventKind;
+
+    const NODES_PER_REQUEST: usize = 132;
+    const LIFECYCLE_EVENTS_PER_REQUEST: usize = 6;
+    const MAX_BYTES_PER_REQUEST: usize = 1024 * 1024;
+
+    let trace_path = resource_trace_temp_path("vnext-basic-compact-execution-identity");
+    let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
+    let mut config = EngineConfig::default();
+    config.runtime.profile_detail = ObservabilityProfileDetail::Basic;
+    let sink =
+        VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Serve, &config);
+
+    let operation = sink
+        .profile_event(&vnext_profile_test_operation_event())
+        .unwrap();
+    operation.validate().unwrap();
+    assert!(!operation.attributes.contains_key("execution_identity"));
+    assert!(!operation.attributes.contains_key("execution_request_id"));
+    assert!(!operation.attributes.contains_key("backend_device"));
+    assert!(!operation.attributes.contains_key("backend_type"));
+    assert_eq!(
+        operation.attributes["execution_identity_version"],
+        ferrum_interfaces::vnext::EXECUTION_IDENTITY_VERSION.to_string()
+    );
+    assert_eq!(operation.request_id, "request.vnext.engine-profile-test");
+    assert_eq!(operation.shape["execution_sequence"], 3);
+    assert_eq!(operation.shape["frame_id"], 1);
+    assert_eq!(operation.shape["node_invocation_id"], 1);
+    for field in [
+        "plan_id",
+        "plan_hash",
+        "node_id",
+        "operation_id",
+        "provider_id",
+        "device_id",
+        "resource_pool_id",
+        "resource_pool_identity_fingerprint",
+        "provisioning_run_id",
+        "provisioning_request_id",
+        "transaction_id",
+        "runtime_implementation_fingerprint",
+        "active_sequence_fingerprint",
+        "run_id",
+        "span_id",
+        "parent_span_id",
+        "async_links",
+    ] {
+        assert!(
+            operation.attributes.contains_key(field),
+            "basic operation identity omitted {field}"
+        );
+    }
+    assert_eq!(
+        operation.backend_detail.as_ref().unwrap()["backend_device"],
+        serde_json::json!(format!("{:?}", config.backend.device))
+    );
+
+    let started = sink
+        .profile_event(&vnext_profile_test_node_event(
+            ExecutionEventKind::NodeStarted,
+        ))
+        .unwrap();
+    let retired = sink
+        .profile_event(&vnext_profile_test_node_event(
+            ExecutionEventKind::NodeRetired,
+        ))
+        .unwrap();
+    for event in [&started, &retired] {
+        for field in [
+            "plan_id",
+            "plan_hash",
+            "node_id",
+            "operation_id",
+            "provider_id",
+            "device_id",
+            "resource_pool_id",
+            "active_sequence_slot",
+            "admission_generation",
+            "activation_epoch",
+            "run_id",
+            "span_id",
+            "parent_span_id",
+        ] {
+            assert!(
+                event.attributes.contains_key(field),
+                "node linkage omitted {field}"
+            );
+        }
+        for field in [
+            "execution_identity",
+            "resource_pool_identity_fingerprint",
+            "provisioning_run_id",
+            "provisioning_request_id",
+            "transaction_id",
+            "runtime_implementation_fingerprint",
+            "active_sequence_fingerprint",
+            "async_links",
+        ] {
+            assert!(
+                !event.attributes.contains_key(field),
+                "repeated node identity retained {field}"
+            );
+        }
+    }
+
+    let (_, _, accepted) = vnext_profile_test_event();
+    let lifecycle = sink.profile_event(&accepted).unwrap();
+    let serialized_request_upper_bound = NODES_PER_REQUEST
+        * (serde_json::to_vec(&started).unwrap().len()
+            + serde_json::to_vec(&operation).unwrap().len()
+            + serde_json::to_vec(&retired).unwrap().len())
+        + LIFECYCLE_EVENTS_PER_REQUEST
+            * serde_json::to_vec(&operation)
+                .unwrap()
+                .len()
+                .max(serde_json::to_vec(&lifecycle).unwrap().len());
+    assert!(
+        serialized_request_upper_bound <= MAX_BYTES_PER_REQUEST,
+        "basic execution trace upper bound is {serialized_request_upper_bound} bytes"
+    );
+
+    let failure = sink
+        .profile_event(&vnext_profile_test_resource_failure_event())
+        .unwrap();
+    assert!(failure.attributes.contains_key("execution_identity"));
+    assert!(failure.attributes.contains_key("execution_request_id"));
 
     drop(sink);
     journal.close().unwrap();
