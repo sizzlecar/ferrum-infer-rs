@@ -184,15 +184,11 @@ fn causal_replay_identity_uses_a_partition_capacity_envelope() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStableDecode"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("ExactShapeEager"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("is_partition_stable"));
-    assert!(CAUSAL_ATTENTION_SOURCE.contains(
-        "partition_stable &= topology.is_partition_stable();"
-    ));
-    assert!(CAUSAL_ATTENTION_SOURCE.contains(
-        "return Ok(ReusableExecutionTopology::EagerBoundary);"
-    ));
-    assert!(!CAUSAL_ATTENTION_SOURCE.contains(
-        ".map(ReusableExecutionTopology::Dynamic)"
-    ));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("partition_stable &= topology.is_partition_stable();"));
+    assert!(
+        CAUSAL_ATTENTION_SOURCE.contains("return Ok(ReusableExecutionTopology::EagerBoundary);")
+    );
+    assert!(!CAUSAL_ATTENTION_SOURCE.contains(".map(ReusableExecutionTopology::Dynamic)"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains(".u64(replay_envelope.sequence_capacity_tokens)"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains(".i32(replay_envelope.table_capacity_entries)"));
     assert!(!CAUSAL_ATTENTION_SOURCE.contains(".u64(launch.sequence_tokens)"));
@@ -273,7 +269,7 @@ fn recurrent_attention_packs_wave_projections_and_keeps_exact_qkvzba() {
         "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect"
     ));
     assert!(RECURRENT_ATTENTION_SOURCE
-        .contains("let use_packed = participant_count_usize > 1 && input_shared && output_shared"));
+        .contains("let use_packed = participant_count_usize > 1 && input_packed && output_packed"));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("super::shared_token_region("));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("DeviceBatchingForm::Packed"));
     assert!(
