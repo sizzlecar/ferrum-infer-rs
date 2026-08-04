@@ -111,6 +111,7 @@ VNEXT_S0A_PUBLIC_API_ADDED_SHA256 = (
     "557dec231957692d7e9e727ad4da20d33441b00c788eaee76fdf2de398a0ef5a"
 )
 VNEXT_S0A_PUBLIC_API_ADDED_COUNT = 1157
+VNEXT_S0A_SHARED_TEST_SUPPORT_OWNER_COUNT = 13
 VNEXT_S0A_PRODUCTION_GROUPS = {"resource", "execution", "event", "operation"}
 VNEXT_S0A_PRODUCTION_COMPOSITION_OWNERS = {
     "crates/ferrum-interfaces/src/vnext/static_initialization.rs"
@@ -3648,7 +3649,7 @@ def validate_vnext_g01a_s0a_provenance(
         == 28
         and inventory_summary.get("shared_test_support_owner_count")
         == category_counts.get("shared_test_support_owner")
-        == 12
+        == VNEXT_S0A_SHARED_TEST_SUPPORT_OWNER_COUNT
         and inventory_summary.get("maximum_facade_physical_lines", 501) <= 500
         and inventory_summary.get("maximum_production_owner_physical_lines", 2501) <= 2500
         and inventory_summary.get("maximum_contract_test_or_support_owner_physical_lines", 2001)
