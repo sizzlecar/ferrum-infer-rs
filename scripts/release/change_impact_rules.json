@@ -261,6 +261,158 @@
       "reason": "the model-independent runtime oracle and its real-weight L1 contract are mandatory S2 inputs"
     },
     {
+      "id": "vnext-core-contract-runtime",
+      "path_globs": [
+        "crates/ferrum-interfaces/src/vnext/**",
+        "crates/ferrum-engine/src/continuous_engine.rs",
+        "crates/ferrum-engine/src/continuous_engine/**",
+        "crates/ferrum-engine/src/product_composition.rs",
+        "crates/ferrum-engine/src/vnext_determinism.rs",
+        "crates/ferrum-models/src/executor/vnext_*.rs",
+        "crates/ferrum-models/src/executor/vnext_executor/**",
+        "crates/ferrum-models/src/vnext/**"
+      ],
+      "domains": ["vnext_execution_contract", "shared_runtime"],
+      "required_gates": [
+        "unit",
+        "planner_selftest",
+        "vnext_g01",
+        "vnext_g02_core",
+        "vnext_s1_cuda",
+        "vnext_s1_cuda_capacity",
+        "vnext_s1_cuda_decode_capacity",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_response_format",
+        "vnext_s2_api_modality",
+        "vnext_s2_stream_disconnect",
+        "vnext_s2_tool_schema",
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_latency_first_failure",
+        "vnext_s2_historical_resource_source",
+        "vnext_s2_cuda_product_contract",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ],
+      "required_scenarios": [
+        "run_multiturn_recall",
+        "serve_multiturn_recall",
+        "serve_stream_done_usage",
+        "serve_tool_call",
+        "serve_structured_output",
+        "serve_concurrency_quality"
+      ],
+      "release_invalidation": [
+        "vnext_g01",
+        "vnext_g02_core",
+        "vnext_s1_cuda",
+        "vnext_s1_cuda_capacity",
+        "vnext_s1_cuda_decode_capacity",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_response_format",
+        "vnext_s2_api_modality",
+        "vnext_s2_stream_disconnect",
+        "vnext_s2_tool_schema",
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_latency_first_failure",
+        "vnext_s2_historical_resource_source",
+        "vnext_s2_cuda_product_contract",
+        "metal_sentinel",
+        "cuda_sentinel",
+        "metal_full",
+        "cuda_full",
+        "cuda_llama_dense"
+      ],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "vNext plan, operation, resource, execution, and product composition contracts feed every S1/S2 proof and both accelerator boundaries"
+    },
+    {
+      "id": "vnext-core-contract-tests",
+      "path_globs": [
+        "crates/ferrum-interfaces/tests/vnext_*.rs",
+        "crates/ferrum-interfaces/tests/vnext_*/**",
+        "crates/ferrum-interfaces/tests/ui/vnext/**"
+      ],
+      "domains": ["vnext_contract_test"],
+      "required_gates": [
+        "unit",
+        "planner_selftest",
+        "vnext_g01",
+        "vnext_g02_core",
+        "vnext_s2_historical_resource_source"
+      ],
+      "release_invalidation": [
+        "vnext_g01",
+        "vnext_g02_core",
+        "vnext_s2_historical_resource_source",
+        "vnext_s2_cuda_product_contract"
+      ],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "contract-test-only changes refresh local proof artifacts without rerunning unchanged actual-model CUDA lanes"
+    },
+    {
+      "id": "vnext-cuda-provider-runtime",
+      "path_globs": [
+        "crates/ferrum-kernels/src/backend/cuda/vnext_*.rs",
+        "crates/ferrum-kernels/src/backend/cuda/vnext_*/**"
+      ],
+      "domains": ["vnext_cuda_provider", "cuda_backend"],
+      "required_gates": [
+        "unit",
+        "planner_selftest",
+        "backend_boundary",
+        "vnext_s1_cuda",
+        "vnext_s1_cuda_capacity",
+        "vnext_s1_cuda_decode_capacity",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_response_format",
+        "vnext_s2_api_modality",
+        "vnext_s2_stream_disconnect",
+        "vnext_s2_tool_schema",
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_latency_first_failure",
+        "vnext_s2_cuda_product_contract",
+        "cuda_sentinel",
+        "metal_boundary_smoke"
+      ],
+      "release_invalidation": [
+        "vnext_s1_cuda",
+        "vnext_s1_cuda_capacity",
+        "vnext_s1_cuda_decode_capacity",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_response_format",
+        "vnext_s2_api_modality",
+        "vnext_s2_stream_disconnect",
+        "vnext_s2_tool_schema",
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_latency_first_failure",
+        "vnext_s2_cuda_product_contract",
+        "cuda_sentinel",
+        "cuda_full",
+        "cuda_llama_dense"
+      ],
+      "exceptions": [],
+      "owner": "cuda",
+      "reason": "vNext CUDA provider, replay, and operation changes invalidate CUDA product witnesses but require only a cheap Metal boundary check"
+    },
+    {
+      "id": "vnext-s2-aggregate-validator",
+      "path_globs": [
+        "scripts/release/runtime_vnext_s2_cuda_product_contract.py"
+      ],
+      "domains": ["vnext_s2_aggregate", "release_gate"],
+      "required_gates": [
+        "vnext_s2_aggregate_selftest",
+        "run_gate_selftest",
+        "planner_selftest"
+      ],
+      "release_invalidation": ["vnext_s2_cuda_product_contract"],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "aggregate-only validator changes must revalidate child manifests without rerunning unchanged real-model CUDA execution"
+    },
+    {
       "id": "native-operator",
       "path_globs": [
         "crates/ferrum-native-ops/**",
