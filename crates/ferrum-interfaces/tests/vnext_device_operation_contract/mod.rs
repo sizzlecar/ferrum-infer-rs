@@ -1312,6 +1312,8 @@ pub(crate) struct RuntimeTrace {
     pub(crate) program_binding_input_counts: Vec<usize>,
     pub(crate) readback_calls: u64,
     pub(crate) readback_lengths: Vec<u64>,
+    pub(crate) readback_fill_pattern: Vec<u8>,
+    pub(crate) readback_fill_index: usize,
     pub(crate) synchronize_calls: u64,
     pub(crate) wait_fence_calls: u64,
     pub(crate) tamper_buffer_descriptor: bool,
@@ -1905,7 +1907,14 @@ impl DeviceRuntime for TestRuntime {
         let mut trace = self.trace.lock().unwrap();
         trace.readback_calls += 1;
         trace.readback_lengths.push(region.length_bytes());
-        Ok(vec![0; output_layout.byte_len().unwrap() as usize])
+        let fill_byte = if trace.readback_fill_pattern.is_empty() {
+            0
+        } else {
+            let index = trace.readback_fill_index % trace.readback_fill_pattern.len();
+            trace.readback_fill_index += 1;
+            trace.readback_fill_pattern[index]
+        };
+        Ok(vec![fill_byte; output_layout.byte_len().unwrap() as usize])
     }
 
     fn describe_error(&self, error: &Self::Error) -> Result<DeviceErrorReport, VNextError> {

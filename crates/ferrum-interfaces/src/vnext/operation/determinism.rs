@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -9,24 +10,25 @@ use super::{
     BatchOperationIdentity, BatchedOperationInvocation, BoundOperationProvider, ElementType,
 };
 use crate::vnext::{
-    BatchInvocationId, BufferUsage, CompletionHandle, CompletionReadbackBatchRequest,
-    CompletionReadbackCollectionObservation, CompletionReadbackCollectionRequest,
-    CompletionReadbackDisposition, CompletionReadbackRequest, DeviceCommandPhase,
-    DeviceComputePathRequirement, DeviceExecutionPath, DeviceReusableExecutionProgramId,
-    DeviceRuntime, ExecutablePlanView, ExecutionDeterminismInitializationKind,
-    ExecutionDeterminismInitializationSpec, ExecutionDeterminismValueExtent,
-    ExecutionDeterminismValueLocation, ExecutionDeterminismWitnessKind,
-    ExecutionDeterminismWitnessPlan, ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId,
-    OperationCompletionDisposition, PlanHash, PreparedStepSubmissionWave, ResourceId,
+    BatchInvocationId, BatchParticipantAuthority, BufferUsage, CompletionHandle,
+    CompletionReadbackBatchRequest, CompletionReadbackCollectionObservation,
+    CompletionReadbackCollectionRequest, CompletionReadbackDisposition, CompletionReadbackRequest,
+    DeviceCommandPhase, DeviceComputePathRequirement, DeviceExecutionPath,
+    DeviceReusableExecutionProgramId, DeviceRuntime, ExecutablePlanView,
+    ExecutionDeterminismInitializationKind, ExecutionDeterminismInitializationSpec,
+    ExecutionDeterminismValueExtent, ExecutionDeterminismValueLocation,
+    ExecutionDeterminismWitnessKind, ExecutionDeterminismWitnessPlan,
+    ExecutionDeterminismWitnessSpec, HostTransferLayout, NodeId, OperationCompletionDisposition,
+    PlanHash, PreparedStepSubmissionWave, ResourceId, ResourceWorkShape, SequenceSession,
     SubmittedOperationReceipt, TrustedActiveSequenceBinding, VNextError,
 };
 
 const LOGICAL_RESTORE_FINGERPRINT_DOMAIN: &[u8] =
-    b"ferrum.runtime-vnext.determinism-logical-restore.v1";
+    b"ferrum.runtime-vnext.determinism-logical-restore.v2";
 const EXTERNAL_INPUT_FINGERPRINT_DOMAIN: &[u8] =
-    b"ferrum.runtime-vnext.determinism-external-input.v1";
+    b"ferrum.runtime-vnext.determinism-external-input.v2";
 const INITIAL_STATE_FINGERPRINT_DOMAIN: &[u8] =
-    b"ferrum.runtime-vnext.determinism-initial-state.v1";
+    b"ferrum.runtime-vnext.determinism-initial-state.v2";
 const NO_RNG_STATE_FINGERPRINT_DOMAIN: &[u8] = b"ferrum.runtime-vnext.determinism-no-rng-state.v1";
 
 fn hash_u64(hasher: &mut Sha256, value: u64) {
@@ -66,6 +68,208 @@ pub struct SubmissionWaveDeterminismLogicalRange {
     length_bytes: u64,
 }
 
+/// Stable semantic participant authority for one physically canonical batch.
+///
+/// Runtime resource ownership and provider bindings remain indexed by physical
+/// batch position. Determinism comparisons use the logical position so fresh
+/// admissions may choose different sequence authorities without changing the
+/// semantic execution identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmissionWaveDeterminismParticipantOrder {
+    physical_authorities: Vec<BatchParticipantAuthority>,
+    logical_authorities: Vec<BatchParticipantAuthority>,
+    physical_to_logical: Vec<u32>,
+    logical_to_physical: Vec<u32>,
+}
+
+impl SubmissionWaveDeterminismParticipantOrder {
+    /// Binds a caller-defined semantic order to the exact physical authorities
+    /// carried by one prepared wave. The logical order cannot be expressed as
+    /// a naked permutation: every position must name one authority in the wave.
+    pub fn from_logical_participant_sessions<R: DeviceRuntime>(
+        wave: &PreparedStepSubmissionWave<R>,
+        logical_sessions: &[Arc<SequenceSession<R>>],
+    ) -> Result<Self, VNextError> {
+        let logical_authorities = logical_sessions
+            .iter()
+            .map(|session| {
+                session.ensure_open_identity()?;
+                Ok(BatchParticipantAuthority::new(
+                    session.sequence_authority(),
+                    session.request_authority(),
+                ))
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        Self::from_logical_participant_authorities(wave, logical_authorities)
+    }
+
+    fn from_logical_participant_authorities<R: DeviceRuntime>(
+        wave: &PreparedStepSubmissionWave<R>,
+        logical_authorities: Vec<BatchParticipantAuthority>,
+    ) -> Result<Self, VNextError> {
+        let physical_authorities = prepared_wave_participant_authorities(wave)?;
+        if logical_authorities.len() != physical_authorities.len()
+            || logical_authorities
+                .iter()
+                .enumerate()
+                .any(|(index, authority)| {
+                    logical_authorities[..index].contains(authority)
+                        || !physical_authorities.contains(authority)
+                })
+        {
+            return Err(invalid_operation(
+                "determinism logical participant authorities differ from the prepared wave",
+            ));
+        }
+        let physical_to_logical = physical_authorities
+            .iter()
+            .map(|authority| {
+                logical_authorities
+                    .iter()
+                    .position(|candidate| candidate == authority)
+                    .and_then(|index| u32::try_from(index).ok())
+                    .ok_or_else(|| {
+                        invalid_operation(
+                            "determinism physical participant lacks a logical authority",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        let logical_to_physical = validate_participant_permutation(&physical_to_logical)?;
+        let order = Self {
+            physical_authorities,
+            logical_authorities,
+            physical_to_logical,
+            logical_to_physical,
+        };
+        order.validate_for_wave(wave)?;
+        Ok(order)
+    }
+
+    fn identity_for_prepared_wave<R: DeviceRuntime>(
+        wave: &PreparedStepSubmissionWave<R>,
+    ) -> Result<Self, VNextError> {
+        let authorities = prepared_wave_participant_authorities(wave)?;
+        Self::from_logical_participant_authorities(wave, authorities)
+    }
+
+    pub fn participant_count(&self) -> u32 {
+        u32::try_from(self.physical_to_logical.len())
+            .expect("determinism participant order count was validated")
+    }
+
+    pub fn logical_index_for_physical(&self, physical_index: u32) -> Option<u32> {
+        usize::try_from(physical_index)
+            .ok()
+            .and_then(|index| self.physical_to_logical.get(index))
+            .copied()
+    }
+
+    pub fn physical_index_for_logical(&self, logical_index: u32) -> Option<u32> {
+        usize::try_from(logical_index)
+            .ok()
+            .and_then(|index| self.logical_to_physical.get(index))
+            .copied()
+    }
+
+    fn validate_for_wave<R: DeviceRuntime>(
+        &self,
+        wave: &PreparedStepSubmissionWave<R>,
+    ) -> Result<(), VNextError> {
+        let actual_physical = prepared_wave_participant_authorities(wave)?;
+        let actual_logical = self.reorder_physical_to_logical(&actual_physical)?;
+        if actual_physical != self.physical_authorities
+            || actual_logical != self.logical_authorities
+        {
+            return Err(invalid_operation(
+                "determinism participant order is not bound to this prepared wave",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reorder_physical_to_logical<T: Clone>(&self, physical: &[T]) -> Result<Vec<T>, VNextError> {
+        if physical.len() != self.physical_to_logical.len() {
+            return Err(invalid_operation(
+                "determinism participant order differs from its physical values",
+            ));
+        }
+        self.logical_to_physical
+            .iter()
+            .map(|physical_index| {
+                physical
+                    .get(usize::try_from(*physical_index).expect("u32 physical index fits usize"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        invalid_operation(
+                            "determinism participant order references an absent physical value",
+                        )
+                    })
+            })
+            .collect()
+    }
+}
+
+fn validate_participant_permutation(physical_to_logical: &[u32]) -> Result<Vec<u32>, VNextError> {
+    if physical_to_logical.is_empty() {
+        return Err(invalid_operation(
+            "determinism participant order requires a non-empty batch",
+        ));
+    }
+    let participant_count = u32::try_from(physical_to_logical.len())
+        .map_err(|_| invalid_operation("determinism participant order count exceeds u32"))?;
+    let mut logical_to_physical = vec![u32::MAX; physical_to_logical.len()];
+    for (physical_index, logical_index) in physical_to_logical.iter().copied().enumerate() {
+        if logical_index >= participant_count {
+            return Err(invalid_operation(
+                "determinism participant order contains an out-of-range logical index",
+            ));
+        }
+        let inverse = logical_to_physical
+            .get_mut(usize::try_from(logical_index).expect("u32 logical index fits usize"))
+            .expect("logical index was range checked");
+        if *inverse != u32::MAX {
+            return Err(invalid_operation(
+                "determinism participant order is not a one-to-one permutation",
+            ));
+        }
+        *inverse = u32::try_from(physical_index)
+            .map_err(|_| invalid_operation("determinism physical participant index exceeds u32"))?;
+    }
+    if logical_to_physical
+        .iter()
+        .any(|physical_index| *physical_index == u32::MAX)
+    {
+        return Err(invalid_operation(
+            "determinism participant order does not cover every logical participant",
+        ));
+    }
+    Ok(logical_to_physical)
+}
+
+fn prepared_wave_participant_authorities<R: DeviceRuntime>(
+    wave: &PreparedStepSubmissionWave<R>,
+) -> Result<Vec<BatchParticipantAuthority>, VNextError> {
+    let authorities = wave
+        .nodes()
+        .first()
+        .map(|node| node.work_shape().participants().to_vec())
+        .filter(|participants| !participants.is_empty())
+        .ok_or_else(|| {
+            invalid_operation("determinism participant order requires a non-empty prepared wave")
+        })?;
+    if wave
+        .nodes()
+        .iter()
+        .any(|node| node.work_shape().participants() != authorities)
+    {
+        return Err(invalid_operation(
+            "determinism prepared-wave nodes disagree on physical participant authorities",
+        ));
+    }
+    Ok(authorities)
+}
+
 impl SubmissionWaveDeterminismLogicalRange {
     pub const fn logical_offset_bytes(self) -> u64 {
         self.logical_offset_bytes
@@ -85,11 +289,14 @@ impl SubmissionWaveDeterminismLogicalRange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionWaveDeterminismRestoreLayout {
     witness_plan: ExecutionDeterminismWitnessPlan,
+    participant_order: SubmissionWaveDeterminismParticipantOrder,
     batch_invocation_id: BatchInvocationId,
     claimed_backing_fingerprint: String,
     node_logical_work_fingerprints: Vec<String>,
     participant_initialization_ranges: Vec<Vec<SubmissionWaveDeterminismLogicalRange>>,
+    logical_participant_initialization_ranges: Vec<Vec<SubmissionWaveDeterminismLogicalRange>>,
     witness_participant_ranges: Vec<Vec<SubmissionWaveDeterminismLogicalRange>>,
+    logical_witness_participant_ranges: Vec<Vec<SubmissionWaveDeterminismLogicalRange>>,
 }
 
 impl SubmissionWaveDeterminismRestoreLayout {
@@ -100,6 +307,31 @@ impl SubmissionWaveDeterminismRestoreLayout {
         resolved: &dyn ExecutablePlanView,
         batch_identity: &BatchOperationIdentity,
         active_bindings: I,
+        wave: &PreparedStepSubmissionWave<R>,
+    ) -> Result<Self, VNextError>
+    where
+        R: DeviceRuntime,
+        I: Clone + ExactSizeIterator<Item = &'binding TrustedActiveSequenceBinding>,
+    {
+        Self::from_prepared_wave_with_participant_order(
+            runtime,
+            providers,
+            resolved,
+            batch_identity,
+            active_bindings,
+            SubmissionWaveDeterminismParticipantOrder::identity_for_prepared_wave(wave)?,
+            wave,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_prepared_wave_with_participant_order<'binding, R, I>(
+        runtime: &R,
+        providers: &[BoundOperationProvider<'_, R>],
+        resolved: &dyn ExecutablePlanView,
+        batch_identity: &BatchOperationIdentity,
+        active_bindings: I,
+        participant_order: SubmissionWaveDeterminismParticipantOrder,
         wave: &PreparedStepSubmissionWave<R>,
     ) -> Result<Self, VNextError>
     where
@@ -125,6 +357,28 @@ impl SubmissionWaveDeterminismRestoreLayout {
         if providers.len() != wave.nodes().len()
             || providers.len() != batch_identity.node_count()
             || active_bindings.len() != participant_count
+            || usize::try_from(participant_order.participant_count()).ok()
+                != Some(participant_count)
+            || participant_order.validate_for_wave(wave).is_err()
+            || active_bindings
+                .clone()
+                .zip(&participant_order.physical_authorities)
+                .any(|(binding, authority)| {
+                    binding.sequence_authority() != authority.sequence_authority()
+                })
+            || batch_identity.nodes().iter().any(|node| {
+                node.participants().len() != participant_count
+                    || node
+                        .participants()
+                        .iter()
+                        .zip(&participant_order.physical_authorities)
+                        .any(|(participant, authority)| {
+                            participant.node_key().sequence_authority()
+                                != authority.sequence_authority()
+                                || participant.node_key().request_authority()
+                                    != authority.request_authority()
+                        })
+            })
             || witness_plan.plan_hash() != resolved.execution_plan().plan_hash()
             || witness_plan.plan_hash() != batch_identity.plan_hash()
             || batch_identity.batch_invocation_id() != wave.batch_invocation_id()
@@ -226,22 +480,41 @@ impl SubmissionWaveDeterminismRestoreLayout {
             })
             .collect::<Result<Vec<_>, VNextError>>()?;
 
+        let logical_participant_initialization_ranges = logical_initialization_ranges(
+            wave,
+            &participant_order,
+            witness_plan.initializations(),
+            &participant_initialization_ranges,
+        )?;
+        let logical_witness_participant_ranges = witness_plan
+            .witnesses()
+            .iter()
+            .zip(&witness_participant_ranges)
+            .map(|(witness, ranges)| {
+                logical_participant_ranges(wave, &participant_order, witness.location(), ranges)
+            })
+            .collect::<Result<Vec<_>, VNextError>>()?;
+        let node_logical_work_fingerprints = logical_work_fingerprints(wave, &participant_order)?;
+
         Ok(Self {
             witness_plan,
+            participant_order,
             batch_invocation_id: batch_identity.batch_invocation_id(),
             claimed_backing_fingerprint: batch_identity.claimed_backing_fingerprint().to_owned(),
-            node_logical_work_fingerprints: wave
-                .nodes()
-                .iter()
-                .map(|node| node.work_shape().logical_work_fingerprint().to_owned())
-                .collect(),
+            node_logical_work_fingerprints,
             participant_initialization_ranges,
+            logical_participant_initialization_ranges,
             witness_participant_ranges,
+            logical_witness_participant_ranges,
         })
     }
 
     pub fn witness_plan(&self) -> &ExecutionDeterminismWitnessPlan {
         &self.witness_plan
+    }
+
+    pub fn participant_order(&self) -> &SubmissionWaveDeterminismParticipantOrder {
+        &self.participant_order
     }
 
     pub fn participant_count(&self) -> u32 {
@@ -393,12 +666,26 @@ impl SubmissionWaveDeterminismRestore {
             u64::try_from(selected_count)
                 .map_err(|_| invalid_operation("determinism initialization count exceeds u64"))?,
         );
-        for (participant_index, (payloads, ranges)) in self
-            .participant_payloads
+        for (participant_index, ranges) in self
+            .layout
+            .logical_participant_initialization_ranges
             .iter()
-            .zip(&self.layout.participant_initialization_ranges)
             .enumerate()
         {
+            let physical_index = self
+                .layout
+                .participant_order
+                .physical_index_for_logical(u32::try_from(participant_index).map_err(|_| {
+                    invalid_operation("determinism logical participant index exceeds u32")
+                })?)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| {
+                    invalid_operation("determinism logical participant lacks a physical payload")
+                })?;
+            let payloads = self
+                .participant_payloads
+                .get(physical_index)
+                .ok_or_else(|| invalid_operation("determinism physical payload is absent"))?;
             for (initialization_index, ((initialization, payload), range)) in
                 initializations.iter().zip(payloads).zip(ranges).enumerate()
             {
@@ -491,7 +778,7 @@ impl SubmissionWaveDeterminismRestore {
                 invalid_operation("determinism restore participant count exceeds u64")
             })?,
         );
-        for ranges in &self.layout.participant_initialization_ranges {
+        for ranges in &self.layout.logical_participant_initialization_ranges {
             hash_ranges(&mut hasher, ranges)?;
         }
 
@@ -500,7 +787,7 @@ impl SubmissionWaveDeterminismRestore {
             u64::try_from(self.layout.witness_participant_ranges.len())
                 .map_err(|_| invalid_operation("determinism restore witness count exceeds u64"))?,
         );
-        for ranges in &self.layout.witness_participant_ranges {
+        for ranges in &self.layout.logical_witness_participant_ranges {
             hash_ranges(&mut hasher, ranges)?;
         }
 
@@ -510,7 +797,21 @@ impl SubmissionWaveDeterminismRestore {
                 invalid_operation("determinism restore payload participant count exceeds u64")
             })?,
         );
-        for payloads in &self.participant_payloads {
+        for logical_index in 0..self.participant_payloads.len() {
+            let physical_index = self
+                .layout
+                .participant_order
+                .physical_index_for_logical(u32::try_from(logical_index).map_err(|_| {
+                    invalid_operation("determinism logical payload index exceeds u32")
+                })?)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| {
+                    invalid_operation("determinism logical payload lacks a physical participant")
+                })?;
+            let payloads = self
+                .participant_payloads
+                .get(physical_index)
+                .ok_or_else(|| invalid_operation("determinism physical payload is absent"))?;
             hash_u64(
                 &mut hasher,
                 u64::try_from(payloads.len()).map_err(|_| {
@@ -549,14 +850,16 @@ impl SubmissionWaveDeterminismRestore {
         wave: &PreparedStepSubmissionWave<R>,
     ) -> Result<(), VNextError> {
         self.validate_for(resolved)?;
-        let actual_layout = SubmissionWaveDeterminismRestoreLayout::from_prepared_wave(
-            runtime,
-            providers,
-            resolved,
-            batch_identity,
-            active_bindings,
-            wave,
-        )?;
+        let actual_layout =
+            SubmissionWaveDeterminismRestoreLayout::from_prepared_wave_with_participant_order(
+                runtime,
+                providers,
+                resolved,
+                batch_identity,
+                active_bindings,
+                self.layout.participant_order.clone(),
+                wave,
+            )?;
         if self.layout != actual_layout
             || self.node_ids().len() != wave.nodes().len()
             || self.node_ids().len() != batch_identity.node_count()
@@ -584,6 +887,113 @@ impl SubmissionWaveDeterminismRestore {
             .and_then(|ranges| ranges.get(initialization_index))
             .copied()
     }
+}
+
+fn logical_initialization_ranges<R: DeviceRuntime>(
+    wave: &PreparedStepSubmissionWave<R>,
+    participant_order: &SubmissionWaveDeterminismParticipantOrder,
+    initializations: &[ExecutionDeterminismInitializationSpec],
+    physical_ranges: &[Vec<SubmissionWaveDeterminismLogicalRange>],
+) -> Result<Vec<Vec<SubmissionWaveDeterminismLogicalRange>>, VNextError> {
+    let participant_count = usize::try_from(participant_order.participant_count())
+        .expect("determinism participant count fits usize");
+    if physical_ranges.len() != participant_count
+        || physical_ranges
+            .iter()
+            .any(|ranges| ranges.len() != initializations.len())
+    {
+        return Err(invalid_operation(
+            "determinism initialization range matrix differs from its participant order",
+        ));
+    }
+    let mut logical_ranges = vec![Vec::with_capacity(initializations.len()); participant_count];
+    for (initialization_index, initialization) in initializations.iter().enumerate() {
+        let physical = physical_ranges
+            .iter()
+            .map(|ranges| ranges[initialization_index])
+            .collect::<Vec<_>>();
+        let logical = logical_participant_ranges(
+            wave,
+            participant_order,
+            initialization.location(),
+            &physical,
+        )?;
+        for (participant_ranges, range) in logical_ranges.iter_mut().zip(logical) {
+            participant_ranges.push(range);
+        }
+    }
+    Ok(logical_ranges)
+}
+
+fn logical_participant_ranges<R: DeviceRuntime>(
+    wave: &PreparedStepSubmissionWave<R>,
+    participant_order: &SubmissionWaveDeterminismParticipantOrder,
+    location: &ExecutionDeterminismValueLocation,
+    physical_ranges: &[SubmissionWaveDeterminismLogicalRange],
+) -> Result<Vec<SubmissionWaveDeterminismLogicalRange>, VNextError> {
+    let mut logical_ranges = participant_order.reorder_physical_to_logical(physical_ranges)?;
+    if resource_is_shared(wave, location.resource_id()) {
+        if let ExecutionDeterminismValueExtent::ImmediateTokenSpan {
+            bytes_per_token,
+            maximum_tokens,
+        } = location.extent()
+        {
+            let maximum_bytes = bytes_per_token
+                .checked_mul(maximum_tokens)
+                .ok_or_else(|| invalid_operation("determinism logical packed range overflows"))?;
+            let mut next_offset = 0_u64;
+            for range in &mut logical_ranges {
+                let end = next_offset
+                    .checked_add(range.length_bytes())
+                    .ok_or_else(|| {
+                        invalid_operation("determinism logical participant ranges overflow")
+                    })?;
+                if end > maximum_bytes {
+                    return Err(invalid_operation(
+                        "determinism logical participant ranges exceed shared capacity",
+                    ));
+                }
+                *range = SubmissionWaveDeterminismLogicalRange {
+                    logical_offset_bytes: next_offset,
+                    length_bytes: range.length_bytes(),
+                };
+                next_offset = end;
+            }
+        }
+    }
+    Ok(logical_ranges)
+}
+
+fn resource_is_shared<R: DeviceRuntime>(
+    wave: &PreparedStepSubmissionWave<R>,
+    resource_id: &ResourceId,
+) -> bool {
+    wave.claimed_backing()
+        .backing_slices()
+        .iter()
+        .chain(wave.step_resources().backing_slices())
+        .any(|authority| authority.resource_id() == resource_id)
+}
+
+fn logical_work_fingerprints<R: DeviceRuntime>(
+    wave: &PreparedStepSubmissionWave<R>,
+    participant_order: &SubmissionWaveDeterminismParticipantOrder,
+) -> Result<Vec<String>, VNextError> {
+    wave.nodes()
+        .iter()
+        .map(|node| {
+            let physical_spans = node
+                .work_shape()
+                .participant_work()
+                .iter()
+                .map(|work| work.token_span().clone())
+                .collect::<Vec<_>>();
+            let logical_spans = participant_order.reorder_physical_to_logical(&physical_spans)?;
+            Ok(ResourceWorkShape::from_token_spans(logical_spans)?
+                .fingerprint()
+                .to_owned())
+        })
+        .collect()
 }
 
 fn prepared_location_range<R: DeviceRuntime>(
@@ -666,12 +1076,7 @@ fn prepared_location_range<R: DeviceRuntime>(
             "determinism provider token range differs from its prepared work",
         ));
     }
-    let resource_is_shared = wave
-        .claimed_backing()
-        .backing_slices()
-        .iter()
-        .chain(wave.step_resources().backing_slices())
-        .any(|authority| authority.resource_id() == location.resource_id());
+    let resource_is_shared = resource_is_shared(wave, location.resource_id());
 
     let (logical_offset_bytes, length_bytes) = match location.extent() {
         ExecutionDeterminismValueExtent::Fixed => (
@@ -822,6 +1227,9 @@ impl SubmissionWaveDeterminismReadbackTarget {
 pub struct SubmissionWaveDeterminismReadbackPlan {
     plan_hash: PlanHash,
     node_ids: Vec<NodeId>,
+    participant_order: SubmissionWaveDeterminismParticipantOrder,
+    witnesses: Vec<ExecutionDeterminismWitnessSpec>,
+    logical_witness_participant_ranges: Vec<Vec<SubmissionWaveDeterminismLogicalRange>>,
     collection: CompletionReadbackCollectionRequest,
     targets: Vec<SubmissionWaveDeterminismReadbackTarget>,
     witness_count: usize,
@@ -841,16 +1249,13 @@ impl SubmissionWaveDeterminismReadbackPlan {
             .collect::<Vec<_>>();
         restore.validate_for(resolved)?;
         let witness_plan = restore.layout().witness_plan();
+        let node_logical_work_fingerprints =
+            logical_work_fingerprints(wave, restore.layout().participant_order())?;
         if witness_plan.plan_hash() != batch_identity.plan_hash()
             || restore.layout.batch_invocation_id != batch_identity.batch_invocation_id()
             || restore.layout.claimed_backing_fingerprint
                 != batch_identity.claimed_backing_fingerprint()
-            || restore.layout.node_logical_work_fingerprints
-                != wave
-                    .nodes()
-                    .iter()
-                    .map(|node| node.work_shape().logical_work_fingerprint().to_owned())
-                    .collect::<Vec<_>>()
+            || restore.layout.node_logical_work_fingerprints != node_logical_work_fingerprints
             || wave.nodes().len() != batch_identity.node_count()
             || wave.nodes().iter().enumerate().any(|(node_index, node)| {
                 node.plan_evidence_ref().plan_hash() != witness_plan.plan_hash()
@@ -975,6 +1380,12 @@ impl SubmissionWaveDeterminismReadbackPlan {
         Ok(Self {
             plan_hash: witness_plan.plan_hash().clone(),
             node_ids,
+            participant_order: restore.layout.participant_order.clone(),
+            witnesses: witness_plan.witnesses().to_vec(),
+            logical_witness_participant_ranges: restore
+                .layout
+                .logical_witness_participant_ranges
+                .clone(),
             collection,
             targets,
             witness_count,
@@ -999,6 +1410,39 @@ impl SubmissionWaveDeterminismReadbackPlan {
 
     pub const fn witness_count(&self) -> usize {
         self.witness_count
+    }
+
+    fn logical_witness_range(
+        &self,
+        witness: &ExecutionDeterminismWitnessSpec,
+        logical_participant_index: u32,
+    ) -> Result<SubmissionWaveDeterminismLogicalRange, VNextError> {
+        let mut matches = self
+            .witnesses
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| *candidate == witness);
+        let (witness_index, _) = matches.next().ok_or_else(|| {
+            invalid_operation("determinism readback witness is absent from its semantic plan")
+        })?;
+        if matches.next().is_some() {
+            return Err(invalid_operation(
+                "determinism readback witness is ambiguous in its semantic plan",
+            ));
+        }
+        self.logical_witness_participant_ranges
+            .get(witness_index)
+            .and_then(|ranges| {
+                usize::try_from(logical_participant_index)
+                    .ok()
+                    .and_then(|index| ranges.get(index))
+            })
+            .copied()
+            .ok_or_else(|| {
+                invalid_operation(
+                    "determinism logical witness range is absent from its participant order",
+                )
+            })
     }
 }
 
@@ -1110,6 +1554,10 @@ impl SubmissionWaveDeterminismPhysicalReadback {
 pub struct SubmissionWaveDeterminismWitnessReadback {
     witness: ExecutionDeterminismWitnessSpec,
     participant_index: u32,
+    #[serde(skip)]
+    physical_participant_index: u32,
+    #[serde(skip)]
+    logical_range: SubmissionWaveDeterminismLogicalRange,
     physical_readback_index: u32,
 }
 
@@ -1120,6 +1568,14 @@ impl SubmissionWaveDeterminismWitnessReadback {
 
     pub const fn participant_index(&self) -> u32 {
         self.participant_index
+    }
+
+    pub const fn physical_participant_index(&self) -> u32 {
+        self.physical_participant_index
+    }
+
+    pub const fn logical_range(&self) -> SubmissionWaveDeterminismLogicalRange {
+        self.logical_range
     }
 
     pub const fn physical_readback_index(&self) -> u32 {
@@ -1607,18 +2063,50 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
                 disposition_index += 1;
             }
             for witness in target.witnesses() {
-                for participant_index in 0..target.batch().requests().len() {
+                for physical_participant_index in 0..target.batch().requests().len() {
                     let physical_readback_index = first_physical_index
-                        .checked_add(participant_index)
+                        .checked_add(physical_participant_index)
                         .and_then(|index| u32::try_from(index).ok())
                         .ok_or_else(|| {
                             invalid_operation("determinism physical readback index exceeds u32")
                         })?;
+                    let physical_participant_index = u32::try_from(physical_participant_index)
+                        .map_err(|_| {
+                            invalid_operation(
+                                "determinism physical witness participant index exceeds u32",
+                            )
+                        })?;
+                    let participant_index = readback_plan
+                        .participant_order
+                        .logical_index_for_physical(physical_participant_index)
+                        .ok_or_else(|| {
+                            invalid_operation(
+                                "determinism physical witness lacks a logical participant",
+                            )
+                        })?;
+                    let logical_range =
+                        readback_plan.logical_witness_range(witness, participant_index)?;
+                    let physical_request = target
+                        .batch()
+                        .requests()
+                        .get(
+                            usize::try_from(physical_participant_index)
+                                .expect("u32 physical participant fits usize"),
+                        )
+                        .ok_or_else(|| {
+                            invalid_operation("determinism physical witness request disappeared")
+                        })?;
+                    if physical_request.output_layout().byte_len()? != logical_range.length_bytes()
+                    {
+                        return Err(invalid_operation(
+                            "determinism logical witness length differs from its physical readback",
+                        ));
+                    }
                     witnesses.push(SubmissionWaveDeterminismWitnessReadback {
                         witness: witness.clone(),
-                        participant_index: u32::try_from(participant_index).map_err(|_| {
-                            invalid_operation("determinism witness participant index exceeds u32")
-                        })?,
+                        participant_index,
+                        physical_participant_index,
+                        logical_range,
                         physical_readback_index,
                     });
                 }
@@ -1645,7 +2133,18 @@ impl<R: DeviceRuntime> SubmissionWaveDeterminismHandle<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::immediate_token_logical_range;
+    use super::{immediate_token_logical_range, validate_participant_permutation};
+
+    #[test]
+    fn participant_order_requires_an_exact_bijection() {
+        assert_eq!(
+            validate_participant_permutation(&[2, 0, 1]).unwrap(),
+            [1, 2, 0]
+        );
+        assert!(validate_participant_permutation(&[]).is_err());
+        assert!(validate_participant_permutation(&[0, 0]).is_err());
+        assert!(validate_participant_permutation(&[0, 2]).is_err());
+    }
 
     #[test]
     fn immediate_token_range_uses_scheduled_capacity_not_canonical_extent() {

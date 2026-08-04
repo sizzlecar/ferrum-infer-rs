@@ -490,20 +490,23 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
     fn bind_determinism_restore(
         &self,
         participants: &[&VNextDeterminismParticipantSpec],
+        participant_order: SubmissionWaveDeterminismParticipantOrder,
         initial_state: VNextDeterminismInitialState,
         identity: &BatchOperationIdentity,
         active_bindings: &[&TrustedActiveSequenceBinding],
         wave: &PreparedStepSubmissionWave<R>,
     ) -> Result<SubmissionWaveDeterminismRestore> {
-        let layout = SubmissionWaveDeterminismRestoreLayout::from_prepared_wave(
-            self.runtime.as_ref(),
-            self.providers.providers(),
-            &self.resolved_plan,
-            identity,
-            active_bindings.iter().copied(),
-            wave,
-        )
-        .map_err(|error| FerrumError::backend(error.to_string()))?;
+        let layout =
+            SubmissionWaveDeterminismRestoreLayout::from_prepared_wave_with_participant_order(
+                self.runtime.as_ref(),
+                self.providers.providers(),
+                &self.resolved_plan,
+                identity,
+                active_bindings.iter().copied(),
+                participant_order,
+                wave,
+            )
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
         if usize::try_from(layout.participant_count()).ok() != Some(participants.len()) {
             return Err(FerrumError::internal(
                 "vNext determinism restore participant count drifted",
@@ -682,7 +685,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext determinism participant is absent from its canonical batch",
             ));
         }
-
         let sequences = canonical_indices
             .iter()
             .map(|index| Arc::clone(&admitted[*index].1))
@@ -722,6 +724,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ok(wave) => wave,
             Err(error) => return Err(self.abort_unsubmitted_step(step, error)),
         };
+        let participant_order =
+            SubmissionWaveDeterminismParticipantOrder::from_logical_participant_sessions(
+                &wave,
+                &admitted
+                    .iter()
+                    .map(|(_, sequence)| Arc::clone(&sequence.session))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(|error| FerrumError::backend(error.to_string()))?;
         let active_bindings = sequences
             .iter()
             .map(|sequence| sequence.active_binding.as_ref())
@@ -743,6 +754,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let restore = match self.bind_determinism_restore(
             &participants,
+            participant_order,
             spec.initial_state,
             &identity,
             &active_bindings,

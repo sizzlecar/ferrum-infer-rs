@@ -37,9 +37,10 @@ pub use descriptor::{
 pub use determinism::{
     SubmissionWaveDeterminismEvidence, SubmissionWaveDeterminismHandle,
     SubmissionWaveDeterminismInitializationIdentity, SubmissionWaveDeterminismLogicalRange,
-    SubmissionWaveDeterminismPhysicalReadback, SubmissionWaveDeterminismReadbackPlan,
-    SubmissionWaveDeterminismReadbackTarget, SubmissionWaveDeterminismRestore,
-    SubmissionWaveDeterminismRestoreLayout, SubmissionWaveDeterminismWitnessReadback,
+    SubmissionWaveDeterminismParticipantOrder, SubmissionWaveDeterminismPhysicalReadback,
+    SubmissionWaveDeterminismReadbackPlan, SubmissionWaveDeterminismReadbackTarget,
+    SubmissionWaveDeterminismRestore, SubmissionWaveDeterminismRestoreLayout,
+    SubmissionWaveDeterminismWitnessReadback,
 };
 pub use determinism_artifact::{
     SubmissionWaveDeterminismArtifactAttribution, SubmissionWaveDeterminismArtifactExecution,
