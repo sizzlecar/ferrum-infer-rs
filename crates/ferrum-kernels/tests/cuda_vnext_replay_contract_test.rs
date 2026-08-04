@@ -184,6 +184,15 @@ fn causal_replay_identity_uses_a_partition_capacity_envelope() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStableDecode"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("ExactShapeEager"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("is_partition_stable"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(
+        "partition_stable &= topology.is_partition_stable();"
+    ));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(
+        "return Ok(ReusableExecutionTopology::EagerBoundary);"
+    ));
+    assert!(!CAUSAL_ATTENTION_SOURCE.contains(
+        ".map(ReusableExecutionTopology::Dynamic)"
+    ));
     assert!(CAUSAL_ATTENTION_SOURCE.contains(".u64(replay_envelope.sequence_capacity_tokens)"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains(".i32(replay_envelope.table_capacity_entries)"));
     assert!(!CAUSAL_ATTENTION_SOURCE.contains(".u64(launch.sequence_tokens)"));
