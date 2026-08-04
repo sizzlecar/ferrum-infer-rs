@@ -4437,7 +4437,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         }
-        let prepared_programs = catalog_by_id.len();
+        let prepared_programs = catalog_by_id
+            .values()
+            .filter(|program| program.has_resident_segments())
+            .count();
         if !reusable_execution_program_catalog_is_usable(device_preparation, prepared_programs) {
             return Err(FerrumError::internal(format!(
                 "vNext reusable execution sealed {} resident executable segments but registered no typed programs",
@@ -6036,7 +6039,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         None
                     }
                     (Some(program_id), Some(catalog)) if !catalog.programs.is_empty() => {
-                        let program = catalog.programs.get(&program_id);
+                        let program = catalog
+                            .programs
+                            .get(&program_id)
+                            .filter(|program| program.has_resident_segments());
                         reusable_catalog_miss = program.is_none();
                         program
                     }

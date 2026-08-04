@@ -1237,6 +1237,7 @@ pub enum DeviceReusableExecutionProgramGapReason {
     CachedCaptureRejected,
     QuiescenceDeferred,
     CapacityDeferred,
+    Evicted,
     OutsidePreparation,
 }
 
@@ -1251,9 +1252,17 @@ impl DeviceReusableExecutionProgramGapReason {
             Self::CachedCaptureRejected => "cached_capture_rejected",
             Self::QuiescenceDeferred => "quiescence_deferred",
             Self::CapacityDeferred => "capacity_deferred",
+            Self::Evicted => "evicted",
             Self::OutsidePreparation => "outside_preparation",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceReusableExecutionProgramState {
+    Partial,
+    DeterminismReady,
 }
 
 /// One classified replay-eligible gap in a partial reusable program.
@@ -1462,8 +1471,20 @@ impl DeviceReusableExecutionProgram {
         &self.gaps
     }
 
+    pub const fn state(&self) -> DeviceReusableExecutionProgramState {
+        if self.gaps.is_empty() {
+            DeviceReusableExecutionProgramState::DeterminismReady
+        } else {
+            DeviceReusableExecutionProgramState::Partial
+        }
+    }
+
+    pub fn has_resident_segments(&self) -> bool {
+        !self.segments.is_empty()
+    }
+
     pub fn is_determinism_ready(&self) -> bool {
-        self.gaps.is_empty()
+        self.state() == DeviceReusableExecutionProgramState::DeterminismReady
     }
 }
 
