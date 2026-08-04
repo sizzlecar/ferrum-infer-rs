@@ -73,7 +73,8 @@ SERVER_POLICY = {
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
     "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
     "target_sizing_max_tokens": CALIBRATION_MAX_TOKENS,
-    "target_budget_derivation": "typed_prime_probe_growth_with_exact_target_rebalance",
+    "target_sizing_runtime_budget": "product_default",
+    "target_budget_derivation": "unpressured_typed_prime_probe_growth_with_exact_target_rebalance",
     "target_rebalance_prime_max_tokens": REBALANCE_PRIME_MAX_TOKENS,
     "target_rebalance_probe_max_tokens": REBALANCE_PROBE_MAX_TOKENS,
     "target_rebalance_probe_prompt_sha256": hashlib.sha256(
@@ -246,7 +247,7 @@ def validate_canonical_server_argv(
     if runtime_budget is None:
         require(
             observed_runtime_budget is None,
-            f"{label}: calibration unexpectedly overrides runtime memory budget",
+            f"{label}: unexpectedly overrides runtime memory budget",
         )
     else:
         require(
@@ -697,11 +698,6 @@ def derive_target_budget_envelope(
         and calibration_budget == static_bytes + calibration_resident_bytes,
         "calibration budget differs from its installed backing",
     )
-    require(
-        max(sizing_resident_bytes, probe_resident_bytes)
-        <= calibration_resident_bytes,
-        "target sizing backing exceeds the calibrated resident budget",
-    )
     minimum_initial_bundle_resident_bytes = sum(
         initial_bundle_floor_bytes_by_pool.values()
     )
@@ -779,13 +775,10 @@ def derive_target_budget_envelope(
         + selected_pressure_growth_end_bytes
         - pressure_quantum_bytes
     )
-    resident_bytes = min(
-        calibration_resident_bytes,
-        max(
-            sizing_resident_bytes,
-            minimum_initial_bundle_resident_bytes,
-            pressure_budget_candidate_resident_bytes,
-        ),
+    resident_bytes = max(
+        sizing_resident_bytes,
+        minimum_initial_bundle_resident_bytes,
+        pressure_budget_candidate_resident_bytes,
     )
     require(
         resident_bytes >= sizing_resident_bytes,
@@ -802,9 +795,17 @@ def derive_target_budget_envelope(
     probe_total_growth_budget_gap_bytes = (
         probe_positive_growth_bytes - probe_growth_headroom_bytes
     )
+    pressure_budget_reduction_from_sizing_probe_bytes = (
+        probe_resident_bytes - resident_bytes
+    )
     require(
         selected_pressure_forced_deficit_bytes >= pressure_quantum_bytes,
         "decode pressure budget does not force the selected sequence event",
+    )
+    require(
+        pressure_budget_reduction_from_sizing_probe_bytes
+        >= pressure_quantum_bytes,
+        "decode pressure budget is not below the unpressured sizing probe",
     )
     exact_budget = static_bytes + resident_bytes
     return {
@@ -852,8 +853,8 @@ def derive_target_budget_envelope(
         "pressure_budget_candidate_resident_bytes": (
             pressure_budget_candidate_resident_bytes
         ),
-        "pressure_budget_reduction_from_calibration_bytes": (
-            calibration_resident_bytes - resident_bytes
+        "pressure_budget_reduction_from_sizing_probe_bytes": (
+            pressure_budget_reduction_from_sizing_probe_bytes
         ),
         "initial_bundle_floor_bytes_by_pool": initial_bundle_floor_bytes_by_pool,
         "minimum_initial_bundle_resident_bytes": minimum_initial_bundle_resident_bytes,
@@ -867,7 +868,7 @@ def derive_target_budget_envelope(
         "pool_storage_profiles": pool_storage_profiles,
         "pool_contracts": pool_contracts,
         "calibration_budget_claimed_bytes": calibration_budget,
-        "calibration_sizing_headroom_bytes": (
+        "calibration_sizing_delta_bytes": (
             calibration_budget - target_sizing["budget_claimed_bytes"]
         ),
         "bootstrap_headroom_bytes": (
@@ -2932,7 +2933,7 @@ def collect(args: argparse.Namespace) -> int:
             model=model,
             port=args.port + 1,
             out_dir=out / "target-sizing",
-            runtime_budget=calibration_budget,
+            runtime_budget=None,
             max_num_batched_tokens=TARGET_TOKEN_BUDGET,
             startup_timeout=args.startup_timeout,
         )
@@ -3514,7 +3515,7 @@ def validate(root: Path, out: Path) -> int:
         read_server_argv(root, "target-sizing"),
         label="target sizing",
         token_budget=TARGET_TOKEN_BUDGET,
-        runtime_budget=calibration_budget,
+        runtime_budget=None,
     )
     validate_canonical_server_argv(
         read_server_argv(root, "target"),
@@ -4218,7 +4219,7 @@ def self_test() -> int:
         and target_envelope["pressure_quantum_bytes_by_pool"]
         == {"sequence": 4}
         and target_envelope["pressure_budget_candidate_resident_bytes"] == 40
-        and target_envelope["pressure_budget_reduction_from_calibration_bytes"] == 30
+        and target_envelope["pressure_budget_reduction_from_sizing_probe_bytes"] == 4
         and target_envelope["initial_bundle_floor_bytes_by_pool"]
         == {"sequence": 30, "workspace": 4}
         and target_envelope["minimum_initial_bundle_resident_bytes"] == 34
@@ -4230,7 +4231,7 @@ def self_test() -> int:
         == ["sequence"]
         and target_envelope["pool_contracts"] == pool_contracts
         and target_envelope["calibration_resident_bytes"] == 70
-        and target_envelope["calibration_sizing_headroom_bytes"] == 30
+        and target_envelope["calibration_sizing_delta_bytes"] == 30
         and target_envelope["bootstrap_headroom_bytes"] == 0,
         "self-test lost typed target-sizing provenance",
     )
@@ -4248,7 +4249,7 @@ def self_test() -> int:
         and pressure_envelope["pressure_budget_candidate_resident_bytes"] == 40
         and pressure_envelope["resident_bytes"] == 40
         and pressure_envelope["budget_claimed_bytes"] == 140
-        and pressure_envelope["pressure_budget_reduction_from_calibration_bytes"] == 40
+        and pressure_envelope["pressure_budget_reduction_from_sizing_probe_bytes"] == 4
         and pressure_envelope["probe_growth_budget_gap_bytes"] == 4
         and pressure_envelope["requires_cross_pool_rebalance"] is True,
         "self-test let calibration headroom erase typed decode pressure",
@@ -4709,17 +4710,24 @@ def self_test() -> int:
         ),
         "initial floor consumed the full observed growth",
     )
-    undersized_calibration = pool_snapshot(
+    narrower_calibration = pool_snapshot(
         {"sequence": 30, "workspace": 9}, calibration_contracts
     )
-    expect_reject(
-        lambda: derive_target_budget_envelope(
-            undersized_calibration,
-            sizing_pool,
-            sizing_probe_pool,
-            probe_maintenance,
-        ),
-        "sizing workload larger than calibration",
+    narrower_calibration_envelope = derive_target_budget_envelope(
+        narrower_calibration,
+        sizing_pool,
+        sizing_probe_pool,
+        probe_maintenance,
+    )
+    require(
+        narrower_calibration_envelope["budget_claimed_bytes"] == 140
+        and narrower_calibration_envelope["resident_bytes"] == 40
+        and narrower_calibration_envelope["calibration_sizing_delta_bytes"] == -1
+        and narrower_calibration_envelope[
+            "pressure_budget_reduction_from_sizing_probe_bytes"
+        ]
+        == 4,
+        "calibration footprint incorrectly capped the unpressured sizing baseline",
     )
     target_bound_drift = json.loads(
         json.dumps(pool_snapshot({"sequence": 34, "workspace": 6}))
