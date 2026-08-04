@@ -72,6 +72,7 @@ LANES = (
     "vnext-s2-latency-first-failure",
     "vnext-s2-historical-resource-source",
     "vnext-s2-m1-determinism",
+    "vnext-s2",
     "vnext-cuda-determinism",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
@@ -1261,6 +1262,41 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-s2-m1-determinism",
+        )
+    if lane == "vnext-s2":
+        required = {
+            "--g01": args.g01,
+            "--s1": args.s1,
+            "--s1-capacity": args.s1_capacity,
+            "--s1-decode-capacity": args.s1_decode_capacity,
+            "--g02-core": args.g02_core,
+            "--m1-determinism": args.m1_determinism,
+            "--response-format": args.response_format,
+            "--api-modality": args.api_modality,
+            "--stream-disconnect": args.stream_disconnect,
+            "--tool-schema": args.tool_schema,
+            "--multiturn-concurrency": args.multiturn_concurrency,
+            "--latency-first-failure": args.latency_first_failure,
+            "--historical-resource-source": args.historical_resource_source,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise GateError("vnext-s2 requires " + ", ".join(missing))
+        cmd = [
+            sys.executable,
+            "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
+        ]
+        for flag, value in required.items():
+            assert value is not None
+            cmd.extend([flag, str(value.resolve())])
+        cmd.extend(["--out", str(out_dir)])
+        return LaneCommand(
+            cmd=cmd,
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT S2 CUDA PRODUCT CONTRACT PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "s2-product-contract" / "manifest.json",
+            provenance_kind="vnext-s2",
         )
     if lane == "vnext-cuda-determinism":
         if args.cuda_determinism_artifact_root is None:
@@ -5997,6 +6033,46 @@ def validate_vnext_g01_provenance(
     return summary
 
 
+def validate_vnext_s2_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        "vnext-s2 delegated manifest path is missing",
+    )
+    require_gate(
+        manifest_path.name == "manifest.json"
+        and manifest_path.parent.name == "s2-product-contract",
+        "vnext-s2 child manifest path mismatch",
+    )
+    try:
+        import runtime_vnext_s2_cuda_product_contract as checkpoint
+
+        summary = checkpoint.verify_checkpoint_manifest(
+            manifest_path,
+            verify_checkout=verify_checkout,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise GateError(
+            f"vnext-s2 checkpoint provenance failed: {error}"
+        ) from error
+    require_gate(
+        summary.get("kind") == "vnext-s2"
+        and summary.get("child_manifest", {}).get("sha256")
+        == require_sha256(
+            child_manifest_sha256,
+            "vnext-s2 child manifest SHA256",
+        ),
+        "vnext-s2 checkpoint summary binding mismatch",
+    )
+    return summary
+
+
 def verify_child_pass_line(
     lane_command: LaneCommand,
     stdout: str,
@@ -6077,6 +6153,13 @@ def verify_child_pass_line(
         )
     if lane_command.provenance_kind == "vnext-g01":
         return validate_vnext_g01_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-s2":
+        return validate_vnext_s2_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
@@ -9223,6 +9306,92 @@ def self_test() -> int:
             in (missing_s2.stderr + missing_s2.stdout),
             missing_s2.stderr or missing_s2.stdout,
         )
+        s2_aggregate_out = (root / "vnext-s2-aggregate-dry-run").resolve()
+        s2_aggregate_inputs = [
+            ("--g01", root / "g01/gate.manifest.json"),
+            ("--s1", root / "s1/gate.manifest.json"),
+            ("--s1-capacity", root / "s1-capacity/gate.manifest.json"),
+            (
+                "--s1-decode-capacity",
+                root / "s1-decode-capacity/gate.manifest.json",
+            ),
+            ("--g02-core", root / "g02-core/gate.manifest.json"),
+            ("--m1-determinism", root / "m1-determinism/gate.manifest.json"),
+            ("--response-format", root / "response-format/gate.manifest.json"),
+            ("--api-modality", root / "api-modality/gate.manifest.json"),
+            (
+                "--stream-disconnect",
+                root / "stream-disconnect/gate.manifest.json",
+            ),
+            ("--tool-schema", root / "tool-schema/gate.manifest.json"),
+            (
+                "--multiturn-concurrency",
+                root / "multiturn-concurrency/gate.manifest.json",
+            ),
+            (
+                "--latency-first-failure",
+                root / "latency-first-failure/gate.manifest.json",
+            ),
+            (
+                "--historical-resource-source",
+                root / "historical-resource-source/gate.manifest.json",
+            ),
+        ]
+        s2_aggregate_argv = [
+            sys.executable,
+            str(this_script),
+            "vnext-s2",
+        ]
+        expected_s2_child_argv = [
+            sys.executable,
+            "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
+        ]
+        for flag, value in s2_aggregate_inputs:
+            s2_aggregate_argv.extend([flag, str(value)])
+            expected_s2_child_argv.extend([flag, str(value.resolve())])
+        s2_aggregate_argv.extend(
+            ["--out", str(s2_aggregate_out), "--dry-run"]
+        )
+        expected_s2_child_argv.extend(["--out", str(s2_aggregate_out)])
+        s2_aggregate = run_selftest_command(s2_aggregate_argv)
+        require_selftest(
+            s2_aggregate.returncode == 0,
+            s2_aggregate.stderr or s2_aggregate.stdout,
+        )
+        s2_aggregate_manifest = json.loads(
+            (s2_aggregate_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            s2_aggregate_manifest["status"] == "dry-run"
+            and s2_aggregate_manifest["lane"] == "vnext-s2"
+            and s2_aggregate_manifest["delegated_command_line"]
+            == expected_s2_child_argv
+            and s2_aggregate_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT S2 CUDA PRODUCT CONTRACT PASS: "
+                f"{s2_aggregate_out}"
+            ),
+            s2_aggregate_manifest,
+        )
+        missing_s2_aggregate = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-s2",
+                "--g01",
+                str(root / "g01/gate.manifest.json"),
+                "--out",
+                str(root / "vnext-s2-aggregate-missing-input"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            missing_s2_aggregate.returncode != 0
+            and "--s1" in (
+                missing_s2_aggregate.stderr + missing_s2_aggregate.stdout
+            ),
+            missing_s2_aggregate.stderr or missing_s2_aggregate.stdout,
+        )
         in_tree_s2_out = REPO_ROOT / (
             f".run-gate-vnext-s2-selftest-{os.getpid()}-{time.monotonic_ns()}"
         )
@@ -9800,9 +9969,19 @@ def main() -> int:
     parser.add_argument("--g00f", type=Path)
     parser.add_argument("--g01a", type=Path)
     parser.add_argument("--g01b", type=Path)
+    parser.add_argument("--g01", type=Path)
     parser.add_argument("--s1", type=Path)
     parser.add_argument("--s1-capacity", type=Path)
     parser.add_argument("--s1-decode-capacity", type=Path)
+    parser.add_argument("--g02-core", type=Path)
+    parser.add_argument("--m1-determinism", type=Path)
+    parser.add_argument("--response-format", type=Path)
+    parser.add_argument("--api-modality", type=Path)
+    parser.add_argument("--stream-disconnect", type=Path)
+    parser.add_argument("--tool-schema", type=Path)
+    parser.add_argument("--multiturn-concurrency", type=Path)
+    parser.add_argument("--latency-first-failure", type=Path)
+    parser.add_argument("--historical-resource-source", type=Path)
     parser.add_argument("--s1-artifact", type=Path)
     parser.add_argument("--s2-artifact-root", type=Path)
     parser.add_argument("--historical-corpus", type=Path)
@@ -9846,6 +10025,7 @@ def main() -> int:
         "vnext-s2-latency-first-failure",
         "vnext-s2-historical-resource-source",
         "vnext-s2-m1-determinism",
+        "vnext-s2",
     }:
         try:
             require_external_vnext_g00_output(out_dir)
