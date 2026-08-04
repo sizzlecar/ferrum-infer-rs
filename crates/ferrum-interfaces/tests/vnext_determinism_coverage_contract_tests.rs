@@ -16,6 +16,16 @@ fn close_fixture(fixture: Fixture) {
 fn live_catalog_and_resolved_plan_form_one_exact_coverage_registry() {
     let fixture =
         fixture_with_determinism_provider_behavior(false, ProviderBehavior::ProgramBinding);
+    let node = &fixture.resolved.execution_plan().payload().nodes()[0];
+    let operation = fixture
+        .resolved
+        .parts()
+        .capabilities
+        .operation(node.operation_id())
+        .unwrap();
+    assert_eq!(node.operation_version(), ContractVersion::new(1, 0));
+    assert_eq!(operation.version, ContractVersion::new(1, 1));
+    assert!(operation.version.satisfies(node.operation_version()));
     let mut registry =
         ExecutionDeterminismCoverageRegistry::from_catalog(&fixture.resolved.parts().capabilities)
             .unwrap();

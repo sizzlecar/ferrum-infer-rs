@@ -285,17 +285,44 @@ impl ExecutionDeterminismCoverageRegistry {
                         node.selection().selected_provider()
                     ))
                 })?;
-            if node.operation_version() != requirement.operation_version
-                || node.operation_fingerprint() != requirement.operation_fingerprint
-                || node.provider_implementation_fingerprint()
-                    != requirement.provider_implementation_fingerprint
-                || node.provider_execution_semantics().contract_fingerprint()
-                    != requirement.provider_execution_contract_fingerprint
-                || node.provider_execution_semantics().replay_equivalence()
-                    != requirement.replay_equivalence
+            if !requirement
+                .operation_version
+                .satisfies(node.operation_version())
             {
                 return Err(invalid_plan(format!(
-                    "resolved node `{}` differs from its live catalog determinism identity",
+                    "resolved node `{}` requires operation version {}, but the live catalog provides {}",
+                    node.id(),
+                    node.operation_version(),
+                    requirement.operation_version
+                )));
+            }
+            if node.operation_fingerprint() != requirement.operation_fingerprint {
+                return Err(invalid_plan(format!(
+                    "resolved node `{}` differs from its live catalog operation fingerprint",
+                    node.id()
+                )));
+            }
+            if node.provider_implementation_fingerprint()
+                != requirement.provider_implementation_fingerprint
+            {
+                return Err(invalid_plan(format!(
+                    "resolved node `{}` differs from its live catalog provider implementation fingerprint",
+                    node.id()
+                )));
+            }
+            if node.provider_execution_semantics().contract_fingerprint()
+                != requirement.provider_execution_contract_fingerprint
+            {
+                return Err(invalid_plan(format!(
+                    "resolved node `{}` differs from its live catalog provider execution contract",
+                    node.id()
+                )));
+            }
+            if node.provider_execution_semantics().replay_equivalence()
+                != requirement.replay_equivalence
+            {
+                return Err(invalid_plan(format!(
+                    "resolved node `{}` differs from its live catalog replay equivalence",
                     node.id()
                 )));
             }
