@@ -245,7 +245,7 @@ REQUIRED_EVENT_TESTS_BY_TARGET = {
     "vnext_event_replay_contract_tests": {"vnext_event_replay_contract"},
 }
 EVENT_PROOF_LINES = {
-    "vnext_event_execution_contract_tests": ("VNEXT EVENT EXECUTION PASS", 54),
+    "vnext_event_execution_contract_tests": ("VNEXT EVENT EXECUTION PASS", 55),
     "vnext_event_sink_contract_tests": ("VNEXT EVENT SINK PASS", 28),
     "vnext_event_resource_pool_contract_tests": (
         "VNEXT EVENT RESOURCE POOL PASS",
@@ -384,7 +384,7 @@ REQUIRED_TEST_DRIVERS = {
 }
 EXPECTED_RESOURCE_CASES = 311
 EXPECTED_FAIL_CLOSED_CASES = 63
-EXPECTED_EVENT_REPLAY_V5_CASES = 176
+EXPECTED_EVENT_REPLAY_V5_CASES = 177
 EXPECTED_DEVICE_OPERATION_CASES = 299
 EXPECTED_ORACLE_CASES = 26
 EXPECTED_MODEL_WIRE_CASES = 24
