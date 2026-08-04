@@ -57,6 +57,8 @@ mod program_binding;
 pub use program_binding::*;
 mod dynamic_pool;
 pub use dynamic_pool::*;
+mod maintenance_boundary;
+pub use maintenance_boundary::*;
 mod lane_stable_arena;
 use lane_stable_arena::*;
 mod dynamic_pool_set;

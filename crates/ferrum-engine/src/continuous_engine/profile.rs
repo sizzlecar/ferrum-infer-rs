@@ -743,6 +743,7 @@ impl VNextProfileEventContext {
             "chunks_reclaimed": chunks_reclaimed,
             "reclaimed_bytes": reclaimed_bytes,
             "rebalance": receipt.rebalance(),
+            "maintenance_boundary": receipt.maintenance_boundary(),
             "receipt": receipt,
             "event_fingerprint": maintenance.fingerprint(),
             "participants": maintenance.participants(),

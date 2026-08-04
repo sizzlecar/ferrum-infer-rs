@@ -3,8 +3,8 @@ use super::{
     invalid_resource, AdmissionDeferred, CapacityEpochs, CapacityVector, CapacityWaitCondition,
     DeviceRuntime, DynamicBackingBlocker, DynamicBackingDeferred, DynamicBackingPackingEnvelope,
     DynamicBackingPoolId, DynamicChunkQuarantineReason, DynamicPoolGrowthBatchReceipt,
-    DynamicPoolGrowthReceipt, DynamicPoolGrowthRequest, DynamicPoolSet, DynamicPoolStatus,
-    VNextError,
+    DynamicPoolGrowthReceipt, DynamicPoolGrowthRequest, DynamicPoolMaintenanceBoundaryReceipt,
+    DynamicPoolSet, DynamicPoolStatus, VNextError,
 };
 use crate::vnext::{
     CapacityShortfallKind, CapacityWaitSnapshot, DeferredAction, DynamicBackingPressure,
@@ -69,6 +69,8 @@ pub enum DynamicDeferredMaintenanceOutcome {
         current_epochs: CapacityEpochs,
         wait_condition: CapacityWaitCondition,
         pressure: DynamicBackingPressure,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        maintenance_boundary: Option<DynamicPoolMaintenanceBoundaryReceipt>,
     },
     Maintained(DynamicPoolGrowthBatchReceipt),
 }
@@ -327,7 +329,18 @@ where
         &self,
         logical_snapshot: CapacityWaitSnapshot,
         blocked: DynamicDeviceCapacityBlocked,
+        maintenance_boundary: DynamicPoolMaintenanceBoundaryReceipt,
     ) -> Result<DynamicDeferredMaintenanceOutcome, VNextError> {
+        if maintenance_boundary.pressure() != &blocked.pressure
+            || maintenance_boundary.plan_device_capacity_epoch()
+                != blocked.availability.plan_epoch()
+            || maintenance_boundary.process_device_capacity_epoch()
+                != blocked.availability.process_epoch()
+        {
+            return Err(invalid_resource(
+                "dynamic maintenance boundary differs from its capacity failure",
+            ));
+        }
         let logical_snapshot = logical_snapshot.narrow_to_domains(blocked.planned_domains)?;
         let mut observed = logical_snapshot.wait_condition().observed().to_vec();
         observed.push(blocked.availability.epoch_for_pressure(&blocked.pressure));
@@ -339,6 +352,7 @@ where
             current_epochs: logical_snapshot.epochs(),
             wait_condition,
             pressure: blocked.pressure.into(),
+            maintenance_boundary: Some(maintenance_boundary),
         })
     }
 
@@ -360,6 +374,7 @@ where
             current_epochs: logical_snapshot.epochs(),
             wait_condition: logical_snapshot.wait_condition().clone(),
             pressure: pressure.into(),
+            maintenance_boundary: None,
         })
     }
 
@@ -367,6 +382,7 @@ where
         &self,
         intents: Vec<DynamicPoolGrowthIntent>,
         capacity_blocked: &mut Option<DynamicDeviceCapacityBlocked>,
+        maintenance_boundary: &mut Option<DynamicPoolMaintenanceBoundaryReceipt>,
         protected_immediate: &CapacityVector,
         protected_packing_envelopes: &[DynamicBackingPackingEnvelope],
     ) -> Result<DynamicPoolGrowthBatchReceipt, VNextError> {
@@ -381,13 +397,18 @@ where
                     .expect("typed capacity failure retains its exact observation")
                     .planned_domains
                     .clone();
-                let Some(rebalance) = self.pools.reclaim_idle_chunks_for_pressure(
+                let blocked = capacity_blocked
+                    .as_ref()
+                    .expect("typed capacity failure retains its exact observation");
+                let attempt = self.pools.reclaim_idle_chunks_for_pressure(
                     &pressure,
+                    blocked.availability,
                     &planned_domains,
                     protected_immediate,
                     protected_packing_envelopes,
-                )?
-                else {
+                )?;
+                *maintenance_boundary = Some(attempt.boundary);
+                let Some(rebalance) = attempt.rebalance else {
                     return Err(VNextError::DeviceCapacityUnavailable(pressure));
                 };
                 *capacity_blocked = None;
@@ -395,6 +416,7 @@ where
                     .pools
                     .maintain_pools_observed(retry_intents, capacity_blocked)?;
                 receipt.rebalance = Some(rebalance);
+                receipt.maintenance_boundary = maintenance_boundary.clone();
                 Ok(receipt)
             }
             outcome => outcome,
@@ -429,6 +451,7 @@ where
                 .map(DynamicBackingBlocker::pool_id),
         )?;
         let mut capacity_blocked = None;
+        let mut maintenance_boundary = None;
         let growth = self.maintain_deferred_pools(
             deferred
                 .blockers()
@@ -437,6 +460,7 @@ where
                 .map(DynamicPoolGrowthIntent::RevalidatedDeferral)
                 .collect(),
             &mut capacity_blocked,
+            &mut maintenance_boundary,
             deferred.protected_immediate(),
             deferred.protected_packing_envelopes(),
         );
@@ -454,6 +478,8 @@ where
             Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
                 logical_snapshot,
                 capacity_blocked.expect("typed capacity failure retains its exact observation"),
+                maintenance_boundary
+                    .expect("typed capacity rebalance failure retains its maintenance boundary"),
             ),
             Err(VNextError::DynamicPoolResidentUnavailable(pressure)) => {
                 self.pool_resident_wait_outcome(logical_snapshot, pressure)
@@ -530,12 +556,14 @@ where
         let logical_snapshot =
             self.wait_snapshot_for_pool_ids(requests.iter().map(|request| request.pool_id()))?;
         let mut capacity_blocked = None;
+        let mut maintenance_boundary = None;
         let growth = self.maintain_deferred_pools(
             requests
                 .into_iter()
                 .map(DynamicPoolGrowthIntent::Additional)
                 .collect(),
             &mut capacity_blocked,
+            &mut maintenance_boundary,
             deferred.immediate_requested(),
             &[],
         );
@@ -544,6 +572,8 @@ where
             Err(VNextError::DeviceCapacityUnavailable(_)) => self.capacity_wait_outcome(
                 logical_snapshot,
                 capacity_blocked.expect("typed capacity failure retains its exact observation"),
+                maintenance_boundary
+                    .expect("typed capacity rebalance failure retains its maintenance boundary"),
             ),
             Err(VNextError::DynamicPoolResidentUnavailable(pressure)) => {
                 self.pool_resident_wait_outcome(logical_snapshot, pressure)
