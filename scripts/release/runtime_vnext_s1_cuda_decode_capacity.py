@@ -73,7 +73,7 @@ SERVER_POLICY = {
     "target_max_num_batched_tokens": TARGET_TOKEN_BUDGET,
     "calibration_max_tokens": CALIBRATION_MAX_TOKENS,
     "target_sizing_max_tokens": CALIBRATION_MAX_TOKENS,
-    "target_budget_derivation": "typed_initial_bundle_plus_sizing_residency",
+    "target_budget_derivation": "typed_prime_probe_growth_with_exact_target_rebalance",
     "target_rebalance_prime_max_tokens": REBALANCE_PRIME_MAX_TOKENS,
     "target_rebalance_probe_max_tokens": REBALANCE_PROBE_MAX_TOKENS,
     "target_rebalance_probe_prompt_sha256": hashlib.sha256(
@@ -305,6 +305,51 @@ def phase_stable_pool_contract(contract: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def growth_replay_signature(
+    receipts: list[dict[str, Any]], label: str
+) -> list[dict[str, Any]]:
+    signature: list[dict[str, Any]] = []
+    for receipt_index, receipt in enumerate(receipts):
+        growths = receipt.get("growths") if isinstance(receipt, dict) else None
+        require(
+            receipt.get("stage") in ALLOWED_EXECUTION_STAGES
+            and isinstance(receipt.get("allocated_bytes"), int)
+            and not isinstance(receipt.get("allocated_bytes"), bool)
+            and isinstance(growths, list)
+            and growths,
+            f"{label}: growth receipt {receipt_index} is incomplete",
+        )
+        normalized_growths = [
+            {
+                "pool_id": growth.get("pool_id") if isinstance(growth, dict) else None,
+                "chunk_bytes": (
+                    growth.get("chunk_bytes") if isinstance(growth, dict) else None
+                ),
+            }
+            for growth in growths
+        ]
+        require(
+            all(
+                isinstance(growth["pool_id"], str)
+                and isinstance(growth["chunk_bytes"], int)
+                and not isinstance(growth["chunk_bytes"], bool)
+                and growth["chunk_bytes"] > 0
+                for growth in normalized_growths
+            )
+            and sum(growth["chunk_bytes"] for growth in normalized_growths)
+            == receipt["allocated_bytes"],
+            f"{label}: growth receipt {receipt_index} byte signature drifted",
+        )
+        signature.append(
+            {
+                "stage": receipt["stage"],
+                "allocated_bytes": receipt["allocated_bytes"],
+                "growths": normalized_growths,
+            }
+        )
+    return signature
+
+
 def validate_typed_pool_contract(
     pool_id: str, envelope: dict[str, Any], label: str
 ) -> dict[str, Any]:
@@ -375,67 +420,184 @@ def validate_typed_pool_contract(
 
 
 def derive_target_budget_envelope(
-    calibration: dict[str, Any], target_sizing: dict[str, Any]
+    calibration: dict[str, Any],
+    target_sizing: dict[str, Any],
+    target_probe: dict[str, Any],
+    probe_maintenance: dict[str, Any],
 ) -> dict[str, Any]:
+    static_bytes = target_sizing.get("static_bytes")
+    require(isinstance(static_bytes, int) and static_bytes > 0, "invalid sizing static bytes")
     require(
-        target_sizing.get("static_bytes") == calibration.get("static_bytes"),
-        "target sizing static bytes differ from calibration",
+        static_bytes == calibration.get("static_bytes") == target_probe.get("static_bytes"),
+        "target sizing static bytes differ across calibration, prime, and probe",
     )
     calibration_pools = calibration.get("pool_resident_bytes")
     sizing_pools = target_sizing.get("pool_resident_bytes")
+    probe_pools = target_probe.get("pool_resident_bytes")
     calibration_envelopes = calibration.get("pool_envelopes")
     sizing_envelopes = target_sizing.get("pool_envelopes")
+    probe_envelopes = target_probe.get("pool_envelopes")
     require(
         isinstance(calibration_pools, dict)
         and isinstance(sizing_pools, dict)
-        and calibration_pools.keys() == sizing_pools.keys(),
-        "target sizing pool identities differ from calibration",
+        and isinstance(probe_pools, dict)
+        and calibration_pools.keys() == sizing_pools.keys() == probe_pools.keys(),
+        "target sizing pool identities differ across calibration, prime, and probe",
     )
     require(
         isinstance(calibration_envelopes, dict)
         and isinstance(sizing_envelopes, dict)
-        and calibration_envelopes.keys() == sizing_envelopes.keys(),
-        "target sizing pool envelopes differ from calibration",
+        and isinstance(probe_envelopes, dict)
+        and calibration_envelopes.keys()
+        == sizing_envelopes.keys()
+        == probe_envelopes.keys(),
+        "target sizing pool envelopes differ across calibration, prime, and probe",
     )
     maximum_active_sequences = target_sizing.get("maximum_active_sequences")
     require(
-        maximum_active_sequences == calibration.get("maximum_active_sequences") == MAX_NUM_SEQS,
+        maximum_active_sequences
+        == calibration.get("maximum_active_sequences")
+        == target_probe.get("maximum_active_sequences")
+        == MAX_NUM_SEQS,
         "target sizing typed sequence ceiling differs from the canonical workload",
     )
 
-    sizing_observed_pool_resident_bytes: dict[str, int] = {}
-    observed_or_floor_pool_bytes: dict[str, int] = {}
+    growth_receipts = probe_maintenance.get("growth_receipts")
+    require(
+        isinstance(growth_receipts, list)
+        and growth_receipts
+        and probe_maintenance.get("maintained_events") == len(growth_receipts),
+        "target sizing probe has no exact typed growth receipts",
+    )
+    require(
+        probe_maintenance.get("rebalance_events") == 0
+        and probe_maintenance.get("pools_reclaimed") == 0
+        and probe_maintenance.get("chunks_reclaimed") == 0
+        and probe_maintenance.get("reclaimed_bytes") == 0,
+        "target sizing probe is not an unpressured physical-growth baseline",
+    )
+    trace_growth_bytes_by_pool: dict[str, int] = {}
+    sequence_extension_growth_bytes_by_pool: dict[str, int] = {}
+    sequence_extension_growth_chunks_by_pool: dict[str, list[int]] = {}
+    trace_reclaimed_bytes_by_pool: dict[str, int] = {}
+    trace_growth_chunks: list[dict[str, Any]] = []
+    for receipt_index, receipt in enumerate(growth_receipts):
+        growths = receipt.get("growths") if isinstance(receipt, dict) else None
+        reclaims = receipt.get("reclaims") if isinstance(receipt, dict) else None
+        stage = receipt.get("stage") if isinstance(receipt, dict) else None
+        require(
+            stage in ALLOWED_EXECUTION_STAGES
+            and isinstance(growths, list)
+            and growths
+            and isinstance(reclaims, list),
+            f"target sizing probe growth receipt {receipt_index} is empty",
+        )
+        receipt_allocated_bytes = 0
+        for growth_index, growth in enumerate(growths):
+            pool_id = growth.get("pool_id") if isinstance(growth, dict) else None
+            chunk_bytes = growth.get("chunk_bytes") if isinstance(growth, dict) else None
+            require(
+                isinstance(pool_id, str)
+                and pool_id in sizing_pools
+                and isinstance(chunk_bytes, int)
+                and not isinstance(chunk_bytes, bool)
+                and chunk_bytes > 0,
+                f"target sizing probe growth {receipt_index}/{growth_index} is invalid",
+            )
+            trace_growth_bytes_by_pool[pool_id] = (
+                trace_growth_bytes_by_pool.get(pool_id, 0) + chunk_bytes
+            )
+            if stage == "sequence_extension":
+                sequence_extension_growth_bytes_by_pool[pool_id] = (
+                    sequence_extension_growth_bytes_by_pool.get(pool_id, 0)
+                    + chunk_bytes
+                )
+                sequence_extension_growth_chunks_by_pool.setdefault(pool_id, []).append(
+                    chunk_bytes
+                )
+            receipt_allocated_bytes += chunk_bytes
+            trace_growth_chunks.append(growth)
+        require(
+            receipt.get("allocated_bytes") == receipt_allocated_bytes,
+            f"target sizing probe growth receipt {receipt_index} byte total drifted",
+        )
+        receipt_reclaimed_bytes = 0
+        for reclaim_index, reclaim in enumerate(reclaims):
+            pool_id = reclaim.get("pool_id") if isinstance(reclaim, dict) else None
+            reclaimed_bytes = (
+                reclaim.get("reclaimed_bytes") if isinstance(reclaim, dict) else None
+            )
+            require(
+                isinstance(pool_id, str)
+                and pool_id in sizing_pools
+                and isinstance(reclaimed_bytes, int)
+                and not isinstance(reclaimed_bytes, bool)
+                and reclaimed_bytes > 0,
+                f"target sizing probe reclaim {receipt_index}/{reclaim_index} is invalid",
+            )
+            trace_reclaimed_bytes_by_pool[pool_id] = (
+                trace_reclaimed_bytes_by_pool.get(pool_id, 0) + reclaimed_bytes
+            )
+            receipt_reclaimed_bytes += reclaimed_bytes
+        require(
+            receipt.get("reclaimed_bytes") == receipt_reclaimed_bytes,
+            f"target sizing probe reclaim receipt {receipt_index} byte total drifted",
+        )
+    require(
+        probe_maintenance.get("allocated_bytes")
+        == sum(trace_growth_bytes_by_pool.values()),
+        "target sizing probe aggregate growth bytes differ from exact receipts",
+    )
+    require(
+        probe_maintenance.get("reclaimed_bytes")
+        == sum(trace_reclaimed_bytes_by_pool.values()),
+        "target sizing probe aggregate reclaimed bytes differ from exact receipts",
+    )
+
+    sizing_pool_bytes: dict[str, int] = {}
+    probe_pool_bytes: dict[str, int] = {}
+    probe_growth_bytes_by_pool: dict[str, int] = {}
+    probe_shrink_bytes_by_pool: dict[str, int] = {}
     initial_bundle_floor_bytes_by_pool: dict[str, int] = {}
     pool_storage_profiles: dict[str, Any] = {}
     pool_contracts: dict[str, Any] = {}
     token_scaled_sequence_pool_ids: list[str] = []
-    token_scaled_sequence_pressure_quanta: dict[str, int] = {}
+    token_scaled_sequence_quanta: dict[str, int] = {}
     for pool_id in sorted(calibration_pools):
         calibration_bytes = calibration_pools[pool_id]
         sizing_bytes = sizing_pools[pool_id]
+        probe_bytes = probe_pools[pool_id]
         require(
-            isinstance(calibration_bytes, int)
-            and calibration_bytes >= 0
-            and isinstance(sizing_bytes, int)
-            and sizing_bytes >= 0,
+            all(
+                isinstance(value, int) and value >= 0
+                for value in (calibration_bytes, sizing_bytes, probe_bytes)
+            ),
             f"invalid sizing residency for {pool_id}",
         )
         calibration_profile = calibration_envelopes[pool_id].get("storage_profile")
         sizing_profile = sizing_envelopes[pool_id].get("storage_profile")
+        probe_profile = probe_envelopes[pool_id].get("storage_profile")
         require(
-            calibration_profile == sizing_profile,
+            calibration_profile == sizing_profile == probe_profile,
             f"target sizing storage profile differs for {pool_id}",
         )
         calibration_contract = validate_typed_pool_contract(
             pool_id, calibration_envelopes[pool_id], "calibration"
         )
         sizing_contract = validate_typed_pool_contract(
-            pool_id, sizing_envelopes[pool_id], "target sizing"
+            pool_id, sizing_envelopes[pool_id], "target sizing prime"
+        )
+        probe_contract = validate_typed_pool_contract(
+            pool_id, probe_envelopes[pool_id], "target sizing probe"
+        )
+        stable_contract = phase_stable_pool_contract(sizing_contract)
+        require(
+            phase_stable_pool_contract(calibration_contract) == stable_contract,
+            f"calibration and target sizing phase-stable contract differ for {pool_id}",
         )
         require(
-            phase_stable_pool_contract(calibration_contract)
-            == phase_stable_pool_contract(sizing_contract),
-            f"target sizing phase-stable typed contract differs for {pool_id}",
+            probe_contract == sizing_contract,
+            f"target sizing prime/probe typed contract differs for {pool_id}",
         )
         initial_bundle_floor = (
             sizing_contract["minimum_request_bytes"]
@@ -449,49 +611,84 @@ def derive_target_budget_envelope(
             calibration_bytes >= initial_bundle_floor,
             f"calibration did not provision the typed initial bundle floor for {pool_id}",
         )
-        observed_or_floor_bytes = max(sizing_bytes, initial_bundle_floor)
         require(
             initial_bundle_floor
             <= sizing_contract["provisioning"]["maximum_resident_bytes"],
             f"typed initial bundle floor exceeds the pool ceiling for {pool_id}",
         )
-        token_scaled_sequence_resources = [
+        sequence_resources = [
             resource
             for resource in sizing_contract["resources"]
-            if (
-                resource.get("lifetime") == "sequence"
-                and demand_is_token_scaled(resource.get("demand"))
-            )
+            if resource.get("lifetime") == "sequence"
+        ]
+        token_scaled_sequence_resources = [
+            resource
+            for resource in sequence_resources
+            if demand_is_token_scaled(resource.get("demand"))
         ]
         if token_scaled_sequence_resources:
-            token_scaled_sequence_pool_ids.append(pool_id)
-            token_scaled_sequence_pressure_quanta[pool_id] = max(
+            require(
+                len(token_scaled_sequence_resources) == len(sequence_resources),
+                f"target sizing cannot attribute mixed sequence demand in {pool_id}",
+            )
+            quanta = {
                 resource["physical_allocation_quantum_bytes"]
                 for resource in token_scaled_sequence_resources
+            }
+            require(
+                len(quanta) == 1,
+                f"target sizing cannot attribute mixed sequence quanta in {pool_id}",
             )
-        sizing_observed_pool_resident_bytes[pool_id] = sizing_bytes
-        observed_or_floor_pool_bytes[pool_id] = observed_or_floor_bytes
+            token_scaled_sequence_pool_ids.append(pool_id)
+            token_scaled_sequence_quanta[pool_id] = next(iter(quanta))
+
+        growth_bytes = max(0, probe_bytes - sizing_bytes)
+        shrink_bytes = max(0, sizing_bytes - probe_bytes)
+        sizing_pool_bytes[pool_id] = sizing_bytes
+        probe_pool_bytes[pool_id] = probe_bytes
+        probe_growth_bytes_by_pool[pool_id] = growth_bytes
+        probe_shrink_bytes_by_pool[pool_id] = shrink_bytes
         initial_bundle_floor_bytes_by_pool[pool_id] = initial_bundle_floor
-        pool_storage_profiles[pool_id] = calibration_profile
+        pool_storage_profiles[pool_id] = sizing_profile
         pool_contracts[pool_id] = sizing_contract
     require(
         token_scaled_sequence_pool_ids,
         "typed target sizing contains no token-scaled sequence resource",
     )
 
-    static_bytes = target_sizing.get("static_bytes")
-    require(isinstance(static_bytes, int) and static_bytes > 0, "invalid sizing static bytes")
+    for pool_id in sizing_pool_bytes:
+        require(
+            probe_pool_bytes[pool_id]
+            == sizing_pool_bytes[pool_id]
+            + trace_growth_bytes_by_pool.get(pool_id, 0)
+            - trace_reclaimed_bytes_by_pool.get(pool_id, 0),
+            f"target sizing probe pool conservation failed for {pool_id}",
+        )
+
     sizing_resident_bytes = target_sizing.get("resident_bytes")
-    require(
-        isinstance(sizing_resident_bytes, int)
-        and sizing_resident_bytes == sum(sizing_observed_pool_resident_bytes.values()),
-        "target sizing resident total differs from its pool receipts",
-    )
+    probe_resident_bytes = target_probe.get("resident_bytes")
     calibration_budget = calibration.get("budget_claimed_bytes")
     calibration_resident_bytes = calibration.get("resident_bytes")
     require(
-        target_sizing.get("budget_claimed_bytes") == static_bytes + sizing_resident_bytes,
-        "target sizing budget differs from installed backing",
+        isinstance(sizing_resident_bytes, int)
+        and sizing_resident_bytes == sum(sizing_pool_bytes.values())
+        and target_sizing.get("budget_claimed_bytes")
+        == static_bytes + sizing_resident_bytes,
+        "target sizing prime budget differs from installed backing",
+    )
+    require(
+        isinstance(probe_resident_bytes, int)
+        and probe_resident_bytes == sum(probe_pool_bytes.values())
+        and target_probe.get("budget_claimed_bytes")
+        == static_bytes + probe_resident_bytes,
+        "target sizing probe budget differs from installed backing",
+    )
+    require(
+        probe_resident_bytes
+        == sizing_resident_bytes
+        + sum(trace_growth_bytes_by_pool.values())
+        - sum(trace_reclaimed_bytes_by_pool.values()),
+        "target sizing probe total residency does not conserve exact maintenance bytes",
     )
     require(
         isinstance(calibration_budget, int)
@@ -501,7 +698,8 @@ def derive_target_budget_envelope(
         "calibration budget differs from its installed backing",
     )
     require(
-        sizing_resident_bytes <= calibration_resident_bytes,
+        max(sizing_resident_bytes, probe_resident_bytes)
+        <= calibration_resident_bytes,
         "target sizing backing exceeds the calibrated resident budget",
     )
     minimum_initial_bundle_resident_bytes = sum(
@@ -511,29 +709,102 @@ def derive_target_budget_envelope(
         minimum_initial_bundle_resident_bytes <= calibration_resident_bytes,
         "typed initial bundles do not fit the calibrated resident budget",
     )
-    observed_or_floor_resident_bytes = sum(observed_or_floor_pool_bytes.values())
-    pressure_quantum_bytes = max(token_scaled_sequence_pressure_quanta.values())
+
+    sizing_growth_replay_signature = growth_replay_signature(
+        growth_receipts, "target sizing probe"
+    )
+    selected_pressure_event_ordinal: int | None = None
+    selected_pressure_growth_pool_ids: list[str] = []
+    selected_pressure_growth_end_bytes = 0
+    growth_prefix_bytes = 0
+    for receipt_ordinal, signature in enumerate(sizing_growth_replay_signature):
+        all_event_growth_pool_ids = {
+            growth["pool_id"] for growth in signature["growths"]
+        }
+        event_growth_pool_ids = sorted(
+            {
+                growth["pool_id"]
+                for growth in signature["growths"]
+                if growth["pool_id"] in token_scaled_sequence_pool_ids
+            }
+        )
+        if signature["stage"] == "sequence_extension" and event_growth_pool_ids:
+            require(
+                all_event_growth_pool_ids.issubset(token_scaled_sequence_pool_ids),
+                "target sizing sequence pressure event contains unattributed pool growth",
+            )
+            for pool_id in event_growth_pool_ids:
+                quantum = token_scaled_sequence_quanta[pool_id]
+                pool_growths = [
+                    growth["chunk_bytes"]
+                    for growth in signature["growths"]
+                    if growth["pool_id"] == pool_id
+                ]
+                require(
+                    sum(pool_growths) >= quantum
+                    and all(chunk_bytes % quantum == 0 for chunk_bytes in pool_growths),
+                    f"target sizing pressure event has non-quantized growth for {pool_id}",
+                )
+            selected_pressure_event_ordinal = receipt_ordinal
+            selected_pressure_growth_pool_ids = event_growth_pool_ids
+            selected_pressure_growth_end_bytes = (
+                growth_prefix_bytes + signature["allocated_bytes"]
+            )
+            break
+        growth_prefix_bytes += signature["allocated_bytes"]
     require(
-        observed_or_floor_resident_bytes > pressure_quantum_bytes,
-        "target sizing cannot reserve one typed sequence allocation quantum",
+        selected_pressure_event_ordinal is not None
+        and selected_pressure_growth_pool_ids,
+        "long probe has no attributable sequence-extension growth event",
+    )
+    pressure_quantum_bytes = max(
+        token_scaled_sequence_quanta[pool_id]
+        for pool_id in selected_pressure_growth_pool_ids
+    )
+    probe_positive_growth_bytes = sum(trace_growth_bytes_by_pool.values())
+    token_scaled_sequence_growth_bytes = sum(
+        growth["chunk_bytes"]
+        for growth in sizing_growth_replay_signature[selected_pressure_event_ordinal][
+            "growths"
+        ]
+        if growth["pool_id"] in selected_pressure_growth_pool_ids
+    )
+    require(
+        probe_positive_growth_bytes >= pressure_quantum_bytes
+        and token_scaled_sequence_growth_bytes >= pressure_quantum_bytes,
+        "long probe growth is smaller than its typed sequence allocation quantum",
     )
     pressure_budget_candidate_resident_bytes = (
-        observed_or_floor_resident_bytes - pressure_quantum_bytes
+        sizing_resident_bytes
+        + selected_pressure_growth_end_bytes
+        - pressure_quantum_bytes
     )
     resident_bytes = min(
         calibration_resident_bytes,
-        pressure_budget_candidate_resident_bytes,
+        max(
+            sizing_resident_bytes,
+            minimum_initial_bundle_resident_bytes,
+            pressure_budget_candidate_resident_bytes,
+        ),
+    )
+    require(
+        resident_bytes >= sizing_resident_bytes,
+        "decode pressure budget cannot replay the measured prime workload",
     )
     require(
         resident_bytes >= minimum_initial_bundle_resident_bytes,
-        "typed initial bundles do not fit after reserving decode pressure",
+        "typed initial bundles do not fit the decode pressure budget",
     )
-    observed_or_floor_budget_gap_bytes = (
-        observed_or_floor_resident_bytes - resident_bytes
+    probe_growth_headroom_bytes = resident_bytes - sizing_resident_bytes
+    selected_pressure_forced_deficit_bytes = (
+        selected_pressure_growth_end_bytes - probe_growth_headroom_bytes
+    )
+    probe_total_growth_budget_gap_bytes = (
+        probe_positive_growth_bytes - probe_growth_headroom_bytes
     )
     require(
-        observed_or_floor_budget_gap_bytes >= pressure_quantum_bytes,
-        "decode pressure budget did not reserve one typed sequence allocation quantum",
+        selected_pressure_forced_deficit_bytes >= pressure_quantum_bytes,
+        "decode pressure budget does not force the selected sequence event",
     )
     exact_budget = static_bytes + resident_bytes
     return {
@@ -543,13 +814,41 @@ def derive_target_budget_envelope(
         "calibration_resident_bytes": calibration_resident_bytes,
         "maximum_active_sequences": maximum_active_sequences,
         "sizing_observed_resident_bytes": sizing_resident_bytes,
-        "sizing_observed_pool_resident_bytes": sizing_observed_pool_resident_bytes,
-        "observed_or_floor_pool_bytes": observed_or_floor_pool_bytes,
-        "observed_or_floor_resident_bytes": observed_or_floor_resident_bytes,
-        "observed_or_floor_budget_gap_bytes": observed_or_floor_budget_gap_bytes,
-        "requires_cross_pool_rebalance": observed_or_floor_budget_gap_bytes > 0,
+        "sizing_observed_pool_resident_bytes": sizing_pool_bytes,
+        "probe_observed_resident_bytes": probe_resident_bytes,
+        "probe_observed_pool_resident_bytes": probe_pool_bytes,
+        "probe_growth_bytes_by_pool": probe_growth_bytes_by_pool,
+        "probe_shrink_bytes_by_pool": probe_shrink_bytes_by_pool,
+        "trace_growth_bytes_by_pool": dict(sorted(trace_growth_bytes_by_pool.items())),
+        "trace_growth_chunks": trace_growth_chunks,
+        "probe_positive_growth_bytes": probe_positive_growth_bytes,
+        "sequence_extension_growth_bytes_by_pool": dict(
+            sorted(sequence_extension_growth_bytes_by_pool.items())
+        ),
+        "sequence_extension_growth_chunks_by_pool": {
+            pool_id: list(chunk_bytes)
+            for pool_id, chunk_bytes in sorted(
+                sequence_extension_growth_chunks_by_pool.items()
+            )
+        },
+        "trace_reclaimed_bytes_by_pool": dict(
+            sorted(trace_reclaimed_bytes_by_pool.items())
+        ),
+        "probe_growth_headroom_bytes": probe_growth_headroom_bytes,
+        "probe_growth_budget_gap_bytes": selected_pressure_forced_deficit_bytes,
+        "probe_total_growth_budget_gap_bytes": probe_total_growth_budget_gap_bytes,
+        "requires_cross_pool_rebalance": selected_pressure_forced_deficit_bytes > 0,
         "pressure_quantum_bytes": pressure_quantum_bytes,
-        "pressure_quantum_bytes_by_pool": token_scaled_sequence_pressure_quanta,
+        "pressure_quantum_bytes_by_pool": token_scaled_sequence_quanta,
+        "growth_replay_signature": sizing_growth_replay_signature,
+        "selected_pressure_event_ordinal": selected_pressure_event_ordinal,
+        "selected_pressure_event_signature": sizing_growth_replay_signature[
+            selected_pressure_event_ordinal
+        ],
+        "selected_pressure_growth_end_bytes": selected_pressure_growth_end_bytes,
+        "selected_pressure_forced_deficit_bytes": (
+            selected_pressure_forced_deficit_bytes
+        ),
         "pressure_budget_candidate_resident_bytes": (
             pressure_budget_candidate_resident_bytes
         ),
@@ -561,12 +860,19 @@ def derive_target_budget_envelope(
         "initial_bundle_headroom_bytes": (
             resident_bytes - minimum_initial_bundle_resident_bytes
         ),
+        "donor_evidence_kind": "target_event_exact_receipt_only",
         "token_scaled_sequence_pool_ids": token_scaled_sequence_pool_ids,
+        "token_scaled_sequence_growth_pool_ids": selected_pressure_growth_pool_ids,
+        "token_scaled_sequence_growth_bytes": token_scaled_sequence_growth_bytes,
         "pool_storage_profiles": pool_storage_profiles,
         "pool_contracts": pool_contracts,
         "calibration_budget_claimed_bytes": calibration_budget,
-        "bootstrap_headroom_bytes": calibration_budget
-        - target_sizing["budget_claimed_bytes"],
+        "calibration_sizing_headroom_bytes": (
+            calibration_budget - target_sizing["budget_claimed_bytes"]
+        ),
+        "bootstrap_headroom_bytes": (
+            exact_budget - target_sizing["budget_claimed_bytes"]
+        ),
     }
 
 
@@ -632,12 +938,83 @@ def require_target_pool_within_budget_contract(
     )
 
 
+def replayable_prime_layout(snapshot: dict[str, Any], label: str) -> dict[str, Any]:
+    pool_resident_bytes = snapshot.get("pool_resident_bytes")
+    pool_used_bytes = snapshot.get("pool_used_bytes")
+    pool_live_segments = snapshot.get("pool_live_segments")
+    pool_transient_occupancy = snapshot.get("pool_transient_occupancy")
+    pool_lane_stable_occupancy = snapshot.get("pool_lane_stable_occupancy")
+    pool_envelopes = snapshot.get("pool_envelopes")
+    require(
+        all(
+            isinstance(value, dict)
+            for value in (
+                pool_resident_bytes,
+                pool_used_bytes,
+                pool_live_segments,
+                pool_transient_occupancy,
+                pool_lane_stable_occupancy,
+                pool_envelopes,
+            )
+        ),
+        f"{label}: replayable pool layout is incomplete",
+    )
+    pool_ids = set(pool_resident_bytes)
+    require(
+        pool_ids
+        and all(
+            set(value) == pool_ids
+            for value in (
+                pool_used_bytes,
+                pool_live_segments,
+                pool_transient_occupancy,
+                pool_lane_stable_occupancy,
+                pool_envelopes,
+            )
+        ),
+        f"{label}: replayable pool identities differ",
+    )
+    return {
+        "static_bytes": snapshot.get("static_bytes"),
+        "resident_bytes": snapshot.get("resident_bytes"),
+        "maximum_active_sequences": snapshot.get("maximum_active_sequences"),
+        "pool_resident_bytes": pool_resident_bytes,
+        "pool_used_bytes": pool_used_bytes,
+        "pool_live_segments": pool_live_segments,
+        "pool_transient_occupancy": pool_transient_occupancy,
+        "pool_lane_stable_occupancy": pool_lane_stable_occupancy,
+        "pool_envelopes": pool_envelopes,
+    }
+
+
+def require_replayed_prime_layout(
+    sizing_prime: dict[str, Any], target_prime: dict[str, Any]
+) -> dict[str, Any]:
+    sizing_layout = replayable_prime_layout(sizing_prime, "target sizing prime")
+    target_layout = replayable_prime_layout(target_prime, "fresh target prime")
+    require(
+        target_layout == sizing_layout,
+        "fresh target prime did not replay the sizing-prime physical layout",
+    )
+    encoded = json.dumps(
+        sizing_layout, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return {
+        "layout_sha256": hashlib.sha256(encoded).hexdigest(),
+        "pool_resident_bytes": sizing_layout["pool_resident_bytes"],
+        "pool_used_bytes": sizing_layout["pool_used_bytes"],
+        "pool_live_segments": sizing_layout["pool_live_segments"],
+    }
+
+
 def rebalance_prime_budget_receipt(
     prime: dict[str, Any],
+    sizing_prime: dict[str, Any],
     envelope: dict[str, Any],
     exact_budget: int,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     require_target_pool_within_budget_contract(prime, envelope, exact_budget)
+    layout_receipt = require_replayed_prime_layout(sizing_prime, prime)
     claimed_bytes = prime.get("budget_claimed_bytes")
     resident_bytes = prime.get("resident_bytes")
     resident_ceiling_bytes = envelope.get("resident_bytes")
@@ -648,9 +1025,31 @@ def rebalance_prime_budget_receipt(
         "rebalance prime budget receipt is incomplete",
     )
     headroom_bytes = exact_budget - claimed_bytes
+    replayed_probe_growth_bytes = envelope.get("probe_positive_growth_bytes")
+    selected_pressure_growth_end_bytes = envelope.get(
+        "selected_pressure_growth_end_bytes"
+    )
+    selected_pressure_event_ordinal = envelope.get("selected_pressure_event_ordinal")
+    pressure_quantum_bytes = envelope.get("pressure_quantum_bytes")
     require(
         0 <= headroom_bytes <= exact_budget,
         "rebalance prime headroom is outside the exact budget",
+    )
+    require(
+        isinstance(replayed_probe_growth_bytes, int)
+        and replayed_probe_growth_bytes > 0
+        and isinstance(selected_pressure_growth_end_bytes, int)
+        and selected_pressure_growth_end_bytes > 0
+        and isinstance(selected_pressure_event_ordinal, int)
+        and selected_pressure_event_ordinal >= 0
+        and isinstance(pressure_quantum_bytes, int)
+        and pressure_quantum_bytes > 0,
+        "rebalance prime has no typed sizing-probe growth contract",
+    )
+    forced_deficit_bytes = selected_pressure_growth_end_bytes - headroom_bytes
+    require(
+        forced_deficit_bytes >= pressure_quantum_bytes,
+        "rebalance prime headroom can absorb the replayed sequence growth",
     )
     return {
         "budget_ceiling_bytes": exact_budget,
@@ -658,6 +1057,12 @@ def rebalance_prime_budget_receipt(
         "headroom_bytes": headroom_bytes,
         "resident_ceiling_bytes": resident_ceiling_bytes,
         "resident_bytes": resident_bytes,
+        "replayed_probe_growth_bytes": replayed_probe_growth_bytes,
+        "selected_pressure_growth_end_bytes": selected_pressure_growth_end_bytes,
+        "selected_pressure_event_ordinal": selected_pressure_event_ordinal,
+        "forced_deficit_bytes": forced_deficit_bytes,
+        "pressure_quantum_bytes": pressure_quantum_bytes,
+        "replayed_prime_layout": layout_receipt,
     }
 
 
@@ -1755,6 +2160,7 @@ def validate_maintenance_trace(
             execution_receipt = validate_execution_maintenance_receipt(
                 row,
                 evidence,
+                exact,
                 f"{label} maintenance {index}",
             )
         growth = {
@@ -1799,7 +2205,10 @@ def validate_maintenance_trace(
 
 
 def validate_execution_maintenance_receipt(
-    row: dict[str, Any], evidence: dict[str, Any], label: str
+    row: dict[str, Any],
+    evidence: dict[str, Any],
+    exact_rebalance: dict[str, Any],
+    label: str,
 ) -> dict[str, Any]:
     require(
         evidence.get("schema_version") == EXECUTION_MAINTENANCE_SCHEMA_VERSION,
@@ -1841,6 +2250,7 @@ def validate_execution_maintenance_receipt(
         f"{label}: allocator growth receipts do not match the aggregate count",
     )
     growth_identities: list[list[Any]] = []
+    normalized_growths: list[dict[str, Any]] = []
     allocated_bytes = 0
     for growth_index, growth in enumerate(growth_receipts):
         require(
@@ -1884,6 +2294,14 @@ def validate_execution_maintenance_receipt(
             f"{label}: growth receipt {growth_index} has invalid bytes or epoch",
         )
         growth_identities.append(identity)
+        normalized_growths.append(
+            {
+                "pool_id": pool_id,
+                "chunk_identity": identity,
+                "chunk_bytes": chunk_bytes,
+                "published_capacity_bytes": published_capacity_bytes,
+            }
+        )
         allocated_bytes += chunk_bytes
     require(
         allocated_bytes == evidence.get("allocated_bytes"),
@@ -1892,6 +2310,74 @@ def validate_execution_maintenance_receipt(
     require(
         receipt.get("rebalance") == evidence.get("rebalance"),
         f"{label}: allocator and event rebalance receipts differ",
+    )
+    normalized_reclaims: list[dict[str, Any]] = []
+    rebalance = evidence.get("rebalance")
+    if exact_rebalance["pools_reclaimed"] == 0:
+        require(rebalance is None, f"{label}: empty reclaim has an exact receipt")
+    else:
+        require(isinstance(rebalance, dict), f"{label}: exact reclaim receipt is missing")
+        reclaim_pools = rebalance.get("pools")
+        require(
+            isinstance(reclaim_pools, list)
+            and len(reclaim_pools) == exact_rebalance["pools_reclaimed"],
+            f"{label}: exact reclaim pool count drifted",
+        )
+        for reclaim_index, reclaim in enumerate(reclaim_pools):
+            pool_id = reclaim.get("pool_id") if isinstance(reclaim, dict) else None
+            chunks = reclaim.get("chunks") if isinstance(reclaim, dict) else None
+            reclaimed_bytes = (
+                reclaim.get("reclaimed_bytes") if isinstance(reclaim, dict) else None
+            )
+            published_capacity_bytes = (
+                reclaim.get("published_capacity_bytes")
+                if isinstance(reclaim, dict)
+                else None
+            )
+            require(
+                isinstance(pool_id, str)
+                and isinstance(chunks, list)
+                and chunks
+                and isinstance(reclaimed_bytes, int)
+                and not isinstance(reclaimed_bytes, bool)
+                and reclaimed_bytes > 0
+                and isinstance(published_capacity_bytes, int)
+                and not isinstance(published_capacity_bytes, bool)
+                and published_capacity_bytes >= 0,
+                f"{label}: reclaim receipt {reclaim_index} is invalid",
+            )
+            chunk_identities = [
+                [chunk.get("pool_id"), chunk.get("ordinal"), chunk.get("generation")]
+                for chunk in chunks
+            ]
+            normalized_reclaims.append(
+                {
+                    "pool_id": pool_id,
+                    "reclaimed_bytes": reclaimed_bytes,
+                    "chunk_identities": chunk_identities,
+                    "published_capacity_bytes": published_capacity_bytes,
+                }
+            )
+        require(
+            [reclaim["pool_id"] for reclaim in normalized_reclaims]
+            == exact_rebalance["pool_ids"]
+            and [
+                identity
+                for reclaim in normalized_reclaims
+                for identity in reclaim["chunk_identities"]
+            ]
+            == exact_rebalance["chunk_identities"]
+            and sum(
+                reclaim["reclaimed_bytes"] for reclaim in normalized_reclaims
+            )
+            == exact_rebalance["reclaimed_bytes"],
+            f"{label}: normalized reclaim receipt differs from exact evidence",
+        )
+    require(
+        {growth["pool_id"] for growth in normalized_growths}.isdisjoint(
+            reclaim["pool_id"] for reclaim in normalized_reclaims
+        ),
+        f"{label}: one event grows and reclaims the same pool",
     )
     participants = evidence.get("participants")
     require(
@@ -1947,6 +2433,10 @@ def validate_execution_maintenance_receipt(
         "stage": stage,
         "coordinator_id": coordinator_id,
         "capacity_epoch": capacity_epoch,
+        "allocated_bytes": allocated_bytes,
+        "growths": normalized_growths,
+        "reclaimed_bytes": exact_rebalance["reclaimed_bytes"],
+        "reclaims": normalized_reclaims,
         "growth_chunk_identities": growth_identities,
         "participant_identities": participant_identities,
         "event_fingerprint": fingerprint,
@@ -1972,6 +2462,152 @@ def validate_rebalance_trace(
         f"{label} produced no typed rebalance",
     )
     return summary
+
+
+def validate_target_rebalance_witness(
+    summary: dict[str, Any],
+    envelope: dict[str, Any],
+    prime_budget_receipt: dict[str, Any],
+    prime_pool: dict[str, Any],
+    probe_pool: dict[str, Any],
+) -> dict[str, Any]:
+    receipts = summary.get("growth_receipts")
+    require(
+        isinstance(receipts, list) and receipts,
+        "target rebalance probe has no exact execution receipts",
+    )
+    actual_growth_replay_signature = growth_replay_signature(
+        receipts, "target rebalance probe"
+    )
+    require(
+        actual_growth_replay_signature == envelope.get("growth_replay_signature"),
+        "target probe did not replay the ordered sizing growth events",
+    )
+    selected_growth_pools = set(envelope["token_scaled_sequence_growth_pool_ids"])
+    pressure_quanta = envelope["pressure_quantum_bytes_by_pool"]
+    actual_growth_bytes_by_pool: dict[str, int] = {}
+    actual_reclaimed_bytes_by_pool: dict[str, int] = {}
+    for receipt_index, receipt in enumerate(receipts):
+        growths = receipt.get("growths") if isinstance(receipt, dict) else None
+        reclaims = receipt.get("reclaims") if isinstance(receipt, dict) else None
+        require(
+            isinstance(growths, list)
+            and growths
+            and isinstance(reclaims, list),
+            f"target rebalance receipt {receipt_index} is incomplete",
+        )
+        for growth in growths:
+            pool_id = growth["pool_id"]
+            actual_growth_bytes_by_pool[pool_id] = (
+                actual_growth_bytes_by_pool.get(pool_id, 0) + growth["chunk_bytes"]
+            )
+        for reclaim in reclaims:
+            pool_id = reclaim["pool_id"]
+            actual_reclaimed_bytes_by_pool[pool_id] = (
+                actual_reclaimed_bytes_by_pool.get(pool_id, 0)
+                + reclaim["reclaimed_bytes"]
+            )
+        require(
+            {growth["pool_id"] for growth in growths}.isdisjoint(
+                reclaim["pool_id"] for reclaim in reclaims
+            ),
+            f"target rebalance receipt {receipt_index} grows and reclaims one pool",
+        )
+    selected_event_ordinal = envelope.get("selected_pressure_event_ordinal")
+    require(
+        isinstance(selected_event_ordinal, int)
+        and 0 <= selected_event_ordinal < len(receipts)
+        and prime_budget_receipt.get("selected_pressure_event_ordinal")
+        == selected_event_ordinal,
+        "target pressure event ordinal is invalid",
+    )
+    selected_receipt = receipts[selected_event_ordinal]
+    require(
+        all(
+            receipt.get("reclaimed_bytes") == 0 and not receipt.get("reclaims")
+            for receipt in receipts[:selected_event_ordinal]
+        ),
+        "target probe reclaimed backing before the selected pressure event",
+    )
+    selected_growths = selected_receipt["growths"]
+    selected_reclaims = selected_receipt["reclaims"]
+    event_sequence_growths = [
+        growth
+        for growth in selected_growths
+        if growth["pool_id"] in selected_growth_pools
+    ]
+    require(
+        selected_receipt.get("stage") == "sequence_extension"
+        and event_sequence_growths
+        and all(
+            growth["chunk_bytes"] % pressure_quanta[growth["pool_id"]] == 0
+            for growth in event_sequence_growths
+        ),
+        "selected target pressure event is not attributable sequence growth",
+    )
+    require(
+        selected_reclaims
+        and selected_receipt.get("reclaimed_bytes", 0)
+        >= prime_budget_receipt["forced_deficit_bytes"],
+        "selected target pressure event did not reclaim the forced deficit",
+    )
+    qualifying_events = [
+        {
+            "event_ordinal": selected_event_ordinal,
+            "event_fingerprint": selected_receipt["event_fingerprint"],
+            "growth_pool_ids": sorted(
+                {growth["pool_id"] for growth in event_sequence_growths}
+            ),
+            "reclaim_pool_ids": sorted(
+                {reclaim["pool_id"] for reclaim in selected_reclaims}
+            ),
+            "allocated_bytes": selected_receipt["allocated_bytes"],
+            "reclaimed_bytes": selected_receipt["reclaimed_bytes"],
+        }
+    ]
+    require(
+        actual_growth_bytes_by_pool == envelope["trace_growth_bytes_by_pool"],
+        "target probe did not replay the sizing probe physical growth",
+    )
+    require(
+        summary.get("allocated_bytes") == sum(actual_growth_bytes_by_pool.values())
+        and summary.get("reclaimed_bytes")
+        == sum(actual_reclaimed_bytes_by_pool.values()),
+        "target probe aggregate bytes differ from its exact receipts",
+    )
+    prime_pools = prime_pool.get("pool_resident_bytes")
+    probe_pools = probe_pool.get("pool_resident_bytes")
+    require(
+        isinstance(prime_pools, dict)
+        and isinstance(probe_pools, dict)
+        and prime_pools.keys() == probe_pools.keys(),
+        "target prime/probe pool identities differ",
+    )
+    for pool_id in prime_pools:
+        require(
+            probe_pools[pool_id]
+            == prime_pools[pool_id]
+            + actual_growth_bytes_by_pool.get(pool_id, 0)
+            - actual_reclaimed_bytes_by_pool.get(pool_id, 0),
+            f"target probe pool conservation failed for {pool_id}",
+        )
+    require(
+        probe_pool.get("resident_bytes")
+        == prime_pool.get("resident_bytes")
+        + sum(actual_growth_bytes_by_pool.values())
+        - sum(actual_reclaimed_bytes_by_pool.values()),
+        "target probe total residency does not conserve exact maintenance bytes",
+    )
+    return {
+        "growth_replay_signature": actual_growth_replay_signature,
+        "sizing_growth_bytes_by_pool": envelope["trace_growth_bytes_by_pool"],
+        "actual_growth_bytes_by_pool": dict(sorted(actual_growth_bytes_by_pool.items())),
+        "actual_reclaimed_bytes_by_pool": dict(
+            sorted(actual_reclaimed_bytes_by_pool.items())
+        ),
+        "forced_deficit_bytes": prime_budget_receipt["forced_deficit_bytes"],
+        "qualifying_events": qualifying_events,
+    }
 
 
 def require_decode_prompt(result: dict[str, Any], slot: str) -> None:
@@ -2320,7 +2956,7 @@ def collect(args: argparse.Namespace) -> int:
             timeout=args.request_timeout,
         )
         tasks = {}
-        sizing_health = target_sizing.health("health.final.json")
+        sizing_health = target_sizing.health("health.prime.json")
         sizing_executor = common.find_executor_snapshot(sizing_health)
         require(sizing_executor is not None, "target sizing health has no vNext executor")
         sizing_start_executor = common.executor_snapshot_from_health(
@@ -2345,16 +2981,67 @@ def collect(args: argparse.Namespace) -> int:
             label="target sizing",
             phase=PREFILL_MAINTENANCE_PHASE,
         )
+        sizing_probe_task = common.StreamTask(
+            port=target_sizing.port,
+            model=target_sizing.model_id,
+            role="target-sizing-rebalance-probe",
+            workload_slot=REBALANCE_PROBE_WORKLOAD_SLOT,
+            max_tokens=REBALANCE_PROBE_MAX_TOKENS,
+            out_dir=out / "target-sizing-rebalance-probe" / "clients",
+            timeout=args.request_timeout,
+            prompt=REBALANCE_PROBE_PROMPT,
+        )
+        tasks = {REBALANCE_PROBE_WORKLOAD_SLOT: sizing_probe_task}
+        sizing_probe_deadline = time.monotonic() + args.request_timeout
+        sizing_probe_task.start()
+        sizing_probe_task.wait_first(
+            min(args.request_timeout, STOP_POLICY["no_progress_timeout_seconds"])
+        )
+        sizing_probe_client = sizing_probe_task.join(
+            max(0.0, sizing_probe_deadline - time.monotonic())
+        )
+        common.validate_stream(
+            sizing_probe_client, "target-sizing-rebalance-probe"
+        )
+        tasks = {}
+        sizing_probe_health = target_sizing.health("health.rebalance-probe.json")
+        sizing_probe_executor = common.find_executor_snapshot(sizing_probe_health)
+        require(
+            sizing_probe_executor is not None,
+            "target sizing rebalance probe health has no vNext executor",
+        )
+        sizing_probe_pool = common.quiescent_pool_snapshot(
+            sizing_probe_executor,
+            "decode target sizing rebalance probe",
+            baseline_executor=sizing_start_executor,
+        )
+        sizing_rows = common.read_trace(target_sizing.trace_path)
+        sizing_probe_maintenance_summary = validate_maintenance_trace(
+            sizing_rows,
+            started_wall_ns=sizing_probe_client["started_wall_ns"],
+            finished_wall_ns=sizing_probe_client["finished_wall_ns"],
+            label="target sizing rebalance probe",
+            phase=EXECUTION_MAINTENANCE_PHASE,
+        )
         collection["target_sizing"] = {
             "clients": sizing_clients,
             "monitor": sizing_monitor,
             "pool_snapshot": sizing_pool,
             "maintenance_summary": sizing_maintenance_summary,
-            "health_final": "target-sizing/health.final.json",
+            "health_prime": "target-sizing/health.prime.json",
+            "rebalance_probe": {
+                "client": sizing_probe_client,
+                "pool_snapshot": sizing_probe_pool,
+                "health": "target-sizing/health.rebalance-probe.json",
+                "maintenance_summary": sizing_probe_maintenance_summary,
+            },
             "trace": "target-sizing/scheduler-trace.jsonl",
         }
         target_budget_envelope = derive_target_budget_envelope(
-            calibration_pool, sizing_pool
+            calibration_pool,
+            sizing_pool,
+            sizing_probe_pool,
+            sizing_probe_maintenance_summary,
         )
         require(
             target_budget_envelope["requires_cross_pool_rebalance"] is True,
@@ -2405,6 +3092,7 @@ def collect(args: argparse.Namespace) -> int:
         )
         prime_budget_receipt = rebalance_prime_budget_receipt(
             prime_pool,
+            sizing_pool,
             target_budget_envelope,
             exact_budget,
         )
@@ -2442,6 +3130,13 @@ def collect(args: argparse.Namespace) -> int:
             started_wall_ns=probe_client["started_wall_ns"],
             finished_wall_ns=probe_client["finished_wall_ns"],
             label="target rebalance probe",
+        )
+        rebalance_witness = validate_target_rebalance_witness(
+            probe_maintenance_summary,
+            target_budget_envelope,
+            prime_budget_receipt,
+            prime_pool,
+            probe_pool,
         )
 
         target_trace_baseline = target.trace_path.stat().st_size if target.trace_path.is_file() else 0
@@ -2483,6 +3178,7 @@ def collect(args: argparse.Namespace) -> int:
                 "pool_snapshot": probe_pool,
                 "health": "target/health.rebalance-probe.json",
                 "maintenance_summary": probe_maintenance_summary,
+                "rebalance_witness": rebalance_witness,
             },
             "clients": target_clients,
             "monitor": target_monitor,
@@ -2575,33 +3271,39 @@ def validate_stream_group(
     return started, finished, silences
 
 
-def validate_rebalance_probe(root: Path, result: dict[str, Any]) -> tuple[int, int, float]:
-    require(isinstance(result, dict), "target-rebalance-probe: result is invalid")
+def validate_rebalance_probe(
+    root: Path,
+    result: dict[str, Any],
+    *,
+    artifact_phase: str,
+    role: str,
+) -> tuple[int, int, float]:
+    require(isinstance(result, dict), f"{role}: result is invalid")
     require(
-        result.get("role") == "target-rebalance-probe"
+        result.get("role") == role
         and result.get("workload_slot") == REBALANCE_PROBE_WORKLOAD_SLOT
         and result.get("max_tokens") == REBALANCE_PROBE_MAX_TOKENS,
-        "target-rebalance-probe: workload identity changed",
+        f"{role}: workload identity changed",
     )
     require(
         result.get("prompt_sha256")
         == hashlib.sha256(REBALANCE_PROBE_PROMPT.encode("utf-8")).hexdigest(),
-        "target-rebalance-probe: prompt changed",
+        f"{role}: prompt changed",
     )
     prompt_tokens = result.get("prompt_tokens")
     require(
         isinstance(prompt_tokens, int)
         and REBALANCE_PROBE_MAX_TOKENS < prompt_tokens < MAX_MODEL_LEN,
-        "target-rebalance-probe: tokenized prompt is outside the product model limit",
+        f"{role}: tokenized prompt is outside the product model limit",
     )
-    common.validate_stream(result, "target-rebalance-probe")
+    common.validate_stream(result, role)
     started = result["started_wall_ns"]
     finished = result["finished_wall_ns"]
     events = (
         root
-        / "target-rebalance-probe"
+        / artifact_phase
         / "clients"
-        / "target-rebalance-probe.events.jsonl"
+        / f"{role}.events.jsonl"
     )
     silence = common.max_stream_silence_seconds(
         result,
@@ -2610,7 +3312,7 @@ def validate_rebalance_probe(root: Path, result: dict[str, Any]) -> tuple[int, i
     )
     require(
         silence < STOP_POLICY["no_progress_timeout_seconds"],
-        f"target-rebalance-probe: token progress stalled for {silence:.3f}s",
+        f"{role}: token progress stalled for {silence:.3f}s",
     )
     return started, finished, silence
 
@@ -2650,15 +3352,21 @@ def validate(root: Path, out: Path) -> int:
     )
     rebalance_prime = target.get("rebalance_prime")
     rebalance_probe = target.get("rebalance_probe")
+    sizing_rebalance_probe = target_sizing.get("rebalance_probe")
     require(
-        isinstance(rebalance_prime, dict) and isinstance(rebalance_probe, dict),
-        "target rebalance phases are missing",
+        isinstance(sizing_rebalance_probe, dict)
+        and isinstance(rebalance_prime, dict)
+        and isinstance(rebalance_probe, dict),
+        "sizing or target rebalance phases are missing",
     )
     calibration_start_health = common.read_json(root / "calibration/health.start.json")
     sizing_start_health = common.read_json(root / "target-sizing/health.start.json")
     target_start_health = common.read_json(root / "target/health.start.json")
     calibration_health = common.read_json(root / str(calibration.get("health_final")))
-    sizing_health = common.read_json(root / str(target_sizing.get("health_final")))
+    sizing_health = common.read_json(root / str(target_sizing.get("health_prime")))
+    sizing_probe_health = common.read_json(
+        root / str(sizing_rebalance_probe.get("health"))
+    )
     target_health = common.read_json(root / str(target.get("health_final")))
     prime_health = common.read_json(root / str(rebalance_prime.get("health")))
     probe_health = common.read_json(root / str(rebalance_probe.get("health")))
@@ -2667,6 +3375,7 @@ def validate(root: Path, out: Path) -> int:
     target_start_executor = common.find_executor_snapshot(target_start_health)
     calibration_executor = common.find_executor_snapshot(calibration_health)
     sizing_executor = common.find_executor_snapshot(sizing_health)
+    sizing_probe_executor = common.find_executor_snapshot(sizing_probe_health)
     target_executor = common.find_executor_snapshot(target_health)
     prime_executor = common.find_executor_snapshot(prime_health)
     probe_executor = common.find_executor_snapshot(probe_health)
@@ -2676,6 +3385,7 @@ def validate(root: Path, out: Path) -> int:
         and target_start_executor is not None
         and calibration_executor is not None
         and sizing_executor is not None
+        and sizing_probe_executor is not None
         and target_executor is not None
         and prime_executor is not None
         and probe_executor is not None,
@@ -2689,7 +3399,8 @@ def validate(root: Path, out: Path) -> int:
             ],
             "target sizing": [
                 ("target sizing start", sizing_start_executor),
-                ("target sizing final", sizing_executor),
+                ("target sizing prime", sizing_executor),
+                ("target sizing rebalance probe", sizing_probe_executor),
             ],
             "target": [
                 ("target start", target_start_executor),
@@ -2707,6 +3418,11 @@ def validate(root: Path, out: Path) -> int:
     sizing_pool = common.quiescent_pool_snapshot(
         sizing_executor,
         "raw decode target sizing",
+        baseline_executor=sizing_start_executor,
+    )
+    sizing_probe_pool = common.quiescent_pool_snapshot(
+        sizing_probe_executor,
+        "raw decode target sizing rebalance probe",
         baseline_executor=sizing_start_executor,
     )
     target_pool = common.quiescent_pool_snapshot(
@@ -2736,6 +3452,10 @@ def validate(root: Path, out: Path) -> int:
         target_sizing.get("pool_snapshot") == sizing_pool,
         "target sizing summary differs from raw health",
     )
+    require(
+        sizing_rebalance_probe.get("pool_snapshot") == sizing_probe_pool,
+        "target sizing rebalance probe summary differs from raw health",
+    )
     require(target.get("pool_snapshot") == target_pool, "target summary differs from raw health")
     require(
         rebalance_prime.get("pool_snapshot") == prime_pool,
@@ -2745,7 +3465,32 @@ def validate(root: Path, out: Path) -> int:
         rebalance_probe.get("pool_snapshot") == probe_pool,
         "rebalance probe summary differs from raw health",
     )
-    target_budget_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
+    sizing_rows = common.read_trace(root / str(target_sizing.get("trace")))
+    sizing_probe_client = sizing_rebalance_probe.get("client")
+    require(
+        isinstance(sizing_probe_client, dict)
+        and isinstance(sizing_probe_client.get("started_wall_ns"), int)
+        and isinstance(sizing_probe_client.get("finished_wall_ns"), int),
+        "target sizing rebalance probe client window is missing",
+    )
+    sizing_probe_maintenance_summary = validate_maintenance_trace(
+        sizing_rows,
+        started_wall_ns=sizing_probe_client["started_wall_ns"],
+        finished_wall_ns=sizing_probe_client["finished_wall_ns"],
+        label="target sizing rebalance probe",
+        phase=EXECUTION_MAINTENANCE_PHASE,
+    )
+    require(
+        sizing_rebalance_probe.get("maintenance_summary")
+        == sizing_probe_maintenance_summary,
+        "target sizing rebalance probe summary differs from raw trace",
+    )
+    target_budget_envelope = derive_target_budget_envelope(
+        calibration_pool,
+        sizing_pool,
+        sizing_probe_pool,
+        sizing_probe_maintenance_summary,
+    )
     require(
         collection.get("target_budget_envelope") == target_budget_envelope,
         "target budget envelope differs from raw sizing receipts",
@@ -2788,6 +3533,7 @@ def validate(root: Path, out: Path) -> int:
     )
     prime_budget_receipt = rebalance_prime_budget_receipt(
         prime_pool,
+        sizing_pool,
         target_budget_envelope,
         exact_budget,
     )
@@ -2815,6 +3561,16 @@ def validate(root: Path, out: Path) -> int:
     sizing_started, sizing_finished, sizing_silence = validate_stream_group(
         root, "target-sizing", target_sizing.get("clients"), CALIBRATION_MAX_TOKENS
     )
+    (
+        sizing_probe_started,
+        sizing_probe_finished,
+        sizing_probe_silence,
+    ) = validate_rebalance_probe(
+        root,
+        sizing_probe_client,
+        artifact_phase="target-sizing-rebalance-probe",
+        role="target-sizing-rebalance-probe",
+    )
     prime_started, prime_finished, prime_silence = validate_stream_group(
         root,
         "target-rebalance-prime",
@@ -2822,7 +3578,10 @@ def validate(root: Path, out: Path) -> int:
         REBALANCE_PRIME_MAX_TOKENS,
     )
     probe_started, probe_finished, probe_silence = validate_rebalance_probe(
-        root, rebalance_probe.get("client")
+        root,
+        rebalance_probe.get("client"),
+        artifact_phase="target-rebalance-probe",
+        role="target-rebalance-probe",
     )
     target_started, target_finished, target_silence = validate_stream_group(
         root, "target", target.get("clients"), TARGET_MAX_TOKENS
@@ -2862,6 +3621,17 @@ def validate(root: Path, out: Path) -> int:
         ),
         "target sizing unexpectedly hit decode capacity pressure",
     )
+    require(
+        not any(
+            row.get("phase") == "vnext.decode_capacity_deferred"
+            and isinstance(row.get("ts_unix_nanos"), int)
+            and sizing_probe_started
+            <= row["ts_unix_nanos"]
+            <= sizing_probe_finished
+            for row in sizing_rows
+        ),
+        "target sizing rebalance probe unexpectedly hit logical decode pressure",
+    )
     sizing_maintenance_summary = validate_maintenance_trace(
         sizing_rows,
         started_wall_ns=sizing_started,
@@ -2874,6 +3644,12 @@ def validate(root: Path, out: Path) -> int:
         "target sizing maintenance summary differs from raw trace",
     )
     target_rows = common.read_trace(root / str(target.get("trace")))
+    sizing_trace_path = root / str(target_sizing.get("trace"))
+    sizing_trace_bytes = sizing_trace_path.stat().st_size
+    require(
+        sizing_trace_bytes <= STOP_POLICY["max_trace_bytes"],
+        "target sizing trace exceeds its byte ceiling",
+    )
     target_trace_path = root / str(target.get("trace"))
     target_trace_bytes = target_trace_path.stat().st_size
     require(target_trace_bytes <= STOP_POLICY["max_trace_bytes"], "target trace exceeds its byte ceiling")
@@ -2881,6 +3657,17 @@ def validate(root: Path, out: Path) -> int:
         rebalance_probe["client"]["prompt_tokens"]
         > max(result["prompt_tokens"] for result in target["clients"].values()),
         "rebalance probe did not increase request-shaped token demand",
+    )
+    require(
+        {
+            key: sizing_probe_client.get(key)
+            for key in ("workload_slot", "prompt_sha256", "prompt_tokens", "max_tokens")
+        }
+        == {
+            key: rebalance_probe["client"].get(key)
+            for key in ("workload_slot", "prompt_sha256", "prompt_tokens", "max_tokens")
+        },
+        "sizing and target rebalance probes did not replay the same workload",
     )
     for phase, started, finished in (
         ("target-rebalance-prime", prime_started, prime_finished),
@@ -2910,6 +3697,17 @@ def validate(root: Path, out: Path) -> int:
     require(
         rebalance_probe.get("maintenance_summary") == probe_maintenance_summary,
         "target rebalance probe maintenance summary differs from raw trace",
+    )
+    rebalance_witness = validate_target_rebalance_witness(
+        probe_maintenance_summary,
+        target_budget_envelope,
+        prime_budget_receipt,
+        prime_pool,
+        probe_pool,
+    )
+    require(
+        rebalance_probe.get("rebalance_witness") == rebalance_witness,
+        "target rebalance witness differs from raw trace and pool receipts",
     )
 
     counters = target_executor.get("counters")
@@ -2964,15 +3762,22 @@ def validate(root: Path, out: Path) -> int:
         "stop_policy": STOP_POLICY,
         "decode_summary": decode_summary,
         "rebalance_summary": probe_maintenance_summary,
+        "rebalance_witness": rebalance_witness,
         "rebalance_evidence_phase": "target-rebalance-probe",
         "sizing_maintenance_summary": sizing_maintenance_summary,
+        "sizing_probe_maintenance_summary": sizing_probe_maintenance_summary,
         "probe_maintenance_summary": probe_maintenance_summary,
         "cross_pool_rebalance_evidence_owner": (
             common.CROSS_POOL_REBALANCE_EVIDENCE_OWNER
         ),
         "target_trace_bytes": target_trace_bytes,
+        "target_sizing_trace_bytes": sizing_trace_bytes,
         "calibration_window_ns": [calibration_started, calibration_finished],
         "target_sizing_window_ns": [sizing_started, sizing_finished],
+        "target_sizing_rebalance_probe_window_ns": [
+            sizing_probe_started,
+            sizing_probe_finished,
+        ],
         "target_rebalance_prime_window_ns": [prime_started, prime_finished],
         "target_rebalance_probe_window_ns": [probe_started, probe_finished],
         "target_window_ns": [target_started, target_finished],
@@ -2980,6 +3785,7 @@ def validate(root: Path, out: Path) -> int:
         "max_silence_seconds": {
             "calibration": calibration_silence,
             "target_sizing": sizing_silence,
+            "target_sizing_rebalance_probe": sizing_probe_silence,
             "target_rebalance_prime": prime_silence,
             "target_rebalance_probe": probe_silence,
             "target": target_silence,
@@ -3224,8 +4030,8 @@ def self_test() -> int:
 
     storage_profiles = {
         "sequence": {
-            "allocator": {"fixed_block_arena": {"block_bytes": 1}},
-            "view": {"paged_regions": {"block_bytes": 1}},
+            "allocator": {"fixed_block_arena": {"block_bytes": 4}},
+            "view": {"paged_regions": {"block_bytes": 4}},
         },
         "workspace": {"allocator": "linear_arena", "view": "contiguous"},
     }
@@ -3247,7 +4053,7 @@ def self_test() -> int:
                     },
                     "lifetime": "sequence",
                     "kind": "value",
-                    "physical_allocation_quantum_bytes": 1,
+                    "physical_allocation_quantum_bytes": 4,
                     "initialization": "none",
                 }
             ],
@@ -3304,97 +4110,401 @@ def self_test() -> int:
     def pool_snapshot(
         pools: dict[str, int],
         contracts: dict[str, dict[str, Any]] = pool_contracts,
+        *,
+        free_bytes_by_pool: dict[str, int] | None = None,
     ) -> dict[str, Any]:
         resident_bytes = sum(pools.values())
+        free_bytes_by_pool = free_bytes_by_pool or pools
+        used_bytes_by_pool = {
+            pool_id: value - free_bytes_by_pool[pool_id]
+            for pool_id, value in pools.items()
+        }
+        live_segments_by_pool = {
+            pool_id: int(used_bytes_by_pool[pool_id] > 0) for pool_id in pools
+        }
+        transient_occupancy = {pool_id: {} for pool_id in pools}
+        lane_stable_occupancy = {pool_id: {} for pool_id in pools}
         return {
             "static_bytes": 100,
             "resident_bytes": resident_bytes,
             "budget_claimed_bytes": 100 + resident_bytes,
             "maximum_active_sequences": MAX_NUM_SEQS,
             "pool_resident_bytes": pools,
+            "pool_used_bytes": used_bytes_by_pool,
+            "pool_live_segments": live_segments_by_pool,
+            "pool_transient_occupancy": transient_occupancy,
+            "pool_lane_stable_occupancy": lane_stable_occupancy,
+            "startup_baseline": {
+                "pool_used_bytes": {pool_id: 0 for pool_id in pools},
+                "pool_live_segments": {pool_id: 0 for pool_id in pools},
+                "pool_transient_occupancy": transient_occupancy,
+                "pool_lane_stable_occupancy": lane_stable_occupancy,
+            },
             "pool_envelopes": {
                 pool_id: {
+                    "domain_id": index + 1,
                     "resident_bytes": value,
                     "resident_chunks": 1,
-                    "largest_contiguous_bytes": value,
+                    "free_bytes": free_bytes_by_pool[pool_id],
+                    "largest_contiguous_bytes": free_bytes_by_pool[pool_id],
+                    "live_segments": live_segments_by_pool[pool_id],
+                    "live_occupancy": {
+                        "transient": transient_occupancy[pool_id],
+                        "lane_stable": lane_stable_occupancy[pool_id],
+                    },
                     "storage_profile": storage_profiles[pool_id],
                     "contract": contracts[pool_id],
                 }
-                for pool_id, value in pools.items()
+                for index, (pool_id, value) in enumerate(pools.items())
             },
         }
 
+    probe_maintenance = {
+        "maintenance_events": 1,
+        "maintained_events": 1,
+        "allocated_bytes": 4,
+        "rebalance_events": 0,
+        "pools_reclaimed": 0,
+        "chunks_reclaimed": 0,
+        "reclaimed_bytes": 0,
+        "growth_receipts": [
+            {
+                "stage": "sequence_extension",
+                "allocated_bytes": 4,
+                "reclaimed_bytes": 0,
+                "reclaims": [],
+                "growths": [
+                    {
+                        "pool_id": "sequence",
+                        "chunk_identity": ["sequence", 1, 1],
+                        "chunk_bytes": 4,
+                        "published_capacity_bytes": 34,
+                    }
+                ],
+            }
+        ],
+    }
     calibration_pool = pool_snapshot(
-        {"sequence": 30, "workspace": 6}, calibration_contracts
+        {"sequence": 50, "workspace": 20}, calibration_contracts
     )
-    sizing_pool = pool_snapshot({"sequence": 20, "workspace": 7})
-    target_envelope = derive_target_budget_envelope(calibration_pool, sizing_pool)
+    sizing_pool = pool_snapshot({"sequence": 30, "workspace": 10})
+    sizing_probe_pool = pool_snapshot({"sequence": 34, "workspace": 10})
+    target_envelope = derive_target_budget_envelope(
+        calibration_pool,
+        sizing_pool,
+        sizing_probe_pool,
+        probe_maintenance,
+    )
     require(
-        target_envelope["budget_claimed_bytes"] == 136
-        and target_envelope["resident_bytes"] == 36,
+        target_envelope["budget_claimed_bytes"] == 140
+        and target_envelope["resident_bytes"] == 40,
         "self-test lost typed target budget derivation",
     )
     require(
         target_envelope["sizing_observed_pool_resident_bytes"]
-        == {"sequence": 20, "workspace": 7}
-        and target_envelope["observed_or_floor_pool_bytes"]
-        == {"sequence": 30, "workspace": 7}
-        and target_envelope["observed_or_floor_resident_bytes"] == 37
-        and target_envelope["observed_or_floor_budget_gap_bytes"] == 1
+        == {"sequence": 30, "workspace": 10}
+        and target_envelope["probe_observed_pool_resident_bytes"]
+        == {"sequence": 34, "workspace": 10}
+        and target_envelope["probe_growth_bytes_by_pool"]
+        == {"sequence": 4, "workspace": 0}
+        and target_envelope["probe_shrink_bytes_by_pool"]
+        == {"sequence": 0, "workspace": 0}
+        and target_envelope["trace_growth_bytes_by_pool"] == {"sequence": 4}
+        and target_envelope["sequence_extension_growth_chunks_by_pool"]
+        == {"sequence": [4]}
+        and target_envelope["probe_growth_budget_gap_bytes"] == 4
         and target_envelope["requires_cross_pool_rebalance"] is True
-        and target_envelope["pressure_quantum_bytes"] == 1
+        and target_envelope["pressure_quantum_bytes"] == 4
         and target_envelope["pressure_quantum_bytes_by_pool"]
-        == {"sequence": 1}
-        and target_envelope["pressure_budget_candidate_resident_bytes"] == 36
-        and target_envelope["pressure_budget_reduction_from_calibration_bytes"] == 0
+        == {"sequence": 4}
+        and target_envelope["pressure_budget_candidate_resident_bytes"] == 40
+        and target_envelope["pressure_budget_reduction_from_calibration_bytes"] == 30
         and target_envelope["initial_bundle_floor_bytes_by_pool"]
         == {"sequence": 30, "workspace": 4}
         and target_envelope["minimum_initial_bundle_resident_bytes"] == 34
-        and target_envelope["initial_bundle_headroom_bytes"] == 2
+        and target_envelope["initial_bundle_headroom_bytes"] == 6
+        and target_envelope["donor_evidence_kind"]
+        == "target_event_exact_receipt_only"
         and target_envelope["token_scaled_sequence_pool_ids"] == ["sequence"]
+        and target_envelope["token_scaled_sequence_growth_pool_ids"]
+        == ["sequence"]
         and target_envelope["pool_contracts"] == pool_contracts
-        and target_envelope["calibration_resident_bytes"] == 36
-        and target_envelope["bootstrap_headroom_bytes"] == 9,
+        and target_envelope["calibration_resident_bytes"] == 70
+        and target_envelope["calibration_sizing_headroom_bytes"] == 30
+        and target_envelope["bootstrap_headroom_bytes"] == 0,
         "self-test lost typed target-sizing provenance",
     )
     wider_calibration_pool = pool_snapshot(
-        {"sequence": 34, "workspace": 6}, calibration_contracts
+        {"sequence": 60, "workspace": 20}, calibration_contracts
     )
     pressure_envelope = derive_target_budget_envelope(
-        wider_calibration_pool, sizing_pool
+        wider_calibration_pool,
+        sizing_pool,
+        sizing_probe_pool,
+        probe_maintenance,
     )
     require(
-        pressure_envelope["calibration_resident_bytes"] == 40
-        and pressure_envelope["pressure_budget_candidate_resident_bytes"] == 36
-        and pressure_envelope["resident_bytes"] == 36
-        and pressure_envelope["budget_claimed_bytes"] == 136
-        and pressure_envelope["pressure_budget_reduction_from_calibration_bytes"] == 4
-        and pressure_envelope["observed_or_floor_budget_gap_bytes"] == 1
+        pressure_envelope["calibration_resident_bytes"] == 80
+        and pressure_envelope["pressure_budget_candidate_resident_bytes"] == 40
+        and pressure_envelope["resident_bytes"] == 40
+        and pressure_envelope["budget_claimed_bytes"] == 140
+        and pressure_envelope["pressure_budget_reduction_from_calibration_bytes"] == 40
+        and pressure_envelope["probe_growth_budget_gap_bytes"] == 4
         and pressure_envelope["requires_cross_pool_rebalance"] is True,
         "self-test let calibration headroom erase typed decode pressure",
     )
     require_target_pool_within_budget_contract(
-        pool_snapshot({"sequence": 32, "workspace": 4}), target_envelope, 136
+        pool_snapshot({"sequence": 34, "workspace": 6}), target_envelope, 140
     )
     prime_receipt = rebalance_prime_budget_receipt(
-        pool_snapshot({"sequence": 31, "workspace": 4}),
+        sizing_pool,
+        sizing_pool,
         target_envelope,
-        136,
+        140,
     )
+    expected_layout_receipt = require_replayed_prime_layout(sizing_pool, sizing_pool)
     require(
         prime_receipt
         == {
-            "budget_ceiling_bytes": 136,
-            "claimed_bytes": 135,
-            "headroom_bytes": 1,
-            "resident_ceiling_bytes": 36,
-            "resident_bytes": 35,
+            "budget_ceiling_bytes": 140,
+            "claimed_bytes": 140,
+            "headroom_bytes": 0,
+            "resident_ceiling_bytes": 40,
+            "resident_bytes": 40,
+            "replayed_probe_growth_bytes": 4,
+            "selected_pressure_growth_end_bytes": 4,
+            "selected_pressure_event_ordinal": 0,
+            "forced_deficit_bytes": 4,
+            "pressure_quantum_bytes": 4,
+            "replayed_prime_layout": expected_layout_receipt,
         },
         "self-test lost bounded rebalance-prime headroom evidence",
     )
+    expect_reject(
+        lambda: rebalance_prime_budget_receipt(
+            pool_snapshot({"sequence": 28, "workspace": 8}),
+            sizing_pool,
+            target_envelope,
+            140,
+        ),
+        "fresh target prime physical layout drift",
+    )
+    swapped_prime_layout = pool_snapshot({"sequence": 26, "workspace": 14})
+    expect_reject(
+        lambda: rebalance_prime_budget_receipt(
+            swapped_prime_layout,
+            sizing_pool,
+            target_envelope,
+            140,
+        ),
+        "same-total fresh target prime with swapped pool distribution",
+    )
+    target_probe_pool = pool_snapshot({"sequence": 34, "workspace": 6})
+    target_witness_summary = {
+        "allocated_bytes": 4,
+        "reclaimed_bytes": 4,
+        "growth_receipts": [
+            {
+                "stage": "sequence_extension",
+                "allocated_bytes": 4,
+                "reclaimed_bytes": 4,
+                "growths": [
+                    {
+                        "pool_id": "sequence",
+                        "chunk_identity": ["sequence", 2, 1],
+                        "chunk_bytes": 4,
+                        "published_capacity_bytes": 34,
+                    }
+                ],
+                "reclaims": [
+                    {
+                        "pool_id": "workspace",
+                        "reclaimed_bytes": 4,
+                        "chunk_identities": [["workspace", 1, 1]],
+                        "published_capacity_bytes": 6,
+                    }
+                ],
+                "event_fingerprint": "f" * 64,
+            }
+        ],
+    }
+    witness_receipt = validate_target_rebalance_witness(
+        target_witness_summary,
+        target_envelope,
+        prime_receipt,
+        sizing_pool,
+        target_probe_pool,
+    )
+    require(
+        witness_receipt["actual_growth_bytes_by_pool"] == {"sequence": 4}
+        and witness_receipt["actual_reclaimed_bytes_by_pool"] == {"workspace": 4}
+        and witness_receipt["forced_deficit_bytes"] == 4
+        and witness_receipt["qualifying_events"][0]["growth_pool_ids"]
+        == ["sequence"]
+        and witness_receipt["qualifying_events"][0]["reclaim_pool_ids"]
+        == ["workspace"],
+        "self-test lost the exact target rebalance witness",
+    )
+    prefixed_maintenance = json.loads(json.dumps(probe_maintenance))
+    prefixed_maintenance.update({"maintenance_events": 2, "maintained_events": 2, "allocated_bytes": 8})
+    prefixed_maintenance["growth_receipts"] = [
+        {
+            "stage": "step_admission",
+            "allocated_bytes": 4,
+            "reclaimed_bytes": 0,
+            "growths": [
+                {
+                    "pool_id": "workspace",
+                    "chunk_identity": ["workspace", 2, 1],
+                    "chunk_bytes": 4,
+                    "published_capacity_bytes": 14,
+                }
+            ],
+            "reclaims": [],
+            "event_fingerprint": "d" * 64,
+        },
+        {
+            "stage": "sequence_extension",
+            "allocated_bytes": 4,
+            "reclaimed_bytes": 0,
+            "growths": [
+                {
+                    "pool_id": "sequence",
+                    "chunk_identity": ["sequence", 2, 1],
+                    "chunk_bytes": 4,
+                    "published_capacity_bytes": 34,
+                }
+            ],
+            "reclaims": [],
+            "event_fingerprint": "e" * 64,
+        },
+    ]
+    prefixed_envelope = derive_target_budget_envelope(
+        calibration_pool,
+        sizing_pool,
+        pool_snapshot({"sequence": 34, "workspace": 14}),
+        prefixed_maintenance,
+    )
+    require(
+        prefixed_envelope["budget_claimed_bytes"] == 144
+        and prefixed_envelope["selected_pressure_event_ordinal"] == 1
+        and prefixed_envelope["selected_pressure_growth_end_bytes"] == 8
+        and prefixed_envelope["probe_growth_headroom_bytes"] == 4
+        and prefixed_envelope["selected_pressure_forced_deficit_bytes"] == 4,
+        "event-specific pressure budget ignored preceding growth",
+    )
+    prefixed_prime_receipt = rebalance_prime_budget_receipt(
+        sizing_pool,
+        sizing_pool,
+        prefixed_envelope,
+        144,
+    )
+    prefixed_target_summary = json.loads(json.dumps(prefixed_maintenance))
+    prefixed_target_summary.update(
+        {
+            "rebalance_events": 1,
+            "pools_reclaimed": 1,
+            "chunks_reclaimed": 1,
+            "reclaimed_bytes": 4,
+        }
+    )
+    prefixed_target_summary["growth_receipts"][1]["reclaimed_bytes"] = 4
+    prefixed_target_summary["growth_receipts"][1]["reclaims"] = [
+        {
+            "pool_id": "workspace",
+            "reclaimed_bytes": 4,
+            "chunk_identities": [["workspace", 2, 1]],
+            "published_capacity_bytes": 10,
+        }
+    ]
+    prefixed_witness = validate_target_rebalance_witness(
+        prefixed_target_summary,
+        prefixed_envelope,
+        prefixed_prime_receipt,
+        sizing_pool,
+        pool_snapshot({"sequence": 34, "workspace": 10}),
+    )
+    require(
+        prefixed_witness["qualifying_events"][0]["event_ordinal"] == 1
+        and prefixed_witness["forced_deficit_bytes"] == 4,
+        "target witness did not bind reclaim to the selected pressure event",
+    )
+    early_reclaim_summary = json.loads(json.dumps(prefixed_target_summary))
+    early_reclaim_summary["reclaimed_bytes"] = 8
+    early_reclaim_summary["growth_receipts"][0]["reclaimed_bytes"] = 4
+    early_reclaim_summary["growth_receipts"][0]["reclaims"] = [
+        {
+            "pool_id": "sequence",
+            "reclaimed_bytes": 4,
+            "chunk_identities": [["sequence", 1, 1]],
+            "published_capacity_bytes": 26,
+        }
+    ]
+    expect_reject(
+        lambda: validate_target_rebalance_witness(
+            early_reclaim_summary,
+            prefixed_envelope,
+            prefixed_prime_receipt,
+            sizing_pool,
+            pool_snapshot({"sequence": 30, "workspace": 10}),
+        ),
+        "target reclaimed headroom before the selected pressure event",
+    )
+    wrong_target_stage = json.loads(json.dumps(target_witness_summary))
+    wrong_target_stage["growth_receipts"][0]["stage"] = "step_admission"
+    expect_reject(
+        lambda: validate_target_rebalance_witness(
+            wrong_target_stage,
+            target_envelope,
+            prime_receipt,
+            sizing_pool,
+            target_probe_pool,
+        ),
+        "target reclaim not bound to sequence-extension growth",
+    )
+    same_pool_target_reclaim = json.loads(json.dumps(target_witness_summary))
+    same_pool_target_reclaim["growth_receipts"][0]["reclaims"][0]["pool_id"] = (
+        "sequence"
+    )
+    expect_reject(
+        lambda: validate_target_rebalance_witness(
+            same_pool_target_reclaim,
+            target_envelope,
+            prime_receipt,
+            sizing_pool,
+            target_probe_pool,
+        ),
+        "target event reused its growth pool as donor",
+    )
+    insufficient_target_reclaim = json.loads(json.dumps(target_witness_summary))
+    insufficient_target_reclaim["reclaimed_bytes"] = 3
+    insufficient_target_reclaim["growth_receipts"][0]["reclaimed_bytes"] = 3
+    insufficient_target_reclaim["growth_receipts"][0]["reclaims"][0][
+        "reclaimed_bytes"
+    ] = 3
+    expect_reject(
+        lambda: validate_target_rebalance_witness(
+            insufficient_target_reclaim,
+            target_envelope,
+            prime_receipt,
+            sizing_pool,
+            pool_snapshot({"sequence": 34, "workspace": 7}),
+        ),
+        "target event reclaimed less than the actual forced deficit",
+    )
+    expect_reject(
+        lambda: validate_target_rebalance_witness(
+            target_witness_summary,
+            target_envelope,
+            prime_receipt,
+            sizing_pool,
+            pool_snapshot({"sequence": 34, "workspace": 7}),
+        ),
+        "target probe snapshot broke exact growth/reclaim conservation",
+    )
     try:
         require_target_pool_within_budget_contract(
-            pool_snapshot({"sequence": 33, "workspace": 4}), target_envelope, 136
+            pool_snapshot({"sequence": 35, "workspace": 10}), target_envelope, 140
         )
         raise AssertionError("oversized global target residency unexpectedly fit its sizing envelope")
     except common.CapacityGateError:
@@ -3402,7 +4512,12 @@ def self_test() -> int:
     opaque_sizing = json.loads(json.dumps(sizing_pool))
     del opaque_sizing["pool_envelopes"]["sequence"]["contract"]
     expect_reject(
-        lambda: derive_target_budget_envelope(calibration_pool, opaque_sizing),
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            opaque_sizing,
+            sizing_probe_pool,
+            probe_maintenance,
+        ),
         "opaque target sizing pool",
     )
     coefficient_drift = json.loads(json.dumps(sizing_pool))
@@ -3410,18 +4525,211 @@ def self_test() -> int:
         "demand"
     ]["tokens"]["bytes_per_token"] = 11
     expect_reject(
-        lambda: derive_target_budget_envelope(calibration_pool, coefficient_drift),
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            coefficient_drift,
+            sizing_probe_pool,
+            probe_maintenance,
+        ),
         "phase-stable token coefficient drift",
     )
+    mixed_sequence_contracts = json.loads(json.dumps(pool_contracts))
+    mixed_sequence_contracts["sequence"]["resources"].append(
+        {
+            "resource_id": "resource/sequence-fixed",
+            "demand": {"fixed": {"bytes": 4}},
+            "lifetime": "sequence",
+            "kind": "value",
+            "physical_allocation_quantum_bytes": 4,
+            "initialization": "none",
+        }
+    )
+    mixed_calibration_contracts = json.loads(json.dumps(mixed_sequence_contracts))
+    mixed_calibration_contracts["sequence"]["resources"][0]["demand"]["tokens"][
+        "maximum_tokens"
+    ] = 3
+    mixed_calibration_contracts["sequence"]["provisioning"][
+        "maximum_resident_bytes"
+    ] = 90
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            pool_snapshot(
+                {"sequence": 50, "workspace": 20}, mixed_calibration_contracts
+            ),
+            pool_snapshot({"sequence": 30, "workspace": 10}, mixed_sequence_contracts),
+            pool_snapshot({"sequence": 34, "workspace": 10}, mixed_sequence_contracts),
+            probe_maintenance,
+        ),
+        "ambiguous mixed token/fixed sequence pool",
+    )
+    probe_contract_drift = json.loads(json.dumps(sizing_probe_pool))
+    probe_contract_drift["pool_envelopes"]["sequence"]["contract"]["resources"][0][
+        "demand"
+    ]["tokens"]["maximum_tokens"] = 11
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            sizing_pool,
+            probe_contract_drift,
+            probe_maintenance,
+        ),
+        "same-process sizing prime/probe contract drift",
+    )
+    non_sequence_growth = json.loads(json.dumps(probe_maintenance))
+    non_sequence_growth["growth_receipts"][0]["growths"][0].update(
+        {
+            "pool_id": "workspace",
+            "chunk_identity": ["workspace", 1, 1],
+            "published_capacity_bytes": 14,
+        }
+    )
+    non_sequence_probe = pool_snapshot({"sequence": 30, "workspace": 14})
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            sizing_pool,
+            non_sequence_probe,
+            non_sequence_growth,
+        ),
+        "probe without token-scaled sequence growth",
+    )
+    subquantum_maintenance = json.loads(json.dumps(probe_maintenance))
+    subquantum_maintenance["allocated_bytes"] = 3
+    subquantum_maintenance["growth_receipts"][0]["allocated_bytes"] = 3
+    subquantum_maintenance["growth_receipts"][0]["growths"][0]["chunk_bytes"] = 3
+    subquantum_maintenance["growth_receipts"][0]["growths"][0][
+        "published_capacity_bytes"
+    ] = 33
+    subquantum_probe = pool_snapshot({"sequence": 33, "workspace": 10})
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            sizing_pool,
+            subquantum_probe,
+            subquantum_maintenance,
+        ),
+        "sub-quantum persistent sequence growth",
+    )
+    misaligned_growth = json.loads(json.dumps(probe_maintenance))
+    misaligned_growth["allocated_bytes"] = 5
+    misaligned_growth["growth_receipts"][0]["allocated_bytes"] = 5
+    misaligned_growth["growth_receipts"][0]["growths"][0]["chunk_bytes"] = 5
+    misaligned_growth["growth_receipts"][0]["growths"][0][
+        "published_capacity_bytes"
+    ] = 35
+    misaligned_probe = pool_snapshot({"sequence": 35, "workspace": 10})
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            sizing_pool,
+            misaligned_probe,
+            misaligned_growth,
+        ),
+        "non-quantized sequence growth receipt",
+    )
+    split_misaligned_growth = json.loads(json.dumps(probe_maintenance))
+    split_misaligned_growth["growth_receipts"][0]["growths"] = [
+        {
+            "pool_id": "sequence",
+            "chunk_identity": ["sequence", 1, 1],
+            "chunk_bytes": 3,
+            "published_capacity_bytes": 33,
+        },
+        {
+            "pool_id": "sequence",
+            "chunk_identity": ["sequence", 2, 1],
+            "chunk_bytes": 1,
+            "published_capacity_bytes": 34,
+        },
+    ]
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            sizing_pool,
+            sizing_probe_pool,
+            split_misaligned_growth,
+        ),
+        "misaligned growth chunks hidden by an aligned aggregate",
+    )
+    mixed_event_growth = json.loads(json.dumps(probe_maintenance))
+    mixed_event_growth["allocated_bytes"] = 5
+    mixed_event_growth["growth_receipts"][0]["allocated_bytes"] = 5
+    mixed_event_growth["growth_receipts"][0]["growths"].append(
+        {
+            "pool_id": "workspace",
+            "chunk_identity": ["workspace", 2, 1],
+            "chunk_bytes": 1,
+            "published_capacity_bytes": 11,
+        }
+    )
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            sizing_pool,
+            pool_snapshot({"sequence": 34, "workspace": 11}),
+            mixed_event_growth,
+        ),
+        "sequence pressure event with unattributed pool growth",
+    )
+    sizing_rebalanced = json.loads(json.dumps(probe_maintenance))
+    sizing_rebalanced.update(
+        {
+            "rebalance_events": 1,
+            "pools_reclaimed": 1,
+            "chunks_reclaimed": 1,
+            "reclaimed_bytes": 4,
+        }
+    )
+    sizing_rebalanced["growth_receipts"][0]["reclaimed_bytes"] = 4
+    sizing_rebalanced["growth_receipts"][0]["reclaims"] = [
+        {
+            "pool_id": "workspace",
+            "reclaimed_bytes": 4,
+            "chunk_identities": [["workspace", 1, 1]],
+            "published_capacity_bytes": 6,
+        }
+    ]
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            sizing_pool,
+            pool_snapshot({"sequence": 34, "workspace": 6}),
+            sizing_rebalanced,
+        ),
+        "sizing probe contaminated by cross-pool rebalance",
+    )
+    low_prime = pool_snapshot({"sequence": 24, "workspace": 6})
+    low_prime_probe = pool_snapshot({"sequence": 28, "workspace": 6})
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            calibration_pool,
+            low_prime,
+            low_prime_probe,
+            probe_maintenance,
+        ),
+        "initial floor consumed the full observed growth",
+    )
+    undersized_calibration = pool_snapshot(
+        {"sequence": 30, "workspace": 9}, calibration_contracts
+    )
+    expect_reject(
+        lambda: derive_target_budget_envelope(
+            undersized_calibration,
+            sizing_pool,
+            sizing_probe_pool,
+            probe_maintenance,
+        ),
+        "sizing workload larger than calibration",
+    )
     target_bound_drift = json.loads(
-        json.dumps(pool_snapshot({"sequence": 32, "workspace": 4}))
+        json.dumps(pool_snapshot({"sequence": 34, "workspace": 6}))
     )
     target_bound_drift["pool_envelopes"]["sequence"]["contract"]["resources"][0][
         "demand"
     ]["tokens"]["maximum_tokens"] = 11
     expect_reject(
         lambda: require_target_pool_within_budget_contract(
-            target_bound_drift, target_envelope, 136
+            target_bound_drift, target_envelope, 140
         ),
         "target runtime-bound contract drift",
     )
@@ -4058,6 +5366,24 @@ def self_test() -> int:
                 "stage": "step_admission",
                 "coordinator_id": 7,
                 "capacity_epoch": 18,
+                "allocated_bytes": 32,
+                "reclaimed_bytes": 64,
+                "growths": [
+                    {
+                        "pool_id": growth_pool_id,
+                        "chunk_identity": [growth_pool_id, 2, 3],
+                        "chunk_bytes": 32,
+                        "published_capacity_bytes": 32,
+                    }
+                ],
+                "reclaims": [
+                    {
+                        "pool_id": donor_pool_id,
+                        "reclaimed_bytes": 64,
+                        "chunk_identities": [[donor_pool_id, 1, 2]],
+                        "published_capacity_bytes": 128,
+                    }
+                ],
                 "growth_chunk_identities": [[growth_pool_id, 2, 3]],
                 "participant_identities": [
                     ["run.self-test", "request.self-test", 0, 1]
@@ -4066,6 +5392,18 @@ def self_test() -> int:
             }
         ],
         "self-test lost the exact growth, participant, or event identity",
+    )
+    same_pool_growth_reclaim = json.loads(json.dumps(rebalance_rows))
+    same_pool_growth = same_pool_growth_reclaim[-1]["attributes"][
+        "maintenance_evidence"
+    ]["receipt"]["growths"][0]
+    same_pool_growth["pool_id"] = donor_pool_id
+    same_pool_growth["chunk"]["pool_id"] = donor_pool_id
+    expect_reject(
+        lambda: validate_rebalance_trace(
+            same_pool_growth_reclaim, started_wall_ns=80, finished_wall_ns=89
+        ),
+        "same-event growth and reclaim from one pool",
     )
     prefill_substitution = json.loads(json.dumps(rebalance_rows))
     prefill_substitution[-1]["phase"] = PREFILL_MAINTENANCE_PHASE
