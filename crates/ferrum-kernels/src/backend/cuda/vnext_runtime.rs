@@ -20,17 +20,19 @@ use ferrum_interfaces::vnext::{
     DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
     DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
-    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeWorkAttribution,
-    DeviceReplayedLogicalCommandAttribution, DeviceReplayedSegmentAttribution,
-    DeviceReusableAddressScope, DeviceReusableExecutionCapture, DeviceReusableExecutionInvocation,
-    DeviceReusableExecutionObservation, DeviceReusableExecutionPlan,
-    DeviceReusableExecutionPreparation, DeviceReusableExecutionProgram,
-    DeviceReusableExecutionProgramGapReason, DeviceReusableExecutionTrim, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionStage, DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt,
-    DeviceTimingMeasurement, DeviceTimingMode, DeviceTimingUnavailableReason,
-    DisabledDeviceSubmissionTimingSink, DynamicStorageProfile, ElementType, FenceIndeterminate,
-    FenceQuery, HostTransferLayout, ProgramBindingNodeBinding, StreamState, VNextError,
+    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
+    DeviceNativeWorkAttribution, DeviceReplayedLogicalCommandAttribution,
+    DeviceReplayedSegmentAttribution, DeviceReusableAddressScope, DeviceReusableExecutionCapture,
+    DeviceReusableExecutionInvocation, DeviceReusableExecutionObservation,
+    DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionProgram, DeviceReusableExecutionProgramGapReason,
+    DeviceReusableExecutionTrim, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
+    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    ProgramBindingNodeBinding, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
+    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::AttentionExecutionPolicy;
 
@@ -1096,7 +1098,7 @@ impl CudaDeviceCommand {
         DeviceReplayedLogicalCommandAttribution::new(
             logical_command_ordinal,
             node_index,
-            self.operation,
+            DeviceNativeOperationId::new(self.operation)?,
             self.batching_form,
             self.participant_count,
             self.token_count,
@@ -1233,11 +1235,17 @@ fn cuda_submission_attribution(
         .map(|(command_index, command)| {
             let command_index = u32::try_from(command_index)
                 .map_err(|_| CudaDeviceRuntimeError::contract("CUDA command index exceeds u32"))?;
+            let native_op_id =
+                DeviceNativeOperationId::new(command.operation).ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA command attribution has a non-portable native operation identity",
+                    )
+                })?;
             DeviceNativeWorkAttribution::with_participant_range(
                 command_index,
                 command_node_indices[command_index as usize],
                 command_phases[command_index as usize],
-                command.operation,
+                native_op_id,
                 execution_paths[command_index as usize],
                 command.batching_form,
                 command.participant_start,
@@ -1972,7 +1980,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let regions = vec![source_region, destination_region];
         Ok(CudaDeviceCommand::transfer(
             self.runtime_instance,
-            "device copy",
+            DEVICE_COPY_NATIVE_OPERATION_ID.as_str(),
             regions,
             Vec::new(),
             Box::new(|stream, _blas, regions, _host_storage| {
@@ -2018,7 +2026,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let host_storage = vec![source.to_vec().into_boxed_slice()];
         Ok(CudaDeviceCommand::transfer(
             self.runtime_instance,
-            "host upload",
+            HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
             vec![destination_region],
             host_storage,
             Box::new(|stream, _blas, regions, host_storage| {
@@ -2050,7 +2058,7 @@ impl DeviceRuntime for CudaDeviceRuntime {
         let destination_region = destination.region(destination_offset_bytes..destination_end)?;
         Ok(CudaDeviceCommand::transfer(
             self.runtime_instance,
-            "device zero",
+            DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
             vec![destination_region],
             Vec::new(),
             Box::new(|stream, _blas, regions, _host_storage| {
@@ -2965,7 +2973,7 @@ mod tests {
         let zero = || {
             CudaDeviceCommand::transfer(
                 1,
-                "device zero",
+                DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
                 Vec::new(),
                 Vec::new(),
                 Box::new(|_, _, _, _| Ok(())),
@@ -3012,5 +3020,24 @@ mod tests {
             .with_work_attribution(DeviceBatchingForm::Scalar, 1, 1, 0, 0)
             .unwrap_err();
         assert!(error.to_string().contains("no participants or native work"));
+    }
+
+    #[test]
+    fn cuda_work_attribution_rejects_non_portable_native_operation_identity() {
+        let invalid = command("human readable label")
+            .with_work_attribution(DeviceBatchingForm::Scalar, 1, 1, 1, 0)
+            .unwrap();
+        let error = cuda_submission_attribution(
+            &[DeviceCommandPhase::Compute],
+            &[Some(0)],
+            &[invalid],
+            &[DeviceExecutionPath::Eager],
+            Some(&[None]),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-portable native operation identity"));
     }
 }

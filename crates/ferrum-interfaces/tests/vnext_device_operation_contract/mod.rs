@@ -1447,7 +1447,8 @@ fn test_submission_attribution(
                 command_index,
                 entry.node_index(),
                 entry.phase(),
-                native_op_id,
+                DeviceNativeOperationId::new(native_op_id)
+                    .ok_or(TestRuntimeError("non-portable test native attribution"))?,
                 execution_path,
                 batching_form,
                 participant_start,
@@ -1469,7 +1470,7 @@ fn test_submission_attribution(
                             .segment()
                             .start_node_index()
                             .checked_add(ordinal)?,
-                        "test_replayed_logical_command",
+                        DeviceNativeOperationId::new("test_replayed_logical_command").unwrap(),
                         DeviceBatchingForm::ParticipantLoop,
                         invocation.participant_count(),
                         invocation.token_count(),

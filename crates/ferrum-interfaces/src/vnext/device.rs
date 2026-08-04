@@ -2402,6 +2402,63 @@ pub enum DeviceCommandPhase {
     ResultBinding,
 }
 
+/// Stable machine identity for backend-native work attribution.
+///
+/// This identity is emitted into replay, determinism, and profile artifacts,
+/// so it must remain portable across filesystems and analysis tools. Human
+/// display labels belong in backend errors rather than this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct DeviceNativeOperationId(&'static str);
+
+impl DeviceNativeOperationId {
+    pub const MAX_BYTES: usize = 256;
+
+    pub const fn new(value: &'static str) -> Option<Self> {
+        let bytes = value.as_bytes();
+        if bytes.is_empty() || bytes.len() > Self::MAX_BYTES {
+            return None;
+        }
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if !matches!(
+                byte,
+                b'a'..=b'z'
+                    | b'A'..=b'Z'
+                    | b'0'..=b'9'
+                    | b'.'
+                    | b'_'
+                    | b':'
+                    | b'/'
+                    | b'-'
+            ) {
+                return None;
+            }
+            index += 1;
+        }
+        Some(Self(value))
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        self.0
+    }
+
+    const fn built_in(value: &'static str) -> Self {
+        match Self::new(value) {
+            Some(identity) => identity,
+            None => panic!("built-in native operation identity must be portable"),
+        }
+    }
+}
+
+pub const DEVICE_COPY_NATIVE_OPERATION_ID: DeviceNativeOperationId =
+    DeviceNativeOperationId::built_in("device.copy");
+pub const HOST_UPLOAD_NATIVE_OPERATION_ID: DeviceNativeOperationId =
+    DeviceNativeOperationId::built_in("host.upload");
+pub const DEVICE_ZERO_NATIVE_OPERATION_ID: DeviceNativeOperationId =
+    DeviceNativeOperationId::built_in("device.zero");
+
 /// Backend-observed physical work for one core-owned command entry.
 ///
 /// Rows are created only when core explicitly requests attribution. The node
@@ -2413,7 +2470,7 @@ pub struct DeviceNativeWorkAttribution {
     command_index: u32,
     node_index: Option<u32>,
     command_phase: DeviceCommandPhase,
-    native_op_id: &'static str,
+    native_op_id: DeviceNativeOperationId,
     execution_path: DeviceExecutionPath,
     batching_form: DeviceBatchingForm,
     participant_start: u32,
@@ -2430,7 +2487,7 @@ impl DeviceNativeWorkAttribution {
         command_index: u32,
         node_index: Option<u32>,
         command_phase: DeviceCommandPhase,
-        native_op_id: &'static str,
+        native_op_id: DeviceNativeOperationId,
         execution_path: DeviceExecutionPath,
         batching_form: DeviceBatchingForm,
         participant_count: u32,
@@ -2460,7 +2517,7 @@ impl DeviceNativeWorkAttribution {
         command_index: u32,
         node_index: Option<u32>,
         command_phase: DeviceCommandPhase,
-        native_op_id: &'static str,
+        native_op_id: DeviceNativeOperationId,
         execution_path: DeviceExecutionPath,
         batching_form: DeviceBatchingForm,
         participant_start: u32,
@@ -2470,8 +2527,7 @@ impl DeviceNativeWorkAttribution {
         transfer_command_count: u64,
         reusable_graph_node_count: Option<u64>,
     ) -> Option<Self> {
-        if native_op_id.is_empty()
-            || (compute_dispatch_count == 0 && transfer_command_count == 0)
+        if (compute_dispatch_count == 0 && transfer_command_count == 0)
             || (node_index.is_some() && participant_count == 0)
             || participant_start.checked_add(participant_count).is_none()
             || (node_index.is_none() && participant_start != 0)
@@ -2509,7 +2565,7 @@ impl DeviceNativeWorkAttribution {
     }
 
     pub const fn native_op_id(&self) -> &'static str {
-        self.native_op_id
+        self.native_op_id.as_str()
     }
 
     pub const fn execution_path(&self) -> DeviceExecutionPath {
@@ -2562,7 +2618,7 @@ impl DeviceNativeWorkAttribution {
 pub struct DeviceReplayedLogicalCommandAttribution {
     logical_command_ordinal: u32,
     node_index: u32,
-    native_op_id: &'static str,
+    native_op_id: DeviceNativeOperationId,
     batching_form: DeviceBatchingForm,
     participant_count: u32,
     token_count: u64,
@@ -2576,7 +2632,7 @@ impl DeviceReplayedLogicalCommandAttribution {
     pub fn new(
         logical_command_ordinal: u32,
         node_index: u32,
-        native_op_id: &'static str,
+        native_op_id: DeviceNativeOperationId,
         batching_form: DeviceBatchingForm,
         participant_count: u32,
         token_count: u64,
@@ -2584,8 +2640,7 @@ impl DeviceReplayedLogicalCommandAttribution {
         transfer_command_count: u64,
         reusable_graph_node_count: u64,
     ) -> Option<Self> {
-        if native_op_id.is_empty()
-            || participant_count == 0
+        if participant_count == 0
             || (compute_dispatch_count == 0 && transfer_command_count == 0)
             || reusable_graph_node_count == 0
         {
@@ -2613,7 +2668,7 @@ impl DeviceReplayedLogicalCommandAttribution {
     }
 
     pub const fn native_op_id(&self) -> &'static str {
-        self.native_op_id
+        self.native_op_id.as_str()
     }
 
     pub const fn batching_form(&self) -> DeviceBatchingForm {
@@ -3454,6 +3509,23 @@ mod execution_timing_tests {
     };
 
     #[test]
+    fn native_operation_identity_is_portable_and_bounded() {
+        let identity = DeviceNativeOperationId::new("cuda.op_1:variant/path-name").unwrap();
+        assert_eq!(identity.as_str(), "cuda.op_1:variant/path-name");
+        assert!(DeviceNativeOperationId::new("").is_none());
+        assert!(DeviceNativeOperationId::new("device zero").is_none());
+        assert!(DeviceNativeOperationId::new("native.操作").is_none());
+        let oversized = Box::leak(
+            "x".repeat(DeviceNativeOperationId::MAX_BYTES + 1)
+                .into_boxed_str(),
+        );
+        assert!(DeviceNativeOperationId::new(oversized).is_none());
+        assert_eq!(DEVICE_COPY_NATIVE_OPERATION_ID.as_str(), "device.copy");
+        assert_eq!(HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(), "host.upload");
+        assert_eq!(DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(), "device.zero");
+    }
+
+    #[test]
     fn timing_capabilities_are_independent_from_compute_path_requirement() {
         assert!(DeviceTimingMode::Replay.completion_enabled());
         assert!(DeviceTimingMode::Replay.physical_span_attribution_enabled());
@@ -3711,7 +3783,7 @@ mod execution_timing_tests {
                 0,
                 Some(0),
                 DeviceCommandPhase::Compute,
-                "test.compute",
+                DeviceNativeOperationId::new("test.compute").unwrap(),
                 execution_path,
                 DeviceBatchingForm::Scalar,
                 1,
@@ -3737,7 +3809,7 @@ mod execution_timing_tests {
             3,
             Some(7),
             DeviceCommandPhase::Initialization,
-            "test.restore",
+            DeviceNativeOperationId::new("test.restore").unwrap(),
             DeviceExecutionPath::Eager,
             DeviceBatchingForm::Scalar,
             2,
@@ -3755,7 +3827,7 @@ mod execution_timing_tests {
             3,
             Some(7),
             DeviceCommandPhase::Initialization,
-            "test.restore",
+            DeviceNativeOperationId::new("test.restore").unwrap(),
             DeviceExecutionPath::Eager,
             DeviceBatchingForm::Scalar,
             u32::MAX,
@@ -3800,7 +3872,7 @@ mod execution_timing_tests {
             0,
             Some(node_index),
             DeviceCommandPhase::Compute,
-            "vnext_reusable_execution",
+            DeviceNativeOperationId::new("vnext_reusable_execution").unwrap(),
             execution_path,
             DeviceBatchingForm::ParticipantLoop,
             2,
@@ -3820,7 +3892,7 @@ mod execution_timing_tests {
         DeviceReplayedLogicalCommandAttribution::new(
             ordinal,
             node_index,
-            "test.logical.compute",
+            DeviceNativeOperationId::new("test.logical.compute").unwrap(),
             DeviceBatchingForm::ParticipantLoop,
             2,
             3,
@@ -3865,7 +3937,7 @@ mod execution_timing_tests {
         assert!(DeviceReplayedLogicalCommandAttribution::new(
             0,
             4,
-            "test.logical.compute",
+            DeviceNativeOperationId::new("test.logical.compute").unwrap(),
             DeviceBatchingForm::ParticipantLoop,
             2,
             3,

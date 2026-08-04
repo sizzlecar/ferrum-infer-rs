@@ -20,12 +20,14 @@ use ferrum_interfaces::vnext::{
     DeviceCommandExecutionTiming, DeviceCommandLogicalWork, DeviceCommandPhase,
     DeviceComputePathRequirement, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
     DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionTiming, DeviceId,
-    DeviceNativeWorkAttribution, DeviceRuntime, DeviceSubmissionAttribution,
-    DeviceSubmissionExecutionTiming, DeviceSubmissionStage, DeviceSubmissionTimingSink,
-    DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
-    DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink, DynamicStorageProfile,
-    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, RetainedHostMemoryRegion,
-    StaticWeightImportSession, StreamState, VNextError, WeightComponentPayload,
+    DeviceNativeOperationId, DeviceNativeWorkAttribution, DeviceRuntime,
+    DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
+    DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
+    DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
+    RetainedHostMemoryRegion, StaticWeightImportSession, StreamState, VNextError,
+    WeightComponentPayload, DEVICE_COPY_NATIVE_OPERATION_ID, DEVICE_ZERO_NATIVE_OPERATION_ID,
+    HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use metal::foreign_types::ForeignType;
 use metal::objc::runtime::{Object, BOOL, YES};
@@ -1748,6 +1750,16 @@ impl MetalDeviceRuntime {
                 ),
             ));
         }
+        if entries
+            .iter()
+            .any(|(_, _, command)| DeviceNativeOperationId::new(command.operation).is_none())
+        {
+            return Err(DefinitelyNotSubmitted::new(
+                MetalDeviceRuntimeError::contract(
+                    "Metal command batch has a non-portable native operation identity",
+                ),
+            ));
+        }
         if let Err(error) = stream.state.begin_submission() {
             return Err(DefinitelyNotSubmitted::new(error));
         }
@@ -1803,7 +1815,8 @@ impl MetalDeviceRuntime {
                     command_index,
                     *node_index,
                     *phase,
-                    command.operation,
+                    DeviceNativeOperationId::new(command.operation)
+                        .expect("Metal command identity was validated before submission"),
                     DeviceExecutionPath::Eager,
                     command.batching_form,
                     command.participant_start,
@@ -1997,7 +2010,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         )?;
         Ok(MetalDeviceCommand::transfer(
             self.runtime_instance,
-            "device copy",
+            DEVICE_COPY_NATIVE_OPERATION_ID.as_str(),
             vec![source_region, destination_region],
             Vec::new(),
             Box::new(|encoder, regions, _staging| {
@@ -2052,7 +2065,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         );
         Ok(MetalDeviceCommand::transfer(
             self.runtime_instance,
-            "host upload",
+            HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
             vec![destination_region],
             vec![staging],
             Box::new(|encoder, regions, staging| {
@@ -2091,7 +2104,7 @@ impl DeviceRuntime for MetalDeviceRuntime {
         let destination_region = destination.region(destination_offset_bytes..destination_end)?;
         Ok(MetalDeviceCommand::transfer(
             self.runtime_instance,
-            "device zero",
+            DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
             vec![destination_region],
             Vec::new(),
             Box::new(|encoder, regions, _staging| {
@@ -2696,7 +2709,10 @@ mod tests {
         assert_eq!(command.command_index(), 0);
         assert_eq!(command.node_index(), Some(0));
         assert_eq!(command.command_phase(), DeviceCommandPhase::Compute);
-        assert_eq!(command.native_op_id(), "device zero");
+        assert_eq!(
+            command.native_op_id(),
+            DEVICE_ZERO_NATIVE_OPERATION_ID.as_str()
+        );
         assert_eq!(command.execution_path(), DeviceExecutionPath::Eager);
         assert_eq!(command.batching_form(), DeviceBatchingForm::Packed);
         assert_eq!(command.participant_count(), 2);

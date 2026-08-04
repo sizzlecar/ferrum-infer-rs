@@ -9,10 +9,11 @@ use ferrum_interfaces::vnext::{
     BufferDescriptor, CapabilityId, CopyRegion, DefinitelyNotSubmitted, DeviceAllocationPermit,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
     DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
-    DeviceErrorReport, DeviceExecutionPath, DeviceNativeWorkAttribution, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMode,
-    ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState, VNextError,
-    DENSE_LINEAR_F16_CAPABILITY_ID,
+    DeviceErrorReport, DeviceExecutionPath, DeviceNativeOperationId, DeviceNativeWorkAttribution,
+    DeviceRuntime, DeviceSubmissionAttribution, DeviceTerminal, DeviceTerminalReceipt,
+    DeviceTimingMode, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout, StreamState,
+    VNextError, DENSE_LINEAR_F16_CAPABILITY_ID, DEVICE_COPY_NATIVE_OPERATION_ID,
+    DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use half::f16;
 
@@ -311,11 +312,16 @@ impl ReferenceDeviceCommand {
         node_index: Option<u32>,
         phase: DeviceCommandPhase,
     ) -> Result<DeviceNativeWorkAttribution, ReferenceDeviceRuntimeError> {
+        let native_op_id = DeviceNativeOperationId::new(self.operation).ok_or_else(|| {
+            ReferenceDeviceRuntimeError::contract(
+                "reference command attribution has a non-portable native operation identity",
+            )
+        })?;
         DeviceNativeWorkAttribution::with_participant_range(
             command_index,
             node_index,
             phase,
-            self.operation,
+            native_op_id,
             DeviceExecutionPath::Eager,
             self.batching_form,
             self.participant_start,
@@ -647,7 +653,7 @@ impl DeviceRuntime for ReferenceDeviceRuntime {
                 ..region.destination_offset_bytes() + region.length_bytes(),
         )?;
         Ok(ReferenceDeviceCommand::transfer(
-            "device copy",
+            DEVICE_COPY_NATIVE_OPERATION_ID.as_str(),
             ReferenceCommandKind::Copy {
                 source,
                 destination,
@@ -680,7 +686,7 @@ impl DeviceRuntime for ReferenceDeviceRuntime {
             })?;
         let destination = destination.region(destination_offset_bytes..end)?;
         Ok(ReferenceDeviceCommand::transfer(
-            "device upload",
+            HOST_UPLOAD_NATIVE_OPERATION_ID.as_str(),
             ReferenceCommandKind::Upload {
                 source: source.to_vec().into_boxed_slice(),
                 destination,
@@ -701,7 +707,7 @@ impl DeviceRuntime for ReferenceDeviceRuntime {
             })?;
         let destination = destination.region(destination_offset_bytes..end)?;
         Ok(ReferenceDeviceCommand::transfer(
-            "device zero",
+            DEVICE_ZERO_NATIVE_OPERATION_ID.as_str(),
             ReferenceCommandKind::Zero { destination },
         ))
     }
