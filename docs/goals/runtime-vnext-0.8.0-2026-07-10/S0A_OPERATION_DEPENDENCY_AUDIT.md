@@ -14,7 +14,7 @@ same scan rejects references from operation owners to model-owned root symbols.
 
 ## Ownership
 
-The former 4,734-line operation monolith is split into 21 production owners:
+The former 4,734-line operation monolith is split into 22 production owners:
 
 | Layer | Owners | Responsibility |
 |---|---|---|
@@ -22,7 +22,7 @@ The former 4,734-line operation monolith is split into 21 production owners:
 | Weight ABI | `weight_contract`, `resolved_value`, `buffer_view` | Provider-visible physical weight identity, resolved storage, and checked physical views |
 | Provider planning | `descriptor`, `provider`, `catalog`, `registry` | Operation contracts, provider semantics, capability catalog, selection, and runtime binding |
 | Submission identity | `compiled_identity`, `identity`, `invocation`, `dispatch_contract` | Immutable compiled identity, batch participants, invocations, and submission policy |
-| Execution evidence | `determinism`, `determinism_artifact`, `workspace_encoding`, `dispatch`, `compiled_submission_wave` | Replay witnesses, workspace encoding, device dispatch, and compiled-wave evidence |
+| Execution evidence | `determinism`, `determinism_artifact`, `backing_upload`, `workspace_encoding`, `dispatch`, `compiled_submission_wave` | Replay witnesses, logical-backing uploads, workspace encoding, device dispatch, and compiled-wave evidence |
 
 The physical weight ABI belongs to `weight_contract`, not `model`. Model-owned `WeightSchema`
 performs schema-to-binding construction and implements the operation-owned logical-validation
@@ -46,27 +46,33 @@ validate and construct the same public `ResolvedWeightBinding` API.
 
 ## Current Graph
 
-The current graph contains 21 owners and 79 directed dependency edges. Every strongly connected
+The current graph contains 22 owners and 84 directed dependency edges. Every strongly connected
 component is a singleton; multi-owner SCC count and diagnostic count are both zero. A valid
 dependencies-first order is:
 
 ```text
 foundation -> semantic -> attribute -> storage_profile -> tensor_contract -> weight_contract
 -> resolved_value -> buffer_view -> descriptor -> provider -> catalog -> compiled_identity
--> identity -> dispatch_contract -> invocation -> registry -> determinism
+-> identity -> dispatch_contract -> backing_upload -> invocation -> registry -> determinism
 -> determinism_artifact -> workspace_encoding -> dispatch -> compiled_submission_wave
 ```
 
-`operation.rs` is 101 physical lines. The largest production owner is `dispatch.rs` at 2,311
+`operation.rs` is 102 physical lines. The largest production owner is `dispatch.rs` at 2,409
 physical lines, below the S0A 2,500-line limit. No production owner uses `include!` or a wildcard
 parent import.
+
+`backing_upload` owns the complete checked translation from one logical backing range to one or
+more physical upload commands. `dispatch` consumes that private helper; the helper depends only on
+device/resource contracts plus `dispatch_contract`, `foundation`, and `storage_profile`, so it does
+not depend back on the dispatch orchestrator.
 
 ## Validation
 
 The focused pre-checkpoint evidence for the final ownership change is:
 
 ```text
-VNEXT OWNER DEPENDENCY GRAPH PASS: groups=4 owners=75 edges=286 scc=0 diagnostics=0
+VNEXT OWNER DEPENDENCY GRAPH PASS: groups=4 owners=78 edges=300 scc=0 diagnostics=0
+backing-upload determinism focused tests: 4 passed; 0 failed
 owner dependency graph unit tests: 6 passed; 0 failed
 weight/model/provider/execution/static-initialization focused tests: 46 passed; 0 failed
 resolved-weight boundary negative test: 1 passed; 0 failed

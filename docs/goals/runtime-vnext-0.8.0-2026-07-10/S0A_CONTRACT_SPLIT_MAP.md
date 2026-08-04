@@ -4,7 +4,7 @@
 
 S0A now covers four production contract groups: `resource`, `execution`, `event`, and
 `operation`, plus the root `static_initialization.rs` composition owner. The four domain groups
-contain 77 production owners and 297 importer-to-owner edges. The syntax-tree graph reports zero
+contain 78 production owners and 300 importer-to-owner edges. The syntax-tree graph reports zero
 multi-owner strongly connected components and zero diagnostics; the composition owner is bounded
 and identity-checked separately because it intentionally joins otherwise independent domains.
 
@@ -61,8 +61,8 @@ Current maxima before the clean aggregate gate are:
 
 | Category | Largest file | Physical lines | Limit |
 |---|---|---:|---:|
-| Facade | `operation.rs` | 101 | 500 |
-| Production owner | `resource/dynamic_pool.rs` | 2,383 | 2,500 |
+| Facade | `operation.rs` | 102 | 500 |
+| Production owner | `operation/dispatch.rs` | 2,409 | 2,500 |
 | Test/support owner | `tests/vnext_device_operation_contract/mod.rs` | 1,839 | 2,000 |
 
 The final gate recomputes these values from the committed tree. These are ownership and
@@ -126,7 +126,7 @@ Detailed rationale is in `S0A_EVENT_DEPENDENCY_AUDIT.md`.
 
 ### Operation
 
-Operation has 21 owners and 79 edges. It owns semantic operation contracts, storage and tensor
+Operation has 22 owners and 84 edges. It owns semantic operation contracts, storage and tensor
 geometry, provider-visible physical weight ABI, provider planning, compiled identity, invocation,
 dispatch, replay/determinism evidence, and compiled submission waves.
 
@@ -135,7 +135,7 @@ Valid dependencies-first order:
 ```text
 foundation -> semantic -> attribute -> storage_profile -> tensor_contract -> weight_contract
 -> resolved_value -> buffer_view -> descriptor -> provider -> catalog -> compiled_identity
--> identity -> dispatch_contract -> invocation -> registry -> determinism
+-> identity -> dispatch_contract -> backing_upload -> invocation -> registry -> determinism
 -> determinism_artifact -> workspace_encoding -> dispatch -> compiled_submission_wave
 ```
 
