@@ -109,6 +109,7 @@ SHARED_TEST_SUPPORT = [
     "crates/ferrum-interfaces/tests/vnext_resource_contract/support.rs",
     "crates/ferrum-interfaces/tests/vnext_core_contract/mod.rs",
     "crates/ferrum-interfaces/tests/vnext_device_operation_contract/mod.rs",
+    "crates/ferrum-interfaces/tests/vnext_device_operation_contract/driver.rs",
     "crates/ferrum-interfaces/tests/vnext_device_operation_contract/planning.rs",
     "crates/ferrum-interfaces/tests/vnext_device_operation_wave_contract/mod.rs",
     "crates/ferrum-interfaces/tests/vnext_event_contract/mod.rs",
@@ -1189,7 +1190,7 @@ def build_gate(g00f_path: Path, output_root: Path) -> str:
 
 def self_test() -> int:
     require(sum(len(targets) for targets in TEST_TARGET_GROUPS.values()) == 28, "S0A target matrix drifted")
-    require(len(SHARED_TEST_SUPPORT) == 12, "S0A shared test support matrix drifted")
+    require(len(SHARED_TEST_SUPPORT) == 13, "S0A shared test support matrix drifted")
     require(
         set(PRODUCTION_GROUPS) == {"resource", "execution", "event", "operation"},
         "S0A production scope drifted",
