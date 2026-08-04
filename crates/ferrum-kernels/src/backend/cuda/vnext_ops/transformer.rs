@@ -540,6 +540,7 @@ pub(super) fn provider_descriptor(
     let estimator_fingerprint = implementation_fingerprint(&[
         include_str!("transformer.rs").as_bytes(),
         estimator_id.as_bytes(),
+        provider_fingerprint.as_bytes(),
     ]);
     OperationProviderDescriptor::new(
         ProviderId::new(provider_id).map_err(contract_error)?,

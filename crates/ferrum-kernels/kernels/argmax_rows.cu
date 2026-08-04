@@ -188,3 +188,105 @@ extern "C" __global__ void argmax_rows_f16_masked(
         }
     }
 }
+
+// vNext selection preserves the semantic logits value. When a repetition
+// penalty is active, one block first creates a private penalized row in the
+// invocation-scoped scratch supplied by the provider contract. The common
+// no-penalty path reads logits directly and performs no scratch traffic.
+extern "C" __global__ void last_token_masked_argmax_preserving_logits_f16(
+    const __half* __restrict__ logits,
+    __half* __restrict__ scratch,
+    int n,
+    const signed char* __restrict__ valid,
+    int mask_len,
+    const unsigned int* __restrict__ repetition_offsets,
+    const unsigned int* __restrict__ repetition_token_ids,
+    const float* __restrict__ repetition_penalty,
+    int repetition_capacity,
+    int* __restrict__ out_idx
+) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    unsigned int repetition_start = min(repetition_offsets[0], (unsigned int)repetition_capacity);
+    unsigned int repetition_end = min(repetition_offsets[1], (unsigned int)repetition_capacity);
+    const float penalty = repetition_penalty[0];
+    const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
+    const __half* selection_logits = logits;
+
+    if (apply_penalty) {
+        for (int token = tid; token < n; token += block_size) {
+            scratch[token] = logits[token];
+        }
+        __syncthreads();
+        for (unsigned int entry = repetition_start + tid;
+             entry < repetition_end;
+             entry += block_size) {
+            const unsigned int token = repetition_token_ids[entry];
+            if (token >= (unsigned int)n) {
+                continue;
+            }
+            float value = __half2float(scratch[token]);
+            if (!isfinite(value)) {
+                continue;
+            }
+            scratch[token] = __float2half_rn(value > 0.0f ? value / penalty : value * penalty);
+        }
+        __syncthreads();
+        selection_logits = scratch;
+    }
+
+    float local_max = -INFINITY;
+    int local_idx = -1;
+    for (int token = tid; token < n; token += block_size) {
+        if (token >= mask_len || valid[token] == 0) {
+            continue;
+        }
+        const float value = __half2float(selection_logits[token]);
+        if (!isfinite(value)) {
+            continue;
+        }
+        if (local_idx < 0 || value > local_max || (value == local_max && token < local_idx)) {
+            local_max = value;
+            local_idx = token;
+        }
+    }
+
+    const unsigned mask = 0xFFFFFFFFu;
+    for (int offset = 16; offset > 0; offset /= 2) {
+        const float other_max = __shfl_xor_sync(mask, local_max, offset);
+        const int other_idx = __shfl_xor_sync(mask, local_idx, offset);
+        if (other_idx >= 0 && (local_idx < 0 || other_max > local_max ||
+                              (other_max == local_max && other_idx < local_idx))) {
+            local_max = other_max;
+            local_idx = other_idx;
+        }
+    }
+
+    __shared__ float shared_max[32];
+    __shared__ int shared_idx[32];
+    const int warp_id = tid / 32;
+    const int lane = tid % 32;
+    if (lane == 0) {
+        shared_max[warp_id] = local_max;
+        shared_idx[warp_id] = local_idx;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        const int num_warps = (block_size + 31) / 32;
+        local_max = lane < num_warps ? shared_max[lane] : -INFINITY;
+        local_idx = lane < num_warps ? shared_idx[lane] : -1;
+        for (int offset = 16; offset > 0; offset /= 2) {
+            const float other_max = __shfl_xor_sync(mask, local_max, offset);
+            const int other_idx = __shfl_xor_sync(mask, local_idx, offset);
+            if (other_idx >= 0 && (local_idx < 0 || other_max > local_max ||
+                                  (other_max == local_max && other_idx < local_idx))) {
+                local_max = other_max;
+                local_idx = other_idx;
+            }
+        }
+        if (lane == 0) {
+            out_idx[0] = local_idx;
+        }
+    }
+}

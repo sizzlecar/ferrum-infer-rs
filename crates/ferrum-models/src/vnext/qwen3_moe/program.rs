@@ -220,7 +220,7 @@ pub(super) fn build_semantic_program(
     nodes.push(ProgramNode {
         id: node_id("node.greedy_token")?,
         operation_id: operation_id(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
-        required_version: ContractVersion::new(2, 0),
+        required_version: ContractVersion::new(3, 0),
         work: ProgramNodeWorkSpec::Fixed,
         inputs: vec![
             logits.clone(),

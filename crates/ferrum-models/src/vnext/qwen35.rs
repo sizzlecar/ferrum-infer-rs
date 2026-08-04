@@ -865,7 +865,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         nodes.push(ProgramNode {
             id: node_id("node.greedy_token")?,
             operation_id: operation_id(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
-            required_version: ContractVersion::new(2, 0),
+            required_version: ContractVersion::new(3, 0),
             work: ProgramNodeWorkSpec::Fixed,
             inputs: vec![
                 logits.clone(),
@@ -4103,6 +4103,7 @@ mod tests {
             .iter()
             .find(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
             .unwrap();
+        assert_eq!(greedy.required_version, ContractVersion::new(3, 0));
         assert_eq!(
             greedy
                 .inputs

@@ -353,16 +353,16 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
 /// Selects one token from a final-position F16 logits row after applying an
 /// exact per-vocabulary validity mask and an optional sparse repetition
 /// penalty. Selection policy is carried by typed inputs so it remains visible
-/// to planning and cannot be hidden in backend flags.
+/// to planning and cannot be hidden in backend flags. Semantic logits remain
+/// immutable; providers use invocation-scoped scratch for any penalized view.
 ///
 /// The repetition token ids are unique and occupy
 /// `offsets[0]..offsets[1]` within the fixed-capacity input. A penalty of `1.0`
-/// or an empty range leaves logits unchanged. Backends apply any non-trivial
-/// penalty to logits in place before masked argmax.
+/// or an empty range leaves logits unchanged.
 pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
         id: OperationId::new(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
-        version: ContractVersion::new(2, 0),
+        version: ContractVersion::new(3, 0),
         inputs: vec![
             contiguous_tensor(
                 vec![
@@ -370,7 +370,7 @@ pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, 
                     DimensionConstraint::Symbol("vocab_size".to_owned()),
                 ],
                 [ElementType::F16],
-                TensorAccess::ReadWrite,
+                TensorAccess::Read,
             )?,
             contiguous_tensor(
                 vec![DimensionConstraint::Symbol("vocab_size".to_owned())],
@@ -403,14 +403,14 @@ pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, 
         attributes: AttributeSchema::new(BTreeMap::from([unsigned_attribute("vocab_size")?]))?,
         resources: ResourceRequirements {
             minimum_value_alignment_bytes: 16,
-            scratch: ResourcePresenceRequirement::Forbidden,
+            scratch: ResourcePresenceRequirement::Required,
             binding: ResourcePresenceRequirement::Forbidden,
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: OracleSpec::Exact,
         provider: provider_requirement(
             LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
-            ContractVersion::new(2, 0),
+            ContractVersion::new(3, 0),
         )?,
         profile_phase: ProfilePhase::Forward,
     };
@@ -1228,9 +1228,21 @@ mod tests {
             descriptor.id.as_str(),
             LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
         );
-        assert_eq!(descriptor.version, ContractVersion::new(2, 0));
+        assert_eq!(descriptor.version, ContractVersion::new(3, 0));
         assert_eq!(descriptor.inputs.len(), 5);
-        assert_eq!(descriptor.inputs[0].access(), TensorAccess::ReadWrite);
+        assert_eq!(descriptor.inputs[0].access(), TensorAccess::Read);
+        assert_eq!(
+            descriptor.resources.scratch,
+            ResourcePresenceRequirement::Required
+        );
+        assert_eq!(
+            descriptor.resources.binding,
+            ResourcePresenceRequirement::Forbidden
+        );
+        assert_eq!(
+            descriptor.resources.persistent,
+            ResourcePresenceRequirement::Forbidden
+        );
         assert_eq!(
             descriptor.inputs[1].element_types(),
             &BTreeSet::from([ElementType::U8])
