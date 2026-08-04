@@ -388,9 +388,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
-        reusable_attention_topology(&request, self.attention_policy)
-            .map(ReusableExecutionTopology::Dynamic)
-            .map_err(invalid_plan)
+        reusable_attention_topology(&request, self.attention_policy).map_err(invalid_plan)
     }
 
     fn encode_selected(
@@ -658,7 +656,7 @@ impl CausalAttentionReplayTopology {
 fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
     attention_policy: AttentionExecutionPolicy,
-) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
+) -> Result<ReusableExecutionTopology, String> {
     if request.operation_id().as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID {
         return Err("CUDA causal topology received another operation".to_owned());
     }
@@ -698,7 +696,7 @@ fn reusable_attention_topology_from_rows<I>(
     shape: CausalAttentionShape,
     row_count: usize,
     rows: I,
-) -> Result<DeviceReusableExecutionTopologyFingerprint, String>
+) -> Result<ReusableExecutionTopology, String>
 where
     I: IntoIterator<Item = Result<CausalAttentionTopologyRow, String>>,
 {
@@ -712,6 +710,7 @@ where
     digest.update((row_count as u64).to_le_bytes());
     let mut observed_rows = 0_usize;
     let mut total_tokens = 0_u64;
+    let mut partition_stable = true;
     for row in rows {
         let row = row?;
         observed_rows = observed_rows
@@ -727,6 +726,7 @@ where
             row.sequence_tokens,
         )?;
         let topology = CausalAttentionReplayTopology::new(shape, path, row.sequence_tokens)?;
+        partition_stable &= topology.is_partition_stable();
         let envelope = topology.envelope();
         digest.update(row.active_tokens.to_le_bytes());
         digest.update(path.replay_id().to_le_bytes());
@@ -737,9 +737,12 @@ where
     if observed_rows != row_count {
         return Err("CUDA causal topology participant count changed while hashing".to_owned());
     }
+    if !partition_stable {
+        return Ok(ReusableExecutionTopology::EagerBoundary);
+    }
     digest.update(total_tokens.to_le_bytes());
-    Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
-        digest.finalize().into(),
+    Ok(ReusableExecutionTopology::Dynamic(
+        DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
     ))
 }
 
@@ -3519,23 +3522,67 @@ mod tests {
     #[test]
     fn reusable_topology_changes_only_at_native_decode_partitions() {
         let shape = goal_shape(16, 2, 256, 4_096);
-        let topology = |sequence_tokens| {
-            reusable_attention_topology_from_rows(
-                AttentionExecutionPolicy::NativeAdaptive,
-                shape,
-                1,
-                std::iter::once(Ok(CausalAttentionTopologyRow {
-                    active_tokens: 1,
-                    sequence_tokens,
-                })),
-            )
-            .unwrap()
+        let topology = |sequence_tokens| match reusable_attention_topology_from_rows(
+            AttentionExecutionPolicy::NativeAdaptive,
+            shape,
+            1,
+            std::iter::once(Ok(CausalAttentionTopologyRow {
+                active_tokens: 1,
+                sequence_tokens,
+            })),
+        )
+        .unwrap()
+        {
+            ReusableExecutionTopology::Dynamic(fingerprint) => fingerprint,
+            topology => panic!("decode topology must be replayable, got {topology:?}"),
         };
 
         assert_ne!(topology(512), topology(513));
         assert_eq!(topology(784), topology(785));
         assert_eq!(topology(513), topology(1_024));
         assert_ne!(topology(1_024), topology(1_025));
+    }
+
+    #[cfg(feature = "vllm-paged-attn-v2")]
+    #[test]
+    fn exact_shape_attention_paths_are_explicit_eager_boundaries() {
+        let shape = goal_shape(16, 2, 256, 4_096);
+        let topology = |rows: &[(u64, u64)]| {
+            reusable_attention_topology_from_rows(
+                AttentionExecutionPolicy::NativeAdaptive,
+                shape,
+                rows.len(),
+                rows.iter().map(|&(active_tokens, sequence_tokens)| {
+                    Ok(CausalAttentionTopologyRow {
+                        active_tokens,
+                        sequence_tokens,
+                    })
+                }),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            topology(&[(8, 64)]),
+            ReusableExecutionTopology::EagerBoundary
+        );
+        assert_eq!(
+            topology(&[(1, 64), (8, 64)]),
+            ReusableExecutionTopology::EagerBoundary
+        );
+        assert_eq!(
+            reusable_attention_topology_from_rows(
+                AttentionExecutionPolicy::Portable,
+                shape,
+                1,
+                std::iter::once(Ok(CausalAttentionTopologyRow {
+                    active_tokens: 1,
+                    sequence_tokens: 64,
+                })),
+            )
+            .unwrap(),
+            ReusableExecutionTopology::EagerBoundary
+        );
     }
 
     #[test]
