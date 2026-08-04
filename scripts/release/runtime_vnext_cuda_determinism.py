@@ -1239,7 +1239,6 @@ def validate_location(value: Any, label: str) -> dict[str, Any]:
     kind = text(extent.get("kind"), f"{label}.extent.kind")
     if kind == "fixed":
         exact_object(extent, VALUE_EXTENT_FIXED_FIELDS, f"{label}.extent")
-        maximum_length = declared
     elif kind == "immediate_token_span":
         exact_object(extent, VALUE_EXTENT_TOKEN_FIELDS, f"{label}.extent")
         bytes_per_token = integer(
@@ -1248,7 +1247,14 @@ def validate_location(value: Any, label: str) -> dict[str, Any]:
         maximum_tokens = integer(
             extent["maximum_tokens"], f"{label}.extent.maximum_tokens", minimum=1
         )
-        maximum_length = bytes_per_token * maximum_tokens
+        require(
+            declared % bytes_per_token == 0,
+            f"{label}.extent does not divide the declared location into whole tokens",
+        )
+        require(
+            bytes_per_token * maximum_tokens <= (1 << 64) - 1,
+            f"{label}.extent maximum token span overflows u64",
+        )
     elif kind == "active_token_prefix":
         exact_object(extent, VALUE_EXTENT_STATE_FIELDS, f"{label}.extent")
         bytes_per_token = integer(
@@ -1266,13 +1272,12 @@ def validate_location(value: Any, label: str) -> dict[str, Any]:
             bytes_per_token * maximum_tokens <= maximum_storage,
             f"{label}.extent token capacity exceeds maximum storage",
         )
-        maximum_length = maximum_storage
+        require(
+            maximum_storage >= declared,
+            f"{label}.extent is smaller than its declared location",
+        )
     else:
         raise DeterminismArtifactError(f"{label}.extent.kind is invalid")
-    require(
-        maximum_length >= declared,
-        f"{label}.extent is smaller than its declared location",
-    )
     return location
 
 
@@ -4404,6 +4409,22 @@ def run_self_test() -> None:
             )
             == plan_ordered_nodes,
             "plan-ordered node validation reordered the execution topology",
+        )
+        immediate_span_location = selftest_location(
+            M1_MODEL,
+            "primary",
+            kind="output",
+            index=0,
+        )
+        immediate_span_location["declared_length_bytes"] = 64
+        immediate_span_location["extent"] = {
+            "kind": "immediate_token_span",
+            "bytes_per_token": 4,
+            "maximum_tokens": 4,
+        }
+        validate_location(
+            immediate_span_location,
+            "self-test immediate token span",
         )
 
         focused = Path(temporary) / "focused"
