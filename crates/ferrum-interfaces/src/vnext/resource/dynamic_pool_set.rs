@@ -15,29 +15,62 @@ use super::{
     DynamicBackingClaimResidency, DynamicBackingClaimScope, DynamicBackingDeferralReason,
     DynamicBackingDeferred, DynamicBackingPackingEnvelope, DynamicBackingPool,
     DynamicBackingPoolId, DynamicBackingPoolState, DynamicChunkQuarantineReason,
-    DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec, DynamicPoolGrowthBatchReceipt,
-    DynamicPoolGrowthIntent, DynamicPoolGrowthReceipt, DynamicPoolIdleReclaim,
-    DynamicPoolLiveOccupancyStatus, DynamicPoolMaintenanceBoundaryChunk,
-    DynamicPoolMaintenanceBoundaryPool, DynamicPoolMaintenanceBoundaryReceipt,
-    DynamicPoolRebalanceReceipt, DynamicResourceShape, DynamicStorageView, EvaluatedBackingRequest,
-    ExecutionLane, FreeExtentIndex, IdleChunkReclaimCandidate, InvocationLivenessMode,
-    LaneBackingPrepareDecision, LaneStableArenaEntry, LaneStableArenaEvictionCandidate,
-    LaneStableArenaLane, LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
-    LogicalAdmissionCoordinator, LogicalBackingBufferView, LogicalBackingSegmentBinding,
-    LogicalBackingSliceAllocationEvidence, LogicalBackingSliceAuthority,
-    LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard, PlanNode,
-    PlannedDynamicGrowth, PreparedBackingClaim, PreparedBackingExtent, PreparedLaneBackingClaim,
-    ProgramBindingLayout, QuarantinedDynamicChunk, RequestStateHazardCoordinator,
-    ResidentChunkBacking, ResidentChunkState, ResourceId, ResourceReservation,
-    ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Sha256, StateInitialization,
-    StaticProvisioningBinding, StepResourceSlotKind, SubmissionWaveDomainCapacityLayout,
-    SubmissionWaveDomainLayout, TransactionId, VNextError,
+    DynamicDeviceCapacityBlocked, DynamicPoolDomainSpec, DynamicPoolGrowthIntent,
+    DynamicPoolGrowthReceipt, DynamicPoolIdleReclaim, DynamicPoolLiveOccupancyStatus,
+    DynamicPoolMaintenanceBoundaryChunk, DynamicPoolMaintenanceBoundaryPool,
+    DynamicPoolMaintenanceBoundaryReceipt, DynamicPoolRebalanceReceipt, DynamicResourceShape,
+    DynamicStorageView, EvaluatedBackingRequest, ExecutionLane, FreeExtentIndex,
+    IdleChunkReclaimCandidate, InvocationLivenessMode, LaneBackingPrepareDecision,
+    LaneStableArenaEntry, LaneStableArenaEvictionCandidate, LaneStableArenaLane,
+    LaneStableArenaSlot, LaneStableArenaSlotLease, LaneStableArenaState,
+    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, LogicalBackingBufferView,
+    LogicalBackingSegmentBinding, LogicalBackingSliceAllocationEvidence,
+    LogicalBackingSliceAuthority, LogicalBackingSliceEvidence, Mutex, Ordering, PendingGrowthGuard,
+    PlanNode, PlannedDynamicGrowth, PreparedBackingClaim, PreparedBackingExtent,
+    PreparedLaneBackingClaim, ProgramBindingLayout, QuarantinedDynamicChunk,
+    RequestStateHazardCoordinator, ResidentChunkBacking, ResidentChunkState, ResourceId,
+    ResourceReservation, ResourceRetentionPolicy, ResourceTransactionIdentity, RunId, Serialize,
+    Sha256, StateInitialization, StaticProvisioningBinding, StepResourceSlotKind,
+    SubmissionWaveDomainCapacityLayout, SubmissionWaveDomainLayout, TransactionId, VNextError,
     DYNAMIC_POOL_MAINTENANCE_BOUNDARY_SCHEMA_VERSION, NEXT_DYNAMIC_POOL_INSTANCE_ID,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DynamicPoolResidentPressure, ReusableExecutionBucketId,
     ReusableExecutionMemoryPlan,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DynamicPoolGrowthBatchReceipt {
+    pub(super) coordinator_id: LogicalAdmissionCoordinatorId,
+    pub(super) growths: Vec<DynamicPoolGrowthReceipt>,
+    pub(super) capacity_epoch: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) rebalance: Option<DynamicPoolRebalanceReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) maintenance_boundary: Option<DynamicPoolMaintenanceBoundaryReceipt>,
+}
+
+impl DynamicPoolGrowthBatchReceipt {
+    pub const fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
+        self.coordinator_id
+    }
+
+    pub fn growths(&self) -> &[DynamicPoolGrowthReceipt] {
+        &self.growths
+    }
+
+    pub const fn capacity_epoch(&self) -> u64 {
+        self.capacity_epoch
+    }
+
+    pub const fn rebalance(&self) -> Option<&DynamicPoolRebalanceReceipt> {
+        self.rebalance.as_ref()
+    }
+
+    pub const fn maintenance_boundary(&self) -> Option<&DynamicPoolMaintenanceBoundaryReceipt> {
+        self.maintenance_boundary.as_ref()
+    }
+}
 
 pub(in crate::vnext::resource) struct DynamicPoolSet<R>
 where
