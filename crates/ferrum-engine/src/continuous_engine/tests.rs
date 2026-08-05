@@ -3790,6 +3790,11 @@ async fn plan_runtime_pressure_keeps_owner_identity_across_two_physical_releases
     assert_eq!(second_transaction.kind(), PressureYieldKind::SelfRecompute);
     assert_eq!(second_transaction.progress_owner_id(), &progress_owner_id);
     assert_eq!(second_transaction.victim_request_id(), &progress_owner_id);
+    assert_eq!(
+        second_transaction.progress_baseline(),
+        first_transaction.progress_baseline(),
+        "one pressure episode must retain its original logical progress baseline"
+    );
 
     assert!(!engine
         .inner
@@ -3856,6 +3861,21 @@ async fn plan_runtime_pressure_keeps_owner_identity_across_two_physical_releases
         Some(&serde_json::json!(progress_owner_id))
     );
     assert_eq!(completions[1].request_id, progress_owner_id.to_string());
+    let holds = profile_events
+        .iter()
+        .filter(|event| event.phase == "vnext.execution_capacity_pressure_hold_active")
+        .collect::<Vec<_>>();
+    assert_eq!(holds.len(), 1);
+    assert_eq!(holds[0].request_id, held_peer_id.to_string());
+    assert_eq!(
+        holds[0].shape.get("progress_owner_id"),
+        Some(&serde_json::json!(progress_owner_id))
+    );
+    assert_eq!(
+        holds[0].shape.get("hold_transition_ordinal"),
+        completions[0].shape.get("release_transition_ordinal")
+    );
+    assert!(holds[0].shape["waiting_ticket"].as_u64().is_some());
     let _ = std::fs::remove_file(trace_path);
 }
 

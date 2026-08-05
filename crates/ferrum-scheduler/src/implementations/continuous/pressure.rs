@@ -988,17 +988,20 @@ impl PressureCoordinator {
                 .episodes
                 .get_mut(&episode_id)
                 .expect("opened pressure episode remains registered");
-            let progress_baseline = episode
+            let progress_current = episode
                 .participants
                 .get(&owner_id)
                 .expect("selected progress owner remains registered")
                 .progress;
             episode.handoff_generation = episode.handoff_generation.saturating_add(1);
             episode.state = PressureEpisodeState::YieldPlanned;
-            if episode.progress_owner.is_none() {
+            let progress_baseline = if episode.progress_owner.is_none() {
                 episode.progress_owner = Some(owner_id.clone());
-                episode.owner_progress_baseline = progress_baseline;
-            }
+                episode.owner_progress_baseline = progress_current;
+                progress_current
+            } else {
+                episode.owner_progress_baseline
+            };
             episode.last_transaction_victim = Some(victim_id.clone());
             episode.owner_admission_pending_ordinal = None;
             episode.last_release_condition = Some(condition.clone());

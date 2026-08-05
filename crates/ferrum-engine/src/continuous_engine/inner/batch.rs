@@ -1510,6 +1510,63 @@ impl EngineInner {
             ]),
             None,
         );
+        if let Some(hold) = completion.installed_hold() {
+            self.write_scheduler_trace_event(serde_json::json!({
+                "event": "scheduler_pressure_hold_installed",
+                "episode_id": hold.episode_id().get(),
+                "transition_ordinal": hold.transition_ordinal().get(),
+                "victim_request_id": hold.request_id(),
+                "progress_owner_id": hold.progress_owner_id(),
+                "progress_baseline": hold.progress_baseline().get(),
+                "progress_current": hold.progress_current().get(),
+                "waiting_ticket": hold.waiting_ticket(),
+                "scheduler": self.scheduler.trace_snapshot(),
+            }));
+            self.write_executor_scheduler_profile_event(
+                hold.request_id(),
+                "vnext.execution_capacity_pressure_hold_active",
+                ProfileEventKind::Instant,
+                ProfileStatus::Ok,
+                None,
+                BTreeMap::from([
+                    (
+                        "decision".to_string(),
+                        serde_json::json!("held_for_owner_progress"),
+                    ),
+                    (
+                        "episode_id".to_string(),
+                        serde_json::json!(hold.episode_id().get()),
+                    ),
+                    (
+                        "hold_transition_ordinal".to_string(),
+                        serde_json::json!(hold.transition_ordinal().get()),
+                    ),
+                    (
+                        "waiting_ticket".to_string(),
+                        serde_json::json!(hold.waiting_ticket()),
+                    ),
+                    (
+                        "progress_owner_id".to_string(),
+                        serde_json::json!(hold.progress_owner_id()),
+                    ),
+                    (
+                        "progress_baseline".to_string(),
+                        serde_json::json!(hold.progress_baseline().get()),
+                    ),
+                    (
+                        "progress_current".to_string(),
+                        serde_json::json!(hold.progress_current().get()),
+                    ),
+                    (
+                        "prefill_submit_observed".to_string(),
+                        serde_json::json!(false),
+                    ),
+                    ("probe_performed".to_string(), serde_json::json!(false)),
+                ]),
+                BTreeMap::new(),
+                None,
+            );
+        }
         if moved {
             self.total_preemptions.fetch_add(1, Ordering::Relaxed);
             counter!("ferrum.engine.preemptions_total").increment(1);
