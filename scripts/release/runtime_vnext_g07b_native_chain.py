@@ -25,7 +25,7 @@ import bounded_command
 import validate_runtime_vnext_g07b_native_chain as independent_validator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = independent_validator.SCHEMA_VERSION
 ARTIFACT_FEATURES = (
     "cuda",
     "vllm-marlin",

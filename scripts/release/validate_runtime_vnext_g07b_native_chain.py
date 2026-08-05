@@ -1358,6 +1358,30 @@ def verify_artifact_index(root: Path, manifest: dict[str, Any]) -> None:
     require(expected == collect_artifact_index(root), "artifact directory index mismatch")
 
 
+def verify_lane_plan(lane_plan: dict[str, Any], source: dict[str, Any]) -> None:
+    require(
+        lane_plan.get("schema_version") == SCHEMA_VERSION,
+        "lane plan schema mismatch",
+    )
+    require(lane_plan.get("lane") == "runtime-vnext-g07b-native-chain", "lane identity mismatch")
+    require(lane_plan.get("source") == source, "lane plan source identity mismatch")
+    require(
+        isinstance(lane_plan.get("expected_runtime_seconds"), int)
+        and lane_plan["expected_runtime_seconds"] > 0,
+        "lane expected runtime is invalid",
+    )
+    require(
+        isinstance(lane_plan.get("hard_deadline_seconds"), int)
+        and lane_plan["hard_deadline_seconds"] >= lane_plan["expected_runtime_seconds"],
+        "lane hard deadline is invalid",
+    )
+    for field in ("hard_stop", "correctness_gate", "performance_command", "progress_signal"):
+        require(
+            isinstance(lane_plan.get(field), str) and lane_plan[field].strip(),
+            f"lane plan {field} is missing",
+        )
+
+
 def verify_source(root: Path, source_root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     source = require_dict(manifest.get("source"), "manifest.source")
     require(source == read_json(root / "source.json", "source identity"), "source identity copies differ")
@@ -1382,24 +1406,7 @@ def verify_source(root: Path, source_root: Path, manifest: dict[str, Any]) -> di
     require(not actual["status_short"], f"verification source is dirty: {actual['status_short']}")
     require(actual == source, "artifact source differs from the verification checkout")
     lane_plan = require_dict(read_json(root / "lane-plan.json", "lane plan"), "lane plan")
-    require(lane_plan.get("schema_version") == 1, "lane plan schema mismatch")
-    require(lane_plan.get("lane") == "runtime-vnext-g07b-native-chain", "lane identity mismatch")
-    require(lane_plan.get("source") == source, "lane plan source identity mismatch")
-    require(
-        isinstance(lane_plan.get("expected_runtime_seconds"), int)
-        and lane_plan["expected_runtime_seconds"] > 0,
-        "lane expected runtime is invalid",
-    )
-    require(
-        isinstance(lane_plan.get("hard_deadline_seconds"), int)
-        and lane_plan["hard_deadline_seconds"] >= lane_plan["expected_runtime_seconds"],
-        "lane hard deadline is invalid",
-    )
-    for field in ("hard_stop", "correctness_gate", "performance_command", "progress_signal"):
-        require(
-            isinstance(lane_plan.get(field), str) and lane_plan[field].strip(),
-            f"lane plan {field} is missing",
-        )
+    verify_lane_plan(lane_plan, source)
     return source
 
 
@@ -1418,15 +1425,11 @@ def verify_hardware(root: Path, manifest: dict[str, Any]) -> None:
         require_sha(row.get("sha256"), f"hardware.tools.{name}.sha256")
 
 
-def verify_step(root: Path, step_id: str) -> None:
-    step_root = root / "steps" / step_id
-    require(step_root.is_dir() and not step_root.is_symlink(), f"step is missing: {step_id}")
-    plan = require_dict(read_json(step_root / "plan.json", f"{step_id} plan"), f"{step_id} plan")
-    receipt = require_dict(
-        read_json(step_root / "bounded.receipt.json", f"{step_id} receipt"),
-        f"{step_id} receipt",
+def verify_step_plan(plan: dict[str, Any], step_id: str) -> tuple[list[str], int]:
+    require(
+        plan.get("schema_version") == SCHEMA_VERSION and plan.get("step_id") == step_id,
+        f"{step_id} plan identity mismatch",
     )
-    require(plan.get("schema_version") == 1 and plan.get("step_id") == step_id, f"{step_id} plan identity mismatch")
     command = plan.get("command")
     require(
         isinstance(command, list)
@@ -1448,6 +1451,18 @@ def verify_step(root: Path, step_id: str) -> None:
         and bool(plan["progress_signal"].strip()),
         f"{step_id} progress signal is missing",
     )
+    return command, deadline
+
+
+def verify_step(root: Path, step_id: str) -> None:
+    step_root = root / "steps" / step_id
+    require(step_root.is_dir() and not step_root.is_symlink(), f"step is missing: {step_id}")
+    plan = require_dict(read_json(step_root / "plan.json", f"{step_id} plan"), f"{step_id} plan")
+    receipt = require_dict(
+        read_json(step_root / "bounded.receipt.json", f"{step_id} receipt"),
+        f"{step_id} receipt",
+    )
+    command, deadline = verify_step_plan(plan, step_id)
     require(receipt.get("schema") == RECEIPT_SCHEMA, f"{step_id} receipt schema mismatch")
     require(
         receipt.get("command") == command and receipt.get("cwd") == plan.get("cwd"),
@@ -2376,6 +2391,46 @@ def expect_reject(action: Any, label: str) -> None:
 def self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="g07b-native-chain-validator-") as temporary:
         root = Path(temporary)
+        source = {
+            "git_sha": "0" * 40,
+            "git_tree_sha": "1" * 40,
+            "dirty": False,
+            "status_short": [],
+        }
+        lane_plan = {
+            "schema_version": SCHEMA_VERSION,
+            "lane": "runtime-vnext-g07b-native-chain",
+            "source": source,
+            "expected_runtime_seconds": 1,
+            "hard_deadline_seconds": 1,
+            "hard_stop": "first failure",
+            "correctness_gate": "catalog identity",
+            "performance_command": "not applicable",
+            "progress_signal": "bounded receipts",
+        }
+        verify_lane_plan(lane_plan, source)
+        legacy_lane_plan = copy.deepcopy(lane_plan)
+        legacy_lane_plan["schema_version"] = SCHEMA_VERSION - 1
+        expect_reject(
+            lambda: verify_lane_plan(legacy_lane_plan, source),
+            "legacy lane plan schema",
+        )
+        step_plan = {
+            "schema_version": SCHEMA_VERSION,
+            "step_id": "builder-build",
+            "command": ["cargo", "build"],
+            "cwd": "/workspace/ferrum",
+            "expected_duration_seconds": 1,
+            "hard_deadline_seconds": 1,
+            "progress_signal": "Cargo log growth",
+        }
+        verify_step_plan(step_plan, "builder-build")
+        legacy_step_plan = copy.deepcopy(step_plan)
+        legacy_step_plan["schema_version"] = SCHEMA_VERSION - 1
+        expect_reject(
+            lambda: verify_step_plan(legacy_step_plan, "builder-build"),
+            "legacy step plan schema",
+        )
         summary_root = root / "build-summary"
         summary_path = summary_root / "artifact-build-summary.receipt.json"
         summary_path.parent.mkdir(parents=True)
