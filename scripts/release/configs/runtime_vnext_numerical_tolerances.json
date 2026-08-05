@@ -1369,8 +1369,8 @@
       "oracle_precision": "fp32",
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
-      "review_commit": "4877ef05ee21ef50021a077ee1766d53c1583635",
-      "row_fingerprint": "fb20cdae81a0bf57dd749fd1dba78e40eb6906e87110121fe5d58b008fc3f0b2",
+      "review_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
+      "row_fingerprint": "095e6029a0519332788a47ecdc23838b5c622f2ac90ac94de48f661911b0fe18",
       "shape_domain": {
         "dimensions": {
           "head_dim": 256,
@@ -1393,7 +1393,7 @@
           "rope_theta": "10000000"
         }
       },
-      "source_commit": "4877ef05ee21ef50021a077ee1766d53c1583635",
+      "source_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-attention.v2.layer.fp16.gguf-q4-k-m.tokens-24"
     },
     {
@@ -1428,8 +1428,8 @@
       "oracle_precision": "fp32",
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
-      "review_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
-      "row_fingerprint": "c25f0a0eaf8b2f2cca29ebe19e7a327fa0381961e79d80c6f9fa2138c26b4649",
+      "review_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
+      "row_fingerprint": "6906953548d5e14ccb1904a9180000c5f22c6ba2e7f28bd7b6d6954746b6030c",
       "shape_domain": {
         "dimensions": {
           "hidden_size": 2560,
@@ -1446,7 +1446,7 @@
           "quantized_embedding_is_model_input": true
         }
       },
-      "source_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
+      "source_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-model.v1.full-model.fp16.gguf-q4-k-m.tokens-24"
     },
     {
@@ -1481,8 +1481,8 @@
       "oracle_precision": "fp32",
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
-      "review_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
-      "row_fingerprint": "e0d537c3e3a9003bd7c0c41a791b0de59b05a82d99ad8c0f3b915e41bb5eb5f8",
+      "review_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
+      "row_fingerprint": "119fcb27a6472f99c6b36783461ecba2eb6aeb1cfaee40426cae3045cca386f1",
       "shape_domain": {
         "dimensions": {
           "vocabulary_size": 248320
@@ -1496,7 +1496,7 @@
           "tied_embedding_lm_head": true
         }
       },
-      "source_commit": "812a66b219196eee16206f3a7ffaf4f37865b632",
+      "source_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-vocab-logits.v1.full-vocab-logits.fp16.gguf-q4-k-m.tokens-24"
     },
     {
@@ -1532,8 +1532,8 @@
       "oracle_precision": "fp32",
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
-      "review_commit": "578650cca7a06869ee7d33aa0a05d40c66a02729",
-      "row_fingerprint": "f86fefac404f6b7feadbfaa2b0b8e28bc6eeba0d2df759e929250104b0f67f9c",
+      "review_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
+      "row_fingerprint": "ae0486f82d29754f6f54ce2eecfa7fda81a2e6c1f46893431132326896666dcb",
       "shape_domain": {
         "dimensions": {
           "hidden_size": 2560,
@@ -1548,7 +1548,7 @@
           "value_head_mapping": "interleaved_by_key_head"
         }
       },
-      "source_commit": "578650cca7a06869ee7d33aa0a05d40c66a02729",
+      "source_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v4.layer.fp16.gguf-q4-k-m.tokens-24"
     },
     {
@@ -1583,8 +1583,8 @@
       "oracle_precision": "fp32",
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
-      "review_commit": "97880cf75a15fc692e81e4939b15fa49520c6999",
-      "row_fingerprint": "355cc85fee6fd44f36f330ea809fc41e8e714d0115d83526da12ac06a8b37726",
+      "review_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
+      "row_fingerprint": "b3c715515f4d02caf01961949623c7362b4487e1a1b75c4573737f752f6415c3",
       "shape_domain": {
         "dimensions": {
           "hidden_size": 2560,
@@ -1599,7 +1599,7 @@
           "value_head_mapping": "interleaved_by_key_head"
         }
       },
-      "source_commit": "578650cca7a06869ee7d33aa0a05d40c66a02729",
+      "source_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v5.layer.fp16.gguf-q4-k-m.tokens-24"
     },
     {
@@ -1634,8 +1634,8 @@
       "oracle_precision": "fp32",
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
-      "review_commit": "883ee9e0ed73cd5ed0578410e19fad9840c39532",
-      "row_fingerprint": "39a4bf4077c5e17ab7bfe3153906ac80e881c03507bff6751c6e564f5ee33ae7",
+      "review_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
+      "row_fingerprint": "1f6dd1c4f8b9a091f21b7c102dae6d61448db4086c9b7999a544878f0d28a293",
       "shape_domain": {
         "dimensions": {
           "hidden_size": 2560,
@@ -1650,7 +1650,7 @@
           "value_head_mapping": "interleaved_by_key_head"
         }
       },
-      "source_commit": "578650cca7a06869ee7d33aa0a05d40c66a02729",
+      "source_commit": "37a3add3baaecb825aa133f5298ed763feeaa916",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v6.layer.fp16.gguf-q4-k-m.tokens-24"
     },
     {
