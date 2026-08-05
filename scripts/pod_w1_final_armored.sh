@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq && apt-get install -y -qq git curl python3-pip pkg-config libssl-dev cmake >/dev/null 2>&1
 if ! command -v cargo >/dev/null; then
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable >/dev/null 2>&1
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.0 >/dev/null 2>&1
 fi
 . "$HOME/.cargo/env"
 mkdir -p ~/.cargo

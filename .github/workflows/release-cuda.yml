@@ -53,7 +53,7 @@ jobs:
           apt-get update
           apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file libnccl2 libnccl-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+            | sh -s -- -y --profile minimal --default-toolchain 1.91.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4

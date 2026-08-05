@@ -531,7 +531,7 @@ if [[ -z "$DATASET" ]]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
-export PATH=/root/.cargo/bin:/root/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin:$PATH
+export PATH=/root/.cargo/bin:/root/.rustup/toolchains/1.91.0-x86_64-unknown-linux-gnu/bin:$PATH
 export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 export HF_XET_HIGH_PERFORMANCE="${HF_XET_HIGH_PERFORMANCE:-1}"
 export RUST_BACKTRACE=1
@@ -578,13 +578,13 @@ nvidia-smi > "$ART/hardware/nvidia_smi_before.txt" 2>&1 || true
 log bootstrap_start
 if ! command -v rustup >/dev/null 2>&1; then
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > "$ART/logs/rustup-init.sh"
-  sh "$ART/logs/rustup-init.sh" -y --default-toolchain 1.96.0 \
+  sh "$ART/logs/rustup-init.sh" -y --default-toolchain 1.91.0 \
     > "$ART/logs/rustup-install.log" 2>&1
 else
-  rustup toolchain install 1.96.0 > "$ART/logs/rustup-toolchain.log" 2>&1 || true
-  rustup default 1.96.0 > "$ART/logs/rustup-default.log" 2>&1 || true
+  rustup toolchain install 1.91.0 > "$ART/logs/rustup-toolchain.log" 2>&1 || true
+  rustup default 1.91.0 > "$ART/logs/rustup-default.log" 2>&1 || true
 fi
-export PATH=/root/.cargo/bin:/root/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/bin:$PATH
+export PATH=/root/.cargo/bin:/root/.rustup/toolchains/1.91.0-x86_64-unknown-linux-gnu/bin:$PATH
 python3 -m pip install -q --upgrade huggingface_hub hf_xet > "$ART/logs/pip-hf.log" 2>&1 || true
 rustc --version > "$ART/env/rustc.txt" 2>&1 || true
 cargo --version > "$ART/env/cargo.txt" 2>&1 || true

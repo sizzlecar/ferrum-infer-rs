@@ -123,8 +123,8 @@ fi
 # ────────────────────────────────────────────────────────────────────────
 section "2. Rust toolchain"
 if ! command -v cargo >/dev/null 2>&1; then
-    record 'Installing rustup (stable)...'
-    run_logged "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal" \
+    record 'Installing rustup (1.91.0)...'
+    run_logged "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.0 --profile minimal" \
         || fail 'rustup install failed'
     # shellcheck source=/dev/null
     . "$HOME/.cargo/env"
