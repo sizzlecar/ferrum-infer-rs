@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "artifact_type": "runtime_vnext_g07a_build_iteration_policy",
   "repeats": 5,
   "sentinel_suffix": "\n// ferrum-runtime-vnext-g07a-sentinel-v1\n",
@@ -54,6 +54,7 @@
     "default_source_policy": "cache-only",
     "features": "cuda,vllm-moe-marlin,vllm-paged-attn-v2",
     "incremental_profile": "cuda-correctness",
+    "no_content_touch_input": "crates/ferrum-models/src/lib.rs",
     "nvcc_threads": 4,
     "official_release_profile": "release"
   },

@@ -24,7 +24,7 @@ POLICY_PATH = (
     REPO_ROOT
     / "scripts/release/configs/runtime_vnext_g07a_build_iteration.json"
 )
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
 MAX_JSON_BYTES = 64 * 1024 * 1024
@@ -314,6 +314,7 @@ def load_policy(path: Path) -> dict[str, Any]:
             "default_source_policy",
             "features",
             "incremental_profile",
+            "no_content_touch_input",
             "nvcc_threads",
             "official_release_profile",
         }
@@ -325,6 +326,8 @@ def load_policy(path: Path) -> dict[str, Any]:
         and product.get("features")
         == "cuda,vllm-moe-marlin,vllm-paged-attn-v2"
         and product.get("incremental_profile") == "cuda-correctness"
+        and product.get("no_content_touch_input")
+        == "crates/ferrum-models/src/lib.rs"
         and product.get("nvcc_threads") == 4
         and product.get("official_release_profile") == "release"
         and len(core_ptx_inputs) == 40
@@ -616,7 +619,22 @@ def verify_setup(
     name, _, input_path, _, _ = scenario
     row = require_dict(setup, f"{name} setup")
     if name == "noop":
-        require(row == {"kind": "none"}, "noop setup drift")
+        touch_input = policy["product_build"]["no_content_touch_input"]
+        source_path = source_root / touch_input
+        require(
+            row.get("kind") == "no-content-touch"
+            and row.get("input_path") == touch_input
+            and row.get("metadata_fsync_completed_before_probe") is True
+            and isinstance(row.get("probe"), dict)
+            and row.get("before_sha256") == row.get("during_sha256")
+            and row.get("during_sha256") == row.get("restored_sha256")
+            and row.get("before_sha256") == sha256(source_path)
+            and isinstance(row.get("before_mtime_ns"), int)
+            and isinstance(row.get("during_mtime_ns"), int)
+            and row["during_mtime_ns"] != row["before_mtime_ns"]
+            and row.get("restored_mtime_ns") == row.get("before_mtime_ns"),
+            "noop no-content touch setup drift",
+        )
         return
     if name == "clean-release":
         require(
@@ -674,6 +692,70 @@ def verify_setup(
             units.get(input_path) == row["during_sha256"],
             "native-TU mutated plan does not bind mutated source",
         )
+
+
+def verify_no_content_touch_probe(
+    root: Path,
+    raw: Any,
+    label: str,
+    *,
+    expected_cwd: str,
+    expected_command: list[str],
+    source_bundle_members: list[str],
+) -> None:
+    probe = require_dict(raw, f"{label} no-content touch probe")
+    receipt, cargo_stdout, cargo_stderr = verify_bounded_step(
+        root,
+        probe,
+        f"{label} no-content touch probe",
+        require_nonempty_logs=True,
+        expected_cwd=expected_cwd,
+    )
+    require(
+        receipt["command"] == expected_command,
+        f"{label} no-content touch probe command drift",
+    )
+    cargo_summary = parse_cargo_messages(cargo_stdout)
+    require(
+        probe.get("cargo_summary") == cargo_summary,
+        f"{label} no-content touch Cargo summary is not independently reproducible",
+    )
+    summary_raw = probe.get("cuda_build_summary")
+    summary = None
+    if summary_raw is not None:
+        summary_path = resolve_ref(
+            root,
+            summary_raw,
+            f"{label} no-content touch CUDA summary",
+            expected_kind="cuda-build-summary",
+        )
+        summary = verify_cuda_build_summary(
+            summary_path,
+            f"{label} no-content touch CUDA summary",
+        )
+    native_signal = verify_product_native_signal(
+        probe.get("native_signal"),
+        cargo_stderr,
+        summary,
+        f"{label} no-content touch probe",
+    )
+    require(
+        native_signal.get("compiled_native_tu_count") == 0
+        and native_signal.get("compiled_native_tu_paths") == []
+        and native_signal.get("core_ptx_built_paths") == [],
+        f"{label} no-content touch probe compiled native source or core PTX",
+    )
+    if summary is not None:
+        require(
+            set(native_signal.get("artifact_build_units", []))
+            == PRODUCT_NATIVE_UNITS,
+            f"{label} no-content touch probe native artifact coverage drift",
+        )
+    stderr = cargo_stderr.read_text(encoding="utf-8", errors="strict")
+    require(
+        not any(member in stderr for member in source_bundle_members),
+        f"{label} no-content touch probe referenced external native source",
+    )
 
 
 def verify_cuda_build_summary(path: Path, label: str) -> dict[str, Any]:
@@ -1279,7 +1361,17 @@ def verify_product_sample(
         read_json(sample_path, f"{label} sample file") == sample,
         f"{label} embedded/file sample mismatch",
     )
-    verify_setup(source_root, policy, sample.get("setup"), scenario, mutated_plan=None)
+    setup = require_dict(sample.get("setup"), f"{label} setup")
+    verify_setup(source_root, policy, setup, scenario, mutated_plan=None)
+    if name == "noop":
+        verify_no_content_touch_probe(
+            root,
+            setup.get("probe"),
+            label,
+            expected_cwd=expected_worktree,
+            expected_command=build_receipt["command"],
+            source_bundle_members=source_bundle_members,
+        )
     return verify_timing(sample, build_receipt, smoke_receipt, label)
 
 
@@ -2061,6 +2153,41 @@ def self_test() -> None:
     )
     with tempfile.TemporaryDirectory(prefix="g07a-validator-selftest-") as raw:
         root = Path(raw)
+        touch_source = root / product["no_content_touch_input"]
+        touch_source.parent.mkdir(parents=True)
+        touch_source.write_text("pub fn fixture() {}\n", encoding="ascii")
+        touch_digest = sha256(touch_source)
+        touch_setup = {
+            "kind": "no-content-touch",
+            "input_path": product["no_content_touch_input"],
+            "before_sha256": touch_digest,
+            "during_sha256": touch_digest,
+            "restored_sha256": touch_digest,
+            "before_mtime_ns": 1,
+            "during_mtime_ns": 2,
+            "restored_mtime_ns": 1,
+            "metadata_fsync_completed_before_probe": True,
+            "probe": {},
+        }
+        verify_setup(
+            root,
+            policy,
+            touch_setup,
+            EXPECTED_SCENARIOS[0],
+            mutated_plan=None,
+        )
+        changed_touch = copy.deepcopy(touch_setup)
+        changed_touch["during_sha256"] = "f" * 64
+        expect_reject(
+            lambda: verify_setup(
+                root,
+                policy,
+                changed_touch,
+                EXPECTED_SCENARIOS[0],
+                mutated_plan=None,
+            ),
+            "no-content touch content mutation",
+        )
         cuda_summary = root / "cuda-summary.json"
         native_rows = [
             {
