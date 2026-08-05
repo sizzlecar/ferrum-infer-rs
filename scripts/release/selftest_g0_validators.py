@@ -140,6 +140,9 @@ RUNTIME_VNEXT_G07A_BUILD_ITERATION_VALIDATOR = (
 RUNTIME_VNEXT_G07A_CHECKPOINT = (
     REPO_ROOT / "scripts/release/runtime_vnext_g07a_checkpoint.py"
 )
+RUNTIME_VNEXT_G07B_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g07b_checkpoint.py"
+)
 NATIVE_WORK_ATTRIBUTION_GATE = REPO_ROOT / "scripts/release/native_work_attribution_gate.py"
 BOUNDED_COMMAND = REPO_ROOT / "scripts/release/bounded_command.py"
 RUN_SCENARIOS = REPO_ROOT / "scripts/release/run_scenarios.py"
@@ -1025,6 +1028,22 @@ def test_runtime_vnext_g07a_build_iteration_selftests() -> None:
     )
 
 
+def test_runtime_vnext_g07b_checkpoint_selftest() -> None:
+    checkpoint = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G07B_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(checkpoint.returncode == 0, checkpoint.stderr or checkpoint.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G07B CHECKPOINT SELFTEST PASS"
+        in checkpoint.stdout,
+        checkpoint.stdout,
+    )
+
+
 def test_native_work_attribution_gate_selftest() -> None:
     ok = run([sys.executable, str(NATIVE_WORK_ATTRIBUTION_GATE), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -1439,6 +1458,7 @@ def main() -> int:
     test_runtime_vnext_g08_performance_smoke_selftest()
     test_runtime_vnext_cuda_replay_kernel_attribution_selftest()
     test_runtime_vnext_g07a_build_iteration_selftests()
+    test_runtime_vnext_g07b_checkpoint_selftest()
     test_runtime_vnext_g07b_native_chain_validator_selftest()
     test_native_work_attribution_gate_selftest()
     test_bounded_command_selftest()

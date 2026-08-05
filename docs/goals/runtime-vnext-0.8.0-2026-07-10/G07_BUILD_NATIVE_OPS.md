@@ -43,7 +43,11 @@ python3 scripts/release/run_gate.py vnext-g07a \
   --source-gate <unit-gate-manifest> \
   --semantic-plan-equivalence <semantic-trace-root> \
   --out <external-out>
-python3 scripts/release/run_gate.py vnext-g07b --g03 <g03-manifest> --g07a <g07a-manifest> --out <external-out>
+python3 scripts/release/run_gate.py vnext-g07b \
+  --g03 <g03-manifest> \
+  --g07a <g07a-manifest> \
+  --g07b-evidence-root <raw-native-chain-evidence> \
+  --out <external-out>
 python3 scripts/release/run_gate.py vnext-g07 --g07a <g07a-manifest> --g07b <g07b-manifest> --out <external-out>
 ```
 
@@ -51,6 +55,9 @@ G07A manifest 必须绑定 G00 build-input inventory、fixed build-host fingerpr
 harness blob 和 raw samples。G07B 必须绑定 G03 operation catalog/version、native ABI、source lock、
 resolver fixtures 和 G07A manifest。aggregate G07 逐字节消费两个 child manifest 并验证 source、
 crate graph、operation catalog 和 ABI freshness；任何 child stale 或 catalog hash 分叉都必须失败。
+`--g07b-evidence-root` 只接受由同一 clean source、同一 canonical G03/G07A 输入生成并经独立
+validator 复验的完整 source-build -> package -> artifact-set -> resolve/link/load chain；它不是裸
+catalog 或调用方自报摘要，canonical checkpoint 必须重新验证其全部外部 manifest 和文件哈希。
 
 ## 目标 build graph
 

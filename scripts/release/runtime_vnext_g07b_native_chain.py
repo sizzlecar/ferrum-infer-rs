@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import bounded_command
+import runtime_vnext_g07b_checkpoint as canonical_checkpoint
 import validate_runtime_vnext_g07b_native_chain as independent_validator
 
 
@@ -348,6 +349,7 @@ def validate_chain(
     lock_path: Path,
     abi_contract_path: Path,
     artifact_binary: Path,
+    dependencies: dict[str, Any],
 ) -> dict[str, Any]:
     artifact_inventory = read_json(artifact_paths["inventory"], "artifact native inventory")
     require(isinstance(artifact_inventory, list), "artifact native inventory must be an array")
@@ -468,6 +470,7 @@ def validate_chain(
         "status": "keep",
         "created_at": now_iso(),
         "source": source,
+        "dependencies": dependencies,
         "hardware": hardware,
         "native_source": {
             "root": str(native_source_root),
@@ -485,7 +488,7 @@ def validate_chain(
         "catalog": {
             "provider_sha256": provider_sha,
             "provider_identity_unchanged": True,
-            "input_kind": "explicit-g03-provider-catalog",
+            "input_kind": "canonical-g03-live-catalog-gate",
             "artifact_native_operator_count": len(artifact_inventory),
         },
         "abi_contract": {
@@ -511,8 +514,6 @@ def validate_chain(
             "schema_version": CUDA_BUILD_SUMMARY_RECEIPT_SCHEMA_VERSION,
         },
         "does_not_prove": [
-            "canonical G03 PASS",
-            "canonical G07A PASS",
             "canonical G07B PASS",
             "G07 aggregate PASS",
             "model correctness",
@@ -525,7 +526,6 @@ def validate_chain(
 def execute(args: argparse.Namespace) -> Path:
     source_root = args.source_root.expanduser().resolve()
     native_source_root = args.native_source_root.expanduser().resolve()
-    g03_provider_catalog = args.g03_provider_catalog.expanduser().resolve()
     out = args.out.expanduser().resolve()
     target_dir = args.target_dir.expanduser().resolve()
     object_cache = args.object_cache.expanduser().resolve()
@@ -535,10 +535,6 @@ def execute(args: argparse.Namespace) -> Path:
         native_source_root.is_dir()
         and not native_source_root.is_relative_to(source_root),
         "--native-source-root must be an existing directory outside the Git source tree",
-    )
-    require(
-        g03_provider_catalog.is_file() and not g03_provider_catalog.is_symlink(),
-        f"G03 provider catalog is missing: {g03_provider_catalog}",
     )
     require(not out.exists(), f"output already exists: {out}")
     require(not out.is_relative_to(source_root), "--out must be outside the Git source tree")
@@ -555,7 +551,16 @@ def execute(args: argparse.Namespace) -> Path:
     object_cache.mkdir(parents=True, exist_ok=True)
     native_cache.mkdir(parents=True, exist_ok=True)
 
-    source = source_identity(source_root)
+    try:
+        source, dependencies = canonical_checkpoint.validate_dependencies(
+            args.g03, args.g07a, source_root=source_root
+        )
+    except canonical_checkpoint.CheckpointError as error:
+        raise ChainError(f"canonical G03/G07A dependency validation failed: {error}") from error
+    require(source == source_identity(source_root), "dependency source differs from G07B source")
+    g03_provider_catalog = Path(
+        dependencies["g03"]["provider_catalog"]["path"]
+    ).resolve()
     tools = {
         "nvcc": resolve_tool(args.nvcc, "nvcc"),
         "ccbin": resolve_tool(args.ccbin, "CUDA host compiler"),
@@ -585,7 +590,7 @@ def execute(args: argparse.Namespace) -> Path:
             "expected_runtime_seconds": args.expected_runtime_seconds,
             "hard_deadline_seconds": args.hard_timeout_seconds,
             "hard_stop": "first failed bounded step, catalog drift, source fallback, or runtime binding rejection",
-            "correctness_gate": "artifact catalog must equal the explicit G03 input; runtime inventory must contain exactly four verified operators",
+            "correctness_gate": "artifact catalog must equal the canonical G03 checkpoint; G03/G07A must match this source; runtime inventory must contain exactly four verified operators",
             "performance_command": "not applicable; G07B validates build/runtime selection, not model throughput",
             "progress_signal": "per-step bounded receipts, log byte growth, and newly materialized package/artifact files",
         },
@@ -792,6 +797,7 @@ def execute(args: argparse.Namespace) -> Path:
         lock_path=lock_path,
         abi_contract_path=abi_contract,
         artifact_binary=artifact_binary,
+        dependencies=dependencies,
     )
     manifest["artifacts"] = artifact_index(out)
     manifest["artifact_count"] = len(manifest["artifacts"])
@@ -804,7 +810,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser()
     result.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[2])
     result.add_argument("--native-source-root", type=Path, required=True)
-    result.add_argument("--g03-provider-catalog", type=Path, required=True)
+    result.add_argument("--g03", type=Path, required=True)
+    result.add_argument("--g07a", type=Path, required=True)
     result.add_argument("--out", type=Path, required=True)
     result.add_argument("--target-dir", type=Path, required=True)
     result.add_argument("--object-cache", type=Path, required=True)

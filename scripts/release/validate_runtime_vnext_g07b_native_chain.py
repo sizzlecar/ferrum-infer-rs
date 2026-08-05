@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
 SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
 SOURCE_OBJECT_BUILD_CONTRACT_VERSION = 7
@@ -74,8 +74,6 @@ EXPECTED_STEPS = {
     *(f"package-{name}" for name in PACKAGES),
 }
 DOES_NOT_PROVE = {
-    "canonical G03 PASS",
-    "canonical G07A PASS",
     "canonical G07B PASS",
     "G07 aggregate PASS",
     "model correctness",
@@ -2228,7 +2226,7 @@ def verify_catalogs_and_packages(
         == {
             "provider_sha256": provider_sha,
             "provider_identity_unchanged": True,
-            "input_kind": "explicit-g03-provider-catalog",
+            "input_kind": "canonical-g03-live-catalog-gate",
             "artifact_native_operator_count": 4,
         },
         "manifest catalog summary mismatch",
@@ -2312,12 +2310,107 @@ def verify_build_summaries(root: Path, manifest: dict[str, Any]) -> None:
         not any(row["status"] == "rejected" for row in summaries),
         "artifact build summary contains a rejected build decision",
     )
-    for step in ("artifact-catalog-export",):
-        output = (root / "steps" / step / "stdout.log").read_text(encoding="utf-8", errors="replace")
+    output = (root / "steps/artifact-catalog-export/stdout.log").read_text(
+        encoding="utf-8", errors="replace"
+    )
+    require(
+        output.count("FERRUM RUNTIME VNEXT CUDA LIVE CATALOG READY:") == 1,
+        "artifact-catalog-export did not emit exactly one runtime readiness line",
+    )
+
+
+def verify_dependency_bindings(
+    root: Path, manifest: dict[str, Any], source: dict[str, Any]
+) -> None:
+    dependencies = require_dict(manifest.get("dependencies"), "manifest.dependencies")
+    require(set(dependencies) == {"g03", "g07a"}, "chain dependency set mismatch")
+    g03 = require_dict(dependencies["g03"], "manifest.dependencies.g03")
+    g07a = require_dict(dependencies["g07a"], "manifest.dependencies.g07a")
+    require(
+        set(g03)
+        == {
+            "outer_manifest",
+            "child_manifest",
+            "source",
+            "provider_catalog",
+            "capability_catalog",
+            "catalogs",
+        }
+        and set(g07a)
+        == {
+            "outer_manifest",
+            "child_manifest",
+            "source",
+            "hardware_fingerprint",
+            "scenario_targets",
+            "semantic_plan_hash",
+        },
+        "chain dependency field set mismatch",
+    )
+    require(
+        g03["source"] == g07a["source"] == source,
+        "chain dependency source identity forked",
+    )
+
+    def verify_external_identity(value: Any, label: str) -> dict[str, Any]:
+        identity = require_dict(value, label)
+        raw_path = Path(identity["path"]) if isinstance(identity.get("path"), str) else Path()
         require(
-            output.count("FERRUM RUNTIME VNEXT CUDA LIVE CATALOG READY:") == 1,
-            f"{step} did not emit exactly one runtime readiness line",
+            set(identity) == {"path", "sha256", "size_bytes"}
+            and raw_path.is_absolute()
+            and require_sha(identity["sha256"], f"{label}.sha256")
+            and isinstance(identity["size_bytes"], int)
+            and not isinstance(identity["size_bytes"], bool)
+            and identity["size_bytes"] >= 0,
+            f"{label} identity is invalid",
         )
+        path = raw_path.resolve()
+        require(
+            path.is_file()
+            and not path.is_symlink()
+            and sha256(path) == identity["sha256"]
+            and path.stat().st_size == identity["size_bytes"],
+            f"{label} external artifact drifted",
+        )
+        return identity
+
+    for dependency_name, dependency in (("g03", g03), ("g07a", g07a)):
+        verify_external_identity(
+            dependency["outer_manifest"],
+            f"manifest.dependencies.{dependency_name}.outer_manifest",
+        )
+        verify_external_identity(
+            dependency["child_manifest"],
+            f"manifest.dependencies.{dependency_name}.child_manifest",
+        )
+    provider = verify_external_identity(
+        g03["provider_catalog"], "manifest.dependencies.g03.provider_catalog"
+    )
+    verify_external_identity(
+        g03["capability_catalog"], "manifest.dependencies.g03.capability_catalog"
+    )
+    catalog_input = root / "catalog-input/provider-catalog.json"
+    require(
+        provider["sha256"] == sha256(catalog_input)
+        and provider["size_bytes"] == catalog_input.stat().st_size,
+        "chain catalog input differs from its canonical G03 dependency identity",
+    )
+    catalogs = require_dict(g03["catalogs"], "manifest.dependencies.g03.catalogs")
+    provider_summary = require_dict(
+        catalogs.get("provider"), "manifest.dependencies.g03.catalogs.provider"
+    )
+    require(
+        provider_summary.get("sha256") == provider["sha256"],
+        "chain G03 catalog summary differs from the provider identity",
+    )
+    require(
+        isinstance(g07a["hardware_fingerprint"], str)
+        and SHA256_RE.fullmatch(g07a["hardware_fingerprint"]) is not None
+        and isinstance(g07a["scenario_targets"], dict)
+        and isinstance(g07a["semantic_plan_hash"], str)
+        and SHA256_RE.fullmatch(g07a["semantic_plan_hash"]) is not None,
+        "chain G07A dependency summary is invalid",
+    )
 
 
 def verify_manifest(root: Path, source_root: Path, native_source_root: Path) -> None:
@@ -2362,6 +2455,7 @@ def verify_manifest(root: Path, source_root: Path, native_source_root: Path) -> 
     )
     verify_artifact_index(root, manifest)
     source = verify_source(root, source_root, manifest)
+    verify_dependency_bindings(root, manifest, source)
     verify_hardware(root, manifest)
     verify_steps(root)
     verify_catalogs_and_packages(
@@ -2397,6 +2491,80 @@ def self_test() -> None:
             "dirty": False,
             "status_short": [],
         }
+        dependency_root = root / "dependency-bindings"
+        (dependency_root / "catalog-input").mkdir(parents=True)
+
+        def write_dependency_file(name: str, content: str) -> Path:
+            path = dependency_root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            return path.resolve()
+
+        def external_identity(path: Path) -> dict[str, Any]:
+            return {
+                "path": str(path),
+                "sha256": sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+
+        g03_outer = write_dependency_file("external/g03-gate.json", "g03 outer\n")
+        g03_child = write_dependency_file("external/g03-child.json", "g03 child\n")
+        g07a_outer = write_dependency_file("external/g07a-gate.json", "g07a outer\n")
+        g07a_child = write_dependency_file("external/g07a-child.json", "g07a child\n")
+        provider = write_dependency_file("external/provider.json", "provider\n")
+        capability = write_dependency_file("external/capability.json", "capability\n")
+        catalog_input = write_dependency_file(
+            "catalog-input/provider-catalog.json", "provider\n"
+        )
+        dependency_manifest = {
+            "dependencies": {
+                "g03": {
+                    "outer_manifest": external_identity(g03_outer),
+                    "child_manifest": external_identity(g03_child),
+                    "source": source,
+                    "provider_catalog": external_identity(provider),
+                    "capability_catalog": external_identity(capability),
+                    "catalogs": {
+                        "provider": {"sha256": sha256(provider)},
+                        "capability": {"sha256": sha256(capability)},
+                    },
+                },
+                "g07a": {
+                    "outer_manifest": external_identity(g07a_outer),
+                    "child_manifest": external_identity(g07a_child),
+                    "source": source,
+                    "hardware_fingerprint": "2" * 64,
+                    "scenario_targets": {"no_op": 30.0},
+                    "semantic_plan_hash": "3" * 64,
+                },
+            }
+        }
+        verify_dependency_bindings(dependency_root, dependency_manifest, source)
+        catalog_input.write_text("forked provider\n", encoding="utf-8")
+        expect_reject(
+            lambda: verify_dependency_bindings(
+                dependency_root, dependency_manifest, source
+            ),
+            "canonical provider catalog fork",
+        )
+        catalog_input.write_text("provider\n", encoding="utf-8")
+        forked_summary = copy.deepcopy(dependency_manifest)
+        forked_summary["dependencies"]["g03"]["catalogs"]["provider"][
+            "sha256"
+        ] = "4" * 64
+        expect_reject(
+            lambda: verify_dependency_bindings(
+                dependency_root, forked_summary, source
+            ),
+            "G03 provider summary fork",
+        )
+        g07a_child.write_text("tampered child\n", encoding="utf-8")
+        expect_reject(
+            lambda: verify_dependency_bindings(
+                dependency_root, dependency_manifest, source
+            ),
+            "G07A child manifest tamper",
+        )
         lane_plan = {
             "schema_version": SCHEMA_VERSION,
             "lane": "runtime-vnext-g07b-native-chain",

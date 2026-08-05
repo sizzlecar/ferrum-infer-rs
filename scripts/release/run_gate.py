@@ -62,6 +62,7 @@ LANES = (
     "vnext-g02-core",
     "vnext-g03-live-catalog",
     "vnext-g07a",
+    "vnext-g07b",
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
     "vnext-s1-cuda-decode-capacity",
@@ -1076,6 +1077,37 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-g07a",
+        )
+    if lane == "vnext-g07b":
+        required = {
+            "--g03": args.g03,
+            "--g07a": args.g07a,
+            "--g07b-evidence-root": args.g07b_evidence_root,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise GateError("vnext-g07b requires " + ", ".join(missing))
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g07b_checkpoint.py",
+                "--source-root",
+                str(REPO_ROOT),
+                "--g03",
+                str(args.g03.resolve()),
+                "--g07a",
+                str(args.g07a.resolve()),
+                "--chain-artifact-root",
+                str(args.g07b_evidence_root.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                "FERRUM RUNTIME VNEXT G07B NATIVE OPERATORS PASS: "
+                f"{out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g07b",
         )
     if lane == "vnext-s1-cuda":
         if args.s1_artifact is None:
@@ -5977,6 +6009,53 @@ def validate_vnext_g07a_provenance(
     return summary
 
 
+def validate_vnext_g07b_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        "vnext-g07b delegated manifest path is missing",
+    )
+    require_gate(
+        manifest_path.resolve()
+        == Path(
+            require_string(
+                child_manifest.get("artifact_dir"),
+                "vnext-g07b artifact_dir",
+            )
+        ).resolve()
+        / "manifest.json",
+        "vnext-g07b child manifest path mismatch",
+    )
+    try:
+        import runtime_vnext_g07b_checkpoint as checkpoint
+
+        summary = checkpoint.verify_checkpoint_manifest(
+            manifest_path,
+            source_root=REPO_ROOT,
+            verify_checkout=verify_checkout,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise GateError(
+            f"vnext-g07b checkpoint provenance failed: {error}"
+        ) from error
+    require_gate(
+        summary.get("kind") == "vnext-g07b"
+        and summary.get("child_manifest", {}).get("sha256")
+        == require_sha256(
+            child_manifest_sha256,
+            "vnext-g07b child manifest SHA256",
+        ),
+        "vnext-g07b checkpoint summary binding mismatch",
+    )
+    return summary
+
+
 def validate_vnext_g01b_provenance(
     lane_command: LaneCommand,
     child_manifest: dict[str, Any],
@@ -6203,6 +6282,13 @@ def verify_child_pass_line(
         )
     if lane_command.provenance_kind == "vnext-g07a":
         return validate_vnext_g07a_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g07b":
+        return validate_vnext_g07b_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
@@ -9238,6 +9324,72 @@ def self_test() -> int:
             g07a_missing_semantic.stderr or g07a_missing_semantic.stdout,
         )
 
+        g07b_out = (root / "vnext-g07b-dry-run").resolve()
+        g07b_g03 = (root / "g03/gate.manifest.json").resolve()
+        g07b_g07a = (root / "g07a/gate.manifest.json").resolve()
+        g07b_raw = (root / "g07b-native-chain").resolve()
+        g07b = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g07b",
+                "--g03",
+                str(g07b_g03),
+                "--g07a",
+                str(g07b_g07a),
+                "--g07b-evidence-root",
+                str(g07b_raw),
+                "--out",
+                str(g07b_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(g07b.returncode == 0, g07b.stderr or g07b.stdout)
+        g07b_manifest = json.loads(
+            (g07b_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g07b_manifest["status"] == "dry-run"
+            and g07b_manifest["lane"] == "vnext-g07b"
+            and g07b_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g07b_checkpoint.py",
+                "--source-root",
+                str(REPO_ROOT),
+                "--g03",
+                str(g07b_g03),
+                "--g07a",
+                str(g07b_g07a),
+                "--chain-artifact-root",
+                str(g07b_raw),
+                "--out",
+                str(g07b_out),
+            ]
+            and g07b_manifest["child_pass_line"]
+            == f"FERRUM RUNTIME VNEXT G07B NATIVE OPERATORS PASS: {g07b_out}",
+            g07b_manifest,
+        )
+        g07b_missing_g07a = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g07b",
+                "--g03",
+                str(g07b_g03),
+                "--g07b-evidence-root",
+                str(g07b_raw),
+                "--out",
+                str(root / "vnext-g07b-missing-g07a"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g07b_missing_g07a.returncode != 0
+            and "--g07a" in (g07b_missing_g07a.stderr + g07b_missing_g07a.stdout),
+            g07b_missing_g07a.stderr or g07b_missing_g07a.stdout,
+        )
+
         s1_out = (root / "vnext-s1-cuda-dry-run").resolve()
         s1_raw = (root / "s1-raw").resolve()
         s1 = run_selftest_command(
@@ -10094,6 +10246,9 @@ def main() -> int:
     parser.add_argument("--s2-artifact-root", type=Path)
     parser.add_argument("--historical-corpus", type=Path)
     parser.add_argument("--g07a-evidence-root", type=Path)
+    parser.add_argument("--g03", type=Path)
+    parser.add_argument("--g07a", type=Path)
+    parser.add_argument("--g07b-evidence-root", type=Path)
     parser.add_argument("--source-gate", type=Path)
     parser.add_argument("--semantic-plan-equivalence", type=Path)
     parser.add_argument("--cuda-determinism-artifact-root", type=Path)
@@ -10126,6 +10281,7 @@ def main() -> int:
         "vnext-g02-core",
         "vnext-g03-live-catalog",
         "vnext-g07a",
+        "vnext-g07b",
         "vnext-s2-response-format",
         "vnext-s2-api-modality",
         "vnext-s2-stream-disconnect",
