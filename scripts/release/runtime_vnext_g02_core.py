@@ -55,6 +55,8 @@ DEV_CODEGEN_UNITS = 4
 DEV_BUILD_OVERRIDE_CODEGEN_UNITS = 4
 TEST_CODEGEN_UNITS = 4
 BUILD_OVERRIDE_CODEGEN_UNITS = 4
+LINUX_LLD_THREADS = 4
+LINUX_LLD_RUSTFLAG = f"-Clink-arg=-Wl,--threads={LINUX_LLD_THREADS}"
 
 
 class GateError(RuntimeError):
@@ -366,6 +368,25 @@ def audit_critical_path() -> dict[str, Any]:
     }
 
 
+def apply_linker_thread_bound(
+    env: dict[str, str], platform_name: str = sys.platform
+) -> None:
+    if not platform_name.startswith("linux"):
+        return
+    encoded = env.get("CARGO_ENCODED_RUSTFLAGS")
+    if encoded:
+        flags = encoded.split("\x1f")
+        if LINUX_LLD_RUSTFLAG not in flags:
+            env["CARGO_ENCODED_RUSTFLAGS"] = "\x1f".join(
+                (*flags, LINUX_LLD_RUSTFLAG)
+            )
+        return
+    flags = env.get("RUSTFLAGS", "").split()
+    if LINUX_LLD_RUSTFLAG not in flags:
+        flags.append(LINUX_LLD_RUSTFLAG)
+    env["RUSTFLAGS"] = " ".join(flags)
+
+
 def child_environment() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("FERRUM_")}
     env.update(
@@ -383,6 +404,7 @@ def child_environment() -> dict[str, str]:
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
+    apply_linker_thread_bound(env)
     return env
 
 
@@ -591,6 +613,8 @@ def collect(out: Path) -> dict[str, Any]:
             "dev_build_override_codegen_units": DEV_BUILD_OVERRIDE_CODEGEN_UNITS,
             "test_codegen_units": TEST_CODEGEN_UNITS,
             "build_override_codegen_units": BUILD_OVERRIDE_CODEGEN_UNITS,
+            "linux_lld_threads": LINUX_LLD_THREADS,
+            "linux_lld_rustflag": LINUX_LLD_RUSTFLAG,
         },
         "warmups": warmups,
         "l0": {
@@ -644,6 +668,8 @@ def validate_artifact(root: Path) -> dict[str, Any]:
             "dev_build_override_codegen_units": DEV_BUILD_OVERRIDE_CODEGEN_UNITS,
             "test_codegen_units": TEST_CODEGEN_UNITS,
             "build_override_codegen_units": BUILD_OVERRIDE_CODEGEN_UNITS,
+            "linux_lld_threads": LINUX_LLD_THREADS,
+            "linux_lld_rustflag": LINUX_LLD_RUSTFLAG,
         },
         "G02 core compile bounds mismatch",
     )
@@ -722,6 +748,27 @@ def self_test() -> int:
         == str(BUILD_OVERRIDE_CODEGEN_UNITS),
         "test-profile build-override codegen-unit bound is missing",
     )
+    linux_rustflags: dict[str, str] = {"RUSTFLAGS": "-D warnings"}
+    apply_linker_thread_bound(linux_rustflags, "linux")
+    require(
+        linux_rustflags["RUSTFLAGS"].split().count(LINUX_LLD_RUSTFLAG) == 1,
+        "Linux lld thread bound is missing from RUSTFLAGS",
+    )
+    apply_linker_thread_bound(linux_rustflags, "linux")
+    require(
+        linux_rustflags["RUSTFLAGS"].split().count(LINUX_LLD_RUSTFLAG) == 1,
+        "Linux lld thread bound is not idempotent",
+    )
+    linux_encoded = {"CARGO_ENCODED_RUSTFLAGS": "-Cdebuginfo=0"}
+    apply_linker_thread_bound(linux_encoded, "linux")
+    require(
+        linux_encoded["CARGO_ENCODED_RUSTFLAGS"].split("\x1f")
+        == ["-Cdebuginfo=0", LINUX_LLD_RUSTFLAG],
+        "Linux lld thread bound is missing from encoded RUSTFLAGS",
+    )
+    non_linux = {"RUSTFLAGS": "-D warnings"}
+    apply_linker_thread_bound(non_linux, "darwin")
+    require(non_linux == {"RUSTFLAGS": "-D warnings"}, "lld bound leaked off Linux")
     sample = """
 running 1 test
 test tiny_real_safetensors_executes_through_reference_vnext_runtime ... ok
