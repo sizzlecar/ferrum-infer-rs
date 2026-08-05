@@ -55,6 +55,30 @@ FERRUM GATE vnext-g08a-source PASS: <out_dir>
 该 child PASS 不替代双后端 C01-C21、product binary legacy selection、完整 numerics、historical
 production mutation、performance smoke 或最终 G08A PASS。
 
+最终 G08A 只能由统一聚合门签发；七个输入都必须是同一 clean source SHA/tree 的 canonical
+`run_gate.py` 外层 `gate.manifest.json`：source ownership、CUDA 703-case、Metal 702-case、完整
+numerics、S2 product contract（含 `H02.1/H12.1-H12.4` 五个历史资源问题的 production
+tests/replays）、以及 M1 CUDA/Metal 各一份 G08 performance smoke。CUDA 与 Metal performance
+artifact 必须独立，不能用一份 backend 结果重复占位。
+
+```text
+python3 scripts/release/run_gate.py vnext-g08a \
+  --g08a-source <vnext-g08a-source/gate.manifest.json> \
+  --g08a-cuda <vnext-g08a-cuda/gate.manifest.json> \
+  --g08a-metal <vnext-g08a-metal/gate.manifest.json> \
+  --g08a-numerics <vnext-g08a-numerics/gate.manifest.json> \
+  --g08a-s2 <vnext-s2/gate.manifest.json> \
+  --g08a-cuda-performance <m1-cuda-performance/gate.manifest.json> \
+  --g08a-metal-performance <m1-metal-performance/gate.manifest.json> \
+  --out <external-out>
+```
+
+聚合器必须重新校验每个外层/child manifest、child stdout PASS、validation/input hash、source
+identity、case denominator、waiver、C18 active floor/duty-cycle、numerical tolerance/token parity、
+历史问题 denominator 和 performance ratio；matrix、numerics、performance 必须回到原始 artifact
+重新执行 canonical validator，performance 阈值固定为 legacy `0.90` / external `0.70`。仅凭手写
+summary、降低 artifact 自报阈值、伪造 delegated command/receipt 或使用旧 SHA 均不得通过。
+
 ```text
 FERRUM RUNTIME VNEXT G08A QWEN35 4B PASS: <out_dir>
 FERRUM GATE vnext-g08a PASS: <out_dir>

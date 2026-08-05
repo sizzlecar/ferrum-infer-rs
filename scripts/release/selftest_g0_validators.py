@@ -90,6 +90,9 @@ RUNTIME_VNEXT_G08A_NUMERICS = (
 RUNTIME_VNEXT_G08A_SOURCE_CONTRACT = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08a_source_contract.py"
 )
+RUNTIME_VNEXT_G08A_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08a_checkpoint.py"
+)
 RUNTIME_VNEXT_S1_CUDA_CHECKPOINT = (
     REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_checkpoint.py"
 )
@@ -784,6 +787,17 @@ def test_runtime_vnext_g08a_source_contract_selftest() -> None:
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require(
         "FERRUM RUNTIME VNEXT G08A SOURCE OWNERSHIP SELFTEST PASS" in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g08a_checkpoint_selftest() -> None:
+    ok = run(
+        [sys.executable, str(RUNTIME_VNEXT_G08A_CHECKPOINT), "--self-test"]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08A CHECKPOINT SELFTEST PASS" in ok.stdout,
         ok.stdout,
     )
 
@@ -1501,6 +1515,7 @@ def main() -> int:
     test_runtime_vnext_qwen35_model_reference_gate_selftest()
     test_runtime_vnext_g08a_numerics_selftests()
     test_runtime_vnext_g08a_source_contract_selftest()
+    test_runtime_vnext_g08a_checkpoint_selftest()
     test_runtime_vnext_s1_cuda_checkpoint_selftest()
     test_runtime_vnext_s1_cuda_basic_collector_selftest()
     test_runtime_vnext_s1_cuda_capacity_selftest()

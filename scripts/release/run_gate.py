@@ -81,6 +81,7 @@ LANES = (
     "vnext-g08a-cuda",
     "vnext-g08a-metal",
     "vnext-g08a-numerics",
+    "vnext-g08a",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
     "vnext-g08c-cuda",
@@ -775,6 +776,7 @@ FRESH_OUTPUT_PROVENANCE_KINDS = frozenset(
         "vnext-g07",
         "vnext-s2-historical-resource-source",
         "vnext-g08a-source",
+        "vnext-g08a",
     }
 )
 
@@ -1527,6 +1529,47 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             child_manifest_path=out_dir / "manifest.json",
             expected_source_git_sha=git_sha(),
             provenance_kind="vnext-g08a-numerics",
+        )
+    if lane == "vnext-g08a":
+        required = {
+            "--g08a-source": args.g08a_source,
+            "--g08a-cuda": args.g08a_cuda,
+            "--g08a-metal": args.g08a_metal,
+            "--g08a-numerics": args.g08a_numerics,
+            "--g08a-s2": args.g08a_s2,
+            "--g08a-cuda-performance": args.g08a_cuda_performance,
+            "--g08a-metal-performance": args.g08a_metal_performance,
+        }
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing:
+            raise GateError("vnext-g08a requires " + ", ".join(missing))
+        cmd = [
+            sys.executable,
+            "scripts/release/runtime_vnext_g08a_checkpoint.py",
+            "--source-root",
+            str(REPO_ROOT),
+        ]
+        child_flags = {
+            "--source": args.g08a_source,
+            "--cuda": args.g08a_cuda,
+            "--metal": args.g08a_metal,
+            "--numerics": args.g08a_numerics,
+            "--s2": args.g08a_s2,
+            "--cuda-performance": args.g08a_cuda_performance,
+            "--metal-performance": args.g08a_metal_performance,
+        }
+        for flag, value in child_flags.items():
+            assert value is not None
+            cmd.extend([flag, str(value.resolve())])
+        cmd.extend(["--out", str(out_dir)])
+        return LaneCommand(
+            cmd=cmd,
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G08A QWEN35 4B PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            expected_source_git_sha=None,
+            provenance_kind="vnext-g08a",
         )
     if lane == "vnext-g08b-cuda":
         if args.g08b_artifact_root is None:
@@ -6228,6 +6271,86 @@ def validate_vnext_g08a_source_provenance(
     }
 
 
+def validate_vnext_g08a_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        "vnext-g08a delegated manifest path is missing",
+    )
+    try:
+        import runtime_vnext_g08a_checkpoint as checkpoint
+
+        summary = checkpoint.verify_checkpoint_manifest(
+            manifest_path,
+            source_root=REPO_ROOT,
+            verify_checkout=verify_checkout,
+            expected_source=child_manifest.get("source"),
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise GateError(f"vnext-g08a provenance failed: {error}") from error
+    require_gate(
+        summary.get("kind") == "vnext-g08a"
+        and summary.get("child_manifest", {}).get("sha256")
+        == require_sha256(
+            child_manifest_sha256,
+            "vnext-g08a child manifest SHA256",
+        ),
+        "vnext-g08a checkpoint summary binding mismatch",
+    )
+    return summary
+
+
+def validate_vnext_g08a_dependency_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    key: str,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        f"{lane_command.provenance_kind} delegated manifest path is missing",
+    )
+    expected_source = {
+        "git_sha": child_manifest.get("source_git_sha"),
+        "git_tree_sha": child_manifest.get("source_tree_sha"),
+        "dirty": child_manifest.get("dirty"),
+    }
+    try:
+        import runtime_vnext_g08a_checkpoint as checkpoint
+
+        summary = checkpoint.verify_dependency_manifest(
+            key,
+            manifest_path,
+            lane_command.cmd,
+            source_root=REPO_ROOT,
+            verify_checkout=verify_checkout,
+            expected_source=expected_source,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise GateError(
+            f"{lane_command.provenance_kind} provenance failed: {error}"
+        ) from error
+    require_gate(
+        summary.get("kind") == lane_command.provenance_kind
+        and summary.get("child_manifest", {}).get("sha256")
+        == require_sha256(
+            child_manifest_sha256,
+            f"{lane_command.provenance_kind} child manifest SHA256",
+        ),
+        f"{lane_command.provenance_kind} provenance binding mismatch",
+    )
+    return summary
+
+
 def validate_vnext_g07b_provenance(
     lane_command: LaneCommand,
     child_manifest: dict[str, Any],
@@ -6548,6 +6671,53 @@ def verify_child_pass_line(
         )
     if lane_command.provenance_kind == "vnext-g08a-source":
         return validate_vnext_g08a_source_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g08a-cuda":
+        return validate_vnext_g08a_dependency_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            key="cuda",
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g08a-metal":
+        return validate_vnext_g08a_dependency_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            key="metal",
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g08a-numerics":
+        return validate_vnext_g08a_dependency_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            key="numerics",
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g08-performance-smoke":
+        backend = require_string(
+            child_manifest.get("backend"),
+            "vnext-g08-performance-smoke backend",
+        )
+        require_gate(
+            backend in {"cuda", "metal"},
+            "vnext-g08-performance-smoke backend is invalid",
+        )
+        return validate_vnext_g08a_dependency_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            key=f"{backend}_performance",
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g08a":
+        return validate_vnext_g08a_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
@@ -8558,6 +8728,7 @@ def self_test() -> int:
                     "vnext-g07",
                     "vnext-s2-historical-resource-source",
                     "vnext-g08a-source",
+                    "vnext-g08a",
                 )
             )
             and not provenance_requires_fresh_output("vnext-g07a"),
@@ -8976,6 +9147,67 @@ def self_test() -> int:
             and g08a_numerics_manifest["delegated_command_line"]
             == expected_g08a_numerics_child,
             g08a_numerics_manifest,
+        )
+        g08a_dependency_inputs = {
+            "--g08a-source": root / "g08a-source/gate.manifest.json",
+            "--g08a-cuda": root / "g08a-cuda/gate.manifest.json",
+            "--g08a-metal": root / "g08a-metal/gate.manifest.json",
+            "--g08a-numerics": root / "g08a-numerics/gate.manifest.json",
+            "--g08a-s2": root / "s2/gate.manifest.json",
+            "--g08a-cuda-performance": root
+            / "g08a-cuda-performance/gate.manifest.json",
+            "--g08a-metal-performance": root
+            / "g08a-metal-performance/gate.manifest.json",
+        }
+        g08a_final_out = root / "g08a-final-dry-run"
+        g08a_final_command = [
+            sys.executable,
+            str(this_script),
+            "vnext-g08a",
+        ]
+        for flag, value in g08a_dependency_inputs.items():
+            g08a_final_command.extend([flag, str(value)])
+        g08a_final_command.extend(
+            ["--out", str(g08a_final_out), "--dry-run"]
+        )
+        g08a_final_dry = run_selftest_command(g08a_final_command)
+        require_selftest(
+            g08a_final_dry.returncode == 0,
+            g08a_final_dry.stderr or g08a_final_dry.stdout,
+        )
+        g08a_final_manifest = json.loads(
+            (g08a_final_out / "gate.manifest.json").read_text()
+        )
+        expected_g08a_final_child = [
+            sys.executable,
+            "scripts/release/runtime_vnext_g08a_checkpoint.py",
+            "--source-root",
+            str(REPO_ROOT),
+        ]
+        child_flags = {
+            "--source": g08a_dependency_inputs["--g08a-source"],
+            "--cuda": g08a_dependency_inputs["--g08a-cuda"],
+            "--metal": g08a_dependency_inputs["--g08a-metal"],
+            "--numerics": g08a_dependency_inputs["--g08a-numerics"],
+            "--s2": g08a_dependency_inputs["--g08a-s2"],
+            "--cuda-performance": g08a_dependency_inputs[
+                "--g08a-cuda-performance"
+            ],
+            "--metal-performance": g08a_dependency_inputs[
+                "--g08a-metal-performance"
+            ],
+        }
+        for flag, value in child_flags.items():
+            expected_g08a_final_child.extend([flag, str(value.resolve())])
+        expected_g08a_final_child.extend(
+            ["--out", str(g08a_final_out.resolve())]
+        )
+        require_selftest(
+            g08a_final_manifest["status"] == "dry-run"
+            and g08a_final_manifest["lane"] == "vnext-g08a"
+            and g08a_final_manifest["delegated_command_line"]
+            == expected_g08a_final_child,
+            g08a_final_manifest,
         )
         g08b_report = g08b_root / "correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json"
         g08b_out = root / "g08b-cuda-dry-run"
@@ -10865,6 +11097,13 @@ def main() -> int:
     parser.add_argument("--g08a-full-attention", type=Path)
     parser.add_argument("--g08a-full-model", type=Path)
     parser.add_argument("--g08a-token-parity", type=Path)
+    parser.add_argument("--g08a-source", type=Path)
+    parser.add_argument("--g08a-cuda", type=Path)
+    parser.add_argument("--g08a-metal", type=Path)
+    parser.add_argument("--g08a-numerics", type=Path)
+    parser.add_argument("--g08a-s2", type=Path)
+    parser.add_argument("--g08a-cuda-performance", type=Path)
+    parser.add_argument("--g08a-metal-performance", type=Path)
     parser.add_argument("--g08b-artifact-root", type=Path)
     parser.add_argument("--g08b-scenario-report", type=Path)
     parser.add_argument("--g08c-artifact-root", type=Path)
@@ -10906,6 +11145,7 @@ def main() -> int:
         "vnext-s2-m1-determinism",
         "vnext-s2",
         "vnext-g08a-source",
+        "vnext-g08a",
     }:
         try:
             require_external_vnext_g00_output(out_dir)
