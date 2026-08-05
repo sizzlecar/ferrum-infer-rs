@@ -19,6 +19,9 @@ from typing import Any, Callable
 
 import runtime_vnext_g08a_metal_op_numerics as op_numerics
 import runtime_vnext_numerical_tolerances as tolerances
+import runtime_vnext_qwen35_full_attention_gate as full_attention_gate
+import runtime_vnext_qwen35_layer_reference_gate as linear_attention_gate
+import runtime_vnext_qwen35_model_reference_gate as model_reference_gate
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -35,22 +38,10 @@ PROMPT_COUNT = 20
 NEAR_TIE_MARGIN = 1.0e-3
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-LINEAR_TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.linear-attention.v4.layer.fp16."
-    "gguf-q4-k-m.tokens-24"
-)
-FULL_ATTENTION_TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.full-attention.v2.layer.fp16."
-    "gguf-q4-k-m.tokens-24"
-)
-FULL_MODEL_TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.full-model.v1.full-model.fp16."
-    "gguf-q4-k-m.tokens-24"
-)
-LOGITS_TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.full-vocab-logits.v1.full-vocab-logits."
-    "fp16.gguf-q4-k-m.tokens-24"
-)
+LINEAR_TOLERANCE_ID = linear_attention_gate.TOLERANCE_ID
+FULL_ATTENTION_TOLERANCE_ID = full_attention_gate.TOLERANCE_ID
+FULL_MODEL_TOLERANCE_ID = model_reference_gate.FULL_MODEL_TOLERANCE_ID
+LOGITS_TOLERANCE_ID = model_reference_gate.LOGITS_TOLERANCE_ID
 TOKEN_CASE_FIELDS = frozenset(
     {
         "prompt_id",
@@ -156,16 +147,31 @@ def current_source_identity(*, require_clean: bool = False) -> tuple[str, str, s
     )
 
 
-def validate_reference_path(gate: dict[str, Any], gate_path: Path, label: str) -> None:
+def validate_reference_path(
+    gate: dict[str, Any],
+    gate_path: Path,
+    label: str,
+    source_git_sha: str,
+) -> tuple[Path, dict[str, Any]]:
     reference = gate.get("reference_artifact")
     require(isinstance(reference, str), f"{label} reference artifact is missing")
-    report = Path(reference) / "report.json"
-    require(report.is_file(), f"{label} reference report is unavailable")
+    artifact_dir = Path(reference).expanduser().resolve()
+    report_path = artifact_dir / "report.json"
+    require(report_path.is_file(), f"{label} reference report is unavailable")
     require(
-        gate.get("reference_report_sha256") == sha256_file(report),
+        gate.get("reference_report_sha256") == sha256_file(report_path),
         f"{label} reference report SHA differs",
     )
     require(gate_path.is_file(), f"{label} gate file is unavailable")
+    report = read_json(report_path)
+    require(isinstance(report, dict), f"{label} reference report must be an object")
+    actual = report.get("actual")
+    require(isinstance(actual, dict), f"{label} reference report actual capture is missing")
+    require(
+        actual.get("git_sha") == source_git_sha,
+        f"{label} actual capture source SHA is stale",
+    )
+    return artifact_dir, report
 
 
 def validate_child_gate(
@@ -174,6 +180,7 @@ def validate_child_gate(
     label: str,
     source_git_sha: str,
     catalog_blob: str,
+    raw_validator: Callable[[Path, dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
     path = path.expanduser().resolve()
     gate = read_json(path)
@@ -183,7 +190,14 @@ def validate_child_gate(
     require(gate.get("catalog_git_blob_sha") == catalog_blob, f"{label} catalog blob is stale")
     compared = gate.get("compared_catalog_commits")
     require(isinstance(compared, list) and source_git_sha in compared, f"{label} widening history is incomplete")
-    validate_reference_path(gate, path, label)
+    artifact_dir, report = validate_reference_path(gate, path, label, source_git_sha)
+    try:
+        raw_validation = raw_validator(artifact_dir, report)
+    except linear_attention_gate.GateError as error:
+        raise GateError(f"{label} raw reference validation failed: {error}") from error
+    require(isinstance(raw_validation, dict), f"{label} raw validator result is invalid")
+    for key, expected in raw_validation.items():
+        require(gate.get(key) == expected, f"{label} canonical validation field differs: {key}")
     return gate
 
 
@@ -442,15 +456,54 @@ def validate_and_write(
     token_parity_path: Path,
     out: Path,
     require_clean: bool = True,
+    child_raw_validators: dict[
+        str, Callable[[Path, dict[str, Any]], dict[str, Any]]
+    ] | None = None,
 ) -> dict[str, Any]:
     source_git_sha, source_tree_sha, catalog_blob, catalog_summary = current_source_identity(
         require_clean=require_clean
     )
-    op_receipt = op_numerics.validate_receipt(op_artifact, git_revision=source_git_sha)
-    linear = validate_child_gate(linear_gate_path, label="linear-attention", source_git_sha=source_git_sha, catalog_blob=catalog_blob)
-    full_attention = validate_child_gate(full_attention_gate_path, label="full-attention", source_git_sha=source_git_sha, catalog_blob=catalog_blob)
-    model = validate_child_gate(model_gate_path, label="full-model", source_git_sha=source_git_sha, catalog_blob=catalog_blob)
     rows = {row["tolerance_id"]: row for row in catalog_summary["catalog"]["rows"]}
+    validators = child_raw_validators or {
+        "linear-attention": lambda artifact_dir, report: linear_attention_gate.validate_report(
+            artifact_dir, report, rows[LINEAR_TOLERANCE_ID]
+        ),
+        "full-attention": lambda artifact_dir, report: full_attention_gate.validate_report(
+            artifact_dir, report, rows[FULL_ATTENTION_TOLERANCE_ID]
+        ),
+        "full-model": lambda artifact_dir, report: model_reference_gate.validate_report(
+            artifact_dir,
+            report,
+            rows[FULL_MODEL_TOLERANCE_ID],
+            rows[LOGITS_TOLERANCE_ID],
+        ),
+    }
+    require(
+        set(validators) == {"linear-attention", "full-attention", "full-model"},
+        "child raw validator set differs",
+    )
+    op_receipt = op_numerics.validate_receipt(op_artifact, git_revision=source_git_sha)
+    linear = validate_child_gate(
+        linear_gate_path,
+        label="linear-attention",
+        source_git_sha=source_git_sha,
+        catalog_blob=catalog_blob,
+        raw_validator=validators["linear-attention"],
+    )
+    full_attention = validate_child_gate(
+        full_attention_gate_path,
+        label="full-attention",
+        source_git_sha=source_git_sha,
+        catalog_blob=catalog_blob,
+        raw_validator=validators["full-attention"],
+    )
+    model = validate_child_gate(
+        model_gate_path,
+        label="full-model",
+        source_git_sha=source_git_sha,
+        catalog_blob=catalog_blob,
+        raw_validator=validators["full-model"],
+    )
     require(linear.get("tolerance_id") == LINEAR_TOLERANCE_ID and linear.get("row_fingerprint") == rows[LINEAR_TOLERANCE_ID]["row_fingerprint"], "linear-attention row binding differs")
     require(full_attention.get("tolerance_id") == FULL_ATTENTION_TOLERANCE_ID and full_attention.get("row_fingerprint") == rows[FULL_ATTENTION_TOLERANCE_ID]["row_fingerprint"], "full-attention row binding differs")
     require(
@@ -666,7 +719,7 @@ def self_test() -> None:
         root = Path(temporary)
         reference = root / "reference"
         reference.mkdir()
-        (reference / "report.json").write_text("{}\n", encoding="utf-8")
+        write_json(reference / "report.json", {"actual": {"git_sha": source_git_sha}})
         linear = root / "linear.json"
         full_attention = root / "full-attention.json"
         model = root / "model.json"
@@ -747,6 +800,11 @@ def self_test() -> None:
             token_parity_path=parity_path,
             out=aggregate_out,
             require_clean=False,
+            child_raw_validators={
+                "linear-attention": lambda _artifact_dir, _report: {},
+                "full-attention": lambda _artifact_dir, _report: {},
+                "full-model": lambda _artifact_dir, _report: {},
+            },
         )
         require(
             aggregate["summary"]["operation_state_row_count"] == 27
@@ -754,6 +812,44 @@ def self_test() -> None:
             and (aggregate_out / "manifest.json").is_file(),
             "aggregate fixture output differs",
         )
+
+        stale_report = {"actual": {"git_sha": "0" * 40}}
+        write_json(reference / "report.json", stale_report)
+        stale_gate = read_json(linear)
+        stale_gate["reference_report_sha256"] = sha256_file(reference / "report.json")
+        write_json(linear, stale_gate)
+        try:
+            validate_child_gate(
+                linear,
+                label="linear-attention",
+                source_git_sha=source_git_sha,
+                catalog_blob=catalog_blob,
+                raw_validator=lambda _artifact_dir, _report: {},
+            )
+        except GateError as error:
+            require("source sha is stale" in str(error).lower(), "wrong stale capture rejection")
+        else:
+            raise GateError("stale actual capture unexpectedly passed")
+
+        write_json(reference / "report.json", {"actual": {"git_sha": source_git_sha}})
+        forged_gate = read_json(linear)
+        forged_gate["reference_report_sha256"] = sha256_file(reference / "report.json")
+        write_json(linear, forged_gate)
+        try:
+            validate_child_gate(
+                linear,
+                label="linear-attention",
+                source_git_sha=source_git_sha,
+                catalog_blob=catalog_blob,
+                raw_validator=lambda _artifact_dir, _report: {"metrics": {"forged": True}},
+            )
+        except GateError as error:
+            require(
+                "canonical validation field differs" in str(error).lower(),
+                "wrong forged child-gate rejection",
+            )
+        else:
+            raise GateError("forged child gate unexpectedly passed")
     print(SELFTEST_PASS)
 
 
