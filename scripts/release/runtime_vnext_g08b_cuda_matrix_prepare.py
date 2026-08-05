@@ -604,7 +604,7 @@ def bind_cuda_correctness_artifact(
         "source_observations": {"before": before, "after": after},
         "binary_artifact": binary_ref,
         "binary_sha256": binary_sha,
-        "native_operator_set_lock": native_operator_set_lock_identity(
+        "native_operator_set_lock": matrix.native_operator_set_lock_identity(
             staged_native_lock
         ),
         "correctness_build_manifest": matrix.existing_artifact_ref(
@@ -818,6 +818,11 @@ def self_test(spec: BackendSpec) -> None:
                 == (root / matrix.CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL).resolve()
                 and len(staged_native["_members"]) > 1,
                 "CUDA self-test native operator closure was not staged canonically",
+            )
+            require(
+                matrix.native_operator_set_lock_identity(native_lock)["sha256"]
+                == matrix.file_sha256(native_lock),
+                "CUDA self-test native operator lock identity drifted",
             )
             broken_native_root = root / "broken-native"
             shutil.copytree(native_lock.parent, broken_native_root)
