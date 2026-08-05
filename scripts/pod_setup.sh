@@ -33,7 +33,7 @@ timeout 1200 apt-get install -y -qq \
 log "▶ Rust toolchain"
 if [ ! -d "$HOME/.cargo" ]; then
     timeout 300 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain stable --profile minimal
+        | sh -s -- -y --default-toolchain 1.91.0 --profile minimal
 fi
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"

@@ -54,9 +54,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config build-essential ffmpeg
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
         with:
-          components: rustfmt, clippy
+          components: rustfmt, clippy, rust-src
 
       - uses: actions/cache@v3
         with:
@@ -198,7 +198,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.91.0
 
       - uses: actions/cache@v3
         with:
@@ -247,7 +247,7 @@ jobs:
         run: |
           apt-get update
           apt-get install -y curl build-essential pkg-config libssl-dev git
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.91.0
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - uses: actions/checkout@v4
