@@ -62,6 +62,7 @@ pub use maintenance_boundary::*;
 mod lane_stable_arena;
 use lane_stable_arena::*;
 mod dynamic_pool_set;
+pub use dynamic_pool_set::DynamicPoolGrowthBatchReceipt;
 use dynamic_pool_set::DynamicPoolSet;
 mod dynamic_pool_maintenance;
 pub use dynamic_pool_maintenance::*;

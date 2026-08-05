@@ -3,11 +3,10 @@ use super::{
     BackingChunkIdentity, BackingSegment, BufferDescriptor, BufferUsage, CapacityDomainId,
     CapacityEntry, CapacityEpochs, CapacityUnits, CapacityVector, CapacityWaitCondition,
     DeviceBufferRetention, DeviceCapacityAvailabilitySnapshot, DeviceCapacityGrant, DeviceRuntime,
-    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicPoolMaintenanceBoundaryReceipt,
-    DynamicResourceDescriptor, DynamicResourceShape, DynamicStorageAllocator,
-    DynamicStorageProfile, ElementType, ExecutionLaneId, FreeExtentIndex, InvocationLivenessMode,
-    LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex, Ordering, PlanNode,
-    ResourceId, Serialize, StateInitialization, VNextError,
+    DynamicBackingPoolId, DynamicBackingPoolSpec, DynamicResourceDescriptor, DynamicResourceShape,
+    DynamicStorageAllocator, DynamicStorageProfile, ElementType, ExecutionLaneId, FreeExtentIndex,
+    InvocationLivenessMode, LogicalAdmissionCoordinator, LogicalAdmissionCoordinatorId, Mutex,
+    Ordering, PlanNode, ResourceId, Serialize, StateInitialization, VNextError,
 };
 use crate::vnext::{
     DeviceCapacityPressure, DeviceReusableAddressScope, DynamicPoolProvisioningPolicy,
@@ -1120,17 +1119,6 @@ impl DynamicPoolGrowthRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DynamicPoolGrowthBatchReceipt {
-    pub(super) coordinator_id: LogicalAdmissionCoordinatorId,
-    pub(super) growths: Vec<DynamicPoolGrowthReceipt>,
-    pub(super) capacity_epoch: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) rebalance: Option<DynamicPoolRebalanceReceipt>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(super) maintenance_boundary: Option<DynamicPoolMaintenanceBoundaryReceipt>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DynamicBackingDeferralReason {
@@ -1533,28 +1521,6 @@ impl DynamicBackingDeferred {
     /// maintenance rebalances unreferenced chunks for this deferred bundle.
     pub fn protected_packing_envelopes(&self) -> &[DynamicBackingPackingEnvelope] {
         &self.protected_packing_envelopes
-    }
-}
-
-impl DynamicPoolGrowthBatchReceipt {
-    pub const fn coordinator_id(&self) -> LogicalAdmissionCoordinatorId {
-        self.coordinator_id
-    }
-
-    pub fn growths(&self) -> &[DynamicPoolGrowthReceipt] {
-        &self.growths
-    }
-
-    pub const fn capacity_epoch(&self) -> u64 {
-        self.capacity_epoch
-    }
-
-    pub const fn rebalance(&self) -> Option<&DynamicPoolRebalanceReceipt> {
-        self.rebalance.as_ref()
-    }
-
-    pub const fn maintenance_boundary(&self) -> Option<&DynamicPoolMaintenanceBoundaryReceipt> {
-        self.maintenance_boundary.as_ref()
     }
 }
 
