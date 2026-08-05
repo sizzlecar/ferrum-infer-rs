@@ -193,6 +193,36 @@ def resolve_ref(
     return path, ref
 
 
+def resolve_typed_ref(
+    root: Path,
+    value: Any,
+    label: str,
+    *,
+    expected_kind: str,
+) -> tuple[Path, dict[str, Any]]:
+    require(isinstance(value, dict), f"{label} reference must be an object")
+    ref = dict(value)
+    require(
+        set(ref) == {"path", "sha256", "size_bytes", "kind"},
+        f"{label} reference field set mismatch",
+    )
+    require(
+        isinstance(ref.get("kind"), str)
+        and ref["kind"] == expected_kind,
+        f"{label} reference kind mismatch",
+    )
+    path, _ = resolve_ref(
+        root,
+        {
+            "path": ref["path"],
+            "sha256": ref["sha256"],
+            "size_bytes": ref["size_bytes"],
+        },
+        label,
+    )
+    return path, ref
+
+
 def external_ref(path: Path) -> dict[str, Any]:
     resolved = path.expanduser().resolve()
     return {
@@ -458,15 +488,17 @@ def validate_timing_evidence(
     manifest_path = root / "evidence.manifest.json"
     manifest = read_json(manifest_path, "G07A timing evidence manifest")
     timing_source = require_source(manifest.get("source"), source, "G07A timing")
-    g00f_copy, _ = resolve_ref(
+    g00f_copy, _ = resolve_typed_ref(
         root,
         manifest.get("inputs", {}).get("g00f"),
         "timing G00F input",
+        expected_kind="input-manifest",
     )
-    s1_copy, _ = resolve_ref(
+    s1_copy, _ = resolve_typed_ref(
         root,
         manifest.get("inputs", {}).get("s1"),
         "timing S1 input",
+        expected_kind="input-manifest",
     )
     require(
         sha256(g00f_copy) == g00f["manifest"]["sha256"]
@@ -621,15 +653,17 @@ def verify_checkpoint_manifest(
         raw_root / "evidence.manifest.json",
         "G07A raw timing manifest",
     )
-    raw_crate_graph, _ = resolve_ref(
+    raw_crate_graph, _ = resolve_typed_ref(
         raw_root,
         raw_manifest.get("crate_graph"),
         "raw crate graph",
+        expected_kind="cargo-metadata",
     )
-    raw_invalidation, _ = resolve_ref(
+    raw_invalidation, _ = resolve_typed_ref(
         raw_root,
         raw_manifest.get("invalidation_report"),
         "raw invalidation report",
+        expected_kind="invalidation-report",
     )
     artifacts = manifest.get("artifacts")
     require(
@@ -729,15 +763,17 @@ def build_checkpoint(
         raw_root / "evidence.manifest.json",
         "G07A raw timing manifest",
     )
-    raw_crate_graph, _ = resolve_ref(
+    raw_crate_graph, _ = resolve_typed_ref(
         raw_root,
         raw_manifest.get("crate_graph"),
         "raw crate graph",
+        expected_kind="cargo-metadata",
     )
-    raw_invalidation, _ = resolve_ref(
+    raw_invalidation, _ = resolve_typed_ref(
         raw_root,
         raw_manifest.get("invalidation_report"),
         "raw invalidation report",
+        expected_kind="invalidation-report",
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
@@ -851,6 +887,35 @@ def self_test() -> int:
         require(
             resolved == payload.resolve(),
             "selftest payload did not resolve",
+        )
+        typed_ref = {**ref, "kind": "selftest-payload"}
+        typed_resolved, _ = resolve_typed_ref(
+            root,
+            typed_ref,
+            "typed selftest payload",
+            expected_kind="selftest-payload",
+        )
+        require(
+            typed_resolved == payload.resolve(),
+            "typed selftest payload did not resolve",
+        )
+        expect_reject(
+            lambda: resolve_typed_ref(
+                root,
+                ref,
+                "untyped selftest payload",
+                expected_kind="selftest-payload",
+            ),
+            "untyped selftest payload",
+        )
+        expect_reject(
+            lambda: resolve_typed_ref(
+                root,
+                typed_ref,
+                "wrong-kind selftest payload",
+                expected_kind="other-payload",
+            ),
+            "wrong-kind selftest payload",
         )
         bad_sha = dict(ref)
         bad_sha["sha256"] = "0" * 64
