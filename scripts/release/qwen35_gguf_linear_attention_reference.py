@@ -19,6 +19,8 @@ from typing import Any
 
 PASS_PREFIX = "QWEN35 GGUF LINEAR ATTENTION REFERENCE PASS"
 SELF_TEST_PASS = "QWEN35 GGUF LINEAR ATTENTION REFERENCE SELF-TEST PASS"
+LEGACY_CAPTURE_MODEL_ID = "Qwen3.5-4B-Q4_K_M"
+V3_CAPTURE_MODEL_ID = "unsloth/Qwen3.5-4B-GGUF"
 VALUE_ID = "value.layer.0.attention"
 HIDDEN_SIZE = 2560
 VOCABULARY_SIZE = 248320
@@ -248,6 +250,15 @@ def validate_ferrum_capture_schema(plan: Any, wave: Any) -> int:
     return schema_version
 
 
+def require_reviewed_capture_model_id(plan: dict[str, Any], schema_version: int) -> None:
+    expected = V3_CAPTURE_MODEL_ID if schema_version >= 3 else LEGACY_CAPTURE_MODEL_ID
+    require(
+        plan.get("model_id") == expected,
+        f"Ferrum schema-v{schema_version} capture model_id is not the reviewed "
+        "Qwen3.5 fixture",
+    )
+
+
 def load_ferrum_checkpoint(
     capture_dir: Path, token_count: int
 ) -> tuple[Path, dict[str, Any]]:
@@ -257,15 +268,14 @@ def load_ferrum_checkpoint(
     require(len(wave_paths) == 1, "expected exactly one Ferrum capture wave")
     plan = load_json(plan_path)
     wave = load_json(wave_paths[0])
-    validate_ferrum_capture_schema(plan, wave)
+    schema_version = validate_ferrum_capture_schema(plan, wave)
     require(wave.get("wave_kind") == "prefill", "Ferrum checkpoint must be prefill")
     require(wave.get("participant_count") == 1,
             "Ferrum checkpoint must contain exactly one participant")
     for key in ("plan_id", "plan_hash", "model_id", "family_fingerprint",
                 "program_fingerprint", "run_id"):
         require(plan.get(key) == wave.get(key), f"Ferrum {key} differs across plan/wave")
-    require(plan.get("model_id") == "Qwen3.5-4B-Q4_K_M",
-            "Ferrum capture model_id is not the reviewed Qwen3.5 fixture")
+    require_reviewed_capture_model_id(plan, schema_version)
 
     records = wave.get("records")
     require(isinstance(records, list), "Ferrum wave records must be a list")
@@ -803,6 +813,20 @@ def self_test() -> None:
         schema3_wave = {"schema_version": 3, "product_outputs": []}
         require(validate_ferrum_capture_schema(schema3_plan, schema3_wave) == 3,
                 "schema-v3 prefill capture was not accepted")
+        require_reviewed_capture_model_id(
+            {"model_id": V3_CAPTURE_MODEL_ID}, 3
+        )
+        require_reviewed_capture_model_id(
+            {"model_id": LEGACY_CAPTURE_MODEL_ID}, 2
+        )
+        try:
+            require_reviewed_capture_model_id(
+                {"model_id": LEGACY_CAPTURE_MODEL_ID}, 3
+            )
+        except ReferenceError as error:
+            require("schema-v3" in str(error), "wrong schema-v3 model rejection")
+        else:
+            raise ReferenceError("legacy model_id unexpectedly passed schema-v3")
         rejected_product = dict(schema3_plan)
         rejected_product["capture_product_output"] = True
         try:
