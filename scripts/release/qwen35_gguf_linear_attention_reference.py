@@ -225,6 +225,29 @@ def load_token_ids(path: Path) -> list[int]:
     return token_ids
 
 
+def validate_ferrum_capture_schema(plan: Any, wave: Any) -> int:
+    require(isinstance(plan, dict) and isinstance(wave, dict),
+            "Ferrum plan and wave must be JSON objects")
+    schema_version = plan.get("schema_version")
+    require(isinstance(schema_version, int) and not isinstance(schema_version, bool)
+            and schema_version in (1, 2, 3),
+            "unsupported Ferrum plan schema")
+    require(wave.get("schema_version") == schema_version,
+            "unsupported Ferrum wave schema")
+    if schema_version >= 2:
+        maximum_decode_waves = plan.get("maximum_decode_waves")
+        require(isinstance(maximum_decode_waves, int)
+                and not isinstance(maximum_decode_waves, bool)
+                and maximum_decode_waves == 0,
+                "numerical reference capture must not include decode waves")
+    if schema_version >= 3:
+        require(plan.get("capture_product_output") is False,
+                "numerical reference capture must not include product outputs")
+        require(wave.get("product_outputs") == [],
+                "numerical reference wave product outputs must be empty")
+    return schema_version
+
+
 def load_ferrum_checkpoint(
     capture_dir: Path, token_count: int
 ) -> tuple[Path, dict[str, Any]]:
@@ -234,13 +257,7 @@ def load_ferrum_checkpoint(
     require(len(wave_paths) == 1, "expected exactly one Ferrum capture wave")
     plan = load_json(plan_path)
     wave = load_json(wave_paths[0])
-    require(isinstance(plan, dict) and isinstance(wave, dict),
-            "Ferrum plan and wave must be JSON objects")
-    require(plan.get("schema_version") in (1, 2), "unsupported Ferrum plan schema")
-    require(
-        wave.get("schema_version") == plan.get("schema_version"),
-        "unsupported Ferrum wave schema",
-    )
+    validate_ferrum_capture_schema(plan, wave)
     require(wave.get("wave_kind") == "prefill", "Ferrum checkpoint must be prefill")
     require(wave.get("participant_count") == 1,
             "Ferrum checkpoint must contain exactly one participant")
@@ -777,6 +794,23 @@ def self_test() -> None:
         )
         require(identity == {"repository": "owner/model", "revision": "a" * 40},
                 "Hugging Face snapshot identity parsing failed")
+
+        schema3_plan = {
+            "schema_version": 3,
+            "maximum_decode_waves": 0,
+            "capture_product_output": False,
+        }
+        schema3_wave = {"schema_version": 3, "product_outputs": []}
+        require(validate_ferrum_capture_schema(schema3_plan, schema3_wave) == 3,
+                "schema-v3 prefill capture was not accepted")
+        rejected_product = dict(schema3_plan)
+        rejected_product["capture_product_output"] = True
+        try:
+            validate_ferrum_capture_schema(rejected_product, schema3_wave)
+        except ReferenceError as error:
+            require("product outputs" in str(error), "wrong schema-v3 product rejection")
+        else:
+            raise ReferenceError("schema-v3 product capture unexpectedly passed")
     print(SELF_TEST_PASS)
 
 
