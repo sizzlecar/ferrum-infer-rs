@@ -362,7 +362,9 @@
       "id": "vnext-cuda-provider-runtime",
       "path_globs": [
         "crates/ferrum-kernels/src/backend/cuda/vnext_*.rs",
-        "crates/ferrum-kernels/src/backend/cuda/vnext_*/**"
+        "crates/ferrum-kernels/src/backend/cuda/vnext_*/**",
+        "crates/ferrum-kernels/kernels/*.cu",
+        "crates/ferrum-kernels/kernels/*.cuh"
       ],
       "domains": ["vnext_cuda_provider", "cuda_backend"],
       "required_gates": [
@@ -402,6 +404,28 @@
       "exceptions": [],
       "owner": "cuda",
       "reason": "vNext CUDA provider, replay, and operation changes invalidate CUDA product witnesses but require only a cheap Metal boundary check"
+    },
+    {
+      "id": "vnext-cuda-determinism-evidence",
+      "path_globs": [
+        "crates/ferrum-cli/src/commands/vnext_determinism.rs",
+        "crates/ferrum-kernels/tests/cuda_vnext_replay_contract_test.rs"
+      ],
+      "domains": ["vnext_determinism_evidence", "evidence_schema"],
+      "required_gates": [
+        "unit",
+        "planner_selftest",
+        "release_validator_selftest",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_cuda_product_contract"
+      ],
+      "release_invalidation": [
+        "vnext_s2_m1_determinism",
+        "vnext_s2_cuda_product_contract"
+      ],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "the CUDA determinism command and replay contract tests define evidence collection rather than run or serve product behavior"
     },
     {
       "id": "vnext-s2-aggregate-validator",
