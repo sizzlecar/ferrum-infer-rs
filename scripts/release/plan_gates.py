@@ -10,7 +10,7 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -37,13 +37,6 @@ SAFE_ENV_PREFIXES = ("CARGO_", "FERRUM_", "HF_", "RUST_")
 
 class PlannerError(RuntimeError):
     pass
-
-
-def repo_rel(path: Path) -> str:
-    try:
-        return path.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
-    except ValueError:
-        return path.as_posix()
 
 
 def run_git(args: list[str]) -> str:
@@ -107,10 +100,22 @@ def sanitized_env() -> dict[str, str]:
 def normalize_changed_files(files: list[str]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
+    repo_root = REPO_ROOT.resolve()
     for item in files:
-        rel = repo_rel(Path(item)) if item.startswith("/") else item
-        rel = rel.strip().lstrip("./")
-        if rel and rel not in seen:
+        raw = item.strip()
+        if not raw:
+            continue
+        path = PurePosixPath(raw)
+        if any(part == ".." for part in path.parts):
+            raise PlannerError(f"changed file path escapes repository: {raw}")
+        if path.is_absolute():
+            try:
+                rel = Path(path.as_posix()).resolve().relative_to(repo_root).as_posix()
+            except ValueError as error:
+                raise PlannerError(f"changed file path is outside repository: {raw}") from error
+        else:
+            rel = path.as_posix()
+        if rel != "." and rel not in seen:
             seen.add(rel)
             out.append(rel)
     return sorted(out)
@@ -552,19 +557,45 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
     fixtures = load_fixture_data(fixtures_path)
     for fixture in fixtures:
         fid = str(fixture.get("id"))
-        plan = plan_from_files(
-            changed_files=list(fixture.get("changed_files") or []),
-            base_sha="fixture-base",
-            head_sha="fixture-head",
-            dirty=False,
-            rules=rules,
-            previous_artifacts=list(fixture.get("previous_artifacts") or []),
-            required_gate_overrides=FINAL_STAGE_GATES
-            if fixture.get("require_final_stage_gates")
-            else set(),
-        )
+        expected_error = fixture.get("expect_error_contains")
+        try:
+            plan = plan_from_files(
+                changed_files=list(fixture.get("changed_files") or []),
+                base_sha="fixture-base",
+                head_sha="fixture-head",
+                dirty=False,
+                rules=rules,
+                previous_artifacts=list(fixture.get("previous_artifacts") or []),
+                required_gate_overrides=FINAL_STAGE_GATES
+                if fixture.get("require_final_stage_gates")
+                else set(),
+            )
+        except PlannerError as error:
+            message = str(error)
+            fixture_failures = []
+            if not isinstance(expected_error, str) or expected_error not in message:
+                fixture_failures.append(f"unexpected planner error: {message}")
+            if fixture_failures:
+                failures.extend(f"{fid}: {failure}" for failure in fixture_failures)
+            fixture_results.append(
+                {
+                    "id": fid,
+                    "status": "pass" if not fixture_failures else "fail",
+                    "plan_status": "error",
+                    "impact_domains": [],
+                    "required_gates": [],
+                    "required_product_scenarios": [],
+                    "unknown_files": [],
+                    "invalidated_previous_gates": [],
+                    "error": message,
+                    "failures": fixture_failures,
+                }
+            )
+            continue
         release_candidate = release_candidate_manifest(plan)
         fixture_failures: list[str] = []
+        if expected_error is not None:
+            fixture_failures.append(f"expected planner error containing {expected_error!r}")
         expected_status = fixture.get("expect_status", "pass")
         if plan["status"] != expected_status:
             fixture_failures.append(f"status {plan['status']!r} != {expected_status!r}")
@@ -585,6 +616,10 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
         if "expect_unknown_files" in fixture and plan["unknown_files"] != fixture["expect_unknown_files"]:
             fixture_failures.append(
                 f"unknown_files {plan['unknown_files']!r} != {fixture['expect_unknown_files']!r}"
+            )
+        if "expect_changed_files" in fixture and plan["changed_files"] != fixture["expect_changed_files"]:
+            fixture_failures.append(
+                f"changed_files {plan['changed_files']!r} != {fixture['expect_changed_files']!r}"
             )
         if "expect_invalidated" in fixture and plan["invalidated_previous_gates"] != fixture["expect_invalidated"]:
             fixture_failures.append(

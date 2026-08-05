@@ -109,7 +109,10 @@
     },
     {
       "id": "types-api-request-contract",
-      "path_globs": ["crates/ferrum-types/src/requests.rs"],
+      "path_globs": [
+        "crates/ferrum-types/src/requests.rs",
+        "crates/ferrum-sampler/src/structured_output.rs"
+      ],
       "domains": ["api_contract", "tool_protocol", "structured_output"],
       "required_gates": [
         "unit",
@@ -571,9 +574,12 @@
     {
       "id": "release-gates",
       "path_globs": [
+        ".github/workflows/**",
         "scripts/release/**",
         "scripts/m3_ab_runner.py",
-        "scripts/m3_validate_runner_artifact.py"
+        "scripts/m3_validate_runner_artifact.py",
+        "scripts/phase-e-verify.sh",
+        "scripts/pod_*.sh"
       ],
       "domains": ["release_gate"],
       "required_gates": ["release_validator_selftest"],
@@ -627,7 +633,14 @@
     },
     {
       "id": "workspace-build-config",
-      "path_globs": ["Cargo.toml", "Cargo.lock", "crates/*/Cargo.toml", "ferrum.toml"],
+      "path_globs": [
+        ".cargo/**",
+        "Cargo.toml",
+        "Cargo.lock",
+        "crates/*/Cargo.toml",
+        "ferrum.toml",
+        "rust-toolchain.toml"
+      ],
       "domains": ["shared_runtime", "release_gate"],
       "required_gates": ["unit", "backend_boundary", "preset_snapshot", "metal_sentinel", "cuda_sentinel"],
       "release_invalidation": ["unit", "preset_snapshot", "metal_sentinel", "cuda_sentinel", "metal_full", "cuda_full"],

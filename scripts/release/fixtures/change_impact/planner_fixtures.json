@@ -46,6 +46,63 @@
       ]
     },
     {
+      "id": "structured_output_contract",
+      "changed_files": ["crates/ferrum-sampler/src/structured_output.rs"],
+      "expect_domains": ["api_contract", "tool_protocol", "structured_output"],
+      "expect_required_gates": [
+        "run_scenarios_selftest",
+        "run_sentinel",
+        "serve_sentinel",
+        "bench_serve_correctness",
+        "product_sentinel"
+      ],
+      "expect_unknown_files": []
+    },
+    {
+      "id": "hidden_workflow_path_normalization",
+      "changed_files": [
+        ".github/workflows/ci.yml",
+        "./.github/workflows/ci.yml"
+      ],
+      "expect_changed_files": [".github/workflows/ci.yml"],
+      "expect_domains": ["release_gate"],
+      "expect_required_gates": ["release_validator_selftest"],
+      "expect_unknown_files": []
+    },
+    {
+      "id": "root_release_scripts",
+      "changed_files": [
+        "scripts/phase-e-verify.sh",
+        "scripts/pod_setup.sh"
+      ],
+      "expect_domains": ["release_gate"],
+      "expect_required_gates": ["release_validator_selftest"],
+      "expect_unknown_files": []
+    },
+    {
+      "id": "workspace_toolchain_and_hidden_config",
+      "changed_files": ["rust-toolchain.toml", ".cargo/config.toml"],
+      "expect_domains": ["shared_runtime", "release_gate"],
+      "expect_required_gates": [
+        "unit",
+        "backend_boundary",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ],
+      "expect_unknown_files": []
+    },
+    {
+      "id": "relative_parent_traversal_rejected",
+      "changed_files": ["../outside.py"],
+      "expect_error_contains": "changed file path escapes repository"
+    },
+    {
+      "id": "absolute_outside_path_rejected",
+      "changed_files": ["/private/tmp/ferrum-outside.py"],
+      "expect_error_contains": "changed file path is outside repository"
+    },
+    {
       "id": "kv_manager",
       "changed_files": ["crates/ferrum-kv/src/managers/paged.rs"],
       "expect_domains": ["shared_runtime"],
