@@ -131,7 +131,7 @@ CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS = (
 )
 CUDA_CORRECTNESS_BUILD_MODE = "cuda-correctness-cache-only"
 CUDA_CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
-CUDA_CORRECTNESS_SCHEMA_VERSION = 5
+CUDA_CORRECTNESS_SCHEMA_VERSION = 6
 CUDA_RELEASE_PLAN_REFERENCE_TYPE = plan_reference.ARTIFACT_TYPE
 CUDA_RELEASE_PLAN_REFERENCE_CASE = plan_reference.CASE_ID
 CUDA_RELEASE_PLAN_REFERENCE_MODEL = plan_reference.MODEL_KEY
@@ -1194,6 +1194,31 @@ def validate_cuda_correctness_build_artifact(
         manifest.get("native_source_policy") == "cache-only",
         "CUDA correctness build did not enforce cache-only native sources",
     )
+    portable_native_lock_path = validate_plain_artifact_ref(
+        root,
+        manifest.get("native_operator_set_artifact"),
+        "CUDA correctness portable native operator set lock",
+    )
+    try:
+        portable_native_set = native_operator_set.validate_native_operator_set(
+            portable_native_lock_path,
+            CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+    except native_operator_set.NativeOperatorSetEvidenceError as error:
+        raise ScenarioError(
+            f"CUDA correctness portable native operator set is invalid: {error}"
+        ) from error
+    native_operator_set_identity = require_object(
+        manifest.get("native_operator_set_lock"),
+        "CUDA correctness native operator set identity",
+    )
+    require(
+        portable_native_set["lock_sha256"]
+        == native_operator_set_identity.get("sha256")
+        and portable_native_set["lock_size_bytes"]
+        == native_operator_set_identity.get("size_bytes"),
+        "CUDA correctness portable native operator set differs from the build input",
+    )
     require(
         1 <= require_count(manifest.get("cargo_jobs"), "CUDA correctness cargo_jobs", minimum=1) <= 16,
         "CUDA correctness Cargo job count is unsafe",
@@ -1238,6 +1263,7 @@ def validate_cuda_correctness_build_artifact(
         "native_build_cache",
         "native_import_dirs",
         "native_operator_set_lock",
+        "native_operator_set_artifact",
         "semantic_plan_contract",
     ):
         expected_value = (
@@ -1420,6 +1446,72 @@ def validate_cuda_correctness_build_artifact(
     return manifest, binary_path, binary_sha
 
 
+def validate_candidate_cuda_native_operator_set(
+    root: Path,
+    receipt: dict[str, Any],
+) -> tuple[Path, dict[str, Any], Path]:
+    recorded_artifact_root = Path(
+        require_string(
+            receipt.get("artifact_root"),
+            "candidate CUDA build artifact_root",
+        )
+    )
+    require(
+        recorded_artifact_root.is_absolute(),
+        "candidate CUDA build artifact_root must be absolute",
+    )
+    recorded_lock = require_object(
+        receipt.get("native_operator_set_lock"),
+        "candidate CUDA native operator set lock",
+    )
+    require(
+        set(recorded_lock) == {"path", "sha256", "size_bytes", "mtime_ns"}
+        and Path(
+            require_string(
+                recorded_lock.get("path"),
+                "candidate CUDA native operator set lock path",
+            )
+        ).is_absolute()
+        and require_sha256(
+            recorded_lock.get("sha256"),
+            "candidate CUDA native operator set lock sha256",
+        )
+        and require_count(
+            recorded_lock.get("size_bytes"),
+            "candidate CUDA native operator set lock size_bytes",
+            minimum=1,
+        )
+        and require_count(
+            recorded_lock.get("mtime_ns"),
+            "candidate CUDA native operator set lock mtime_ns",
+            minimum=1,
+        ),
+        "candidate CUDA native operator set lock identity is invalid",
+    )
+    require(
+        Path(recorded_lock["path"])
+        == recorded_artifact_root / CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL,
+        "candidate CUDA native operator set lock path is not canonical",
+    )
+    portable_lock = root.resolve() / CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL
+    portable_identity = native_operator_set_lock_identity(portable_lock)
+    require(
+        portable_identity["sha256"] == recorded_lock["sha256"]
+        and portable_identity["size_bytes"] == recorded_lock["size_bytes"],
+        "candidate CUDA portable native operator set lock differs from the build input",
+    )
+    try:
+        native_operator_set.validate_native_operator_set(
+            portable_lock,
+            CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+    except native_operator_set.NativeOperatorSetEvidenceError as error:
+        raise ScenarioError(
+            f"candidate CUDA native operator set closure is invalid: {error}"
+        ) from error
+    return recorded_artifact_root, recorded_lock, portable_lock
+
+
 def validate_candidate_build_receipt(
     root: Path,
     raw: Any,
@@ -1451,6 +1543,17 @@ def validate_candidate_build_receipt(
     backend = require_string(expected.get("backend"), "candidate build expected backend")
     require(backend in CANDIDATE_BUILD_COMMANDS, "candidate build expected backend is unsupported")
     require(receipt.get("backend") == backend, "candidate build receipt backend mismatch")
+    recorded_artifact_root: Path | None = None
+    native_operator_set_lock: dict[str, Any] | None = None
+    if backend == "cuda":
+        recorded_artifact_root, native_operator_set_lock, _ = (
+            validate_candidate_cuda_native_operator_set(root, receipt)
+        )
+    else:
+        require(
+            "native_operator_set_lock" not in receipt,
+            "Metal candidate build unexpectedly carries a native operator set lock",
+        )
     build_mode = receipt.get("build_mode", "release")
     if build_mode == CUDA_CORRECTNESS_BUILD_MODE:
         require(backend == "cuda", "CUDA correctness build binding is CUDA-only")
@@ -1501,19 +1604,34 @@ def validate_candidate_build_receipt(
             "CUDA correctness build manifest",
             allowed_kinds={"raw-json"},
         )
-        _, nested_binary_path, nested_binary_sha = validate_cuda_correctness_build_artifact(
-            correctness_manifest_path,
-            expected={
-                "source_git_sha": receipt["source_git_sha"],
-                "source_tree_sha": receipt["source_tree_sha"],
-                "binary_sha256": binary_sha,
-                "binary_path": binary_path,
-            },
-            allow_internal_fixture=allow_internal_fixture,
+        nested_manifest, nested_binary_path, nested_binary_sha = (
+            validate_cuda_correctness_build_artifact(
+                correctness_manifest_path,
+                expected={
+                    "source_git_sha": receipt["source_git_sha"],
+                    "source_tree_sha": receipt["source_tree_sha"],
+                    "binary_sha256": binary_sha,
+                },
+                allow_internal_fixture=allow_internal_fixture,
+            )
         )
         require(
-            nested_binary_path == binary_path and nested_binary_sha == binary_sha,
-            "CUDA correctness binding does not reference the manifest binary",
+            nested_binary_path.is_file()
+            and nested_binary_sha == binary_sha
+            and file_sha256(nested_binary_path) == file_sha256(binary_path),
+            "CUDA correctness binding binary differs from the manifest binary",
+        )
+        nested_native_lock = require_object(
+            nested_manifest.get("native_operator_set_lock"),
+            "CUDA correctness nested native operator set identity",
+        )
+        require(
+            native_operator_set_lock is not None
+            and nested_native_lock.get("sha256")
+            == native_operator_set_lock.get("sha256")
+            and nested_native_lock.get("size_bytes")
+            == native_operator_set_lock.get("size_bytes"),
+            "CUDA correctness binding native operator set differs from the manifest",
         )
         probes = require_object(
             receipt.get("probe_artifacts"),
@@ -1536,72 +1654,23 @@ def validate_candidate_build_receipt(
             )
         return receipt, receipt_path, file_sha256(receipt_path), binary_path
     require(build_mode == "release", "candidate build mode is unsupported")
-    recorded_artifact_root = Path(
-        require_string(receipt.get("artifact_root"), "candidate build artifact_root")
-    )
+    if recorded_artifact_root is None:
+        recorded_artifact_root = Path(
+            require_string(
+                receipt.get("artifact_root"),
+                "candidate build artifact_root",
+            )
+        )
     recorded_repository_root = Path(
         require_string(receipt.get("repository_root"), "candidate build repository_root")
     )
     require(recorded_artifact_root.is_absolute(), "candidate build artifact_root must be absolute")
     require(recorded_repository_root.is_absolute(), "candidate build repository_root must be absolute")
     if backend == "cuda":
-        native_operator_set_lock = require_object(
-            receipt.get("native_operator_set_lock"),
-            "candidate CUDA native operator set lock",
-        )
         require(
-            set(native_operator_set_lock)
-            == {"path", "sha256", "size_bytes", "mtime_ns"}
-            and Path(
-                require_string(
-                    native_operator_set_lock.get("path"),
-                    "candidate CUDA native operator set lock path",
-                )
-            ).is_absolute()
-            and require_sha256(
-                native_operator_set_lock.get("sha256"),
-                "candidate CUDA native operator set lock sha256",
-            )
-            and require_count(
-                native_operator_set_lock.get("size_bytes"),
-                "candidate CUDA native operator set lock size_bytes",
-                minimum=1,
-            )
-            and require_count(
-                native_operator_set_lock.get("mtime_ns"),
-                "candidate CUDA native operator set lock mtime_ns",
-                minimum=1,
-            ),
-            "candidate CUDA native operator set lock identity is invalid",
+            native_operator_set_lock is not None,
+            "candidate CUDA native operator set lock was not validated",
         )
-        recorded_native_lock_path = Path(native_operator_set_lock["path"])
-        require(
-            recorded_native_lock_path
-            == recorded_artifact_root / CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL,
-            "candidate CUDA native operator set lock path is not canonical",
-        )
-        portable_native_lock_path = (
-            root.resolve() / CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL
-        )
-        portable_native_lock = native_operator_set_lock_identity(
-            portable_native_lock_path
-        )
-        require(
-            portable_native_lock["sha256"]
-            == native_operator_set_lock["sha256"]
-            and portable_native_lock["size_bytes"]
-            == native_operator_set_lock["size_bytes"],
-            "candidate CUDA portable native operator set lock differs from the build input",
-        )
-        try:
-            native_operator_set.validate_native_operator_set(
-                portable_native_lock_path,
-                CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
-            )
-        except native_operator_set.NativeOperatorSetEvidenceError as error:
-            raise ScenarioError(
-                f"candidate CUDA native operator set closure is invalid: {error}"
-            ) from error
         build_command = [
             "env",
             (
@@ -1611,10 +1680,6 @@ def validate_candidate_build_receipt(
             *CANDIDATE_BUILD_COMMANDS[backend],
         ]
     else:
-        require(
-            "native_operator_set_lock" not in receipt,
-            "Metal candidate build unexpectedly carries a native operator set lock",
-        )
         build_command = CANDIDATE_BUILD_COMMANDS[backend]
     require(receipt.get("command") == build_command, "candidate build command is not canonical")
     require(receipt.get("returncode") == 0, "candidate build returncode must be 0")

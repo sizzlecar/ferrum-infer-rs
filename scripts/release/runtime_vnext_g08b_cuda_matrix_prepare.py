@@ -520,18 +520,32 @@ def bind_cuda_correctness_artifact(
     )
     receipt_path = root / BUILD_RECEIPT_REL
     import_root = root / CUDA_CORRECTNESS_IMPORT_REL
+    candidate_binary = root / BUILD_BINARY_REL
     require(not receipt_path.exists(), f"candidate build receipt already exists: {receipt_path}")
     require(not import_root.exists(), f"CUDA correctness import already exists: {import_root}")
+    require(not candidate_binary.exists(), f"candidate build binary already exists: {candidate_binary}")
     source_manifest = correctness_build_manifest.expanduser().resolve()
     require(source_manifest.is_file(), f"CUDA correctness build manifest is missing: {source_manifest}")
     before = source_observation(spec)
-    matrix.validate_cuda_correctness_build_artifact(
+    source_correctness, _, _ = matrix.validate_cuda_correctness_build_artifact(
         source_manifest,
         expected={
             "source_git_sha": before["source_git_sha"],
             "source_tree_sha": before["source_tree_sha"],
         },
         allow_internal_fixture=False,
+    )
+    source_native_lock = matrix.validate_plain_artifact_ref(
+        source_manifest.parent,
+        source_correctness.get("native_operator_set_artifact"),
+        "CUDA correctness portable native operator set lock",
+    )
+    staged_native_lock, staged_native_set = (
+        native_operator_set.stage_native_operator_set(
+            source_native_lock,
+            root / BUILD_DIR,
+            matrix.CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
     )
     shutil.copytree(source_manifest.parent, import_root, symlinks=False)
     copied_manifest = import_root / source_manifest.relative_to(source_manifest.parent)
@@ -547,13 +561,33 @@ def bind_cuda_correctness_artifact(
         imported["native_source_policy"] == "cache-only",
         "imported CUDA correctness artifact is not cache-only",
     )
+    imported_native_lock = matrix.validate_plain_artifact_ref(
+        import_root,
+        imported.get("native_operator_set_artifact"),
+        "imported CUDA correctness portable native operator set lock",
+    )
+    imported_native_set = native_operator_set.validate_native_operator_set(
+        imported_native_lock,
+        matrix.CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS,
+    )
+    require(
+        native_operator_set.public_identity(imported_native_set)
+        == native_operator_set.public_identity(staged_native_set),
+        "candidate native operator closure differs from the correctness artifact",
+    )
     probes = {
         name: capture_probe(root, name, argv)
         for name, argv in spec.probe_commands.items()
     }
     after = source_observation(spec)
     require(after == before, "candidate source changed during CUDA correctness artifact binding")
-    binary_ref = matrix.existing_artifact_ref(root, binary_path, "binary")
+    shutil.copy2(binary_path, candidate_binary)
+    require(
+        candidate_binary.is_file()
+        and matrix.file_sha256(candidate_binary) == binary_sha,
+        "canonical candidate binary differs from the correctness artifact",
+    )
+    binary_ref = matrix.existing_artifact_ref(root, candidate_binary, "binary")
     require(binary_ref["sha256"] == binary_sha, "imported CUDA correctness binary SHA drift")
     receipt = {
         "schema_version": matrix.SCHEMA_VERSION,
@@ -563,11 +597,16 @@ def bind_cuda_correctness_artifact(
         **before,
         "hardware_id": hardware_id,
         "backend": "cuda",
+        "artifact_root": str(root),
+        "repository_root": str(REPO_ROOT),
         "build_mode": matrix.CUDA_CORRECTNESS_BUILD_MODE,
         "bound_at": matrix.iso_now(),
         "source_observations": {"before": before, "after": after},
         "binary_artifact": binary_ref,
         "binary_sha256": binary_sha,
+        "native_operator_set_lock": native_operator_set_lock_identity(
+            staged_native_lock
+        ),
         "correctness_build_manifest": matrix.existing_artifact_ref(
             root,
             copied_manifest,
@@ -585,7 +624,7 @@ def bind_cuda_correctness_artifact(
             "hardware_id": hardware_id,
             "backend": "cuda",
             "binary_sha256": binary_sha,
-            "binary_path": binary_path,
+            "binary_path": candidate_binary,
         },
         allow_internal_fixture=False,
     )
@@ -974,7 +1013,13 @@ def main(
             )
         else:
             raise PreparationError(f"unsupported command: {args.command}")
-    except (PreparationError, matrix.ScenarioError, OSError, subprocess.SubprocessError) as error:
+    except (
+        PreparationError,
+        matrix.ScenarioError,
+        native_operator_set.NativeOperatorSetEvidenceError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as error:
         print(f"{error_label}: error: {error}", file=sys.stderr)
         return 1
     return 0
