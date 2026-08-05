@@ -339,6 +339,56 @@
       "expect_unknown_files": []
     },
     {
+      "id": "vnext_cuda_native_source",
+      "changed_files": [
+        "crates/ferrum-kernels/kernels/argmax_rows.cu"
+      ],
+      "expect_domains": ["cuda_backend", "vnext_cuda_provider"],
+      "expect_required_gates": [
+        "vnext_s1_cuda",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_response_format",
+        "vnext_s2_cuda_product_contract",
+        "cuda_sentinel",
+        "metal_boundary_smoke"
+      ],
+      "forbid_required_gates": ["metal_full"],
+      "expect_invalidated_contains": [
+        "vnext_s1_cuda",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_response_format",
+        "vnext_s2_cuda_product_contract",
+        "cuda_full"
+      ],
+      "expect_unknown_files": []
+    },
+    {
+      "id": "vnext_cuda_determinism_evidence",
+      "changed_files": [
+        "crates/ferrum-cli/src/commands/vnext_determinism.rs",
+        "crates/ferrum-kernels/tests/cuda_vnext_replay_contract_test.rs"
+      ],
+      "expect_domains": ["evidence_schema", "vnext_determinism_evidence"],
+      "expect_required_gates": [
+        "unit",
+        "planner_selftest",
+        "release_validator_selftest",
+        "vnext_s2_m1_determinism",
+        "vnext_s2_cuda_product_contract"
+      ],
+      "forbid_required_gates": [
+        "vnext_s1_cuda",
+        "vnext_s2_response_format",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ],
+      "expect_invalidated_contains": [
+        "vnext_s2_m1_determinism",
+        "vnext_s2_cuda_product_contract"
+      ],
+      "expect_unknown_files": []
+    },
+    {
       "id": "vnext_s2_aggregate_validator_only",
       "changed_files": [
         "scripts/release/runtime_vnext_s2_cuda_product_contract.py"
