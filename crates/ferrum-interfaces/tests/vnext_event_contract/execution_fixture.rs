@@ -415,11 +415,13 @@ pub(crate) fn execute_terminal_failure_then_complete(
     }
 }
 
-pub(crate) fn emit_pre_active_prefix(
-    emitter: &mut ExecutionEventEmitter<'_>,
+pub(crate) fn emit_pre_active_prefix<S>(
+    emitter: &mut ExecutionEventEmitter<'_, S>,
     plan: &ExecutionPlan,
     active: &TrustedActiveSequenceBinding,
-) {
+) where
+    S: ExecutionEventSink + ?Sized,
+{
     let accepted = accepted_event(active.run_id(), active.request_id());
     emitter
         .emit(
