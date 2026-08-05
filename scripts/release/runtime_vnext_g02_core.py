@@ -50,6 +50,8 @@ L1_WARM_LIMIT_SECONDS = 300.0
 PROCESS_LIMIT = 16
 GROUP_THREAD_LIMIT = 64
 PER_PROCESS_THREAD_LIMIT = 16
+CARGO_BUILD_JOBS = 4
+TEST_CODEGEN_UNITS = 4
 
 
 class GateError(RuntimeError):
@@ -365,7 +367,8 @@ def child_environment() -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if not key.startswith("FERRUM_")}
     env.update(
         {
-            "CARGO_BUILD_JOBS": "4",
+            "CARGO_BUILD_JOBS": str(CARGO_BUILD_JOBS),
+            "CARGO_PROFILE_TEST_CODEGEN_UNITS": str(TEST_CODEGEN_UNITS),
             "RUST_TEST_THREADS": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
@@ -572,6 +575,10 @@ def collect(out: Path) -> dict[str, Any]:
             "path": str(BOUNDED_COMMAND.relative_to(REPO_ROOT)),
             "sha256": sha256(BOUNDED_COMMAND),
         },
+        "compile_bounds": {
+            "cargo_build_jobs": CARGO_BUILD_JOBS,
+            "test_codegen_units": TEST_CODEGEN_UNITS,
+        },
         "warmups": warmups,
         "l0": {
             "warm_limit_seconds": L0_WARM_LIMIT_SECONDS,
@@ -616,6 +623,14 @@ def validate_artifact(root: Path) -> dict[str, Any]:
     bounded = manifest.get("bounded_command")
     require(isinstance(bounded, dict), "G02 core bounded command lock is missing")
     require(bounded.get("sha256") == sha256(BOUNDED_COMMAND), "bounded command lock is stale")
+    require(
+        manifest.get("compile_bounds")
+        == {
+            "cargo_build_jobs": CARGO_BUILD_JOBS,
+            "test_codegen_units": TEST_CODEGEN_UNITS,
+        },
+        "G02 core compile bounds mismatch",
+    )
     audit = manifest.get("critical_path_audit")
     require(isinstance(audit, dict), "G02 core critical-path audit is missing")
     require(audit == audit_critical_path(), "G02 core critical-path audit is stale")
@@ -674,6 +689,11 @@ def validate_artifact(root: Path) -> dict[str, Any]:
 
 
 def self_test() -> int:
+    environment = child_environment()
+    require(environment.get("CARGO_BUILD_JOBS") == str(CARGO_BUILD_JOBS),
+            "Cargo build job bound is missing")
+    require(environment.get("CARGO_PROFILE_TEST_CODEGEN_UNITS") == str(TEST_CODEGEN_UNITS),
+            "test-profile codegen-unit bound is missing")
     sample = """
 running 1 test
 test tiny_real_safetensors_executes_through_reference_vnext_runtime ... ok
