@@ -1213,18 +1213,25 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
             isinstance(victim_request_id, str) and victim_request_id,
             f"{label}: pressure-yield victim is missing",
         )
-        require(
-            common.request_identity_matches(victim_request_id, request_ids[0]),
-            f"{label}: pressure-yield victim does not match the failing cohort",
-        )
         require(yield_kind in ALLOWED_PRESSURE_YIELD_KINDS, f"{label}: yield kind is invalid")
         require(isinstance(progress_owner_id, str), f"{label}: progress owner is missing")
         same_frontier = common.request_identity_matches(progress_owner_id, victim_request_id)
-        require(
-            (yield_kind == "self_recompute" and same_frontier)
-            or (yield_kind == "peer_handoff" and not same_frontier),
-            f"{label}: yield kind does not match its frontier identities",
+        victim_is_cohort = common.request_identity_matches(
+            victim_request_id, request_ids[0]
         )
+        owner_is_cohort = common.request_identity_matches(
+            progress_owner_id, request_ids[0]
+        )
+        if yield_kind == "self_recompute":
+            require(
+                same_frontier and victim_is_cohort and owner_is_cohort,
+                f"{label}: self-recompute does not match the failing cohort",
+            )
+        else:
+            require(
+                not same_frontier and victim_is_cohort != owner_is_cohort,
+                f"{label}: peer handoff does not contain the failing cohort exactly once",
+            )
         require(
             isinstance(progress_baseline, int) and progress_baseline >= 0,
             f"{label}: logical progress baseline is invalid",
@@ -1436,6 +1443,11 @@ def validate_pressure_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
     )
     episode_id = shape.get("episode_id")
     require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
+    hold_transition_ordinal = shape.get("hold_transition_ordinal")
+    require(
+        isinstance(hold_transition_ordinal, int) and hold_transition_ordinal > 0,
+        f"{label}: hold transition ordinal is invalid",
+    )
     ticket = shape.get("waiting_ticket")
     require(isinstance(ticket, int) and ticket > 0, f"{label}: waiting ticket is invalid")
     return {
@@ -1446,6 +1458,7 @@ def validate_pressure_hold(row: dict[str, Any], label: str) -> dict[str, Any]:
         "progress_current": progress_current,
         "waiting_ticket": ticket,
         "episode_id": episode_id,
+        "hold_transition_ordinal": hold_transition_ordinal,
     }
 
 
@@ -1823,6 +1836,7 @@ def validate_decode_trace(
         and row.get("shape", {}).get("decision") == "admitted"
     ]
     progress_owner_by_episode: dict[int, str] = {}
+    progress_baseline_by_episode: dict[int, int] = {}
     for pressure_yield in yields:
         episode_id = pressure_yield["episode_id"]
         progress_owner_id = pressure_yield["progress_owner_id"]
@@ -1832,6 +1846,13 @@ def validate_decode_trace(
         require(
             common.request_identity_matches(prior_owner, progress_owner_id),
             f"pressure episode {episode_id} transferred its stable progress owner",
+        )
+        prior_baseline = progress_baseline_by_episode.setdefault(
+            episode_id, pressure_yield["progress_baseline"]
+        )
+        require(
+            prior_baseline == pressure_yield["progress_baseline"],
+            f"pressure episode {episode_id} changed its logical progress baseline",
         )
     for hold in holds:
         require(
@@ -1910,6 +1931,8 @@ def validate_decode_trace(
             and common.request_identity_matches(hold["victim_request_id"], victim_request_id)
             and common.request_identity_matches(hold["progress_owner_id"], progress_owner_id)
             and hold["progress_baseline"] == progress_baseline
+            and hold["hold_transition_ordinal"]
+            == completed["release_transition_ordinal"]
         ]
         if yield_kind == "self_recompute":
             require(
@@ -5317,6 +5340,45 @@ def self_test() -> int:
             "attributes": attributes,
         }
 
+    owner_cohort_handoff = validate_decode_deferral(
+        deferral(
+            90,
+            "pressure_yield_planned",
+            ["A"],
+            victim_request_id="C",
+            progress_owner_id="A",
+            progress_baseline=52,
+            episode_id=1,
+            planned_transition_ordinal=1,
+            yield_kind="peer_handoff",
+            execution_stage="sequence_extension",
+        ),
+        "owner-cohort peer handoff",
+    )
+    require(
+        owner_cohort_handoff["victim_request_id"] == "C"
+        and owner_cohort_handoff["progress_owner_id"] == "A",
+        "self-test lost a peer handoff selected from the progress-owner cohort",
+    )
+    expect_reject(
+        lambda: validate_decode_deferral(
+            deferral(
+                91,
+                "pressure_yield_planned",
+                ["B"],
+                victim_request_id="C",
+                progress_owner_id="A",
+                progress_baseline=52,
+                episode_id=1,
+                planned_transition_ordinal=2,
+                yield_kind="peer_handoff",
+                execution_stage="sequence_extension",
+            ),
+            "foreign-cohort peer handoff",
+        ),
+        "peer handoff whose victim and owner both differ from the failing cohort",
+    )
+
     rows = [
         deferral(100, "split_cohort", ["A", "B", "C"]),
         deferral(110, "wait_for_release", ["B"]),
@@ -5430,6 +5492,7 @@ def self_test() -> int:
             "shape": {
                 "decision": "held_for_owner_progress",
                 "episode_id": 1,
+                "hold_transition_ordinal": 5,
                 "waiting_ticket": 1,
                 "progress_owner_id": "A",
                 "progress_baseline": 53,
@@ -5444,7 +5507,7 @@ def self_test() -> int:
             ["A"],
             victim_request_id="A",
             progress_owner_id="A",
-            progress_baseline=54,
+            progress_baseline=53,
             episode_id=1,
             planned_transition_ordinal=7,
             yield_kind="self_recompute",
@@ -6294,6 +6357,15 @@ def self_test() -> int:
     try:
         validate_decode_trace(missing_victim, started_wall_ns=90, finished_wall_ns=170)
         raise AssertionError("pressure yield without a victim unexpectedly passed")
+    except common.CapacityGateError:
+        pass
+    drifting_episode_baseline = json.loads(json.dumps(rows))
+    drifting_episode_baseline[9]["attributes"]["progress_baseline"] = 54
+    try:
+        validate_decode_trace(
+            drifting_episode_baseline, started_wall_ns=90, finished_wall_ns=170
+        )
+        raise AssertionError("pressure episode with a drifting baseline unexpectedly passed")
     except common.CapacityGateError:
         pass
     missing_hold = json.loads(json.dumps(rows))
