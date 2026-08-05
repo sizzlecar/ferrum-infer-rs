@@ -5,7 +5,7 @@
 - 状态：Open
 - G07A 依赖：fresh G00F build-input inventory、S1 production build graph、
   workspace source gate 和 release/correctness semantic-plan equivalence；不等待 G00P
-- G07B 依赖：live G03 catalog 和 G07A manifest
+- G07B 依赖：canonical G03 live-catalog checkpoint manifest 和 G07A manifest；不等待完整 G03
 - G07 aggregate/发布前依赖：G00P、G07A 和 G07B
 - G07A 在 S1 后立即与 S2/S3 并行，S4 前达到开发反馈目标；G07B 随 live operation catalog/version
 - 下游：S2-S7、G08-G10
@@ -23,6 +23,11 @@
 
 G07 总 PASS 必须聚合 G07A/G07B；不能用编译时间 PASS 代替 ABI correctness，也不能用
 native artifact PASS 代替增量构建证据。
+
+G07B 不得直接接受 `provider-catalog.json`。它必须从
+[`G03_BACKEND_OPS.md`](G03_BACKEND_OPS.md) 定义的 `vnext-g03-live-catalog` gate manifest
+解析并重新验证 catalog SHA、source identity、S1 identity 和 raw artifact closure；随后生成的
+四个 native operator package、artifact-set lock、resolve/link/load 证据必须继续绑定同一 catalog。
 
 G07 不再等待完整 G01/G02/G03 后启动。S1 一旦形成真实 model/runtime/provider/product dependency
 graph，就开始测量并拆分 invalidation domain；否则到 S4 大模型迁移时仍会承受 30 分钟反馈循环。

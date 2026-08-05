@@ -91,6 +91,12 @@ RUNTIME_VNEXT_S1_CUDA_CAPACITY = REPO_ROOT / "scripts/release/runtime_vnext_s1_c
 RUNTIME_VNEXT_S1_CUDA_DECODE_CAPACITY = (
     REPO_ROOT / "scripts/release/runtime_vnext_s1_cuda_decode_capacity.py"
 )
+RUNTIME_VNEXT_G03_LIVE_CATALOG_COLLECTOR = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g03_live_catalog_collect.py"
+)
+RUNTIME_VNEXT_G03_LIVE_CATALOG_CHECKPOINT = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g03_live_catalog_checkpoint.py"
+)
 RUNTIME_VNEXT_G08B_CUDA_MATRIX_CHECKPOINT = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py"
 )
@@ -777,6 +783,37 @@ def test_runtime_vnext_s1_cuda_decode_capacity_selftest() -> None:
     )
 
 
+def test_runtime_vnext_g03_live_catalog_collector_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G03_LIVE_CATALOG_COLLECTOR),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G03 LIVE CATALOG COLLECTOR SELFTEST PASS"
+        in ok.stdout,
+        ok.stdout,
+    )
+
+
+def test_runtime_vnext_g03_live_catalog_checkpoint_selftest() -> None:
+    ok = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G03_LIVE_CATALOG_CHECKPOINT),
+            "--self-test",
+        ]
+    )
+    require(ok.returncode == 0, ok.stderr or ok.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G03 LIVE CATALOG PASS:" in ok.stdout,
+        ok.stdout,
+    )
+
+
 def test_runtime_vnext_g08b_cuda_matrix_checkpoint_selftest() -> None:
     ok = run(
         [
@@ -1389,6 +1426,8 @@ def main() -> int:
     test_runtime_vnext_s1_cuda_basic_collector_selftest()
     test_runtime_vnext_s1_cuda_capacity_selftest()
     test_runtime_vnext_s1_cuda_decode_capacity_selftest()
+    test_runtime_vnext_g03_live_catalog_collector_selftest()
+    test_runtime_vnext_g03_live_catalog_checkpoint_selftest()
     test_runtime_vnext_g08b_cuda_matrix_checkpoint_selftest()
     test_runtime_vnext_g08b_cuda_matrix_prepare_selftest()
     test_runtime_vnext_g08b_metal_matrix_checkpoint_selftest()

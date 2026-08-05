@@ -109,6 +109,45 @@ Qwen3.5 Metal 的最低数值门以 MODEL_MATRIX 7.2 为准；任何更宽 row �
   microbench `<2%`，否则改用 monomorphized fast path并保留同一 contract。
 - novel-op 扩展演练不修改 planner/runtime 主循环。
 
+## G03 Live Catalog Checkpoint
+
+G07B 不等待完整 G03 conformance、Metal parity 和 dispatch-overhead，但不得消费调用方传入的裸
+provider JSON。中间 checkpoint 必须在一张 RTX 4090 上从当前 clean source 的真实
+`CudaVNextComposition` 导出 operation/provider/capability catalog，并绑定：
+
+- 同一 Git SHA/tree 的 canonical S1 CUDA basic-slice PASS manifest；
+- 完整四算子 native-operator bootstrap lock 及 cache-only build summary；
+- `runtime_vnext_cuda_catalog_input` 二进制、精确 argv 和 bounded-command receipt；
+- provider catalog 与 capability catalog 的逐字段 projection、SHA256 和 artifact index；
+- `native-adaptive` typed product policy、CUDA ordinal `0` 和恰好一张 RTX 4090。
+
+raw collector 只能打印 `EVIDENCE READY`。独立 checkpoint 必须从原始 catalog 和 receipt 重算，
+拒绝 source/S1/catalog/command/log 任一漂移；它只证明 G07B 所需的 live catalog 输入真实且可追溯，
+明确不证明完整 G03、Metal、conformance、determinism、performance 或 release readiness。
+
+```text
+python3 scripts/release/runtime_vnext_g03_live_catalog_collect.py \
+  --source-root <clean-source-root> \
+  --native-operator-set-lock <complete-native-operator-set.lock.json> \
+  --native-build-cache <populated-content-addressed-cache> \
+  [--native-import-dir <populated-core-ptx-import-dir>] \
+  --target-dir <external-target-dir> \
+  --out <external-raw-out>
+
+python3 scripts/release/run_gate.py vnext-g03-live-catalog \
+  --s1 <s1-gate.manifest.json> \
+  --g03-live-artifact-root <external-raw-out> \
+  --out <external-checkpoint-out>
+```
+
+```text
+FERRUM RUNTIME VNEXT G03 LIVE CATALOG PASS: <out_dir>
+FERRUM GATE vnext-g03-live-catalog PASS: <out_dir>
+```
+
+G07B 必须消费该 checkpoint 的 `gate.manifest.json`，不得退回裸 catalog 路径。完整 G03 仍须满足
+本文件全部验收项并打印 `FERRUM RUNTIME VNEXT G03 BACKEND OPS PASS`。
+
 ## 迁移与删除
 
 compat layer 只能从 legacy method 调新 op，禁止新 op 反向调用 legacy Backend。G03 冻结
