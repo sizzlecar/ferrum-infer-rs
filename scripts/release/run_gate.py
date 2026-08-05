@@ -113,6 +113,8 @@ SAFETENSORS_SHARD_RE = re.compile(
     r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
 )
 VNEXT_FROZEN_LEGACY_SHA = "cff4c47765ef3259b8a04890187d99c60da86394"
+VNEXT_HISTORICAL_FAMILY_COUNT = 16
+VNEXT_HISTORICAL_CASE_COUNT = 29
 VNEXT_S0A_PUBLIC_API_ADDED_SHA256 = (
     "e8807f35c842e9f23ff660aa5f401fb454c6ec1ae9e38cceddf73744ce494bf6"
 )
@@ -2360,9 +2362,26 @@ def validate_vnext_g00a_provenance(
     require_gate(history.get("catalog_sha256") == indexed_digest("historical-bugs.catalog.json"), "vnext-g00a historical catalog copy mismatch")
     history_facts = require_object(history.get("facts"), "vnext-g00a historical facts")
     require_gate(history_facts.get("catalog_scope") == "catalog_only" and history_facts.get("full_historical_corpus_complete") is False, "vnext-g00a historical facts overclaim corpus completion")
-    require_gate(history_facts.get("family_count") == 15 and history_facts.get("concrete_case_count") == 28, "vnext-g00a historical fact counts mismatch")
+    require_gate(
+        history_facts.get("family_count") == VNEXT_HISTORICAL_FAMILY_COUNT
+        and history_facts.get("concrete_case_count") == VNEXT_HISTORICAL_CASE_COUNT,
+        "vnext-g00a historical fact counts mismatch",
+    )
     families = require_list(history_facts.get("families"), "vnext-g00a historical families")
-    require_gate(len(families) == 15 and sum(len(require_list(require_object(family, "vnext-g00a historical family").get("cases"), "vnext-g00a historical family cases")) for family in families) == 28, "vnext-g00a historical family/case matrix mismatch")
+    require_gate(
+        len(families) == VNEXT_HISTORICAL_FAMILY_COUNT
+        and sum(
+            len(
+                require_list(
+                    require_object(family, "vnext-g00a historical family").get("cases"),
+                    "vnext-g00a historical family cases",
+                )
+            )
+            for family in families
+        )
+        == VNEXT_HISTORICAL_CASE_COUNT,
+        "vnext-g00a historical family/case matrix mismatch",
+    )
 
     inventory = require_object(lock.get("inventory"), "vnext-g00a lock inventory")
     inventory_document = read_json_object(root / "coupling-inventory.json", "vnext-g00a coupling inventory")
@@ -2893,7 +2912,10 @@ def validate_vnext_g00a_provenance(
         "model_facts_lock": {"path": lock_rel, "sha256": lock_digest},
         "model_lane_count": len(locked_lanes),
         "catalog_expected_weight_identity_count": expected_weight_identity_count,
-        "historical_bug_counts": {"families": 15, "cases": 28},
+        "historical_bug_counts": {
+            "families": VNEXT_HISTORICAL_FAMILY_COUNT,
+            "cases": VNEXT_HISTORICAL_CASE_COUNT,
+        },
         "artifact_index_sha256": canonical_json_sha256(child_manifest["artifact_index"]),
     }
 
@@ -2992,7 +3014,11 @@ def validate_vnext_g00f_provenance(
         }
         and g00a.get("facts_reused_without_copy") is True
         and g00a.get("model_lane_count") == 12
-        and g00a.get("historical_bug_counts") == {"families": 15, "cases": 28},
+        and g00a.get("historical_bug_counts")
+        == {
+            "families": VNEXT_HISTORICAL_FAMILY_COUNT,
+            "cases": VNEXT_HISTORICAL_CASE_COUNT,
+        },
         "vnext-g00f G00a binding summary mismatch",
     )
     outer_ref = require_object(g00a.get("outer_manifest"), "vnext-g00f G00a outer ref")
@@ -7274,8 +7300,8 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
         },
         "historical-bugs.catalog.json": {
             "catalog_id": "g00a-selftest-history",
-            "concrete_case_count": 28,
-            "family_count": 15,
+            "concrete_case_count": VNEXT_HISTORICAL_CASE_COUNT,
+            "family_count": VNEXT_HISTORICAL_FAMILY_COUNT,
             "schema_version": 1,
         },
         "inventory-review.catalog.json": {
@@ -7556,7 +7582,7 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
         }
     }
     history_families = []
-    for family_index in range(1, 16):
+    for family_index in range(1, VNEXT_HISTORICAL_FAMILY_COUNT + 1):
         case_count = 2 if family_index <= 13 else 1
         history_families.append(
             {
@@ -7568,8 +7594,9 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
             }
         )
     require_selftest(
-        sum(len(family["cases"]) for family in history_families) == 28,
-        "G00a selftest history matrix must contain 28 cases",
+        sum(len(family["cases"]) for family in history_families)
+        == VNEXT_HISTORICAL_CASE_COUNT,
+        f"G00a selftest history matrix must contain {VNEXT_HISTORICAL_CASE_COUNT} cases",
     )
     inventory_document = {
         "analyzer": {
@@ -7606,9 +7633,9 @@ def make_selftest_vnext_g00a_artifact(root: Path) -> LaneCommand:
             "catalog_sha256": sha256(root / "historical-bugs.catalog.json"),
             "facts": {
                 "catalog_scope": "catalog_only",
-                "concrete_case_count": 28,
+                "concrete_case_count": VNEXT_HISTORICAL_CASE_COUNT,
                 "families": history_families,
-                "family_count": 15,
+                "family_count": VNEXT_HISTORICAL_FAMILY_COUNT,
                 "full_historical_corpus_complete": False,
             },
         },
@@ -10144,7 +10171,11 @@ def self_test() -> int:
             str(g00a_provenance),
         )
         require_selftest(
-            g00a_provenance["historical_bug_counts"] == {"families": 15, "cases": 28},
+            g00a_provenance["historical_bug_counts"]
+            == {
+                "families": VNEXT_HISTORICAL_FAMILY_COUNT,
+                "cases": VNEXT_HISTORICAL_CASE_COUNT,
+            },
             str(g00a_provenance),
         )
         require_selftest(

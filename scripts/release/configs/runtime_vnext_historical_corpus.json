@@ -4,7 +4,7 @@
   "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
   "catalog": {
     "path": "scripts/release/configs/runtime_vnext_historical_bugs.json",
-    "sha256": "00a10fabce214bcc232c8315bdb645df27b1d7087beaba57ab4889e482cb0aad"
+    "sha256": "24995d6589b05a2f16f22c949af6041af840db9e82ff0abc69cd4a4cc58b6dd3"
   },
   "goal_documents": [
     {
@@ -31,9 +31,10 @@
     "H12",
     "H13",
     "H14",
-    "H15"
+    "H15",
+    "H16"
   ],
-  "expected_concrete_case_count": 28,
+  "expected_concrete_case_count": 29,
   "artifact_file": "historical-bug-corpus.json",
   "receipt_glob": "historical-bugs/**/evidence.json",
   "receipt_template": "historical-bugs/{case_id}/evidence.json",

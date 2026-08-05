@@ -45,8 +45,10 @@ PASS_PREFIX = "FERRUM RUNTIME VNEXT G00A FACT CHECKPOINT PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00A FACT CHECKPOINT SELFTEST PASS"
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-FAMILY_RE = re.compile(r"^H(0[1-9]|1[0-5])$")
-CASE_RE = re.compile(r"^(H(?:0[1-9]|1[0-5]))\.([1-9][0-9]*)$")
+EXPECTED_HISTORICAL_FAMILY_COUNT = 16
+EXPECTED_HISTORICAL_CASE_COUNT = 29
+FAMILY_RE = re.compile(r"^H(0[1-9]|1[0-6])$")
+CASE_RE = re.compile(r"^(H(?:0[1-9]|1[0-6]))\.([1-9][0-9]*)$")
 SAFETENSORS_SHARD_RE = re.compile(
     r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
 )
@@ -1556,14 +1558,23 @@ def validate_historical_catalog(
     catalog = read_json(catalog_path)
     require(catalog.get("schema_version") == 1, "historical bug catalog schema_version must be 1")
     require(catalog.get("baseline_git_sha") == FROZEN_LEGACY_SHA, "historical bug catalog baseline SHA mismatch")
-    require(catalog.get("family_count") == 15, "historical bug catalog family_count must be 15")
-    require(catalog.get("concrete_case_count") == 28, "historical bug catalog concrete_case_count must be 28")
+    require(
+        catalog.get("family_count") == EXPECTED_HISTORICAL_FAMILY_COUNT,
+        f"historical bug catalog family_count must be {EXPECTED_HISTORICAL_FAMILY_COUNT}",
+    )
+    require(
+        catalog.get("concrete_case_count") == EXPECTED_HISTORICAL_CASE_COUNT,
+        f"historical bug catalog concrete_case_count must be {EXPECTED_HISTORICAL_CASE_COUNT}",
+    )
     vocabulary = require_object(catalog.get("evidence_status_vocabulary"), "historical bug catalog evidence_status_vocabulary")
     require(set(vocabulary) == {"bound", "partial", "gap"}, "historical bug catalog evidence status vocabulary mismatch")
     for status, description in vocabulary.items():
         require_string(description, f"historical bug catalog evidence status {status}")
     families = require_list(catalog.get("families"), "historical bug catalog families")
-    require(len(families) == 15, "historical bug catalog must contain 15 families")
+    require(
+        len(families) == EXPECTED_HISTORICAL_FAMILY_COUNT,
+        f"historical bug catalog must contain {EXPECTED_HISTORICAL_FAMILY_COUNT} families",
+    )
     seen_families: set[str] = set()
     seen_cases: set[str] = set()
     status_counts: Counter[str] = Counter()
@@ -1628,21 +1639,31 @@ def validate_historical_catalog(
             )
         normalized_cases.sort(key=lambda item: item["id"])
         normalized_families.append({"cases": normalized_cases, "id": family_id, "title": title})
-    require(seen_families == {f"H{index:02d}" for index in range(1, 16)}, "historical bug catalog family ids are incomplete")
-    require(len(seen_cases) == 28, "historical bug catalog must contain 28 unique concrete cases")
     require(
-        status_counts == Counter({"bound": 28}),
-        "historical bug catalog must contain exactly 28 reviewed bound cases",
+        seen_families
+        == {
+            f"H{index:02d}"
+            for index in range(1, EXPECTED_HISTORICAL_FAMILY_COUNT + 1)
+        },
+        "historical bug catalog family ids are incomplete",
+    )
+    require(
+        len(seen_cases) == EXPECTED_HISTORICAL_CASE_COUNT,
+        f"historical bug catalog must contain {EXPECTED_HISTORICAL_CASE_COUNT} unique concrete cases",
+    )
+    require(
+        status_counts == Counter({"bound": EXPECTED_HISTORICAL_CASE_COUNT}),
+        f"historical bug catalog must contain exactly {EXPECTED_HISTORICAL_CASE_COUNT} reviewed bound cases",
     )
     normalized_families.sort(key=lambda item: item["id"])
     normalized = {
         "catalog_id": catalog.get("catalog_id"),
         "catalog_scope": "catalog_only",
-        "concrete_case_count": 28,
+        "concrete_case_count": EXPECTED_HISTORICAL_CASE_COUNT,
         "evidence_status_counts": dict(sorted(status_counts.items())),
         "evidence_status_vocabulary": copy.deepcopy(vocabulary),
         "families": normalized_families,
-        "family_count": 15,
+        "family_count": EXPECTED_HISTORICAL_FAMILY_COUNT,
         "full_historical_corpus_complete": False,
     }
     return catalog, normalized
@@ -2362,7 +2383,7 @@ def run_self_test() -> None:
         expect_rejected(
             "downgraded historical evidence status",
             lambda: validate_historical_catalog(downgraded_catalog_path),
-            marker="exactly 28 reviewed bound cases",
+            marker=f"exactly {EXPECTED_HISTORICAL_CASE_COUNT} reviewed bound cases",
         )
     deterministic = {"facts": facts, "scope": {"unlocks": ["G01A"]}}
     require(canonical_bytes(deterministic) == canonical_bytes(copy.deepcopy(deterministic)), "model fact serialization is not deterministic")

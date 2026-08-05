@@ -3,7 +3,7 @@
   "artifact_type": "runtime_vnext_historical_replay_catalog",
   "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
   "review_artifact": "docs/status/runtime-vnext-historical-reconstruction-2026-07-12.md",
-  "case_count": 28,
+  "case_count": 29,
   "cases": [
     {
       "id": "H01.1",
@@ -284,6 +284,31 @@
       "expected_summary": {"cross_request_reuse": false, "previous_owner_cleared": true},
       "observed_summary": {"cross_request_reuse": true, "previous_owner_cleared": false},
       "trace": [{"event": "fallback", "owner": "request-a"}, {"event": "reuse", "request": "request-b", "state_owner": "request-a"}]
+    },
+    {
+      "id": "H16.1",
+      "expected_failure_layer": "L1",
+      "mutation_kind": "frozen_bad_input",
+      "source_type": "historical_artifact",
+      "expected_invariant": "replay-equivalent CUDA execution proves every declared output and Write/ReadWrite post-state bitwise equal from the same initial state",
+      "expected_summary": {
+        "reusable_executable_count": 1,
+        "declared_output_witness_count": 1,
+        "state_effect_witness_count": 1,
+        "eager_replay_comparison_count": 1
+      },
+      "observed_summary": {
+        "reusable_executable_count": 1,
+        "declared_output_witness_count": 0,
+        "state_effect_witness_count": 0,
+        "eager_replay_comparison_count": 0
+      },
+      "trace": [
+        {"event": "reusable_executable_inventory", "count": 1},
+        {"event": "declared_output_witness", "count": 0},
+        {"event": "state_effect_witness", "count": 0},
+        {"event": "eager_replay_comparison", "count": 0}
+      ]
     }
   ]
 }
