@@ -187,7 +187,14 @@ def parse_log(log: str, catalog: dict[str, Any]) -> dict[str, Any]:
     require("test result: ok." in log, "cargo test did not report an ok result")
     require("skipping" not in log.lower(), "real-Metal conformance log contains a skip")
     for test_name in required_tests:
-        pattern = re.compile(rf"^test .*::{re.escape(test_name)} \.\.\. ok$", re.MULTILINE)
+        # libtest prints the test prefix before the body runs. A test that emits
+        # metrics with --nocapture therefore has its first metric on that same
+        # line and prints the final `ok` only after the metric block.
+        pattern = re.compile(
+            rf"^test .*::{re.escape(test_name)} \.\.\. "
+            rf"(?:ok$|{re.escape(METRICS_PREFIX)})",
+            re.MULTILINE,
+        )
         require(pattern.search(log) is not None, f"required Metal test did not pass: {test_name}")
 
     observed: dict[str, dict[str, Any]] = {}
@@ -364,6 +371,14 @@ def self_test() -> None:
     log = "\n".join([*test_lines, *metric_lines, "test result: ok. 7 passed; 0 failed"])
     parsed = parse_log(log, catalog)
     require(parsed["row_count"] == 27 and parsed["required_test_count"] == 7, "selftest summary differs")
+
+    noisy_test_lines = list(test_lines)
+    noisy_test_lines[0] = noisy_test_lines[0].removesuffix("ok") + metric_lines[0]
+    noisy_log = "\n".join(
+        [*noisy_test_lines, *metric_lines[1:], "ok", "test result: ok. 7 passed; 0 failed"]
+    )
+    noisy = parse_log(noisy_log, catalog)
+    require(noisy == parsed, "libtest --nocapture metric interleaving changed evidence")
 
     def rejects(candidate: str, marker: str) -> None:
         try:
