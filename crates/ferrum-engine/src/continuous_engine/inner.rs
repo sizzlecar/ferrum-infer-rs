@@ -600,50 +600,6 @@ impl EngineInner {
             })
         };
         match observation {
-            ExecutorAdmissionQueueObservation::PressureHoldActive {
-                episode_id,
-                request_id,
-                progress_owner_id,
-                progress_baseline,
-                progress_current,
-                ticket,
-            } => self.write_executor_scheduler_profile_event(
-                &request_id,
-                "vnext.execution_capacity_pressure_hold_active",
-                ProfileEventKind::Instant,
-                ProfileStatus::Ok,
-                None,
-                BTreeMap::from([
-                    (
-                        "decision".to_string(),
-                        serde_json::json!("held_for_owner_progress"),
-                    ),
-                    (
-                        "episode_id".to_string(),
-                        serde_json::json!(episode_id.get()),
-                    ),
-                    ("waiting_ticket".to_string(), serde_json::json!(ticket)),
-                    (
-                        "progress_owner_id".to_string(),
-                        serde_json::json!(progress_owner_id.0),
-                    ),
-                    (
-                        "progress_baseline".to_string(),
-                        serde_json::json!(progress_baseline.get()),
-                    ),
-                    (
-                        "progress_current".to_string(),
-                        serde_json::json!(progress_current.get()),
-                    ),
-                    (
-                        "prefill_submit_observed".to_string(),
-                        serde_json::json!(false),
-                    ),
-                    ("probe_performed".to_string(), serde_json::json!(false)),
-                ]),
-                BTreeMap::new(),
-                None,
-            ),
             ExecutorAdmissionQueueObservation::PressureHoldReleased {
                 episode_id,
                 transition_ordinal,

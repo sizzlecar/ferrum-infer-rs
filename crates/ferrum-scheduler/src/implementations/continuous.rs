@@ -249,6 +249,48 @@ impl ExecutionCapacityYieldDisposition {
     }
 }
 
+/// Exact receipt for a peer victim installed behind a release fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionCapacityPressureHoldReceipt {
+    episode_id: PressureEpisodeId,
+    transition_ordinal: PressureTransitionOrdinal,
+    request_id: RequestId,
+    progress_owner_id: RequestId,
+    progress_baseline: LogicalWorkGeneration,
+    progress_current: LogicalWorkGeneration,
+    waiting_ticket: u64,
+}
+
+impl ExecutionCapacityPressureHoldReceipt {
+    pub const fn episode_id(&self) -> PressureEpisodeId {
+        self.episode_id
+    }
+
+    pub const fn transition_ordinal(&self) -> PressureTransitionOrdinal {
+        self.transition_ordinal
+    }
+
+    pub const fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub const fn progress_owner_id(&self) -> &RequestId {
+        &self.progress_owner_id
+    }
+
+    pub const fn progress_baseline(&self) -> LogicalWorkGeneration {
+        self.progress_baseline
+    }
+
+    pub const fn progress_current(&self) -> LogicalWorkGeneration {
+        self.progress_current
+    }
+
+    pub const fn waiting_ticket(&self) -> u64 {
+        self.waiting_ticket
+    }
+}
+
 /// Terminal result of one physical execution-capacity yield transaction.
 ///
 /// A completed release can make a peer progress owner runnable, queue the same
@@ -259,6 +301,7 @@ impl ExecutionCapacityYieldDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCapacityYieldCompletion {
     victim_requeued: bool,
+    installed_hold: Option<ExecutionCapacityPressureHoldReceipt>,
     release_transition_ordinal: PressureTransitionOrdinal,
     resumable_transition_ordinal: Option<PressureTransitionOrdinal>,
     owner_admission_pending_transition_ordinal: Option<PressureTransitionOrdinal>,
@@ -269,6 +312,10 @@ pub struct ExecutionCapacityYieldCompletion {
 impl ExecutionCapacityYieldCompletion {
     pub const fn victim_requeued(&self) -> bool {
         self.victim_requeued
+    }
+
+    pub const fn installed_hold(&self) -> Option<&ExecutionCapacityPressureHoldReceipt> {
+        self.installed_hold.as_ref()
     }
 
     pub const fn progress_owner_resumable(&self) -> bool {
@@ -472,14 +519,6 @@ pub type ExecutorAdmissionProbeOutcome =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorAdmissionQueueObservation {
-    PressureHoldActive {
-        episode_id: PressureEpisodeId,
-        request_id: RequestId,
-        progress_owner_id: RequestId,
-        progress_baseline: LogicalWorkGeneration,
-        progress_current: LogicalWorkGeneration,
-        ticket: u64,
-    },
     PressureHoldReleased {
         episode_id: PressureEpisodeId,
         transition_ordinal: PressureTransitionOrdinal,
@@ -1401,30 +1440,7 @@ impl ContinuousBatchScheduler {
                         PressureHoldStatus::None => AdmissionQueueEligibility::Eligible,
                     }
                 },
-                |request, ticket| {
-                    if let PressureHoldStatus::Held {
-                        episode_id,
-                        progress_owner_id,
-                        progress_baseline,
-                        progress_current,
-                        ..
-                    } = self
-                        .pressure_coordinator
-                        .lock()
-                        .hold_status(&request.inner.request.id)
-                    {
-                        if let Some(observer) = observer.borrow_mut().as_deref_mut() {
-                            observer(ExecutorAdmissionQueueObservation::PressureHoldActive {
-                                episode_id,
-                                request_id: request.inner.request.id.clone(),
-                                progress_owner_id,
-                                progress_baseline,
-                                progress_current,
-                                ticket: ticket.get(),
-                            });
-                        }
-                    }
-                },
+                |_request, _ticket| {},
                 |request, ticket, deferral| {
                     if let Some(observer) = observer.borrow_mut().as_deref_mut() {
                         observer(ExecutorAdmissionQueueObservation::SkippedUnchanged {
@@ -2419,15 +2435,16 @@ impl ContinuousBatchScheduler {
         observed_free_blocks: Option<usize>,
     ) -> Result<ExecutionCapacityYieldCompletion> {
         let request_id = transaction.victim_request_id();
-        let requeued = self.requeue_execution_capacity_victim(
+        let victim_waiting_ticket = self.requeue_execution_capacity_victim(
             request_id,
             attempted_decode_width,
             observed_free_blocks,
         );
+        let requeued = victim_waiting_ticket.is_some();
         let progress_owner_wait_condition =
             self.execution_capacity_wait_condition(transaction.progress_owner_id());
 
-        let (release_ordinal, disposition) = {
+        let (release_ordinal, disposition, installed_hold) = {
             let mut coordinator = self.pressure_coordinator.lock();
             if !requeued && transaction.kind() == PressureYieldKind::SelfRecompute {
                 let _ = coordinator
@@ -2444,7 +2461,28 @@ impl ContinuousBatchScheduler {
             }
             self.pressure_active
                 .store(coordinator.has_records(), Ordering::Release);
-            completion
+            let installed_hold = match (coordinator.hold_status(request_id), victim_waiting_ticket)
+            {
+                (
+                    PressureHoldStatus::Held {
+                        episode_id,
+                        progress_owner_id,
+                        progress_baseline,
+                        progress_current,
+                    },
+                    Some(waiting_ticket),
+                ) => Some(ExecutionCapacityPressureHoldReceipt {
+                    episode_id,
+                    transition_ordinal: completion.0,
+                    request_id: request_id.clone(),
+                    progress_owner_id,
+                    progress_baseline,
+                    progress_current,
+                    waiting_ticket,
+                }),
+                _ => None,
+            };
+            (completion.0, completion.1, installed_hold)
         };
         let (
             resumable_transition_ordinal,
@@ -2481,6 +2519,7 @@ impl ContinuousBatchScheduler {
         };
         Ok(ExecutionCapacityYieldCompletion {
             victim_requeued: requeued,
+            installed_hold,
             release_transition_ordinal: release_ordinal,
             resumable_transition_ordinal,
             owner_admission_pending_transition_ordinal,
@@ -2551,11 +2590,13 @@ impl ContinuousBatchScheduler {
             }
         }
         let requeued = victim_released
-            && self.requeue_execution_capacity_victim(
-                transaction.victim_request_id(),
-                attempted_decode_width,
-                observed_free_blocks,
-            );
+            && self
+                .requeue_execution_capacity_victim(
+                    transaction.victim_request_id(),
+                    attempted_decode_width,
+                    observed_free_blocks,
+                )
+                .is_some();
         Ok((requeued, aborted_ordinal, closed_ordinal))
     }
 
@@ -2564,7 +2605,7 @@ impl ContinuousBatchScheduler {
         request_id: &RequestId,
         attempted_decode_width: usize,
         observed_free_blocks: Option<usize>,
-    ) -> bool {
+    ) -> Option<u64> {
         let request = {
             let mut prefill = self.prefill_queue.write();
             prefill
@@ -2577,8 +2618,9 @@ impl ContinuousBatchScheduler {
             decode.remove(request_id)
         });
 
-        let mut requeued = false;
+        let mut requeued_ticket = None;
         if let Some(mut request) = request {
+            let waiting_ticket = request.waiting_admission_ticket;
             request.phase = RequestPhase::Waiting;
             request.inner.state = RequestState::Waiting;
             request.inner.started_at = None;
@@ -2601,8 +2643,8 @@ impl ContinuousBatchScheduler {
 
             let mut waiting = self.waiting_queue.write();
             let mut request_index = self.request_index.write();
-            requeued = self.requeue_waiting_request(&mut waiting, &mut request_index, request);
-            if requeued {
+            if self.requeue_waiting_request(&mut waiting, &mut request_index, request) {
+                requeued_ticket = waiting_ticket.map(|ticket| ticket.get());
                 self.record_capacity_defer_feedback(attempted_decode_width.max(1));
                 self.record_decode_capacity_pressure(
                     attempted_decode_width.max(1),
@@ -2611,7 +2653,7 @@ impl ContinuousBatchScheduler {
             }
         }
 
-        requeued
+        requeued_ticket
     }
 
     fn defer_decode_to_waiting_for_capacity_inner(
