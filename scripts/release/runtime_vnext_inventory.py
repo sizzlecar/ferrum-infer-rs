@@ -159,6 +159,9 @@ SCAFFOLDING_RE = re.compile(
 )
 BACKEND_TRAIT_RE = re.compile(r"\btrait\s+Backend\b")
 FUNCTION_RE = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
+RUST_FUNCTION_DECL_RE = re.compile(
+    r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<|\()"
+)
 CFG_TEST_RE = re.compile(r"#\s*\[\s*cfg\s*\([^\]]*\btest\b[^\]]*\)\s*\]")
 MODULE_RE = re.compile(r"\bmod\s+[A-Za-z_][A-Za-z0-9_]*")
 BACKEND_CFG_RE = re.compile(
@@ -359,6 +362,80 @@ def logical_loc(
         if code.strip():
             counts[classification] += 1
     return sum(counts.values()), dict(sorted(counts.items())), code_lines, line_classes
+
+
+def rust_function_spans(
+    text: str,
+    base_classification: str = "production",
+) -> list[dict[str, Any]]:
+    """Return function-level spans using the inventory's logical-LOC rules.
+
+    This intentionally remains a lexical Rust analyzer. It is used for the
+    frozen and candidate trees alike, so model-scaffolding deltas cannot be
+    manufactured by changing paths or switching LOC definitions.
+    """
+
+    code_lines = code_lines_for("rust", text)
+    line_classes = rust_line_classifications(code_lines, base_classification)
+    spans: list[dict[str, Any]] = []
+    line_index = 0
+    while line_index < len(code_lines):
+        first_line = mask_strings(code_lines[line_index])
+        declaration = RUST_FUNCTION_DECL_RE.search(first_line)
+        if declaration is None:
+            line_index += 1
+            continue
+
+        name = declaration.group(1)
+        signature_end = line_index
+        body_started = False
+        body_depth = 0
+        while signature_end < len(code_lines):
+            masked = mask_strings(code_lines[signature_end])
+            if signature_end == line_index:
+                masked = masked[declaration.end() :]
+            open_at = masked.find("{")
+            if open_at < 0 and masked.rstrip().endswith(";"):
+                break
+            if open_at >= 0:
+                body_started = True
+                body_fragment = masked[open_at:]
+                body_depth = body_fragment.count("{") - body_fragment.count("}")
+                break
+            signature_end += 1
+        if signature_end >= len(code_lines):
+            break
+
+        end_index = signature_end
+        if body_started:
+            while body_depth > 0:
+                end_index += 1
+                if end_index >= len(code_lines):
+                    raise InventoryError(
+                        f"unterminated Rust function {name!r} at line {line_index + 1}"
+                    )
+                masked = mask_strings(code_lines[end_index])
+                body_depth += masked.count("{") - masked.count("}")
+
+        counts: Counter[str] = Counter()
+        for code, classification in zip(
+            code_lines[line_index : end_index + 1],
+            line_classes[line_index : end_index + 1],
+        ):
+            if code.strip():
+                counts[classification] += 1
+        spans.append(
+            {
+                "name": name,
+                "start_line": line_index + 1,
+                "end_line": end_index + 1,
+                "logical_loc": sum(counts.values()),
+                "logical_loc_by_classification": dict(sorted(counts.items())),
+                "has_body": body_started,
+            }
+        )
+        line_index = end_index + 1
+    return spans
 
 
 def finding(
@@ -1115,6 +1192,29 @@ pub fn after_tests_is_production() {}
         require(
             all(entry["classification"] in CLASSIFICATIONS for entry in reparsed["files"]),
             "classification enum",
+        )
+        function_spans = rust_function_spans(rust_path.read_text())
+        spans_by_name = {span["name"]: span for span in function_spans}
+        require(
+            spans_by_name["qwen35_decode"]["has_body"] is False
+            and spans_by_name["qwen35_decode"]["logical_loc_by_classification"]
+            == {"production": 1},
+            "trait function span",
+        )
+        require(
+            spans_by_name["qwen35_decode_loop"]["has_body"] is True
+            and spans_by_name["qwen35_decode_loop"]["logical_loc_by_classification"]
+            == {"production": 1},
+            "production function span",
+        )
+        require(
+            spans_by_name["inline_test"]["logical_loc_by_classification"]
+            == {"test": 1}
+            and spans_by_name["after_tests_is_production"][
+                "logical_loc_by_classification"
+            ]
+            == {"production": 1},
+            "function span cfg(test) classification",
         )
         composite_classes = rust_line_classifications(
             [
