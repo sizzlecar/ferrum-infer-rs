@@ -218,7 +218,31 @@ pub struct ExecutionEventEmitter<'sink> {
 }
 
 impl<'sink> ExecutionEventEmitter<'sink> {
-    pub fn new(
+    #[inline]
+    pub fn new<S>(sink: &'sink S, run_id: RunId, request_id: RequestIdentity) -> Self
+    where
+        S: ExecutionEventSink,
+    {
+        let sink_enablement = sink.enablement();
+        let capture_policy = if sink_enablement == ExecutionEventSinkEnablement::None {
+            ExecutionEventCapturePolicy::AllFrames
+        } else {
+            sink.capture_policy()
+        };
+        Self {
+            sink: ExecutionEventSinkHandle::Borrowed(sink),
+            cursor: ExecutionEventCursor::new(run_id, request_id),
+            capture_policy,
+            sink_enablement,
+            sink_failed: false,
+        }
+    }
+
+    /// Creates a borrowed emitter when the caller has already erased the sink
+    /// type. Prefer [`Self::new`] while the concrete sink type is available so
+    /// stable enablement and capture capabilities can be resolved statically.
+    #[inline]
+    pub fn new_dyn(
         sink: &'sink dyn ExecutionEventSink,
         run_id: RunId,
         request_id: RequestIdentity,
@@ -282,6 +306,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
         }
     }
 
+    #[inline]
     fn records_event(&self, event: &ExecutionEvent) -> bool {
         self.capture_policy.records_event(event.kind())
             && match self.sink_enablement {
@@ -293,6 +318,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             }
     }
 
+    #[inline]
     fn validate_next(
         cursor: &mut ExecutionEventCursor,
         event: &ExecutionEvent,
@@ -335,6 +361,7 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             .map_err(|error| ExecutionEventSinkError::new(error.to_string()))
     }
 
+    #[inline]
     pub fn emit(
         &mut self,
         event: ExecutionEvent,
