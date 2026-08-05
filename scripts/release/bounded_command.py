@@ -208,7 +208,10 @@ def _parse_linux_stat(raw: str) -> tuple[int, int, int]:
         threads = int(fields[17])
     except (IndexError, ValueError) as error:
         raise SamplingError("malformed /proc PID stat fields") from error
-    if threads < 1:
+    # Linux can expose num_threads=0 briefly after the final thread exits but
+    # before the PID disappears from /proc. Keep the PID in the process count;
+    # zero active threads is an observable exit state, not a sampling failure.
+    if threads < 0:
         raise SamplingError(f"invalid /proc thread count for pid {pid}: {threads}")
     return pid, pgid, threads
 
@@ -810,6 +813,22 @@ def self_test() -> int:
                 assert "cannot read /proc/123/stat" in str(error)
             else:
                 raise AssertionError("non-transient /proc read error was ignored")
+
+        exiting_stat = "123 (exiting worker) Z 1 456 " + " ".join(["0"] * 15)
+        assert _parse_linux_stat(exiting_stat) == (123, 456, 0)
+        exiting_snapshot = ProcessGroupSnapshot({123: 0})
+        assert exiting_snapshot.processes == 1
+        assert exiting_snapshot.group_threads == 0
+
+        invalid_stat = "123 (invalid worker) R 1 456 " + " ".join(
+            ["0"] * 14 + ["-1"]
+        )
+        try:
+            _parse_linux_stat(invalid_stat)
+        except SamplingError as error:
+            assert "invalid /proc thread count for pid 123: -1" in str(error)
+        else:
+            raise AssertionError("negative /proc thread count was accepted")
 
     print("BOUNDED COMMAND SELFTEST PASS")
     return 0
