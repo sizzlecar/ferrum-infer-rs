@@ -16,6 +16,15 @@ from typing import Any, Iterable
 LOCK_SCHEMA_VERSION = 5
 LOCK_FILE_NAME = "native-operator-set.lock.json"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+PUBLIC_IDENTITY_FIELDS = (
+    "lock_sha256",
+    "lock_size_bytes",
+    "schema_version",
+    "g03_catalog_sha256",
+    "operators",
+    "binary_sha256_by_operator",
+    "closure",
+)
 
 SINGLE_EVIDENCE_FIELDS = (
     "manifest",
@@ -424,11 +433,11 @@ def validate_native_operator_set(
 
 
 def public_identity(validated: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in validated.items()
-        if key not in {"lock_path", "_members"}
-    }
+    require(
+        set(PUBLIC_IDENTITY_FIELDS).issubset(validated),
+        "validated native operator set is missing public identity fields",
+    )
+    return {key: validated[key] for key in PUBLIC_IDENTITY_FIELDS}
 
 
 def cuda_native_build_cache_contract(
