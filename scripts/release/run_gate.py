@@ -77,6 +77,7 @@ LANES = (
     "vnext-s2-m1-determinism",
     "vnext-s2",
     "vnext-cuda-determinism",
+    "vnext-g08a-source",
     "vnext-g08a-cuda",
     "vnext-g08a-metal",
     "vnext-g08a-numerics",
@@ -773,6 +774,7 @@ FRESH_OUTPUT_PROVENANCE_KINDS = frozenset(
         "vnext-g07b",
         "vnext-g07",
         "vnext-s2-historical-resource-source",
+        "vnext-g08a-source",
     }
 )
 
@@ -1432,6 +1434,28 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-cuda-determinism",
+        )
+    if lane == "vnext-g08a-source":
+        if args.coupling_inventory is None:
+            raise GateError(
+                "vnext-g08a-source requires --coupling-inventory"
+            )
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g08a_source_contract.py",
+                "--baseline-inventory",
+                str(args.coupling_inventory.resolve()),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                "FERRUM RUNTIME VNEXT G08A SOURCE OWNERSHIP PASS: "
+                f"{out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            expected_source_git_sha=git_sha(),
+            provenance_kind="vnext-g08a-source",
         )
     if lane == "vnext-g08a-cuda":
         if args.g08a_artifact_root is None:
@@ -6153,6 +6177,57 @@ def validate_vnext_g07a_provenance(
     return summary
 
 
+def validate_vnext_g08a_source_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        "vnext-g08a-source delegated manifest path is missing",
+    )
+    try:
+        import runtime_vnext_g08a_source_contract as source_contract
+
+        verified = source_contract.verify_manifest(
+            manifest_path,
+            verify_checkout=verify_checkout,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise GateError(f"vnext-g08a-source provenance failed: {error}") from error
+    require_gate(
+        verified == child_manifest,
+        "vnext-g08a-source verified manifest changed during validation",
+    )
+    artifact_index = validate_child_artifact_index(
+        manifest_path.parent.resolve(),
+        verified,
+        role_from_top_level_path=False,
+    )
+    return {
+        "kind": "vnext-g08a-source",
+        "child_manifest": {
+            "path": str(manifest_path),
+            "sha256": require_sha256(
+                child_manifest_sha256,
+                "vnext-g08a-source child manifest SHA256",
+            ),
+        },
+        "source": {
+            "git_sha": verified.get("source_git_sha"),
+            "git_tree_sha": verified.get("source_tree_sha"),
+            "dirty": verified.get("dirty"),
+        },
+        "artifact_count": len(artifact_index),
+        "artifact_index_sha256": canonical_json_sha256(
+            verified["artifact_index"]
+        ),
+    }
+
+
 def validate_vnext_g07b_provenance(
     lane_command: LaneCommand,
     child_manifest: dict[str, Any],
@@ -6466,6 +6541,13 @@ def verify_child_pass_line(
         )
     if lane_command.provenance_kind == "vnext-s2":
         return validate_vnext_s2_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-g08a-source":
+        return validate_vnext_g08a_source_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
@@ -8475,6 +8557,7 @@ def self_test() -> int:
                     "vnext-g07b",
                     "vnext-g07",
                     "vnext-s2-historical-resource-source",
+                    "vnext-g08a-source",
                 )
             )
             and not provenance_requires_fresh_output("vnext-g07a"),
@@ -8711,6 +8794,46 @@ def self_test() -> int:
                 f"{focused_determinism_out.resolve()}"
             ),
             focused_determinism_manifest,
+        )
+        g08a_baseline_inventory = root / "g00-coupling-inventory.json"
+        g08a_source_out = root / "g08a-source-dry-run"
+        g08a_source_dry = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g08a-source",
+                "--coupling-inventory",
+                str(g08a_baseline_inventory),
+                "--out",
+                str(g08a_source_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g08a_source_dry.returncode == 0,
+            g08a_source_dry.stderr or g08a_source_dry.stdout,
+        )
+        g08a_source_manifest = json.loads(
+            (g08a_source_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g08a_source_manifest["status"] == "dry-run"
+            and g08a_source_manifest["lane"] == "vnext-g08a-source"
+            and g08a_source_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g08a_source_contract.py",
+                "--baseline-inventory",
+                str(g08a_baseline_inventory.resolve()),
+                "--out",
+                str(g08a_source_out.resolve()),
+            ]
+            and g08a_source_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT G08A SOURCE OWNERSHIP PASS: "
+                f"{g08a_source_out.resolve()}"
+            ),
+            g08a_source_manifest,
         )
         g08a_report = (
             g08a_root
@@ -10782,6 +10905,7 @@ def main() -> int:
         "vnext-s2-historical-resource-source",
         "vnext-s2-m1-determinism",
         "vnext-s2",
+        "vnext-g08a-source",
     }:
         try:
             require_external_vnext_g00_output(out_dir)

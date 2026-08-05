@@ -5,7 +5,6 @@ use vnext_device_operation_contract::*;
 use vnext_device_operation_wave_contract::prepare_wave;
 
 const CHILD_SEQUENCE_COUNT: usize = 3;
-const LIFECYCLE_IMPLEMENTATION_COUNT: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -498,7 +497,6 @@ fn analyze(profile: SyntheticLifecycleProfile) -> LifecycleAnalysis {
 
 #[test]
 fn dense_moe_and_hybrid_share_one_exact_resource_lifecycle() {
-    assert_eq!(LIFECYCLE_IMPLEMENTATION_COUNT, 1);
     let analyses = SyntheticLifecycleProfile::ALL.map(analyze);
     let expected_stages = vec![
         LifecycleStage::Plan,

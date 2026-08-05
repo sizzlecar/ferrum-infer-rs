@@ -28,6 +28,33 @@
 - G08 统一 performance smoke：legacy PASS 时 `>=0.90x` legacy，否则 `>=0.70x` same-host
   vLLM/llama.cpp；该结果只作 diagnostic。
 
+源码所有权与 legacy 删除先由独立、低成本 child gate 冻结：
+
+```text
+python3 scripts/release/run_gate.py vnext-g08a-source \
+  --coupling-inventory <G00-coupling-inventory.json> \
+  --out <external-out>
+```
+
+该 gate 必须使用 G00 同一 checked-in inventory analyzer 对冻结树和候选树计算函数级 logical LOC。
+`<=1500 LOC` 指 G00 定义内的 model provider glue/执行脚手架；权重声明、真实数学 program/op 描述和
+格式 parser 仍按 G00 规则单列排除。artifact 同时必须报告未排除的完整 Qwen3.5 family production
+LOC/file 数，禁止用排除口径隐藏总体代码量。任一新增 family 文件或 provider 函数没有 checked-in
+owner/reason/classification 时 fail closed。provider glue 必须按完整 provider production LOC 减去逐函数
+review 的 parser/weights/math span 计算，顶层 type/const/impl 外壳不得漏算。源码 owner map 必须从真实
+generic runtime symbol 证明 setup/admission/state-transition/finalize/cleanup `5/5` 只有一个共享 owner，
+并验证 Qwen3.5 注册链最终进入共享 `VNextModelExecutor<R>`、family source 不持有 lifecycle authority、
+`ModelFamilyProvider` 没有重新获得 lifecycle hook。独立 bounded dense/MoE/hybrid 测试只证明三种资源形状
+执行同一状态轨迹并最终零占用，不允许由测试常量自报实现数量。
+
+```text
+FERRUM RUNTIME VNEXT G08A SOURCE OWNERSHIP PASS: <out_dir>
+FERRUM GATE vnext-g08a-source PASS: <out_dir>
+```
+
+该 child PASS 不替代双后端 C01-C21、product binary legacy selection、完整 numerics、historical
+production mutation、performance smoke 或最终 G08A PASS。
+
 ```text
 FERRUM RUNTIME VNEXT G08A QWEN35 4B PASS: <out_dir>
 FERRUM GATE vnext-g08a PASS: <out_dir>
