@@ -28,7 +28,7 @@ POLICY_PATH = (
     REPO_ROOT
     / "scripts/release/configs/runtime_vnext_g07a_build_iteration.json"
 )
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SOURCE_BUILD_RECEIPT_SCHEMA_VERSION = 7
 ARTIFACT_TYPE = "runtime_vnext_g07a_build_iteration_evidence"
 PASS_LINE = "FERRUM RUNTIME VNEXT G07A BUILD ITERATION EVIDENCE READY"
@@ -338,6 +338,7 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
             "default_source_policy",
             "features",
             "incremental_profile",
+            "no_content_touch_input",
             "nvcc_threads",
             "official_release_profile",
         },
@@ -353,6 +354,8 @@ def load_policy(path: Path = POLICY_PATH) -> dict[str, Any]:
         and product["features"]
         == "cuda,vllm-moe-marlin,vllm-paged-attn-v2"
         and product["incremental_profile"] == "cuda-correctness"
+        and product["no_content_touch_input"]
+        == "crates/ferrum-models/src/lib.rs"
         and product["nvcc_threads"] == 4
         and product["official_release_profile"] == "release"
         and isinstance(core_ptx_inputs, list)
@@ -889,6 +892,63 @@ def prepare_mutation(
     return setup, original, before_mtime, path.stat().st_atime_ns
 
 
+def prepare_no_content_touch(
+    path: Path,
+    input_label: str,
+) -> tuple[dict[str, Any], int, int]:
+    require(path.is_file() and not path.is_symlink(), f"touch input missing: {path}")
+    before_sha256 = sha256(path)
+    before = path.stat()
+    during_mtime_ns = max(time.time_ns(), before.st_mtime_ns + 1_000_000_000)
+    os.utime(path, ns=(before.st_atime_ns, during_mtime_ns))
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    during = path.stat()
+    during_sha256 = sha256(path)
+    require(
+        during_sha256 == before_sha256
+        and during.st_mtime_ns != before.st_mtime_ns,
+        "no-content touch changed content or did not advance mtime",
+    )
+    return (
+        {
+            "kind": "no-content-touch",
+            "input_path": input_label,
+            "before_sha256": before_sha256,
+            "during_sha256": during_sha256,
+            "before_mtime_ns": before.st_mtime_ns,
+            "during_mtime_ns": during.st_mtime_ns,
+            "metadata_fsync_completed_before_probe": True,
+        },
+        before.st_mtime_ns,
+        before.st_atime_ns,
+    )
+
+
+def restore_no_content_touch(
+    path: Path,
+    setup: dict[str, Any],
+    original_mtime_ns: int,
+    original_atime_ns: int,
+) -> None:
+    os.utime(path, ns=(original_atime_ns, original_mtime_ns))
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    setup["restored_sha256"] = sha256(path)
+    setup["restored_mtime_ns"] = path.stat().st_mtime_ns
+    require(
+        setup["restored_sha256"] == setup["before_sha256"]
+        and setup["restored_mtime_ns"] == setup["before_mtime_ns"],
+        f"no-content touch input was not restored: {path}",
+    )
+
+
 def restore_mutation(
     path: Path,
     setup: dict[str, Any],
@@ -1029,6 +1089,20 @@ def validate_product_sample_signal(
                 for path, row in native["core_ptx_rows"].items()
             ),
             "core-ptx sample did not rebuild only add_bias.cu with 39 cache hits",
+        )
+
+
+def validate_no_content_touch_signal(native: dict[str, Any]) -> None:
+    require(
+        native["compiled_native_tu_count"] == 0
+        and native["compiled_native_tu_paths"] == []
+        and native["core_ptx_built_paths"] == [],
+        "no-content touch probe compiled native source or core PTX",
+    )
+    if native["build_summary_present"]:
+        require(
+            set(native["artifact_build_units"]) == PRODUCT_NATIVE_ARTIFACTS,
+            "no-content touch probe did not resolve the complete native artifact set",
         )
 
 
@@ -1328,7 +1402,63 @@ def product_sample(
                 else None
             ),
         }
-        if scenario["input"] is None:
+        if name == "noop":
+            touch_input = policy["product_build"]["no_content_touch_input"]
+            touch_path = worktree / touch_input
+            setup, touch_original_mtime, touch_original_atime = (
+                prepare_no_content_touch(touch_path, touch_input)
+            )
+            summary_path.unlink(missing_ok=True)
+            touch_probe = run_bounded_step(
+                evidence_root=evidence_root,
+                step_root=sample_root / "no-content-touch-probe",
+                cwd=worktree,
+                command=cargo_build_command(
+                    policy=policy,
+                    profile=profile,
+                    target_dir=target_dir,
+                    native_operator_set_lock=native_operator_set_lock,
+                    native_build_cache=sample_native_build_cache,
+                    build_summary_receipt=summary_path,
+                    source_policy=source_policy,
+                ),
+                expected_seconds=30,
+                deadline_seconds=scenario["deadline_seconds"],
+                progress_signal=(
+                    "Cargo log growth and explicit zero native/PTX compilation"
+                ),
+                lane_deadline=lane_deadline,
+            )
+            touch_stdout = verify_ref(
+                evidence_root,
+                touch_probe["stdout"],
+                f"{sample_id} no-content touch Cargo stdout",
+            )
+            touch_stderr = verify_ref(
+                evidence_root,
+                touch_probe["stderr"],
+                f"{sample_id} no-content touch Cargo stderr",
+            )
+            touch_native_signal = parse_product_native_signal(
+                touch_stderr,
+                summary_path,
+            )
+            validate_no_content_touch_signal(touch_native_signal)
+            setup["probe"] = {
+                **touch_probe,
+                "cargo_summary": parse_cargo_messages(touch_stdout),
+                "native_signal": touch_native_signal,
+                "cuda_build_summary": (
+                    store_blob(
+                        evidence_root,
+                        summary_path,
+                        "cuda-build-summary",
+                    )
+                    if summary_path.is_file()
+                    else None
+                ),
+            }
+        elif scenario["input"] is None:
             setup = {"kind": "none"}
         else:
             mutation_path = worktree / scenario["input"]
@@ -1414,7 +1544,14 @@ def product_sample(
             else None
         )
     finally:
-        if scenario.get("input") is not None and "original" in locals():
+        if name == "noop" and "touch_original_mtime" in locals():
+            restore_no_content_touch(
+                worktree / policy["product_build"]["no_content_touch_input"],
+                setup,
+                touch_original_mtime,
+                touch_original_atime,
+            )
+        elif scenario.get("input") is not None and "original" in locals():
             restore_mutation(
                 worktree / scenario["input"],
                 setup,
@@ -2533,6 +2670,26 @@ def self_test() -> None:
         require(
             setup["restored_sha256"] == setup["before_sha256"],
             "sentinel self-test did not restore content",
+        )
+        touch_setup, touch_mtime, touch_atime = prepare_no_content_touch(
+            source,
+            "input.rs",
+        )
+        require(
+            touch_setup["before_sha256"] == touch_setup["during_sha256"]
+            and touch_setup["before_mtime_ns"] != touch_setup["during_mtime_ns"],
+            "no-content touch self-test did not isolate metadata",
+        )
+        restore_no_content_touch(
+            source,
+            touch_setup,
+            touch_mtime,
+            touch_atime,
+        )
+        require(
+            touch_setup["restored_sha256"] == touch_setup["before_sha256"]
+            and touch_setup["restored_mtime_ns"] == touch_setup["before_mtime_ns"],
+            "no-content touch self-test did not restore metadata",
         )
         receipt = root / "source-build.receipt.json"
         write_json(
