@@ -55,7 +55,7 @@ def load_ferrum_capture(
     common.require(len(wave_paths) == 1, "expected one Ferrum capture wave")
     plan = common.load_json(plan_path)
     wave = common.load_json(wave_paths[0])
-    common.validate_ferrum_capture_schema(plan, wave)
+    schema_version = common.validate_ferrum_capture_schema(plan, wave)
     common.require(wave.get("wave_kind") == "prefill"
                    and wave.get("participant_count") == 1,
                    "Ferrum capture must be one-participant prefill")
@@ -69,8 +69,7 @@ def load_ferrum_capture(
     ):
         common.require(plan.get(key) == wave.get(key),
                        f"Ferrum {key} differs across plan/wave")
-    common.require(plan.get("model_id") == "Qwen3.5-4B-Q4_K_M",
-                   "Ferrum capture model differs from the reviewed fixture")
+    common.require_reviewed_capture_model_id(plan, schema_version)
     records = wave.get("records")
     common.require(isinstance(records, list), "Ferrum capture records must be a list")
 
