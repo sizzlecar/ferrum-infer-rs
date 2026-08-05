@@ -60,6 +60,7 @@ LANES = (
     "vnext-g01b",
     "vnext-g01",
     "vnext-g02-core",
+    "vnext-g03-live-catalog",
     "vnext-g07a",
     "vnext-s1-cuda",
     "vnext-s1-cuda-capacity",
@@ -1007,6 +1008,37 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=child_out / "manifest.json",
             provenance_kind="vnext-g02-core",
+        )
+    if lane == "vnext-g03-live-catalog":
+        if args.s1 is None:
+            raise GateError("vnext-g03-live-catalog requires --s1")
+        if args.g03_live_artifact_root is None:
+            raise GateError(
+                "vnext-g03-live-catalog requires --g03-live-artifact-root"
+            )
+        raw_root = args.g03_live_artifact_root.resolve()
+        return LaneCommand(
+            cmd=[
+                sys.executable,
+                "scripts/release/runtime_vnext_g03_live_catalog_checkpoint.py",
+                "--source-root",
+                str(REPO_ROOT),
+                "--s1-manifest",
+                str(args.s1.resolve()),
+                "--provider-catalog",
+                str(raw_root / "catalog/provider-catalog.json"),
+                "--capability-catalog",
+                str(raw_root / "catalog/capability-catalog.json"),
+                "--catalog-export-receipt",
+                str(raw_root / "catalog-export/bounded.receipt.json"),
+                "--out",
+                str(out_dir),
+            ],
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G03 LIVE CATALOG PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-g03-live-catalog",
         )
     if lane == "vnext-g07a":
         required = {
@@ -9055,6 +9087,77 @@ def self_test() -> int:
             missing_g01b.stderr or missing_g01b.stdout,
         )
 
+        g03_live_out = (root / "vnext-g03-live-catalog-dry-run").resolve()
+        g03_live_s1 = (root / "s1/gate.manifest.json").resolve()
+        g03_live_raw = (root / "g03-live-raw").resolve()
+        g03_live = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g03-live-catalog",
+                "--s1",
+                str(g03_live_s1),
+                "--g03-live-artifact-root",
+                str(g03_live_raw),
+                "--out",
+                str(g03_live_out),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g03_live.returncode == 0,
+            g03_live.stderr or g03_live.stdout,
+        )
+        g03_live_manifest = json.loads(
+            (g03_live_out / "gate.manifest.json").read_text()
+        )
+        require_selftest(
+            g03_live_manifest["status"] == "dry-run"
+            and g03_live_manifest["lane"] == "vnext-g03-live-catalog"
+            and g03_live_manifest["delegated_command_line"]
+            == [
+                sys.executable,
+                "scripts/release/runtime_vnext_g03_live_catalog_checkpoint.py",
+                "--source-root",
+                str(REPO_ROOT),
+                "--s1-manifest",
+                str(g03_live_s1),
+                "--provider-catalog",
+                str(g03_live_raw / "catalog/provider-catalog.json"),
+                "--capability-catalog",
+                str(g03_live_raw / "catalog/capability-catalog.json"),
+                "--catalog-export-receipt",
+                str(g03_live_raw / "catalog-export/bounded.receipt.json"),
+                "--out",
+                str(g03_live_out),
+            ]
+            and g03_live_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT G03 LIVE CATALOG PASS: "
+                f"{g03_live_out}"
+            ),
+            g03_live_manifest,
+        )
+        g03_live_missing_s1 = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-g03-live-catalog",
+                "--g03-live-artifact-root",
+                str(g03_live_raw),
+                "--out",
+                str(root / "vnext-g03-live-missing-s1"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            g03_live_missing_s1.returncode != 0
+            and "--s1" in (
+                g03_live_missing_s1.stderr + g03_live_missing_s1.stdout
+            ),
+            g03_live_missing_s1.stderr or g03_live_missing_s1.stdout,
+        )
+
         g07a_out = (root / "vnext-g07a-dry-run").resolve()
         g07a_timing_root = (root / "g07a-raw-evidence").resolve()
         g07a_source_gate = (root / "unit-gate/gate.manifest.json").resolve()
@@ -9978,6 +10081,7 @@ def main() -> int:
     parser.add_argument("--s1-capacity", type=Path)
     parser.add_argument("--s1-decode-capacity", type=Path)
     parser.add_argument("--g02-core", type=Path)
+    parser.add_argument("--g03-live-artifact-root", type=Path)
     parser.add_argument("--m1-determinism", type=Path)
     parser.add_argument("--response-format", type=Path)
     parser.add_argument("--api-modality", type=Path)
@@ -10020,6 +10124,7 @@ def main() -> int:
         "vnext-g01b",
         "vnext-g01",
         "vnext-g02-core",
+        "vnext-g03-live-catalog",
         "vnext-g07a",
         "vnext-s2-response-format",
         "vnext-s2-api-modality",
