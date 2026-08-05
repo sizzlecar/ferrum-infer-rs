@@ -25,6 +25,14 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Sequence
 
+from runtime_vnext_native_operator_set import (
+    PUBLIC_IDENTITY_FIELDS as NATIVE_OPERATOR_SET_PUBLIC_IDENTITY_FIELDS,
+    NativeOperatorSetEvidenceError,
+    create_selftest_native_operator_set,
+    public_identity as native_operator_set_public_identity,
+    validate_native_operator_set,
+)
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 1
@@ -164,11 +172,7 @@ RAW_COLLECTOR_FIELDS = {"source_path", "path", "sha256", "size_bytes"}
 RAW_BOOTSTRAP_FIELDS = {
     "role",
     "lock",
-    "schema_version",
-    "g03_catalog_sha256",
-    "operators",
-    "binary_sha256_by_operator",
-    "closure",
+    *NATIVE_OPERATOR_SET_PUBLIC_IDENTITY_FIELDS,
 }
 RAW_BOOTSTRAP_CLOSURE_FIELDS = {"member_count", "total_bytes", "index_sha256"}
 RAW_BUILD_FIELDS = {
@@ -1523,59 +1527,24 @@ def validate_bootstrap_native_operator_set(
     lock_path = validate_relative_ref(
         raw_root, bootstrap["lock"], "raw bootstrap native operator lock"
     )
-    lock, _ = read_json(lock_path, "raw bootstrap native operator lock")
-    lock_value = require_dict(lock, "raw bootstrap native operator lock")
-    require_exact_fields(
-        lock_value,
-        {"schema_version", "g03_catalog_sha256", "artifacts"},
-        "raw bootstrap native operator lock",
-    )
-    require(
-        bootstrap["schema_version"] == 5
-        and lock_value["schema_version"] == 5
-        and require_sha(
-            bootstrap["g03_catalog_sha256"], "raw bootstrap catalog SHA256"
+    try:
+        validated = validate_native_operator_set(
+            lock_path, REQUIRED_CUDA_NATIVE_OPERATORS
         )
-        == lock_value["g03_catalog_sha256"],
-        "raw bootstrap schema/catalog identity mismatch",
-    )
-    operators = validate_sorted_strings(
-        bootstrap["operators"], "raw bootstrap operators", nonempty=True
+    except NativeOperatorSetEvidenceError as error:
+        raise CheckpointError(str(error)) from error
+    expected_identity = native_operator_set_public_identity(validated)
+    actual_identity = {
+        key: bootstrap[key] for key in NATIVE_OPERATOR_SET_PUBLIC_IDENTITY_FIELDS
+    }
+    require(
+        actual_identity == expected_identity,
+        "raw bootstrap native operator public identity differs from its lock closure",
     )
     require(
-        operators == list(REQUIRED_CUDA_NATIVE_OPERATORS),
-        "raw bootstrap operator denominator mismatch",
-    )
-    artifacts = require_list(lock_value["artifacts"], "raw bootstrap lock artifacts")
-    require(len(artifacts) == len(operators), "raw bootstrap lock artifact count mismatch")
-    lock_binaries: list[dict[str, str]] = []
-    for index, raw_artifact in enumerate(artifacts):
-        artifact = require_dict(raw_artifact, f"raw bootstrap lock artifact[{index}]")
-        operator = artifact.get("operator")
-        binary_sha = artifact.get("binary_sha256")
-        require(
-            isinstance(operator, str)
-            and operator == operators[index]
-            and isinstance(binary_sha, str)
-            and SHA256_RE.fullmatch(binary_sha) is not None,
-            f"raw bootstrap lock artifact[{index}] identity mismatch",
-        )
-        lock_binaries.append({"operator": operator, "sha256": binary_sha})
-    require(
-        bootstrap["binary_sha256_by_operator"] == lock_binaries,
-        "raw bootstrap operator binary summary is stale",
-    )
-    closure = require_dict(bootstrap["closure"], "raw bootstrap closure")
-    require_exact_fields(
-        closure, RAW_BOOTSTRAP_CLOSURE_FIELDS, "raw bootstrap closure"
-    )
-    require(
-        require_int(closure["member_count"], "raw bootstrap member count", minimum=36)
-        >= len(operators) * 9
-        and require_int(closure["total_bytes"], "raw bootstrap total bytes", minimum=1)
-        > 0
-        and require_sha(closure["index_sha256"], "raw bootstrap closure index"),
-        "raw bootstrap closure identity is invalid",
+        bootstrap["lock"]["sha256"] == expected_identity["lock_sha256"]
+        and bootstrap["lock"]["size_bytes"] == expected_identity["lock_size_bytes"],
+        "raw bootstrap lock evidence differs from its public identity",
     )
     return bootstrap, lock_path
 
@@ -2671,36 +2640,17 @@ def fixture_raw(
     bootstrap_lock = (
         raw / "bootstrap-native-operator-set/native-operator-set.lock.json"
     )
-    lock_artifacts = [
-        {
-            "operator": operator,
-            "binary_sha256": format(index + 1, "x") * 64,
-        }
-        for index, operator in enumerate(REQUIRED_CUDA_NATIVE_OPERATORS)
-    ]
-    write_json_create_new(
-        bootstrap_lock,
-        {
-            "schema_version": 5,
-            "g03_catalog_sha256": "b" * 64,
-            "artifacts": lock_artifacts,
-        },
+    created_lock = create_selftest_native_operator_set(
+        bootstrap_lock.parent, REQUIRED_CUDA_NATIVE_OPERATORS
+    )
+    require(created_lock == bootstrap_lock, "native operator fixture lock path drifted")
+    validated_bootstrap = validate_native_operator_set(
+        bootstrap_lock, REQUIRED_CUDA_NATIVE_OPERATORS
     )
     bootstrap = {
         "role": "build bootstrap only; G07B must rebuild artifacts against the exported live catalog",
         "lock": file_identity(bootstrap_lock, relative_to=raw),
-        "schema_version": 5,
-        "g03_catalog_sha256": "b" * 64,
-        "operators": list(REQUIRED_CUDA_NATIVE_OPERATORS),
-        "binary_sha256_by_operator": [
-            {"operator": row["operator"], "sha256": row["binary_sha256"]}
-            for row in lock_artifacts
-        ],
-        "closure": {
-            "member_count": 36,
-            "total_bytes": bootstrap_lock.stat().st_size,
-            "index_sha256": "c" * 64,
-        },
+        **native_operator_set_public_identity(validated_bootstrap),
     }
     target_dir = root / "target"
     native_cache = root / "native-cache"

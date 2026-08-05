@@ -200,15 +200,25 @@ def run_text(cwd: Path, command: Sequence[str], timeout: int = 60) -> str:
 def resolve_tool(raw: str, label: str) -> Path:
     candidate = Path(raw).expanduser()
     if candidate.is_absolute():
-        resolved = candidate.resolve()
+        executable = candidate.absolute()
     else:
         found = shutil.which(raw)
         require(found is not None, f"{label} is not on PATH: {raw}")
-        resolved = Path(found).resolve()  # type: ignore[arg-type]
+        executable = Path(found).absolute()  # type: ignore[arg-type]
     require(
-        resolved.is_file() and os.access(resolved, os.X_OK),
-        f"{label} is not executable: {resolved}",
+        executable.is_file() and os.access(executable, os.X_OK),
+        f"{label} is not executable: {executable}",
     )
+    resolved = executable.resolve()
+    if label in {"cargo", "rustc"} and resolved.name == "rustup":
+        actual = Path(
+            run_text(REPO_ROOT, [str(resolved), "which", label])
+        ).expanduser().resolve()
+        require(
+            actual.is_file() and os.access(actual, os.X_OK) and actual.name == label,
+            f"rustup did not resolve an executable {label}: {actual}",
+        )
+        return actual
     return resolved
 
 
@@ -1051,6 +1061,26 @@ def self_test() -> int:
 
     with tempfile.TemporaryDirectory(prefix="ferrum-g03-live-catalog-") as raw:
         root = Path(raw)
+        tool_root = root / "tools"
+        tool_root.mkdir()
+        actual_cargo = tool_root / "cargo"
+        actual_cargo.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        actual_cargo.chmod(0o755)
+        rustup = tool_root / "rustup"
+        rustup.write_text(
+            "#!/bin/sh\n"
+            "test \"$1\" = which || exit 2\n"
+            "test \"$2\" = cargo || exit 3\n"
+            f"printf '%s\\n' {actual_cargo}\n",
+            encoding="utf-8",
+        )
+        rustup.chmod(0o755)
+        cargo_proxy = tool_root / "cargo-proxy"
+        cargo_proxy.symlink_to(rustup)
+        require(
+            resolve_tool(str(cargo_proxy), "cargo") == actual_cargo.resolve(),
+            "rustup cargo proxy did not resolve to the actual toolchain binary",
+        )
         provider_path = root / "provider.json"
         capability_path = root / "capability.json"
         operation = {
