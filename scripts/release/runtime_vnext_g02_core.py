@@ -52,6 +52,7 @@ GROUP_THREAD_LIMIT = 64
 PER_PROCESS_THREAD_LIMIT = 16
 CARGO_BUILD_JOBS = 4
 TEST_CODEGEN_UNITS = 4
+BUILD_OVERRIDE_CODEGEN_UNITS = 4
 
 
 class GateError(RuntimeError):
@@ -369,6 +370,9 @@ def child_environment() -> dict[str, str]:
         {
             "CARGO_BUILD_JOBS": str(CARGO_BUILD_JOBS),
             "CARGO_PROFILE_TEST_CODEGEN_UNITS": str(TEST_CODEGEN_UNITS),
+            "CARGO_PROFILE_TEST_BUILD_OVERRIDE_CODEGEN_UNITS": str(
+                BUILD_OVERRIDE_CODEGEN_UNITS
+            ),
             "RUST_TEST_THREADS": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
@@ -578,6 +582,7 @@ def collect(out: Path) -> dict[str, Any]:
         "compile_bounds": {
             "cargo_build_jobs": CARGO_BUILD_JOBS,
             "test_codegen_units": TEST_CODEGEN_UNITS,
+            "build_override_codegen_units": BUILD_OVERRIDE_CODEGEN_UNITS,
         },
         "warmups": warmups,
         "l0": {
@@ -628,6 +633,7 @@ def validate_artifact(root: Path) -> dict[str, Any]:
         == {
             "cargo_build_jobs": CARGO_BUILD_JOBS,
             "test_codegen_units": TEST_CODEGEN_UNITS,
+            "build_override_codegen_units": BUILD_OVERRIDE_CODEGEN_UNITS,
         },
         "G02 core compile bounds mismatch",
     )
@@ -694,6 +700,11 @@ def self_test() -> int:
             "Cargo build job bound is missing")
     require(environment.get("CARGO_PROFILE_TEST_CODEGEN_UNITS") == str(TEST_CODEGEN_UNITS),
             "test-profile codegen-unit bound is missing")
+    require(
+        environment.get("CARGO_PROFILE_TEST_BUILD_OVERRIDE_CODEGEN_UNITS")
+        == str(BUILD_OVERRIDE_CODEGEN_UNITS),
+        "test-profile build-override codegen-unit bound is missing",
+    )
     sample = """
 running 1 test
 test tiny_real_safetensors_executes_through_reference_vnext_runtime ... ok
