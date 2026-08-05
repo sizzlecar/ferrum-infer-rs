@@ -195,13 +195,20 @@ pub trait ExecutionEventSink: Send + Sync {
     }
 }
 
-enum ExecutionEventSinkHandle<'sink> {
-    Borrowed(&'sink dyn ExecutionEventSink),
-    Shared(Arc<dyn ExecutionEventSink>),
+enum ExecutionEventSinkHandle<'sink, S>
+where
+    S: ExecutionEventSink + ?Sized,
+{
+    Borrowed(&'sink S),
+    Shared(Arc<S>),
 }
 
-impl ExecutionEventSinkHandle<'_> {
-    fn as_sink(&self) -> &dyn ExecutionEventSink {
+impl<S> ExecutionEventSinkHandle<'_, S>
+where
+    S: ExecutionEventSink + ?Sized,
+{
+    #[inline]
+    fn as_sink(&self) -> &S {
         match self {
             Self::Borrowed(sink) => *sink,
             Self::Shared(sink) => sink.as_ref(),
@@ -209,20 +216,23 @@ impl ExecutionEventSinkHandle<'_> {
     }
 }
 
-pub struct ExecutionEventEmitter<'sink> {
-    sink: ExecutionEventSinkHandle<'sink>,
+pub struct ExecutionEventEmitter<'sink, S = dyn ExecutionEventSink>
+where
+    S: ExecutionEventSink + ?Sized,
+{
+    sink: ExecutionEventSinkHandle<'sink, S>,
     cursor: ExecutionEventCursor,
     capture_policy: ExecutionEventCapturePolicy,
     sink_enablement: ExecutionEventSinkEnablement,
     sink_failed: bool,
 }
 
-impl<'sink> ExecutionEventEmitter<'sink> {
+impl<'sink, S> ExecutionEventEmitter<'sink, S>
+where
+    S: ExecutionEventSink + ?Sized,
+{
     #[inline]
-    pub fn new<S>(sink: &'sink S, run_id: RunId, request_id: RequestIdentity) -> Self
-    where
-        S: ExecutionEventSink,
-    {
+    pub fn new(sink: &'sink S, run_id: RunId, request_id: RequestIdentity) -> Self {
         let sink_enablement = sink.enablement();
         let capture_policy = if sink_enablement == ExecutionEventSinkEnablement::None {
             ExecutionEventCapturePolicy::AllFrames
@@ -237,7 +247,9 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             sink_failed: false,
         }
     }
+}
 
+impl ExecutionEventEmitter<'static, dyn ExecutionEventSink> {
     /// Creates a durable emitter that may be owned by a request/session.
     ///
     /// The borrowed constructor remains useful for bounded validation. Product
@@ -281,7 +293,12 @@ impl<'sink> ExecutionEventEmitter<'sink> {
             sink_failed: false,
         }
     }
+}
 
+impl<'sink, S> ExecutionEventEmitter<'sink, S>
+where
+    S: ExecutionEventSink + ?Sized,
+{
     #[inline]
     fn records_event(&self, event: &ExecutionEvent) -> bool {
         self.capture_policy.records_event(event.kind())
