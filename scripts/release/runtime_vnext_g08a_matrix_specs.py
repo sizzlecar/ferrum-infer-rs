@@ -104,7 +104,10 @@ def exact_files(value: Any, expected: dict[str, tuple[str, int]], label: str) ->
         require(isinstance(path, str) and path not in observed, f"{label} path is invalid")
         digest = row["sha256"]
         size = row["size_bytes"]
-        require(isinstance(digest, str) and SHA256_RE.fullmatch(digest), f"{label} SHA invalid")
+        require(
+            isinstance(digest, str) and SHA256_RE.fullmatch(digest),
+            f"{label} SHA invalid",
+        )
         require(isinstance(size, int) and not isinstance(size, bool) and size > 0, f"{label} size invalid")
         observed[path] = (digest, size)
     require(observed == expected, f"{label} identity differs")
@@ -128,9 +131,17 @@ def validate_model_lock_contract(backend: str) -> None:
         {"source_git_sha", "source_catalog_sha256", "source_lock_sha256", "extraction"},
         f"{backend} lock provenance",
     )
-    require(GIT_SHA_RE.fullmatch(provenance["source_git_sha"]) is not None, "source Git SHA invalid")
+    require(
+        isinstance(provenance["source_git_sha"], str)
+        and GIT_SHA_RE.fullmatch(provenance["source_git_sha"]) is not None,
+        "source Git SHA invalid",
+    )
     require(provenance["source_catalog_sha256"] == sha256(CATALOG), "source catalog SHA differs")
-    require(SHA256_RE.fullmatch(provenance["source_lock_sha256"]) is not None, "source lock SHA invalid")
+    require(
+        isinstance(provenance["source_lock_sha256"], str)
+        and SHA256_RE.fullmatch(provenance["source_lock_sha256"]) is not None,
+        "source lock SHA invalid",
+    )
     require(isinstance(provenance["extraction"], str) and provenance["extraction"], "extraction is absent")
 
     models = document["models"]

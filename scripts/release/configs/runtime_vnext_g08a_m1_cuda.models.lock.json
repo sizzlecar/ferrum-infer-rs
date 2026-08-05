@@ -5,7 +5,7 @@
     "source_git_sha": "3328ecd4122b3108a0d7c458a7ab251f3f966d3d",
     "source_catalog_sha256": "a02135a058e94e9e745caed8f0cc9cbed559a1f91a87a13a56b72424366361fe",
     "source_lock_sha256": "0e5b912bb4568da110dc80b9bf6815b24099fc67488ac076a51fd50b4c98558b",
-    "extraction": "Exact M1-CUDA lane projection from the pinned G00/S2 lock; path and sha256 fields preserved"
+    "extraction": "Reviewed M1-CUDA projection from the pinned model catalog and G00/S2 resolved weight lock; exact path, size, and SHA identities preserved"
   },
   "models": [
     {

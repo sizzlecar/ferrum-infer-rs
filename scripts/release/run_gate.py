@@ -79,6 +79,7 @@ LANES = (
     "vnext-cuda-determinism",
     "vnext-g08a-cuda",
     "vnext-g08a-metal",
+    "vnext-g08a-numerics",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
     "vnext-g08c-cuda",
@@ -1473,6 +1474,33 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-g08a-metal",
+        )
+    if lane == "vnext-g08a-numerics":
+        required = {
+            "--g08a-op-numerics": args.g08a_op_numerics,
+            "--g08a-linear-attention": args.g08a_linear_attention,
+            "--g08a-full-attention": args.g08a_full_attention,
+            "--g08a-full-model": args.g08a_full_model,
+            "--g08a-token-parity": args.g08a_token_parity,
+        }
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing:
+            raise GateError(
+                "vnext-g08a-numerics requires " + ", ".join(missing)
+            )
+        cmd = [sys.executable, "scripts/release/runtime_vnext_g08a_numerics.py"]
+        for flag, value in required.items():
+            assert value is not None
+            cmd.extend([flag, str(value.resolve())])
+        cmd.extend(["--out", str(out_dir)])
+        return LaneCommand(
+            cmd=cmd,
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT G08A NUMERICS PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            expected_source_git_sha=git_sha(),
+            provenance_kind="vnext-g08a-numerics",
         )
     if lane == "vnext-g08b-cuda":
         if args.g08b_artifact_root is None:
@@ -8742,6 +8770,63 @@ def self_test() -> int:
             ],
             g08a_metal_manifest,
         )
+        g08a_numerics_selftest = run_selftest_command(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts/release/runtime_vnext_g08a_numerics.py"),
+                "--self-test",
+            ]
+        )
+        require_selftest(
+            g08a_numerics_selftest.returncode == 0
+            and "FERRUM RUNTIME VNEXT G08A NUMERICS SELFTEST PASS"
+            in g08a_numerics_selftest.stdout.splitlines(),
+            g08a_numerics_selftest.stderr or g08a_numerics_selftest.stdout,
+        )
+        g08a_numerics_inputs = {
+            "--g08a-op-numerics": g08a_root / "numerics/metal-ops",
+            "--g08a-linear-attention": g08a_root / "numerics/linear.json",
+            "--g08a-full-attention": g08a_root / "numerics/full-attention.json",
+            "--g08a-full-model": g08a_root / "numerics/full-model.json",
+            "--g08a-token-parity": g08a_root / "numerics/token-parity.json",
+        }
+        g08a_numerics_out = root / "g08a-numerics-dry-run"
+        g08a_numerics_command = [
+            sys.executable,
+            str(this_script),
+            "vnext-g08a-numerics",
+        ]
+        for flag, value in g08a_numerics_inputs.items():
+            g08a_numerics_command.extend([flag, str(value)])
+        g08a_numerics_command.extend(
+            ["--out", str(g08a_numerics_out), "--dry-run"]
+        )
+        g08a_numerics_dry = run_selftest_command(g08a_numerics_command)
+        require_selftest(
+            g08a_numerics_dry.returncode == 0,
+            g08a_numerics_dry.stderr or g08a_numerics_dry.stdout,
+        )
+        g08a_numerics_manifest = json.loads(
+            (g08a_numerics_out / "gate.manifest.json").read_text()
+        )
+        expected_g08a_numerics_child = [
+            sys.executable,
+            "scripts/release/runtime_vnext_g08a_numerics.py",
+        ]
+        for flag, value in g08a_numerics_inputs.items():
+            expected_g08a_numerics_child.extend(
+                [flag, str(value.resolve())]
+            )
+        expected_g08a_numerics_child.extend(
+            ["--out", str(g08a_numerics_out.resolve())]
+        )
+        require_selftest(
+            g08a_numerics_manifest["status"] == "dry-run"
+            and g08a_numerics_manifest["lane"] == "vnext-g08a-numerics"
+            and g08a_numerics_manifest["delegated_command_line"]
+            == expected_g08a_numerics_child,
+            g08a_numerics_manifest,
+        )
         g08b_report = g08b_root / "correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json"
         g08b_out = root / "g08b-cuda-dry-run"
         g08b_dry = run_selftest_command(
@@ -10621,6 +10706,11 @@ def main() -> int:
     parser.add_argument("--cuda-determinism-artifact-root", type=Path)
     parser.add_argument("--g08a-artifact-root", type=Path)
     parser.add_argument("--g08a-scenario-report", type=Path)
+    parser.add_argument("--g08a-op-numerics", type=Path)
+    parser.add_argument("--g08a-linear-attention", type=Path)
+    parser.add_argument("--g08a-full-attention", type=Path)
+    parser.add_argument("--g08a-full-model", type=Path)
+    parser.add_argument("--g08a-token-parity", type=Path)
     parser.add_argument("--g08b-artifact-root", type=Path)
     parser.add_argument("--g08b-scenario-report", type=Path)
     parser.add_argument("--g08c-artifact-root", type=Path)
