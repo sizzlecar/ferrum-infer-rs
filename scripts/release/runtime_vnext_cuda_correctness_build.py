@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import bounded_command
+import runtime_vnext_native_operator_set as native_operator_set
 import runtime_vnext_plan_reference as plan_reference
 
 try:
@@ -39,7 +40,7 @@ READY_PREFIX = "FERRUM CUDA CORRECTNESS BINARY READY"
 PLAN_READY_PREFIX = "FERRUM CUDA CORRECTNESS IMPORT INVENTORY READY"
 SEMANTIC_PASS_PREFIX = "FERRUM CUDA CORRECTNESS SEMANTIC TRACE PASS"
 SELFTEST_PASS_LINE = "FERRUM CUDA CORRECTNESS BUILD SELFTEST PASS"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SEMANTIC_SCHEMA_VERSION = 6
 REFERENCE_ARTIFACT_TYPE = plan_reference.ARTIFACT_TYPE
 CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
@@ -125,10 +126,22 @@ def stable_file_identity(path: Path) -> dict[str, Any]:
 
 
 def file_ref(path: Path, artifact_root: Path) -> dict[str, Any]:
+    resolved_root = artifact_root.resolve()
+    resolved_path = path.resolve()
+    try:
+        relative = resolved_path.relative_to(resolved_root)
+    except ValueError as error:
+        raise CorrectnessBuildError(
+            f"artifact file is outside its root: {resolved_path}"
+        ) from error
+    require(
+        path.is_file() and not path.is_symlink() and resolved_path.is_file(),
+        f"artifact file is not regular: {resolved_path}",
+    )
     return {
-        "path": path.relative_to(artifact_root).as_posix(),
-        "sha256": sha256(path),
-        "size_bytes": path.stat().st_size,
+        "path": relative.as_posix(),
+        "sha256": sha256(resolved_path),
+        "size_bytes": resolved_path.stat().st_size,
     }
 
 
@@ -645,15 +658,24 @@ def create_plan(
     inventory, missing = inventory_imports(source_root, import_dirs)
     native_cache = args.native_cache.expanduser().resolve()
     target_dir = args.target_dir.expanduser().resolve()
-    native_operator_set_lock = args.native_operator_set_lock.expanduser().resolve()
+    source_native_operator_set_lock = (
+        args.native_operator_set_lock.expanduser().resolve()
+    )
     require(native_cache.is_absolute(), "native cache must be absolute")
     require(target_dir.is_absolute(), "Cargo target directory must be absolute")
     require(
-        native_operator_set_lock.is_file()
-        and not native_operator_set_lock.is_symlink(),
-        f"native operator set lock must be a regular file: {native_operator_set_lock}",
+        source_native_operator_set_lock.is_file()
+        and not source_native_operator_set_lock.is_symlink(),
+        "native operator set lock must be a regular file: "
+        f"{source_native_operator_set_lock}",
+    )
+    native_operator_set_lock, _ = native_operator_set.stage_native_operator_set(
+        source_native_operator_set_lock,
+        root / "native-operator-set",
+        plan_reference.REQUIRED_CUDA_NATIVE_OPERATORS,
     )
     native_operator_set_identity = stable_file_identity(native_operator_set_lock)
+    native_operator_set_artifact = file_ref(native_operator_set_lock, root)
     require(
         re.fullmatch(r"[0-9]{2,3}", args.compute_capability) is not None,
         "compute capability must be numeric, for example 89",
@@ -674,6 +696,7 @@ def create_plan(
         "crates/ferrum-kernels/build.rs",
         "crates/ferrum-native-ops/src/build_cache.rs",
         "scripts/release/runtime_vnext_cuda_correctness_build.py",
+        "scripts/release/runtime_vnext_native_operator_set.py",
     ):
         path = source_root / relative
         require(path.is_file(), f"required correctness-build source is missing: {relative}")
@@ -698,6 +721,7 @@ def create_plan(
         "native_build_cache": str(native_cache),
         "native_import_dirs": [str(path) for path in import_dirs],
         "native_operator_set_lock": native_operator_set_identity,
+        "native_operator_set_artifact": native_operator_set_artifact,
         "native_import_inventory": inventory,
         "missing_native_imports": missing,
         "ready": not missing,
@@ -855,6 +879,7 @@ def run_build(args: argparse.Namespace, plan: dict[str, Any], root: Path) -> dic
         "native_build_cache": plan["native_build_cache"],
         "native_import_dirs": plan["native_import_dirs"],
         "native_operator_set_lock": plan["native_operator_set_lock"],
+        "native_operator_set_artifact": plan["native_operator_set_artifact"],
         "source_inputs": plan["source_inputs"],
         "toolchain": plan["toolchain"],
         "target_preparation": target_preparation,
@@ -1587,6 +1612,26 @@ strip = false
             f"missing native import was not classified: {missing}",
         )
 
+        source_native_lock = native_operator_set.create_selftest_native_operator_set(
+            root / "native-source",
+            plan_reference.REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+        portable_native_lock, portable_native_set = (
+            native_operator_set.stage_native_operator_set(
+                source_native_lock,
+                root / "native-operator-set",
+                plan_reference.REQUIRED_CUDA_NATIVE_OPERATORS,
+            )
+        )
+        portable_ref = file_ref(portable_native_lock, root)
+        require(
+            portable_ref["path"]
+            == "native-operator-set/native-operator-set.lock.json"
+            and portable_ref["sha256"]
+            == portable_native_set["lock_sha256"],
+            "portable native operator set artifact binding drifted",
+        )
+
         execution_root, fixture = plan_reference.make_fixture(root)
         execution_manifest_path = Path(fixture["execution"])
         focused_report = Path(fixture["focused"])
@@ -1927,6 +1972,7 @@ def main() -> int:
         return 0
     except (
         CorrectnessBuildError,
+        native_operator_set.NativeOperatorSetEvidenceError,
         OSError,
         ValueError,
         plan_reference.PlanReferenceError,
