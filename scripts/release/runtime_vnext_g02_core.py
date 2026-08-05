@@ -51,6 +51,8 @@ PROCESS_LIMIT = 16
 GROUP_THREAD_LIMIT = 64
 PER_PROCESS_THREAD_LIMIT = 16
 CARGO_BUILD_JOBS = 4
+DEV_CODEGEN_UNITS = 4
+DEV_BUILD_OVERRIDE_CODEGEN_UNITS = 4
 TEST_CODEGEN_UNITS = 4
 BUILD_OVERRIDE_CODEGEN_UNITS = 4
 
@@ -369,6 +371,10 @@ def child_environment() -> dict[str, str]:
     env.update(
         {
             "CARGO_BUILD_JOBS": str(CARGO_BUILD_JOBS),
+            "CARGO_PROFILE_DEV_CODEGEN_UNITS": str(DEV_CODEGEN_UNITS),
+            "CARGO_PROFILE_DEV_BUILD_OVERRIDE_CODEGEN_UNITS": str(
+                DEV_BUILD_OVERRIDE_CODEGEN_UNITS
+            ),
             "CARGO_PROFILE_TEST_CODEGEN_UNITS": str(TEST_CODEGEN_UNITS),
             "CARGO_PROFILE_TEST_BUILD_OVERRIDE_CODEGEN_UNITS": str(
                 BUILD_OVERRIDE_CODEGEN_UNITS
@@ -581,6 +587,8 @@ def collect(out: Path) -> dict[str, Any]:
         },
         "compile_bounds": {
             "cargo_build_jobs": CARGO_BUILD_JOBS,
+            "dev_codegen_units": DEV_CODEGEN_UNITS,
+            "dev_build_override_codegen_units": DEV_BUILD_OVERRIDE_CODEGEN_UNITS,
             "test_codegen_units": TEST_CODEGEN_UNITS,
             "build_override_codegen_units": BUILD_OVERRIDE_CODEGEN_UNITS,
         },
@@ -632,6 +640,8 @@ def validate_artifact(root: Path) -> dict[str, Any]:
         manifest.get("compile_bounds")
         == {
             "cargo_build_jobs": CARGO_BUILD_JOBS,
+            "dev_codegen_units": DEV_CODEGEN_UNITS,
+            "dev_build_override_codegen_units": DEV_BUILD_OVERRIDE_CODEGEN_UNITS,
             "test_codegen_units": TEST_CODEGEN_UNITS,
             "build_override_codegen_units": BUILD_OVERRIDE_CODEGEN_UNITS,
         },
@@ -698,6 +708,13 @@ def self_test() -> int:
     environment = child_environment()
     require(environment.get("CARGO_BUILD_JOBS") == str(CARGO_BUILD_JOBS),
             "Cargo build job bound is missing")
+    require(environment.get("CARGO_PROFILE_DEV_CODEGEN_UNITS") == str(DEV_CODEGEN_UNITS),
+            "dev-profile codegen-unit bound is missing")
+    require(
+        environment.get("CARGO_PROFILE_DEV_BUILD_OVERRIDE_CODEGEN_UNITS")
+        == str(DEV_BUILD_OVERRIDE_CODEGEN_UNITS),
+        "dev-profile build-override codegen-unit bound is missing",
+    )
     require(environment.get("CARGO_PROFILE_TEST_CODEGEN_UNITS") == str(TEST_CODEGEN_UNITS),
             "test-profile codegen-unit bound is missing")
     require(
