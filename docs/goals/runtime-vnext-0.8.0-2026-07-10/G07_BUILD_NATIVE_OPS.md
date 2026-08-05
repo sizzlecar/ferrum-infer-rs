@@ -48,13 +48,18 @@ python3 scripts/release/run_gate.py vnext-g07b \
   --g07a <g07a-manifest> \
   --g07b-evidence-root <raw-native-chain-evidence> \
   --out <external-out>
-python3 scripts/release/run_gate.py vnext-g07 --g07a <g07a-manifest> --g07b <g07b-manifest> --out <external-out>
+python3 scripts/release/run_gate.py vnext-g07 \
+  --g00p <g00p-manifest> \
+  --g07a <g07a-manifest> \
+  --g07b <g07b-manifest> \
+  --out <external-out>
 ```
 
 G07A manifest 必须绑定 G00 build-input inventory、fixed build-host fingerprint、crate graph、timing
 harness blob 和 raw samples。G07B 必须绑定 G03 operation catalog/version、native ABI、source lock、
-resolver fixtures 和 G07A manifest。aggregate G07 逐字节消费两个 child manifest 并验证 source、
-crate graph、operation catalog 和 ABI freshness；任何 child stale 或 catalog hash 分叉都必须失败。
+resolver fixtures 和 G07A manifest。aggregate G07 逐字节消费 G00P、G07A、G07B 三个 outer/child
+manifest，完整复验 G00P raw baseline 与 full-redteam，并验证 source、crate graph、operation catalog
+和 ABI freshness；任何 child stale、wrapper receipt 被篡改或 catalog hash 分叉都必须失败。
 `--g07b-evidence-root` 只接受由同一 clean source、同一 canonical G03/G07A 输入生成并经独立
 validator 复验的完整 source-build -> package -> artifact-set -> resolve/link/load chain；它不是裸
 catalog 或调用方自报摘要，canonical checkpoint 必须重新验证其全部外部 manifest 和文件哈希。
@@ -624,6 +629,30 @@ release binaries, correctness binaries, typed config and model locks. This is
 validator/source progress only. No bounded workspace source artifact on the
 eventual clean checkpoint SHA, canonical five-sample CUDA timing root, or the
 two required real PASS lines exists yet, so G07A and G07 remain Open.
+
+### 2026-08-05 canonical G07B and aggregate wiring
+
+The source gate now includes canonical `vnext-g07b` and aggregate `vnext-g07`
+lanes. G07B consumes only independently revalidated G03 and G07A outer gate
+manifests, requires one clean source identity, and revalidates the complete
+source-build -> package -> artifact-set -> resolve/link/load chain. Aggregate
+G07 consumes the exact G00P/G07A/G07B outer and child bytes, revalidates G00P's
+full raw baseline and red-team receipt, rejects a forked G07A binding, and
+copies the verified crate graph, invalidation/timing evidence, native operator
+catalog, resolver fixtures and non-empty build logs into one indexed checkpoint.
+
+The repository now pins Rust `1.91.0` plus `rust-src` in
+`rust-toolchain.toml`; CI, release and remote bootstrap entrypoints install
+that exact version instead of floating `stable`. The source component also
+keeps trybuild's normalized `$RUST/core` excerpts identical across macOS and
+Linux. This makes compile diagnostics and the G07 timing/toolchain identity
+reproducible without overwriting compile-fail snapshots when a newer compiler
+changes only diagnostic rendering.
+
+Focused checkpoint, Python syntax, shell syntax and unified dry-run tests pass.
+These are source-level implementation results only. Current-clean-SHA unit,
+S1/G03, semantic-plan, five-sample G07A, native-chain G07B and aggregate G07
+artifact PASS lines are still required; G07 remains Open.
 
 ## 验收
 
