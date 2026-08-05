@@ -38,8 +38,10 @@ FAIL_PREFIX = "FERRUM RUNTIME VNEXT G00 HISTORICAL CORPUS FAIL"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT G00 HISTORICAL CORPUS SELFTEST PASS"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-FAMILY_RE = re.compile(r"H(0[1-9]|1[0-5])")
-CASE_RE = re.compile(r"(H(?:0[1-9]|1[0-5]))\.([1-9][0-9]*)")
+EXPECTED_FAMILY_COUNT = 16
+EXPECTED_CONCRETE_CASE_COUNT = 29
+FAMILY_RE = re.compile(r"H(0[1-9]|1[0-6])")
+CASE_RE = re.compile(r"(H(?:0[1-9]|1[0-6]))\.([1-9][0-9]*)")
 
 
 class CorpusError(RuntimeError):
@@ -327,9 +329,24 @@ def load_context(
 
     expected_family_ids = require_list(policy.get("expected_family_ids"), "historical corpus policy.expected_family_ids", nonempty=True)
     require(all(isinstance(item, str) and FAMILY_RE.fullmatch(item) is not None for item in expected_family_ids), "historical corpus policy has invalid family ids")
-    require(len(expected_family_ids) == len(set(expected_family_ids)) == 15, "historical corpus policy must contain 15 unique family ids")
-    require(expected_family_ids == [f"H{index:02d}" for index in range(1, 16)], "historical corpus policy family order must be H01-H15")
-    require_int(policy.get("expected_concrete_case_count"), "historical corpus policy.expected_concrete_case_count", minimum=1)
+    require(
+        len(expected_family_ids) == len(set(expected_family_ids)) == EXPECTED_FAMILY_COUNT,
+        f"historical corpus policy must contain {EXPECTED_FAMILY_COUNT} unique family ids",
+    )
+    require(
+        expected_family_ids
+        == [f"H{index:02d}" for index in range(1, EXPECTED_FAMILY_COUNT + 1)],
+        "historical corpus policy family order must be H01-H16",
+    )
+    require(
+        require_int(
+            policy.get("expected_concrete_case_count"),
+            "historical corpus policy.expected_concrete_case_count",
+            minimum=1,
+        )
+        == EXPECTED_CONCRETE_CASE_COUNT,
+        f"historical corpus policy must contain {EXPECTED_CONCRETE_CASE_COUNT} concrete cases",
+    )
     require(policy.get("artifact_file") == "historical-bug-corpus.json", "historical corpus artifact_file mismatch")
     require(policy.get("receipt_glob") == "historical-bugs/**/evidence.json", "historical corpus receipt_glob mismatch")
     require(policy.get("receipt_template") == "historical-bugs/{case_id}/evidence.json", "historical corpus receipt_template mismatch")
@@ -353,10 +370,16 @@ def load_context(
     catalog = read_json(catalog_path)
     require(catalog.get("schema_version") == SCHEMA_VERSION, "historical bug catalog schema_version mismatch")
     require(catalog.get("baseline_git_sha") == baseline_sha, "historical bug catalog baseline SHA mismatch")
-    require(catalog.get("family_count") == 15, "historical bug catalog family_count must be 15")
+    require(
+        catalog.get("family_count") == EXPECTED_FAMILY_COUNT,
+        f"historical bug catalog family_count must be {EXPECTED_FAMILY_COUNT}",
+    )
     require(catalog.get("concrete_case_count") == policy.get("expected_concrete_case_count"), "historical bug catalog concrete case denominator is stale")
     catalog_families = require_list(catalog.get("families"), "historical bug catalog.families", nonempty=True)
-    require(len(catalog_families) == 15, "historical bug catalog must have 15 family rows")
+    require(
+        len(catalog_families) == EXPECTED_FAMILY_COUNT,
+        f"historical bug catalog must have {EXPECTED_FAMILY_COUNT} family rows",
+    )
 
     cases: dict[str, dict[str, Any]] = {}
     family_cases: dict[str, tuple[str, ...]] = {}
@@ -890,12 +913,18 @@ def validate_corpus_document(context: Context, artifact_root: Path, document: di
     assembled_at = require_string(document.get("assembled_at"), "historical corpus assembled_at")
     expected = build_corpus(context, artifact_root, assembled_at=assembled_at)
     require(document == expected, "historical corpus does not match current catalog, receipts, hashes, or freshness inputs")
-    require(document.get("family_count") == 15, "historical corpus family denominator must be 15")
+    require(
+        document.get("family_count") == EXPECTED_FAMILY_COUNT,
+        f"historical corpus family denominator must be {EXPECTED_FAMILY_COUNT}",
+    )
     require(document.get("concrete_case_count") == context.policy.get("expected_concrete_case_count"), "historical corpus concrete case denominator mismatch")
     require(document.get("orphan_case_count") == 0, "historical corpus contains orphan cases")
     require(document.get("duplicate_case_count") == 0, "historical corpus contains duplicate cases")
     if document.get("status") == "complete":
-        require(document.get("complete_family_count") == 15, "historical corpus complete family coverage must be 15/15")
+        require(
+            document.get("complete_family_count") == EXPECTED_FAMILY_COUNT,
+            "historical corpus complete family coverage must be 16/16",
+        )
         require(document.get("complete_case_count") == document.get("concrete_case_count"), "historical corpus concrete case coverage must be M/M")
         require(document.get("blocker_count") == 0 and document.get("blockers") == [], "complete historical corpus must not contain blockers")
     else:
@@ -1139,7 +1168,10 @@ def self_test() -> None:
         create_selftest_root(context, base)
         complete = assemble(context, base)
         require(complete.get("status") == "complete", "complete self-test corpus was not accepted")
-        require(complete.get("complete_family_count") == 15, "self-test corpus did not cover 15/15 families")
+        require(
+            complete.get("complete_family_count") == EXPECTED_FAMILY_COUNT,
+            "self-test corpus did not cover 16/16 families",
+        )
         require(complete.get("complete_case_count") == len(context.cases), "self-test corpus did not cover M/M cases")
         production_context = load_context(allow_selftest=False)
         try:

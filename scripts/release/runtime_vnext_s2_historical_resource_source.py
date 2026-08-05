@@ -402,8 +402,10 @@ def validate_historical_cases(
         "historical corpus catalog binding is stale",
     )
     require(
-        corpus_document.get("concrete_case_count") == 28
-        and corpus_document.get("complete_case_count") == 28
+        corpus_document.get("concrete_case_count")
+        == historical_corpus.EXPECTED_CONCRETE_CASE_COUNT
+        and corpus_document.get("complete_case_count")
+        == historical_corpus.EXPECTED_CONCRETE_CASE_COUNT
         and corpus_document.get("incomplete_case_count") == 0,
         "historical corpus denominator is incomplete",
     )

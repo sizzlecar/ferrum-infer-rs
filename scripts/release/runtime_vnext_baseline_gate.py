@@ -88,6 +88,8 @@ SELFTEST_SUMMARY_PREFIX = "FERRUM RUNTIME VNEXT G00 BASELINE SELFTEST SUMMARY:"
 SCHEMA_VERSION = 1
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+EXPECTED_HISTORICAL_FAMILY_COUNT = 16
+EXPECTED_HISTORICAL_CASE_COUNT = 29
 SECRET_KEY_RE = re.compile(
     r"(?:^|[_-])(?:token|secret|password|api[_-]?key|credential|authorization|auth[_-]?key|bearer|cookie|private[_-]?key)(?:$|[_-])",
     re.IGNORECASE,
@@ -5147,6 +5149,14 @@ def validate_historical_bugs(root: Path) -> None:
     catalog = read_json(BUG_CATALOG_PATH)
     require_schema(catalog, "runtime_vnext_historical_bugs catalog")
     require(catalog.get("baseline_git_sha") == FROZEN_LEGACY_SHA, "historical bug catalog baseline SHA mismatch")
+    require(
+        catalog.get("family_count") == EXPECTED_HISTORICAL_FAMILY_COUNT,
+        "historical bug catalog family denominator mismatch",
+    )
+    require(
+        catalog.get("concrete_case_count") == EXPECTED_HISTORICAL_CASE_COUNT,
+        "historical bug catalog concrete case denominator mismatch",
+    )
     catalog_families = require_list(catalog.get("families"), "historical bug catalog families")
     expected_cases: dict[str, dict[str, Any]] = {}
     expected_family_cases: dict[str, set[str]] = {}
@@ -5178,15 +5188,21 @@ def validate_historical_bugs(root: Path) -> None:
     require_source_identity(data, "historical-bug-corpus")
     require(data.get("catalog_id") == catalog.get("catalog_id"), "historical-bug-corpus.catalog_id mismatch")
     require(data.get("catalog_sha256") == file_sha256(BUG_CATALOG_PATH), "historical-bug-corpus.catalog_sha256 mismatch")
-    require(data.get("family_count") == 15, "historical-bug-corpus.family_count must be 15")
+    require(
+        data.get("family_count") == EXPECTED_HISTORICAL_FAMILY_COUNT,
+        f"historical-bug-corpus.family_count must be {EXPECTED_HISTORICAL_FAMILY_COUNT}",
+    )
     families = require_list(data.get("families"), "historical-bug-corpus.families")
-    require(len(families) == 15, "historical-bug-corpus must contain 15 families")
+    require(
+        len(families) == EXPECTED_HISTORICAL_FAMILY_COUNT,
+        f"historical-bug-corpus must contain {EXPECTED_HISTORICAL_FAMILY_COUNT} families",
+    )
     ids: set[str] = set()
     cases: set[str] = set()
     for index, raw in enumerate(families):
         family = require_object(raw, f"historical-bug-corpus.families[{index}]")
         family_id = require_string(family.get("id"), f"historical-bug-corpus.families[{index}].id")
-        require(re.fullmatch(r"H(0[1-9]|1[0-5])", family_id) is not None, f"invalid historical family id: {family_id}")
+        require(re.fullmatch(r"H(0[1-9]|1[0-6])", family_id) is not None, f"invalid historical family id: {family_id}")
         require(family_id not in ids, f"duplicate historical family: {family_id}")
         ids.add(family_id)
         case_rows = require_list(family.get("cases"), f"historical-bug-corpus.{family_id}.cases")
@@ -5264,9 +5280,20 @@ def validate_historical_bugs(root: Path) -> None:
                 f"historical-bug-corpus.{case_id} mutation_kind is invalid",
             )
         require(family_case_ids == expected_family_cases.get(family_id), f"historical-bug-corpus.{family_id} case coverage mismatch")
-    require(ids == {f"H{index:02d}" for index in range(1, 16)}, "historical bug families must be H01-H15")
+    require(
+        ids
+        == {
+            f"H{index:02d}"
+            for index in range(1, EXPECTED_HISTORICAL_FAMILY_COUNT + 1)
+        },
+        "historical bug families must be H01-H16",
+    )
     require(cases == set(expected_cases), "historical-bug-corpus concrete case coverage mismatch")
     require(data.get("concrete_case_count") == len(cases), "historical-bug-corpus concrete_case_count mismatch")
+    require(
+        len(cases) == EXPECTED_HISTORICAL_CASE_COUNT,
+        "historical-bug-corpus concrete case denominator is stale",
+    )
     require(data.get("orphan_case_count") == 0, "historical-bug-corpus orphan_case_count must be zero")
     require(data.get("duplicate_case_count") == 0, "historical-bug-corpus duplicate_case_count must be zero")
 
@@ -7903,7 +7930,7 @@ def make_synthetic_root(root: Path) -> None:
             "dirty_status": {"is_dirty": False, "status_short": []},
             "catalog_id": bug_catalog["catalog_id"],
             "catalog_sha256": file_sha256(BUG_CATALOG_PATH),
-            "family_count": 15,
+            "family_count": EXPECTED_HISTORICAL_FAMILY_COUNT,
             "concrete_case_count": concrete_case_count,
             "orphan_case_count": 0,
             "duplicate_case_count": 0,

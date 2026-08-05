@@ -4,8 +4,8 @@
   "baseline_git_sha": "cff4c47765ef3259b8a04890187d99c60da86394",
   "source_document": "docs/goals/runtime-vnext-0.8.0-2026-07-10/G02_TEST_EVIDENCE.md",
   "prior_catalog": "docs/goals/test-architecture-2026-06-10/historical_bugs.json",
-  "family_count": 15,
-  "concrete_case_count": 28,
+  "family_count": 16,
+  "concrete_case_count": 29,
   "evidence_status_vocabulary": {
     "bound": "A historical fix or record and a current reproducer path are both identified.",
     "partial": "Some source evidence exists, but the original failing artifact or an isolated mutation fixture is still missing.",
@@ -530,6 +530,35 @@
           "entrypoints": ["run", "serve"],
           "backends": ["cuda"],
           "downstream_goals": ["G02", "G04", "G08B"],
+          "evidence_status": "bound"
+        }
+      ]
+    },
+    {
+      "id": "H16",
+      "title": "CUDA reusable execution was declared equivalent without eager/replay numerical state evidence",
+      "cases": [
+        {
+          "id": "H16.1",
+          "title": "reusable executable inventory passed without declared output or KV/recurrent post-state witnesses",
+          "commits": [
+            {"sha": "8d9d6a9a41e7869317c1dd7234861f1cadba7065", "relation": "contract_gap_and_fix"},
+            {"sha": "3e5fe7cc582de98c8c7813ba00433793495347fe", "relation": "evidence_validator"},
+            {"sha": "1a04dcd401e647a61a466ffe6382eaf5bd9d5935", "relation": "actual_replay_followup_fix"}
+          ],
+          "historical_artifacts": [
+            "docs/goals/runtime-vnext-0.8.0-2026-07-10/G02_TEST_EVIDENCE.md",
+            "docs/goals/runtime-vnext-0.8.0-2026-07-10/GOAL.md"
+          ],
+          "reproducer_paths": [
+            "scripts/release/runtime_vnext_cuda_determinism.py",
+            "crates/ferrum-cli/src/commands/vnext_determinism.rs",
+            "crates/ferrum-interfaces/src/vnext/operation/determinism.rs"
+          ],
+          "failure_class": "replay_equivalence_without_numeric_state_witness",
+          "entrypoints": ["run", "serve"],
+          "backends": ["cuda"],
+          "downstream_goals": ["G02", "G03", "G06", "G08", "G10"],
           "evidence_status": "bound"
         }
       ]

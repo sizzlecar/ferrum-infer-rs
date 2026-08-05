@@ -1097,8 +1097,8 @@ python3 scripts/release/run_gate.py vnext-g00f \
 `vnext-g00f` 是 G00a 事实 artifact 的 freshness-bound DAG 引用，不复制或重跑同一事实
 collector；它只把开发解锁范围收敛到 `S0A`/`S1`。
 
-checkpoint 必须冻结 12/12 model/backend lane、M1-M3 四类 generation preset、15 个 historical
-bug family/28 个 concrete case 的 catalog 事实和完整 analyzer/catalog/goal source identity。collector
+checkpoint 必须冻结 12/12 model/backend lane、M1-M3 四类 generation preset、16 个 historical
+bug family/29 个 concrete case 的 catalog 事实和完整 analyzer/catalog/goal source identity。collector
 必须先把两个外部输入读取成不可变快照，再用 checked-in resolver 重新执行一次实时 HF 解析；
 调用方解析与 live recheck 的完整 model facts 必须相等，二者都作为 artifact 保存；HF
 `model-info`/`repo-tree` 原始响应必须可按 SHA/size 重放，safetensors index 的 weight map、shard

@@ -312,7 +312,10 @@ def capture_all(artifact_root: Path, *, replace: bool) -> dict[str, Any]:
 def self_test() -> None:
     context = corpus.load_context()
     _, definitions = load_replay_cases(context)
-    require(len(definitions) == 28, "historical replay self-test case count mismatch")
+    require(
+        len(definitions) == corpus.EXPECTED_CONCRETE_CASE_COUNT,
+        "historical replay self-test case count mismatch",
+    )
     result = subprocess.run(
         [sys.executable, str(REPLAY_PATH), "--self-test"],
         cwd=REPO_ROOT,
