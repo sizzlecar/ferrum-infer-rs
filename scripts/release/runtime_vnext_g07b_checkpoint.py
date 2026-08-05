@@ -50,6 +50,13 @@ UNLOCKS = ["G07"]
 DOES_NOT_PROVE = ["G07", "G08", "G09", "G10", "release readiness"]
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+CHECKPOINT_CONTROL_FILES = {
+    "manifest.json",
+    "gate.manifest.json",
+    "run_gate.child.command.json",
+    "run_gate.child.stdout",
+    "run_gate.child.stderr",
+}
 
 
 class CheckpointError(RuntimeError):
@@ -313,7 +320,8 @@ def checkpoint_artifact_index(root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
         require(not path.is_symlink(), f"checkpoint artifact contains symlink: {path}")
-        if path.is_file() and path.name != "manifest.json":
+        relative = path.relative_to(root).as_posix()
+        if path.is_file() and relative not in CHECKPOINT_CONTROL_FILES:
             rows.append(file_identity(path, relative_to=root))
     return rows
 
