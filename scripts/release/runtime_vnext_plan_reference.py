@@ -14,8 +14,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+try:
+    import runtime_vnext_native_operator_set as native_operator_set
+except ModuleNotFoundError:
+    from scripts.release import runtime_vnext_native_operator_set as native_operator_set
 
-SCHEMA_VERSION = 1
+
+LEGACY_SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ARTIFACT_TYPE = "runtime-vnext-cuda-release-plan-reference"
 READY_PREFIX = "FERRUM CUDA RELEASE PLAN REFERENCE READY"
 CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
@@ -42,6 +48,17 @@ RELEASE_BUILD_COMMAND = [
     "--features",
     ",".join(FEATURES),
 ]
+NATIVE_OPERATOR_SET_LOCK_ENV = "FERRUM_NATIVE_OPERATOR_SET_LOCK"
+NATIVE_OPERATOR_SET_LOCK_INPUT = "native-operator-set.lock.json"
+CANONICAL_NATIVE_OPERATOR_SET_LOCK_REL = Path(
+    "build/candidate/native-operator-set.lock.json"
+)
+REQUIRED_CUDA_NATIVE_OPERATORS = (
+    "ferrum.cuda.marlin",
+    "ferrum.cuda.vllm_marlin",
+    "ferrum.cuda.vllm_moe_marlin",
+    "ferrum.cuda.vllm_paged_attention_v2",
+)
 GIT_SHA_LENGTH = 40
 SHA256_LENGTH = 64
 MAX_PORTABLE_ARTIFACT_BYTES = 512 * 1024 * 1024
@@ -321,10 +338,140 @@ def validate_focused_report(
     )
 
 
+def validate_native_operator_set_lock_identity(
+    raw: Any,
+    *,
+    lock_path: Path | None,
+    require_recorded_path: bool,
+) -> dict[str, Any]:
+    require(
+        isinstance(raw, dict)
+        and set(raw) == {"path", "sha256", "size_bytes", "mtime_ns"},
+        "release build native operator set lock identity is invalid",
+    )
+    recorded_path_raw = raw.get("path")
+    recorded_path = Path(recorded_path_raw) if isinstance(recorded_path_raw, str) else Path()
+    require(
+        isinstance(recorded_path_raw, str)
+        and recorded_path_raw
+        and recorded_path.is_absolute()
+        and ".." not in recorded_path.parts
+        and str(recorded_path) == recorded_path_raw,
+        "release build native operator set lock path is invalid",
+    )
+    require_sha256(raw.get("sha256"), "release build native operator set lock sha256")
+    for key in ("size_bytes", "mtime_ns"):
+        value = raw.get(key)
+        require(
+            isinstance(value, int) and not isinstance(value, bool) and value > 0,
+            f"release build native operator set lock {key} is invalid",
+        )
+    if lock_path is not None:
+        require(
+            lock_path.is_absolute()
+            and not lock_path.is_symlink()
+            and lock_path.is_file()
+            and lock_path.stat().st_size > 0,
+            f"release build native operator set lock is missing: {lock_path}",
+        )
+        require(
+            not require_recorded_path or recorded_path == lock_path,
+            "release build command and native operator set lock path differ",
+        )
+        require(
+            raw["sha256"] == sha256(lock_path)
+            and raw["size_bytes"] == lock_path.stat().st_size,
+            "release build native operator set lock content identity differs",
+        )
+        if require_recorded_path:
+            require(
+                raw["mtime_ns"] == lock_path.stat().st_mtime_ns,
+                "release build native operator set lock mtime differs",
+            )
+    return raw
+
+
+def validate_native_operator_set_closure(lock_path: Path) -> dict[str, Any]:
+    try:
+        return native_operator_set.validate_native_operator_set(
+            lock_path,
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+    except native_operator_set.NativeOperatorSetEvidenceError as error:
+        raise PlanReferenceError(
+            f"release build native operator set closure is invalid: {error}"
+        ) from error
+
+
+def validate_release_build_command(
+    receipt: dict[str, Any],
+    *,
+    allow_legacy: bool,
+    execution_root: Path | None = None,
+    portable_lock_path: Path | None = None,
+) -> Path | None:
+    command = receipt.get("command")
+    if command == RELEASE_BUILD_COMMAND:
+        require(
+            allow_legacy and receipt.get("native_operator_set_lock") is None,
+            "legacy release command is only valid for a schema v1 reference",
+        )
+        return None
+
+    require(
+        isinstance(command, list)
+        and len(command) == len(RELEASE_BUILD_COMMAND) + 2
+        and command[0] == "env"
+        and command[2:] == RELEASE_BUILD_COMMAND,
+        "reference build did not use the exact official CUDA release command",
+    )
+    assignment = command[1]
+    prefix = f"{NATIVE_OPERATOR_SET_LOCK_ENV}="
+    require(
+        isinstance(assignment, str)
+        and assignment.startswith(prefix)
+        and assignment.count("=") == 1
+        and len(assignment) > len(prefix),
+        "release build command has an invalid native operator set lock binding",
+    )
+    command_lock_path = Path(assignment[len(prefix) :])
+    identity = validate_native_operator_set_lock_identity(
+        receipt.get("native_operator_set_lock"),
+        lock_path=None,
+        require_recorded_path=False,
+    )
+    require(
+        command_lock_path == Path(identity["path"]),
+        "release build command and native operator set lock path differ",
+    )
+
+    if execution_root is not None:
+        require_under(command_lock_path, execution_root, "native operator set lock")
+        require(
+            command_lock_path.resolve()
+            == (execution_root / CANONICAL_NATIVE_OPERATOR_SET_LOCK_REL).resolve(),
+            "release build native operator set lock path is not canonical",
+        )
+        validate_native_operator_set_lock_identity(
+            identity,
+            lock_path=command_lock_path,
+            require_recorded_path=True,
+        )
+        validate_native_operator_set_closure(command_lock_path)
+    if portable_lock_path is not None:
+        validate_native_operator_set_lock_identity(
+            identity,
+            lock_path=portable_lock_path,
+            require_recorded_path=False,
+        )
+        validate_native_operator_set_closure(portable_lock_path)
+    return command_lock_path
+
+
 def validate_release_build_receipt(
     execution_root: Path,
     execution: dict[str, Any],
-) -> tuple[Path, dict[str, Any], Path]:
+) -> tuple[Path, dict[str, Any], Path, Path]:
     receipt_path = resolve_execution_artifact_ref(
         execution_root,
         execution.get("binary_build_receipt"),
@@ -341,10 +488,15 @@ def validate_release_build_receipt(
     )
     require(
         receipt.get("backend") == BACKEND
-        and receipt.get("build_mode", "release") == "release"
-        and receipt.get("command") == RELEASE_BUILD_COMMAND,
-        "reference build did not use the exact official CUDA release command",
+        and receipt.get("build_mode", "release") == "release",
+        "reference build did not use the official CUDA release profile",
     )
+    native_lock = validate_release_build_command(
+        receipt,
+        allow_legacy=False,
+        execution_root=execution_root,
+    )
+    require(native_lock is not None, "current release build requires a native operator set lock")
     for key in ("source_git_sha", "source_tree_sha", "hardware_id", "binary_sha256"):
         require(
             receipt.get(key) == execution.get(key),
@@ -376,7 +528,7 @@ def validate_release_build_receipt(
         == receipt.get("binary_sha256"),
         "release build and execution binary identities differ",
     )
-    return receipt_path, receipt, binary_path
+    return receipt_path, receipt, binary_path, native_lock
 
 
 def capture(
@@ -448,6 +600,7 @@ def capture(
         build_receipt_path,
         _,
         release_binary_path,
+        native_operator_set_lock_path,
     ) = validate_release_build_receipt(execution_root, execution)
     effective_config_path = resolve_execution_artifact_ref(
         execution_root,
@@ -491,7 +644,19 @@ def capture(
 
     input_dir = root / "inputs"
     input_dir.mkdir(parents=True)
-    copied: dict[str, Any] = {}
+    try:
+        portable_native_lock, _ = native_operator_set.stage_native_operator_set(
+            native_operator_set_lock_path,
+            input_dir / "native-operator-set",
+            REQUIRED_CUDA_NATIVE_OPERATORS,
+        )
+    except native_operator_set.NativeOperatorSetEvidenceError as error:
+        raise PlanReferenceError(
+            f"failed to stage the release native operator set: {error}"
+        ) from error
+    copied: dict[str, Any] = {
+        NATIVE_OPERATOR_SET_LOCK_INPUT: file_ref(portable_native_lock, root)
+    }
     for label, source in (
         ("release-build-receipt.json", build_receipt_path),
         ("execution-manifest.json", execution_manifest_path),
@@ -568,8 +733,9 @@ def validate(
     )
     root = manifest_path.parent
     manifest = read_object(manifest_path, "release plan reference manifest")
+    schema_version = manifest.get("schema_version")
     require(
-        manifest.get("schema_version") == SCHEMA_VERSION
+        schema_version in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}
         and manifest.get("artifact_type") == ARTIFACT_TYPE
         and manifest.get("status") == "reference-ready",
         "release plan reference schema, type, or status is invalid",
@@ -634,6 +800,8 @@ def validate(
         "actual-effective-config.json",
         "release-binary",
     }
+    if schema_version == SCHEMA_VERSION:
+        expected_inputs.add(NATIVE_OPERATOR_SET_LOCK_INPUT)
     require(set(inputs) == expected_inputs, "release plan reference input set is invalid")
     resolved = {
         label: resolve_file_ref(root, inputs[label], f"release plan reference {label}")
@@ -676,10 +844,26 @@ def validate(
         and build_receipt.get("status") == "pass"
         and build_receipt.get("execution_contract") == EXECUTION_CONTRACT
         and build_receipt.get("backend") == BACKEND
-        and build_receipt.get("command") == RELEASE_BUILD_COMMAND
         and build_receipt.get("build_mode", "release") == "release"
         and build_receipt.get("binary_sha256") == manifest["binary_sha256"],
         "release reference build receipt no longer proves the official release profile",
+    )
+    validated_native_lock = validate_release_build_command(
+        build_receipt,
+        allow_legacy=schema_version == LEGACY_SCHEMA_VERSION,
+        portable_lock_path=(
+            resolved[NATIVE_OPERATOR_SET_LOCK_INPUT]
+            if schema_version == SCHEMA_VERSION
+            else None
+        ),
+    )
+    require(
+        (schema_version == SCHEMA_VERSION and validated_native_lock is not None)
+        or (
+            schema_version == LEGACY_SCHEMA_VERSION
+            and validated_native_lock is None
+        ),
+        "release plan reference schema does not match its native lock contract",
     )
     validate_focused_report(focused, expected=execution)
     require(
@@ -803,6 +987,11 @@ def make_fixture(root: Path) -> tuple[Path, dict[str, str]]:
     binary = execution_root / "build/candidate/ferrum"
     binary.parent.mkdir(parents=True)
     binary.write_bytes(binary_bytes)
+    native_lock = native_operator_set.create_selftest_native_operator_set(
+        binary.parent,
+        REQUIRED_CUDA_NATIVE_OPERATORS,
+    )
+    native_lock_stat = native_lock.stat()
     build_receipt = execution_root / "build/candidate/candidate-build-receipt.json"
     write_json(
         build_receipt,
@@ -816,7 +1005,17 @@ def make_fixture(root: Path) -> tuple[Path, dict[str, str]]:
             "dirty_status": {"is_dirty": False, "status_short": []},
             "hardware_id": hardware_id,
             "backend": BACKEND,
-            "command": RELEASE_BUILD_COMMAND,
+            "command": [
+                "env",
+                f"{NATIVE_OPERATOR_SET_LOCK_ENV}={native_lock}",
+                *RELEASE_BUILD_COMMAND,
+            ],
+            "native_operator_set_lock": {
+                "path": str(native_lock),
+                "sha256": sha256(native_lock),
+                "size_bytes": native_lock_stat.st_size,
+                "mtime_ns": native_lock_stat.st_mtime_ns,
+            },
             "binary_sha256": sha256(binary),
             "binary_artifact": execution_artifact_ref(
                 binary,
@@ -934,6 +1133,105 @@ def self_test() -> None:
             Path(fixture["execution"]),
             "fixture execution manifest",
         )
+        fixture_receipt_path = resolve_execution_artifact_ref(
+            execution_root,
+            execution["binary_build_receipt"],
+            "fixture build receipt",
+            expected_kind="raw-json",
+        )
+        fixture_receipt = read_object(fixture_receipt_path, "fixture build receipt")
+        fixture_native_lock = validate_release_build_command(
+            fixture_receipt,
+            allow_legacy=False,
+            execution_root=execution_root,
+        )
+        require(
+            fixture_native_lock is not None,
+            "canonical fixture release command did not bind a native operator set",
+        )
+
+        hostile_commands = {
+            "extra-env": [
+                "env",
+                "FERRUM_HOSTILE=1",
+                *fixture_receipt["command"][1:],
+            ],
+            "wrong-env-key": [
+                "env",
+                f"FERRUM_NATIVE_LOCK={fixture_native_lock}",
+                *RELEASE_BUILD_COMMAND,
+            ],
+            "relative-lock": [
+                "env",
+                f"{NATIVE_OPERATOR_SET_LOCK_ENV}=relative.lock.json",
+                *RELEASE_BUILD_COMMAND,
+            ],
+        }
+        for name, command in hostile_commands.items():
+            hostile_receipt = json.loads(json.dumps(fixture_receipt))
+            hostile_receipt["command"] = command
+            try:
+                validate_release_build_command(
+                    hostile_receipt,
+                    allow_legacy=False,
+                    execution_root=execution_root,
+                )
+            except PlanReferenceError:
+                pass
+            else:
+                raise PlanReferenceError(f"hostile {name} release command was accepted")
+
+        wrong_identity = json.loads(json.dumps(fixture_receipt))
+        wrong_identity["native_operator_set_lock"]["path"] = str(
+            execution_root / "wrong-native.lock.json"
+        )
+        try:
+            validate_release_build_command(
+                wrong_identity,
+                allow_legacy=False,
+                execution_root=execution_root,
+            )
+        except PlanReferenceError as error:
+            require(
+                "command and native operator set lock path differ" in str(error),
+                f"wrong native lock path used an unexpected rejection: {error}",
+            )
+        else:
+            raise PlanReferenceError("wrong native lock identity path was accepted")
+
+        wrong_lock_sha = json.loads(json.dumps(fixture_receipt))
+        wrong_lock_sha["native_operator_set_lock"]["sha256"] = "f" * SHA256_LENGTH
+        try:
+            validate_release_build_command(
+                wrong_lock_sha,
+                allow_legacy=False,
+                execution_root=execution_root,
+            )
+        except PlanReferenceError as error:
+            require(
+                "content identity differs" in str(error),
+                f"wrong native lock SHA used an unexpected rejection: {error}",
+            )
+        else:
+            raise PlanReferenceError("wrong native lock SHA was accepted")
+
+        legacy_receipt = json.loads(json.dumps(fixture_receipt))
+        legacy_receipt["command"] = list(RELEASE_BUILD_COMMAND)
+        legacy_receipt.pop("native_operator_set_lock")
+        require(
+            validate_release_build_command(legacy_receipt, allow_legacy=True) is None,
+            "schema v1 release command compatibility did not validate",
+        )
+        try:
+            validate_release_build_command(legacy_receipt, allow_legacy=False)
+        except PlanReferenceError as error:
+            require(
+                "schema v1" in str(error),
+                f"current schema legacy command used an unexpected rejection: {error}",
+            )
+        else:
+            raise PlanReferenceError("current schema accepted a legacy release command")
+
         binary_ref = execution["binary_artifact"]
         binary_path = resolve_execution_artifact_ref(
             execution_root,
@@ -1027,6 +1325,33 @@ def self_test() -> None:
             and validated["plan_identity"]["plan_hash"] == fixture["plan_hash"],
             "matching release plan reference did not round-trip",
         )
+        portable_lock = resolve_file_ref(
+            artifact,
+            validated["inputs"][NATIVE_OPERATOR_SET_LOCK_INPUT],
+            "fixture portable native operator set lock",
+        )
+        portable_set = validate_native_operator_set_closure(portable_lock)
+        member_path = portable_lock.parent / portable_set["_members"][0]["path"]
+        member_bytes = member_path.read_bytes()
+        member_path.write_bytes(member_bytes + b"-tampered")
+        try:
+            validate(
+                artifact / "manifest.json",
+                expected_hardware_id=fixture["hardware_id"],
+                candidate_source_git_sha=fixture["source_git_sha"],
+                candidate_source_tree_sha=fixture["source_tree_sha"],
+                allow_internal_fixture=True,
+            )
+        except PlanReferenceError as error:
+            require(
+                "native operator set closure is invalid" in str(error)
+                and "mismatch" in str(error),
+                f"tampered native closure member used an unexpected rejection: {error}",
+            )
+        else:
+            raise PlanReferenceError("tampered native operator closure member was accepted")
+        member_path.write_bytes(member_bytes)
+
         release_binary = artifact / "inputs/release-binary"
         release_binary_bytes = release_binary.read_bytes()
         release_binary.write_bytes(release_binary_bytes + b"-tampered")
