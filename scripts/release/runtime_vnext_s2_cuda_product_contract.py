@@ -325,6 +325,14 @@ def canonical_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def json_materialize(value: Any, label: str) -> Any:
+    try:
+        payload = json.dumps(value, allow_nan=False)
+        return json.loads(payload, object_pairs_hook=strict_object)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        raise AggregateError(f"invalid JSON materialization for {label}: {error}") from error
+
+
 def iso_now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
 
@@ -775,7 +783,9 @@ def require_evidence_match(
     recorded_raw: str,
 ) -> None:
     recorded = require_object(child.get("evidence"), f"{key} recorded evidence")
-    normalized = normalize_paths(observed, raw, recorded_raw)
+    normalized = json_materialize(
+        normalize_paths(observed, raw, recorded_raw), f"{key} observed evidence"
+    )
     require(recorded == normalized, f"{key} child evidence differs from raw revalidation")
 
 
@@ -1584,6 +1594,15 @@ def self_test() -> int:
     expect_reject(
         lambda: test_evidence_passed({"passed": 1}, "fixture"),
         "summary",
+    )
+    require(
+        json_materialize({"cells": {1: "one", 4: "four"}}, "fixture")
+        == {"cells": {"1": "one", "4": "four"}},
+        "JSON materialization did not normalize integer object keys",
+    )
+    expect_reject(
+        lambda: json_materialize({1: "integer", "1": "string"}, "fixture"),
+        "duplicate JSON key",
     )
     locked_model = {
         "key": "m1-qwen35-4b",
