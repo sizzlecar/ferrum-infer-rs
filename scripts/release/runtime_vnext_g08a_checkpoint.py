@@ -400,11 +400,13 @@ def validate_numerics_child(
     verify_checkout: bool,
 ) -> dict[str, Any]:
     require(
-        child.get("artifact_type") == "runtime_vnext_g08a_numerics_manifest"
+        child.get("schema_version") == 2
+        and child.get("artifact_type") == "runtime_vnext_g08a_numerics_manifest"
         and child.get("lane") == "runtime-vnext-g08a-numerics",
         "G08A numerics child identity mismatch",
     )
     _, validation = validate_validation_ref(root, child, source, "G08A numerics")
+    require(validation.get("schema_version") == 2, "G08A numerics validation schema mismatch")
     require(validation.get("artifact_local_tolerance_count") == 0, "G08A numerics contains artifact-local tolerances")
     require(validation.get("operation_state_row_count", 0) >= 27, "G08A operation/state numerical coverage is incomplete")
     require(validation.get("layer_checkpoint_count") == 2, "G08A layer numerical coverage is incomplete")
@@ -413,32 +415,61 @@ def validate_numerics_child(
     parity = validation.get("token_parity")
     require(isinstance(parity, dict), "G08A token parity summary is missing")
     require(parity.get("case_count") == 20, "G08A token parity must pass 20/20 prompts")
+    require(parity.get("prompt_token_match_count") == 20, "G08A prompt token parity must pass 20/20")
     require(parity.get("token_count_per_case") == 64, "G08A token parity token denominator mismatch")
-    require(parity.get("matched_token_count") == 1280, "G08A token parity matched-token denominator mismatch")
+    require(
+        parity.get("product_output_token_count_per_runtime") == 1280,
+        "G08A token parity output-token observation denominator mismatch",
+    )
     require(parity.get("exception_count") == 0, "G08A token parity contains generated-token exceptions")
     require(parity.get("waiver_count") == 0, "G08A token parity contains waivers")
+    same_history = validation.get("same_history")
+    require(isinstance(same_history, dict), "G08A same-history summary is missing")
+    require(same_history.get("case_count") == 20, "G08A same-history must pass 20/20 prompts")
+    require(
+        same_history.get("validated_decision_count") == 1280,
+        "G08A same-history decision denominator mismatch",
+    )
+    require(
+        same_history.get("robust_decision_count", 0)
+        + same_history.get("ambiguous_decision_count", 0)
+        == 1280,
+        "G08A same-history classification denominator mismatch",
+    )
+    require(
+        same_history.get("robust_decision_count", 0)
+        + same_history.get("ambiguous_top2_accepted_count", 0)
+        == 1280,
+        "G08A same-history accepted-decision denominator mismatch",
+    )
+    require(
+        same_history.get("exception_count") == same_history.get("waiver_count") == 0,
+        "G08A same-history contains an exception or waiver",
+    )
     expected_child_summary = {
         "catalog_row_count": validation.get("catalog_row_count"),
         "operation_state_row_count": validation.get("operation_state_row_count"),
-        **parity,
+        "token_parity": parity,
+        "same_history": same_history,
     }
     require(
         child.get("summary") == expected_child_summary,
         "G08A numerical child/validation summary mismatch",
     )
     inputs = validation.get("inputs")
-    require(isinstance(inputs, dict) and len(inputs) == 5, "G08A numerical input set is incomplete")
+    require(isinstance(inputs, dict) and len(inputs) == 6, "G08A numerical input set is incomplete")
     input_paths = {
         key: validate_ref(value, f"G08A numerics input {key}")
         for key, value in inputs.items()
     }
     require(child.get("inputs") == inputs, "G08A numerical child/input binding mismatch")
     expected_flags = {
-        "metal_op_numerics": "--g08a-op-numerics",
-        "linear_attention": "--g08a-linear-attention",
-        "full_attention": "--g08a-full-attention",
-        "full_model": "--g08a-full-model",
-        "token_parity": "--g08a-token-parity",
+        "metal_op_numerics": "--op-artifact",
+        "linear_attention": "--linear-attention",
+        "full_attention": "--full-attention",
+        "full_model": "--full-model",
+        "token_parity": "--token-parity",
+        "same_history": "--same-history",
     }
     command_paths = {
         key: Path(
@@ -457,7 +488,7 @@ def validate_numerics_child(
         == input_paths["metal_op_numerics"],
         "G08A op numerics command/input binding mismatch",
     )
-    for key in ("linear_attention", "full_attention", "full_model", "token_parity"):
+    for key in ("linear_attention", "full_attention", "full_model", "token_parity", "same_history"):
         require(command_paths[key] == input_paths[key], f"G08A {key} command/input binding mismatch")
     if verify_checkout:
         import runtime_vnext_g08a_numerics as numerics
@@ -469,6 +500,7 @@ def validate_numerics_child(
                 full_attention_gate_path=command_paths["full_attention"],
                 model_gate_path=command_paths["full_model"],
                 token_parity_path=command_paths["token_parity"],
+                same_history_path=command_paths["same_history"],
                 out=Path(tmp) / "out",
                 require_clean=True,
             )
@@ -482,6 +514,7 @@ def validate_numerics_child(
         "operation_state_row_count": validation["operation_state_row_count"],
         "layer_checkpoint_count": validation["layer_checkpoint_count"],
         "token_parity": copy.deepcopy(parity),
+        "same_history": copy.deepcopy(same_history),
     }
 
 
@@ -602,7 +635,13 @@ def validate_child(
     verify_checkout: bool,
     expected_model_key: str = MODEL_KEY,
 ) -> dict[str, Any]:
-    require(child.get("schema_version") == 1 and child.get("status") == "pass" and child.get("canonical") is True, f"{spec.lane} child status is not canonical PASS")
+    expected_schema_version = 2 if spec.kind == "numerics" else 1
+    require(
+        child.get("schema_version") == expected_schema_version
+        and child.get("status") == "pass"
+        and child.get("canonical") is True,
+        f"{spec.lane} child status is not canonical PASS",
+    )
     require(Path(str(child.get("artifact_dir", ""))).expanduser().resolve() == root, f"{spec.lane} child artifact_dir mismatch")
     require(
         child.get("pass_line") == f"{spec.child_pass_prefix}: {declared_root}",
@@ -810,6 +849,7 @@ def acceptance(dependencies: dict[str, Any]) -> dict[str, Any]:
         "numerical_operation_state_rows": dependencies["numerics"]["summary"]["operation_state_row_count"],
         "numerical_layer_checkpoints": dependencies["numerics"]["summary"]["layer_checkpoint_count"],
         "token_parity": "20/20",
+        "canonical_history_decisions": "1280/1280",
         "performance_smoke_backends": ["cuda", "metal"],
         "product_entrypoints": ["run", "serve"],
     }
@@ -951,14 +991,40 @@ def fixture_child(root: Path, key: str, source: dict[str, Any]) -> None:
             "full_attention": root / "full-attention.json",
             "full_model": root / "full-model.json",
             "token_parity": root / "token-parity.json",
+            "same_history": root / "same-history.json",
         }
         for ordinal, path in enumerate(numeric_paths.values()):
             write_json(path, {"ordinal": ordinal})
         inputs = {name: file_ref(path) for name, path in numeric_paths.items()}
-        parity = {"case_count": 20, "token_count_per_case": 64, "matched_token_count": 1280, "exception_count": 0, "waiver_count": 0}
-        validation.update({"catalog_row_count": 33, "artifact_local_tolerance_count": 0, "operation_state_row_count": 27, "layer_checkpoint_count": 2, "full_model_checkpoint_count": 1, "full_vocabulary_logits_checkpoint_count": 1, "token_parity": parity, "inputs": inputs})
+        parity = {
+            "case_count": 20,
+            "prompt_token_match_count": 20,
+            "token_count_per_case": 64,
+            "product_output_token_count_per_runtime": 1280,
+            "generated_sequence_match_count": 19,
+            "shared_prefix_token_count": 1219,
+            "reference_near_tie_step_count": 1,
+            "exception_count": 0,
+            "waiver_count": 0,
+            "reference_kind": "llama.cpp-gguf-diagnostic",
+            "ferrum_binary_sha256": "1" * 64,
+            "reference_binary_sha256": "2" * 64,
+        }
+        same_history = {
+            "case_count": 20,
+            "validated_decision_count": 1280,
+            "robust_decision_count": 1279,
+            "ambiguous_decision_count": 1,
+            "ferrum_oracle_exact_count": 1279,
+            "ambiguous_top2_accepted_count": 1,
+            "llama_oracle_exact_count": 1278,
+            "external_flip_count": 2,
+            "exception_count": 0,
+            "waiver_count": 0,
+        }
+        validation.update({"schema_version": 2, "catalog_row_count": 34, "artifact_local_tolerance_count": 0, "operation_state_row_count": 27, "layer_checkpoint_count": 2, "full_model_checkpoint_count": 1, "full_vocabulary_logits_checkpoint_count": 1, "token_parity": parity, "same_history": same_history, "inputs": inputs})
         write_json(child_root / "validation.json", validation)
-        child.update({"artifact_type": "runtime_vnext_g08a_numerics_manifest", "lane": "runtime-vnext-g08a-numerics", "validation": file_ref(child_root / "validation.json"), "summary": {"catalog_row_count": 33, "operation_state_row_count": 27, **parity}, "inputs": inputs})
+        child.update({"schema_version": 2, "artifact_type": "runtime_vnext_g08a_numerics_manifest", "lane": "runtime-vnext-g08a-numerics", "validation": file_ref(child_root / "validation.json"), "summary": {"catalog_row_count": 34, "operation_state_row_count": 27, "token_parity": parity, "same_history": same_history}, "inputs": inputs})
     elif key == "s2":
         child.pop("source_git_sha")
         child.pop("source_tree_sha")
@@ -985,16 +1051,18 @@ def fixture_child(root: Path, key: str, source: dict[str, Any]) -> None:
     elif key == "numerics":
         delegated.extend(
             [
-                "--g08a-op-numerics",
+                "--op-artifact",
                 str((root / "op-numerics").resolve()),
-                "--g08a-linear-attention",
+                "--linear-attention",
                 str((root / "linear-attention.json").resolve()),
-                "--g08a-full-attention",
+                "--full-attention",
                 str((root / "full-attention.json").resolve()),
-                "--g08a-full-model",
+                "--full-model",
                 str((root / "full-model.json").resolve()),
-                "--g08a-token-parity",
+                "--token-parity",
                 str((root / "token-parity.json").resolve()),
+                "--same-history",
+                str((root / "same-history.json").resolve()),
             ]
         )
     elif key.endswith("performance"):
@@ -1100,6 +1168,23 @@ def self_test() -> int:
         line = build_checkpoint(paths, output, source_root=REPO_ROOT, verify_checkout=False, expected_source=source)
         require(line == f"{PASS_PREFIX}: {output.resolve()}", "G08A self-test PASS line mismatch")
         verify_checkpoint_manifest(output / "manifest.json", verify_checkout=False, expected_source=source)
+
+        numerics_root = root / "numerics"
+        numerics_validation_path = numerics_root / "validation.json"
+        numerics_validation = read_json(numerics_validation_path, "numerics fixture")
+        numerics_validation["same_history"]["waiver_count"] = 1
+        write_json(numerics_validation_path, numerics_validation)
+        rehash_fixture(numerics_root, "numerics")
+        try:
+            validate_dependencies(paths, source, verify_checkout=False)
+        except CheckpointError as error:
+            require(
+                "same-history contains" in str(error),
+                f"same-history waiver mutation failed unexpectedly: {error}",
+            )
+        else:
+            raise AssertionError("same-history waiver mutation unexpectedly passed")
+        fixture_child(numerics_root, "numerics", source)
 
         cuda_child = root / "cuda" / "manifest.json"
         cuda = read_json(cuda_child, "CUDA fixture")

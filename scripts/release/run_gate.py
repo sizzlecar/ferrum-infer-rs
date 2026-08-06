@@ -1505,21 +1505,22 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
         )
     if lane == "vnext-g08a-numerics":
         required = {
-            "--g08a-op-numerics": args.g08a_op_numerics,
-            "--g08a-linear-attention": args.g08a_linear_attention,
-            "--g08a-full-attention": args.g08a_full_attention,
-            "--g08a-full-model": args.g08a_full_model,
-            "--g08a-token-parity": args.g08a_token_parity,
+            "--g08a-op-numerics": ("--op-artifact", args.g08a_op_numerics),
+            "--g08a-linear-attention": ("--linear-attention", args.g08a_linear_attention),
+            "--g08a-full-attention": ("--full-attention", args.g08a_full_attention),
+            "--g08a-full-model": ("--full-model", args.g08a_full_model),
+            "--g08a-token-parity": ("--token-parity", args.g08a_token_parity),
+            "--g08a-same-history": ("--same-history", args.g08a_same_history),
         }
-        missing = [flag for flag, value in required.items() if value is None]
+        missing = [flag for flag, (_child_flag, value) in required.items() if value is None]
         if missing:
             raise GateError(
                 "vnext-g08a-numerics requires " + ", ".join(missing)
             )
         cmd = [sys.executable, "scripts/release/runtime_vnext_g08a_numerics.py"]
-        for flag, value in required.items():
+        for child_flag, value in required.values():
             assert value is not None
-            cmd.extend([flag, str(value.resolve())])
+            cmd.extend([child_flag, str(value.resolve())])
         cmd.extend(["--out", str(out_dir)])
         return LaneCommand(
             cmd=cmd,
@@ -9110,6 +9111,7 @@ def self_test() -> int:
             "--g08a-full-attention": g08a_root / "numerics/full-attention.json",
             "--g08a-full-model": g08a_root / "numerics/full-model.json",
             "--g08a-token-parity": g08a_root / "numerics/token-parity.json",
+            "--g08a-same-history": g08a_root / "numerics/same-history.json",
         }
         g08a_numerics_out = root / "g08a-numerics-dry-run"
         g08a_numerics_command = [
@@ -9134,9 +9136,17 @@ def self_test() -> int:
             sys.executable,
             "scripts/release/runtime_vnext_g08a_numerics.py",
         ]
+        g08a_numerics_child_flags = {
+            "--g08a-op-numerics": "--op-artifact",
+            "--g08a-linear-attention": "--linear-attention",
+            "--g08a-full-attention": "--full-attention",
+            "--g08a-full-model": "--full-model",
+            "--g08a-token-parity": "--token-parity",
+            "--g08a-same-history": "--same-history",
+        }
         for flag, value in g08a_numerics_inputs.items():
             expected_g08a_numerics_child.extend(
-                [flag, str(value.resolve())]
+                [g08a_numerics_child_flags[flag], str(value.resolve())]
             )
         expected_g08a_numerics_child.extend(
             ["--out", str(g08a_numerics_out.resolve())]
@@ -11097,6 +11107,7 @@ def main() -> int:
     parser.add_argument("--g08a-full-attention", type=Path)
     parser.add_argument("--g08a-full-model", type=Path)
     parser.add_argument("--g08a-token-parity", type=Path)
+    parser.add_argument("--g08a-same-history", type=Path)
     parser.add_argument("--g08a-source", type=Path)
     parser.add_argument("--g08a-cuda", type=Path)
     parser.add_argument("--g08a-metal", type=Path)

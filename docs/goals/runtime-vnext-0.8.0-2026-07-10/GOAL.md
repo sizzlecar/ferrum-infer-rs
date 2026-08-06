@@ -875,9 +875,11 @@ synthetic fixture 代替：
   诊断，不能把 generated token flip 改写为 PASS。
 - 新增 Metal/Qwen3.5 lane：官方 HF config/tokenizer/template 是 metadata 真值；独立 CPU
   FP32/Transformers checkpoint 是 op/layer 数值真值；同 GGUF llama.cpp 只做量化端到端
-  token/logit 交叉验证和性能参考。三层证据均通过 [`MODEL_MATRIX.md`](MODEL_MATRIX.md) 的明确
-  数值门，并绑定 checked-in `runtime_vnext_numerical_tolerances.json` row/blob SHA；artifact 不得
-  自带或事后放宽 tolerance。
+  token/logit 交叉验证和性能参考。prompt tokenization 必须 `20/20` 精确；自由生成序列分歧只作
+  路径诊断，数值硬门使用 canonical teacher history 对 `20 x 64 = 1280` 个 full-vocab decision
+  逐项裁决并要求 `1280/1280`。三层证据均通过 [`MODEL_MATRIX.md`](MODEL_MATRIX.md) 的明确数值门，
+  并绑定 checked-in `runtime_vnext_numerical_tolerances.json` row/blob SHA；artifact 不得自带或事后
+  放宽 tolerance。
 - required tool call `20/20`，auto tool call `20/20`，tool-result 回填 `20/20`。
 - streamed tool-call delta 重组 `20/20`，arguments 必须通过声明的 JSON schema。
 - strict `json_schema` `50/50`，`json_object` `50/50`。这是 Ferrum server contract，
