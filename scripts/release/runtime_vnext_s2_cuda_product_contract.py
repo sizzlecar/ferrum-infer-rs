@@ -535,6 +535,41 @@ def find_model_revisions(value: Any) -> set[str]:
     return revisions
 
 
+def locked_model_revision(
+    models_lock: dict[str, Any],
+    *,
+    model_key: str,
+    backend: str,
+    model_id: str,
+) -> str:
+    models = require_list(models_lock.get("models"), "models lock entries")
+    matches = [
+        require_object(model, "models lock entry")
+        for model in models
+        if isinstance(model, dict) and model.get("key") == model_key
+    ]
+    require(len(matches) == 1, f"models lock must contain exactly one {model_key}")
+    lanes = require_object(matches[0].get("lanes"), f"{model_key} lanes")
+    lane = require_object(lanes.get(backend), f"{model_key} {backend} lane")
+    require(lane.get("repo") == model_id, f"{model_key} {backend} repo mismatch")
+    revision = require_string(
+        lane.get("revision"), f"{model_key} {backend} revision"
+    )
+    require(
+        GIT_SHA_RE.fullmatch(revision) is not None,
+        f"{model_key} {backend} revision is invalid",
+    )
+    semantic = require_object(
+        lane.get("semantic_source"), f"{model_key} {backend} semantic source"
+    )
+    require(
+        semantic.get("repo") == model_id
+        and semantic.get("revision") == revision,
+        f"{model_key} {backend} semantic source mismatch",
+    )
+    return revision
+
+
 def model_revision_binding(
     key: str,
     raw: Path,
@@ -1089,12 +1124,16 @@ def deep_validate(
                 }
             )
             models_lock = read_json(raw / "models.lock.json", "M1 determinism models lock")
-            revisions = find_model_revisions(models_lock)
-            require(len(revisions) == 1, "M1 determinism model revision binding mismatch")
+            model_revision = locked_model_revision(
+                models_lock,
+                model_key="m1-qwen35-4b",
+                backend="cuda",
+                model_id=MODEL_ID,
+            )
             binding = {
                 "binary_sha256": observed["binary_sha256"],
                 "model_id": MODEL_ID,
-                "model_revision": next(iter(revisions)),
+                "model_revision": model_revision,
                 "hardware": hardware,
                 "hardware_id": probe.get("hardware_id"),
                 "device_fingerprint": observed["device_fingerprint"],
@@ -1545,6 +1584,38 @@ def self_test() -> int:
     expect_reject(
         lambda: test_evidence_passed({"passed": 1}, "fixture"),
         "summary",
+    )
+    locked_model = {
+        "key": "m1-qwen35-4b",
+        "lanes": {
+            "cuda": {
+                "repo": MODEL_ID,
+                "revision": "5" * 40,
+                "semantic_source": {
+                    "repo": MODEL_ID,
+                    "revision": "5" * 40,
+                },
+            }
+        },
+    }
+    require(
+        locked_model_revision(
+            {"models": [locked_model, {"key": "other-model"}]},
+            model_key="m1-qwen35-4b",
+            backend="cuda",
+            model_id=MODEL_ID,
+        )
+        == "5" * 40,
+        "typed M1 CUDA model revision binding drifted",
+    )
+    expect_reject(
+        lambda: locked_model_revision(
+            {"models": [locked_model, copy.deepcopy(locked_model)]},
+            model_key="m1-qwen35-4b",
+            backend="cuda",
+            model_id=MODEL_ID,
+        ),
+        "exactly one",
     )
     original_g02_git = g02.git
     original_baseline_git_text = determinism.baseline_scenarios.git_text
