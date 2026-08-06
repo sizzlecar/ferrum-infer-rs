@@ -220,9 +220,18 @@ def validate_actual(actual: Any) -> dict[str, Path]:
     for value_id, checkpoint in checkpoints.items():
         checkpoint = base.exact_fields(
             checkpoint,
-            frozenset({"logical_dtype", "logical_shape", "raw_file", "raw_sha256"}),
+            frozenset(
+                {
+                    "logical_dtype",
+                    "logical_shape",
+                    "raw_file",
+                    "raw_sha256",
+                    "value_id",
+                }
+            ),
             f"actual.checkpoints.{value_id}",
         )
+        base.require(checkpoint["value_id"] == value_id, f"{value_id} identity differs")
         base.require(
             checkpoint["logical_dtype"] == "fp32"
             and checkpoint["logical_shape"] == EXPECTED_SHAPE,
