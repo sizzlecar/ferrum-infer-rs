@@ -19,10 +19,11 @@ use ferrum_interfaces::vnext::{
     SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
-    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID,
-    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+    DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+    LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+    RESIDUAL_ADD_F32_F16_OPERATION_ID, RMS_NORM_F32_OPERATION_ID, RMS_NORM_F32_TO_F16_OPERATION_ID,
+    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
 };
 use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
 use ferrum_quantization::{
@@ -512,7 +513,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let mut hidden = value_id("value.hidden.embedding")?;
         nodes.push(ProgramNode {
             id: node_id("node.embedding")?,
-            operation_id: operation_id(TOKEN_EMBEDDING_OPERATION_ID)?,
+            operation_id: operation_id(TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::tokens(value_id("value.input.token_ids")?, 0),
             inputs: vec![
@@ -600,8 +601,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         ),
                     };
                     (
-                        GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
-                        ContractVersion::new(6, 0),
+                        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+                        ContractVersion::new(1, 0),
                         BTreeMap::from([
                             attribute("key_heads", text.linear_attention.num_key_heads as u64)?,
                             attribute("value_heads", text.linear_attention.num_value_heads as u64)?,
@@ -679,8 +680,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         initialization: StateInitialization::None,
                     });
                     (
-                        CAUSAL_PAGED_ATTENTION_OPERATION_ID,
-                        ContractVersion::new(2, 0),
+                        CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+                        ContractVersion::new(1, 0),
                         BTreeMap::from([
                             attribute("query_heads", text.num_attention_heads as u64)?,
                             attribute("key_value_heads", text.num_key_value_heads as u64)?,
@@ -735,7 +736,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 required_weight(config, Some(layer_index as u32), "post_attention_layernorm")?;
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.post_attention_norm"))?,
-                operation_id: operation_id(RMS_NORM_OPERATION_ID)?,
+                operation_id: operation_id(RMS_NORM_F32_TO_F16_OPERATION_ID)?,
                 required_version: ContractVersion::new(1, 0),
                 work: ProgramNodeWorkSpec::tokens(attention_output.clone(), 0),
                 inputs: vec![
@@ -815,7 +816,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             let layer_output = value_id(format!("value.layer.{layer_index}.output"))?;
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.residual"))?,
-                operation_id: operation_id(RESIDUAL_ADD_OPERATION_ID)?,
+                operation_id: operation_id(RESIDUAL_ADD_F32_F16_OPERATION_ID)?,
                 required_version: ContractVersion::new(1, 0),
                 work: ProgramNodeWorkSpec::tokens(attention_output.clone(), 0),
                 inputs: vec![attention_output, mlp_output],
@@ -834,7 +835,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let final_hidden = value_id("value.output.final_hidden")?;
         nodes.push(ProgramNode {
             id: node_id("node.final_norm")?,
-            operation_id: operation_id(RMS_NORM_OPERATION_ID)?,
+            operation_id: operation_id(RMS_NORM_F32_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
             inputs: vec![hidden, weight_value_id(final_norm)?],
@@ -847,7 +848,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let logits = value_id("value.output.logits")?;
         nodes.push(ProgramNode {
             id: node_id("node.logits")?,
-            operation_id: operation_id(LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)?,
+            operation_id: operation_id(LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::tokens(final_hidden.clone(), 0),
             inputs: vec![final_hidden, weight_value_id(projection)?],
@@ -864,8 +865,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let greedy_token = value_id("value.output.greedy_token")?;
         nodes.push(ProgramNode {
             id: node_id("node.greedy_token")?,
-            operation_id: operation_id(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
-            required_version: ContractVersion::new(3, 0),
+            operation_id: operation_id(LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID)?,
+            required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::Fixed,
             inputs: vec![
                 logits.clone(),
@@ -3259,7 +3260,7 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        gated_delta_recurrent_attention_contract, routed_shared_swiglu_moe_contract,
+        gated_delta_recurrent_attention_f32_master_contract, routed_shared_swiglu_moe_contract,
         ModelArtifactSourceRole, ModelSourceKind, OperationContract, OriginalModelSource,
         OriginalModelSources, PhysicalStorageLayout, PhysicalWeightComponentBinding,
         WeightComponentSource,
@@ -4055,7 +4056,7 @@ mod tests {
         assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
         assert_eq!(prepared.program().blocks()[0].nodes.len(), 20);
         assert!(prepared.program().blocks()[0].nodes.iter().all(|node| {
-            if node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID {
+            if node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID {
                 matches!(&node.work, ProgramNodeWorkSpec::Fixed)
             } else {
                 matches!(
@@ -4073,9 +4074,16 @@ mod tests {
         assert_eq!(
             operation_ids
                 .iter()
-                .filter(|operation| **operation == RMS_NORM_OPERATION_ID)
+                .filter(|operation| **operation == RMS_NORM_F32_TO_F16_OPERATION_ID)
                 .count(),
-            5
+            4
+        );
+        assert_eq!(
+            operation_ids
+                .iter()
+                .filter(|operation| **operation == RMS_NORM_F32_OPERATION_ID)
+                .count(),
+            1
         );
         assert_eq!(
             operation_ids
@@ -4087,23 +4095,23 @@ mod tests {
         assert_eq!(
             operation_ids
                 .iter()
-                .filter(|operation| **operation == LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)
+                .filter(|operation| **operation == LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID)
                 .count(),
             1
         );
         assert_eq!(
             operation_ids
                 .iter()
-                .filter(|operation| **operation == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
+                .filter(|operation| **operation == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID)
                 .count(),
             1
         );
         let greedy = prepared.program().blocks()[0]
             .nodes
             .iter()
-            .find(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
+            .find(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID)
             .unwrap();
-        assert_eq!(greedy.required_version, ContractVersion::new(3, 0));
+        assert_eq!(greedy.required_version, ContractVersion::new(1, 0));
         assert_eq!(
             greedy
                 .inputs
@@ -4151,7 +4159,10 @@ mod tests {
         let linear_attention = prepared.program().blocks()[0]
             .nodes
             .iter()
-            .find(|node| node.operation_id.as_str() == GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)
+            .find(|node| {
+                node.operation_id.as_str()
+                    == GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
+            })
             .unwrap();
         let linear_inputs = linear_attention
             .inputs
@@ -4160,7 +4171,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             linear_attention.required_version,
-            ContractVersion::new(6, 0)
+            ContractVersion::new(1, 0)
         );
         assert_eq!(
             linear_attention
@@ -4198,14 +4209,16 @@ mod tests {
         let full_attention = prepared.program().blocks()[0]
             .nodes
             .iter()
-            .find(|node| node.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_OPERATION_ID)
+            .find(|node| {
+                node.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID
+            })
             .unwrap();
         let full_inputs = full_attention
             .inputs
             .iter()
             .map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(full_attention.required_version, ContractVersion::new(2, 0));
+        assert_eq!(full_attention.required_version, ContractVersion::new(1, 0));
         assert_eq!(
             full_attention
                 .attributes
@@ -4429,7 +4442,7 @@ mod tests {
             .iter()
             .find(|node| node.id.as_str() == "node.layer.0.attention")
             .unwrap();
-        let contract = gated_delta_recurrent_attention_contract().unwrap();
+        let contract = gated_delta_recurrent_attention_f32_master_contract().unwrap();
         let descriptor = contract.descriptor();
         let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config).unwrap();
         let conv_channels = (text.linear_qk_total_dim() * 2 + text.linear_value_total_dim()) as u64;
@@ -4475,7 +4488,7 @@ mod tests {
                     .map(|state| (&state.value_id, &state.tensor)),
             )
             .collect::<BTreeMap<_, _>>();
-        let hidden = tensor_spec(vec![config.max_position_embeddings, 16], ElementType::F16);
+        let hidden = tensor_spec(vec![config.max_position_embeddings, 16], ElementType::F32);
 
         for (ordinal, (value_id, expected)) in
             node.inputs.iter().zip(&descriptor.inputs).enumerate()
@@ -4736,11 +4749,14 @@ mod tests {
         let linear_attention = prepared.family().program().blocks()[0]
             .nodes
             .iter()
-            .find(|node| node.operation_id.as_str() == GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)
+            .find(|node| {
+                node.operation_id.as_str()
+                    == GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
+            })
             .unwrap();
         assert_eq!(
             linear_attention.required_version,
-            ContractVersion::new(6, 0)
+            ContractVersion::new(1, 0)
         );
         assert_eq!(
             linear_attention

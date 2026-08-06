@@ -746,6 +746,16 @@ struct VNextLanguageIoIds {
     greedy_token_output: ProgramValueId,
 }
 
+fn is_language_token_embedding_operation(operation_id: &str) -> bool {
+    operation_id == TOKEN_EMBEDDING_OPERATION_ID
+        || operation_id == TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID
+}
+
+fn is_language_masked_argmax_operation(operation_id: &str) -> bool {
+    operation_id == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
+        || operation_id == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID
+}
+
 #[derive(Debug, Clone)]
 struct VNextIoBinding {
     input_node_id: NodeId,
@@ -3494,7 +3504,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .blocks()
             .iter()
             .flat_map(|block| &block.nodes)
-            .filter(|node| node.operation_id.as_str() == TOKEN_EMBEDDING_OPERATION_ID)
+            .filter(|node| is_language_token_embedding_operation(node.operation_id.as_str()))
             .collect::<Vec<_>>();
         let [embedding] = embedding_nodes.as_slice() else {
             return Err(FerrumError::model(format!(
@@ -3510,7 +3520,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .blocks()
             .iter()
             .flat_map(|block| &block.nodes)
-            .filter(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
+            .filter(|node| is_language_masked_argmax_operation(node.operation_id.as_str()))
             .collect::<Vec<_>>();
         let [argmax] = argmax_nodes.as_slice() else {
             return Err(FerrumError::model(format!(
@@ -8806,7 +8816,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        decode_output_width, decode_selected_token, nonterminal_completion_message,
+        decode_output_width, decode_selected_token, is_language_masked_argmax_operation,
+        is_language_token_embedding_operation, nonterminal_completion_message,
         normalized_product_token_mask, product_output_mode_for_policies, product_repetition_input,
         reported_allocated_bytes, resolve_reusable_execution_policy,
         resolve_runtime_attention_authority, resolved_sequence_fit_policy,
@@ -8828,8 +8839,33 @@ mod tests {
         DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
         DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink,
         DeviceTimingMeasurement, DeviceTimingMode, StepResourceAdmissionProfilePhase,
+        DENSE_SWIGLU_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+        LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+        TOKEN_EMBEDDING_OPERATION_ID,
     };
     use ferrum_types::{AttentionExecutionPolicy, RequestId, TokenId};
+
+    #[test]
+    fn language_io_resolution_accepts_legacy_and_fp32_master_contracts_only() {
+        for operation_id in [
+            TOKEN_EMBEDDING_OPERATION_ID,
+            TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+        ] {
+            assert!(is_language_token_embedding_operation(operation_id));
+        }
+        for operation_id in [
+            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+            LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+        ] {
+            assert!(is_language_masked_argmax_operation(operation_id));
+        }
+        assert!(!is_language_token_embedding_operation(
+            DENSE_SWIGLU_OPERATION_ID
+        ));
+        assert!(!is_language_masked_argmax_operation(
+            DENSE_SWIGLU_OPERATION_ID
+        ));
+    }
 
     #[test]
     fn runtime_attention_authority_rejects_plan_provider_drift() {
