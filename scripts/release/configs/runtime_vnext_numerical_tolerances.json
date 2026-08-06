@@ -2,7 +2,7 @@
   "coverage": {
     "missing_required_coverage": [],
     "profile": "g08a_m1_metal.v1",
-    "scope": "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures; token sequence equality remains a separate exact gate",
+    "scope": "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures plus canonical-history full-vocabulary decisions; prompt token identity remains exact",
     "status": "complete"
   },
   "rows": [
@@ -1652,6 +1652,58 @@
       },
       "source_commit": "5947a4f86cd8a86c6ea845f2ff0ec30c3ca83afd",
       "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v6.layer.fp16.gguf-q4-k-m.tokens-24"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "For each of 64 canonical-history decisions, real Qwen3.5-4B Q4_K_M Metal full-vocabulary FP32 logits are checked against the independent GGUF-dequantized CPU FP32 semantic oracle; robust argmax must match top-1 and ambiguous decisions may match only the oracle top-2.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_teacher_logits_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.1,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "teacher_forced_full_vocab_logits",
+      "checkpoint_name": "canonical_history_logits",
+      "coverage_markers": [
+        "checkpoint.teacher_forced_full_vocab_logits"
+      ],
+      "dtype": "fp32",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.qwen35_model_forward",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_teacher_logits_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "7d57fc3a8872f6edefe3581b76946d39091143f3",
+      "row_fingerprint": "8d98540bf70ac3c3066ad356415f0c1f9d0d90b19a3808533fea920da6bc341d",
+      "shape_domain": {
+        "dimensions": {
+          "decision_count": 64,
+          "vocabulary_size": 248320
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.canonical-history.decisions-64",
+        "semantics": {
+          "ambiguity_margin": "0.001",
+          "argmax_policy": "robust_top1_ambiguous_top2",
+          "canonical_history": true,
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "oracle_role": "hard_semantic_truth",
+          "teacher_source": "llama_cpp_free_run"
+        }
+      },
+      "source_commit": "d23ee0f43a4c05f8cda7b41c9cfbfe61cd1009e0",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.same-history-logits.v1.full-vocab-logits.fp32.gguf-q4-k-m.decisions-64"
     },
     {
       "backend": "metal",
