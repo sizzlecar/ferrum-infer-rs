@@ -355,18 +355,24 @@ def validate_report(artifact_dir: Path, report: Any, row: dict[str, Any]) -> dic
     base.require(oracle.get("precision") == row["oracle_precision"], "oracle precision differs")
     base.require(oracle.get("source_path") == row["basis"]["source_path"], "oracle source path differs")
     source = oracle.get("ferrum_source")
-    base.require(
-        isinstance(source, dict) and source.get("tracked_dirty") is False,
-        "oracle source worktree was dirty",
+    execution_commit = base.validate_reviewed_oracle_source(
+        source,
+        row=row,
+        artifact_source_sha256=oracle.get("source_sha256"),
+        expected_source_sha256=EXPECTED_SOURCE_SHA256,
+        actual_commit=report["actual"].get("git_sha") if isinstance(report["actual"], dict) else None,
+        label="full-attention oracle",
     )
-    base.require(source.get("git_sha") == row["source_commit"], "oracle source commit differs")
-    source_payload = base.git_bytes(row["source_commit"], row["basis"]["source_path"])
-    base.require(hashlib.sha256(source_payload).hexdigest() == EXPECTED_SOURCE_SHA256, "reviewed oracle source hash differs")
-    base.require(oracle.get("source_sha256") == EXPECTED_SOURCE_SHA256, "artifact oracle source hash differs")
     common_path = oracle.get("common_source_path")
     base.require(common_path == "scripts/release/qwen35_gguf_linear_attention_reference.py", "common source path differs")
-    common_payload = base.git_bytes(row["source_commit"], common_path)
-    base.require(hashlib.sha256(common_payload).hexdigest() == EXPECTED_COMMON_SOURCE_SHA256, "reviewed common source hash differs")
+    base.require_git_blob_sha(
+        row["source_commit"], common_path, EXPECTED_COMMON_SOURCE_SHA256,
+        "full-attention reviewed common",
+    )
+    base.require_git_blob_sha(
+        execution_commit, common_path, EXPECTED_COMMON_SOURCE_SHA256,
+        "full-attention execution common",
+    )
     base.require(oracle.get("common_source_sha256") == EXPECTED_COMMON_SOURCE_SHA256, "artifact common source hash differs")
     llama_source = oracle.get("llama_cpp_gguf_py_source")
     base.require(
@@ -376,8 +382,6 @@ def validate_report(artifact_dir: Path, report: Any, row: dict[str, Any]) -> dic
         and base.GIT_SHA_RE.fullmatch(llama_source["git_sha"]) is not None,
         "gguf-py source provenance is invalid",
     )
-    base.require_git_commit(source.get("git_sha"), "oracle source commit")
-
     validate_model(artifact_dir, report["model"])
     validate_fixture(report["fixture"], row)
     actual_paths = validate_actual(report["actual"])

@@ -164,6 +164,78 @@ def require_git_commit(commit: Any, label: str) -> str:
     return commit
 
 
+def require_git_ancestor(ancestor: Any, descendant: Any, label: str) -> None:
+    ancestor_sha = require_git_commit(ancestor, f"{label} ancestor")
+    descendant_sha = require_git_commit(descendant, f"{label} descendant")
+    completed = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor_sha, descendant_sha],
+        cwd=tolerances.REPO_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(completed.returncode == 0, f"{label} does not preserve reviewed lineage")
+
+
+def require_git_blob_sha(
+    commit: str,
+    path: str,
+    expected_sha256: str,
+    label: str,
+) -> None:
+    payload = git_bytes(commit, path)
+    require(
+        hashlib.sha256(payload).hexdigest() == expected_sha256,
+        f"{label} source blob differs from the reviewed implementation",
+    )
+
+
+def validate_reviewed_oracle_source(
+    source: Any,
+    *,
+    row: dict[str, Any],
+    artifact_source_sha256: Any,
+    expected_source_sha256: str,
+    actual_commit: Any,
+    label: str,
+) -> str:
+    source = exact_fields(
+        source,
+        frozenset({"root", "git_sha", "tracked_dirty"}),
+        f"{label}.ferrum_source",
+    )
+    require(source["tracked_dirty"] is False, f"{label} source worktree was dirty")
+    require(
+        isinstance(source["root"], str) and Path(source["root"]).is_absolute(),
+        f"{label} source root is invalid",
+    )
+    execution_commit = require_git_commit(source["git_sha"], f"{label} execution commit")
+    require(
+        actual_commit == execution_commit,
+        f"{label} execution and Ferrum capture commits differ",
+    )
+    reviewed_commit = require_git_commit(row["source_commit"], f"{label} reviewed commit")
+    require_git_ancestor(reviewed_commit, execution_commit, f"{label} source")
+    source_path = row["basis"]["source_path"]
+    require_git_blob_sha(
+        reviewed_commit,
+        source_path,
+        expected_source_sha256,
+        f"{label} reviewed",
+    )
+    require_git_blob_sha(
+        execution_commit,
+        source_path,
+        expected_source_sha256,
+        f"{label} execution",
+    )
+    require(
+        artifact_source_sha256 == expected_source_sha256,
+        f"{label} artifact source hash differs from the reviewed implementation",
+    )
+    return execution_commit
+
+
 def validated_f32_sha256(path: Path, expected_elements: int) -> str:
     payload = path.read_bytes()
     require(len(payload) == expected_elements * 4, "actual FP32 checkpoint byte count differs")
@@ -252,19 +324,17 @@ def validate_report(
     require(oracle.get("source_path") == row["basis"]["source_path"],
             "oracle source path differs from catalog row")
     source = oracle.get("ferrum_source")
-    require(isinstance(source, dict) and source.get("tracked_dirty") is False,
-            "oracle source worktree was dirty")
-    require(source.get("git_sha") == row["source_commit"],
-            "oracle source commit differs from catalog row")
-    source_payload = git_bytes(row["source_commit"], row["basis"]["source_path"])
-    require(hashlib.sha256(source_payload).hexdigest() == EXPECTED_SOURCE_SHA256,
-            "catalog oracle source hash differs from the reviewed source")
-    require(oracle.get("source_sha256") == EXPECTED_SOURCE_SHA256,
-            "artifact oracle source hash differs from the reviewed source")
+    validate_reviewed_oracle_source(
+        source,
+        row=row,
+        artifact_source_sha256=oracle.get("source_sha256"),
+        expected_source_sha256=EXPECTED_SOURCE_SHA256,
+        actual_commit=report["actual"].get("git_sha") if isinstance(report["actual"], dict) else None,
+        label="linear-attention oracle",
+    )
     llama_source = oracle.get("llama_cpp_gguf_py_source")
     require(isinstance(llama_source, dict) and llama_source.get("tracked_dirty") is False,
             "gguf-py source worktree was dirty")
-    require_git_commit(source.get("git_sha"), "oracle source commit")
 
     model = report["model"]
     require(isinstance(model, dict) and model.get("sha256") == EXPECTED_MODEL_SHA256,
@@ -433,6 +503,59 @@ def self_test() -> None:
         require("artifact-local tolerance" in str(error), "wrong tolerance rejection")
     else:
         raise GateError("artifact-local tolerance unexpectedly passed")
+
+    head_process = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tolerances.REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(head_process.returncode == 0, "cannot resolve self-test HEAD")
+    head = head_process.stdout.strip()
+    provenance_row = {
+        "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+        "basis": {"source_path": "scripts/release/qwen35_gguf_linear_attention_reference.py"},
+    }
+    provenance = {"root": str(tolerances.REPO_ROOT), "git_sha": head, "tracked_dirty": False}
+    require(
+        validate_reviewed_oracle_source(
+            provenance,
+            row=provenance_row,
+            artifact_source_sha256=EXPECTED_SOURCE_SHA256,
+            expected_source_sha256=EXPECTED_SOURCE_SHA256,
+            actual_commit=head,
+            label="self-test oracle",
+        )
+        == head,
+        "reviewed oracle provenance did not retain the execution commit",
+    )
+    try:
+        validate_reviewed_oracle_source(
+            provenance,
+            row=provenance_row,
+            artifact_source_sha256=EXPECTED_SOURCE_SHA256,
+            expected_source_sha256=EXPECTED_SOURCE_SHA256,
+            actual_commit=provenance_row["source_commit"],
+            label="self-test oracle",
+        )
+    except GateError as error:
+        require("capture commits differ" in str(error), "wrong execution/capture rejection")
+    else:
+        raise GateError("mismatched execution/capture commits unexpectedly passed")
+    try:
+        require_git_blob_sha(
+            head,
+            provenance_row["basis"]["source_path"],
+            "0" * 64,
+            "self-test mutated oracle",
+        )
+    except GateError as error:
+        require("source blob differs" in str(error), "wrong oracle mutation rejection")
+    else:
+        raise GateError("mutated oracle source hash unexpectedly passed")
+
     with tempfile.TemporaryDirectory(prefix="qwen35-f32-gate-") as tmp:
         root = Path(tmp)
         valid = root / "valid.f32"

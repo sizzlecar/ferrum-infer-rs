@@ -445,17 +445,29 @@ def validate_report(
                  and oracle.get("identity") == full_model_row["oracle_identity"]
                  == logits_row["oracle_identity"],
                  "oracle identity differs from catalog rows")
+    base.require(
+        oracle.get("precision") == full_model_row["oracle_precision"]
+        == logits_row["oracle_precision"],
+        "oracle precision differs from catalog rows",
+    )
+    base.require(
+        oracle.get("source_path") == full_model_row["basis"]["source_path"]
+        == logits_row["basis"]["source_path"],
+        "oracle source path differs from catalog rows",
+    )
+    base.require(
+        full_model_row["source_commit"] == logits_row["source_commit"],
+        "model tolerance rows use different reviewed source commits",
+    )
     source = oracle.get("ferrum_source")
-    base.require(isinstance(source, dict) and source.get("tracked_dirty") is False,
-                 "oracle source worktree was dirty")
-    base.require(source.get("git_sha") == full_model_row["source_commit"]
-                 == logits_row["source_commit"],
-                 "oracle source commit differs")
-    source_payload = base.git_bytes(full_model_row["source_commit"],
-                                    full_model_row["basis"]["source_path"])
-    base.require(hashlib.sha256(source_payload).hexdigest() == EXPECTED_SOURCE_SHA256
-                 and oracle.get("source_sha256") == EXPECTED_SOURCE_SHA256,
-                 "model oracle source hash differs")
+    execution_commit = base.validate_reviewed_oracle_source(
+        source,
+        row=full_model_row,
+        artifact_source_sha256=oracle.get("source_sha256"),
+        expected_source_sha256=EXPECTED_SOURCE_SHA256,
+        actual_commit=report["actual"].get("git_sha") if isinstance(report["actual"], dict) else None,
+        label="full-model oracle",
+    )
     for path_key, sha_key, expected_path, expected_sha in (
         (
             "linear_common_source_path",
@@ -471,16 +483,19 @@ def validate_report(
         ),
     ):
         base.require(oracle.get(path_key) == expected_path, f"oracle {path_key} differs")
-        payload = base.git_bytes(full_model_row["source_commit"], expected_path)
-        base.require(hashlib.sha256(payload).hexdigest() == expected_sha
-                     and oracle.get(sha_key) == expected_sha,
-                     f"oracle {sha_key} differs")
+        base.require_git_blob_sha(
+            full_model_row["source_commit"], expected_path, expected_sha,
+            f"full-model reviewed {path_key}",
+        )
+        base.require_git_blob_sha(
+            execution_commit, expected_path, expected_sha,
+            f"full-model execution {path_key}",
+        )
+        base.require(oracle.get(sha_key) == expected_sha, f"oracle {sha_key} differs")
     llama_source = oracle.get("llama_cpp_gguf_py_source")
     base.require(isinstance(llama_source, dict)
                  and llama_source.get("tracked_dirty") is False,
                  "gguf-py source worktree was dirty")
-    base.require_git_commit(source["git_sha"], "oracle source commit")
-
     shared.validate_model(artifact_dir, report["model"])
     validate_fixture(report["fixture"], full_model_row, logits_row)
     actual_paths, actual_checkpoints = validate_actual(report["actual"])
