@@ -3,9 +3,10 @@
 use crate::{
     parse_bool_env_value, parse_path_env_value, parse_usize_env_value, AttentionExecutionPolicy,
     DataType, Device, ModelId, ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint,
-    RuntimeConfigSnapshot, SamplingParams, SamplingPresets,
+    RuntimeConfigSnapshot, SamplingParams, SamplingPresets, TokenId,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 /// Product policy for proving that a sequence fits before prefill admission.
@@ -82,6 +83,59 @@ pub struct VNextCheckpointCaptureConfig {
     /// `value_ids`, this does not retain an activation or alter memory planning.
     #[serde(default)]
     pub capture_product_output: bool,
+    /// Optional canonical output history for a same-history numerical
+    /// diagnostic. The vNext executor persists each unmodified full-logits
+    /// result before forcing the corresponding token into the engine-facing
+    /// copy. Ordinary product inference leaves this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teacher_forcing: Option<VNextTeacherForcingConfig>,
+}
+
+pub const MAX_VNEXT_TEACHER_FORCED_TOKENS: usize = 512;
+
+/// Bounded token history used only by explicit vNext checkpoint diagnostics.
+///
+/// Construction and executor binding both validate this contract. The latter
+/// is required because deserialization can bypass `new` and only model binding
+/// knows the live vocabulary size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VNextTeacherForcingConfig {
+    token_ids: Vec<TokenId>,
+}
+
+impl VNextTeacherForcingConfig {
+    pub fn new(token_ids: Vec<TokenId>) -> std::result::Result<Self, String> {
+        let value = Self { token_ids };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.token_ids.is_empty() || self.token_ids.len() > MAX_VNEXT_TEACHER_FORCED_TOKENS {
+            return Err(format!(
+                "vNext checkpoint teacher forcing requires 1..={MAX_VNEXT_TEACHER_FORCED_TOKENS} tokens"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn token_ids(&self) -> &[TokenId] {
+        &self.token_ids
+    }
+
+    pub fn token_count(&self) -> usize {
+        self.token_ids.len()
+    }
+
+    /// Canonical identity used by release validators: concatenated little-
+    /// endian u32 token IDs, with no JSON or path-dependent representation.
+    pub fn token_ids_sha256(&self) -> String {
+        let mut digest = Sha256::new();
+        for token in &self.token_ids {
+            digest.update(token.get().to_le_bytes());
+        }
+        format!("{:x}", digest.finalize())
+    }
 }
 
 /// Engine runtime knobs the CLI/autosizer resolves and injects via the

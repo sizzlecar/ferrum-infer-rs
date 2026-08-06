@@ -892,6 +892,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         Some(ferrum_models::Architecture::Qwen3TTS) => ServedModelKind::Speech,
         _ => ServedModelKind::Llm,
     };
+    if vnext_checkpoint.teacher_token_file.is_some() {
+        return Err(FerrumError::unsupported(
+            "vNext checkpoint teacher forcing is supported only by one-shot ferrum run",
+        ));
+    }
     let vnext_checkpoint_capture = vnext_checkpoint.to_config()?;
     if vnext_checkpoint_capture.is_some() && served_model_kind != ServedModelKind::Llm {
         return Err(FerrumError::unsupported(
