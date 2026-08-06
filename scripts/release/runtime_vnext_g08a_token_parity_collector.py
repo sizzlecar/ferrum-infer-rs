@@ -120,6 +120,15 @@ def binary_identity(path: Path, label: str) -> dict[str, str]:
     return {"path": str(path), "sha256": sha256_file(path)}
 
 
+def locked_model_path(path: Path, revision: str, expected_sha256: str) -> Path:
+    snapshot_path = Path(os.path.abspath(path.expanduser()))
+    resolved = snapshot_path.resolve()
+    require(resolved.is_file(), f"GGUF model is unavailable: {resolved}")
+    require(snapshot_path.parent.name == revision, "GGUF snapshot revision differs from the M1 lock")
+    require(sha256_file(resolved) == expected_sha256, "GGUF model SHA256 differs from the M1 lock")
+    return resolved
+
+
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -704,11 +713,12 @@ def collection_context(args: argparse.Namespace) -> dict[str, Any]:
     ferrum = binary_identity(args.ferrum_binary, "Ferrum binary")
     reference = binary_identity(args.llama_server_binary, "llama-server binary")
     llama_source = clean_git_identity(args.llama_cpp_source, "llama.cpp")
-    model = args.model.expanduser().resolve()
-    require(model.is_file(), f"GGUF model is unavailable: {model}")
     identity = numerics.model_lock_identity()
-    require(sha256_file(model) == identity["model_file_sha256"], "GGUF model SHA256 differs from the M1 lock")
-    require(model.parent.name == identity["model_revision"], "GGUF snapshot revision differs from the M1 lock")
+    model = locked_model_path(
+        args.model,
+        identity["model_revision"],
+        identity["model_file_sha256"],
+    )
     return {
         "source_git_sha": source_git_sha,
         "source_tree_sha": source_tree_sha,
@@ -893,6 +903,15 @@ def self_test() -> None:
         path = root / "nested" / "value.json"
         atomic_write_json(path, {"b": 2, "a": 1})
         require(path.read_bytes() == b'{"a":1,"b":2}\n', "canonical JSON output differs")
+        blob = root / "blobs" / "model.gguf"
+        atomic_write(blob, b"locked-model")
+        snapshot = root / ("a" * 40) / "model.gguf"
+        snapshot.parent.mkdir()
+        snapshot.symlink_to(blob)
+        require(
+            locked_model_path(snapshot, "a" * 40, sha256_file(blob)) == blob.resolve(),
+            "HF snapshot symlink validation differs",
+        )
     print(SELFTEST_PASS)
 
 
