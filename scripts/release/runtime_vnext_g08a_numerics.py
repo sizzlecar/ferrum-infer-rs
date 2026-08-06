@@ -152,7 +152,9 @@ def current_source_identity(*, require_clean: bool = False) -> tuple[str, str, s
     catalog, provenance = tolerances.load_catalog_from_git("HEAD", None)
     summary = tolerances.validate_catalog_document(catalog, require_complete=True)
     tolerances.validate_catalog_provenance(catalog, provenance["commit"])
-    tolerances.validate_no_widening_from_revision(catalog, provenance["commit"])
+    compared_catalog_commits = tolerances.validate_no_widening_from_revision(
+        catalog, provenance["commit"]
+    )
     source_tree_sha = git_text("rev-parse", "HEAD^{tree}")
     require(GIT_SHA_RE.fullmatch(source_tree_sha) is not None, "source tree SHA is invalid")
     if require_clean:
@@ -161,7 +163,11 @@ def current_source_identity(*, require_clean: bool = False) -> tuple[str, str, s
         provenance["commit"],
         source_tree_sha,
         provenance["git_blob_sha"],
-        {**summary, "catalog": catalog},
+        {
+            **summary,
+            "catalog": catalog,
+            "compared_catalog_commits": compared_catalog_commits,
+        },
     )
 
 
@@ -198,6 +204,7 @@ def validate_child_gate(
     label: str,
     source_git_sha: str,
     catalog_blob: str,
+    expected_catalog_history: list[str],
     raw_validator: Callable[[Path, dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
     path = path.expanduser().resolve()
@@ -207,7 +214,10 @@ def validate_child_gate(
     require(gate.get("catalog_commit") == source_git_sha, f"{label} source SHA is stale")
     require(gate.get("catalog_git_blob_sha") == catalog_blob, f"{label} catalog blob is stale")
     compared = gate.get("compared_catalog_commits")
-    require(isinstance(compared, list) and source_git_sha in compared, f"{label} widening history is incomplete")
+    require(
+        isinstance(compared, list) and compared == expected_catalog_history,
+        f"{label} widening history differs",
+    )
     artifact_dir, report = validate_reference_path(gate, path, label, source_git_sha)
     try:
         raw_validation = raw_validator(artifact_dir, report)
@@ -687,6 +697,7 @@ def validate_and_write(
         label="linear-attention",
         source_git_sha=source_git_sha,
         catalog_blob=catalog_blob,
+        expected_catalog_history=catalog_summary["compared_catalog_commits"],
         raw_validator=validators["linear-attention"],
     )
     full_attention = validate_child_gate(
@@ -694,6 +705,7 @@ def validate_and_write(
         label="full-attention",
         source_git_sha=source_git_sha,
         catalog_blob=catalog_blob,
+        expected_catalog_history=catalog_summary["compared_catalog_commits"],
         raw_validator=validators["full-attention"],
     )
     model = validate_child_gate(
@@ -701,6 +713,7 @@ def validate_and_write(
         label="full-model",
         source_git_sha=source_git_sha,
         catalog_blob=catalog_blob,
+        expected_catalog_history=catalog_summary["compared_catalog_commits"],
         raw_validator=validators["full-model"],
     )
     require(linear.get("tolerance_id") == LINEAR_TOLERANCE_ID and linear.get("row_fingerprint") == rows[LINEAR_TOLERANCE_ID]["row_fingerprint"], "linear-attention row binding differs")
@@ -791,13 +804,22 @@ def validate_and_write(
     return manifest
 
 
-def fixture_child(path: Path, *, kind: str, source_git_sha: str, catalog_blob: str, reference: Path, rows: dict[str, Any]) -> None:
+def fixture_child(
+    path: Path,
+    *,
+    kind: str,
+    source_git_sha: str,
+    catalog_blob: str,
+    compared_catalog_commits: list[str],
+    reference: Path,
+    rows: dict[str, Any],
+) -> None:
     gate: dict[str, Any] = {
         "schema_version": 1,
         "status": "pass",
         "catalog_commit": source_git_sha,
         "catalog_git_blob_sha": catalog_blob,
-        "compared_catalog_commits": [source_git_sha],
+        "compared_catalog_commits": list(compared_catalog_commits),
         "reference_artifact": str(reference),
         "reference_report_sha256": sha256_file(reference / "report.json"),
     }
@@ -987,9 +1009,34 @@ def self_test() -> None:
         linear = root / "linear.json"
         full_attention = root / "full-attention.json"
         model = root / "model.json"
-        fixture_child(linear, kind="linear", source_git_sha=source_git_sha, catalog_blob=catalog_blob, reference=reference, rows=rows)
-        fixture_child(full_attention, kind="full_attention", source_git_sha=source_git_sha, catalog_blob=catalog_blob, reference=reference, rows=rows)
-        fixture_child(model, kind="model", source_git_sha=source_git_sha, catalog_blob=catalog_blob, reference=reference, rows=rows)
+        compared_catalog_commits = summary["compared_catalog_commits"]
+        fixture_child(
+            linear,
+            kind="linear",
+            source_git_sha=source_git_sha,
+            catalog_blob=catalog_blob,
+            compared_catalog_commits=compared_catalog_commits,
+            reference=reference,
+            rows=rows,
+        )
+        fixture_child(
+            full_attention,
+            kind="full_attention",
+            source_git_sha=source_git_sha,
+            catalog_blob=catalog_blob,
+            compared_catalog_commits=compared_catalog_commits,
+            reference=reference,
+            rows=rows,
+        )
+        fixture_child(
+            model,
+            kind="model",
+            source_git_sha=source_git_sha,
+            catalog_blob=catalog_blob,
+            compared_catalog_commits=compared_catalog_commits,
+            reference=reference,
+            rows=rows,
+        )
         binary = root / "binary"
         binary.write_bytes(b"fixture")
         parity_path = root / "token-parity.json"
@@ -1134,6 +1181,27 @@ def self_test() -> None:
             "aggregate fixture output differs",
         )
 
+        incomplete_history_path = root / "linear-incomplete-history.json"
+        incomplete_history = read_json(linear)
+        incomplete_history["compared_catalog_commits"] = compared_catalog_commits[:-1]
+        write_json(incomplete_history_path, incomplete_history)
+        try:
+            validate_child_gate(
+                incomplete_history_path,
+                label="linear-attention",
+                source_git_sha=source_git_sha,
+                catalog_blob=catalog_blob,
+                expected_catalog_history=compared_catalog_commits,
+                raw_validator=lambda _artifact_dir, _report: {},
+            )
+        except GateError as error:
+            require(
+                "widening history differs" in str(error).lower(),
+                "wrong incomplete-history rejection",
+            )
+        else:
+            raise GateError("incomplete widening history unexpectedly passed")
+
         stale_report = {"actual": {"git_sha": "0" * 40}}
         write_json(reference / "report.json", stale_report)
         stale_gate = read_json(linear)
@@ -1145,6 +1213,7 @@ def self_test() -> None:
                 label="linear-attention",
                 source_git_sha=source_git_sha,
                 catalog_blob=catalog_blob,
+                expected_catalog_history=compared_catalog_commits,
                 raw_validator=lambda _artifact_dir, _report: {},
             )
         except GateError as error:
@@ -1162,6 +1231,7 @@ def self_test() -> None:
                 label="linear-attention",
                 source_git_sha=source_git_sha,
                 catalog_blob=catalog_blob,
+                expected_catalog_history=compared_catalog_commits,
                 raw_validator=lambda _artifact_dir, _report: {"metrics": {"forged": True}},
             )
         except GateError as error:
