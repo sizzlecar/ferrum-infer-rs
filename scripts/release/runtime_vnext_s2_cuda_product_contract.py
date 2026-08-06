@@ -1482,7 +1482,11 @@ def verify_checkpoint_manifest(
             "sha256": sha256(path),
             "artifact_count": len(rows),
         },
-        "source": source,
+        "source": {
+            "git_sha": source["git_sha"],
+            "git_tree_sha": source["git_tree_sha"],
+            "dirty": source["dirty"],
+        },
         "dependency_source": dependency_source,
         "source_closure": closure,
         "bindings": bindings,
