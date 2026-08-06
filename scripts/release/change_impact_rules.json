@@ -449,6 +449,28 @@
       "reason": "explicit checkpoint and teacher-forcing CLI controls affect numerical evidence while remaining disabled on normal run and serve paths"
     },
     {
+      "id": "vnext-s2-multiturn-product-identity",
+      "path_globs": [
+        "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py"
+      ],
+      "domains": ["vnext_s2_product_identity", "release_gate"],
+      "required_gates": [
+        "vnext_s2_multiturn_concurrency_selftest",
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_cuda_product_contract",
+        "run_gate_selftest",
+        "planner_selftest"
+      ],
+      "release_invalidation": [
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_cuda_product_contract",
+        "vnext_r0"
+      ],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "the focused run/serve sentinel binds product plan, runtime implementation, and zero legacy selection into S2 and R0"
+    },
+    {
       "id": "vnext-s2-aggregate-validator",
       "path_globs": [
         "scripts/release/runtime_vnext_s2_cuda_product_contract.py"
@@ -459,10 +481,26 @@
         "run_gate_selftest",
         "planner_selftest"
       ],
-      "release_invalidation": ["vnext_s2_cuda_product_contract"],
+      "release_invalidation": ["vnext_s2_cuda_product_contract", "vnext_r0"],
       "exceptions": [],
       "owner": "runtime-vnext",
       "reason": "aggregate-only validator changes must revalidate child manifests without rerunning unchanged real-model CUDA execution"
+    },
+    {
+      "id": "vnext-r0-aggregate-validator",
+      "path_globs": [
+        "scripts/release/runtime_vnext_r0_core_closure.py"
+      ],
+      "domains": ["vnext_r0_aggregate", "release_gate"],
+      "required_gates": [
+        "vnext_r0_selftest",
+        "run_gate_selftest",
+        "planner_selftest"
+      ],
+      "release_invalidation": ["vnext_r0"],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "the thin R0 validator aggregates source ownership, numerics, and focused CUDA S2 evidence without widening the release denominator"
     },
     {
       "id": "native-operator",

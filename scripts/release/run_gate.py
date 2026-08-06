@@ -82,6 +82,7 @@ LANES = (
     "vnext-g08a-metal",
     "vnext-g08a-numerics",
     "vnext-g08a",
+    "vnext-r0",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
     "vnext-g08c-cuda",
@@ -777,6 +778,7 @@ FRESH_OUTPUT_PROVENANCE_KINDS = frozenset(
         "vnext-s2-historical-resource-source",
         "vnext-g08a-source",
         "vnext-g08a",
+        "vnext-r0",
     }
 )
 
@@ -1571,6 +1573,31 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             child_manifest_path=out_dir / "manifest.json",
             expected_source_git_sha=None,
             provenance_kind="vnext-g08a",
+        )
+    if lane == "vnext-r0":
+        required = {
+            "--g08a-source": args.g08a_source,
+            "--g08a-numerics": args.g08a_numerics,
+            "--s2": args.s2,
+        }
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing:
+            raise GateError("vnext-r0 requires " + ", ".join(missing))
+        cmd = [
+            sys.executable,
+            "scripts/release/runtime_vnext_r0_core_closure.py",
+        ]
+        for flag, value in required.items():
+            assert value is not None
+            cmd.extend([flag, str(value.resolve())])
+        cmd.extend(["--out", str(out_dir)])
+        return LaneCommand(
+            cmd=cmd,
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT R0 CORE CLOSURE PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-r0",
         )
     if lane == "vnext-g08b-cuda":
         if args.g08b_artifact_root is None:
@@ -6307,6 +6334,43 @@ def validate_vnext_g08a_provenance(
     return summary
 
 
+def validate_vnext_r0_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        "vnext-r0 delegated manifest path is missing",
+    )
+    try:
+        import runtime_vnext_r0_core_closure as checkpoint
+
+        summary = checkpoint.verify_manifest(
+            manifest_path,
+            verify_checkout=verify_checkout,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise GateError(f"vnext-r0 provenance failed: {error}") from error
+    require_gate(
+        summary.get("kind") == "vnext-r0"
+        and summary.get("child_manifest", {}).get("sha256")
+        == require_sha256(
+            child_manifest_sha256,
+            "vnext-r0 child manifest SHA256",
+        ),
+        "vnext-r0 checkpoint summary binding mismatch",
+    )
+    require_gate(
+        summary.get("source") == child_manifest.get("source"),
+        "vnext-r0 source binding mismatch",
+    )
+    return summary
+
+
 def validate_vnext_g08a_dependency_provenance(
     lane_command: LaneCommand,
     child_manifest: dict[str, Any],
@@ -6719,6 +6783,13 @@ def verify_child_pass_line(
         )
     if lane_command.provenance_kind == "vnext-g08a":
         return validate_vnext_g08a_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-r0":
+        return validate_vnext_r0_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
@@ -8730,6 +8801,7 @@ def self_test() -> int:
                     "vnext-s2-historical-resource-source",
                     "vnext-g08a-source",
                     "vnext-g08a",
+                    "vnext-r0",
                 )
             )
             and not provenance_requires_fresh_output("vnext-g07a"),
@@ -9218,6 +9290,53 @@ def self_test() -> int:
             and g08a_final_manifest["delegated_command_line"]
             == expected_g08a_final_child,
             g08a_final_manifest,
+        )
+        r0_child_selftest = run_selftest_command(
+            [
+                sys.executable,
+                str(
+                    REPO_ROOT
+                    / "scripts/release/runtime_vnext_r0_core_closure.py"
+                ),
+                "--self-test",
+            ]
+        )
+        require_selftest(
+            r0_child_selftest.returncode == 0
+            and "FERRUM RUNTIME VNEXT R0 CORE CLOSURE SELFTEST PASS"
+            in r0_child_selftest.stdout.splitlines(),
+            r0_child_selftest.stderr or r0_child_selftest.stdout,
+        )
+        r0_inputs = {
+            "--g08a-source": root / "g08a-source/gate.manifest.json",
+            "--g08a-numerics": root / "g08a-numerics/gate.manifest.json",
+            "--s2": root / "s2/gate.manifest.json",
+        }
+        r0_out = root / "r0-dry-run"
+        r0_command = [sys.executable, str(this_script), "vnext-r0"]
+        for flag, value in r0_inputs.items():
+            r0_command.extend([flag, str(value)])
+        r0_command.extend(["--out", str(r0_out), "--dry-run"])
+        r0_dry = run_selftest_command(r0_command)
+        require_selftest(
+            r0_dry.returncode == 0,
+            r0_dry.stderr or r0_dry.stdout,
+        )
+        r0_manifest = json.loads((r0_out / "gate.manifest.json").read_text())
+        expected_r0_child = [
+            sys.executable,
+            "scripts/release/runtime_vnext_r0_core_closure.py",
+        ]
+        for flag, value in r0_inputs.items():
+            expected_r0_child.extend([flag, str(value.resolve())])
+        expected_r0_child.extend(["--out", str(r0_out.resolve())])
+        require_selftest(
+            r0_manifest["status"] == "dry-run"
+            and r0_manifest["lane"] == "vnext-r0"
+            and r0_manifest["delegated_command_line"] == expected_r0_child
+            and r0_manifest["child_pass_line"]
+            == f"FERRUM RUNTIME VNEXT R0 CORE CLOSURE PASS: {r0_out.resolve()}",
+            r0_manifest,
         )
         g08b_report = g08b_root / "correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json"
         g08b_out = root / "g08b-cuda-dry-run"
@@ -11077,6 +11196,7 @@ def main() -> int:
     parser.add_argument("--g01b", type=Path)
     parser.add_argument("--g01", type=Path)
     parser.add_argument("--s1", type=Path)
+    parser.add_argument("--s2", type=Path)
     parser.add_argument("--s1-capacity", type=Path)
     parser.add_argument("--s1-decode-capacity", type=Path)
     parser.add_argument("--g02-core", type=Path)
@@ -11157,6 +11277,7 @@ def main() -> int:
         "vnext-s2",
         "vnext-g08a-source",
         "vnext-g08a",
+        "vnext-r0",
     }:
         try:
             require_external_vnext_g00_output(out_dir)

@@ -840,7 +840,9 @@ def validate_concurrency(source: Path, recorded: Path, row: dict[str, Any]) -> d
     }
 
 
-def validate_lifecycle(rows: list[dict[str, Any]], request_id: str, entrypoint: str) -> None:
+def validate_lifecycle(
+    rows: list[dict[str, Any]], request_id: str, entrypoint: str
+) -> dict[str, Any]:
     resource_rows = [row for row in rows if row.get("request_id") == request_id]
     require(resource_rows, f"request has no resource trace: {request_id}")
     closes = [row for row in resource_rows if row.get("phase") == "engine_request_close"]
@@ -853,6 +855,9 @@ def validate_lifecycle(rows: list[dict[str, Any]], request_id: str, entrypoint: 
     execution_id = f"request.product.{request_id}"
     execution = [row for row in rows if row.get("request_id") == execution_id]
     require(EXECUTION_PHASES <= {str(row.get("phase")) for row in execution}, f"vNext lifecycle incomplete: {request_id}")
+    plan_hashes: set[str] = set()
+    runtime_fingerprints: set[str] = set()
+    legacy_selection_count = 0
     for event in execution:
         if event.get("phase") not in EXECUTION_PHASES:
             continue
@@ -868,9 +873,38 @@ def validate_lifecycle(rows: list[dict[str, Any]], request_id: str, entrypoint: 
             and attributes.get("l0_only") is False,
             f"vNext source mismatch: {request_id}",
         )
+        if attributes.get("execution_trace_source") != "vnext":
+            legacy_selection_count += 1
+        plan_hash = attributes.get("plan_hash")
+        runtime_fingerprint = attributes.get("runtime_implementation_fingerprint")
+        if plan_hash is not None:
+            require(
+                isinstance(plan_hash, str) and SHA256_RE.fullmatch(plan_hash),
+                f"vNext plan hash is invalid: {request_id}",
+            )
+            plan_hashes.add(plan_hash)
+        if runtime_fingerprint is not None:
+            require(
+                isinstance(runtime_fingerprint, str)
+                and SHA256_RE.fullmatch(runtime_fingerprint),
+                f"vNext runtime fingerprint is invalid: {request_id}",
+            )
+            runtime_fingerprints.add(runtime_fingerprint)
         if event.get("phase") == "vnext.operation_submitted":
             require(str(attributes.get("provider_id") or "").startswith("provider.cuda."), f"CUDA provider missing: {request_id}")
             require(attributes.get("device_id") == "device.cuda.0", f"CUDA device id missing: {request_id}")
+    require(len(plan_hashes) == 1, f"vNext request plan identity is missing or ambiguous: {request_id}")
+    require(
+        len(runtime_fingerprints) == 1,
+        f"vNext request runtime identity is missing or ambiguous: {request_id}",
+    )
+    require(legacy_selection_count == 0, f"legacy execution selected: {request_id}")
+    return {
+        "entrypoint": entrypoint,
+        "resolved_execution_plan_hash": next(iter(plan_hashes)),
+        "runtime_implementation_fingerprint": next(iter(runtime_fingerprints)),
+        "legacy_selection_count": 0,
+    }
 
 
 def request_bundles(root: Path, *, expected_startup: int) -> tuple[list[Path], list[Path]]:
@@ -917,10 +951,13 @@ def validate_observability(source: Path, recorded: Path, summary: dict[str, Any]
     _, run_bundles = request_bundles(run_root / "request_dump", expected_startup=0)
     require(len(run_bundles) == EXPECTED_RUN_REQUESTS, "run request dump count mismatch")
     require({bundle.name for bundle in run_bundles} == run_ids, "run stdout/request-dump identity mismatch")
+    execution_identities: dict[str, list[dict[str, Any]]] = {"run": [], "serve": []}
     for bundle in run_bundles:
         request = validate_bundle(bundle, "run")
         require("http" not in request, "run request dump masquerades as HTTP")
-        validate_lifecycle(run_rows, bundle.name, "run")
+        execution_identities["run"].append(
+            validate_lifecycle(run_rows, bundle.name, "run")
+        )
 
     serve_rows = read_jsonl(serve_root / "scheduler_trace.jsonl")
     _, serve_bundles = request_bundles(serve_root / "request_dump", expected_startup=1)
@@ -966,16 +1003,44 @@ def validate_observability(source: Path, recorded: Path, summary: dict[str, Any]
             categories.append("concurrency")
         else:
             categories.append(label)
-        validate_lifecycle(serve_rows, bundle.name, "serve")
+        execution_identities["serve"].append(
+            validate_lifecycle(serve_rows, bundle.name, "serve")
+        )
     require(observed_bodies == set(expected_bodies), "serve request dump/body matrix incomplete")
     require(categories.count("turn1") == 1 and categories.count("turn2") == 1, "serve multi-turn request matrix incomplete")
     require(categories.count("concurrency") == 5, "serve concurrency request count mismatch")
     expected_markers = {"ferrum0100", "ferrum0400", "ferrum0401", "ferrum0402", "ferrum0403"}
     require(markers == expected_markers, "serve concurrency request markers incomplete")
+    plan_hashes = {
+        row["resolved_execution_plan_hash"]
+        for rows in execution_identities.values()
+        for row in rows
+    }
+    runtime_fingerprints = {
+        row["runtime_implementation_fingerprint"]
+        for rows in execution_identities.values()
+        for row in rows
+    }
+    legacy_selection_count = sum(
+        row["legacy_selection_count"]
+        for rows in execution_identities.values()
+        for row in rows
+    )
+    require(len(plan_hashes) == 1, "run and serve resolved execution plans differ")
+    require(len(runtime_fingerprints) == 1, "run and serve runtime implementations differ")
+    require(legacy_selection_count == 0, "run or serve selected legacy execution")
     return {
         "run_requests": EXPECTED_RUN_REQUESTS,
         "serve_requests": EXPECTED_SERVE_REQUESTS,
         "execution_lifecycles": EXPECTED_RUN_REQUESTS + EXPECTED_SERVE_REQUESTS,
+        "product_execution_identity": {
+            "entrypoints": ["run", "serve"],
+            "resolved_execution_plan_hash": next(iter(plan_hashes)),
+            "runtime_implementation_fingerprint": next(iter(runtime_fingerprints)),
+            "same_resolved_execution_plan": True,
+            "same_runtime_implementation": True,
+            "production_legacy_selection_count": 0,
+        },
     }
 
 
@@ -1070,6 +1135,8 @@ def lifecycle_rows(request_id: str, entrypoint: str) -> list[dict[str, Any]]:
             "actual_model_smoke": True,
             "diagnostic_only": False,
             "l0_only": False,
+            "plan_hash": "1" * 64,
+            "runtime_implementation_fingerprint": "2" * 64,
         }
         if phase == "vnext.operation_submitted":
             attributes.update({"provider_id": "provider.cuda.fixture", "device_id": "device.cuda.0"})
@@ -1386,6 +1453,32 @@ def self_test() -> None:
                     break
             path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
+        def plan_identity_drift(candidate: Path) -> None:
+            path = candidate / "observability/serve/scheduler_trace.jsonl"
+            rows = read_jsonl(path)
+            for row in rows:
+                attributes = row.get("attributes")
+                if (
+                    row.get("phase") == "vnext.operation_submitted"
+                    and isinstance(attributes, dict)
+                ):
+                    attributes["plan_hash"] = "3" * 64
+                    break
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+        def runtime_identity_drift(candidate: Path) -> None:
+            path = candidate / "observability/serve/scheduler_trace.jsonl"
+            rows = read_jsonl(path)
+            for row in rows:
+                attributes = row.get("attributes")
+                if (
+                    row.get("phase") == "vnext.operation_submitted"
+                    and isinstance(attributes, dict)
+                ):
+                    attributes["runtime_implementation_fingerprint"] = "4" * 64
+                    break
+            path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
         def helper_drift(candidate: Path) -> None:
             path = candidate / "inputs/openai_concurrency_quality_regression.py"
             path.write_text(read_text(path) + "# drift\n", encoding="utf-8")
@@ -1490,6 +1583,8 @@ def self_test() -> None:
         expect_reject(root, thinking_wrapper, "thinking wrapper")
         expect_reject(root, crosstalk, "crosstalk")
         expect_reject(root, legacy_trace, "legacy trace")
+        expect_reject(root, plan_identity_drift, "plan identity drift")
+        expect_reject(root, runtime_identity_drift, "runtime identity drift")
         expect_reject(root, helper_drift, "helper drift")
         expect_reject(root, inherited_run_env, "inherited run env")
         expect_reject(root, changed_run_cwd, "changed run cwd")
