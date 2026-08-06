@@ -578,7 +578,7 @@ int main(int argc, char ** argv) {
             manifest.size());
         fsync_directory(output_directory);
 
-        std::cout << "LLAMA TEACHER LOGITS DUMP PASS: " << output_directory << '\n';
+        std::cout << "LLAMA TEACHER LOGITS DUMP PASS: " << output_directory.string() << '\n';
         return 0;
     } catch (const std::exception & error) {
         std::cerr << "llama_teacher_logits_dump: " << error.what() << '\n';
