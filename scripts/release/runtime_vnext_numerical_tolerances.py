@@ -66,6 +66,7 @@ G08A_REQUIRED_COVERAGE = frozenset(
     {
         "checkpoint.full_model",
         "checkpoint.full_vocab_logits",
+        "checkpoint.teacher_forced_full_vocab_logits",
         "layer.full_attention",
         "layer.linear_attention",
         "layer.linear_attention@5.0",
@@ -101,8 +102,8 @@ G08A_REQUIRED_COVERAGE = frozenset(
     }
 )
 G08A_SCOPE = (
-    "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures; "
-    "token sequence equality remains a separate exact gate"
+    "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures plus "
+    "canonical-history full-vocabulary decisions; prompt token identity remains exact"
 )
 
 # Coverage is awarded only to reviewed, exact oracle descriptors. An oracle name
@@ -246,6 +247,13 @@ TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
         "source_commit": "5947a4f86cd8a86c6ea845f2ff0ec30c3ca83afd",
         "basis_kind": "checked_in_conformance_test",
         "source_path": "scripts/release/qwen35_gguf_model_reference.py",
+        "test_name": "build_reference",
+    },
+    "cpu.fp32.python.qwen35_gguf_teacher_logits_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "d23ee0f43a4c05f8cda7b41c9cfbfe61cd1009e0",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_teacher_logits_reference.py",
         "test_name": "build_reference",
     },
 }
@@ -661,6 +669,31 @@ G08A_COVERAGE_RULES["checkpoint.full_vocab_logits"] = _coverage_selector(
     oracle_identity="cpu.fp32.python.qwen35_gguf_model_reference",
 )
 
+G08A_COVERAGE_RULES["checkpoint.teacher_forced_full_vocab_logits"] = _coverage_selector(
+    model_scope="qwen3.5-4b",
+    operation_id="operation.qwen35_model_forward",
+    operation_schema_version="1.0",
+    checkpoint_kind="teacher_forced_full_vocab_logits",
+    checkpoint_name="canonical_history_logits",
+    dtype="fp32",
+    quant_format="gguf_q4_k_m",
+    shape_domain={
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.canonical-history.decisions-64",
+        "dimensions": {"decision_count": 64, "vocabulary_size": 248320},
+        "semantics": {
+            "ambiguity_margin": "0.001",
+            "argmax_policy": "robust_top1_ambiguous_top2",
+            "canonical_history": True,
+            "model_sha256": (
+                "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+            ),
+            "oracle_role": "hard_semantic_truth",
+            "teacher_source": "llama_cpp_free_run",
+        },
+    },
+    oracle_identity="cpu.fp32.python.qwen35_gguf_teacher_logits_reference",
+)
+
 for _version in ("4.0", "5.0", "6.0"):
     _state_marker_prefix = (
         "state.gated_delta"
@@ -719,7 +752,14 @@ GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 BACKENDS = frozenset({"cpu", "cuda", "metal", "shared"})
 CHECKPOINT_KINDS = frozenset(
-    {"operation_output", "state", "layer_output", "full_model", "full_vocab_logits"}
+    {
+        "operation_output",
+        "state",
+        "layer_output",
+        "full_model",
+        "full_vocab_logits",
+        "teacher_forced_full_vocab_logits",
+    }
 )
 DTYPES = frozenset({"fp16", "bf16", "fp32"})
 OWNERS = frozenset({"runtime-vnext-g03"})

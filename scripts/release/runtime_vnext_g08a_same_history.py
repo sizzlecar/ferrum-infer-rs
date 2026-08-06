@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 import runtime_vnext_checkpoint_artifact as checkpoint_artifact
+import runtime_vnext_numerical_tolerances as tolerances
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -47,6 +48,8 @@ ROOT_FIELDS = frozenset(
         "model_file_sha256",
         "backend",
         "tolerance_id",
+        "tolerance_catalog_sha256",
+        "tolerance_row_fingerprint",
         "oracle_ambiguity_margin",
         "prompt_id",
         "prompt_sha256",
@@ -259,6 +262,25 @@ def validate_tolerance_row(value: dict[str, Any]) -> dict[str, float]:
     required = {"cosine_min", "relative_l2_max", "max_abs_max"}
     require(set(bounds) == required, "same-history tolerance bound fields differ")
     return {field: finite(bounds[field], f"tolerance.{field}") for field in required}
+
+
+def load_tolerance_row(catalog_path: Path) -> tuple[dict[str, Any], str]:
+    canonical_path = tolerances.DEFAULT_CATALOG.resolve()
+    require(catalog_path.expanduser().resolve() == canonical_path, "same-history tolerance catalog must use the checked-in canonical path")
+    try:
+        document = tolerances.load_catalog_bytes(canonical_path.read_bytes())
+        tolerances.validate_catalog_document(document, require_complete=True)
+    except (OSError, tolerances.CatalogError) as error:
+        raise GateError(f"same-history tolerance catalog is invalid: {error}") from error
+    rows = [row for row in document["rows"] if row.get("tolerance_id") == TOLERANCE_ID]
+    require(len(rows) == 1, "same-history tolerance row must exist exactly once")
+    row = rows[0]
+    require(
+        row.get("row_fingerprint") == tolerances.row_fingerprint(row),
+        "same-history tolerance row fingerprint differs",
+    )
+    validate_tolerance_row(row)
+    return row, file_sha256(canonical_path)
 
 
 def validate_metric_bounds(metric: dict[str, float], bounds: dict[str, float]) -> None:
@@ -749,7 +771,11 @@ def build_comparison(
     return comparison
 
 
-def validate_manifest(path: Path, tolerance_row: dict[str, Any]) -> dict[str, Any]:
+def validate_manifest(
+    path: Path,
+    tolerance_row: dict[str, Any],
+    tolerance_catalog_sha256: str,
+) -> dict[str, Any]:
     document = exact_object(read_json(path, "same-history manifest"), ROOT_FIELDS, "same-history manifest")
     require(document["schema_version"] == SCHEMA_VERSION and document["status"] == "pass", "same-history manifest is not PASS")
     require(document["source_dirty"] is False, "same-history source must be clean")
@@ -764,6 +790,8 @@ def validate_manifest(path: Path, tolerance_row: dict[str, Any]) -> dict[str, An
     )
     require(
         document["tolerance_id"] == TOLERANCE_ID
+        and document["tolerance_catalog_sha256"] == tolerance_catalog_sha256
+        and document["tolerance_row_fingerprint"] == tolerance_row["row_fingerprint"]
         and finite(document["oracle_ambiguity_margin"], "oracle_ambiguity_margin") == ORACLE_AMBIGUITY_MARGIN,
         "same-history oracle policy differs",
     )
@@ -908,7 +936,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--self-test", action="store_true")
     result.add_argument("--manifest", type=Path)
-    result.add_argument("--tolerance-row", type=Path)
+    result.add_argument("--catalog", type=Path, default=tolerances.DEFAULT_CATALOG)
     result.add_argument("--build-comparison", action="store_true")
     result.add_argument("--ferrum-capture", type=Path)
     result.add_argument("--llama-capture", type=Path)
@@ -923,16 +951,15 @@ def main() -> int:
         if args.self_test:
             self_test()
             return 0
+        tolerance_row, tolerance_catalog_sha256 = load_tolerance_row(args.catalog)
         if args.build_comparison:
             required = (
                 args.ferrum_capture,
                 args.llama_capture,
                 args.oracle_dir,
-                args.tolerance_row,
                 args.out,
             )
             require(all(value is not None for value in required), "comparison inputs and --out are required")
-            tolerance_row = read_json(args.tolerance_row, "same-history tolerance row")
             comparison = build_comparison(
                 ferrum_capture_dir=args.ferrum_capture,
                 llama_capture_dir=args.llama_capture,
@@ -942,9 +969,8 @@ def main() -> int:
             )
             print(json.dumps(comparison["summary"], sort_keys=True))
             return 0
-        require(args.manifest is not None and args.tolerance_row is not None, "--manifest and --tolerance-row are required")
-        tolerance_row = read_json(args.tolerance_row, "same-history tolerance row")
-        summary = validate_manifest(args.manifest, tolerance_row)
+        require(args.manifest is not None, "--manifest is required")
+        summary = validate_manifest(args.manifest, tolerance_row, tolerance_catalog_sha256)
         print(f"{PASS_PREFIX}: {args.manifest.expanduser().resolve()}")
         print(json.dumps(summary, sort_keys=True))
         return 0
