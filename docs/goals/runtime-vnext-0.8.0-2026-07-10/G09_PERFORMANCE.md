@@ -1,5 +1,10 @@
 # G09: 三模型双后端性能恢复与优化
 
+> 2026-08-06 v0.8.0 performance release 门已由
+> [`PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md`](PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md)
+> 收敛为 Ferrum 自身量化基线回归。本文的 vLLM/llama.cpp、same-host ABBA 和竞争 ratio
+> 不再阻塞 v0.8.0，转入 v0.8.1/0.9；correctness-first、profile、动态资源、编译和自身非回退要求不变。
+
 ## 状态与依赖
 
 - 状态：Open
@@ -8,9 +13,9 @@
 
 ## 目标
 
-在正确性和 legacy 删除后恢复并超过重构前性能。CUDA 是主优化方向；Metal 必须达到
-可发布正确性和同机主流实现逐 cell 90% / 主矩阵几何平均 95% 的竞争线，不得在最后发布
-阶段才第一次运行。
+在正确性和主模型 legacy production path 删除后，按性能收敛修订达到可发布的绝对可用线和
+Ferrum 自身非回退线。CUDA 是主优化方向；Metal 也必须在 R2 运行一次，不能到最终发布阶段
+才第一次测量。外部竞争性结论不属于 v0.8.0 release claim。
 
 ## 统一流程
 

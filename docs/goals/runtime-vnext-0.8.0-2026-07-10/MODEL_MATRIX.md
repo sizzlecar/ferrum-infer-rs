@@ -6,6 +6,11 @@
 来源。实现阶段必须增加机器可读 manifest，并由 validator 检查本文、manifest、命令和
 artifact 一致。
 
+2026-08-06 起，v0.8.0 的性能 comparator、采样规模和阈值以
+[`PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md`](PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md)
+为准。本文件的三模型、双后端、并发档位和 correctness 矩阵继续生效；下文 external
+ABBA、vLLM/llama.cpp ratio 和更大的采样规模保留为 v0.8.1/0.9 hardening 目标。
+
 热度数据是 2026-07-10 的 Hugging Face 近 30 天快照，只用于解释模型选择，不作为
 Goal PASS 条件。
 

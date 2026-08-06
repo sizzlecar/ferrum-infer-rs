@@ -6,7 +6,10 @@ Open。创建于 2026-07-10。
 
 2026-08-06 起，v0.8.0 的发布阻塞范围和执行口径以
 [`RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`](RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md)
-为准。该修订保留三主模型 CUDA/Metal、真实 `run`/`serve`、动态资源、正确性、性能、profile、
+和后续
+[`PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md`](PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md)
+为准。后者将 v0.8.0 性能门改为量化的 Ferrum 自身基线回归；vLLM/llama.cpp 只作非阻断诊断，
+竞争性比较转入 v0.8.1/0.9。修订保留三主模型 CUDA/Metal、真实 `run`/`serve`、动态资源、正确性、性能、profile、
 编译阈值和发布后安装验证硬门，但把完整历史治理、未使用 provider、全仓 support disposition、
 legacy physical zero 和平台完备性转入 v0.8.1/0.9 hardening。v0.8.0 正式进度分母改为
 `R0-R3 0/4 PASS`；下文各时期的 `G00-G10 0/11` 是原 exhaustive roadmap 的历史状态，不再作为
