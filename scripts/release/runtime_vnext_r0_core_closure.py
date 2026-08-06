@@ -35,17 +35,22 @@ CONTROL_PLANE_FILES = frozenset(
         "scripts/release/fixtures/change_impact/planner_fixtures.json",
     }
 )
+S2_MULTITURN_SCENARIO = (
+    "scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json"
+)
 DEPENDENCY_LOCAL_FILES = {
     "source": frozenset(
         {
             "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
             "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py",
+            S2_MULTITURN_SCENARIO,
         }
     ),
     "numerics": frozenset(
         {
             "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
             "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py",
+            S2_MULTITURN_SCENARIO,
         }
     ),
     "s2": frozenset(),
@@ -517,10 +522,16 @@ def self_test() -> int:
             "scripts/release/runtime_vnext_r0_core_closure.py",
             "scripts/release/change_impact_rules.json",
             "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
+            S2_MULTITURN_SCENARIO,
         ],
         "numerics",
     )
-    require(len(allowed) == 4 and not rejected, "R0 control-plane closure rejected allowed paths")
+    require(len(allowed) == 5 and not rejected, "R0 control-plane closure rejected allowed paths")
+    _, rejected = control_plane_only([S2_MULTITURN_SCENARIO], "s2")
+    require(
+        rejected == [S2_MULTITURN_SCENARIO],
+        "R0 S2 closure accepted a changed product scenario",
+    )
     _, rejected = control_plane_only(["crates/ferrum-engine/src/lib.rs"], "numerics")
     require(rejected == ["crates/ferrum-engine/src/lib.rs"], "R0 product change was not rejected")
     dependencies = fixture_dependencies()
