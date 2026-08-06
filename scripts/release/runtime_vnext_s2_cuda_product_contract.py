@@ -752,23 +752,47 @@ def test_evidence_passed(value: Any, label: str) -> int:
     return passed
 
 
-def validate_g02_at_source(
-    child_path: Path, source: dict[str, Any]
-) -> dict[str, Any]:
+@contextlib.contextmanager
+def dependency_source_context(source: dict[str, Any]) -> Any:
     original_git = g02.git
+    baseline = determinism.baseline_scenarios
+    original_baseline_git_text = baseline.git_text
+    original_latency_git_output = latency_failure.git_output
+    source_sha = require_string(source.get("git_sha"), "dependency source git SHA")
+    source_tree = require_string(
+        source.get("git_tree_sha"), "dependency source git tree"
+    )
 
     def source_git(*args: str) -> str:
         if args == ("rev-parse", "HEAD"):
-            return require_string(source.get("git_sha"), "G02 source git SHA")
+            return source_sha
         if args == ("rev-parse", "HEAD^{tree}"):
-            return require_string(source.get("git_tree_sha"), "G02 source git tree")
+            return source_tree
         return original_git(*args)
 
+    def source_baseline_git_text(args: list[str]) -> str:
+        if args == ["rev-parse", "HEAD"]:
+            return source_sha
+        if args == ["status", "--short", "--untracked-files=all"]:
+            return ""
+        return original_baseline_git_text(args)
+
+    def source_latency_git_output(*args: str) -> str:
+        if args == ("rev-parse", "HEAD"):
+            return source_sha
+        if args == ("rev-parse", "HEAD^{tree}"):
+            return source_tree
+        return original_latency_git_output(*args)
+
     g02.git = source_git
+    baseline.git_text = source_baseline_git_text
+    latency_failure.git_output = source_latency_git_output
     try:
-        return g02.validate_artifact(child_path.parent)
+        yield
     finally:
         g02.git = original_git
+        baseline.git_text = original_baseline_git_text
+        latency_failure.git_output = original_latency_git_output
 
 
 def validate_s1(
@@ -997,7 +1021,7 @@ def deep_validate(
             }
         }, None
     if spec.validator == "g02_core":
-        observed = validate_g02_at_source(child_path, source)
+        observed = g02.validate_artifact(child_path.parent)
         require(observed.get("source") == source, "G02 core source binding mismatch")
         validator_path = Path(g02.__file__).resolve()
         return {
@@ -1131,15 +1155,16 @@ def load_input(path: Path, key: str, *, verify_checkout: bool) -> dict[str, Any]
     source = validate_outer_child_pair(key, outer, child, child_digest)
     if verify_checkout:
         require(source == clean_source(), f"{key} is stale against current checkout")
-    binding, raw = deep_validate(
-        key,
-        child,
-        child_path,
-        outer_path,
-        outer,
-        source,
-        verify_checkout=verify_checkout,
-    )
+    with dependency_source_context(source):
+        binding, raw = deep_validate(
+            key,
+            child,
+            child_path,
+            outer_path,
+            outer,
+            source,
+            verify_checkout=verify_checkout,
+        )
     return {
         "outer_path": outer_path,
         "outer": outer,
@@ -1520,6 +1545,26 @@ def self_test() -> int:
     expect_reject(
         lambda: test_evidence_passed({"passed": 1}, "fixture"),
         "summary",
+    )
+    original_g02_git = g02.git
+    original_baseline_git_text = determinism.baseline_scenarios.git_text
+    original_latency_git_output = latency_failure.git_output
+    with dependency_source_context(source):
+        require(g02.git("rev-parse", "HEAD") == source_sha, "G02 source context drifted")
+        require(
+            determinism.baseline_scenarios.git_text(["rev-parse", "HEAD"])
+            == source_sha,
+            "determinism source context drifted",
+        )
+        require(
+            latency_failure.git_output("rev-parse", "HEAD^{tree}") == source_tree,
+            "latency source context drifted",
+        )
+    require(
+        g02.git is original_g02_git
+        and determinism.baseline_scenarios.git_text is original_baseline_git_text
+        and latency_failure.git_output is original_latency_git_output,
+        "dependency source context did not restore validator functions",
     )
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-s2-contract-") as temporary:
         root = Path(temporary)
