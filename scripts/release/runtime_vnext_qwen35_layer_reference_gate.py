@@ -23,11 +23,6 @@ TOLERANCE_ID = (
     "runtime-vnext.metal.qwen35-4b.linear-attention.v6.layer."
     "fp16.gguf-q4-k-m.tokens-24"
 )
-EXPECTED_MISSING = [
-    "checkpoint.full_model",
-    "checkpoint.full_vocab_logits",
-    "layer.full_attention",
-]
 EXPECTED_MODEL_SHA256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 EXPECTED_TOKEN_SHA256 = "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
 EXPECTED_SOURCE_SHA256 = "9d5a85f2df899888d509fcd09bba3ea7ad2c2e4b4d204cb9e2a7d79860f44251"
@@ -464,18 +459,22 @@ def main() -> int:
         catalog, catalog_provenance = tolerances.load_catalog_from_git(
             args.git_revision, args.expected_catalog_blob_sha
         )
-        catalog_summary = tolerances.validate_catalog_document(catalog)
+        catalog_summary = tolerances.validate_catalog_document(
+            catalog, require_complete=True
+        )
         tolerances.validate_catalog_provenance(catalog, catalog_provenance["commit"])
         compared = tolerances.validate_no_widening_from_revision(
             catalog, catalog_provenance["commit"]
         )
-        require(catalog_summary["missing_required_coverage"] == EXPECTED_MISSING,
-                "catalog G08A coverage gap differs from this checkpoint")
+        require(
+            catalog_summary["coverage_status"] == "complete"
+            and catalog_summary["missing_required_coverage"] == [],
+            "catalog G08A numerical coverage is not complete",
+        )
         rows = [row for row in catalog["rows"] if row["tolerance_id"] == TOLERANCE_ID]
         require(len(rows) == 1, "catalog does not contain exactly one reviewed layer row")
         row = rows[0]
-        require(row["coverage_markers"]
-                == ["layer.linear_attention", "quant_format.gguf_q4_k_m"],
+        require(row["coverage_markers"] == ["layer.linear_attention@6.0"],
                 "layer row coverage markers differ")
         require(row["row_fingerprint"] == tolerances.row_fingerprint(row),
                 "layer row fingerprint differs")

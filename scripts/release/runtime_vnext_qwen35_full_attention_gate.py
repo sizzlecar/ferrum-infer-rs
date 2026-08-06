@@ -20,7 +20,6 @@ TOLERANCE_ID = (
     "runtime-vnext.metal.qwen35-4b.full-attention.v2.layer."
     "fp16.gguf-q4-k-m.tokens-24"
 )
-EXPECTED_MISSING = ["checkpoint.full_model", "checkpoint.full_vocab_logits"]
 EXPECTED_MODEL_SHA256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 EXPECTED_TOKEN_SHA256 = "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
 EXPECTED_SOURCE_SHA256 = "d2aae61529e59db56819f971207c6dfb7ef5d1f7e6eedc777a265be5da4d7488"
@@ -460,10 +459,14 @@ def main() -> int:
         catalog, provenance = tolerances.load_catalog_from_git(
             args.git_revision, args.expected_catalog_blob_sha
         )
-        summary = tolerances.validate_catalog_document(catalog)
+        summary = tolerances.validate_catalog_document(catalog, require_complete=True)
         tolerances.validate_catalog_provenance(catalog, provenance["commit"])
         compared = tolerances.validate_no_widening_from_revision(catalog, provenance["commit"])
-        base.require(summary["missing_required_coverage"] == EXPECTED_MISSING, "catalog G08A coverage gap differs")
+        base.require(
+            summary["coverage_status"] == "complete"
+            and summary["missing_required_coverage"] == [],
+            "catalog G08A numerical coverage is not complete",
+        )
         rows = [row for row in catalog["rows"] if row["tolerance_id"] == TOLERANCE_ID]
         base.require(len(rows) == 1, "catalog does not contain exactly one full-attention row")
         row = rows[0]
