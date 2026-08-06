@@ -2,6 +2,10 @@
 
 ## 依赖与目标
 
+- 2026-08-06 起，本文件中三主模型及共享 Qwen production legacy 删除仍为 v0.8.0 硬门；
+  非三主模型的完整 support disposition 和全仓 legacy physical zero 按
+  [`RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`](RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md)
+  转入 v0.8.1/0.9 hardening，不得误报为已完成。
 - 依赖：G08C
 - 下游：G08 aggregator、G09
 - 目标：迁移补充 lane，处置全部 support rows，并物理删除 legacy decoder/runtime。
