@@ -12,8 +12,36 @@ Open。创建于 2026-07-10。
 竞争性比较转入 v0.8.1/0.9。修订保留三主模型 CUDA/Metal、真实 `run`/`serve`、动态资源、正确性、性能、profile、
 编译阈值和发布后安装验证硬门，但把完整历史治理、未使用 provider、全仓 support disposition、
 legacy physical zero 和平台完备性转入 v0.8.1/0.9 hardening。v0.8.0 正式进度分母改为
-`R0-R3 0/4 PASS`；下文各时期的 `G00-G10 0/11` 是原 exhaustive roadmap 的历史状态，不再作为
+`R0-R3 1/4 PASS`；下文各时期的 `G00-G10 0/11` 是原 exhaustive roadmap 的历史状态，不再作为
 release freeze 前置条件。
+
+### 当前 release-blocking 状态（2026-08-07）
+
+- 正式分母：R0 `PASS`，R1-R3 `OPEN`，合计 `R0-R3 1/4 PASS`。本段是当前状态源；下方按日期
+  保留的 `0/11`、S2 child 计数和 focused checkpoint 均为历史快照，不能覆盖本段。
+- R0 product/raw evidence source 为 clean、已推送
+  `84d6b72419b21b39b68ac1102cbc6fbf031d5790`；R0 validator/authenticity 修复已推送至
+  `7a1a79b0f64c5e901438cfd6e0be247927acd8d7`。正式 S2 和 R0 聚合分别打印：
+
+```text
+FERRUM RUNTIME VNEXT S2 CUDA PRODUCT CONTRACT PASS: /workspace/ferrum-artifacts/r0-s2-84d6b724/s2-current-r6
+FERRUM GATE vnext-s2 PASS: /workspace/ferrum-artifacts/r0-s2-84d6b724/s2-current-r6
+FERRUM RUNTIME VNEXT R0 CORE CLOSURE PASS: /workspace/ferrum-artifacts/r0-s2-84d6b724/r0-current-r2
+FERRUM GATE vnext-r0 PASS: /workspace/ferrum-artifacts/r0-s2-84d6b724/r0-current-r2
+```
+
+- R0 证据归档 `runtime-vnext-r0-evidence-7a1a79b0.tar.zst` 为 `506452352` bytes，SHA256 为
+  `32a5bdbc5e53176d5834ad194de1b695e424a8600b17fd08c84fdb1c5190b7b3`，已上传至 draft
+  [GitHub transfer release](https://github.com/sizzlecar/ferrum-infer-rs/releases/tag/untagged-9ed36af1f2445efff73d)，
+  并从 GitHub 下载到
+  `/Users/chejinxuan/ferrum-artifacts/runtime-vnext-r0-transfer-7a1a79b0/` 完成 SHA256 和
+  `zstd -t` 回环校验。
+- R0 付费 RTX 4090 实例 `46998761` 已停止并确认 `cur_state=stopped`、
+  `actual_status=exited`；最终 inventory 中无 running/loading/scheduling sibling。保留停止实例中的
+  build/model cache，R1 需要 CUDA 时按单实例策略复用。
+- 当前关键路径切换为 R1 Product Correctness：复用 G08A/G08B/G08C CUDA/Metal、产品场景和
+  Llama dense 证据，补齐薄 `vnext-r1` 聚合及缺失的真实模型 correctness；R1 精确 PASS 前不得进入
+  R2 正式性能结论。
 
 截至 2026-08-04，clean、已推送 production source
 `04699472d17b72a5368692bacb81a4b38cdae04f` 已关闭 S2 CUDA API/modality
