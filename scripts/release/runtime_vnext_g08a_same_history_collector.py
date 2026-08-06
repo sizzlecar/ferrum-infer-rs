@@ -27,6 +27,8 @@ FAIL_PREFIX = "FERRUM RUNTIME VNEXT G08A SAME HISTORY COLLECTOR FAIL"
 SELFTEST_PASS = "FERRUM RUNTIME VNEXT G08A SAME HISTORY COLLECTOR SELFTEST PASS"
 SCHEMA_VERSION = 1
 THREAD_LIMIT = 4
+DEFAULT_STAGE_MAX_PER_PROCESS_THREADS = 8
+HELPER_COMPILE_MAX_PER_PROCESS_THREADS = 16
 HELPER_BUILD_TIMEOUT_SECONDS = 600
 FERRUM_TIMEOUT_SECONDS = 300
 LLAMA_TIMEOUT_SECONDS = 180
@@ -160,7 +162,12 @@ def stage_record(root: Path) -> dict[str, Any]:
     }
 
 
-def validate_stage_record(value: Any, label: str) -> None:
+def validate_stage_record(
+    value: Any,
+    label: str,
+    *,
+    expected_max_per_process_threads: int = DEFAULT_STAGE_MAX_PER_PROCESS_THREADS,
+) -> None:
     record = exact_object(value, frozenset({"command", "receipt", "stdout", "stderr"}), label)
     command_path = validate_artifact_ref(record["command"], f"{label}.command")
     receipt_path = validate_artifact_ref(record["receipt"], f"{label}.receipt")
@@ -182,7 +189,7 @@ def validate_stage_record(value: Any, label: str) -> None:
         and limits.get("wall_timeout_seconds") == float(command.get("hard_deadline_seconds"))
         and limits.get("max_processes") == 16
         and limits.get("max_group_threads") == 32
-        and limits.get("max_per_process_threads") == 8,
+        and limits.get("max_per_process_threads") == expected_max_per_process_threads,
         f"{label} command or resource envelope differs",
     )
 
@@ -213,6 +220,7 @@ def run_stage(
     timeout_seconds: int,
     progress_signal: str,
     input_key: str,
+    max_per_process_threads: int = DEFAULT_STAGE_MAX_PER_PROCESS_THREADS,
 ) -> dict[str, Any]:
     require(not root.exists(), f"stage output already exists: {root}")
     root.mkdir(parents=True)
@@ -243,7 +251,7 @@ def run_stage(
         "--max-group-threads",
         "32",
         "--max-per-process-threads",
-        "8",
+        str(max_per_process_threads),
         "--",
         *argv,
     ]
@@ -278,7 +286,11 @@ def run_stage(
         f"stage {root.name} failed with exit code {returncode}; see {root}",
     )
     record = stage_record(root)
-    validate_stage_record(record, f"stage {root.name}")
+    validate_stage_record(
+        record,
+        f"stage {root.name}",
+        expected_max_per_process_threads=max_per_process_threads,
+    )
     print(f"stage {root.name}: PASS", flush=True)
     return record
 
@@ -369,6 +381,7 @@ def helper_key(llama_cpp: dict[str, Any]) -> str:
             "source_git_sha": llama_cpp["git_sha"],
             "helper_source": source_file_identity(HELPER_SOURCE),
             "thread_limit": THREAD_LIMIT,
+            "helper_compile_max_per_process_threads": HELPER_COMPILE_MAX_PER_PROCESS_THREADS,
             "compiler_flags": ["-std=c++17", "-O2", "-Wall", "-Wextra", "-Wpedantic", "-Werror"],
         }
     )
@@ -386,7 +399,11 @@ def validate_helper(value: Any, expected_key: str) -> Path:
     require(os.access(binary, os.X_OK), "llama helper binary is not executable")
     validate_libraries(record["libraries"])
     validate_stage_record(record["cmake_build"], "llama cmake build")
-    validate_stage_record(record["compile"], "llama helper compile")
+    validate_stage_record(
+        record["compile"],
+        "llama helper compile",
+        expected_max_per_process_threads=HELPER_COMPILE_MAX_PER_PROCESS_THREADS,
+    )
     return binary
 
 
@@ -438,6 +455,7 @@ def build_helper(out: Path, llama_cpp: dict[str, Any]) -> tuple[Path, dict[str, 
         timeout_seconds=HELPER_BUILD_TIMEOUT_SECONDS,
         progress_signal="bounded receipt samples plus compiler stdout bytes",
         input_key=same_history.canonical_sha256({"helper_key": key, "libraries": libraries}),
+        max_per_process_threads=HELPER_COMPILE_MAX_PER_PROCESS_THREADS,
     )
     require(binary.is_file() and os.access(binary, os.X_OK), "llama helper compilation produced no executable")
     record = {
@@ -1008,6 +1026,11 @@ def collect(args: argparse.Namespace) -> Path:
 
 
 def self_test() -> None:
+    require(
+        DEFAULT_STAGE_MAX_PER_PROCESS_THREADS == 8
+        and HELPER_COMPILE_MAX_PER_PROCESS_THREADS == 16,
+        "same-history native helper thread bounds differ",
+    )
     base = {field: 0 for field in SUMMARY_FIELDS}
     first = copy.deepcopy(base)
     first.update({"robust_decision_count": 63, "ambiguous_decision_count": 1, "ferrum_oracle_exact_count": 64, "ambiguous_top2_accepted_count": 1, "llama_oracle_exact_count": 63, "external_flip_count": 1})

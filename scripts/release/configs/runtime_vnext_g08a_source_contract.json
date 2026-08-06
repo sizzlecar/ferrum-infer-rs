@@ -40,7 +40,7 @@
       "path": "crates/ferrum-models/src/vnext/qwen35.rs",
       "classification": "reviewed-provider",
       "owner": "ferrum-models/vnext::qwen35",
-      "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+      "reviewed_at_git_sha": "db1137ee21f7b278c7bccd4cb1fd96da2d6ef252",
       "reason": "The typed family provider is reviewed function by function below."
         }
     ],
@@ -64,7 +64,7 @@
 	    "provider_review": {
     "path": "crates/ferrum-models/src/vnext/qwen35.rs",
     "owner": "ferrum-models/vnext::qwen35",
-    "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+    "reviewed_at_git_sha": "db1137ee21f7b278c7bccd4cb1fd96da2d6ef252",
 	        "classification_reasons": {
             "counted-execution-scaffolding": "Family-owned execution, scheduling, batching, state transition, or lifecycle code counts toward the frozen G00 scaffolding delta.",
             "counted-provider-glue": "Typed family identity, validation, preparation, and descriptor glue count toward the G08A provider limit.",
@@ -171,6 +171,7 @@
     ],
     "excluded-math-program": [
       "semantic_program",
+      "for_weight_format",
       "moe_weight_references",
       "value_id",
       "node_id",
@@ -238,7 +239,7 @@
 	            "symbol": "create",
 	            "line_hint": 1352,
 	            "owner": "ferrum-engine/llm-executor-factory",
-	            "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+	            "reviewed_at_git_sha": "6ddd2d621127b12ce588ac739119c09a95738307",
 	            "required_fragments": [
 	                "resolve_registered_model_from_sources",
 	                "resolve_registered_model_from_dir",
@@ -262,7 +263,7 @@
             "symbol": "create_registered_vnext_executor",
             "line_hint": 1159,
             "owner": "ferrum-engine/registered-vnext-selection",
-            "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+            "reviewed_at_git_sha": "6ddd2d621127b12ce588ac739119c09a95738307",
 	            "required_fragments": [
 	                "ProductionExecutionKind::CausalLanguage",
 	                "CudaVNextComposition::create",
