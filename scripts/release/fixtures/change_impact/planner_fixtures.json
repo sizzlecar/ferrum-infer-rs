@@ -499,6 +499,30 @@
       "forbid_required_gates": ["cuda_l1_native_op_smoke"]
     },
     {
+      "id": "typed_engine_config",
+      "changed_files": ["crates/ferrum-types/src/config.rs"],
+      "expect_domains": ["shared_runtime", "runtime_preset"],
+      "expect_required_gates": [
+        "unit",
+        "backend_boundary",
+        "preset_snapshot",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ]
+    },
+    {
+      "id": "vnext_checkpoint_evidence",
+      "changed_files": ["crates/ferrum-cli/src/commands/vnext_checkpoint.rs"],
+      "expect_domains": ["evidence_schema", "vnext_numerical_evidence"],
+      "expect_required_gates": [
+        "unit",
+        "planner_selftest",
+        "release_validator_selftest",
+        "vnext_g08a_numerics"
+      ],
+      "forbid_required_gates": ["metal_sentinel", "cuda_sentinel"]
+    },
+    {
       "id": "native_op_manifest",
       "changed_files": ["scripts/release/schemas/native_operator_manifest.schema.json"],
       "expect_domains": ["evidence_schema", "native_operator", "release_gate"],

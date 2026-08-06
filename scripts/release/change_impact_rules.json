@@ -91,6 +91,7 @@
       "id": "types-runtime-config-and-presets",
       "path_globs": [
         "crates/ferrum-types/src/auto_config.rs",
+        "crates/ferrum-types/src/config.rs",
         "crates/ferrum-types/src/runtime_config.rs",
         "crates/ferrum-types/examples/backend_runtime_preset_snapshot.rs"
       ],
@@ -429,6 +430,23 @@
       "exceptions": [],
       "owner": "runtime-vnext",
       "reason": "the CUDA determinism command and replay contract tests define evidence collection rather than run or serve product behavior"
+    },
+    {
+      "id": "vnext-checkpoint-evidence",
+      "path_globs": [
+        "crates/ferrum-cli/src/commands/vnext_checkpoint.rs"
+      ],
+      "domains": ["vnext_numerical_evidence", "evidence_schema"],
+      "required_gates": [
+        "unit",
+        "planner_selftest",
+        "release_validator_selftest",
+        "vnext_g08a_numerics"
+      ],
+      "release_invalidation": ["vnext_g08a_numerics"],
+      "exceptions": [],
+      "owner": "runtime-vnext",
+      "reason": "explicit checkpoint and teacher-forcing CLI controls affect numerical evidence while remaining disabled on normal run and serve paths"
     },
     {
       "id": "vnext-s2-aggregate-validator",
