@@ -501,6 +501,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
                    "--llama-extractor-artifact must be a directory")
     token_ids = common.load_token_ids(token_path)
     token_count = len(token_ids)
+    emulate_layer_output_f16 = bool(args.emulate_layer_output_f16)
     common.require(token_count <= full_attention.TOKENS_MAXIMUM,
                    "full-model fixture exceeds token maximum")
     selected_wave = (
@@ -632,6 +633,8 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         else:
             attention_residual = linear_attention_residual(np, hidden, layer, weight)
         next_hidden = finish_dense_layer(np, attention_residual, layer, weight)
+        if emulate_layer_output_f16:
+            next_hidden = next_hidden.astype(np.float16).astype(np.float32)
         del attention_residual, hidden
         hidden = next_hidden
         path = reference_dir / f"layer-{layer:02d}-output.f32"
@@ -734,11 +737,22 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         "schema_version": 1,
         "status": "measured",
         "oracle": {
-            "identity": "cpu.fp32.python.qwen35_gguf_model_reference",
-            "precision": "fp32",
+            "identity": (
+                "cpu.mixed.python.qwen35_gguf_model_reference.layer_output_f16"
+                if emulate_layer_output_f16
+                else "cpu.fp32.python.qwen35_gguf_model_reference"
+            ),
+            "precision": "fp32-with-f16-layer-output"
+            if emulate_layer_output_f16
+            else "fp32",
             "semantics": (
                 "independent streamed Qwen3.5 dense-hybrid transformer stack and "
                 "tied full-vocabulary head over GGUF-dequantized weights"
+                + (
+                    "; diagnostic FP16 round-trip after every complete layer"
+                    if emulate_layer_output_f16
+                    else ""
+                )
             ),
             "source_path": str(source_path.relative_to(repo_root)),
             "source_sha256": common.sha256_file(source_path),
@@ -945,6 +959,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llama-cpp-root")
     parser.add_argument("--llama-artifact")
     parser.add_argument("--llama-extractor-artifact")
+    parser.add_argument("--emulate-layer-output-f16", action="store_true")
     parser.add_argument("--out")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
