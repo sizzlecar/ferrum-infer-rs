@@ -220,14 +220,24 @@ fn live_provider_catalog() -> NativeOperatorProviderCatalog {
     NativeOperatorProviderCatalog {
         schema_version: NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
         backend: NativeOperatorBackend::Cuda,
-        providers: vec![NativeOperatorProviderCatalogRow {
-            operation_id: "operation.causal_paged_attention".to_string(),
-            operation_contract_version: NativeOperatorContractVersion::new(1, 2),
-            operation_fingerprint: digest('a'),
-            provider_id: "provider.cuda.causal_paged_attention.f16".to_string(),
-            provider_version: NativeOperatorContractVersion::new(3, 4),
-            provider_implementation_fingerprint: digest('b'),
-        }],
+        providers: vec![
+            NativeOperatorProviderCatalogRow {
+                operation_id: "operation.causal_paged_attention".to_string(),
+                operation_contract_version: NativeOperatorContractVersion::new(1, 2),
+                operation_fingerprint: digest('a'),
+                provider_id: "provider.cuda.causal_paged_attention.f16".to_string(),
+                provider_version: NativeOperatorContractVersion::new(3, 4),
+                provider_implementation_fingerprint: digest('b'),
+            },
+            NativeOperatorProviderCatalogRow {
+                operation_id: "operation.gated_delta_recurrent_attention".to_string(),
+                operation_contract_version: NativeOperatorContractVersion::new(1, 0),
+                operation_fingerprint: digest('c'),
+                provider_id: "provider.cuda.gated_delta_recurrent_attention.f16".to_string(),
+                provider_version: NativeOperatorContractVersion::new(1, 0),
+                provider_implementation_fingerprint: digest('d'),
+            },
+        ],
     }
 }
 
@@ -281,22 +291,63 @@ fn compiled_native_operator_bindings_match_the_exact_live_catalog() {
 }
 
 #[test]
-fn compiled_native_operator_bindings_reject_stale_catalog_or_provider_identity() {
+fn compiled_native_operator_bindings_accept_unrelated_catalog_provenance_change() {
     let catalog = live_provider_catalog();
-    let mut stale_catalog = compiled_provider(&catalog);
-    stale_catalog.g03_catalog_sha256 = Some(digest('0'));
-    assert!(
-        validate_compiled_native_operator_provider_catalog(&catalog, &[stale_catalog])
-            .unwrap_err()
-            .contains("stale")
+    let artifact = compiled_provider(&catalog);
+    let mut changed_catalog = catalog.clone();
+    changed_catalog.providers[1].provider_implementation_fingerprint = digest('0');
+    let changed_catalog_sha256 = changed_catalog.canonical_sha256().unwrap();
+    assert_ne!(
+        artifact.g03_catalog_sha256.as_deref(),
+        Some(changed_catalog_sha256.as_str())
     );
 
+    validate_compiled_native_operator_provider_catalog(&changed_catalog, &[artifact]).unwrap();
+}
+
+#[test]
+fn compiled_native_operator_bindings_reject_changed_bound_provider_identity() {
+    let catalog = live_provider_catalog();
     let mut stale_provider = compiled_provider(&catalog);
     stale_provider.operation_bindings[0].provider_implementation_fingerprint = digest('0');
     assert!(
         validate_compiled_native_operator_provider_catalog(&catalog, &[stale_provider])
             .unwrap_err()
             .contains("differs from the live provider identity")
+    );
+}
+
+#[test]
+fn compiled_native_operator_bindings_reject_missing_bound_provider() {
+    let catalog = live_provider_catalog();
+    let artifact = compiled_provider(&catalog);
+    let mut incomplete_catalog = catalog;
+    incomplete_catalog.providers.remove(0);
+
+    assert!(
+        validate_compiled_native_operator_provider_catalog(&incomplete_catalog, &[artifact])
+            .unwrap_err()
+            .contains("binds missing live provider")
+    );
+}
+
+#[test]
+fn compiled_native_operator_set_rejects_missing_bindings_or_provenance() {
+    let catalog = live_provider_catalog();
+    let mut unbound = compiled_provider(&catalog);
+    unbound.operation_bindings.clear();
+    assert!(
+        validate_compiled_native_operator_provider_catalog(&catalog, &[unbound])
+            .unwrap_err()
+            .contains("does not bind any live G03 operation/provider")
+    );
+
+    let mut missing_provenance = compiled_provider(&catalog);
+    missing_provenance.g03_catalog_sha256 = None;
+    assert!(
+        validate_compiled_native_operator_provider_catalog(&catalog, &[missing_provenance])
+            .unwrap_err()
+            .contains("has no provider catalog provenance")
     );
 }
 
