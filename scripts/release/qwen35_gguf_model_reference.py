@@ -62,11 +62,13 @@ def load_ferrum_capture(
                        "selected Ferrum capture wave must be inside --ferrum-capture")
     plan = common.load_json(plan_path)
     wave = common.load_json(wave_path)
-    schema_version = common.validate_ferrum_capture_schema(plan, wave)
     wave_kind = wave.get("wave_kind")
     common.require(wave_kind in ("prefill", "decode")
                    and wave.get("participant_count") == 1,
                    "Ferrum capture must be one-participant prefill or decode")
+    schema_version = common.validate_ferrum_capture_schema(
+        plan, wave, allow_decode=wave_kind == "decode"
+    )
     captured_tokens = token_count if wave_kind == "prefill" else 1
     immediate_start = 0 if wave_kind == "prefill" else token_count - 1
     for key in (
