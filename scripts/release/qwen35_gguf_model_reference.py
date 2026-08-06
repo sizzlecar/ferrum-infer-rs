@@ -47,18 +47,28 @@ def layer_value_id(layer: int) -> str:
 
 
 def load_ferrum_capture(
-    capture_dir: Path, token_count: int
+    capture_dir: Path, token_count: int, selected_wave: Path | None = None
 ) -> tuple[dict[str, Path], dict[str, Any]]:
     plan_path = capture_dir / "plan.json"
-    wave_paths = sorted(capture_dir.glob("wave-*.json"))
     common.require(plan_path.is_file(), f"missing Ferrum capture plan: {plan_path}")
-    common.require(len(wave_paths) == 1, "expected one Ferrum capture wave")
+    if selected_wave is None:
+        wave_paths = sorted(capture_dir.glob("wave-*.json"))
+        common.require(len(wave_paths) == 1, "expected one Ferrum capture wave")
+        wave_path = wave_paths[0]
+    else:
+        wave_path = selected_wave.expanduser().resolve()
+        common.require(wave_path.is_file(), "selected Ferrum capture wave is unavailable")
+        common.require(wave_path.parent == capture_dir.resolve(),
+                       "selected Ferrum capture wave must be inside --ferrum-capture")
     plan = common.load_json(plan_path)
-    wave = common.load_json(wave_paths[0])
+    wave = common.load_json(wave_path)
     schema_version = common.validate_ferrum_capture_schema(plan, wave)
-    common.require(wave.get("wave_kind") == "prefill"
+    wave_kind = wave.get("wave_kind")
+    common.require(wave_kind in ("prefill", "decode")
                    and wave.get("participant_count") == 1,
-                   "Ferrum capture must be one-participant prefill")
+                   "Ferrum capture must be one-participant prefill or decode")
+    captured_tokens = token_count if wave_kind == "prefill" else 1
+    immediate_start = 0 if wave_kind == "prefill" else token_count - 1
     for key in (
         "plan_id",
         "plan_hash",
@@ -94,11 +104,11 @@ def load_ferrum_capture(
         span = record.get("token_span")
         common.require(
             isinstance(span, dict)
-            and span.get("immediate_tokens") == token_count
+            and span.get("immediate_tokens") == captured_tokens
             and span.get("full_input_tokens") == token_count
-            and span.get("immediate_start_token") == 0
+            and span.get("immediate_start_token") == immediate_start
             and span.get("immediate_end_token") == token_count,
-            f"{value_id} does not cover the complete prompt",
+            f"{value_id} token span differs from the selected wave",
         )
         tensor = record["value"].get("tensor")
         layout = record.get("output_layout")
@@ -113,12 +123,12 @@ def load_ferrum_capture(
             common.require(tensor.get("dimensions") == dimensions,
                            f"{value_id} dimensions differ from the fixture")
         else:
-            shape = [token_count, HIDDEN_SIZE]
+            shape = [captured_tokens, HIDDEN_SIZE]
             dimensions = tensor.get("dimensions")
             common.require(
                 isinstance(dimensions, list)
                 and len(dimensions) == 2
-                and dimensions[0] >= token_count
+                and dimensions[0] >= captured_tokens
                 and dimensions[1] == HIDDEN_SIZE,
                 f"{value_id} capacity differs from the fixture",
             )
@@ -146,8 +156,10 @@ def load_ferrum_capture(
         "artifact_root": str(root.resolve()),
         "plan_file": plan_path.name,
         "plan_sha256": common.sha256_file(plan_path),
-        "wave_file": wave_paths[0].name,
-        "wave_sha256": common.sha256_file(wave_paths[0]),
+        "wave_file": wave_path.name,
+        "wave_sha256": common.sha256_file(wave_path),
+        "wave_kind": wave_kind,
+        "captured_tokens": captured_tokens,
         "git_sha": common.read_optional_text(root, "git-sha.txt"),
         "git_status": common.read_optional_text(root, "git-status.txt"),
         "tracked_diff_sha256": (
@@ -489,7 +501,15 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     token_count = len(token_ids)
     common.require(token_count <= full_attention.TOKENS_MAXIMUM,
                    "full-model fixture exceeds token maximum")
-    actual_paths, actual_provenance = load_ferrum_capture(capture_dir, token_count)
+    selected_wave = (
+        Path(args.ferrum_wave).expanduser().resolve()
+        if args.ferrum_wave
+        else None
+    )
+    actual_paths, actual_provenance = load_ferrum_capture(
+        capture_dir, token_count, selected_wave
+    )
+    captured_tokens = actual_provenance["captured_tokens"]
     llama_paths, llama_provenance = load_llama_artifact(
         llama_artifact, extractor_artifact, token_count
     )
@@ -589,13 +609,13 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     np.asarray(hidden, dtype="<f4").tofile(embedding_path)
     actual_embedding = np.fromfile(
         actual_paths[EMBEDDING_VALUE_ID], dtype="<f2"
-    ).astype(np.float32).reshape(token_count, HIDDEN_SIZE)
+    ).astype(np.float32).reshape(captured_tokens, HIDDEN_SIZE)
     llama_embedding = np.fromfile(
         llama_paths["model.input_embed"], dtype="<f4"
     ).reshape(token_count, HIDDEN_SIZE)
     embedding_metrics = measured(
-        np, actual_embedding, hidden,
-        actual_dtype="fp16", shape=[token_count, HIDDEN_SIZE]
+        np, actual_embedding, hidden[-captured_tokens:],
+        actual_dtype="fp16", shape=[captured_tokens, HIDDEN_SIZE]
     )
     layer_records: list[dict[str, Any]] = []
     llama_layer_metrics: list[dict[str, Any]] = []
@@ -616,10 +636,10 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         np.asarray(hidden, dtype="<f4").tofile(path)
         actual = np.fromfile(
             actual_paths[layer_value_id(layer)], dtype="<f2"
-        ).astype(np.float32).reshape(token_count, HIDDEN_SIZE)
+        ).astype(np.float32).reshape(captured_tokens, HIDDEN_SIZE)
         metrics = measured(
-            np, actual, hidden,
-            actual_dtype="fp16", shape=[token_count, HIDDEN_SIZE]
+            np, actual, hidden[-captured_tokens:],
+            actual_dtype="fp16", shape=[captured_tokens, HIDDEN_SIZE]
         )
         layer_records.append(
             {
@@ -659,10 +679,10 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     np.asarray(final_hidden, dtype="<f4").tofile(final_path)
     actual_final = np.fromfile(
         actual_paths[FINAL_HIDDEN_VALUE_ID], dtype="<f2"
-    ).astype(np.float32).reshape(token_count, HIDDEN_SIZE)
+    ).astype(np.float32).reshape(captured_tokens, HIDDEN_SIZE)
     final_metrics = measured(
-        np, actual_final, final_hidden,
-        actual_dtype="fp16", shape=[token_count, HIDDEN_SIZE]
+        np, actual_final, final_hidden[-captured_tokens:],
+        actual_dtype="fp16", shape=[captured_tokens, HIDDEN_SIZE]
     )
     llama_final = np.fromfile(llama_paths["result_norm"], dtype="<f4").reshape(
         1, HIDDEN_SIZE
@@ -880,6 +900,37 @@ def self_test() -> None:
                        "synthetic model capture did not roundtrip")
         common.require(len(provenance["checkpoints"]) == LAYER_COUNT + 3,
                        "synthetic model provenance is incomplete")
+        decode_records = [
+            {
+                **record,
+                "token_span": {
+                    "immediate_tokens": 1,
+                    "full_input_tokens": 2,
+                    "immediate_start_token": 1,
+                    "immediate_end_token": 2,
+                },
+            }
+            for record in records
+        ]
+        decode_wave = capture / "decode-wave-0000.json"
+        common.write_json(
+            decode_wave,
+            {
+                "schema_version": 1,
+                **identity,
+                "wave_kind": "decode",
+                "participant_count": 1,
+                "records": decode_records,
+            },
+        )
+        decode_paths, decode_provenance = load_ferrum_capture(
+            capture, 2, decode_wave
+        )
+        common.require(len(decode_paths) == LAYER_COUNT + 3,
+                       "synthetic decode capture did not roundtrip")
+        common.require(decode_provenance["wave_kind"] == "decode"
+                       and decode_provenance["captured_tokens"] == 1,
+                       "synthetic decode provenance differs")
     print(SELF_TEST_PASS)
 
 
@@ -888,6 +939,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model")
     parser.add_argument("--prompt-token-ids")
     parser.add_argument("--ferrum-capture")
+    parser.add_argument("--ferrum-wave")
     parser.add_argument("--llama-cpp-root")
     parser.add_argument("--llama-artifact")
     parser.add_argument("--llama-extractor-artifact")
