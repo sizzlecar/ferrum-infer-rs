@@ -28,6 +28,23 @@
 - G08 统一 performance smoke：legacy PASS 时 `>=0.90x` legacy，否则 `>=0.70x` same-host
   vLLM/llama.cpp；该结果只作 diagnostic。
 
+Metal token parity 必须由 checked-in collector 生成，不能手写 JSON 或用自定义 Qwen 模板替代模型内置
+chat template。collector 启动一个固定 `parallel=1`、固定线程上限的外部 `llama-server`，逐 case 调用
+`/apply-template`、`/tokenize`、`/completion`，并逐个执行真实 `ferrum run`。20 个 prompt 的 prompt token
+必须完全相同，每个 prompt 的 64 个 greedy output token 必须完全相同，共 `1280/1280`，waiver/exception
+均为 `0`：
+
+```text
+python3 scripts/release/runtime_vnext_g08a_token_parity_collector.py \
+  --ferrum-binary <ferrum> \
+  --llama-server-binary <llama-server> \
+  --llama-cpp-source <clean-llama.cpp-worktree> \
+  --model <locked-Qwen3.5-4B-Q4_K_M.gguf> \
+  --out <external-out>
+
+FERRUM RUNTIME VNEXT G08A TOKEN PARITY COLLECTOR PASS: <external-out>
+```
+
 源码所有权与 legacy 删除先由独立、低成本 child gate 冻结：
 
 ```text

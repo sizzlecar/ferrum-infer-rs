@@ -87,6 +87,9 @@ RUNTIME_VNEXT_G08A_METAL_OP_NUMERICS = (
 RUNTIME_VNEXT_G08A_NUMERICS = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08a_numerics.py"
 )
+RUNTIME_VNEXT_G08A_TOKEN_PARITY_COLLECTOR = (
+    REPO_ROOT / "scripts/release/runtime_vnext_g08a_token_parity_collector.py"
+)
 RUNTIME_VNEXT_G08A_SOURCE_CONTRACT = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08a_source_contract.py"
 )
@@ -777,6 +780,19 @@ def test_runtime_vnext_g08a_numerics_selftests() -> None:
     require(
         "FERRUM RUNTIME VNEXT G08A NUMERICS SELFTEST PASS" in aggregate.stdout,
         aggregate.stdout,
+    )
+    collector = run(
+        [
+            sys.executable,
+            str(RUNTIME_VNEXT_G08A_TOKEN_PARITY_COLLECTOR),
+            "--self-test",
+        ]
+    )
+    require(collector.returncode == 0, collector.stderr or collector.stdout)
+    require(
+        "FERRUM RUNTIME VNEXT G08A TOKEN PARITY COLLECTOR SELFTEST PASS"
+        in collector.stdout,
+        collector.stdout,
     )
 
 
