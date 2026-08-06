@@ -238,9 +238,9 @@ def validate_teacher_token_span(
     token_span: dict[str, Any],
     expected_history: list[int],
     wave_kind: str,
-    expected_fit_tokens: int | None,
+    request_fit_ceiling: int,
     label: str,
-) -> int:
+) -> None:
     require(
         token_span["full_input_tokens"] == len(expected_history),
         f"{label}.full_input_tokens differs from canonical teacher history",
@@ -257,17 +257,21 @@ def validate_teacher_token_span(
             f"{label} decode span must contain exactly the appended token",
         )
     fit_tokens = token_span["fit_input_tokens"]
-    if expected_fit_tokens is not None:
+    if wave_kind == "prefill":
         require(
-            fit_tokens == expected_fit_tokens,
-            f"{label}.fit_input_tokens changed across teacher-forced waves",
+            fit_tokens == request_fit_ceiling,
+            f"{label}.fit_input_tokens differs from the request fit ceiling",
+        )
+    else:
+        require(
+            fit_tokens == len(expected_history),
+            f"{label}.fit_input_tokens must equal the current decode history",
         )
     require(
         token_span["fingerprint"]
         == token_span_fingerprint(expected_history, token_span),
         f"{label}.fingerprint differs from canonical teacher history",
     )
-    return fit_tokens
 
 
 def file_sha256(path: Path) -> str:
@@ -537,7 +541,11 @@ def validate_artifact(
     summaries: list[dict[str, Any]] = []
     referenced_raw: set[str] = set()
     teacher_decisions: list[dict[str, int]] = []
-    teacher_fit_input_tokens: int | None = None
+    teacher_request_fit_ceiling = (
+        len(teacher_prompt["token_ids"]) + teacher_forcing["token_count"] - 1
+        if schema_version == 4
+        else 0
+    )
     teacher_product_contract: tuple[str, str, int, str, int] | None = None
     for expected_kind, filename_prefix, expected_index, wave_path in wave_entries:
         require(
@@ -899,11 +907,11 @@ def validate_artifact(
                     "teacher-forced product-output contract changed across waves",
                 )
             product_token_span = product_outputs_raw[0]["token_span"]
-            teacher_fit_input_tokens = validate_teacher_token_span(
+            validate_teacher_token_span(
                 product_token_span,
                 expected_teacher_history,
                 expected_kind,
-                teacher_fit_input_tokens,
+                teacher_request_fit_ceiling,
                 "wave.product_outputs[0].token_span",
             )
         summaries.append(
@@ -1226,7 +1234,11 @@ def write_self_test_teacher_capture(
         token_span = {
             "immediate_tokens": len(history) - start,
             "full_input_tokens": len(history),
-            "fit_input_tokens": 128,
+            "fit_input_tokens": (
+                len(prompt_token_ids) + len(target_token_ids) - 1
+                if wave_kind == "prefill"
+                else len(history)
+            ),
             "immediate_start_token": start,
             "immediate_end_token": len(history),
         }
@@ -1630,6 +1642,20 @@ def self_test() -> None:
                 ("product_outputs", 0, "token_span", "fingerprint"),
                 "0" * 64,
                 "fingerprint differs from canonical teacher history",
+            ),
+            (
+                "prefill-fit-ceiling",
+                "wave-0000.json",
+                ("product_outputs", 0, "token_span", "fit_input_tokens"),
+                128,
+                "differs from the request fit ceiling",
+            ),
+            (
+                "decode-fit-history",
+                "decode-wave-0000.json",
+                ("product_outputs", 0, "token_span", "fit_input_tokens"),
+                128,
+                "must equal the current decode history",
             ),
             (
                 "participant-count",
