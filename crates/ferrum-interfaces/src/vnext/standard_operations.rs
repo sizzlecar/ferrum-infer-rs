@@ -11,14 +11,28 @@ use super::{
 
 pub const TOKEN_EMBEDDING_OPERATION_ID: &str = "operation.token_embedding";
 pub const TOKEN_EMBEDDING_F16_CAPABILITY_ID: &str = "capability.operation.token_embedding.f16";
+pub const TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID: &str = "operation.token_embedding.f32-master";
+pub const TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID: &str =
+    "capability.operation.token_embedding.f32-master";
 pub const LAST_TOKEN_DENSE_LINEAR_OPERATION_ID: &str = "operation.last_token_dense_linear";
 pub const LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID: &str =
     "capability.operation.last_token_dense_linear.f16";
+pub const LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID: &str = "operation.last_token_dense_linear.f32";
+pub const LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID: &str =
+    "capability.operation.last_token_dense_linear.f32";
 pub const LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID: &str = "operation.last_token_masked_argmax";
 pub const LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID: &str =
     "capability.operation.last_token_masked_argmax.f16";
+pub const LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID: &str =
+    "operation.last_token_masked_argmax.f32";
+pub const LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID: &str =
+    "capability.operation.last_token_masked_argmax.f32";
 pub const RMS_NORM_OPERATION_ID: &str = "operation.rms_norm";
 pub const RMS_NORM_F16_CAPABILITY_ID: &str = "capability.operation.rms_norm.f16";
+pub const RMS_NORM_F32_TO_F16_OPERATION_ID: &str = "operation.rms_norm.f32-to-f16";
+pub const RMS_NORM_F32_TO_F16_CAPABILITY_ID: &str = "capability.operation.rms_norm.f32-to-f16";
+pub const RMS_NORM_F32_OPERATION_ID: &str = "operation.rms_norm.f32";
+pub const RMS_NORM_F32_CAPABILITY_ID: &str = "capability.operation.rms_norm.f32";
 pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
 pub const DENSE_LINEAR_F16_CAPABILITY_ID: &str = "capability.operation.dense_linear.f16";
 pub const DENSE_SWIGLU_OPERATION_ID: &str = "operation.dense_swiglu";
@@ -30,15 +44,25 @@ pub const ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID: &str =
     "capability.operation.routed_shared_swiglu_moe.f16";
 pub const RESIDUAL_ADD_OPERATION_ID: &str = "operation.residual_add";
 pub const RESIDUAL_ADD_F16_CAPABILITY_ID: &str = "capability.operation.residual_add.f16";
+pub const RESIDUAL_ADD_F32_F16_OPERATION_ID: &str = "operation.residual_add.f32-f16";
+pub const RESIDUAL_ADD_F32_F16_CAPABILITY_ID: &str = "capability.operation.residual_add.f32-f16";
 pub const GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID: &str =
     "operation.gated_delta_recurrent_attention";
 pub const GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID: &str =
     "capability.operation.gated_delta_recurrent_attention.f16";
+pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID: &str =
+    "operation.gated_delta_recurrent_attention.f32-master";
+pub const GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID: &str =
+    "capability.operation.gated_delta_recurrent_attention.f32-master";
 pub const GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION: &str =
     "gated-delta-execution-form-selector-v1";
 pub const CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str = "operation.causal_paged_attention";
 pub const CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
     "capability.operation.causal_paged_attention.f16";
+pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID: &str =
+    "operation.causal_paged_attention.f32-master";
+pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID: &str =
+    "capability.operation.causal_paged_attention.f32-master";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatedDeltaDecayParameterization {
@@ -249,8 +273,28 @@ impl OperationContract for StandardOperationContract {
 }
 
 pub fn token_embedding_contract() -> Result<StandardOperationContract, VNextError> {
+    token_embedding_contract_with_output(
+        TOKEN_EMBEDDING_OPERATION_ID,
+        TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+        ElementType::F16,
+    )
+}
+
+pub fn token_embedding_f32_master_contract() -> Result<StandardOperationContract, VNextError> {
+    token_embedding_contract_with_output(
+        TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+        TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
+        ElementType::F32,
+    )
+}
+
+fn token_embedding_contract_with_output(
+    operation_id: &str,
+    capability_id: &str,
+    output_type: ElementType,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(TOKEN_EMBEDDING_OPERATION_ID)?,
+        id: OperationId::new(operation_id)?,
         version: ContractVersion::new(1, 0),
         inputs: vec![
             contiguous_tensor(
@@ -272,7 +316,7 @@ pub fn token_embedding_contract() -> Result<StandardOperationContract, VNextErro
                 DimensionConstraint::Symbol("tokens".to_owned()),
                 DimensionConstraint::Symbol("hidden_size".to_owned()),
             ],
-            [ElementType::F16],
+            [output_type],
             TensorAccess::Write,
         )?],
         attributes: AttributeSchema::new(BTreeMap::from([
@@ -288,9 +332,7 @@ pub fn token_embedding_contract() -> Result<StandardOperationContract, VNextErro
         oracle: OracleSpec::Exact,
         provider: ProviderRequirement {
             minimum_version: ContractVersion::new(1, 0),
-            required_capabilities: BTreeSet::from([CapabilityId::new(
-                TOKEN_EMBEDDING_F16_CAPABILITY_ID,
-            )?]),
+            required_capabilities: BTreeSet::from([CapabilityId::new(capability_id)?]),
         },
         profile_phase: ProfilePhase::Forward,
     };
@@ -303,13 +345,36 @@ pub fn token_embedding_contract() -> Result<StandardOperationContract, VNextErro
 /// logits while leaving providers free to use a pointer offset, row gather,
 /// or a fused kernel.
 pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, VNextError> {
+    last_token_dense_linear_contract_with_activation(
+        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+        ContractVersion::new(1, 1),
+        LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+        ElementType::F16,
+    )
+}
+
+pub fn last_token_dense_linear_f32_contract() -> Result<StandardOperationContract, VNextError> {
+    last_token_dense_linear_contract_with_activation(
+        LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+        ElementType::F32,
+    )
+}
+
+fn last_token_dense_linear_contract_with_activation(
+    operation_id: &str,
+    version: ContractVersion,
+    capability_id: &str,
+    activation_type: ElementType,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)?,
-        version: ContractVersion::new(1, 1),
+        id: OperationId::new(operation_id)?,
+        version,
         inputs: vec![
             contiguous_tensor(
                 token_hidden_dimensions(),
-                [ElementType::F16],
+                [activation_type],
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
@@ -326,7 +391,7 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
                 DimensionConstraint::Exact(1),
                 DimensionConstraint::Symbol("out_features".to_owned()),
             ],
-            [ElementType::F16],
+            [activation_type],
             TensorAccess::Write,
         )?],
         attributes: AttributeSchema::new(BTreeMap::from([
@@ -340,10 +405,7 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(
-            LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-            ContractVersion::new(1, 1),
-        )?,
+        provider: provider_requirement(capability_id, version)?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -360,16 +422,39 @@ pub fn last_token_dense_linear_contract() -> Result<StandardOperationContract, V
 /// `offsets[0]..offsets[1]` within the fixed-capacity input. A penalty of `1.0`
 /// or an empty range leaves logits unchanged.
 pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, VNextError> {
+    last_token_masked_argmax_contract_with_logits(
+        LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+        ContractVersion::new(3, 0),
+        LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+        ElementType::F16,
+    )
+}
+
+pub fn last_token_masked_argmax_f32_contract() -> Result<StandardOperationContract, VNextError> {
+    last_token_masked_argmax_contract_with_logits(
+        LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
+        ElementType::F32,
+    )
+}
+
+fn last_token_masked_argmax_contract_with_logits(
+    operation_id: &str,
+    version: ContractVersion,
+    capability_id: &str,
+    logits_type: ElementType,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?,
-        version: ContractVersion::new(3, 0),
+        id: OperationId::new(operation_id)?,
+        version,
         inputs: vec![
             contiguous_tensor(
                 vec![
                     DimensionConstraint::Exact(1),
                     DimensionConstraint::Symbol("vocab_size".to_owned()),
                 ],
-                [ElementType::F16],
+                [logits_type],
                 TensorAccess::Read,
             )?,
             contiguous_tensor(
@@ -408,10 +493,7 @@ pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, 
             persistent: ResourcePresenceRequirement::Forbidden,
         },
         oracle: OracleSpec::Exact,
-        provider: provider_requirement(
-            LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
-            ContractVersion::new(3, 0),
-        )?,
+        provider: provider_requirement(capability_id, version)?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -419,15 +501,43 @@ pub fn last_token_masked_argmax_contract() -> Result<StandardOperationContract, 
 }
 
 pub fn rms_norm_contract() -> Result<StandardOperationContract, VNextError> {
+    rms_norm_contract_with_types(
+        RMS_NORM_OPERATION_ID,
+        RMS_NORM_F16_CAPABILITY_ID,
+        ElementType::F16,
+        ElementType::F16,
+    )
+}
+
+pub fn rms_norm_f32_to_f16_contract() -> Result<StandardOperationContract, VNextError> {
+    rms_norm_contract_with_types(
+        RMS_NORM_F32_TO_F16_OPERATION_ID,
+        RMS_NORM_F32_TO_F16_CAPABILITY_ID,
+        ElementType::F32,
+        ElementType::F16,
+    )
+}
+
+pub fn rms_norm_f32_contract() -> Result<StandardOperationContract, VNextError> {
+    rms_norm_contract_with_types(
+        RMS_NORM_F32_OPERATION_ID,
+        RMS_NORM_F32_CAPABILITY_ID,
+        ElementType::F32,
+        ElementType::F32,
+    )
+}
+
+fn rms_norm_contract_with_types(
+    operation_id: &str,
+    capability_id: &str,
+    input_type: ElementType,
+    output_type: ElementType,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(RMS_NORM_OPERATION_ID)?,
+        id: OperationId::new(operation_id)?,
         version: ContractVersion::new(1, 0),
         inputs: vec![
-            contiguous_tensor(
-                token_hidden_dimensions(),
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
+            contiguous_tensor(token_hidden_dimensions(), [input_type], TensorAccess::Read)?,
             contiguous_tensor(
                 vec![DimensionConstraint::Symbol("hidden_size".to_owned())],
                 [ElementType::F16],
@@ -436,7 +546,7 @@ pub fn rms_norm_contract() -> Result<StandardOperationContract, VNextError> {
         ],
         outputs: vec![contiguous_tensor(
             token_hidden_dimensions(),
-            [ElementType::F16],
+            [output_type],
             TensorAccess::Write,
         )?],
         attributes: AttributeSchema::new(BTreeMap::from([
@@ -444,8 +554,12 @@ pub fn rms_norm_contract() -> Result<StandardOperationContract, VNextError> {
             positive_epsilon_attribute("epsilon")?,
         ]))?,
         resources: no_auxiliary_resources(),
-        oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(RMS_NORM_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
+        oracle: if output_type == ElementType::F32 {
+            f32_reference_tolerance()?
+        } else {
+            f16_reference_tolerance()?
+        },
+        provider: provider_requirement(capability_id, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -681,31 +795,53 @@ pub fn routed_swiglu_moe_contract() -> Result<StandardOperationContract, VNextEr
 }
 
 pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> {
+    residual_add_contract_with_types(
+        RESIDUAL_ADD_OPERATION_ID,
+        RESIDUAL_ADD_F16_CAPABILITY_ID,
+        ElementType::F16,
+        ElementType::F16,
+        ElementType::F16,
+    )
+}
+
+pub fn residual_add_f32_f16_contract() -> Result<StandardOperationContract, VNextError> {
+    residual_add_contract_with_types(
+        RESIDUAL_ADD_F32_F16_OPERATION_ID,
+        RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
+        ElementType::F32,
+        ElementType::F16,
+        ElementType::F32,
+    )
+}
+
+fn residual_add_contract_with_types(
+    operation_id: &str,
+    capability_id: &str,
+    left_type: ElementType,
+    right_type: ElementType,
+    output_type: ElementType,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(RESIDUAL_ADD_OPERATION_ID)?,
+        id: OperationId::new(operation_id)?,
         version: ContractVersion::new(1, 0),
         inputs: vec![
-            contiguous_tensor(
-                token_hidden_dimensions(),
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
-            contiguous_tensor(
-                token_hidden_dimensions(),
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
+            contiguous_tensor(token_hidden_dimensions(), [left_type], TensorAccess::Read)?,
+            contiguous_tensor(token_hidden_dimensions(), [right_type], TensorAccess::Read)?,
         ],
         outputs: vec![contiguous_tensor_with_alias(
             token_hidden_dimensions(),
-            [ElementType::F16],
+            [output_type],
             TensorAccess::Write,
             AliasPolicy::MayAlias { tensor_index: 0 },
         )?],
         attributes: AttributeSchema::new(BTreeMap::from([unsigned_attribute("hidden_size")?]))?,
         resources: no_auxiliary_resources(),
-        oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(RESIDUAL_ADD_F16_CAPABILITY_ID, ContractVersion::new(1, 0))?,
+        oracle: if output_type == ElementType::F32 {
+            OracleSpec::Exact
+        } else {
+            f16_reference_tolerance()?
+        },
+        provider: provider_requirement(capability_id, ContractVersion::new(1, 0))?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -716,15 +852,35 @@ pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> 
 /// convolution/Delta state update, gated normalization, output projection, and
 /// the attention residual. Weight ordinals are part of the stable contract.
 pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationContract, VNextError> {
+    gated_delta_recurrent_attention_contract_with_hidden(
+        GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+        ContractVersion::new(6, 0),
+        GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+        ElementType::F16,
+    )
+}
+
+pub fn gated_delta_recurrent_attention_f32_master_contract(
+) -> Result<StandardOperationContract, VNextError> {
+    gated_delta_recurrent_attention_contract_with_hidden(
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        ElementType::F32,
+    )
+}
+
+fn gated_delta_recurrent_attention_contract_with_hidden(
+    operation_id: &str,
+    version: ContractVersion,
+    capability_id: &str,
+    hidden_type: ElementType,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?,
-        version: ContractVersion::new(6, 0),
+        id: OperationId::new(operation_id)?,
+        version,
         inputs: vec![
-            contiguous_tensor(
-                token_hidden_dimensions(),
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
+            contiguous_tensor(token_hidden_dimensions(), [hidden_type], TensorAccess::Read)?,
             contiguous_tensor(
                 vec![symbol("hidden_size")],
                 [ElementType::F16],
@@ -777,7 +933,7 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
         ],
         outputs: vec![contiguous_tensor_with_alias(
             token_hidden_dimensions(),
-            [ElementType::F16],
+            [hidden_type],
             TensorAccess::Write,
             AliasPolicy::MayAlias { tensor_index: 0 },
         )?],
@@ -807,10 +963,7 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
         ]))?,
         resources: attention_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(
-            GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-            ContractVersion::new(6, 0),
-        )?,
+        provider: provider_requirement(capability_id, version)?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -821,15 +974,35 @@ pub fn gated_delta_recurrent_attention_contract() -> Result<StandardOperationCon
 /// RoPE, KV update, attention, optional output gate, output projection, and
 /// the attention residual. KV physical paging remains a provider concern.
 pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VNextError> {
+    causal_paged_attention_contract_with_hidden(
+        CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+        ContractVersion::new(2, 0),
+        CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+        ElementType::F16,
+    )
+}
+
+pub fn causal_paged_attention_f32_master_contract() -> Result<StandardOperationContract, VNextError>
+{
+    causal_paged_attention_contract_with_hidden(
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+        ContractVersion::new(1, 0),
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        ElementType::F32,
+    )
+}
+
+fn causal_paged_attention_contract_with_hidden(
+    operation_id: &str,
+    version: ContractVersion,
+    capability_id: &str,
+    hidden_type: ElementType,
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
-        version: ContractVersion::new(2, 0),
+        id: OperationId::new(operation_id)?,
+        version,
         inputs: vec![
-            contiguous_tensor(
-                token_hidden_dimensions(),
-                [ElementType::F16],
-                TensorAccess::Read,
-            )?,
+            contiguous_tensor(token_hidden_dimensions(), [hidden_type], TensorAccess::Read)?,
             contiguous_tensor(
                 vec![symbol("hidden_size")],
                 [ElementType::F16],
@@ -873,7 +1046,7 @@ pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VN
         ],
         outputs: vec![contiguous_tensor_with_alias(
             token_hidden_dimensions(),
-            [ElementType::F16],
+            [hidden_type],
             TensorAccess::Write,
             AliasPolicy::MayAlias { tensor_index: 0 },
         )?],
@@ -896,10 +1069,7 @@ pub fn causal_paged_attention_contract() -> Result<StandardOperationContract, VN
         ]))?,
         resources: causal_attention_resources(),
         oracle: f16_reference_tolerance()?,
-        provider: provider_requirement(
-            CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-            ContractVersion::new(2, 0),
-        )?,
+        provider: provider_requirement(capability_id, version)?,
         profile_phase: ProfilePhase::Forward,
     };
     descriptor.validate()?;
@@ -1028,6 +1198,12 @@ fn provider_requirement(
 fn f16_reference_tolerance() -> Result<OracleSpec, VNextError> {
     Ok(OracleSpec::RelativeTolerance {
         tolerance: CanonicalRational::new(1, 1_000)?,
+    })
+}
+
+fn f32_reference_tolerance() -> Result<OracleSpec, VNextError> {
+    Ok(OracleSpec::RelativeTolerance {
+        tolerance: CanonicalRational::new(1, 100_000)?,
     })
 }
 
@@ -1196,6 +1372,94 @@ mod tests {
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)
             .unwrap();
+    }
+
+    #[test]
+    fn fp32_master_contracts_form_one_exact_mixed_precision_chain() {
+        let contracts = [
+            token_embedding_f32_master_contract().unwrap(),
+            gated_delta_recurrent_attention_f32_master_contract().unwrap(),
+            causal_paged_attention_f32_master_contract().unwrap(),
+            rms_norm_f32_to_f16_contract().unwrap(),
+            residual_add_f32_f16_contract().unwrap(),
+            rms_norm_f32_contract().unwrap(),
+            last_token_dense_linear_f32_contract().unwrap(),
+            last_token_masked_argmax_f32_contract().unwrap(),
+        ];
+        let ids = contracts
+            .iter()
+            .map(|contract| contract.descriptor().id.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), contracts.len());
+        for contract in &contracts {
+            let descriptor = contract.descriptor();
+            assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+            assert_eq!(descriptor.provider.required_capabilities.len(), 1);
+            contract
+                .validate_signature(&descriptor.inputs, &descriptor.outputs)
+                .unwrap();
+        }
+
+        let embedding = contracts[0].descriptor();
+        assert_eq!(
+            embedding.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F32])
+        );
+        for attention in [&contracts[1], &contracts[2]] {
+            let descriptor = attention.descriptor();
+            assert_eq!(
+                descriptor.inputs[0].element_types(),
+                &BTreeSet::from([ElementType::F32])
+            );
+            assert_eq!(
+                descriptor.outputs[0].element_types(),
+                &BTreeSet::from([ElementType::F32])
+            );
+            assert_eq!(
+                descriptor.outputs[0].alias(),
+                &AliasPolicy::MayAlias { tensor_index: 0 }
+            );
+        }
+
+        let branch_norm = contracts[3].descriptor();
+        assert_eq!(
+            branch_norm.inputs[0].element_types(),
+            &BTreeSet::from([ElementType::F32])
+        );
+        assert_eq!(
+            branch_norm.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F16])
+        );
+        let residual = contracts[4].descriptor();
+        assert_eq!(
+            residual.inputs[0].element_types(),
+            &BTreeSet::from([ElementType::F32])
+        );
+        assert_eq!(
+            residual.inputs[1].element_types(),
+            &BTreeSet::from([ElementType::F16])
+        );
+        assert_eq!(
+            residual.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F32])
+        );
+
+        let final_norm = contracts[5].descriptor();
+        let head = contracts[6].descriptor();
+        let argmax = contracts[7].descriptor();
+        for tensor in [
+            &final_norm.inputs[0],
+            &final_norm.outputs[0],
+            &head.inputs[0],
+            &head.outputs[0],
+            &argmax.inputs[0],
+        ] {
+            assert_eq!(tensor.element_types(), &BTreeSet::from([ElementType::F32]));
+        }
+
+        assert!(!ids.contains(TOKEN_EMBEDDING_OPERATION_ID));
+        assert!(!ids.contains(RMS_NORM_OPERATION_ID));
+        assert!(!ids.contains(RESIDUAL_ADD_OPERATION_ID));
     }
 
     #[test]
