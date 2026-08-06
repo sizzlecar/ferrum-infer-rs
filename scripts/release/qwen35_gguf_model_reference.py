@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import hashlib
 import math
@@ -40,6 +41,10 @@ FINAL_HIDDEN_VALUE_ID = "value.output.final_hidden"
 LOGITS_VALUE_ID = "value.output.logits"
 EXTRACTOR_SOURCE_COMMIT = "7a75cdcd6db7fb427d3b175200ef218eff364e05"
 EXTRACTOR_SOURCE_SHA256 = "2ae2f57bfcd38d69d046e8d4dadb545f8423e72d9af46cd2836490aee2662253"
+FERRUM_CAPTURE_DTYPES = {
+    "f16": ("<f2", 2, "fp16"),
+    "f32": ("<f4", 4, "fp32"),
+}
 
 
 def layer_value_id(layer: int) -> str:
@@ -116,9 +121,14 @@ def load_ferrum_capture(
         layout = record.get("output_layout")
         common.require(isinstance(tensor, dict) and isinstance(layout, dict),
                        f"{value_id} tensor/layout must be objects")
-        common.require(tensor.get("element_type") == "f16"
-                       and layout.get("element_type") == "f16",
-                       f"{value_id} must be logical FP16")
+        element_type = tensor.get("element_type")
+        common.require(element_type in FERRUM_CAPTURE_DTYPES,
+                       f"{value_id} element type must be f16 or f32")
+        common.require(layout.get("element_type") == element_type,
+                       f"{value_id} tensor/layout element types differ")
+        _numpy_dtype, bytes_per_element, logical_dtype = FERRUM_CAPTURE_DTYPES[
+            element_type
+        ]
         if value_id == LOGITS_VALUE_ID:
             shape = [VOCABULARY_SIZE]
             dimensions = [1, VOCABULARY_SIZE]
@@ -136,18 +146,18 @@ def load_ferrum_capture(
             )
         elements = math.prod(shape)
         common.require(layout.get("element_count") == elements
-                       and record.get("raw_bytes") == elements * 2,
+                       and record.get("raw_bytes") == elements * bytes_per_element,
                        f"{value_id} element/byte count differs")
         raw_path = common.safe_child(capture_dir, record.get("raw_file"),
                                      f"{value_id}.raw_file")
-        common.require(raw_path.stat().st_size == elements * 2,
+        common.require(raw_path.stat().st_size == elements * bytes_per_element,
                        f"{value_id} file size differs")
         raw_sha = common.sha256_file(raw_path)
         common.require(raw_sha == record.get("raw_sha256"),
                        f"{value_id} SHA256 mismatch")
         paths[value_id] = raw_path
         checkpoints[value_id] = {
-            "logical_dtype": "fp16",
+            "logical_dtype": logical_dtype,
             "logical_shape": shape,
             "raw_file": raw_path.name,
             "raw_sha256": raw_sha,
@@ -173,6 +183,24 @@ def load_ferrum_capture(
         "checkpoints": checkpoints,
     }
     return paths, provenance
+
+
+def load_ferrum_array(
+    np: Any,
+    paths: dict[str, Path],
+    provenance: dict[str, Any],
+    value_id: str,
+    shape: tuple[int, ...] | list[int],
+) -> tuple[Any, str]:
+    checkpoint = provenance["checkpoints"][value_id]
+    logical_dtype = checkpoint["logical_dtype"]
+    numpy_dtype = {"fp16": "<f2", "fp32": "<f4"}.get(logical_dtype)
+    common.require(numpy_dtype is not None,
+                   f"{value_id} has unsupported logical dtype {logical_dtype!r}")
+    value = np.fromfile(paths[value_id], dtype=numpy_dtype).astype(np.float32)
+    common.require(value.size == math.prod(shape),
+                   f"{value_id} decoded element count differs")
+    return value.reshape(shape), logical_dtype
 
 
 def load_llama_artifact(
@@ -653,15 +681,16 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
                    "reference embedding shape differs")
     embedding_path = out_dir / "embedding.f32"
     np.asarray(hidden, dtype="<f4").tofile(embedding_path)
-    actual_embedding = np.fromfile(
-        actual_paths[EMBEDDING_VALUE_ID], dtype="<f2"
-    ).astype(np.float32).reshape(captured_tokens, HIDDEN_SIZE)
+    actual_embedding, embedding_dtype = load_ferrum_array(
+        np, actual_paths, actual_provenance, EMBEDDING_VALUE_ID,
+        (captured_tokens, HIDDEN_SIZE),
+    )
     llama_embedding = np.fromfile(
         llama_paths["model.input_embed"], dtype="<f4"
     ).reshape(token_count, HIDDEN_SIZE)
     embedding_metrics = measured(
         np, actual_embedding, hidden[-captured_tokens:],
-        actual_dtype="fp16", shape=[captured_tokens, HIDDEN_SIZE]
+        actual_dtype=embedding_dtype, shape=[captured_tokens, HIDDEN_SIZE]
     )
     layer_records: list[dict[str, Any]] = []
     llama_layer_metrics: list[dict[str, Any]] = []
@@ -700,12 +729,14 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         hidden = next_hidden
         path = reference_dir / f"layer-{layer:02d}-output.f32"
         np.asarray(hidden, dtype="<f4").tofile(path)
-        actual = np.fromfile(
-            actual_paths[layer_value_id(layer)], dtype="<f2"
-        ).astype(np.float32).reshape(captured_tokens, HIDDEN_SIZE)
+        value_id = layer_value_id(layer)
+        actual, actual_dtype = load_ferrum_array(
+            np, actual_paths, actual_provenance, value_id,
+            (captured_tokens, HIDDEN_SIZE),
+        )
         metrics = measured(
             np, actual, hidden[-captured_tokens:],
-            actual_dtype="fp16", shape=[captured_tokens, HIDDEN_SIZE]
+            actual_dtype=actual_dtype, shape=[captured_tokens, HIDDEN_SIZE]
         )
         layer_records.append(
             {
@@ -714,7 +745,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
                 "raw_file": str(path.relative_to(out_dir)),
                 "raw_sha256": common.sha256_file(path),
                 "actual_raw_sha256": actual_provenance["checkpoints"][
-                    layer_value_id(layer)
+                    value_id
                 ]["raw_sha256"],
                 "metrics": metrics,
             }
@@ -743,12 +774,13 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     del final_norm_weight, hidden
     final_path = out_dir / "final-hidden.f32"
     np.asarray(final_hidden, dtype="<f4").tofile(final_path)
-    actual_final = np.fromfile(
-        actual_paths[FINAL_HIDDEN_VALUE_ID], dtype="<f2"
-    ).astype(np.float32).reshape(captured_tokens, HIDDEN_SIZE)
+    actual_final, final_hidden_dtype = load_ferrum_array(
+        np, actual_paths, actual_provenance, FINAL_HIDDEN_VALUE_ID,
+        (captured_tokens, HIDDEN_SIZE),
+    )
     final_metrics = measured(
         np, actual_final, final_hidden[-captured_tokens:],
-        actual_dtype="fp16", shape=[captured_tokens, HIDDEN_SIZE]
+        actual_dtype=final_hidden_dtype, shape=[captured_tokens, HIDDEN_SIZE]
     )
     llama_final = np.fromfile(llama_paths["result_norm"], dtype="<f4").reshape(
         1, HIDDEN_SIZE
@@ -772,19 +804,20 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     isolated_path = out_dir / "ferrum-final-hidden-head-reference.f32"
     np.asarray(reference_logits, dtype="<f4").tofile(logits_path)
     np.asarray(isolated_logits, dtype="<f4").tofile(isolated_path)
-    actual_logits = np.fromfile(
-        actual_paths[LOGITS_VALUE_ID], dtype="<f2"
-    ).astype(np.float32).reshape(VOCABULARY_SIZE)
+    actual_logits, logits_dtype = load_ferrum_array(
+        np, actual_paths, actual_provenance, LOGITS_VALUE_ID,
+        (VOCABULARY_SIZE,),
+    )
     llama_logits = np.fromfile(llama_paths["logits"], dtype="<f4").reshape(
         VOCABULARY_SIZE
     )
     logits_metrics = measured(
         np, actual_logits, reference_logits,
-        actual_dtype="fp16", shape=[VOCABULARY_SIZE]
+        actual_dtype=logits_dtype, shape=[VOCABULARY_SIZE]
     )
     isolated_head_metrics = measured(
         np, actual_logits, isolated_logits,
-        actual_dtype="fp16", shape=[VOCABULARY_SIZE]
+        actual_dtype=logits_dtype, shape=[VOCABULARY_SIZE]
     )
     llama_logits_metrics = measured(
         np, llama_logits, reference_logits,
@@ -950,32 +983,50 @@ def self_test() -> None:
         value_ids = [EMBEDDING_VALUE_ID]
         value_ids.extend(layer_value_id(layer) for layer in range(LAYER_COUNT))
         value_ids.extend((FINAL_HIDDEN_VALUE_ID, LOGITS_VALUE_ID))
-        records = []
-        for index, value_id in enumerate(value_ids):
-            elements = VOCABULARY_SIZE if value_id == LOGITS_VALUE_ID else HIDDEN_SIZE
-            dimensions = [1, VOCABULARY_SIZE] if value_id == LOGITS_VALUE_ID else [128, HIDDEN_SIZE]
-            raw_name = f"checkpoint-{index}.bin"
-            payload = struct.pack("<e", float(index + 1)) * elements
-            (capture / raw_name).write_bytes(payload)
-            records.append(
-                {
-                    "value": {
-                        "value_id": value_id,
-                        "tensor": {"dimensions": dimensions, "element_type": "f16"},
-                    },
-                    "participant_index": 0,
-                    "token_span": {
-                        "immediate_tokens": 1,
-                        "full_input_tokens": 1,
-                        "immediate_start_token": 0,
-                        "immediate_end_token": 1,
-                    },
-                    "output_layout": {"element_type": "f16", "element_count": elements},
-                    "raw_file": raw_name,
-                    "raw_bytes": len(payload),
-                    "raw_sha256": hashlib.sha256(payload).hexdigest(),
-                }
-            )
+
+        def synthetic_records(element_type: str, name_prefix: str) -> list[dict[str, Any]]:
+            records = []
+            struct_format = {"f16": "<e", "f32": "<f"}[element_type]
+            for index, value_id in enumerate(value_ids):
+                elements = (
+                    VOCABULARY_SIZE if value_id == LOGITS_VALUE_ID else HIDDEN_SIZE
+                )
+                dimensions = (
+                    [1, VOCABULARY_SIZE]
+                    if value_id == LOGITS_VALUE_ID
+                    else [128, HIDDEN_SIZE]
+                )
+                raw_name = f"{name_prefix}-{index}.bin"
+                payload = struct.pack(struct_format, float(index + 1)) * elements
+                (capture / raw_name).write_bytes(payload)
+                records.append(
+                    {
+                        "value": {
+                            "value_id": value_id,
+                            "tensor": {
+                                "dimensions": dimensions,
+                                "element_type": element_type,
+                            },
+                        },
+                        "participant_index": 0,
+                        "token_span": {
+                            "immediate_tokens": 1,
+                            "full_input_tokens": 1,
+                            "immediate_start_token": 0,
+                            "immediate_end_token": 1,
+                        },
+                        "output_layout": {
+                            "element_type": element_type,
+                            "element_count": elements,
+                        },
+                        "raw_file": raw_name,
+                        "raw_bytes": len(payload),
+                        "raw_sha256": hashlib.sha256(payload).hexdigest(),
+                    }
+                )
+            return records
+
+        records = synthetic_records("f16", "checkpoint")
         common.write_json(
             capture / "wave-0000.json",
             {
@@ -1022,6 +1073,50 @@ def self_test() -> None:
         common.require(decode_provenance["wave_kind"] == "decode"
                        and decode_provenance["captured_tokens"] == 1,
                        "synthetic decode provenance differs")
+
+        f32_records = synthetic_records("f32", "checkpoint-f32")
+        f32_wave = capture / "wave-f32.json"
+        common.write_json(
+            f32_wave,
+            {
+                "schema_version": 1,
+                **identity,
+                "wave_kind": "prefill",
+                "participant_count": 1,
+                "records": f32_records,
+            },
+        )
+        f32_paths, f32_provenance = load_ferrum_capture(capture, 1, f32_wave)
+        common.require(len(f32_paths) == LAYER_COUNT + 3,
+                       "synthetic FP32 model capture did not roundtrip")
+        common.require(
+            all(
+                record["logical_dtype"] == "fp32"
+                for record in f32_provenance["checkpoints"].values()
+            ),
+            "synthetic FP32 model provenance lost its typed dtype",
+        )
+
+        mismatched_records = copy.deepcopy(f32_records)
+        mismatched_records[0]["output_layout"]["element_type"] = "f16"
+        mismatched_wave = capture / "wave-mismatched-dtype.json"
+        common.write_json(
+            mismatched_wave,
+            {
+                "schema_version": 1,
+                **identity,
+                "wave_kind": "prefill",
+                "participant_count": 1,
+                "records": mismatched_records,
+            },
+        )
+        try:
+            load_ferrum_capture(capture, 1, mismatched_wave)
+        except common.ReferenceError as error:
+            common.require("tensor/layout element types differ" in str(error),
+                           "mismatched dtype rejection reason differs")
+        else:
+            raise common.ReferenceError("mismatched tensor/layout dtype was accepted")
     print(SELF_TEST_PASS)
 
 
