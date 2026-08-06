@@ -17,14 +17,14 @@ import runtime_vnext_qwen35_layer_reference_gate as base
 PASS_PREFIX = "RUNTIME VNEXT QWEN35 FULL ATTENTION NUMERICS PASS"
 SELF_TEST_PASS = "RUNTIME VNEXT QWEN35 FULL ATTENTION NUMERICS SELF-TEST PASS"
 TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.full-attention.v2.layer."
-    "fp16.gguf-q4-k-m.tokens-24"
+    "runtime-vnext.metal.qwen35-4b.full-attention-f32-master.v1.layer."
+    "fp32.gguf-q4-k-m.tokens-24"
 )
 EXPECTED_MODEL_SHA256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 EXPECTED_TOKEN_SHA256 = "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
-EXPECTED_SOURCE_SHA256 = "d2aae61529e59db56819f971207c6dfb7ef5d1f7e6eedc777a265be5da4d7488"
+EXPECTED_SOURCE_SHA256 = "1ca045ebc6352c0c4a09cefac3a9facdd578a0262d0885835599c6815c005c14"
 EXPECTED_COMMON_SOURCE_SHA256 = (
-    "9d5a85f2df899888d509fcd09bba3ea7ad2c2e4b4d204cb9e2a7d79860f44251"
+    "306d63ad0670d7507c432db235f579c80043ae7abcafc4b4a5d5c80838f26f16"
 )
 EXPECTED_SHAPE = [24, 2560]
 EXPECTED_ELEMENTS = 24 * 2560
@@ -150,15 +150,19 @@ def validate_fixture(fixture: Any, row: dict[str, Any]) -> None:
             "tokens": EXPECTED_SHAPE[0],
         },
         "semantics": {
+            "activation_profile": "gguf_f32_master_v1",
+            "branch_dtype": "fp16",
             "causal": fixture.get("causal"),
             "input_value_id": fixture.get("input_value_id"),
             "layer_index": fixture.get("layer_index"),
+            "master_residual_dtype": "fp32",
             "model_sha256": EXPECTED_MODEL_SHA256,
             "output_gate": fixture.get("output_gate"),
             "output_value_id": fixture.get("output_value_id"),
             "prompt_token_sequence_sha256": fixture.get("token_sequence_sha256"),
             "rope_interleaved": fixture.get("rope_interleaved"),
             "rope_theta": fixture.get("rope_theta"),
+            "weight_format": "gguf_q4_k_m",
         },
     }
     base.require(fixture.get("shape") == EXPECTED_SHAPE, "fixture shape differs")
@@ -220,13 +224,14 @@ def validate_actual(actual: Any) -> dict[str, Path]:
             f"actual.checkpoints.{value_id}",
         )
         base.require(
-            checkpoint["logical_dtype"] == "fp16"
+            checkpoint["logical_dtype"] == "fp32"
             and checkpoint["logical_shape"] == EXPECTED_SHAPE,
             f"{value_id} dtype/shape differs",
         )
         raw = base.safe_child(capture_root, checkpoint["raw_file"], f"{value_id}.raw_file")
-        base.require(raw.stat().st_size == EXPECTED_ELEMENTS * 2, f"{value_id} byte count differs")
+        base.require(raw.stat().st_size == EXPECTED_ELEMENTS * 4, f"{value_id} byte count differs")
         base.require(base.sha256_file(raw) == checkpoint["raw_sha256"], f"{value_id} SHA mismatch")
+        base.validated_f32_sha256(raw, EXPECTED_ELEMENTS)
         paths[value_id] = raw
     return paths
 
@@ -388,7 +393,7 @@ def validate_report(artifact_dir: Path, report: Any, row: dict[str, Any]) -> dic
     base.require(report["metrics"]["expected_f32_sha256"] == reference_sha, "metric/reference SHA differs")
     base.require(
         report["metrics"]["actual_f32_sha256"]
-        == base.f16_as_f32_sha256(actual_paths[OUTPUT_VALUE_ID], EXPECTED_ELEMENTS),
+        == base.validated_f32_sha256(actual_paths[OUTPUT_VALUE_ID], EXPECTED_ELEMENTS),
         "metric/actual FP32 SHA differs",
     )
     cross_validation = validate_cross_validation(report["llama_cpp_cross_validation"])
@@ -403,14 +408,14 @@ def validate_report(artifact_dir: Path, report: Any, row: dict[str, Any]) -> dic
 
 def self_test() -> None:
     row = {
-        "dtype": "fp16",
+        "dtype": "fp32",
         "oracle_precision": "fp32",
         "bounds": {"max_abs_max": 0.012, "relative_l2_max": 0.01, "cosine_min": 0.999},
     }
     metrics = {
         "shape": EXPECTED_SHAPE,
         "element_count": EXPECTED_ELEMENTS,
-        "actual_logical_dtype": "fp16",
+        "actual_logical_dtype": "fp32",
         "oracle_precision": "fp32",
         "actual_nan_count": 0,
         "actual_inf_count": 0,

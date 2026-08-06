@@ -1,8 +1,8 @@
 {
   "coverage": {
     "missing_required_coverage": [],
-    "profile": "g08a_m1_metal.v1",
-    "scope": "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures plus canonical-history full-vocabulary decisions; prompt token identity remains exact",
+    "profile": "g08a_m1_metal.v2",
+    "scope": "Exact Qwen3.5-4B Metal operation/state and GGUF FP32-master layer/model/logit fixtures plus canonical-history full-vocabulary decisions; prompt token identity remains exact",
     "status": "complete"
   },
   "rows": [
@@ -1340,7 +1340,7 @@
     {
       "backend": "metal",
       "basis": {
-        "assertion": "Real Qwen3.5-4B Q4_K_M Metal layer-3 full-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal FP32-master layer-3 full-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
         "kind": "checked_in_conformance_test",
         "source_path": "scripts/release/qwen35_gguf_full_attention_reference.py",
         "test_name": "build_reference"
@@ -1355,6 +1355,67 @@
       "coverage_markers": [
         "layer.full_attention"
       ],
+      "dtype": "fp32",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.causal_paged_attention.f32-master",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_full_attention_f32_master_capture_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "row_fingerprint": "5d04e349fde529a7e0967103521b76af420c3e60d90064cd4b7d5b2074d59ae2",
+      "shape_domain": {
+        "dimensions": {
+          "head_dim": 256,
+          "hidden_size": 2560,
+          "key_value_heads": 4,
+          "query_heads": 16,
+          "rope_dim": 64,
+          "tokens": 24
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.f32-master.layer-3.full-attention.tokens-24",
+        "semantics": {
+          "activation_profile": "gguf_f32_master_v1",
+          "branch_dtype": "fp16",
+          "causal": true,
+          "input_value_id": "value.layer.2.output",
+          "layer_index": 3,
+          "master_residual_dtype": "fp32",
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "output_gate": true,
+          "output_value_id": "value.layer.3.attention",
+          "prompt_token_sequence_sha256": "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f",
+          "rope_interleaved": false,
+          "rope_theta": "10000000",
+          "weight_format": "gguf_q4_k_m"
+        }
+      },
+      "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-attention-f32-master.v1.layer.fp32.gguf-q4-k-m.tokens-24"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal layer-3 full-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_full_attention_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "layer_output",
+      "checkpoint_name": "layer_3_attention_residual",
+      "coverage_markers": [],
       "dtype": "fp16",
       "invariants": {
         "exact_dtype": true,
@@ -1370,7 +1431,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
       "review_commit": "5947a4f86cd8a86c6ea845f2ff0ec30c3ca83afd",
-      "row_fingerprint": "70846ec9c2d9ff4b1e756ea0162a390ab1762225997e9b6a73292c96fa5ee423",
+      "row_fingerprint": "6cfbc2c4a41f727660d90f2949813d21ca447c29114d031cae1785b84465365d",
       "shape_domain": {
         "dimensions": {
           "head_dim": 256,
@@ -1399,7 +1460,7 @@
     {
       "backend": "metal",
       "basis": {
-        "assertion": "Real Qwen3.5-4B Q4_K_M Metal 32-layer final hidden state is checked against the independently streamed CPU FP32 model oracle with max_abs <= 0.25.",
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal FP32-master 32-layer final hidden state is checked against the independently streamed CPU FP32 model oracle with max_abs <= 0.25.",
         "kind": "checked_in_conformance_test",
         "source_path": "scripts/release/qwen35_gguf_model_reference.py",
         "test_name": "build_reference"
@@ -1414,6 +1475,61 @@
       "coverage_markers": [
         "checkpoint.full_model"
       ],
+      "dtype": "fp32",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.qwen35_model_forward",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_model_f32_master_capture_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "row_fingerprint": "b9f66bb953f0db14c0fbcf61f4bbacd1a078c2206238ac11a419d6950b2f331e",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 2560,
+          "layers": 32,
+          "tokens": 24
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.f32-master.full-model.tokens-24",
+        "semantics": {
+          "activation_profile": "gguf_f32_master_v1",
+          "branch_dtype": "fp16",
+          "final_norm": "rms_norm",
+          "full_attention_interval": 4,
+          "layer_pattern": "three_linear_then_one_full",
+          "master_residual_dtype": "fp32",
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "prompt_token_sequence_sha256": "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f",
+          "quantized_embedding_is_model_input": true,
+          "weight_format": "gguf_q4_k_m"
+        }
+      },
+      "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-model-f32-master.v1.full-model.fp32.gguf-q4-k-m.tokens-24"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal 32-layer final hidden state is checked against the independently streamed CPU FP32 model oracle with max_abs <= 0.25.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_model_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.25,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "full_model",
+      "checkpoint_name": "final_hidden",
+      "coverage_markers": [],
       "dtype": "fp16",
       "invariants": {
         "exact_dtype": true,
@@ -1429,7 +1545,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
       "review_commit": "5947a4f86cd8a86c6ea845f2ff0ec30c3ca83afd",
-      "row_fingerprint": "46c5f16221d1aca43e3150c5be508f32179483b4a6c9f11e998361743e659f19",
+      "row_fingerprint": "958ad5c2438af0ae43d3470e5f053b7d37a03dd4c08e527865a41c095d32de04",
       "shape_domain": {
         "dimensions": {
           "hidden_size": 2560,
@@ -1452,7 +1568,7 @@
     {
       "backend": "metal",
       "basis": {
-        "assertion": "Real Qwen3.5-4B Q4_K_M Metal last-token full-vocabulary logits are checked against the independent CPU FP32 model and tied-head oracle with max_abs <= 0.1.",
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal FP32 full-vocabulary logits are checked against the independent CPU FP32 model and tied-head oracle with max_abs <= 0.1.",
         "kind": "checked_in_conformance_test",
         "source_path": "scripts/release/qwen35_gguf_model_reference.py",
         "test_name": "build_reference"
@@ -1467,6 +1583,58 @@
       "coverage_markers": [
         "checkpoint.full_vocab_logits"
       ],
+      "dtype": "fp32",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.last_token_dense_linear.f32",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_model_f32_master_capture_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "row_fingerprint": "196a94abcc347faabdd52218fd4a199d6ae06bd7803c41291fd2039748519fe0",
+      "shape_domain": {
+        "dimensions": {
+          "vocabulary_size": 248320
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.f32-master.full-vocab-logits.tokens-24",
+        "semantics": {
+          "activation_profile": "gguf_f32_master_v1",
+          "argmax_token_id": 57590,
+          "input_master_dtype": "fp32",
+          "last_token_index": 23,
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "output_dtype": "fp32",
+          "prompt_token_sequence_sha256": "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f",
+          "tied_embedding_lm_head": true,
+          "weight_format": "gguf_q4_k_m"
+        }
+      },
+      "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-vocab-logits-f32.v1.full-vocab-logits.fp32.gguf-q4-k-m.tokens-24"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal last-token full-vocabulary logits are checked against the independent CPU FP32 model and tied-head oracle with max_abs <= 0.1.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_model_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.1,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "full_vocab_logits",
+      "checkpoint_name": "last_token_logits",
+      "coverage_markers": [],
       "dtype": "fp16",
       "invariants": {
         "exact_dtype": true,
@@ -1482,7 +1650,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
       "review_commit": "5947a4f86cd8a86c6ea845f2ff0ec30c3ca83afd",
-      "row_fingerprint": "267ce969533e51e0974a6300099081d466ac7b104bbc58e1cb29142a33e81159",
+      "row_fingerprint": "1a708cff43c17e2dafb4cf800cd26a49edf4c0ed3c4f0e313b6a0ac7e91d5f36",
       "shape_domain": {
         "dimensions": {
           "vocabulary_size": 248320
@@ -1502,7 +1670,7 @@
     {
       "backend": "metal",
       "basis": {
-        "assertion": "Real Qwen3.5-4B Q4_K_M Metal layer-0 linear-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal FP32-master layer-0 linear-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
         "kind": "checked_in_conformance_test",
         "source_path": "scripts/release/qwen35_gguf_linear_attention_reference.py",
         "test_name": "build_reference"
@@ -1518,6 +1686,59 @@
         "layer.linear_attention",
         "quant_format.gguf_q4_k_m"
       ],
+      "dtype": "fp32",
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      },
+      "model_scope": "qwen3.5-4b",
+      "operation_id": "operation.gated_delta_recurrent_attention.f32-master",
+      "operation_schema_version": "1.0",
+      "oracle_identity": "cpu.fp32.python.qwen35_gguf_linear_attention_f32_master_capture_reference",
+      "oracle_precision": "fp32",
+      "owner": "runtime-vnext-g03",
+      "quant_format": "gguf_q4_k_m",
+      "review_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "row_fingerprint": "ddb031533b3cb6d8e3f71d1cc8d4b195049582863731a5e1b8bedf7f55c55a57",
+      "shape_domain": {
+        "dimensions": {
+          "hidden_size": 2560,
+          "tokens": 24
+        },
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.f32-master.layer-0.linear-attention.tokens-24",
+        "semantics": {
+          "activation_profile": "gguf_f32_master_v1",
+          "branch_dtype": "fp16",
+          "decay_parameterization": "negative_rate",
+          "layer_index": 0,
+          "master_residual_dtype": "fp32",
+          "model_sha256": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4",
+          "prompt_token_sequence_sha256": "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f",
+          "value_head_mapping": "interleaved_by_key_head",
+          "weight_format": "gguf_q4_k_m"
+        }
+      },
+      "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention-f32-master.v1.layer.fp32.gguf-q4-k-m.tokens-24"
+    },
+    {
+      "backend": "metal",
+      "basis": {
+        "assertion": "Real Qwen3.5-4B Q4_K_M Metal layer-0 linear-attention residual is checked against the independent GGUF-dequantized CPU FP32 semantic oracle with max_abs <= 0.012.",
+        "kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_linear_attention_reference.py",
+        "test_name": "build_reference"
+      },
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "checkpoint_kind": "layer_output",
+      "checkpoint_name": "layer_0_attention_residual",
+      "coverage_markers": [],
       "dtype": "fp16",
       "invariants": {
         "exact_dtype": true,
@@ -1533,7 +1754,7 @@
       "owner": "runtime-vnext-g03",
       "quant_format": "gguf_q4_k_m",
       "review_commit": "5947a4f86cd8a86c6ea845f2ff0ec30c3ca83afd",
-      "row_fingerprint": "963d6dadbc2e7ddf621c0f3b147fb2d8843d04976a35e0bdd1c125306ede5592",
+      "row_fingerprint": "d60f5755a70169fba7850497d4f6373703ec34551bb6014421f2d1be0bbfb345",
       "shape_domain": {
         "dimensions": {
           "hidden_size": 2560,

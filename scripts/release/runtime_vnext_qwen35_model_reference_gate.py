@@ -19,21 +19,21 @@ base = shared.base
 PASS_PREFIX = "RUNTIME VNEXT QWEN35 MODEL NUMERICS PASS"
 SELF_TEST_PASS = "RUNTIME VNEXT QWEN35 MODEL NUMERICS SELF-TEST PASS"
 FULL_MODEL_TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.full-model.v1.full-model."
-    "fp16.gguf-q4-k-m.tokens-24"
+    "runtime-vnext.metal.qwen35-4b.full-model-f32-master.v1.full-model."
+    "fp32.gguf-q4-k-m.tokens-24"
 )
 LOGITS_TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.full-vocab-logits.v1.full-vocab-logits."
-    "fp16.gguf-q4-k-m.tokens-24"
+    "runtime-vnext.metal.qwen35-4b.full-vocab-logits-f32.v1.full-vocab-logits."
+    "fp32.gguf-q4-k-m.tokens-24"
 )
 EXPECTED_MODEL_SHA256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 EXPECTED_TOKEN_SHA256 = "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
-EXPECTED_SOURCE_SHA256 = "6274c58bcec5f7b3cf278c0b82ce07b71046003929ddd032b675cf5e310918fc"
+EXPECTED_SOURCE_SHA256 = "774cb8b22c6273cca16e3731da362337aef792348efa8fab746af27ac7378917"
 EXPECTED_LINEAR_COMMON_SHA256 = (
-    "9d5a85f2df899888d509fcd09bba3ea7ad2c2e4b4d204cb9e2a7d79860f44251"
+    "306d63ad0670d7507c432db235f579c80043ae7abcafc4b4a5d5c80838f26f16"
 )
 EXPECTED_FULL_COMMON_SHA256 = (
-    "d2aae61529e59db56819f971207c6dfb7ef5d1f7e6eedc777a265be5da4d7488"
+    "1ca045ebc6352c0c4a09cefac3a9facdd578a0262d0885835599c6815c005c14"
 )
 EXPECTED_EXTRACTOR_SOURCE_COMMIT = "7a75cdcd6db7fb427d3b175200ef218eff364e05"
 EXPECTED_EXTRACTOR_SOURCE_SHA256 = (
@@ -209,25 +209,33 @@ def validate_fixture(
         "fixture_id": fixture["fixture_id"],
         "dimensions": {"hidden_size": HIDDEN_SIZE, "layers": LAYERS, "tokens": TOKENS},
         "semantics": {
+            "activation_profile": "gguf_f32_master_v1",
+            "branch_dtype": "fp16",
             "final_norm": "rms_norm",
             "full_attention_interval": 4,
             "layer_pattern": "three_linear_then_one_full",
+            "master_residual_dtype": "fp32",
             "model_sha256": EXPECTED_MODEL_SHA256,
             "prompt_token_sequence_sha256": EXPECTED_TOKEN_SHA256,
             "quantized_embedding_is_model_input": True,
+            "weight_format": "gguf_q4_k_m",
         },
     }
     base.require(full_domain == full_model_row["shape_domain"],
                  "full-model fixture differs from catalog row")
     logits_domain = {
-        "fixture_id": "qwen35-4b.gguf-q4-k-m.full-vocab-logits.tokens-24",
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.f32-master.full-vocab-logits.tokens-24",
         "dimensions": {"vocabulary_size": VOCABULARY_SIZE},
         "semantics": {
+            "activation_profile": "gguf_f32_master_v1",
             "argmax_token_id": 57590,
+            "input_master_dtype": "fp32",
             "last_token_index": 23,
             "model_sha256": EXPECTED_MODEL_SHA256,
+            "output_dtype": "fp32",
             "prompt_token_sequence_sha256": EXPECTED_TOKEN_SHA256,
             "tied_embedding_lm_head": True,
+            "weight_format": "gguf_q4_k_m",
         },
     }
     base.require(logits_domain == logits_row["shape_domain"],
@@ -288,14 +296,15 @@ def validate_actual(actual: Any) -> tuple[dict[str, Path], dict[str, Any]]:
             frozenset({"logical_dtype", "logical_shape", "raw_file", "raw_sha256"}),
             f"actual.checkpoints.{value_id}",
         )
-        base.require(checkpoint["logical_dtype"] == "fp16"
+        base.require(checkpoint["logical_dtype"] == "fp32"
                      and checkpoint["logical_shape"] == shape,
                      f"{value_id} dtype/shape differs")
         raw = base.safe_child(capture_root, checkpoint["raw_file"], f"{value_id}.raw_file")
-        base.require(raw.stat().st_size == math.prod(shape) * 2,
+        base.require(raw.stat().st_size == math.prod(shape) * 4,
                      f"{value_id} byte count differs")
         base.require(base.sha256_file(raw) == checkpoint["raw_sha256"],
                      f"{value_id} raw SHA mismatch")
+        base.validated_f32_sha256(raw, math.prod(shape))
         paths[value_id] = raw
     return paths, checkpoints
 
@@ -489,11 +498,13 @@ def validate_report(
     )
     validate_metrics(
         embedding["metrics"], full_model_row,
-        shape=FULL_HIDDEN_SHAPE, actual_dtype="fp16", label="embedding.metrics"
+        shape=FULL_HIDDEN_SHAPE, actual_dtype="fp32", label="embedding.metrics"
     )
     base.require(
         embedding["metrics"]["actual_f32_sha256"]
-        == base.f16_as_f32_sha256(actual_paths[EMBEDDING_VALUE_ID], FULL_HIDDEN_ELEMENTS),
+        == base.validated_f32_sha256(
+            actual_paths[EMBEDDING_VALUE_ID], FULL_HIDDEN_ELEMENTS
+        ),
         "embedding metric/actual SHA differs",
     )
 
@@ -521,14 +532,16 @@ def validate_report(
                      f"reference layer {layer} actual SHA differs")
         metrics = validate_metrics(
             record["metrics"], full_model_row,
-            shape=FULL_HIDDEN_SHAPE, actual_dtype="fp16",
+            shape=FULL_HIDDEN_SHAPE, actual_dtype="fp32",
             label=f"reference.layer[{layer}].metrics",
         )
         base.require(record["metrics"]["expected_f32_sha256"] == record["raw_sha256"],
                      f"reference layer {layer} metric SHA differs")
         base.require(
             record["metrics"]["actual_f32_sha256"]
-            == base.f16_as_f32_sha256(actual_paths[layer_value_id(layer)], FULL_HIDDEN_ELEMENTS),
+            == base.validated_f32_sha256(
+                actual_paths[layer_value_id(layer)], FULL_HIDDEN_ELEMENTS
+            ),
             f"reference layer {layer} actual metric SHA differs",
         )
         if worst_layer is None or metrics["relative_l2"] > worst_layer["relative_l2"]:
@@ -540,11 +553,13 @@ def validate_report(
     )
     final_metrics = validate_metrics(
         final_hidden["metrics"], full_model_row,
-        shape=FULL_HIDDEN_SHAPE, actual_dtype="fp16", label="final_hidden.metrics"
+        shape=FULL_HIDDEN_SHAPE, actual_dtype="fp32", label="final_hidden.metrics"
     )
     base.require(
         final_hidden["metrics"]["actual_f32_sha256"]
-        == base.f16_as_f32_sha256(actual_paths[FINAL_HIDDEN_VALUE_ID], FULL_HIDDEN_ELEMENTS),
+        == base.validated_f32_sha256(
+            actual_paths[FINAL_HIDDEN_VALUE_ID], FULL_HIDDEN_ELEMENTS
+        ),
         "final-hidden metric/actual SHA differs",
     )
     logits_path, logits = validate_reference_tensor(
@@ -553,11 +568,11 @@ def validate_report(
     )
     logits_metrics = validate_metrics(
         logits["metrics"], logits_row,
-        shape=LOGITS_SHAPE, actual_dtype="fp16", label="logits.metrics"
+        shape=LOGITS_SHAPE, actual_dtype="fp32", label="logits.metrics"
     )
     base.require(
         logits["metrics"]["actual_f32_sha256"]
-        == base.f16_as_f32_sha256(actual_paths[LOGITS_VALUE_ID], VOCABULARY_SIZE),
+        == base.validated_f32_sha256(actual_paths[LOGITS_VALUE_ID], VOCABULARY_SIZE),
         "logits metric/actual SHA differs",
     )
     logits_top = validate_top_tokens(logits["top_tokens"], "reference.logits.top_tokens")
@@ -573,7 +588,7 @@ def validate_report(
     )
     isolated_metrics = validate_metrics(
         isolated["metrics"], logits_row,
-        shape=LOGITS_SHAPE, actual_dtype="fp16", label="isolated_head.metrics"
+        shape=LOGITS_SHAPE, actual_dtype="fp32", label="isolated_head.metrics"
     )
     isolated_top = validate_top_tokens(isolated["top_tokens"], "reference.isolated_head.top_tokens")
     base.require(isolated_top["argmax_token_id"] == 57590,
@@ -602,7 +617,7 @@ def self_test() -> None:
     metrics = {
         "shape": FULL_HIDDEN_SHAPE,
         "element_count": FULL_HIDDEN_ELEMENTS,
-        "actual_logical_dtype": "fp16",
+        "actual_logical_dtype": "fp32",
         "oracle_precision": "fp32",
         "actual_nan_count": 0,
         "actual_inf_count": 0,
@@ -618,14 +633,14 @@ def self_test() -> None:
     }
     validate_metrics(
         metrics, row, shape=FULL_HIDDEN_SHAPE,
-        actual_dtype="fp16", label="selftest"
+        actual_dtype="fp32", label="selftest"
     )
     rejected = dict(metrics)
     rejected["cosine"] = 0.998
     try:
         validate_metrics(
             rejected, row, shape=FULL_HIDDEN_SHAPE,
-            actual_dtype="fp16", label="selftest"
+            actual_dtype="fp32", label="selftest"
         )
     except base.GateError as error:
         base.require("cosine" in str(error), "wrong model metric rejection")
