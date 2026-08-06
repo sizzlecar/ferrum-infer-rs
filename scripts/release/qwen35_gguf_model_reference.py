@@ -276,25 +276,41 @@ def silu(np: Any, value: Any) -> Any:
     return value * common.stable_sigmoid(np, value)
 
 
+def f16_roundtrip(np: Any, value: Any) -> Any:
+    return value.astype(np.float16).astype(np.float32)
+
+
 def linear_attention_residual(
     np: Any,
     layer_input: Any,
     layer: int,
     weight: Callable[[str], Any],
+    *,
+    emulate_master_residual_f32: bool = False,
 ) -> Any:
     prefix = f"blk.{layer}"
     normalized = rms_norm(np, layer_input, weight(f"{prefix}.attn_norm.weight"))
+    if emulate_master_residual_f32:
+        normalized = f16_roundtrip(np, normalized)
     qkv_weight = weight(f"{prefix}.attn_qkv.weight")
     qkv = normalized @ qkv_weight.T
+    if emulate_master_residual_f32:
+        qkv = f16_roundtrip(np, qkv)
     del qkv_weight
     gate_weight = weight(f"{prefix}.attn_gate.weight")
     z = normalized @ gate_weight.T
+    if emulate_master_residual_f32:
+        z = f16_roundtrip(np, z)
     del gate_weight
     beta_weight = weight(f"{prefix}.ssm_beta.weight")
     beta_raw = normalized @ beta_weight.T
+    if emulate_master_residual_f32:
+        beta_raw = f16_roundtrip(np, beta_raw)
     del beta_weight
     alpha_weight = weight(f"{prefix}.ssm_alpha.weight")
     alpha_raw = normalized @ alpha_weight.T
+    if emulate_master_residual_f32:
+        alpha_raw = f16_roundtrip(np, alpha_raw)
     del alpha_weight
 
     conv_weight = weight(f"{prefix}.ssm_conv1d.weight")
@@ -368,9 +384,14 @@ def linear_attention_residual(
         * recurrent_weight[None, None, :]
         * silu(np, z).reshape(tokens, VALUE_HEADS, HEAD_DIM)
     ).reshape(tokens, VALUE_SIZE)
+    if emulate_master_residual_f32:
+        gated = f16_roundtrip(np, gated)
     del recurrent, recurrent_inverse, recurrent_weight, z
     output_weight = weight(f"{prefix}.ssm_out.weight")
-    residual = layer_input + gated @ output_weight.T
+    branch = gated @ output_weight.T
+    if emulate_master_residual_f32:
+        branch = f16_roundtrip(np, branch)
+    residual = layer_input + branch
     del output_weight, gated, normalized
     common.require(residual.dtype == np.float32
                    and bool(np.isfinite(residual).all()),
@@ -383,6 +404,8 @@ def full_attention_residual(
     layer_input: Any,
     layer: int,
     weight: Callable[[str], Any],
+    *,
+    emulate_master_residual_f32: bool = False,
 ) -> Any:
     prefix = f"blk.{layer}"
     mapped = {
@@ -395,6 +418,8 @@ def full_attention_residual(
         "blk.3.attn_output.weight": weight(f"{prefix}.attn_output.weight"),
     }
     residual, _ = full_attention.execute_full_attention(np, layer_input, mapped)
+    if emulate_master_residual_f32:
+        residual = layer_input + f16_roundtrip(np, residual - layer_input)
     del mapped
     return residual
 
@@ -404,21 +429,34 @@ def finish_dense_layer(
     attention_residual: Any,
     layer: int,
     weight: Callable[[str], Any],
+    *,
+    emulate_master_residual_f32: bool = False,
 ) -> Any:
     prefix = f"blk.{layer}"
     normalized = rms_norm(
         np, attention_residual, weight(f"{prefix}.post_attention_norm.weight")
     )
+    if emulate_master_residual_f32:
+        normalized = f16_roundtrip(np, normalized)
     gate_weight = weight(f"{prefix}.ffn_gate.weight")
     gate = normalized @ gate_weight.T
+    if emulate_master_residual_f32:
+        gate = f16_roundtrip(np, gate)
     del gate_weight
     up_weight = weight(f"{prefix}.ffn_up.weight")
     up = normalized @ up_weight.T
+    if emulate_master_residual_f32:
+        up = f16_roundtrip(np, up)
     del up_weight, normalized
     fused = silu(np, gate) * up
+    if emulate_master_residual_f32:
+        fused = f16_roundtrip(np, fused)
     del gate, up
     down_weight = weight(f"{prefix}.ffn_down.weight")
-    output = attention_residual + fused @ down_weight.T
+    branch = fused @ down_weight.T
+    if emulate_master_residual_f32:
+        branch = f16_roundtrip(np, branch)
+    output = attention_residual + branch
     del down_weight, fused
     common.require(output.dtype == np.float32 and bool(np.isfinite(output).all()),
                    f"layer {layer} output is invalid")
@@ -502,6 +540,11 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     token_ids = common.load_token_ids(token_path)
     token_count = len(token_ids)
     emulate_layer_output_f16 = bool(args.emulate_layer_output_f16)
+    emulate_master_residual_f32 = bool(args.emulate_master_residual_f32)
+    common.require(
+        not (emulate_layer_output_f16 and emulate_master_residual_f32),
+        "diagnostic precision emulation modes are mutually exclusive",
+    )
     common.require(token_count <= full_attention.TOKENS_MAXIMUM,
                    "full-model fixture exceeds token maximum")
     selected_wave = (
@@ -629,10 +672,28 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
             else "linear_attention"
         )
         if layer_kind == "full_attention":
-            attention_residual = full_attention_residual(np, hidden, layer, weight)
+            attention_residual = full_attention_residual(
+                np,
+                hidden,
+                layer,
+                weight,
+                emulate_master_residual_f32=emulate_master_residual_f32,
+            )
         else:
-            attention_residual = linear_attention_residual(np, hidden, layer, weight)
-        next_hidden = finish_dense_layer(np, attention_residual, layer, weight)
+            attention_residual = linear_attention_residual(
+                np,
+                hidden,
+                layer,
+                weight,
+                emulate_master_residual_f32=emulate_master_residual_f32,
+            )
+        next_hidden = finish_dense_layer(
+            np,
+            attention_residual,
+            layer,
+            weight,
+            emulate_master_residual_f32=emulate_master_residual_f32,
+        )
         if emulate_layer_output_f16:
             next_hidden = next_hidden.astype(np.float16).astype(np.float32)
         del attention_residual, hidden
@@ -738,20 +799,34 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         "status": "measured",
         "oracle": {
             "identity": (
-                "cpu.mixed.python.qwen35_gguf_model_reference.layer_output_f16"
-                if emulate_layer_output_f16
-                else "cpu.fp32.python.qwen35_gguf_model_reference"
+                "cpu.mixed.python.qwen35_gguf_model_reference.master_residual_f32"
+                if emulate_master_residual_f32
+                else (
+                    "cpu.mixed.python.qwen35_gguf_model_reference.layer_output_f16"
+                    if emulate_layer_output_f16
+                    else "cpu.fp32.python.qwen35_gguf_model_reference"
+                )
             ),
-            "precision": "fp32-with-f16-layer-output"
-            if emulate_layer_output_f16
-            else "fp32",
+            "precision": (
+                "fp32-master-residual-with-f16-branch-boundaries"
+                if emulate_master_residual_f32
+                else (
+                    "fp32-with-f16-layer-output"
+                    if emulate_layer_output_f16
+                    else "fp32"
+                )
+            ),
             "semantics": (
                 "independent streamed Qwen3.5 dense-hybrid transformer stack and "
                 "tied full-vocabulary head over GGUF-dequantized weights"
                 + (
-                    "; diagnostic FP16 round-trip after every complete layer"
-                    if emulate_layer_output_f16
-                    else ""
+                    "; diagnostic FP32 master residual with FP16 branch boundaries"
+                    if emulate_master_residual_f32
+                    else (
+                        "; diagnostic FP16 round-trip after every complete layer"
+                        if emulate_layer_output_f16
+                        else ""
+                    )
                 )
             ),
             "source_path": str(source_path.relative_to(repo_root)),
@@ -960,6 +1035,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llama-artifact")
     parser.add_argument("--llama-extractor-artifact")
     parser.add_argument("--emulate-layer-output-f16", action="store_true")
+    parser.add_argument("--emulate-master-residual-f32", action="store_true")
     parser.add_argument("--out")
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args()
