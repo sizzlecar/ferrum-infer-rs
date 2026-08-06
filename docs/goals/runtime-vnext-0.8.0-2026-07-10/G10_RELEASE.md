@@ -3,7 +3,10 @@
 ## 状态与依赖
 
 - 状态：Open
-- G10A 依赖：S6 的 G00P、G01-G09 development PASS，且在 release-freeze 前未 stale
+- 2026-08-06 发布依赖以
+  [`RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`](RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md)
+  为准；本文件其余三模型、资产、发布和安装后验证标准不降低。
+- G10A 依赖：fresh R0、R1、R2 development PASS，且在 release-freeze 前未 stale
 - G08-RC/G09-RC 依赖：G10A；二者必须在 G10A 的 release-candidate SHA 和 exact staged binary 上重跑
 - G10B 依赖：fresh G08-RC、G09-RC 和 staged asset gates
 - G10 aggregate 依赖：G10A、G08-RC、G09-RC、G10B 全部 PASS
@@ -16,7 +19,7 @@
 
 ## G10A：发布候选冻结
 
-1. `git pull --rebase --autostash`，确认进入 freeze 前 G00-G09 development manifest 未 stale。
+1. `git pull --rebase --autostash`，确认进入 freeze 前 R0-R2 development manifest 未 stale。
 2. workspace 全部 crate version 升到 `0.8.0`。
 3. 生成 breaking-change migration guide、release notes、support matrix 和性能报告。
 4. 改造并自测 `.github/workflows/release.yml`、`release-cuda.yml` 和 `docker.yml`：`v0.8.0`
@@ -38,7 +41,7 @@
 
 ```text
 python3 scripts/release/run_gate.py vnext-g10a \
-  --g09 <g09-development-manifest> \
+  --r0 <r0-manifest> --r1 <r1-manifest> --r2 <r2-manifest> \
   --out <external-out>
 
 FERRUM RUNTIME VNEXT G10A RELEASE FREEZE PASS: <out_dir>

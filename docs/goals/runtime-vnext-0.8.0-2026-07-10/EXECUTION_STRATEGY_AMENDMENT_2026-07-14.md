@@ -3,6 +3,10 @@
 ## 状态与效力
 
 - 状态：Accepted。
+- 2026-08-06 起，本文件继续作为 S0-S7 架构迁移历史和核心不变量来源；与 v0.8.0 发布阻塞范围、
+  完整 G00-G10 前置或重复验证时机冲突的条款，由
+  [`RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`](RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md)
+  中的 R0-R3 DAG 替代。
 - 本修订只改变开发顺序、阶段依赖、进度口径和验证时机，不降低
   [`GOAL.md`](GOAL.md)、[`MODEL_MATRIX.md`](MODEL_MATRIX.md)、G08、G09、G10 的最终
   correctness、性能、双后端、发布和真实资产标准。

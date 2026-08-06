@@ -4,6 +4,14 @@
 
 Open。创建于 2026-07-10。
 
+2026-08-06 起，v0.8.0 的发布阻塞范围和执行口径以
+[`RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`](RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md)
+为准。该修订保留三主模型 CUDA/Metal、真实 `run`/`serve`、动态资源、正确性、性能、profile、
+编译阈值和发布后安装验证硬门，但把完整历史治理、未使用 provider、全仓 support disposition、
+legacy physical zero 和平台完备性转入 v0.8.1/0.9 hardening。v0.8.0 正式进度分母改为
+`R0-R3 0/4 PASS`；下文各时期的 `G00-G10 0/11` 是原 exhaustive roadmap 的历史状态，不再作为
+release freeze 前置条件。
+
 截至 2026-08-04，clean、已推送 production source
 `04699472d17b72a5368692bacb81a4b38cdae04f` 已关闭 S2 CUDA API/modality
 checkpoint。真实 Qwen3.5-4B/RTX 4090 产品回归覆盖 C16 negative API `30/30` 和
@@ -1004,6 +1012,10 @@ artifact 和独立 source-build lane。
 
 ## 10. 子目标与依赖
 
+本节 G00-G10 表保留为能力来源和 post-release hardening backlog。v0.8.0 的 release-critical
+依赖、PASS 分母和执行顺序已由 2026-08-06 发布加速修订替换为 `R0 -> R1 -> R2 -> R3`；不得再要求
+G00-G10 十一个 exhaustive aggregate 全部 PASS 后才进入 release freeze。
+
 | ID | 文档 | 依赖 | 目标 |
 |---|---|---|---|
 | G00 | [`G00_BASELINE.md`](G00_BASELINE.md) | G00F 无前置；G00M1-M3 随模型；G00P 在 G09 前 | 事实锁、逐模型 baseline、最终完整 external/legacy/build baseline |
@@ -1016,7 +1028,7 @@ artifact 和独立 source-build lane。
 | G07 | [`G07_BUILD_NATIVE_OPS.md`](G07_BUILD_NATIVE_OPS.md) | G07A 在 S1 后并行；G07B 随 operation catalog | crate/build graph、native ops、增量编译；S4 前完成开发反馈目标 |
 | G08 | [`G08_MODEL_MIGRATION.md`](G08_MODEL_MIGRATION.md) | S1-S5 逐模型 CUDA->Metal；每模型立即删除 legacy | 三主模型逐个迁移、parity、legacy 删除和长尾处置 |
 | G09 | [`G09_PERFORMANCE.md`](G09_PERFORMANCE.md) | G00P,G06,G07,G08；S6 | 三模型双端性能恢复及竞争性外部线 |
-| G10 | [`G10_RELEASE.md`](G10_RELEASE.md) | G10A<-G00-G09 dev PASS；G10A->fresh G08-RC/G09-RC->G10B | release freeze、候选 SHA 重验、发布、安装后回归和最终 PASS |
+| G10 | [`G10_RELEASE.md`](G10_RELEASE.md) | G10A<-R0-R2；G10A->fresh staged correctness/performance->G10B | release freeze、候选 SHA 重验、发布、安装后回归和最终 PASS |
 
 ### Canonical gate 入口
 
@@ -1030,8 +1042,9 @@ python3 scripts/release/run_gate.py vnext-g00 --out <out>
 python3 scripts/release/run_gate.py vnext-g10 --out <out>
 ```
 
-`run_gate.py --list-lanes` 最终必须列出 G00F/G00M/G00P、S milestone、G00-G10、G07A/G07B、G08A-G08D、
-G10A/G08-RC/G09-RC/G10B，以及 G10 定义的三模型 source/published/prepromotion lanes。
+`run_gate.py --list-lanes` 在 v0.8.0 发布前必须列出 R0-R3、G10A/G08-RC/G09-RC/G10B，
+以及 G10 定义的三模型 source/published/prepromotion lanes。G00-G10、G07A/G07B、G08A-G08D 的
+现有 lanes 继续作为可复用 child 或 hardening 入口，但不要求所有 exhaustive aggregate 成为 R3 前置。
 stage-specific validator 可以作为内部模块存在，但有效 PASS 必须来自 `run_gate.py` 写出的统一
 `gate.manifest.json`。
 manifest 记录 command、SHA、dirty、binary/model/config hashes、child artifacts 和 PASS line。
@@ -1064,8 +1077,8 @@ G02 determinism evidence + G03 provider execution contract
   -> CUDA determinism gate
   -> per-model CUDA correctness matrix
   -> CUDA performance
-G00P + G06 + G07 + G08 -> S6/G09-dev
-  -> G10A-release-freeze
+release-critical G00/G06/G07/G08 inputs -> R2
+  -> G10A-release-freeze / R3
   -> G08-RC + G09-RC
   -> G10B-stage-publish-promote
   -> S7/G10
@@ -1141,6 +1154,9 @@ G00P。G07A 在 S1 后与 S2/S3 并行，G07B 仍消费已被真实 provider 使
 | S5 M3 双端 | G08C/G08D | Qwen3-30B-A3B CUDA->Metal，主模型 legacy/runtime 分叉清零 |
 | S6 严格证据 | G00P、G02 full、G06、G07、G08、G09 | 六 lane correctness、正式 performance、historical kill、build/profile 全部通过 |
 | S7 发布 | G10A -> G08-RC/G09-RC -> G10B -> G10 | exact staged/published/installed binary 双端复验并发布 `v0.8.0` |
+
+S0-S7 是 2026-07-14 至 2026-08-06 的历史生产纵切分解。当前发布进度和剩余关键路径必须使用
+R0-R3；S6 中未被 R0-R2 明确保留的 exhaustive evidence 转入 post-release backlog。
 
 CUDA 优先顺序：Qwen3.5-4B -> Qwen3.5-35B-A3B -> Qwen3-30B-A3B。Metal 在每个模型
 CUDA contract 稳定后开始，但不得把三个 Metal lane 全部拖到发布前一次性补做。

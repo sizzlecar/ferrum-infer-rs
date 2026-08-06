@@ -3,6 +3,10 @@
 ## 状态与依赖
 
 - 状态：Open
+- 2026-08-06 的 v0.8.0 release-blocking 范围以
+  [`RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`](RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md)
+  为准：三主模型和共享 Qwen legacy production path 仍必须从 release binary 的可达路径删除；
+  非三主模型的全仓 legacy physical zero 与完整 support disposition 转入 post-release hardening。
 - 依赖：M1 从 S1 live slice 开始；每个模型只依赖其实际需要的 G03-G07 capability；full G08 在 S6 聚合
 - 内部依赖：S1/S2 -> G08A(S3) -> G08B(S4) -> G08C/G08D(S5)；G08 只聚合四个未 stale PASS
 - 下游：G09、G10
