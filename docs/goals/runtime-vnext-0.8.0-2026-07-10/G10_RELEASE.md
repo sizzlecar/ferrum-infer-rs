@@ -5,6 +5,8 @@
 - 状态：Open
 - 2026-08-06 发布依赖以
   [`RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`](RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md)
+  和
+  [`PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md`](PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md)
   为准；本文件其余三模型、资产、发布和安装后验证标准不降低。
 - G10A 依赖：fresh R0、R1、R2 development PASS，且在 release-freeze 前未 stale
 - G08-RC/G09-RC 依赖：G10A；二者必须在 G10A 的 release-candidate SHA 和 exact staged binary 上重跑
@@ -49,8 +51,8 @@ FERRUM GATE vnext-g10a PASS: <out_dir>
 ```
 
 G10A 只证明 release candidate SHA、workflow policy 和 staged bits 已冻结，不证明正确性、性能或
-发布完成。release commit 后不得复用 G08/G09 development candidate rows；只允许继续使用固定
-`cff4...` legacy comparator、model/download cache、dataset 和 external binary bits。
+发布完成。release commit 后不得用 G08/G09 development candidate rows 代替 staged-binary rows；
+只允许复用冻结的 Ferrum floor catalog、model/download cache 和 dataset。
 
 ## Source gates
 
@@ -68,23 +70,23 @@ G10A 只证明 release candidate SHA、workflow policy 和 staged bits 已冻结
 
 ## Paid CUDA 发布合同
 
-G10 的 G08-RC/G09-RC、staged binary gate 和 published-asset CUDA 验证分别是独立 paid lane。
+G10 的 G08-RC/G09-RC 和 staged binary gate 是 paid lane；published asset 与 staged asset bytes
+完全相同时，发布后只执行安装与 correctness smoke，不再开启第三条完整性能 paid lane。
 每条 lane 开始前
 都必须重新 inventory 并记录 instance、小时价、预计 runtime/cost、commands 和 stop
 condition；不能引用 G00/G09 的旧成本声明。
 
 - 优先复用 G09 retained stopped 4090 和模型/build cache，同时最多 1 个 billable instance。
-- G08-RC/G09-RC 合并的三模型 full lane 与 published full lane 各最长 `5h`；staged binary gate
-  最长 `1h`；三者总计上限
-  `12 GPU-hours`。
+- G08-RC/G09-RC 合并的三模型 full lane 最长 `5h`；staged binary gate 最长 `1h`；总计上限
+  `6 GPU-hours`。
 - 任一 correctness failure 立即终止当前及后续性能/发布动作。
-- G08-RC/G09-RC 与 published tarball 必须各自实际执行完整 correctness，并为每个 required
-  `comparison_id` 重新执行 same-host `ABBA-BAAB`；不能只复用 external/legacy 的 A rows。
+- G08-RC/G09-RC 必须用 staged binary 实际执行完整 correctness 和性能收敛修订定义的
+  Ferrum-only 矩阵；不执行 external/legacy ABBA。
 - staged tarball 先过 binary/dependency/version gate；随后 G08-RC/G09-RC 直接执行 tarball 内 binary。
   G10B 只允许发布同一 tarball SHA 和 binary SHA。任一 SHA 不同即废弃 G08-RC/G09-RC 并重新
   冻结/全量执行，不能引用部分 rows 或把另一个 source-built binary 当作等价物。
-- G08-RC/G09-RC 与 published 之间不得复用 measured comparison；只可复用模型/download cache、dataset
-  和相同 external binary bits，external server 仍须在各自 outer slots 重新运行。
+- published tarball/binary SHA 与 staged 完全相同时复用 staged 性能证据；发布后重新验证安装、
+  version/dependency 和三主模型 `run`/`serve` correctness smoke。任何 byte 不同都使性能证据 stale。
 - 超过上限需要用户明确批准；不允许因为 release 已开始而自动续费。
 - 每条 lane结束 copy back artifacts并确认实例 `actual_status=exited`。
 
@@ -97,15 +99,14 @@ M1/M2/M3 x Metal/CUDA 必须重新执行：
 - tools required/auto/stream delta/tool result；
 - strict schema/json object；
 - concurrency isolation；
-- G09 正式性能 workload；
-- candidate 与 G00 baseline、vLLM/llama.cpp ratio。
+- 性能收敛修订定义的 Ferrum-only 正式 workload；
+- candidate 与冻结 Ferrum floor catalog 的绝对可用、自身非回退、稳定性和并发门。
 
 六个 lane PASS `6/6`，waiver/skipped/stale `0`。
 
 G08-RC/G09-RC 的 `source_git_sha` 必须等于 G10A `release_candidate_sha`，dirty=false；两者
-Metal/CUDA candidate binary SHA 必须分别相等，并等于 G10A staged tarball 内 binary。G09-RC
-可以重新启动固定 G00 legacy comparator，但 G00 的 `source_git_sha=cff4...` 不参与 candidate SHA
-相等检查。任何 candidate binary/source/config hash 不同都必须使两项 RC artifact stale。
+Metal/CUDA candidate binary SHA 必须分别相等，并等于 G10A staged tarball 内 binary。任何 candidate
+binary/source/config hash 不同都必须使两项 RC artifact stale。
 
 必须新增并注册 canonical lanes：
 

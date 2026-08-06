@@ -6,7 +6,10 @@
 - 本修订响应“缩短 v0.8.0 发布周期”的目标调整，优先于 [`GOAL.md`](GOAL.md)、
   [`EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`](EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md)
   和 G00-G10 中与发布阻塞依赖、阶段重复验证、全仓治理完成时机冲突的条款。
-- 本修订不降低真实产品正确性、性能、动态资源、profile、编译效率、CUDA/Metal 或发布后安装验证标准。
+- 性能范围随后由
+  [`PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md`](PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md)
+  进一步收敛；该文件优先于本修订中的 external comparator、ABBA 和 ratio 条款。
+- 本修订不降低真实产品正确性、动态资源、profile、编译效率、CUDA/Metal 或发布后安装验证标准。
 - G00-G10 的未完成项目不删除。未列为本修订 v0.8.0 硬门的项目转入 v0.8.1/0.9 hardening backlog，
   不能被误报为已经完成。
 - v0.8.0 的正式进度分母从 `G00-G10 0/11` 改为下文 `R0-R3 0/4`。旧 `0/11` 只保留为原始
@@ -42,8 +45,9 @@
    tool required/auto/streamed/tool-result、`json_object`、strict `json_schema`、cancel/disconnect 和并发隔离。
 5. 动态资源必须在 kernel submit 前完成 admission；暂时不足使用 typed defer/wait/resume，active decode
    和后续 eligible request 继续推进。OOM、panic、livelock、泄漏、提前 fence 回收和全局 HOL 均为 `0`。
-6. CUDA 正式性能保留 c1/c4/c16/c32、三次 repeat、同硬件 legacy/vLLM 比较和既有 G09 ratio/CI 门；
-   Metal 保留 MODEL_MATRIX 要求的正式 cells 和同硬件 llama.cpp/legacy 比较。
+6. CUDA 正式性能保留 c1/c4/c16/c32 和三次 repeat；Metal 保留 c1/c4/c16 和三次 repeat。
+   两端按性能收敛修订执行绝对可用线、Ferrum 自身非回退、并发、稳定性和内存门；外部比较不阻塞
+   v0.8.0。
 7. profile-off 是产品性能真值；公开 typed profile 开关关闭时不改变执行路径。basic/replay/full 必须能把
    请求关联到 plan/node/op/resource/provider/kernel，不能再靠反复排除法定位主瓶颈。
 8. G07 的关键编译阈值继续生效：no-op `<=30s`，Rust/runtime leaf `<=90s`，core PTX `<=120s`，
@@ -114,10 +118,13 @@ R2 只允许在 R1 correctness 通过后形成正式性能结论。
 
 必须满足：
 
-- 三主模型 CUDA/Metal 按 G09 正式 workload、同硬件和固定 model/config/dataset/binary 执行。
+- 三主模型 CUDA/Metal 按性能收敛修订的 Ferrum-only workload、同硬件和固定
+  model/config/dataset/binary 执行。
 - CUDA c1/c4/c16/c32 和 Metal required cells 的 completed request、usage-token source、CI、active timeline、
   TTFT/TPOT/throughput/ITL eligibility 字段完整率为 `100%`。
-- 原 G09 的 legacy no-regression 与 vLLM/llama.cpp 竞争阈值保持不变；低于阈值只能形成 REJECT。
+- 每 cell throughput median `>=0.95x` 冻结自身基线、model/backend 几何平均 `>=1.00`，
+  TTFT/TPOT p95 `<=1.10x` 自身基线，三次 repeat CV `<=8%`；缺历史基线的 cell 还必须达到
+  性能收敛修订中的模型/backend 绝对可用线。
 - 性能优化只能由现有 profile/replay artifact 指向的单一 stage/provider/op 假设启动。每个候选先跑 focused
   correctness，再跑 bounded A/B；两次相同 failure class 后停止 GPU sweep，回到源码分析。
 - profile-off 产品性能不因诊断功能存在而回退。basic profile overhead 以用户已接受的 `<=7%` 为
