@@ -48,6 +48,12 @@ MODEL_REVISION_RE = re.compile(
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+DEPENDENCY_CLOSURE_FILES = frozenset(
+    {
+        "scripts/release/runtime_vnext_r0_core_closure.py",
+        "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -356,6 +362,54 @@ def source_for_sha(git_sha: str) -> dict[str, Any]:
         "git_tree_sha": tree,
         "dirty": False,
         "status_short": [],
+    }
+
+
+def dependency_control_plane_only(paths: list[str]) -> tuple[list[str], list[str]]:
+    allowed = [path for path in paths if path in DEPENDENCY_CLOSURE_FILES]
+    rejected = [path for path in paths if path not in DEPENDENCY_CLOSURE_FILES]
+    return allowed, rejected
+
+
+def dependency_source_closure(
+    dependency_source: dict[str, Any], current_source: dict[str, Any]
+) -> dict[str, Any]:
+    recorded = source_for_sha(
+        require_string(dependency_source.get("git_sha"), "S2 dependency git SHA")
+    )
+    require(recorded == dependency_source, "S2 dependency source differs from git")
+    current = source_for_sha(
+        require_string(current_source.get("git_sha"), "S2 current git SHA")
+    )
+    require(current == current_source, "S2 current source differs from git")
+    git(
+        "merge-base",
+        "--is-ancestor",
+        recorded["git_sha"],
+        current["git_sha"],
+    )
+    changed = [
+        line
+        for line in git(
+            "diff",
+            "--name-only",
+            "--diff-filter=ACDMRTUXB",
+            f"{recorded['git_sha']}..{current['git_sha']}",
+        ).splitlines()
+        if line
+    ]
+    allowed, rejected = dependency_control_plane_only(changed)
+    require(
+        not rejected,
+        "S2 evidence is stale after product, scenario, or validator changes: "
+        f"{rejected[:8]}",
+    )
+    return {
+        "from_git_sha": recorded["git_sha"],
+        "to_git_sha": current["git_sha"],
+        "changed_files": allowed,
+        "changed_file_count": len(allowed),
+        "policy": "s2-aggregate-control-plane-only",
     }
 
 
@@ -690,6 +744,33 @@ def require_evidence_match(
     require(recorded == normalized, f"{key} child evidence differs from raw revalidation")
 
 
+def test_evidence_passed(value: Any, label: str) -> int:
+    evidence = require_object(value, f"{label} test evidence")
+    summary = require_object(evidence.get("summary"), f"{label} test summary")
+    passed = summary.get("passed")
+    require(type(passed) is int and passed >= 0, f"{label} passed count is invalid")
+    return passed
+
+
+def validate_g02_at_source(
+    child_path: Path, source: dict[str, Any]
+) -> dict[str, Any]:
+    original_git = g02.git
+
+    def source_git(*args: str) -> str:
+        if args == ("rev-parse", "HEAD"):
+            return require_string(source.get("git_sha"), "G02 source git SHA")
+        if args == ("rev-parse", "HEAD^{tree}"):
+            return require_string(source.get("git_tree_sha"), "G02 source git tree")
+        return original_git(*args)
+
+    g02.git = source_git
+    try:
+        return g02.validate_artifact(child_path.parent)
+    finally:
+        g02.git = original_git
+
+
 def validate_s1(
     key: str,
     child: dict[str, Any],
@@ -899,10 +980,14 @@ def deep_validate(
     outer_path: Path,
     outer: dict[str, Any],
     source: dict[str, Any],
+    *,
+    verify_checkout: bool,
 ) -> tuple[dict[str, Any], Path | None]:
     spec = INPUT_SPECS[key]
     if spec.validator == "g01":
-        summary = g01.verify_checkpoint_manifest(child_path, verify_checkout=True)
+        summary = g01.verify_checkpoint_manifest(
+            child_path, verify_checkout=verify_checkout
+        )
         require(summary.get("source") == source, "G01 deep source binding mismatch")
         validator_path = Path(g01.__file__).resolve()
         return {
@@ -912,7 +997,7 @@ def deep_validate(
             }
         }, None
     if spec.validator == "g02_core":
-        observed = g02.validate_artifact(child_path.parent)
+        observed = validate_g02_at_source(child_path, source)
         require(observed.get("source") == source, "G02 core source binding mismatch")
         validator_path = Path(g02.__file__).resolve()
         return {
@@ -921,7 +1006,9 @@ def deep_validate(
                 "sha256": sha256(validator_path),
             },
             "l0_test_count": observed["l0"]["test_count"],
-            "l1_test_count": observed["l1"]["test_evidence"]["passed"],
+            "l1_test_count": test_evidence_passed(
+                observed["l1"].get("test_evidence"), "G02 L1"
+            ),
         }, None
     if spec.validator == "historical_resource_source":
         return validate_historical_output(child_path, child, source), None
@@ -1044,7 +1131,15 @@ def load_input(path: Path, key: str, *, verify_checkout: bool) -> dict[str, Any]
     source = validate_outer_child_pair(key, outer, child, child_digest)
     if verify_checkout:
         require(source == clean_source(), f"{key} is stale against current checkout")
-    binding, raw = deep_validate(key, child, child_path, outer_path, outer, source)
+    binding, raw = deep_validate(
+        key,
+        child,
+        child_path,
+        outer_path,
+        outer,
+        source,
+        verify_checkout=verify_checkout,
+    )
     return {
         "outer_path": outer_path,
         "outer": outer,
@@ -1232,6 +1327,8 @@ def verify_checkpoint_manifest(
             "artifact_dir",
             "output_root",
             "source",
+            "dependency_source",
+            "source_closure",
             "children",
             "bindings",
             "acceptance",
@@ -1260,12 +1357,24 @@ def verify_checkpoint_manifest(
     source = require_object(manifest.get("source"), "S2 source")
     if verify_checkout:
         require(source == clean_source(), "S2 aggregate source is stale")
+    dependency_source = require_object(
+        manifest.get("dependency_source"), "S2 dependency source"
+    )
+    closure = dependency_source_closure(dependency_source, source)
+    require(
+        manifest.get("source_closure") == closure,
+        "S2 dependency source closure mismatch",
+    )
     children = require_object(manifest.get("children"), "S2 children")
     require(set(children) == set(INPUT_SPECS), "S2 child matrix mismatch")
     reconstructed_inputs: dict[str, dict[str, Any]] = {}
     for key, spec in INPUT_SPECS.items():
         ref = require_object(children.get(key), f"S2 child {key}")
-        require(ref.get("lane") == spec.lane and ref.get("source") == source, f"S2 child {key} identity mismatch")
+        require(
+            ref.get("lane") == spec.lane
+            and ref.get("source") == dependency_source,
+            f"S2 child {key} identity mismatch",
+        )
         outer_ref = require_object(ref.get("outer_manifest"), f"S2 child {key} outer")
         child_ref = require_object(ref.get("child_manifest"), f"S2 child {key} child")
         outer_path = safe_relative_path(root, outer_ref["path"], f"S2 child {key} outer")
@@ -1275,9 +1384,15 @@ def verify_checkpoint_manifest(
         outer = read_json(outer_path, f"S2 copied {key} outer")
         child = read_json(child_path, f"S2 copied {key} child")
         observed_source = validate_outer_child_pair(key, outer, child, child_ref["sha256"])
-        require(observed_source == source, f"S2 copied {key} source mismatch")
-        reconstructed_inputs[key] = {"source": source, "binding": ref.get("deep_validation")}
-    bindings = cross_bindings(reconstructed_inputs, source)
+        require(
+            observed_source == dependency_source,
+            f"S2 copied {key} source mismatch",
+        )
+        reconstructed_inputs[key] = {
+            "source": dependency_source,
+            "binding": ref.get("deep_validation"),
+        }
+    bindings = cross_bindings(reconstructed_inputs, dependency_source)
     require(manifest.get("bindings") == bindings, "S2 aggregate cross-binding mismatch")
     require(manifest.get("acceptance") == ACCEPTANCE, "S2 acceptance mismatch")
     require(manifest.get("unlocks") == ["S3"], "S2 unlock set mismatch")
@@ -1294,6 +1409,8 @@ def verify_checkpoint_manifest(
             "artifact_count": len(rows),
         },
         "source": source,
+        "dependency_source": dependency_source,
+        "source_closure": closure,
         "bindings": bindings,
     }
 
@@ -1310,10 +1427,12 @@ def build_checkpoint(input_paths: dict[str, Path], out: Path) -> str:
     started = time.monotonic()
     try:
         inputs = {
-            key: load_input(input_paths[key], key, verify_checkout=True)
+            key: load_input(input_paths[key], key, verify_checkout=False)
             for key in INPUT_SPECS
         }
-        bindings = cross_bindings(inputs, source)
+        dependency_source = inputs["g01"]["source"]
+        closure = dependency_source_closure(dependency_source, source)
+        bindings = cross_bindings(inputs, dependency_source)
         children = {key: input_reference(inputs[key], root, key) for key in INPUT_SPECS}
         rows = artifact_index(root)
         pass_line = f"{PASS_PREFIX}: {output}"
@@ -1327,6 +1446,8 @@ def build_checkpoint(input_paths: dict[str, Path], out: Path) -> str:
             "artifact_dir": str(root),
             "output_root": str(output),
             "source": source,
+            "dependency_source": dependency_source,
+            "source_closure": closure,
             "children": children,
             "bindings": bindings,
             "acceptance": ACCEPTANCE,
@@ -1378,6 +1499,28 @@ def self_test() -> int:
         "dirty": False,
         "status_short": [],
     }
+    allowed, rejected = dependency_control_plane_only(
+        [
+            "scripts/release/runtime_vnext_r0_core_closure.py",
+            "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
+        ]
+    )
+    require(len(allowed) == 2 and not rejected, "S2 dependency closure rejected control-plane files")
+    _, rejected = dependency_control_plane_only(
+        [
+            "crates/ferrum-engine/src/lib.rs",
+            "scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json",
+        ]
+    )
+    require(len(rejected) == 2, "S2 dependency closure accepted product or scenario changes")
+    require(
+        test_evidence_passed({"summary": {"passed": 1}}, "fixture") == 1,
+        "nested test evidence count drifted",
+    )
+    expect_reject(
+        lambda: test_evidence_passed({"passed": 1}, "fixture"),
+        "summary",
+    )
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-s2-contract-") as temporary:
         root = Path(temporary)
         duplicate = root / "duplicate.json"
