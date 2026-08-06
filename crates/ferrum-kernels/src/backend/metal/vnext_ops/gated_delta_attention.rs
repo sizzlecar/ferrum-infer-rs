@@ -5,17 +5,19 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
-    DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint, DynamicStorageRequirement,
-    ElementType, EncodedDeviceOperation, GatedDeltaDecayParameterization,
-    GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm, GatedDeltaExecutionPreference,
-    GatedDeltaValueHeadMapping, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
-    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError,
+    gated_delta_recurrent_attention_contract, gated_delta_recurrent_attention_f32_master_contract,
+    AttributeId, BatchedOperationInvocation, DeviceBatchingForm,
+    DeviceReusableExecutionTopologyFingerprint, DynamicStorageRequirement, ElementType,
+    EncodedDeviceOperation, GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities,
+    GatedDeltaExecutionForm, GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping,
+    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 use metal::{
@@ -30,13 +32,16 @@ use super::super::vnext_runtime::{
 };
 use super::linear::{
     append_shared_matrix_weight, append_shared_partitioned_matrix_weight, dispatch_linear,
-    linear_launch, validate_launch_regions, LinearLaunch, MetalLinearPipelines,
+    linear_launch, validate_launch_regions_with_raw_workspace, LinearLaunch, MetalLinearPipelines,
 };
-use super::primitives::{dispatch_residual_add_at, dispatch_rms_norm_at, MetalPrimitivePipelines};
+use super::primitives::{
+    dispatch_residual_add_at, dispatch_residual_add_f32_f16_at, dispatch_rms_norm_at,
+    dispatch_rms_norm_f32_to_f16_at, MetalPrimitivePipelines,
+};
 use super::{
     authorize_reusable_topology, binding, checked_u32, contiguous_bindings, contiguous_region,
-    contiguous_token_region, ensure_invocation, f16_contiguous, implementation_fingerprint,
-    invalid_plan, provider_descriptor, provider_failure, rational_attribute, shared_full_region,
+    contiguous_token_region, ensure_invocation, implementation_fingerprint, invalid_plan,
+    provider_descriptor, provider_failure, rational_attribute, shared_full_region,
     shared_scratch_region, shared_token_region, token_binding_is_packed, unsigned_attribute,
     DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID, Q4_K_FORMAT_ID, Q5_K_FORMAT_ID,
     Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
@@ -45,6 +50,10 @@ use super::{
 const SHADER_SOURCE: &str = include_str!("gated_delta_attention.metal");
 const PROVIDER_ID: &str = "provider.metal.gated_delta_recurrent_attention.f16.native";
 const ESTIMATOR_ID: &str = "resource-estimator.metal.gated_delta_recurrent_attention.f16.native";
+const F32_MASTER_PROVIDER_ID: &str =
+    "provider.metal.gated_delta_recurrent_attention.f32-master.native";
+const F32_MASTER_ESTIMATOR_ID: &str =
+    "resource-estimator.metal.gated_delta_recurrent_attention.f32-master.native";
 const PREPARE_CONV_KERNEL: &str = "vnext_gated_delta_prepare_conv_f16";
 const PREPARE_GATES_KERNEL: &str = "vnext_gated_delta_prepare_gates_f16";
 const COLLECT_CONV_STATE_KERNEL: &str = "vnext_gated_delta_collect_conv_state_f16";
@@ -206,6 +215,9 @@ impl MetalGatedDeltaPipelines {
 
 pub(super) struct MetalGatedDeltaRecurrentAttentionProvider {
     descriptor: OperationProviderDescriptor,
+    operation_id: &'static str,
+    hidden_type: ElementType,
+    failure_stage: &'static str,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     execution_cost_model: MetalGatedDeltaExecutionCostModel,
     attention: Arc<MetalGatedDeltaPipelines>,
@@ -220,7 +232,50 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
         linear: Arc<MetalLinearPipelines>,
         primitives: Arc<MetalPrimitivePipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        let contract = gated_delta_recurrent_attention_contract().map_err(super::contract_error)?;
+        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F16)
+    }
+
+    pub(super) fn new_f32_master(
+        runtime: &MetalDeviceRuntime,
+        attention: Arc<MetalGatedDeltaPipelines>,
+        linear: Arc<MetalLinearPipelines>,
+        primitives: Arc<MetalPrimitivePipelines>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)
+    }
+
+    fn new_with_hidden_type(
+        runtime: &MetalDeviceRuntime,
+        attention: Arc<MetalGatedDeltaPipelines>,
+        linear: Arc<MetalLinearPipelines>,
+        primitives: Arc<MetalPrimitivePipelines>,
+        hidden_type: ElementType,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        let (contract, operation_id, provider_id, capability_id, estimator_id, failure_stage) =
+            match hidden_type {
+                ElementType::F16 => (
+                    gated_delta_recurrent_attention_contract().map_err(super::contract_error)?,
+                    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+                    PROVIDER_ID,
+                    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+                    ESTIMATOR_ID,
+                    "metal.gated_delta_recurrent_attention.encode",
+                ),
+                ElementType::F32 => (
+                    gated_delta_recurrent_attention_f32_master_contract()
+                        .map_err(super::contract_error)?,
+                    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+                    F32_MASTER_PROVIDER_ID,
+                    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+                    F32_MASTER_ESTIMATOR_ID,
+                    "metal.gated_delta_recurrent_attention.f32_master.encode",
+                ),
+                _ => {
+                    return Err(MetalDeviceRuntimeError::contract(
+                        "Metal gated-delta hidden ABI supports only F16 or F32",
+                    ))
+                }
+            };
         let execution_capabilities =
             GatedDeltaExecutionCapabilities::with_chunked_scan(GATED_DELTA_CHUNK_SIZE)
                 .map_err(super::contract_error)?;
@@ -228,9 +283,9 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
         let descriptor = provider_descriptor(
             runtime,
             &contract,
-            PROVIDER_ID,
-            GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-            ESTIMATOR_ID,
+            provider_id,
+            capability_id,
+            estimator_id,
             contiguous_bindings(10),
             &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
             &[
@@ -247,11 +302,14 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
                 GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION.as_bytes(),
-                PROVIDER_ID.as_bytes(),
+                provider_id.as_bytes(),
             ]),
         )?;
         Ok(Self {
             descriptor,
+            operation_id,
+            hidden_type,
+            failure_stage,
             execution_capabilities,
             execution_cost_model,
             attention,
@@ -270,7 +328,7 @@ impl OperationResourceEstimator for MetalGatedDeltaRecurrentAttentionProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        if request.operation().id.as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID
+        if request.operation().id.as_str() != self.operation_id
             || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
         {
             return Err(invalid_plan(format!(
@@ -320,6 +378,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttention
             }
             reusable_attention_topology(
                 &request,
+                self.operation_id,
                 self.execution_capabilities,
                 self.execution_cost_model,
             )
@@ -337,27 +396,24 @@ impl OperationProvider<MetalDeviceRuntime> for MetalGatedDeltaRecurrentAttention
             Arc::clone(&self.attention),
             Arc::clone(&self.linear),
             Arc::clone(&self.primitives),
+            self.operation_id,
+            self.hidden_type,
             self.execution_capabilities,
             self.execution_cost_model,
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
-        .map_err(|message| {
-            provider_failure(
-                identity,
-                "metal.gated_delta_recurrent_attention.encode",
-                message,
-            )
-        })
+        .map_err(|message| provider_failure(identity, self.failure_stage, message))
     }
 }
 
 fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
+    operation_id: &str,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     execution_cost_model: MetalGatedDeltaExecutionCostModel,
 ) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
-    if request.operation_id().as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID {
+    if request.operation_id().as_str() != operation_id {
         return Err("Metal gated-delta topology received another operation".to_owned());
     }
     let shape = AttentionShape::from_attributes(request.attributes())?;
@@ -846,19 +902,21 @@ fn encode_attention(
     attention: Arc<MetalGatedDeltaPipelines>,
     linear: Arc<MetalLinearPipelines>,
     primitives: Arc<MetalPrimitivePipelines>,
+    operation_id: &'static str,
+    hidden_type: ElementType,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     execution_cost_model: MetalGatedDeltaExecutionCostModel,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
-    ensure_invocation(&invocation, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)?;
+    ensure_invocation(&invocation, operation_id)?;
     let first = &invocation.participants()[0];
     let shape = AttentionShape::from_attributes(first.attributes())?;
-    validate_signature(first, shape)?;
+    validate_signature(first, shape, hidden_type)?;
     for participant in &invocation.participants()[1..] {
         if AttentionShape::from_attributes(participant.attributes())? != shape {
             return Err("Metal gated-delta participant attributes disagree".to_owned());
         }
-        validate_signature(participant, shape)?;
+        validate_signature(participant, shape, hidden_type)?;
     }
     let total_tokens = invocation.work_shape().immediate_tokens();
     let layout = ScratchLayout::new(shape, total_tokens)?;
@@ -928,7 +986,7 @@ fn encode_attention(
         regions.push(contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-            ElementType::F16,
+            hidden_type,
             input_start,
             tokens,
         )?);
@@ -936,7 +994,7 @@ fn encode_attention(
         regions.push(contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-            ElementType::F16,
+            hidden_type,
             output_start,
             tokens,
         )?);
@@ -1054,7 +1112,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Input,
             0,
-            ElementType::F16,
+            hidden_type,
             total_tokens,
         )?);
         let output = regions.len();
@@ -1062,7 +1120,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            hidden_type,
             total_tokens,
         )?);
         let packed = PackedLaunch {
@@ -1101,13 +1159,21 @@ fn encode_attention(
         };
         let mut projection_launches = packed.input_projections.clone();
         projection_launches.push(packed.output_projection);
-        validate_launch_regions(&regions, &projection_launches)?;
+        validate_launch_regions_with_raw_workspace(
+            &regions,
+            &projection_launches,
+            &[shared.scratch],
+        )?;
         Some(packed)
     } else {
         for launch in &launches {
             let mut projection_launches = launch.input_projections.clone();
             projection_launches.push(launch.output_projection);
-            validate_launch_regions(&regions, &projection_launches)?;
+            validate_launch_regions_with_raw_workspace(
+                &regions,
+                &projection_launches,
+                &[shared.scratch],
+            )?;
         }
         None
     };
@@ -1143,12 +1209,15 @@ fn encode_attention(
             )
         })
         .count();
-    let operation_label = if chunked_count == launches.len() {
-        "vnext_gated_delta_chunked_attention"
-    } else if chunked_count == 0 {
-        "vnext_gated_delta_recurrent_attention"
-    } else {
-        "vnext_gated_delta_mixed_attention"
+    let operation_label = match (hidden_type, chunked_count, launches.len()) {
+        (ElementType::F32, count, total) if count == total => {
+            "vnext_gated_delta_chunked_attention_f32_master"
+        }
+        (ElementType::F32, 0, _) => "vnext_gated_delta_recurrent_attention_f32_master",
+        (ElementType::F32, _, _) => "vnext_gated_delta_mixed_attention_f32_master",
+        (_, count, total) if count == total => "vnext_gated_delta_chunked_attention",
+        (_, 0, _) => "vnext_gated_delta_recurrent_attention",
+        _ => "vnext_gated_delta_mixed_attention",
     };
     MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
         encoder.record_compute_dispatches(dispatch_count);
@@ -1157,6 +1226,7 @@ fn encode_attention(
                 &attention,
                 &linear,
                 &primitives,
+                hidden_type,
                 encoder,
                 regions,
                 shared,
@@ -1170,6 +1240,7 @@ fn encode_attention(
                     &attention,
                     &linear,
                     &primitives,
+                    hidden_type,
                     encoder,
                     regions,
                     shared,
@@ -1203,10 +1274,94 @@ const fn delta_dispatch_count(form: GatedDeltaExecutionForm) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn dispatch_input_rms_norm(
+    primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
+    encoder: &ComputeCommandEncoderRef,
+    input: &MetalBufferRegion,
+    input_offset_bytes: u64,
+    weight: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    rows: u32,
+    hidden_size: u32,
+    epsilon: f32,
+) {
+    match hidden_type {
+        ElementType::F16 => dispatch_rms_norm_at(
+            primitives,
+            encoder,
+            input,
+            input_offset_bytes,
+            weight,
+            output,
+            output_offset_bytes,
+            rows,
+            hidden_size,
+            epsilon,
+        ),
+        ElementType::F32 => dispatch_rms_norm_f32_to_f16_at(
+            primitives,
+            encoder,
+            input,
+            input_offset_bytes,
+            weight,
+            output,
+            output_offset_bytes,
+            rows,
+            hidden_size,
+            epsilon,
+        ),
+        _ => unreachable!("validated Metal gated-delta hidden ABI"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_hidden_residual(
+    primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
+    encoder: &ComputeCommandEncoderRef,
+    left: &MetalBufferRegion,
+    left_offset_bytes: u64,
+    right: &MetalBufferRegion,
+    right_offset_bytes: u64,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    elements: u32,
+) {
+    match hidden_type {
+        ElementType::F16 => dispatch_residual_add_at(
+            primitives,
+            encoder,
+            left,
+            left_offset_bytes,
+            right,
+            right_offset_bytes,
+            output,
+            output_offset_bytes,
+            elements,
+        ),
+        ElementType::F32 => dispatch_residual_add_f32_f16_at(
+            primitives,
+            encoder,
+            left,
+            left_offset_bytes,
+            right,
+            right_offset_bytes,
+            output,
+            output_offset_bytes,
+            elements,
+        ),
+        _ => unreachable!("validated Metal gated-delta hidden ABI"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn enqueue_attention(
     attention: &MetalGatedDeltaPipelines,
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
     encoder: &mut MetalSubmissionEncoder,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
@@ -1214,8 +1369,9 @@ fn enqueue_attention(
     launch: &ParticipantLaunch,
 ) {
     let scratch = &regions[shared.scratch];
-    dispatch_rms_norm_at(
+    dispatch_input_rms_norm(
         primitives,
+        hidden_type,
         compute_subwork(encoder, "gated_delta.input_norm"),
         &regions[launch.input],
         0,
@@ -1276,8 +1432,9 @@ fn enqueue_attention(
         regions,
         launch.output_projection,
     );
-    dispatch_residual_add_at(
+    dispatch_hidden_residual(
         primitives,
+        hidden_type,
         compute_subwork(encoder, "gated_delta.residual_add"),
         &regions[launch.input],
         0,
@@ -1294,6 +1451,7 @@ fn enqueue_packed_attention(
     attention: &MetalGatedDeltaPipelines,
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
     encoder: &mut MetalSubmissionEncoder,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
@@ -1302,8 +1460,9 @@ fn enqueue_packed_attention(
     participants: &[ParticipantLaunch],
 ) {
     let scratch = &regions[shared.scratch];
-    dispatch_rms_norm_at(
+    dispatch_input_rms_norm(
         primitives,
+        hidden_type,
         compute_subwork(encoder, "gated_delta.input_norm"),
         &regions[packed.input],
         0,
@@ -1373,8 +1532,9 @@ fn enqueue_packed_attention(
         regions,
         packed.output_projection,
     );
-    dispatch_residual_add_at(
+    dispatch_hidden_residual(
         primitives,
+        hidden_type,
         compute_subwork(encoder, "gated_delta.residual_add"),
         &regions[packed.input],
         0,
@@ -1805,6 +1965,7 @@ fn push_shared_region(
 fn validate_signature(
     participant: &OperationInvocation<'_, MetalDeviceBuffer>,
     shape: AttentionShape,
+    hidden_type: ElementType,
 ) -> Result<(), String> {
     let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
@@ -1846,8 +2007,8 @@ fn validate_signature(
     if *tokens == 0
         || *hidden_width != shape.hidden_size
         || output.tensor().dimensions() != [*tokens, shape.hidden_size]
-        || !f16_contiguous(hidden)
-        || !f16_contiguous(output)
+        || !contiguous(hidden, hidden_type)
+        || !contiguous(output, hidden_type)
         || expected.iter().any(|(binding, dimensions, element_type)| {
             binding.tensor().dimensions() != dimensions.as_slice()
                 || !contiguous(binding, *element_type)

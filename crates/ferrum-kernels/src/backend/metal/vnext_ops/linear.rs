@@ -6,14 +6,16 @@ use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, last_token_dense_linear_contract,
-    BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
-    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
-    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole,
+    last_token_dense_linear_f32_contract, BatchedOperationInvocation, DeviceBatchingForm,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueRole,
     ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
     DENSE_SWIGLU_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+    LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
     LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
@@ -44,6 +46,9 @@ const DENSE_SWIGLU_PROVIDER_ID: &str = "provider.metal.dense_swiglu.f16.native";
 const DENSE_SWIGLU_ESTIMATOR_ID: &str = "resource-estimator.metal.dense_swiglu.f16.native";
 const LAST_TOKEN_PROVIDER_ID: &str = "provider.metal.last_token_dense_linear.f16.native";
 const LAST_TOKEN_ESTIMATOR_ID: &str = "resource-estimator.metal.last_token_dense_linear.f16.native";
+const LAST_TOKEN_F32_PROVIDER_ID: &str = "provider.metal.last_token_dense_linear.f32.native";
+const LAST_TOKEN_F32_ESTIMATOR_ID: &str =
+    "resource-estimator.metal.last_token_dense_linear.f32.native";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 const QUANTIZED_TILED_GEMM_MIN_ROWS: u32 = 8;
 const METAL_BLIT_ALIGNMENT_BYTES: u64 = 4;
@@ -51,15 +56,28 @@ const LAST_TOKEN_SCRATCH_PADDING_BYTES: u64 = VALUE_ALIGNMENT_BYTES - 1;
 
 const LINEAR_DENSE_KERNEL: &str = "vnext_linear_dense_f16";
 const LINEAR_Q8_0_KERNEL: &str = "vnext_linear_q8_0_f16";
+const LINEAR_DENSE_F32_KERNEL: &str = "vnext_linear_dense_f32";
+const LINEAR_Q8_0_F32_KERNEL: &str = "vnext_linear_q8_0_f32";
 const SWIGLU_KERNEL: &str = "vnext_swiglu_f16";
+const ALL_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[
+    Q4_K_FORMAT_ID,
+    Q5_K_FORMAT_ID,
+    Q6_K_FORMAT_ID,
+    Q8_0_FORMAT_ID,
+];
+const F32_LINEAR_QUANTIZATION_FORMATS: &[&str] = &[Q4_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID];
 
 pub(super) struct MetalLinearPipelines {
     dense: ComputePipelineState,
+    dense_f32: ComputePipelineState,
     q4_k_gemv: ComputePipelineState,
+    q4_k_gemv_f32: ComputePipelineState,
     q5_k_gemv: ComputePipelineState,
     q6_k_gemv: ComputePipelineState,
+    q6_k_gemv_f32: ComputePipelineState,
     k_quant_gemm: MetalKQuantGemmPipelines,
     q8_0: ComputePipelineState,
+    q8_0_f32: ComputePipelineState,
     swiglu: ComputePipelineState,
 }
 
@@ -94,15 +112,21 @@ impl MetalLinearPipelines {
         };
         Ok(Self {
             dense: pipeline(LINEAR_DENSE_KERNEL)?,
+            dense_f32: pipeline(LINEAR_DENSE_F32_KERNEL)?,
             q4_k_gemv: crate::backend::metal::q4_k_gemv_v2::new_f16_batched_pipeline(device)
+                .map_err(MetalDeviceRuntimeError::contract)?,
+            q4_k_gemv_f32: crate::backend::metal::q4_k_gemv_v2::new_f32_batched_pipeline(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
             q5_k_gemv: crate::backend::metal::q5_k_gemv::new_f16_batched_pipeline(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
             q6_k_gemv: crate::backend::metal::q6_k_gemv::new_f16_batched_pipeline(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
+            q6_k_gemv_f32: crate::backend::metal::q6_k_gemv::new_f32_batched_pipeline(device)
+                .map_err(MetalDeviceRuntimeError::contract)?,
             k_quant_gemm: MetalKQuantGemmPipelines::new(device)
                 .map_err(MetalDeviceRuntimeError::contract)?,
             q8_0: pipeline(LINEAR_Q8_0_KERNEL)?,
+            q8_0_f32: pipeline(LINEAR_Q8_0_F32_KERNEL)?,
             swiglu: pipeline(SWIGLU_KERNEL)?,
         })
     }
@@ -143,6 +167,16 @@ impl MetalLinearPipelines {
             }
         }
     }
+
+    fn f32_linear_pipeline(&self, format: LinearPhysicalFormat) -> Option<&ComputePipelineState> {
+        match format {
+            LinearPhysicalFormat::DenseF16 => Some(&self.dense_f32),
+            LinearPhysicalFormat::Q4K => Some(&self.q4_k_gemv_f32),
+            LinearPhysicalFormat::Q6K => Some(&self.q6_k_gemv_f32),
+            LinearPhysicalFormat::Q8_0 => Some(&self.q8_0_f32),
+            LinearPhysicalFormat::Q5K => None,
+        }
+    }
 }
 
 pub(super) struct MetalDenseLinearProvider {
@@ -163,6 +197,7 @@ impl MetalDenseLinearProvider {
             DENSE_LINEAR_F16_CAPABILITY_ID,
             DENSE_LINEAR_ESTIMATOR_ID,
             2,
+            ALL_LINEAR_QUANTIZATION_FORMATS,
         )?;
         Ok(Self {
             descriptor,
@@ -223,6 +258,7 @@ impl MetalDenseSwiGluProvider {
             DENSE_SWIGLU_F16_CAPABILITY_ID,
             DENSE_SWIGLU_ESTIMATOR_ID,
             3,
+            ALL_LINEAR_QUANTIZATION_FORMATS,
         )?;
         Ok(Self {
             descriptor,
@@ -297,6 +333,9 @@ impl OperationProvider<MetalDeviceRuntime> for MetalDenseSwiGluProvider {
 
 pub(super) struct MetalLastTokenDenseLinearProvider {
     descriptor: OperationProviderDescriptor,
+    operation_id: &'static str,
+    activation_type: ElementType,
+    failure_stage: &'static str,
     pipelines: Arc<MetalLinearPipelines>,
 }
 
@@ -305,17 +344,68 @@ impl MetalLastTokenDenseLinearProvider {
         runtime: &MetalDeviceRuntime,
         pipelines: Arc<MetalLinearPipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        let contract = last_token_dense_linear_contract().map_err(super::contract_error)?;
+        Self::new_with_activation_type(runtime, pipelines, ElementType::F16)
+    }
+
+    pub(super) fn new_f32(
+        runtime: &MetalDeviceRuntime,
+        pipelines: Arc<MetalLinearPipelines>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        Self::new_with_activation_type(runtime, pipelines, ElementType::F32)
+    }
+
+    fn new_with_activation_type(
+        runtime: &MetalDeviceRuntime,
+        pipelines: Arc<MetalLinearPipelines>,
+        activation_type: ElementType,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        let (
+            contract,
+            operation_id,
+            provider_id,
+            capability_id,
+            estimator_id,
+            quant_formats,
+            failure_stage,
+        ) = match activation_type {
+            ElementType::F16 => (
+                last_token_dense_linear_contract().map_err(super::contract_error)?,
+                LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+                LAST_TOKEN_PROVIDER_ID,
+                LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
+                LAST_TOKEN_ESTIMATOR_ID,
+                ALL_LINEAR_QUANTIZATION_FORMATS,
+                "metal.last_token_dense_linear.encode",
+            ),
+            ElementType::F32 => (
+                last_token_dense_linear_f32_contract().map_err(super::contract_error)?,
+                LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+                LAST_TOKEN_F32_PROVIDER_ID,
+                LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+                LAST_TOKEN_F32_ESTIMATOR_ID,
+                F32_LINEAR_QUANTIZATION_FORMATS,
+                "metal.last_token_dense_linear.f32.encode",
+            ),
+            _ => {
+                return Err(MetalDeviceRuntimeError::contract(
+                    "Metal last-token linear activation ABI supports only F16 or F32",
+                ))
+            }
+        };
         let descriptor = linear_provider_descriptor(
             runtime,
             &contract,
-            LAST_TOKEN_PROVIDER_ID,
-            LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-            LAST_TOKEN_ESTIMATOR_ID,
+            provider_id,
+            capability_id,
+            estimator_id,
             2,
+            quant_formats,
         )?;
         Ok(Self {
             descriptor,
+            operation_id,
+            activation_type,
+            failure_stage,
             pipelines,
         })
     }
@@ -330,7 +420,7 @@ impl OperationResourceEstimator for MetalLastTokenDenseLinearProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        if request.operation().id.as_str() != LAST_TOKEN_DENSE_LINEAR_OPERATION_ID
+        if request.operation().id.as_str() != self.operation_id
             || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
         {
             return Err(invalid_plan(format!(
@@ -342,8 +432,9 @@ impl OperationResourceEstimator for MetalLastTokenDenseLinearProvider {
             unsigned_attribute(request.attributes(), "out_features").map_err(invalid_plan)?;
         let hidden_size =
             unsigned_attribute(request.attributes(), "hidden_size").map_err(invalid_plan)?;
-        let bytes_per_sequence = last_token_scratch_bytes_per_sequence(hidden_size, out_features)
-            .map_err(invalid_plan)?;
+        let bytes_per_sequence =
+            last_token_scratch_bytes_per_sequence(hidden_size, out_features, self.activation_type)
+                .map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
                 LAST_TOKEN_SCRATCH_PADDING_BYTES,
@@ -383,11 +474,14 @@ impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenDenseLinearProvider
         invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_last_token_dense_linear(Arc::clone(&self.pipelines), invocation)
-            .map(EncodedDeviceOperation::compute)
-            .map_err(|message| {
-                provider_failure(identity, "metal.last_token_dense_linear.encode", message)
-            })
+        encode_last_token_dense_linear(
+            Arc::clone(&self.pipelines),
+            self.operation_id,
+            self.activation_type,
+            invocation,
+        )
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| provider_failure(identity, self.failure_stage, message))
     }
 }
 
@@ -398,6 +492,7 @@ fn linear_provider_descriptor(
     capability_id: &str,
     estimator_id: &str,
     input_count: u32,
+    accepted_quantization_formats: &[&str],
 ) -> Result<OperationProviderDescriptor, MetalDeviceRuntimeError> {
     provider_descriptor(
         runtime,
@@ -407,12 +502,7 @@ fn linear_provider_descriptor(
         estimator_id,
         contiguous_bindings(input_count),
         &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
-        &[
-            Q4_K_FORMAT_ID,
-            Q5_K_FORMAT_ID,
-            Q6_K_FORMAT_ID,
-            Q8_0_FORMAT_ID,
-        ],
+        accepted_quantization_formats,
         implementation_fingerprint(&[
             include_str!("linear.rs").as_bytes(),
             SHADER_SOURCE.as_bytes(),
@@ -479,6 +569,7 @@ pub(super) struct LinearLaunch {
     output_region: usize,
     input_offset_bytes: u64,
     output_offset_bytes: u64,
+    activation_type: ElementType,
     format: LinearPhysicalFormat,
     params: LinearParams,
 }
@@ -624,13 +715,15 @@ fn encode_dense_linear(
 
 fn encode_last_token_dense_linear(
     pipelines: Arc<MetalLinearPipelines>,
+    operation_id: &'static str,
+    activation_type: ElementType,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
-    ensure_invocation(&invocation, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)?;
+    ensure_invocation(&invocation, operation_id)?;
     let first = &invocation.participants()[0];
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
     let out_features = unsigned_attribute(first.attributes(), "out_features")?;
-    validate_last_token_participant(first, hidden_size, out_features)?;
+    validate_last_token_participant(first, hidden_size, out_features, activation_type)?;
     let resolved = resolve_weight(
         first,
         binding(first.bindings(), ResolvedValueRole::Input, 1)?,
@@ -641,7 +734,7 @@ fn encode_last_token_dense_linear(
         {
             return Err("Metal last-token linear participant attributes disagree".to_owned());
         }
-        validate_last_token_participant(participant, hidden_size, out_features)?;
+        validate_last_token_participant(participant, hidden_size, out_features, activation_type)?;
         let candidate = resolve_weight(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
@@ -667,8 +760,12 @@ fn encode_last_token_dense_linear(
         "Metal last-token linear participant count",
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
-    let scratch_layout =
-        LastTokenPackedScratchLayout::new(participant_count as u64, hidden_size, out_features)?;
+    let scratch_layout = LastTokenPackedScratchLayout::new(
+        participant_count as u64,
+        hidden_size,
+        out_features,
+        activation_type,
+    )?;
     let shared_packed_input = packed_last_token_rows(
         input_packed,
         participant_count,
@@ -702,7 +799,7 @@ fn encode_last_token_dense_linear(
                     contiguous_token_region(
                         participant,
                         binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-                        ElementType::F16,
+                        activation_type,
                         selected.end - 1,
                         1,
                     )
@@ -716,7 +813,7 @@ fn encode_last_token_dense_linear(
                 contiguous_region(
                     participant,
                     binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-                    ElementType::F16,
+                    activation_type,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -734,7 +831,7 @@ fn encode_last_token_dense_linear(
                     &invocation,
                     ResolvedValueRole::Input,
                     0,
-                    ElementType::F16,
+                    activation_type,
                     participant_count as u64,
                 )?);
                 Some(region)
@@ -751,7 +848,7 @@ fn encode_last_token_dense_linear(
                 return Err("Metal packed last-token scratch is not blit aligned".to_owned());
             }
             regions.push(scratch);
-            let launch = linear_launch(
+            let launch = linear_launch_typed(
                 part,
                 shared_input_region.unwrap_or(scratch_region),
                 scratch_region,
@@ -760,16 +857,22 @@ fn encode_last_token_dense_linear(
                 out_features,
                 0,
                 scratch_layout.output_offset_bytes,
+                activation_type,
             )?;
-            validate_launch_regions(&regions, &[launch])?;
+            validate_launch_regions_with_raw_workspace(&regions, &[launch], &[scratch_region])?;
             validate_region_span(
                 &regions[scratch_region],
                 0,
                 scratch_layout.required_bytes,
                 "Metal packed last-token scratch",
             )?;
+            let operation_label = if activation_type == ElementType::F32 {
+                "vnext_last_token_dense_linear_f32"
+            } else {
+                "vnext_last_token_dense_linear"
+            };
             return MetalDeviceCommand::operation(
-                "vnext_last_token_dense_linear",
+                operation_label,
                 regions,
                 move |encoder, regions| {
                     if let Some(input_region_base) = gathered_input_region_base {
@@ -828,7 +931,7 @@ fn encode_last_token_dense_linear(
         regions.push(contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-            ElementType::F16,
+            activation_type,
             selected.end - 1,
             1,
         )?);
@@ -836,9 +939,9 @@ fn encode_last_token_dense_linear(
         regions.push(contiguous_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-            ElementType::F16,
+            activation_type,
         )?);
-        launches.push(linear_launch(
+        launches.push(linear_launch_typed(
             part,
             input_region,
             output_region,
@@ -847,21 +950,23 @@ fn encode_last_token_dense_linear(
             out_features,
             0,
             0,
+            activation_type,
         )?);
     }
     validate_launch_regions(&regions, &launches)?;
     let dispatch_count = launches.len() as u64;
-    MetalDeviceCommand::operation(
-        "vnext_last_token_dense_linear",
-        regions,
-        move |encoder, regions| {
-            encoder.record_compute_dispatches(dispatch_count);
-            for launch in &launches {
-                dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
-            }
-            Ok(())
-        },
-    )
+    let operation_label = if activation_type == ElementType::F32 {
+        "vnext_last_token_dense_linear_f32"
+    } else {
+        "vnext_last_token_dense_linear"
+    };
+    MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
+        encoder.record_compute_dispatches(dispatch_count);
+        for launch in &launches {
+            dispatch_linear(&pipelines, encoder.compute_encoder(), regions, *launch);
+        }
+        Ok(())
+    })
     .map_err(|error| error.to_string())?
     .with_work_shape(
         if participant_count_u32 == 1 {
@@ -884,16 +989,21 @@ struct LastTokenPackedScratchLayout {
 }
 
 impl LastTokenPackedScratchLayout {
-    fn new(participant_count: u64, hidden_size: u64, out_features: u64) -> Result<Self, String> {
+    fn new(
+        participant_count: u64,
+        hidden_size: u64,
+        out_features: u64,
+        activation_type: ElementType,
+    ) -> Result<Self, String> {
         if participant_count == 0 {
             return Err("Metal packed last-token scratch has zero participants".to_owned());
         }
         let input_row_bytes = hidden_size
-            .checked_mul(ElementType::F16.size_bytes())
+            .checked_mul(activation_type.size_bytes())
             .filter(|bytes| *bytes > 0)
             .ok_or_else(|| "Metal last-token input row size is zero or overflows".to_owned())?;
         let output_row_bytes = out_features
-            .checked_mul(ElementType::F16.size_bytes())
+            .checked_mul(activation_type.size_bytes())
             .filter(|bytes| *bytes > 0)
             .ok_or_else(|| "Metal last-token output row size is zero or overflows".to_owned())?;
         let input_bytes = input_row_bytes
@@ -918,10 +1028,11 @@ impl LastTokenPackedScratchLayout {
 fn last_token_scratch_bytes_per_sequence(
     hidden_size: u64,
     out_features: u64,
+    activation_type: ElementType,
 ) -> Result<u64, String> {
     hidden_size
         .checked_add(out_features)
-        .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+        .and_then(|elements| elements.checked_mul(activation_type.size_bytes()))
         .filter(|bytes| *bytes > 0)
         .ok_or_else(|| "Metal last-token scratch bytes per sequence overflow".to_owned())
 }
@@ -1078,8 +1189,8 @@ fn encode_dense_swiglu(
         gate_up_bytes,
         0,
     )?;
-    validate_launch_regions(&regions, &gate_launches)?;
-    validate_launch_regions(&regions, &[down_launch])?;
+    validate_launch_regions_with_raw_workspace(&regions, &gate_launches, &[scratch_region])?;
+    validate_launch_regions_with_raw_workspace(&regions, &[down_launch], &[scratch_region])?;
     validate_region_span(
         &regions[scratch_region],
         0,
@@ -1129,12 +1240,44 @@ pub(super) fn linear_launch(
     input_offset_bytes: u64,
     output_offset_bytes: u64,
 ) -> Result<LinearLaunch, String> {
+    linear_launch_typed(
+        part,
+        input_region,
+        output_region,
+        rows,
+        in_features,
+        output_stride,
+        input_offset_bytes,
+        output_offset_bytes,
+        ElementType::F16,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_launch_typed(
+    part: PreparedLinearPart,
+    input_region: usize,
+    output_region: usize,
+    rows: u64,
+    in_features: u64,
+    output_stride: u64,
+    input_offset_bytes: u64,
+    output_offset_bytes: u64,
+    activation_type: ElementType,
+) -> Result<LinearLaunch, String> {
+    if !matches!(activation_type, ElementType::F16 | ElementType::F32) {
+        return Err("Metal linear activation ABI supports only F16 or F32".to_owned());
+    }
+    if activation_type == ElementType::F32 && part.format == LinearPhysicalFormat::Q5K {
+        return Err("Metal F32 linear does not advertise a Q5_K kernel".to_owned());
+    }
     Ok(LinearLaunch {
         input_region,
         weight_region: part.region,
         output_region,
         input_offset_bytes,
         output_offset_bytes,
+        activation_type,
         format: part.format,
         params: LinearParams {
             rows: checked_u32(rows, "Metal linear row count")?,
@@ -1150,6 +1293,14 @@ pub(super) fn validate_launch_regions(
     regions: &[MetalBufferRegion],
     launches: &[LinearLaunch],
 ) -> Result<(), String> {
+    validate_launch_regions_with_raw_workspace(regions, launches, &[])
+}
+
+pub(super) fn validate_launch_regions_with_raw_workspace(
+    regions: &[MetalBufferRegion],
+    launches: &[LinearLaunch],
+    raw_workspace_regions: &[usize],
+) -> Result<(), String> {
     for launch in launches {
         let input = regions
             .get(launch.input_region)
@@ -1162,13 +1313,13 @@ pub(super) fn validate_launch_regions(
             .ok_or_else(|| "Metal linear output region index is invalid".to_owned())?;
         let input_bytes = u64::from(launch.params.rows)
             .checked_mul(u64::from(launch.params.in_features))
-            .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+            .and_then(|elements| elements.checked_mul(launch.activation_type.size_bytes()))
             .ok_or_else(|| "Metal linear input byte size overflows".to_owned())?;
         let output_elements = u64::from(launch.params.rows)
             .checked_mul(u64::from(launch.params.output_stride))
             .ok_or_else(|| "Metal linear output byte size overflows".to_owned())?;
         let output_bytes = output_elements
-            .checked_mul(ElementType::F16.size_bytes())
+            .checked_mul(launch.activation_type.size_bytes())
             .ok_or_else(|| "Metal linear output byte size overflows".to_owned())?;
         validate_region_span(
             input,
@@ -1182,6 +1333,19 @@ pub(super) fn validate_launch_regions(
             output_bytes,
             "Metal linear output",
         )?;
+        if !linear_activation_region_matches(
+            input.element_type(),
+            launch.input_region,
+            launch.activation_type,
+            raw_workspace_regions,
+        ) || !linear_activation_region_matches(
+            output.element_type(),
+            launch.output_region,
+            launch.activation_type,
+            raw_workspace_regions,
+        ) {
+            return Err("Metal linear activation regions differ from the typed launch".to_owned());
+        }
         if weight.length_bytes() == 0 {
             return Err("Metal linear weight region is empty".to_owned());
         }
@@ -1193,6 +1357,16 @@ pub(super) fn validate_launch_regions(
         }
     }
     Ok(())
+}
+
+fn linear_activation_region_matches(
+    region_type: ElementType,
+    region_index: usize,
+    activation_type: ElementType,
+    raw_workspace_regions: &[usize],
+) -> bool {
+    region_type == activation_type
+        || (region_type == ElementType::U8 && raw_workspace_regions.contains(&region_index))
 }
 
 fn validate_region_span(
@@ -1217,7 +1391,16 @@ pub(super) fn dispatch_linear(
     regions: &[MetalBufferRegion],
     launch: LinearLaunch,
 ) {
-    let (pipeline, dispatch_kind) = pipelines.linear_pipeline(launch.format, launch.params.rows);
+    let (pipeline, dispatch_kind) = match launch.activation_type {
+        ElementType::F16 => pipelines.linear_pipeline(launch.format, launch.params.rows),
+        ElementType::F32 => (
+            pipelines
+                .f32_linear_pipeline(launch.format)
+                .expect("validated Metal F32 linear format"),
+            LinearDispatchKind::CooperativeGemv,
+        ),
+        _ => unreachable!("validated Metal linear activation ABI"),
+    };
     encoder.set_compute_pipeline_state(pipeline);
     set_region_offset(
         encoder,
@@ -1749,6 +1932,7 @@ fn validate_last_token_participant(
     participant: &ferrum_interfaces::vnext::OperationInvocation<'_, MetalDeviceBuffer>,
     hidden_size: u64,
     out_features: u64,
+    activation_type: ElementType,
 ) -> Result<(), String> {
     let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
     let weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
@@ -1759,9 +1943,11 @@ fn validate_last_token_participant(
         || dimensions[1] != hidden_size
         || weight.tensor().dimensions() != [out_features, hidden_size]
         || output.tensor().dimensions() != [1, out_features]
-        || !f16_contiguous(input)
+        || input.tensor().element_type() != activation_type
+        || !matches!(input.tensor().layout(), ResolvedTensorLayout::Contiguous)
         || !f16_contiguous(weight)
-        || !f16_contiguous(output)
+        || output.tensor().element_type() != activation_type
+        || !matches!(output.tensor().layout(), ResolvedTensorLayout::Contiguous)
     {
         return Err("Metal last-token linear invocation differs from its signature".to_owned());
     }
@@ -1841,6 +2027,10 @@ mod tests {
         values.iter().map(|value| value.to_f32()).collect()
     }
 
+    fn read_f32(buffer: &BufferRef, elements: usize) -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(buffer.contents() as *const f32, elements) }.to_vec()
+    }
+
     #[test]
     fn packed_last_token_shape_requires_shared_consecutive_unit_rows() {
         assert!(!packed_last_token_rows(true, 1, [0..1]));
@@ -1857,15 +2047,48 @@ mod tests {
     }
 
     #[test]
+    fn raw_linear_workspace_requires_explicit_region_authorization() {
+        assert!(linear_activation_region_matches(
+            ElementType::F32,
+            3,
+            ElementType::F32,
+            &[],
+        ));
+        assert!(!linear_activation_region_matches(
+            ElementType::U8,
+            3,
+            ElementType::F32,
+            &[],
+        ));
+        assert!(linear_activation_region_matches(
+            ElementType::U8,
+            3,
+            ElementType::F32,
+            &[3],
+        ));
+        assert!(!linear_activation_region_matches(
+            ElementType::U8,
+            4,
+            ElementType::F32,
+            &[3],
+        ));
+    }
+
+    #[test]
     fn packed_last_token_scratch_formula_covers_1_2_and_15_participants() {
         let hidden_size = 2560_u64;
         let out_features = 248_320_u64;
         let bytes_per_sequence =
-            last_token_scratch_bytes_per_sequence(hidden_size, out_features).unwrap();
+            last_token_scratch_bytes_per_sequence(hidden_size, out_features, ElementType::F16)
+                .unwrap();
         for participant_count in [1_u64, 2, 15] {
-            let layout =
-                LastTokenPackedScratchLayout::new(participant_count, hidden_size, out_features)
-                    .unwrap();
+            let layout = LastTokenPackedScratchLayout::new(
+                participant_count,
+                hidden_size,
+                out_features,
+                ElementType::F16,
+            )
+            .unwrap();
             let admitted = align_up_bytes(
                 LAST_TOKEN_SCRATCH_PADDING_BYTES + participant_count * bytes_per_sequence,
                 VALUE_ALIGNMENT_BYTES,
@@ -2551,6 +2774,83 @@ mod tests {
     }
 
     #[test]
+    fn native_last_token_q6k_f32_linear_preserves_f32_head_boundary_on_real_metal() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping F32 last-token linear conformance");
+            return;
+        };
+        let pipelines = MetalLinearPipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+        let rows = 3_usize;
+        let hidden = 256_usize;
+        let output_width = 64_usize;
+        let input = (0..rows * hidden)
+            .map(|index| {
+                let row = index / hidden;
+                (index as f32 * 0.011).sin() * 0.125 + row as f32 * 0.03125 + 0.000_123
+            })
+            .collect::<Vec<_>>();
+        let weight = (0..output_width * hidden)
+            .map(|index| (index as f32 * 0.0071).cos() * 0.0625)
+            .collect::<Vec<_>>();
+        let cpu = CandleDevice::Cpu;
+        let weight_tensor = Tensor::from_vec(weight, (output_width, hidden), &cpu).unwrap();
+        let quantized = QTensor::quantize(&weight_tensor, GgmlDType::Q6K).unwrap();
+        let reference = Tensor::from_vec(input[(rows - 1) * hidden..].to_vec(), (1, hidden), &cpu)
+            .unwrap()
+            .matmul(&quantized.dequantize(&cpu).unwrap().transpose(0, 1).unwrap())
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+
+        let input_buffer = shared_buffer(&device, &input);
+        let weight_buffer = shared_buffer(&device, &quantized.data().unwrap());
+        let output = output_buffer::<f32>(&device, output_width);
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        let params = LinearParams {
+            rows: 1,
+            in_features: hidden as u32,
+            out_features: output_width as u32,
+            output_stride: output_width as u32,
+            output_column_offset: 0,
+        };
+        encoder.set_compute_pipeline_state(
+            pipelines
+                .f32_linear_pipeline(LinearPhysicalFormat::Q6K)
+                .unwrap(),
+        );
+        encoder.set_buffer(
+            0,
+            Some(&input_buffer),
+            ((rows - 1) * hidden * std::mem::size_of::<f32>()) as u64,
+        );
+        encoder.set_buffer(1, Some(&weight_buffer), 0);
+        encoder.set_buffer(2, Some(&output), 0);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<LinearParams>() as u64,
+            &params as *const _ as *const c_void,
+        );
+        dispatch_linear_grid(encoder, params, LinearDispatchKind::CooperativeGemv);
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+        let actual = read_f32(&output, output_width);
+        for (index, (actual, expected)) in actual.iter().zip(&reference).enumerate() {
+            let tolerance = 2.0e-4_f32.max(expected.abs() * 2.0e-4);
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "F32 Q6_K head[{index}] {actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn native_packed_last_token_q6k_linear_gathers_and_scatters_on_real_metal() {
         let Some(device) = Device::system_default() else {
             eprintln!("no Metal device; skipping packed last-token linear conformance");
@@ -2607,6 +2907,7 @@ mod tests {
             participant_count as u64,
             hidden as u64,
             output_width as u64,
+            ElementType::F16,
         )
         .unwrap();
         let scratch = output_buffer::<u8>(&device, layout.required_bytes as usize);

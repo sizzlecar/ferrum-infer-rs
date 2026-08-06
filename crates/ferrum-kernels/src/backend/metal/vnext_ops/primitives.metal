@@ -272,3 +272,243 @@ kernel void vnext_last_token_masked_argmax_f16(
         output[0] = index == 0x7fffffff ? 0xffffffffu : uint(index);
     }
 }
+
+kernel void vnext_embedding_dense_f32(
+    device const half * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint token = group.y;
+    const uint column = group.x * THREADS_PER_GROUP + lane;
+    if (token >= params.token_count || column >= params.hidden_size) {
+        return;
+    }
+    const uint token_id = token_ids[token];
+    const ulong output_index = ulong(token) * params.hidden_size + column;
+    output[output_index] = token_id < params.vocabulary_size
+        ? float(table[ulong(token_id) * params.hidden_size + column])
+        : 0.0f;
+}
+
+kernel void vnext_embedding_q6_k_f32(
+    device const block_q6_K * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint token = group.y;
+    const uint column = group.x * THREADS_PER_GROUP + lane;
+    if (token >= params.token_count || column >= params.hidden_size) {
+        return;
+    }
+    const uint token_id = token_ids[token];
+    const ulong output_index = ulong(token) * params.hidden_size + column;
+    if (token_id >= params.vocabulary_size) {
+        output[output_index] = 0.0f;
+        return;
+    }
+    const uint blocks_per_row = params.hidden_size / QK_K;
+    const ulong block_index = ulong(token_id) * blocks_per_row + column / QK_K;
+    output[output_index] = q6_k_value(table[block_index], column % QK_K);
+}
+
+kernel void vnext_embedding_q8_0_f32(
+    device const block_q8_0 * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint token = group.y;
+    const uint column = group.x * THREADS_PER_GROUP + lane;
+    if (token >= params.token_count || column >= params.hidden_size) {
+        return;
+    }
+    const uint token_id = token_ids[token];
+    const ulong output_index = ulong(token) * params.hidden_size + column;
+    if (token_id >= params.vocabulary_size) {
+        output[output_index] = 0.0f;
+        return;
+    }
+    const uint blocks_per_row = params.hidden_size / QK8_0;
+    const ulong block_index = ulong(token_id) * blocks_per_row + column / QK8_0;
+    const block_q8_0 block = table[block_index];
+    output[output_index] = float(block.d) * float(block.qs[column % QK8_0]);
+}
+
+kernel void vnext_rms_norm_f32_to_f16(
+    device const float * input [[buffer(0)]],
+    device const half * weight [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant RmsNormParams & params [[buffer(3)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group.x;
+    if (row >= params.rows) {
+        return;
+    }
+    const ulong base = ulong(row) * params.hidden_size;
+    float sum = 0.0f;
+    for (uint column = lane; column < params.hidden_size; column += THREADS_PER_GROUP) {
+        const float value = input[base + column];
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        partial[simd_group] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        const uint simdgroups = THREADS_PER_GROUP / 32;
+        float total = simd_lane < simdgroups ? partial[simd_lane] : 0.0f;
+        total = simd_sum(total);
+        if (simd_lane == 0) {
+            partial[0] = rsqrt(total / float(params.hidden_size) + params.epsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inverse_rms = partial[0];
+    for (uint column = lane; column < params.hidden_size; column += THREADS_PER_GROUP) {
+        output[base + column] = half(input[base + column] * inverse_rms * float(weight[column]));
+    }
+}
+
+kernel void vnext_rms_norm_f32(
+    device const float * input [[buffer(0)]],
+    device const half * weight [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant RmsNormParams & params [[buffer(3)]],
+    threadgroup float * partial [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group.x;
+    if (row >= params.rows) {
+        return;
+    }
+    const ulong base = ulong(row) * params.hidden_size;
+    float sum = 0.0f;
+    for (uint column = lane; column < params.hidden_size; column += THREADS_PER_GROUP) {
+        const float value = input[base + column];
+        sum += value * value;
+    }
+    sum = simd_sum(sum);
+    if (simd_lane == 0) {
+        partial[simd_group] = sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_group == 0) {
+        const uint simdgroups = THREADS_PER_GROUP / 32;
+        float total = simd_lane < simdgroups ? partial[simd_lane] : 0.0f;
+        total = simd_sum(total);
+        if (simd_lane == 0) {
+            partial[0] = rsqrt(total / float(params.hidden_size) + params.epsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inverse_rms = partial[0];
+    for (uint column = lane; column < params.hidden_size; column += THREADS_PER_GROUP) {
+        output[base + column] = input[base + column] * inverse_rms * float(weight[column]);
+    }
+}
+
+kernel void vnext_residual_add_f32_f16(
+    device const float * left [[buffer(0)]],
+    device const half * right [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant ResidualAddParams & params [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    if (index < params.elements) {
+        output[index] = left[index] + float(right[index]);
+    }
+}
+
+kernel void vnext_last_token_masked_argmax_f32(
+    device const float * logits [[buffer(0)]],
+    device float * scratch [[buffer(1)]],
+    device const uchar * valid_mask [[buffer(2)]],
+    device const uint * repetition_token_ids [[buffer(3)]],
+    device const uint * repetition_offsets [[buffer(4)]],
+    device const float * repetition_penalty [[buffer(5)]],
+    device uint * output [[buffer(6)]],
+    constant LastTokenMaskedArgmaxParams & params [[buffer(7)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const float penalty = repetition_penalty[0];
+    const uint repetition_start = min(repetition_offsets[0], params.repetition_capacity);
+    const uint repetition_end = min(repetition_offsets[1], params.repetition_capacity);
+    const bool apply_penalty = penalty != 1.0f && repetition_start < repetition_end;
+    if (apply_penalty) {
+        for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {
+            scratch[token] = logits[token];
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+        for (uint entry = repetition_start + lane;
+             entry < repetition_end;
+             entry += THREADS_PER_GROUP) {
+            const uint token = repetition_token_ids[entry];
+            if (token >= params.vocabulary_size) {
+                continue;
+            }
+            const float value = scratch[token];
+            if (!isfinite(value)) {
+                continue;
+            }
+            scratch[token] = value > 0.0f ? value / penalty : value * penalty;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+
+    float local_maximum = -INFINITY;
+    int local_index = -1;
+    for (uint token = lane; token < params.vocabulary_size; token += THREADS_PER_GROUP) {
+        if (valid_mask[token] == 0) {
+            continue;
+        }
+        const float value = apply_penalty ? scratch[token] : logits[token];
+        if (!isfinite(value)) {
+            continue;
+        }
+        if (local_index < 0 || value > local_maximum ||
+            (value == local_maximum && int(token) < local_index)) {
+            local_maximum = value;
+            local_index = int(token);
+        }
+    }
+
+    const float simd_maximum = simd_max(local_maximum);
+    const int simd_index = simd_min(
+        local_index >= 0 && local_maximum == simd_maximum ? local_index : 0x7fffffff
+    );
+    threadgroup float partial_maximum[THREADS_PER_GROUP / 32];
+    threadgroup int partial_index[THREADS_PER_GROUP / 32];
+    if (simd_lane == 0) {
+        partial_maximum[simd_group] = simd_maximum;
+        partial_index[simd_group] = simd_index;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float maximum = -INFINITY;
+        int index = 0x7fffffff;
+        for (uint group = 0; group < THREADS_PER_GROUP / 32; ++group) {
+            const float candidate_maximum = partial_maximum[group];
+            const int candidate_index = partial_index[group];
+            if (candidate_index != 0x7fffffff &&
+                (index == 0x7fffffff || candidate_maximum > maximum ||
+                 (candidate_maximum == maximum && candidate_index < index))) {
+                maximum = candidate_maximum;
+                index = candidate_index;
+            }
+        }
+        output[0] = index == 0x7fffffff ? 0xffffffffu : uint(index);
+    }
+}

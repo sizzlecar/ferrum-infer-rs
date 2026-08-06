@@ -4,17 +4,24 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, BatchedOperationInvocation, DeviceBatchingForm,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
-    ReusableExecutionTopology, ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
-    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
-    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
-    RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    last_token_masked_argmax_contract, last_token_masked_argmax_f32_contract,
+    residual_add_contract, residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
+    rms_norm_f32_to_f16_contract, token_embedding_contract, token_embedding_f32_master_contract,
+    BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
+    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, VNextError, WeightEncoding,
+    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
+    LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
+    RESIDUAL_ADD_F32_F16_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
+    RMS_NORM_F32_CAPABILITY_ID, RMS_NORM_F32_OPERATION_ID, RMS_NORM_F32_TO_F16_CAPABILITY_ID,
+    RMS_NORM_F32_TO_F16_OPERATION_ID, RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+    TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+    TOKEN_EMBEDDING_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
@@ -43,6 +50,19 @@ const RESIDUAL_ADD_ESTIMATOR_ID: &str = "resource-estimator.metal.residual_add.f
 const LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID: &str = "provider.metal.last_token_masked_argmax.f16";
 const LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID: &str =
     "resource-estimator.metal.last_token_masked_argmax.f16";
+const TOKEN_EMBEDDING_F32_MASTER_PROVIDER_ID: &str = "provider.metal.token_embedding.f32-master";
+const TOKEN_EMBEDDING_F32_MASTER_ESTIMATOR_ID: &str =
+    "resource-estimator.metal.token_embedding.f32-master";
+const RMS_NORM_F32_TO_F16_PROVIDER_ID: &str = "provider.metal.rms_norm.f32-to-f16";
+const RMS_NORM_F32_TO_F16_ESTIMATOR_ID: &str = "resource-estimator.metal.rms_norm.f32-to-f16";
+const RMS_NORM_F32_PROVIDER_ID: &str = "provider.metal.rms_norm.f32";
+const RMS_NORM_F32_ESTIMATOR_ID: &str = "resource-estimator.metal.rms_norm.f32";
+const RESIDUAL_ADD_F32_F16_PROVIDER_ID: &str = "provider.metal.residual_add.f32-f16";
+const RESIDUAL_ADD_F32_F16_ESTIMATOR_ID: &str = "resource-estimator.metal.residual_add.f32-f16";
+const LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID: &str =
+    "provider.metal.last_token_masked_argmax.f32";
+const LAST_TOKEN_MASKED_ARGMAX_F32_ESTIMATOR_ID: &str =
+    "resource-estimator.metal.last_token_masked_argmax.f32";
 
 const EMBEDDING_DENSE_KERNEL: &str = "vnext_embedding_dense_f16";
 const EMBEDDING_Q6_K_KERNEL: &str = "vnext_embedding_q6_k_f16";
@@ -50,6 +70,13 @@ const EMBEDDING_Q8_0_KERNEL: &str = "vnext_embedding_q8_0_f16";
 const RMS_NORM_KERNEL: &str = "vnext_rms_norm_f16";
 const RESIDUAL_ADD_KERNEL: &str = "vnext_residual_add_f16";
 const LAST_TOKEN_MASKED_ARGMAX_KERNEL: &str = "vnext_last_token_masked_argmax_f16";
+const EMBEDDING_DENSE_F32_KERNEL: &str = "vnext_embedding_dense_f32";
+const EMBEDDING_Q6_K_F32_KERNEL: &str = "vnext_embedding_q6_k_f32";
+const EMBEDDING_Q8_0_F32_KERNEL: &str = "vnext_embedding_q8_0_f32";
+const RMS_NORM_F32_TO_F16_KERNEL: &str = "vnext_rms_norm_f32_to_f16";
+const RMS_NORM_F32_KERNEL: &str = "vnext_rms_norm_f32";
+const RESIDUAL_ADD_F32_F16_KERNEL: &str = "vnext_residual_add_f32_f16";
+const LAST_TOKEN_MASKED_ARGMAX_F32_KERNEL: &str = "vnext_last_token_masked_argmax_f32";
 
 pub(super) struct MetalPrimitivePipelines {
     embedding_dense: ComputePipelineState,
@@ -58,6 +85,13 @@ pub(super) struct MetalPrimitivePipelines {
     rms_norm: ComputePipelineState,
     residual_add: ComputePipelineState,
     last_token_masked_argmax: ComputePipelineState,
+    embedding_dense_f32: ComputePipelineState,
+    embedding_q6_k_f32: ComputePipelineState,
+    embedding_q8_0_f32: ComputePipelineState,
+    rms_norm_f32_to_f16: ComputePipelineState,
+    rms_norm_f32: ComputePipelineState,
+    residual_add_f32_f16: ComputePipelineState,
+    last_token_masked_argmax_f32: ComputePipelineState,
 }
 
 impl MetalPrimitivePipelines {
@@ -90,6 +124,13 @@ impl MetalPrimitivePipelines {
             rms_norm: pipeline(RMS_NORM_KERNEL)?,
             residual_add: pipeline(RESIDUAL_ADD_KERNEL)?,
             last_token_masked_argmax: pipeline(LAST_TOKEN_MASKED_ARGMAX_KERNEL)?,
+            embedding_dense_f32: pipeline(EMBEDDING_DENSE_F32_KERNEL)?,
+            embedding_q6_k_f32: pipeline(EMBEDDING_Q6_K_F32_KERNEL)?,
+            embedding_q8_0_f32: pipeline(EMBEDDING_Q8_0_F32_KERNEL)?,
+            rms_norm_f32_to_f16: pipeline(RMS_NORM_F32_TO_F16_KERNEL)?,
+            rms_norm_f32: pipeline(RMS_NORM_F32_KERNEL)?,
+            residual_add_f32_f16: pipeline(RESIDUAL_ADD_F32_F16_KERNEL)?,
+            last_token_masked_argmax_f32: pipeline(LAST_TOKEN_MASKED_ARGMAX_F32_KERNEL)?,
         })
     }
 }
@@ -337,34 +378,12 @@ impl OperationResourceEstimator for MetalLastTokenMaskedArgmaxProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        if request.operation().id.as_str() != LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
-            || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
-        {
-            return Err(invalid_plan(format!(
-                "Metal estimator `{}` received another operation",
-                self.descriptor.resource_estimator_id()
-            )));
-        }
-        let vocabulary_size =
-            unsigned_attribute(request.attributes(), "vocab_size").map_err(invalid_plan)?;
-        let scratch_bytes = masked_argmax_scratch_stride(vocabulary_size).map_err(invalid_plan)?;
-        let scratch = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::actual_sequences(scratch_bytes)?,
-            VALUE_ALIGNMENT_BYTES,
-            ProviderWorkspaceScope::Invocation,
-            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
-            DynamicStorageRequirement::contiguous(),
-        )?;
-        Ok(OperationResourceEstimate::new(
-            self.descriptor.resource_estimator_id(),
-            self.descriptor.resource_estimator_version(),
-            self.descriptor
-                .resource_estimator_implementation_fingerprint(),
-            request.input_fingerprint(),
-            VALUE_ALIGNMENT_BYTES,
-            Some(scratch),
-            None,
-        ))
+        estimate_masked_argmax_resources(
+            &self.descriptor,
+            request,
+            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+            ElementType::F16,
+        )
     }
 }
 
@@ -387,6 +406,220 @@ impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenMaskedArgmaxProvide
             .map(EncodedDeviceOperation::compute)
             .map_err(|message| {
                 provider_failure(identity, "metal.last_token_masked_argmax.encode", message)
+            })
+    }
+}
+
+macro_rules! no_workspace_primitive_provider {
+    (
+        $provider:ident,
+        $contract:ident,
+        $provider_id:ident,
+        $capability_id:ident,
+        $estimator_id:ident,
+        $operation_id:ident,
+        $bindings:expr,
+        $physical_formats:expr,
+        $quantization_formats:expr,
+        $encode:ident,
+        $failure_stage:literal
+    ) => {
+        pub(super) struct $provider {
+            descriptor: OperationProviderDescriptor,
+            pipelines: Arc<MetalPrimitivePipelines>,
+        }
+
+        impl $provider {
+            pub(super) fn new(
+                runtime: &MetalDeviceRuntime,
+                pipelines: Arc<MetalPrimitivePipelines>,
+            ) -> Result<Self, MetalDeviceRuntimeError> {
+                let contract = $contract().map_err(super::contract_error)?;
+                let descriptor = provider_descriptor(
+                    runtime,
+                    &contract,
+                    $provider_id,
+                    $capability_id,
+                    $estimator_id,
+                    contiguous_bindings($bindings),
+                    $physical_formats,
+                    $quantization_formats,
+                    implementation_fingerprint(&[
+                        include_str!("primitives.rs").as_bytes(),
+                        SHADER_SOURCE.as_bytes(),
+                        $provider_id.as_bytes(),
+                    ]),
+                )?;
+                Ok(Self {
+                    descriptor,
+                    pipelines,
+                })
+            }
+        }
+
+        impl OperationResourceEstimator for $provider {
+            fn descriptor(&self) -> &OperationProviderDescriptor {
+                &self.descriptor
+            }
+
+            fn estimate_resources(
+                &self,
+                request: OperationResourceEstimateRequest<'_>,
+            ) -> Result<OperationResourceEstimate, VNextError> {
+                estimate_without_workspace(&self.descriptor, &request, $operation_id)
+            }
+        }
+
+        impl OperationProvider<MetalDeviceRuntime> for $provider {
+            fn reusable_execution_topology(
+                &self,
+                _request: ReusableExecutionTopologyRequest<'_>,
+            ) -> Result<ReusableExecutionTopology, VNextError> {
+                authorize_reusable_topology(self.descriptor.execution_semantics(), || {
+                    Ok(ReusableExecutionTopology::Static)
+                })
+            }
+
+            fn encode_selected(
+                &self,
+                invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+            ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, OperationFailure> {
+                let identity = invocation.participants()[0].identity().clone();
+                $encode(Arc::clone(&self.pipelines), invocation)
+                    .map(EncodedDeviceOperation::compute)
+                    .map_err(|message| provider_failure(identity, $failure_stage, message))
+            }
+        }
+    };
+}
+
+no_workspace_primitive_provider!(
+    MetalTokenEmbeddingF32MasterProvider,
+    token_embedding_f32_master_contract,
+    TOKEN_EMBEDDING_F32_MASTER_PROVIDER_ID,
+    TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
+    TOKEN_EMBEDDING_F32_MASTER_ESTIMATOR_ID,
+    TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+    2,
+    &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
+    &[Q6_K_FORMAT_ID, Q8_0_FORMAT_ID],
+    encode_token_embedding_f32_master,
+    "metal.token_embedding_f32_master.encode"
+);
+no_workspace_primitive_provider!(
+    MetalRmsNormF32ToF16Provider,
+    rms_norm_f32_to_f16_contract,
+    RMS_NORM_F32_TO_F16_PROVIDER_ID,
+    RMS_NORM_F32_TO_F16_CAPABILITY_ID,
+    RMS_NORM_F32_TO_F16_ESTIMATOR_ID,
+    RMS_NORM_F32_TO_F16_OPERATION_ID,
+    2,
+    &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
+    &[],
+    encode_rms_norm_f32_to_f16,
+    "metal.rms_norm_f32_to_f16.encode"
+);
+no_workspace_primitive_provider!(
+    MetalRmsNormF32Provider,
+    rms_norm_f32_contract,
+    RMS_NORM_F32_PROVIDER_ID,
+    RMS_NORM_F32_CAPABILITY_ID,
+    RMS_NORM_F32_ESTIMATOR_ID,
+    RMS_NORM_F32_OPERATION_ID,
+    2,
+    &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
+    &[],
+    encode_rms_norm_f32,
+    "metal.rms_norm_f32.encode"
+);
+no_workspace_primitive_provider!(
+    MetalResidualAddF32F16Provider,
+    residual_add_f32_f16_contract,
+    RESIDUAL_ADD_F32_F16_PROVIDER_ID,
+    RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
+    RESIDUAL_ADD_F32_F16_ESTIMATOR_ID,
+    RESIDUAL_ADD_F32_F16_OPERATION_ID,
+    2,
+    &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
+    &[],
+    encode_residual_add_f32_f16,
+    "metal.residual_add_f32_f16.encode"
+);
+
+pub(super) struct MetalLastTokenMaskedArgmaxF32Provider {
+    descriptor: OperationProviderDescriptor,
+    pipelines: Arc<MetalPrimitivePipelines>,
+}
+
+impl MetalLastTokenMaskedArgmaxF32Provider {
+    pub(super) fn new(
+        runtime: &MetalDeviceRuntime,
+        pipelines: Arc<MetalPrimitivePipelines>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        let contract = last_token_masked_argmax_f32_contract().map_err(super::contract_error)?;
+        let descriptor = provider_descriptor(
+            runtime,
+            &contract,
+            LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID,
+            LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
+            LAST_TOKEN_MASKED_ARGMAX_F32_ESTIMATOR_ID,
+            contiguous_bindings(5),
+            &[],
+            &[],
+            implementation_fingerprint(&[
+                include_str!("primitives.rs").as_bytes(),
+                SHADER_SOURCE.as_bytes(),
+                LAST_TOKEN_MASKED_ARGMAX_F32_PROVIDER_ID.as_bytes(),
+            ]),
+        )?;
+        Ok(Self {
+            descriptor,
+            pipelines,
+        })
+    }
+}
+
+impl OperationResourceEstimator for MetalLastTokenMaskedArgmaxF32Provider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        estimate_masked_argmax_resources(
+            &self.descriptor,
+            request,
+            LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+            ElementType::F32,
+        )
+    }
+}
+
+impl OperationProvider<MetalDeviceRuntime> for MetalLastTokenMaskedArgmaxF32Provider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        authorize_reusable_topology(self.descriptor.execution_semantics(), || {
+            Ok(ReusableExecutionTopology::Static)
+        })
+    }
+
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_last_token_masked_argmax_f32(Arc::clone(&self.pipelines), invocation)
+            .map(EncodedDeviceOperation::compute)
+            .map_err(|message| {
+                provider_failure(
+                    identity,
+                    "metal.last_token_masked_argmax_f32.encode",
+                    message,
+                )
             })
     }
 }
@@ -417,7 +650,33 @@ fn encode_token_embedding(
     pipelines: Arc<MetalPrimitivePipelines>,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
-    ensure_invocation(&invocation, TOKEN_EMBEDDING_OPERATION_ID)?;
+    encode_token_embedding_typed(
+        pipelines,
+        invocation,
+        TOKEN_EMBEDDING_OPERATION_ID,
+        ElementType::F16,
+    )
+}
+
+fn encode_token_embedding_f32_master(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+) -> Result<MetalDeviceCommand, String> {
+    encode_token_embedding_typed(
+        pipelines,
+        invocation,
+        TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+        ElementType::F32,
+    )
+}
+
+fn encode_token_embedding_typed(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    operation_id: &'static str,
+    output_type: ElementType,
+) -> Result<MetalDeviceCommand, String> {
+    ensure_invocation(&invocation, operation_id)?;
     let token_ranges = invocation.participant_token_ranges();
     if token_ranges.len() != invocation.participants().len() {
         return Err("Metal token embedding participant ranges are incomplete".to_owned());
@@ -431,7 +690,14 @@ fn encode_token_embedding(
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         let hidden_size = unsigned_attribute(participant.attributes(), "hidden_size")?;
         let vocabulary_size = unsigned_attribute(participant.attributes(), "vocab_size")?;
-        validate_embedding_signature(token_ids, table, output, vocabulary_size, hidden_size)?;
+        validate_embedding_signature(
+            token_ids,
+            table,
+            output,
+            vocabulary_size,
+            hidden_size,
+            output_type,
+        )?;
         let weight = resolve_weight(participant, table)?;
         let format = embedding_weight_format(&weight, vocabulary_size, hidden_size)?;
         let (mut table_regions, _, _) = weight.into_command_parts();
@@ -454,7 +720,7 @@ fn encode_token_embedding(
         regions.push(contiguous_token_region(
             participant,
             output,
-            ElementType::F16,
+            output_type,
             token_range.immediate_token_range().start,
             token_range.immediate_tokens(),
         )?);
@@ -489,6 +755,7 @@ fn encode_token_embedding(
                 &regions[launch.first_region + 1],
                 &regions[launch.first_region + 2],
                 launch.params,
+                output_type,
             );
         }
         Ok(())
@@ -584,11 +851,12 @@ fn validate_embedding_signature(
     output: &ferrum_interfaces::vnext::ResolvedValueBinding,
     vocabulary_size: u64,
     hidden_size: u64,
+    output_type: ElementType,
 ) -> Result<(), String> {
     let token_dimensions = token_ids.tensor().dimensions();
     if token_ids.tensor().element_type() != ElementType::U32
         || table.tensor().element_type() != ElementType::F16
-        || output.tensor().element_type() != ElementType::F16
+        || output.tensor().element_type() != output_type
         || token_dimensions.len() != 1
         || table.tensor().dimensions() != [vocabulary_size, hidden_size]
         || output.tensor().dimensions() != [token_dimensions[0], hidden_size]
@@ -622,7 +890,49 @@ fn encode_rms_norm(
     pipelines: Arc<MetalPrimitivePipelines>,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
-    ensure_invocation(&invocation, RMS_NORM_OPERATION_ID)?;
+    encode_rms_norm_typed(
+        pipelines,
+        invocation,
+        RMS_NORM_OPERATION_ID,
+        ElementType::F16,
+        ElementType::F16,
+    )
+}
+
+fn encode_rms_norm_f32_to_f16(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+) -> Result<MetalDeviceCommand, String> {
+    encode_rms_norm_typed(
+        pipelines,
+        invocation,
+        RMS_NORM_F32_TO_F16_OPERATION_ID,
+        ElementType::F32,
+        ElementType::F16,
+    )
+}
+
+fn encode_rms_norm_f32(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+) -> Result<MetalDeviceCommand, String> {
+    encode_rms_norm_typed(
+        pipelines,
+        invocation,
+        RMS_NORM_F32_OPERATION_ID,
+        ElementType::F32,
+        ElementType::F32,
+    )
+}
+
+fn encode_rms_norm_typed(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    operation_id: &'static str,
+    input_type: ElementType,
+    output_type: ElementType,
+) -> Result<MetalDeviceCommand, String> {
+    ensure_invocation(&invocation, operation_id)?;
     let first = &invocation.participants()[0];
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
     let epsilon = rational_attribute(first.attributes(), "epsilon")?;
@@ -632,26 +942,20 @@ fn encode_rms_norm(
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
             || rational_attribute(participant.attributes(), "epsilon")? != epsilon
-            || !valid_rms_norm(input, weight, output, hidden_size)
+            || !valid_rms_norm(input, weight, output, hidden_size, input_type, output_type)
         {
             return Err("Metal RMSNorm participants disagree with the signature".to_owned());
         }
     }
     let tokens = invocation.work_shape().immediate_tokens();
     let regions = vec![
-        shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            0,
-            ElementType::F16,
-            tokens,
-        )?,
+        shared_token_region(&invocation, ResolvedValueRole::Input, 0, input_type, tokens)?,
         shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?,
         shared_token_region(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            output_type,
             tokens,
         )?,
     ];
@@ -666,13 +970,15 @@ fn encode_rms_norm(
     )?;
     MetalDeviceCommand::operation("vnext_rms_norm", regions, move |encoder, regions| {
         encoder.record_compute_dispatches(1);
-        dispatch_rms_norm(
+        dispatch_rms_norm_typed(
             &pipelines,
             encoder.compute_encoder(),
             &regions[0],
             &regions[1],
             &regions[2],
             params,
+            input_type,
+            output_type,
         );
         Ok(())
     })
@@ -694,6 +1000,8 @@ fn valid_rms_norm(
     weight: &ferrum_interfaces::vnext::ResolvedValueBinding,
     output: &ferrum_interfaces::vnext::ResolvedValueBinding,
     hidden_size: u64,
+    input_type: ElementType,
+    output_type: ElementType,
 ) -> bool {
     let [rows, input_hidden] = input.tensor().dimensions() else {
         return false;
@@ -701,9 +1009,11 @@ fn valid_rms_norm(
     *input_hidden == hidden_size
         && weight.tensor().dimensions() == [hidden_size]
         && output.tensor().dimensions() == [*rows, hidden_size]
-        && f16_contiguous(input)
+        && input.tensor().element_type() == input_type
+        && matches!(input.tensor().layout(), ResolvedTensorLayout::Contiguous)
         && f16_contiguous(weight)
-        && f16_contiguous(output)
+        && output.tensor().element_type() == output_type
+        && matches!(output.tensor().layout(), ResolvedTensorLayout::Contiguous)
 }
 
 #[repr(C)]
@@ -716,7 +1026,39 @@ fn encode_residual_add(
     pipelines: Arc<MetalPrimitivePipelines>,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
-    ensure_invocation(&invocation, RESIDUAL_ADD_OPERATION_ID)?;
+    encode_residual_add_typed(
+        pipelines,
+        invocation,
+        RESIDUAL_ADD_OPERATION_ID,
+        ElementType::F16,
+        ElementType::F16,
+        ElementType::F16,
+    )
+}
+
+fn encode_residual_add_f32_f16(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+) -> Result<MetalDeviceCommand, String> {
+    encode_residual_add_typed(
+        pipelines,
+        invocation,
+        RESIDUAL_ADD_F32_F16_OPERATION_ID,
+        ElementType::F32,
+        ElementType::F16,
+        ElementType::F32,
+    )
+}
+
+fn encode_residual_add_typed(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    operation_id: &'static str,
+    left_type: ElementType,
+    right_type: ElementType,
+    output_type: ElementType,
+) -> Result<MetalDeviceCommand, String> {
+    ensure_invocation(&invocation, operation_id)?;
     let first = &invocation.participants()[0];
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
     for participant in invocation.participants() {
@@ -724,7 +1066,15 @@ fn encode_residual_add(
         let right = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
         let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
         if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
-            || !valid_residual_add(left, right, output, hidden_size)
+            || !valid_residual_add(
+                left,
+                right,
+                output,
+                hidden_size,
+                left_type,
+                right_type,
+                output_type,
+            )
         {
             return Err("Metal residual-add participants disagree with the signature".to_owned());
         }
@@ -734,25 +1084,13 @@ fn encode_residual_add(
         .checked_mul(hidden_size)
         .ok_or_else(|| "Metal residual-add element count overflows".to_owned())?;
     let regions = vec![
-        shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            0,
-            ElementType::F16,
-            tokens,
-        )?,
-        shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            1,
-            ElementType::F16,
-            tokens,
-        )?,
+        shared_token_region(&invocation, ResolvedValueRole::Input, 0, left_type, tokens)?,
+        shared_token_region(&invocation, ResolvedValueRole::Input, 1, right_type, tokens)?,
         shared_token_region(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            output_type,
             tokens,
         )?,
     ];
@@ -765,13 +1103,16 @@ fn encode_residual_add(
     )?;
     MetalDeviceCommand::operation("vnext_residual_add", regions, move |encoder, regions| {
         encoder.record_compute_dispatches(1);
-        dispatch_residual_add(
+        dispatch_residual_add_typed(
             &pipelines,
             encoder.compute_encoder(),
             &regions[0],
             &regions[1],
             &regions[2],
             params,
+            left_type,
+            right_type,
+            output_type,
         );
         Ok(())
     })
@@ -793,6 +1134,9 @@ fn valid_residual_add(
     right: &ferrum_interfaces::vnext::ResolvedValueBinding,
     output: &ferrum_interfaces::vnext::ResolvedValueBinding,
     hidden_size: u64,
+    left_type: ElementType,
+    right_type: ElementType,
+    output_type: ElementType,
 ) -> bool {
     let [tokens, input_hidden] = left.tensor().dimensions() else {
         return false;
@@ -800,9 +1144,12 @@ fn valid_residual_add(
     *input_hidden == hidden_size
         && right.tensor().dimensions() == [*tokens, hidden_size]
         && output.tensor().dimensions() == [*tokens, hidden_size]
-        && f16_contiguous(left)
-        && f16_contiguous(right)
-        && f16_contiguous(output)
+        && left.tensor().element_type() == left_type
+        && right.tensor().element_type() == right_type
+        && output.tensor().element_type() == output_type
+        && matches!(left.tensor().layout(), ResolvedTensorLayout::Contiguous)
+        && matches!(right.tensor().layout(), ResolvedTensorLayout::Contiguous)
+        && matches!(output.tensor().layout(), ResolvedTensorLayout::Contiguous)
 }
 
 #[repr(C)]
@@ -823,10 +1170,36 @@ fn encode_last_token_masked_argmax(
     pipelines: Arc<MetalPrimitivePipelines>,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<MetalDeviceCommand, String> {
-    ensure_invocation(&invocation, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)?;
+    encode_last_token_masked_argmax_typed(
+        pipelines,
+        invocation,
+        LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+        ElementType::F16,
+    )
+}
+
+fn encode_last_token_masked_argmax_f32(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+) -> Result<MetalDeviceCommand, String> {
+    encode_last_token_masked_argmax_typed(
+        pipelines,
+        invocation,
+        LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+        ElementType::F32,
+    )
+}
+
+fn encode_last_token_masked_argmax_typed(
+    pipelines: Arc<MetalPrimitivePipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    operation_id: &'static str,
+    logits_type: ElementType,
+) -> Result<MetalDeviceCommand, String> {
+    ensure_invocation(&invocation, operation_id)?;
     let first_vocabulary_size =
         unsigned_attribute(invocation.participants()[0].attributes(), "vocab_size")?;
-    let scratch_stride = masked_argmax_scratch_stride(first_vocabulary_size)?;
+    let scratch_stride = masked_argmax_scratch_stride(first_vocabulary_size, logits_type)?;
     let required_scratch_bytes = scratch_stride
         .checked_mul(invocation.participants().len() as u64)
         .ok_or_else(|| "Metal masked argmax scratch size overflows".to_owned())?;
@@ -851,13 +1224,14 @@ fn encode_last_token_masked_argmax(
             repetition_penalty,
             output,
             vocabulary_size,
+            logits_type,
         ) else {
             return Err(
                 "Metal masked argmax participant differs from its resolved signature".to_owned(),
             );
         };
         let first_region = regions.len();
-        regions.push(contiguous_region(participant, logits, ElementType::F16)?);
+        regions.push(contiguous_region(participant, logits, logits_type)?);
         regions.push(contiguous_region(participant, valid_mask, ElementType::U8)?);
         regions.push(contiguous_region(
             participant,
@@ -914,6 +1288,7 @@ fn encode_last_token_masked_argmax(
                     &regions[scratch_region],
                     launch.scratch_offset_bytes,
                     launch.params,
+                    logits_type,
                 );
             }
             Ok(())
@@ -940,11 +1315,12 @@ fn valid_last_token_masked_argmax(
     repetition_penalty: &ResolvedValueBinding,
     output: &ResolvedValueBinding,
     vocabulary_size: u64,
+    logits_type: ElementType,
 ) -> Option<u32> {
     let contiguous = |binding: &ResolvedValueBinding| {
         matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
     };
-    let valid = logits.tensor().element_type() == ElementType::F16
+    let valid = logits.tensor().element_type() == logits_type
         && valid_mask.tensor().element_type() == ElementType::U8
         && repetition_token_ids.tensor().element_type() == ElementType::U32
         && repetition_offsets.tensor().element_type() == ElementType::U32
@@ -1003,8 +1379,14 @@ fn dispatch_last_token_masked_argmax(
     scratch: &MetalBufferRegion,
     scratch_offset_bytes: u64,
     params: LastTokenMaskedArgmaxParams,
+    logits_type: ElementType,
 ) {
-    encoder.set_compute_pipeline_state(&pipelines.last_token_masked_argmax);
+    let pipeline = match logits_type {
+        ElementType::F16 => &pipelines.last_token_masked_argmax,
+        ElementType::F32 => &pipelines.last_token_masked_argmax_f32,
+        other => panic!("unsupported Metal masked argmax logits type {other:?}"),
+    };
+    encoder.set_compute_pipeline_state(pipeline);
     set_region(encoder, 0, logits);
     set_region_offset(encoder, 1, scratch, scratch_offset_bytes);
     set_region(encoder, 2, valid_mask);
@@ -1020,9 +1402,48 @@ fn dispatch_last_token_masked_argmax(
     encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(THREADS_PER_GROUP, 1, 1));
 }
 
-fn masked_argmax_scratch_stride(vocabulary_size: u64) -> Result<u64, String> {
+fn estimate_masked_argmax_resources(
+    descriptor: &OperationProviderDescriptor,
+    request: OperationResourceEstimateRequest<'_>,
+    operation_id: &str,
+    logits_type: ElementType,
+) -> Result<OperationResourceEstimate, VNextError> {
+    if request.operation().id.as_str() != operation_id
+        || request.operation().fingerprint()? != descriptor.operation_fingerprint()
+    {
+        return Err(invalid_plan(format!(
+            "Metal estimator `{}` received another operation",
+            descriptor.resource_estimator_id()
+        )));
+    }
+    let vocabulary_size =
+        unsigned_attribute(request.attributes(), "vocab_size").map_err(invalid_plan)?;
+    let scratch_bytes =
+        masked_argmax_scratch_stride(vocabulary_size, logits_type).map_err(invalid_plan)?;
+    let scratch = ProviderWorkspaceRequirement::from_formula(
+        ProviderWorkspaceSizeFormula::actual_sequences(scratch_bytes)?,
+        VALUE_ALIGNMENT_BYTES,
+        ProviderWorkspaceScope::Invocation,
+        ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
+        DynamicStorageRequirement::contiguous(),
+    )?;
+    Ok(OperationResourceEstimate::new(
+        descriptor.resource_estimator_id(),
+        descriptor.resource_estimator_version(),
+        descriptor.resource_estimator_implementation_fingerprint(),
+        request.input_fingerprint(),
+        VALUE_ALIGNMENT_BYTES,
+        Some(scratch),
+        None,
+    ))
+}
+
+fn masked_argmax_scratch_stride(
+    vocabulary_size: u64,
+    logits_type: ElementType,
+) -> Result<u64, String> {
     let bytes = vocabulary_size
-        .checked_mul(ElementType::F16.size_bytes())
+        .checked_mul(logits_type.size_bytes())
         .ok_or_else(|| "Metal masked argmax scratch size overflows".to_owned())?;
     bytes
         .checked_add(VALUE_ALIGNMENT_BYTES - 1)
@@ -1039,11 +1460,16 @@ fn dispatch_embedding(
     token_ids: &MetalBufferRegion,
     output: &MetalBufferRegion,
     params: EmbeddingParams,
+    output_type: ElementType,
 ) {
-    let pipeline = match format {
-        EmbeddingPhysicalFormat::DenseF16 => &pipelines.embedding_dense,
-        EmbeddingPhysicalFormat::Q6K => &pipelines.embedding_q6_k,
-        EmbeddingPhysicalFormat::Q8_0 => &pipelines.embedding_q8_0,
+    let pipeline = match (format, output_type) {
+        (EmbeddingPhysicalFormat::DenseF16, ElementType::F16) => &pipelines.embedding_dense,
+        (EmbeddingPhysicalFormat::Q6K, ElementType::F16) => &pipelines.embedding_q6_k,
+        (EmbeddingPhysicalFormat::Q8_0, ElementType::F16) => &pipelines.embedding_q8_0,
+        (EmbeddingPhysicalFormat::DenseF16, ElementType::F32) => &pipelines.embedding_dense_f32,
+        (EmbeddingPhysicalFormat::Q6K, ElementType::F32) => &pipelines.embedding_q6_k_f32,
+        (EmbeddingPhysicalFormat::Q8_0, ElementType::F32) => &pipelines.embedding_q8_0_f32,
+        (_, other) => panic!("unsupported Metal embedding output type {other:?}"),
     };
     encoder.set_compute_pipeline_state(pipeline);
     set_region(encoder, 0, table);
@@ -1072,7 +1498,29 @@ fn dispatch_rms_norm(
     output: &MetalBufferRegion,
     params: RmsNormParams,
 ) {
-    dispatch_rms_norm_at(
+    dispatch_rms_norm_typed(
+        pipelines,
+        encoder,
+        input,
+        weight,
+        output,
+        params,
+        ElementType::F16,
+        ElementType::F16,
+    );
+}
+
+fn dispatch_rms_norm_typed(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    input: &MetalBufferRegion,
+    weight: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    params: RmsNormParams,
+    input_type: ElementType,
+    output_type: ElementType,
+) {
+    dispatch_rms_norm_typed_at(
         pipelines,
         encoder,
         input,
@@ -1083,6 +1531,8 @@ fn dispatch_rms_norm(
         params.rows,
         params.hidden_size,
         params.epsilon,
+        input_type,
+        output_type,
     );
 }
 
@@ -1099,12 +1549,107 @@ pub(super) fn dispatch_rms_norm_at(
     hidden_size: u32,
     epsilon: f32,
 ) {
+    dispatch_rms_norm_typed_at(
+        pipelines,
+        encoder,
+        input,
+        input_offset_bytes,
+        weight,
+        output,
+        output_offset_bytes,
+        rows,
+        hidden_size,
+        epsilon,
+        ElementType::F16,
+        ElementType::F16,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_rms_norm_f32_to_f16_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    input: &MetalBufferRegion,
+    input_offset_bytes: u64,
+    weight: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    rows: u32,
+    hidden_size: u32,
+    epsilon: f32,
+) {
+    dispatch_rms_norm_typed_at(
+        pipelines,
+        encoder,
+        input,
+        input_offset_bytes,
+        weight,
+        output,
+        output_offset_bytes,
+        rows,
+        hidden_size,
+        epsilon,
+        ElementType::F32,
+        ElementType::F16,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_rms_norm_f32_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    input: &MetalBufferRegion,
+    input_offset_bytes: u64,
+    weight: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    rows: u32,
+    hidden_size: u32,
+    epsilon: f32,
+) {
+    dispatch_rms_norm_typed_at(
+        pipelines,
+        encoder,
+        input,
+        input_offset_bytes,
+        weight,
+        output,
+        output_offset_bytes,
+        rows,
+        hidden_size,
+        epsilon,
+        ElementType::F32,
+        ElementType::F32,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_rms_norm_typed_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    input: &MetalBufferRegion,
+    input_offset_bytes: u64,
+    weight: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    rows: u32,
+    hidden_size: u32,
+    epsilon: f32,
+    input_type: ElementType,
+    output_type: ElementType,
+) {
     let params = RmsNormParams {
         rows,
         hidden_size,
         epsilon,
     };
-    encoder.set_compute_pipeline_state(&pipelines.rms_norm);
+    let pipeline = match (input_type, output_type) {
+        (ElementType::F16, ElementType::F16) => &pipelines.rms_norm,
+        (ElementType::F32, ElementType::F16) => &pipelines.rms_norm_f32_to_f16,
+        (ElementType::F32, ElementType::F32) => &pipelines.rms_norm_f32,
+        other => panic!("unsupported Metal RMSNorm type pair {other:?}"),
+    };
+    encoder.set_compute_pipeline_state(pipeline);
     set_region_offset(encoder, 0, input, input_offset_bytes);
     set_region(encoder, 1, weight);
     set_region_offset(encoder, 2, output, output_offset_bytes);
@@ -1128,7 +1673,32 @@ fn dispatch_residual_add(
     output: &MetalBufferRegion,
     params: ResidualAddParams,
 ) {
-    dispatch_residual_add_at(
+    dispatch_residual_add_typed(
+        pipelines,
+        encoder,
+        left,
+        right,
+        output,
+        params,
+        ElementType::F16,
+        ElementType::F16,
+        ElementType::F16,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_residual_add_typed(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    left: &MetalBufferRegion,
+    right: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    params: ResidualAddParams,
+    left_type: ElementType,
+    right_type: ElementType,
+    output_type: ElementType,
+) {
+    dispatch_residual_add_typed_at(
         pipelines,
         encoder,
         left,
@@ -1138,6 +1708,9 @@ fn dispatch_residual_add(
         output,
         0,
         params.elements,
+        left_type,
+        right_type,
+        output_type,
     );
 }
 
@@ -1153,8 +1726,72 @@ pub(super) fn dispatch_residual_add_at(
     output_offset_bytes: u64,
     elements: u32,
 ) {
+    dispatch_residual_add_typed_at(
+        pipelines,
+        encoder,
+        left,
+        left_offset_bytes,
+        right,
+        right_offset_bytes,
+        output,
+        output_offset_bytes,
+        elements,
+        ElementType::F16,
+        ElementType::F16,
+        ElementType::F16,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_residual_add_f32_f16_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    left: &MetalBufferRegion,
+    left_offset_bytes: u64,
+    right: &MetalBufferRegion,
+    right_offset_bytes: u64,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    elements: u32,
+) {
+    dispatch_residual_add_typed_at(
+        pipelines,
+        encoder,
+        left,
+        left_offset_bytes,
+        right,
+        right_offset_bytes,
+        output,
+        output_offset_bytes,
+        elements,
+        ElementType::F32,
+        ElementType::F16,
+        ElementType::F32,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_residual_add_typed_at(
+    pipelines: &MetalPrimitivePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    left: &MetalBufferRegion,
+    left_offset_bytes: u64,
+    right: &MetalBufferRegion,
+    right_offset_bytes: u64,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    elements: u32,
+    left_type: ElementType,
+    right_type: ElementType,
+    output_type: ElementType,
+) {
     let params = ResidualAddParams { elements };
-    encoder.set_compute_pipeline_state(&pipelines.residual_add);
+    let pipeline = match (left_type, right_type, output_type) {
+        (ElementType::F16, ElementType::F16, ElementType::F16) => &pipelines.residual_add,
+        (ElementType::F32, ElementType::F16, ElementType::F32) => &pipelines.residual_add_f32_f16,
+        other => panic!("unsupported Metal residual-add type triple {other:?}"),
+    };
+    encoder.set_compute_pipeline_state(pipeline);
     set_region_offset(encoder, 0, left, left_offset_bytes);
     set_region_offset(encoder, 1, right, right_offset_bytes);
     set_region_offset(encoder, 2, output, output_offset_bytes);
@@ -1210,6 +1847,153 @@ mod tests {
         let values: &[f16] =
             unsafe { std::slice::from_raw_parts(buffer.contents() as *const f16, elements) };
         values.iter().map(|value| value.to_f32()).collect()
+    }
+
+    fn read_f32(buffer: &BufferRef, elements: usize) -> Vec<f32> {
+        unsafe { std::slice::from_raw_parts(buffer.contents() as *const f32, elements) }.to_vec()
+    }
+
+    #[test]
+    fn f32_master_primitives_preserve_precision_and_residual_aliasing_on_real_metal() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping F32 master primitive conformance");
+            return;
+        };
+        let pipelines = MetalPrimitivePipelines::new(&device).unwrap();
+        let queue = device.new_command_queue();
+
+        let table = [
+            f16::from_f32(1.0),
+            f16::from_f32(2.0),
+            f16::from_f32(3.0),
+            f16::from_f32(4.0),
+        ];
+        let table_buffer = shared_buffer(&device, &table);
+        let token_buffer = shared_buffer(&device, &[0_u32]);
+        let embedding_output = output_buffer::<f32>(&device, 4);
+
+        let rms_input = [1.0_f32, 2.0, 3.0, 4.0];
+        let rms_weight = [f16::from_f32(1.0); 4];
+        let rms_input_buffer = shared_buffer(&device, &rms_input);
+        let rms_weight_buffer = shared_buffer(&device, &rms_weight);
+        let rms_f16_output = output_buffer::<f16>(&device, 4);
+        let rms_f32_output = output_buffer::<f32>(&device, 4);
+
+        let residual_left = [1.0_f32, -2.0, 3.25, -4.5];
+        let residual_right = [
+            f16::from_f32(0.5),
+            f16::from_f32(1.0),
+            f16::from_f32(-0.25),
+            f16::from_f32(2.0),
+        ];
+        let residual_left_buffer = shared_buffer(&device, &residual_left);
+        let residual_alias_buffer = shared_buffer(&device, &residual_left);
+        let residual_right_buffer = shared_buffer(&device, &residual_right);
+        let residual_output = output_buffer::<f32>(&device, 4);
+
+        let close_logits = [21.930_f32, 21.934_f32];
+        assert_eq!(
+            f16::from_f32(close_logits[0]),
+            f16::from_f32(close_logits[1]),
+            "adversarial logits must demonstrate the precision lost by the legacy F16 boundary"
+        );
+        let logits_buffer = shared_buffer(&device, &close_logits);
+        let mask_buffer = shared_buffer(&device, &[1_u8, 1]);
+        let repetition_ids_buffer = shared_buffer(&device, &[0_u32]);
+        let repetition_offsets_buffer = shared_buffer(&device, &[0_u32, 0]);
+        let repetition_penalty_buffer = shared_buffer(&device, &[1.0_f32]);
+        let argmax_output = output_buffer::<u32>(&device, 1);
+        let argmax_scratch = output_buffer::<f32>(&device, 2);
+
+        let command = queue.new_command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        dispatch_raw_embedding_f32(
+            &pipelines,
+            encoder,
+            &table_buffer,
+            &token_buffer,
+            &embedding_output,
+            EmbeddingParams {
+                token_count: 1,
+                hidden_size: 4,
+                vocabulary_size: 1,
+            },
+        );
+        dispatch_raw_rms_norm_f32(
+            &pipelines,
+            encoder,
+            &rms_input_buffer,
+            &rms_weight_buffer,
+            &rms_f16_output,
+            RmsNormParams {
+                rows: 1,
+                hidden_size: 4,
+                epsilon: 1e-6,
+            },
+            false,
+        );
+        dispatch_raw_rms_norm_f32(
+            &pipelines,
+            encoder,
+            &rms_input_buffer,
+            &rms_weight_buffer,
+            &rms_f32_output,
+            RmsNormParams {
+                rows: 1,
+                hidden_size: 4,
+                epsilon: 1e-6,
+            },
+            true,
+        );
+        dispatch_raw_residual_add_f32_f16(
+            &pipelines,
+            encoder,
+            &residual_left_buffer,
+            &residual_right_buffer,
+            &residual_output,
+            ResidualAddParams { elements: 4 },
+        );
+        dispatch_raw_residual_add_f32_f16(
+            &pipelines,
+            encoder,
+            &residual_alias_buffer,
+            &residual_right_buffer,
+            &residual_alias_buffer,
+            ResidualAddParams { elements: 4 },
+        );
+        dispatch_raw_last_token_masked_argmax_f32(
+            &pipelines,
+            encoder,
+            &logits_buffer,
+            &mask_buffer,
+            &repetition_ids_buffer,
+            &repetition_offsets_buffer,
+            &repetition_penalty_buffer,
+            &argmax_output,
+            &argmax_scratch,
+            LastTokenMaskedArgmaxParams {
+                vocabulary_size: 2,
+                repetition_capacity: 1,
+            },
+        );
+        encoder.end_encoding();
+        command.commit();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+        assert_eq!(read_f32(&embedding_output, 4), [1.0, 2.0, 3.0, 4.0]);
+        let inverse_rms = (7.5_f32 + 1e-6).sqrt().recip();
+        let expected_rms = rms_input.map(|value| value * inverse_rms);
+        for (observed, expected) in read_f32(&rms_f32_output, 4).iter().zip(expected_rms) {
+            assert!((observed - expected).abs() <= 1e-5);
+        }
+        for (observed, expected) in read_f16(&rms_f16_output, 4).iter().zip(expected_rms) {
+            assert!((observed - expected).abs() <= 1e-3);
+        }
+        let expected_residual = [1.5_f32, -1.0, 3.0, -2.5];
+        assert_eq!(read_f32(&residual_output, 4), expected_residual);
+        assert_eq!(read_f32(&residual_alias_buffer, 4), expected_residual);
+        assert_eq!(unsafe { *(argmax_output.contents() as *const u32) }, 1);
     }
 
     #[test]
@@ -1520,6 +2304,33 @@ mod tests {
         );
     }
 
+    fn dispatch_raw_embedding_f32(
+        pipelines: &MetalPrimitivePipelines,
+        encoder: &ComputeCommandEncoderRef,
+        table: &BufferRef,
+        token_ids: &BufferRef,
+        output: &BufferRef,
+        params: EmbeddingParams,
+    ) {
+        encoder.set_compute_pipeline_state(&pipelines.embedding_dense_f32);
+        set_raw(encoder, 0, table);
+        set_raw(encoder, 1, token_ids);
+        set_raw(encoder, 2, output);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<EmbeddingParams>() as u64,
+            &params as *const _ as *const c_void,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                u64::from(params.hidden_size).div_ceil(THREADS_PER_GROUP),
+                u64::from(params.token_count),
+                1,
+            ),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    }
+
     fn dispatch_raw_rms_norm(
         pipelines: &MetalPrimitivePipelines,
         encoder: &ComputeCommandEncoderRef,
@@ -1529,6 +2340,35 @@ mod tests {
         params: RmsNormParams,
     ) {
         encoder.set_compute_pipeline_state(&pipelines.rms_norm);
+        set_raw(encoder, 0, input);
+        set_raw(encoder, 1, weight);
+        set_raw(encoder, 2, output);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<RmsNormParams>() as u64,
+            &params as *const _ as *const c_void,
+        );
+        encoder.set_threadgroup_memory_length(0, 32 * std::mem::size_of::<f32>() as u64);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.rows), 1, 1),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    }
+
+    fn dispatch_raw_rms_norm_f32(
+        pipelines: &MetalPrimitivePipelines,
+        encoder: &ComputeCommandEncoderRef,
+        input: &BufferRef,
+        weight: &BufferRef,
+        output: &BufferRef,
+        params: RmsNormParams,
+        output_f32: bool,
+    ) {
+        encoder.set_compute_pipeline_state(if output_f32 {
+            &pipelines.rms_norm_f32
+        } else {
+            &pipelines.rms_norm_f32_to_f16
+        });
         set_raw(encoder, 0, input);
         set_raw(encoder, 1, weight);
         set_raw(encoder, 2, output);
@@ -1567,6 +2407,29 @@ mod tests {
         );
     }
 
+    fn dispatch_raw_residual_add_f32_f16(
+        pipelines: &MetalPrimitivePipelines,
+        encoder: &ComputeCommandEncoderRef,
+        left: &BufferRef,
+        right: &BufferRef,
+        output: &BufferRef,
+        params: ResidualAddParams,
+    ) {
+        encoder.set_compute_pipeline_state(&pipelines.residual_add_f32_f16);
+        set_raw(encoder, 0, left);
+        set_raw(encoder, 1, right);
+        set_raw(encoder, 2, output);
+        encoder.set_bytes(
+            3,
+            std::mem::size_of::<ResidualAddParams>() as u64,
+            &params as *const _ as *const c_void,
+        );
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(params.elements).div_ceil(THREADS_PER_GROUP), 1, 1),
+            MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        );
+    }
+
     fn dispatch_raw_last_token_masked_argmax(
         pipelines: &MetalPrimitivePipelines,
         encoder: &ComputeCommandEncoderRef,
@@ -1580,6 +2443,36 @@ mod tests {
         params: LastTokenMaskedArgmaxParams,
     ) {
         encoder.set_compute_pipeline_state(&pipelines.last_token_masked_argmax);
+        set_raw(encoder, 0, logits);
+        set_raw(encoder, 1, scratch);
+        set_raw(encoder, 2, valid_mask);
+        set_raw(encoder, 3, repetition_token_ids);
+        set_raw(encoder, 4, repetition_offsets);
+        set_raw(encoder, 5, repetition_penalty);
+        set_raw(encoder, 6, output);
+        encoder.set_bytes(
+            7,
+            std::mem::size_of::<LastTokenMaskedArgmaxParams>() as u64,
+            &params as *const _ as *const c_void,
+        );
+        encoder
+            .dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(THREADS_PER_GROUP, 1, 1));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_raw_last_token_masked_argmax_f32(
+        pipelines: &MetalPrimitivePipelines,
+        encoder: &ComputeCommandEncoderRef,
+        logits: &BufferRef,
+        valid_mask: &BufferRef,
+        repetition_token_ids: &BufferRef,
+        repetition_offsets: &BufferRef,
+        repetition_penalty: &BufferRef,
+        output: &BufferRef,
+        scratch: &BufferRef,
+        params: LastTokenMaskedArgmaxParams,
+    ) {
+        encoder.set_compute_pipeline_state(&pipelines.last_token_masked_argmax_f32);
         set_raw(encoder, 0, logits);
         set_raw(encoder, 1, scratch);
         set_raw(encoder, 2, valid_mask);

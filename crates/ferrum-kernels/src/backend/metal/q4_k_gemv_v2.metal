@@ -203,3 +203,30 @@ kernel void gemv_f16a_q4kw_v2_batched(
         sgitg
     );
 }
+
+kernel void gemv_f32a_q4kw_v2_batched(
+    device const float * src1 [[buffer(0)]],
+    device const block_q4_K * src0 [[buffer(1)]],
+    device float * dst [[buffer(2)]],
+    constant GemvQ4KBatchParams & p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]])
+{
+    if (tgpig.y >= p.rows) return;
+    const int nb01 = int((p.in_features / QK_K) * sizeof(block_q4_K));
+    gemv_q4kw_v2_impl(
+        src0,
+        src1,
+        dst,
+        int(p.out_features),
+        int(p.in_features),
+        nb01,
+        tgpig.y,
+        p.output_stride,
+        p.output_column_offset,
+        tgpig,
+        tiisg,
+        sgitg
+    );
+}
