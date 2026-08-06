@@ -227,7 +227,9 @@ def load_token_ids(path: Path) -> list[int]:
     return token_ids
 
 
-def validate_ferrum_capture_schema(plan: Any, wave: Any) -> int:
+def validate_ferrum_capture_schema(
+    plan: Any, wave: Any, *, allow_decode: bool = False
+) -> int:
     require(isinstance(plan, dict) and isinstance(wave, dict),
             "Ferrum plan and wave must be JSON objects")
     schema_version = plan.get("schema_version")
@@ -239,14 +241,26 @@ def validate_ferrum_capture_schema(plan: Any, wave: Any) -> int:
     if schema_version >= 2:
         maximum_decode_waves = plan.get("maximum_decode_waves")
         require(isinstance(maximum_decode_waves, int)
-                and not isinstance(maximum_decode_waves, bool)
-                and maximum_decode_waves == 0,
-                "numerical reference capture must not include decode waves")
+                and not isinstance(maximum_decode_waves, bool),
+                "numerical reference maximum_decode_waves must be an integer")
+        if allow_decode:
+            require(maximum_decode_waves >= 1,
+                    "decode numerical reference requires captured decode waves")
+        else:
+            require(maximum_decode_waves == 0,
+                    "numerical reference capture must not include decode waves")
     if schema_version >= 3:
-        require(plan.get("capture_product_output") is False,
-                "numerical reference capture must not include product outputs")
-        require(wave.get("product_outputs") == [],
-                "numerical reference wave product outputs must be empty")
+        if allow_decode:
+            require(plan.get("capture_product_output") is True,
+                    "decode numerical reference requires product output capture")
+            require(isinstance(wave.get("product_outputs"), list)
+                    and bool(wave["product_outputs"]),
+                    "decode numerical reference wave requires product outputs")
+        else:
+            require(plan.get("capture_product_output") is False,
+                    "numerical reference capture must not include product outputs")
+            require(wave.get("product_outputs") == [],
+                    "numerical reference wave product outputs must be empty")
     return schema_version
 
 
