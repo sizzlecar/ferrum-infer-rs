@@ -83,48 +83,15 @@ def load_capture(
         ]
         common.require(len(selected) == 1,
                        f"Ferrum wave must contain exactly one {value_id}")
-        record = selected[0]
-        common.require(record.get("participant_index") == 0,
-                       f"{value_id} participant index must be zero")
-        span = record.get("token_span")
-        common.require(isinstance(span, dict), f"{value_id} token_span must be an object")
-        common.require(
-            span.get("immediate_tokens") == token_count
-            and span.get("full_input_tokens") == token_count
-            and span.get("immediate_start_token") == 0
-            and span.get("immediate_end_token") == token_count,
-            f"{value_id} does not cover the complete prompt",
+        raw_path, checkpoint = common.load_ferrum_master_checkpoint_record(
+            capture_dir,
+            selected[0],
+            value_id=value_id,
+            token_count=token_count,
+            hidden_size=HIDDEN_SIZE,
         )
-        tensor = record["value"].get("tensor")
-        layout = record.get("output_layout")
-        common.require(isinstance(tensor, dict) and isinstance(layout, dict),
-                       f"{value_id} tensor/layout must be objects")
-        common.require(tensor.get("element_type") == "f16"
-                       and layout.get("element_type") == "f16",
-                       f"{value_id} must be logical FP16")
-        dimensions = tensor.get("dimensions")
-        common.require(isinstance(dimensions, list) and len(dimensions) == 2,
-                       f"{value_id} must have rank-2 capacity")
-        common.require(dimensions[0] >= token_count and dimensions[1] == HIDDEN_SIZE,
-                       f"{value_id} capacity differs from the fixture")
-        elements = token_count * HIDDEN_SIZE
-        common.require(layout.get("element_count") == elements
-                       and record.get("raw_bytes") == elements * 2,
-                       f"{value_id} element/byte count differs")
-        raw_path = common.safe_child(capture_dir, record.get("raw_file"),
-                                     f"{value_id}.raw_file")
-        common.require(raw_path.stat().st_size == elements * 2,
-                       f"{value_id} file size differs")
-        raw_sha = common.sha256_file(raw_path)
-        common.require(raw_sha == record.get("raw_sha256"),
-                       f"{value_id} SHA256 mismatch")
         paths[value_id] = raw_path
-        checkpoint_provenance[value_id] = {
-            "logical_dtype": "fp16",
-            "logical_shape": [token_count, HIDDEN_SIZE],
-            "raw_file": raw_path.name,
-            "raw_sha256": raw_sha,
-        }
+        checkpoint_provenance[value_id] = checkpoint
 
     artifact_root = capture_dir.parent
     provenance = {
@@ -368,11 +335,11 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
                        f"dequantized tensor is non-finite: {name}")
         weights[name] = value
 
-    layer_input = np.fromfile(capture_paths[INPUT_VALUE_ID], dtype="<f2").astype(
-        np.float32
+    layer_input = np.fromfile(
+        capture_paths[INPUT_VALUE_ID], dtype=common.FERRUM_MASTER_NUMPY_DTYPE
     ).reshape(token_count, HIDDEN_SIZE)
-    actual_output = np.fromfile(capture_paths[OUTPUT_VALUE_ID], dtype="<f2").astype(
-        np.float32
+    actual_output = np.fromfile(
+        capture_paths[OUTPUT_VALUE_ID], dtype=common.FERRUM_MASTER_NUMPY_DTYPE
     ).reshape(token_count, HIDDEN_SIZE)
     reference, stage_hashes = execute_full_attention(np, layer_input, weights)
     reference_path = out_dir / "layer-3-full-attention-residual.f32"
@@ -381,7 +348,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     metrics.update(
         {
             "shape": [token_count, HIDDEN_SIZE],
-            "actual_logical_dtype": "fp16",
+            "actual_logical_dtype": common.FERRUM_MASTER_LOGICAL_DTYPE,
             "oracle_precision": "fp32",
             "actual_f32_sha256": tensor_f32_sha256(np, actual_output),
             "expected_f32_sha256": common.sha256_file(reference_path),
@@ -420,7 +387,10 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         "schema_version": 1,
         "status": "measured",
         "oracle": {
-            "identity": "cpu.fp32.python.qwen35_gguf_full_attention_reference",
+            "identity": (
+                "cpu.fp32.python."
+                "qwen35_gguf_full_attention_f32_master_capture_reference"
+            ),
             "precision": "fp32",
             "semantics": (
                 "independent Qwen3.5 layer-3 RMSNorm, gated QKV, Q/K norm, "
@@ -457,7 +427,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         },
         "fixture": {
             "fixture_id": (
-                "qwen35-4b.gguf-q4-k-m.layer-3.full-attention."
+                "qwen35-4b.gguf-q4-k-m.f32-master.layer-3.full-attention."
                 f"tokens-{token_count}"
             ),
             "layer_index": 3,
@@ -508,7 +478,7 @@ def self_test() -> None:
         records = []
         for index, value_id in enumerate((INPUT_VALUE_ID, OUTPUT_VALUE_ID)):
             raw_name = f"checkpoint-{index}.bin"
-            payload = struct.pack("<e", float(index + 1)) * HIDDEN_SIZE
+            payload = struct.pack("<f", float(index + 1)) * HIDDEN_SIZE
             (capture / raw_name).write_bytes(payload)
             records.append(
                 {
@@ -516,7 +486,7 @@ def self_test() -> None:
                         "value_id": value_id,
                         "tensor": {
                             "dimensions": [TOKENS_MAXIMUM, HIDDEN_SIZE],
-                            "element_type": "f16",
+                            "element_type": "f32",
                         },
                     },
                     "participant_index": 0,
@@ -527,7 +497,7 @@ def self_test() -> None:
                         "immediate_end_token": 1,
                     },
                     "output_layout": {
-                        "element_type": "f16",
+                        "element_type": "f32",
                         "element_count": HIDDEN_SIZE,
                     },
                     "raw_file": raw_name,
@@ -550,6 +520,38 @@ def self_test() -> None:
                        "synthetic capture values did not roundtrip")
         common.require(len(provenance["checkpoints"]) == 2,
                        "synthetic capture provenance is incomplete")
+        mixed_records = [dict(record) for record in records]
+        mixed_records[0] = {
+            **records[0],
+            "value": {
+                **records[0]["value"],
+                "tensor": {
+                    **records[0]["value"]["tensor"],
+                    "element_type": "f16",
+                },
+            },
+            "output_layout": {
+                **records[0]["output_layout"],
+                "element_type": "f16",
+            },
+        }
+        common.write_json(
+            capture / "wave-0000.json",
+            {
+                "schema_version": 1,
+                **identity,
+                "wave_kind": "prefill",
+                "participant_count": 1,
+                "records": mixed_records,
+            },
+        )
+        try:
+            load_capture(capture, 1)
+        except common.ReferenceError as error:
+            common.require("FP32 master" in str(error),
+                           "mixed-dtype capture rejection reason differs")
+        else:
+            raise common.ReferenceError("mixed FP16/FP32 capture unexpectedly passed")
     print(SELF_TEST_PASS)
 
 

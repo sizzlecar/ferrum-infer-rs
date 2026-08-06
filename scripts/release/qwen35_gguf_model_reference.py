@@ -203,6 +203,27 @@ def load_ferrum_array(
     return value.reshape(shape), logical_dtype
 
 
+def require_f32_master_capture(
+    paths: dict[str, Path], provenance: dict[str, Any]
+) -> None:
+    checkpoints = provenance.get("checkpoints")
+    common.require(isinstance(checkpoints, dict),
+                   "Ferrum capture checkpoint provenance is missing")
+    common.require(set(paths) == set(checkpoints),
+                   "Ferrum capture path/provenance coverage differs")
+    for value_id, path in paths.items():
+        checkpoint = checkpoints[value_id]
+        common.require(
+            checkpoint.get("logical_dtype") == common.FERRUM_MASTER_LOGICAL_DTYPE,
+            f"{value_id} must be the logical FP32 master activation",
+        )
+        payload = path.read_bytes()
+        common.require(
+            all(math.isfinite(value) for (value,) in struct.iter_unpack("<f", payload)),
+            f"{value_id} contains NaN or Inf",
+        )
+
+
 def load_llama_artifact(
     artifact_root: Path,
     extractor_root: Path,
@@ -583,6 +604,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     actual_paths, actual_provenance = load_ferrum_capture(
         capture_dir, token_count, selected_wave
     )
+    require_f32_master_capture(actual_paths, actual_provenance)
     captured_tokens = actual_provenance["captured_tokens"]
     llama_paths, llama_provenance = load_llama_artifact(
         llama_artifact, extractor_artifact, token_count
@@ -837,7 +859,10 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
                 else (
                     "cpu.mixed.python.qwen35_gguf_model_reference.layer_output_f16"
                     if emulate_layer_output_f16
-                    else "cpu.fp32.python.qwen35_gguf_model_reference"
+                    else (
+                        "cpu.fp32.python."
+                        "qwen35_gguf_model_f32_master_capture_reference"
+                    )
                 )
             ),
             "precision": (
@@ -898,7 +923,10 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
             "tensor_count": len(inventory),
         },
         "fixture": {
-            "fixture_id": f"qwen35-4b.gguf-q4-k-m.full-model.tokens-{token_count}",
+            "fixture_id": (
+                "qwen35-4b.gguf-q4-k-m.f32-master.full-model."
+                f"tokens-{token_count}"
+            ),
             "token_ids": token_ids,
             "token_sequence_sha256": hashlib.sha256(
                 b"".join(int(value).to_bytes(4, "little") for value in token_ids)
@@ -1096,6 +1124,28 @@ def self_test() -> None:
             ),
             "synthetic FP32 model provenance lost its typed dtype",
         )
+        require_f32_master_capture(f32_paths, f32_provenance)
+        try:
+            require_f32_master_capture(paths, provenance)
+        except common.ReferenceError as error:
+            common.require("FP32 master" in str(error),
+                           "formal FP16 capture rejection reason differs")
+        else:
+            raise common.ReferenceError("formal FP16 model capture unexpectedly passed")
+
+        nonfinite_path = f32_paths[EMBEDDING_VALUE_ID]
+        original_payload = nonfinite_path.read_bytes()
+        nonfinite_path.write_bytes(
+            struct.pack("<f", math.inf) + original_payload[4:]
+        )
+        try:
+            require_f32_master_capture(f32_paths, f32_provenance)
+        except common.ReferenceError as error:
+            common.require("NaN or Inf" in str(error),
+                           "formal non-finite capture rejection reason differs")
+        else:
+            raise common.ReferenceError("non-finite model capture unexpectedly passed")
+        nonfinite_path.write_bytes(original_payload)
 
         mismatched_records = copy.deepcopy(f32_records)
         mismatched_records[0]["output_layout"]["element_type"] = "f16"

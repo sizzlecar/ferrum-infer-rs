@@ -10,6 +10,7 @@ import math
 import os
 import platform
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,10 @@ SELF_TEST_PASS = "QWEN35 GGUF LINEAR ATTENTION REFERENCE SELF-TEST PASS"
 LEGACY_CAPTURE_MODEL_ID = "Qwen3.5-4B-Q4_K_M"
 V3_CAPTURE_MODEL_ID = "unsloth/Qwen3.5-4B-GGUF"
 VALUE_ID = "value.layer.0.attention"
+FERRUM_MASTER_ELEMENT_TYPE = "f32"
+FERRUM_MASTER_LOGICAL_DTYPE = "fp32"
+FERRUM_MASTER_NUMPY_DTYPE = "<f4"
+FERRUM_MASTER_BYTES_PER_ELEMENT = 4
 HIDDEN_SIZE = 2560
 VOCABULARY_SIZE = 248320
 KEY_HEADS = 16
@@ -302,43 +307,13 @@ def load_ferrum_checkpoint(
     ]
     require(len(selected) == 1, f"Ferrum wave must contain exactly one {VALUE_ID}")
     record = selected[0]
-    require(record.get("participant_index") == 0,
-            "Ferrum checkpoint participant index must be zero")
-    span = record.get("token_span")
-    require(isinstance(span, dict), "Ferrum checkpoint token_span must be an object")
-    require(span.get("immediate_tokens") == token_count,
-            "Ferrum checkpoint token count differs from the oracle fixture")
-    require(span.get("full_input_tokens") == token_count,
-            "Ferrum checkpoint must cover the full input")
-    require(span.get("immediate_start_token") == 0
-            and span.get("immediate_end_token") == token_count,
-            "Ferrum checkpoint token range is not the full prompt")
-
-    value = record["value"]
-    tensor = value.get("tensor")
-    layout = record.get("output_layout")
-    require(isinstance(tensor, dict) and isinstance(layout, dict),
-            "Ferrum checkpoint tensor/layout must be objects")
-    require(tensor.get("element_type") == "f16"
-            and layout.get("element_type") == "f16",
-            "Ferrum layer checkpoint must be logical fp16")
-    dimensions = tensor.get("dimensions")
-    require(isinstance(dimensions, list) and len(dimensions) == 2,
-            "Ferrum checkpoint must have a rank-2 capacity shape")
-    require(dimensions[0] >= token_count and dimensions[1] == HIDDEN_SIZE,
-            "Ferrum checkpoint capacity shape is incompatible with the fixture")
-    element_count = token_count * HIDDEN_SIZE
-    require(layout.get("element_count") == element_count,
-            "Ferrum checkpoint element count differs from [tokens, hidden]")
-    require(record.get("raw_bytes") == element_count * 2,
-            "Ferrum checkpoint raw byte count is invalid")
-    raw_path = safe_child(capture_dir, record.get("raw_file"), "Ferrum raw_file")
-    require(raw_path.stat().st_size == element_count * 2,
-            "Ferrum checkpoint file size is invalid")
-    raw_sha = sha256_file(raw_path)
-    require(SHA256_RE.fullmatch(str(record.get("raw_sha256", ""))) is not None,
-            "Ferrum checkpoint raw_sha256 is invalid")
-    require(raw_sha == record["raw_sha256"], "Ferrum checkpoint SHA256 mismatch")
+    raw_path, checkpoint = load_ferrum_master_checkpoint_record(
+        capture_dir,
+        record,
+        value_id=VALUE_ID,
+        token_count=token_count,
+        hidden_size=HIDDEN_SIZE,
+    )
 
     artifact_root = capture_dir.parent
     provenance = {
@@ -355,13 +330,74 @@ def load_ferrum_checkpoint(
             else None
         ),
         "binary_sha256_record": read_optional_text(artifact_root, "binary-sha256.txt"),
-        "value_id": VALUE_ID,
-        "logical_dtype": "fp16",
-        "logical_shape": [token_count, HIDDEN_SIZE],
+        **checkpoint,
+    }
+    return raw_path, provenance
+
+
+def load_ferrum_master_checkpoint_record(
+    capture_dir: Path,
+    record: Any,
+    *,
+    value_id: str,
+    token_count: int,
+    hidden_size: int,
+) -> tuple[Path, dict[str, Any]]:
+    require(isinstance(record, dict), f"{value_id} checkpoint record must be an object")
+    require(record.get("participant_index") == 0,
+            f"{value_id} participant index must be zero")
+    span = record.get("token_span")
+    require(isinstance(span, dict), f"{value_id} token_span must be an object")
+    require(span.get("immediate_tokens") == token_count,
+            f"{value_id} token count differs from the oracle fixture")
+    require(span.get("full_input_tokens") == token_count,
+            f"{value_id} must cover the full input")
+    require(span.get("immediate_start_token") == 0
+            and span.get("immediate_end_token") == token_count,
+            f"{value_id} token range is not the full prompt")
+
+    value = record.get("value")
+    require(isinstance(value, dict) and value.get("value_id") == value_id,
+            f"{value_id} checkpoint identity differs")
+    tensor = value.get("tensor")
+    layout = record.get("output_layout")
+    require(isinstance(tensor, dict) and isinstance(layout, dict),
+            f"{value_id} tensor/layout must be objects")
+    require(
+        tensor.get("element_type") == FERRUM_MASTER_ELEMENT_TYPE
+        and layout.get("element_type") == FERRUM_MASTER_ELEMENT_TYPE,
+        f"{value_id} must be the logical FP32 master activation",
+    )
+    dimensions = tensor.get("dimensions")
+    require(isinstance(dimensions, list) and len(dimensions) == 2,
+            f"{value_id} must have a rank-2 capacity shape")
+    require(dimensions[0] >= token_count and dimensions[1] == hidden_size,
+            f"{value_id} capacity shape is incompatible with the fixture")
+    element_count = token_count * hidden_size
+    require(layout.get("element_count") == element_count,
+            f"{value_id} element count differs from [tokens, hidden]")
+    expected_bytes = element_count * FERRUM_MASTER_BYTES_PER_ELEMENT
+    require(record.get("raw_bytes") == expected_bytes,
+            f"{value_id} raw byte count is invalid")
+    raw_path = safe_child(capture_dir, record.get("raw_file"), f"{value_id}.raw_file")
+    require(raw_path.stat().st_size == expected_bytes,
+            f"{value_id} file size is invalid")
+    payload = raw_path.read_bytes()
+    require(
+        all(math.isfinite(value) for (value,) in struct.iter_unpack("<f", payload)),
+        f"{value_id} contains NaN or Inf",
+    )
+    raw_sha = sha256_file(raw_path)
+    require(SHA256_RE.fullmatch(str(record.get("raw_sha256", ""))) is not None,
+            f"{value_id} raw_sha256 is invalid")
+    require(raw_sha == record["raw_sha256"], f"{value_id} SHA256 mismatch")
+    return raw_path, {
+        "value_id": value_id,
+        "logical_dtype": FERRUM_MASTER_LOGICAL_DTYPE,
+        "logical_shape": [token_count, hidden_size],
         "raw_file": raw_path.name,
         "raw_sha256": raw_sha,
     }
-    return raw_path, provenance
 
 
 def load_llama_checkpoint(
@@ -671,7 +707,9 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     require(reference.dtype == np.float32, "reference residual is not FP32")
     require(bool(np.isfinite(reference).all()), "reference residual contains NaN or Inf")
 
-    actual = np.fromfile(actual_path, dtype="<f2").reshape(token_count, HIDDEN_SIZE)
+    actual = np.fromfile(actual_path, dtype=FERRUM_MASTER_NUMPY_DTYPE).reshape(
+        token_count, HIDDEN_SIZE
+    )
     reference_path = out_dir / "layer-0-linear-attention-residual.f32"
     np.asarray(reference, dtype="<f4").tofile(reference_path)
     actual_f32 = np.asarray(actual, dtype="<f4")
@@ -680,7 +718,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
     metrics.update(
         {
             "shape": [token_count, HIDDEN_SIZE],
-            "actual_logical_dtype": "fp16",
+            "actual_logical_dtype": FERRUM_MASTER_LOGICAL_DTYPE,
             "oracle_precision": "fp32",
             "actual_f32_sha256": sha256_bytes(actual_f32.tobytes(order="C")),
             "expected_f32_sha256": sha256_file(reference_path),
@@ -710,7 +748,10 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         "schema_version": 1,
         "status": "measured",
         "oracle": {
-            "identity": "cpu.fp32.python.qwen35_gguf_linear_attention_reference",
+            "identity": (
+                "cpu.fp32.python."
+                "qwen35_gguf_linear_attention_f32_master_capture_reference"
+            ),
             "precision": "fp32",
             "semantics": (
                 "independent Qwen3.5 layer-0 linear-attention execution over "
@@ -745,7 +786,7 @@ def build_reference(args: argparse.Namespace, out_dir: Path) -> dict[str, Any]:
         },
         "fixture": {
             "fixture_id": (
-                "qwen35-4b.gguf-q4-k-m.layer-0.linear-attention."
+                "qwen35-4b.gguf-q4-k-m.f32-master.layer-0.linear-attention."
                 f"tokens-{token_count}"
             ),
             "layer_index": 0,
@@ -818,6 +859,73 @@ def self_test() -> None:
         )
         require(identity == {"repository": "owner/model", "revision": "a" * 40},
                 "Hugging Face snapshot identity parsing failed")
+
+        checkpoint = root / "checkpoint.f32"
+        payload = struct.pack("<f", 1.25) * HIDDEN_SIZE
+        checkpoint.write_bytes(payload)
+        record = {
+            "value": {
+                "value_id": VALUE_ID,
+                "tensor": {
+                    "dimensions": [128, HIDDEN_SIZE],
+                    "element_type": "f32",
+                },
+            },
+            "participant_index": 0,
+            "token_span": {
+                "immediate_tokens": 1,
+                "full_input_tokens": 1,
+                "immediate_start_token": 0,
+                "immediate_end_token": 1,
+            },
+            "output_layout": {"element_type": "f32", "element_count": HIDDEN_SIZE},
+            "raw_file": checkpoint.name,
+            "raw_bytes": len(payload),
+            "raw_sha256": sha256_bytes(payload),
+        }
+        _, provenance = load_ferrum_master_checkpoint_record(
+            root,
+            record,
+            value_id=VALUE_ID,
+            token_count=1,
+            hidden_size=HIDDEN_SIZE,
+        )
+        require(provenance["logical_dtype"] == "fp32",
+                "FP32 master checkpoint lost its typed dtype")
+        rejected_f16 = json.loads(json.dumps(record))
+        rejected_f16["value"]["tensor"]["element_type"] = "f16"
+        rejected_f16["output_layout"]["element_type"] = "f16"
+        try:
+            load_ferrum_master_checkpoint_record(
+                root,
+                rejected_f16,
+                value_id=VALUE_ID,
+                token_count=1,
+                hidden_size=HIDDEN_SIZE,
+            )
+        except ReferenceError as error:
+            require("FP32 master" in str(error), "wrong FP16 checkpoint rejection")
+        else:
+            raise ReferenceError("FP16 checkpoint unexpectedly passed FP32 master validation")
+
+        nonfinite = root / "nonfinite.f32"
+        nonfinite_payload = struct.pack("<f", math.nan) * HIDDEN_SIZE
+        nonfinite.write_bytes(nonfinite_payload)
+        rejected_nonfinite = json.loads(json.dumps(record))
+        rejected_nonfinite["raw_file"] = nonfinite.name
+        rejected_nonfinite["raw_sha256"] = sha256_bytes(nonfinite_payload)
+        try:
+            load_ferrum_master_checkpoint_record(
+                root,
+                rejected_nonfinite,
+                value_id=VALUE_ID,
+                token_count=1,
+                hidden_size=HIDDEN_SIZE,
+            )
+        except ReferenceError as error:
+            require("NaN or Inf" in str(error), "wrong non-finite checkpoint rejection")
+        else:
+            raise ReferenceError("non-finite FP32 checkpoint unexpectedly passed")
 
         schema3_plan = {
             "schema_version": 3,
