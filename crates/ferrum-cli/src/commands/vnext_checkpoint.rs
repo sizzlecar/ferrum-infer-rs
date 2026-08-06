@@ -1,7 +1,15 @@
-use std::path::PathBuf;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use clap::Args;
-use ferrum_types::{FerrumError, Result, VNextCheckpointCaptureConfig};
+use ferrum_types::{
+    FerrumError, Result, TokenId, VNextCheckpointCaptureConfig, VNextTeacherForcingConfig,
+};
+use serde::Deserialize;
+
+const MAX_TEACHER_TOKEN_FILE_BYTES: usize = 64 * 1024;
 
 #[derive(Args, Clone, Debug, Default)]
 pub struct VNextCheckpointArgs {
@@ -32,6 +40,11 @@ pub struct VNextCheckpointArgs {
     /// activation or changing the compiled memory plan.
     #[arg(long = "vnext-checkpoint-product-output")]
     pub capture_product_output: bool,
+
+    /// JSON file containing a bounded canonical token history for a same-history
+    /// numerical diagnostic. Supported only by one-shot `ferrum run`.
+    #[arg(long = "vnext-checkpoint-teacher-token-file", value_name = "JSON")]
+    pub teacher_token_file: Option<PathBuf>,
 }
 
 impl VNextCheckpointArgs {
@@ -40,10 +53,16 @@ impl VNextCheckpointArgs {
             || !self.value_ids.is_empty()
             || self.maximum_prefill_waves.is_some()
             || self.maximum_decode_waves.is_some()
-            || self.capture_product_output;
+            || self.capture_product_output
+            || self.teacher_token_file.is_some();
         if !configured {
             return Ok(None);
         }
+        let teacher_forcing = self
+            .teacher_token_file
+            .as_deref()
+            .map(load_teacher_forcing)
+            .transpose()?;
         let output_dir = self.output_dir.clone().ok_or_else(|| {
             FerrumError::config(
                 "--vnext-checkpoint-dir is required when checkpoint capture is configured",
@@ -54,14 +73,82 @@ impl VNextCheckpointArgs {
                 "at least one --vnext-checkpoint-value or --vnext-checkpoint-product-output is required",
             ));
         }
+        if let Some(teacher_forcing) = &teacher_forcing {
+            if !self.capture_product_output {
+                return Err(FerrumError::config(
+                    "--vnext-checkpoint-teacher-token-file requires --vnext-checkpoint-product-output",
+                ));
+            }
+            if self.maximum_prefill_waves.is_some_and(|waves| waves != 1) {
+                return Err(FerrumError::config(
+                    "teacher-forced checkpoint capture requires exactly one final prefill wave",
+                ));
+            }
+            let expected_decode_waves = teacher_forcing.token_count().saturating_sub(1);
+            if self
+                .maximum_decode_waves
+                .is_some_and(|waves| waves != expected_decode_waves)
+            {
+                return Err(FerrumError::config(format!(
+                    "teacher-forced checkpoint capture requires {expected_decode_waves} decode waves for {} tokens",
+                    teacher_forcing.token_count()
+                )));
+            }
+        }
         Ok(Some(VNextCheckpointCaptureConfig {
             output_dir,
             value_ids: self.value_ids.clone(),
             maximum_prefill_waves: self.maximum_prefill_waves.unwrap_or(1),
-            maximum_decode_waves: self.maximum_decode_waves.unwrap_or(0),
+            maximum_decode_waves: self.maximum_decode_waves.unwrap_or_else(|| {
+                teacher_forcing
+                    .as_ref()
+                    .map_or(0, |teacher| teacher.token_count().saturating_sub(1))
+            }),
             capture_product_output: self.capture_product_output,
+            teacher_forcing,
         }))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TeacherTokenFile {
+    schema_version: u32,
+    encoding: String,
+    token_ids: Vec<u32>,
+}
+
+fn load_teacher_forcing(path: &Path) -> Result<VNextTeacherForcingConfig> {
+    let bytes = fs::read(path).map_err(|error| {
+        FerrumError::config(format!(
+            "cannot read vNext teacher-token file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if bytes.len() > MAX_TEACHER_TOKEN_FILE_BYTES {
+        return Err(FerrumError::config(format!(
+            "vNext teacher-token file exceeds {MAX_TEACHER_TOKEN_FILE_BYTES} bytes"
+        )));
+    }
+    parse_teacher_forcing(&bytes)
+}
+
+fn parse_teacher_forcing(bytes: &[u8]) -> Result<VNextTeacherForcingConfig> {
+    let parsed: TeacherTokenFile = serde_json::from_slice(bytes).map_err(|error| {
+        FerrumError::config(format!("invalid vNext teacher-token JSON: {error}"))
+    })?;
+    if parsed.schema_version != 1 {
+        return Err(FerrumError::config(
+            "vNext teacher-token schema_version must be 1",
+        ));
+    }
+    if parsed.encoding != "u32-le" {
+        return Err(FerrumError::config(
+            "vNext teacher-token encoding must be u32-le",
+        ));
+    }
+    VNextTeacherForcingConfig::new(parsed.token_ids.into_iter().map(TokenId::new).collect())
+        .map_err(FerrumError::config)
 }
 
 #[cfg(test)]
@@ -99,6 +186,7 @@ mod tests {
             maximum_prefill_waves: None,
             maximum_decode_waves: None,
             capture_product_output: false,
+            teacher_token_file: None,
         }
         .to_config()
         .unwrap()
@@ -115,6 +203,7 @@ mod tests {
             maximum_prefill_waves: Some(1),
             maximum_decode_waves: Some(64),
             capture_product_output: false,
+            teacher_token_file: None,
         }
         .to_config()
         .unwrap()
@@ -139,5 +228,80 @@ mod tests {
 
         assert!(config.value_ids.is_empty());
         assert!(config.capture_product_output);
+    }
+
+    #[test]
+    fn teacher_token_json_is_typed_and_bounded() {
+        let parsed = parse_teacher_forcing(
+            br#"{"schema_version":1,"encoding":"u32-le","token_ids":[11690,369]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .token_ids()
+                .iter()
+                .map(|token| token.get())
+                .collect::<Vec<_>>(),
+            [11690, 369]
+        );
+
+        assert!(parse_teacher_forcing(
+            br#"{"schema_version":2,"encoding":"u32-le","token_ids":[1]}"#
+        )
+        .is_err());
+        assert!(parse_teacher_forcing(
+            br#"{"schema_version":1,"encoding":"json","token_ids":[1]}"#
+        )
+        .is_err());
+        assert!(parse_teacher_forcing(
+            br#"{"schema_version":1,"encoding":"u32-le","token_ids":[],"extra":true}"#
+        )
+        .is_err());
+
+        let excessive = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "encoding": "u32-le",
+            "token_ids": vec![0_u32; ferrum_types::MAX_VNEXT_TEACHER_FORCED_TOKENS + 1],
+        }))
+        .unwrap();
+        assert!(parse_teacher_forcing(&excessive).is_err());
+    }
+
+    #[test]
+    fn teacher_token_file_derives_exact_wave_contract() {
+        let root = std::env::temp_dir().join(format!(
+            "ferrum-vnext-teacher-token-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let token_file = root.join("tokens.json");
+        std::fs::write(
+            &token_file,
+            br#"{"schema_version":1,"encoding":"u32-le","token_ids":[7,11,13]}"#,
+        )
+        .unwrap();
+        let args = VNextCheckpointArgs {
+            output_dir: Some(root.join("capture")),
+            capture_product_output: true,
+            teacher_token_file: Some(token_file.clone()),
+            ..VNextCheckpointArgs::default()
+        };
+        let config = args.to_config().unwrap().unwrap();
+        assert_eq!(config.maximum_prefill_waves, 1);
+        assert_eq!(config.maximum_decode_waves, 2);
+        assert_eq!(config.teacher_forcing.unwrap().token_count(), 3);
+
+        let wrong_decode_count = VNextCheckpointArgs {
+            maximum_decode_waves: Some(3),
+            ..args.clone()
+        };
+        assert!(wrong_decode_count.to_config().is_err());
+        let missing_product_output = VNextCheckpointArgs {
+            capture_product_output: false,
+            value_ids: vec!["value.output.logits".to_owned()],
+            ..args
+        };
+        assert!(missing_product_output.to_config().is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

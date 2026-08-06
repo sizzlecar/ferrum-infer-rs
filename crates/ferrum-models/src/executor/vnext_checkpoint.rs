@@ -9,7 +9,11 @@ use ferrum_interfaces::vnext::{
     ProgramPlanCompileOptions, ProgramValueId, ResourceWorkShape, RetainedCompletionValue, RunId,
     TokenSpanWork,
 };
-use ferrum_types::{FerrumError, RequestId, Result, VNextCheckpointCaptureConfig};
+use ferrum_types::{
+    FerrumError, RequestId, Result, TokenId, VNextCheckpointCaptureConfig,
+    VNextTeacherForcingConfig,
+};
+use parking_lot::Mutex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -17,6 +21,8 @@ const MAX_CHECKPOINT_VALUES: usize = 63;
 const MAX_PREFILL_WAVES: usize = 16;
 const MAX_DECODE_WAVES: usize = 512;
 const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
+const TEACHER_FORCING_CHECKPOINT_SCHEMA_VERSION: u32 = 4;
+const TEACHER_PROMPT_MANIFEST_FILE: &str = "teacher-prompt.json";
 
 pub(super) struct VNextCheckpointSelection {
     output_dir: PathBuf,
@@ -24,6 +30,7 @@ pub(super) struct VNextCheckpointSelection {
     maximum_prefill_waves: usize,
     maximum_decode_waves: usize,
     capture_product_output: bool,
+    teacher_forcing: Option<VNextTeacherForcingConfig>,
 }
 
 impl VNextCheckpointSelection {
@@ -55,6 +62,22 @@ impl VNextCheckpointSelection {
                 "vNext checkpoint decode wave count must be in 0..={MAX_DECODE_WAVES}"
             )));
         }
+        if let Some(teacher) = &config.teacher_forcing {
+            teacher.validate().map_err(FerrumError::config)?;
+            if !config.capture_product_output {
+                return Err(FerrumError::config(
+                    "vNext checkpoint teacher forcing requires product-output capture",
+                ));
+            }
+            if config.maximum_prefill_waves != 1
+                || config.maximum_decode_waves != teacher.token_count().saturating_sub(1)
+            {
+                return Err(FerrumError::config(format!(
+                    "vNext checkpoint teacher forcing requires one prefill wave and {} decode waves",
+                    teacher.token_count().saturating_sub(1)
+                )));
+            }
+        }
         let value_ids = config
             .value_ids
             .iter()
@@ -79,6 +102,7 @@ impl VNextCheckpointSelection {
             maximum_prefill_waves: config.maximum_prefill_waves,
             maximum_decode_waves: config.maximum_decode_waves,
             capture_product_output: config.capture_product_output,
+            teacher_forcing: config.teacher_forcing.clone(),
         }))
     }
 
@@ -95,7 +119,20 @@ impl VNextCheckpointSelection {
         family_fingerprint: String,
         program_fingerprint: String,
         run_id: &RunId,
+        vocabulary_size: usize,
     ) -> Result<VNextCheckpointCapture> {
+        if let Some(teacher) = &self.teacher_forcing {
+            if let Some(token) = teacher
+                .token_ids()
+                .iter()
+                .find(|token| usize::try_from(token.get()).map_or(true, |id| id >= vocabulary_size))
+            {
+                return Err(FerrumError::config(format!(
+                    "vNext checkpoint teacher token {} is outside vocabulary {vocabulary_size}",
+                    token.get()
+                )));
+            }
+        }
         prepare_empty_output_directory(&self.output_dir)?;
         let checkpoints = self
             .value_ids
@@ -109,6 +146,7 @@ impl VNextCheckpointSelection {
             maximum_prefill_waves: self.maximum_prefill_waves,
             maximum_decode_waves: self.maximum_decode_waves,
             capture_product_output: self.capture_product_output,
+            teacher_forcing: self.teacher_forcing.map(VNextTeacherForcingCapture::new),
             next_prefill_wave: AtomicUsize::new(0),
             next_decode_wave: AtomicUsize::new(0),
             armed: AtomicBool::new(false),
@@ -130,6 +168,7 @@ pub(super) struct VNextCheckpointCapture {
     maximum_prefill_waves: usize,
     maximum_decode_waves: usize,
     capture_product_output: bool,
+    teacher_forcing: Option<VNextTeacherForcingCapture>,
     next_prefill_wave: AtomicUsize,
     next_decode_wave: AtomicUsize,
     armed: AtomicBool,
@@ -139,6 +178,30 @@ pub(super) struct VNextCheckpointCapture {
     family_fingerprint: String,
     program_fingerprint: String,
     run_id: String,
+}
+
+struct VNextTeacherForcingCapture {
+    config: VNextTeacherForcingConfig,
+    token_ids_sha256: String,
+    state: Mutex<VNextTeacherForcingState>,
+}
+
+#[derive(Default)]
+struct VNextTeacherForcingState {
+    owner_request_id: Option<RequestId>,
+    prompt_token_ids: Option<Vec<u32>>,
+    next_token_index: usize,
+}
+
+impl VNextTeacherForcingCapture {
+    fn new(config: VNextTeacherForcingConfig) -> Self {
+        let token_ids_sha256 = config.token_ids_sha256();
+        Self {
+            config,
+            token_ids_sha256,
+            state: Mutex::new(VNextTeacherForcingState::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,22 +252,85 @@ impl VNextCheckpointClaim {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(super) struct VNextTeacherForcedDecision {
+    token_index: usize,
+    token_id: TokenId,
+}
+
+impl VNextTeacherForcedDecision {
+    pub(super) const fn new(token_index: usize, token_id: TokenId) -> Self {
+        Self {
+            token_index,
+            token_id,
+        }
+    }
+
+    pub(super) const fn token_index(self) -> usize {
+        self.token_index
+    }
+
+    pub(super) const fn token_id(self) -> TokenId {
+        self.token_id
+    }
+}
+
 impl VNextCheckpointCapture {
     pub(super) fn arm(&self) {
         self.armed.store(true, Ordering::Release);
     }
 
-    pub(super) fn claim_prefill_wave(&self) -> Option<VNextCheckpointClaim> {
-        self.claim_wave(VNextCheckpointWaveKind::Prefill)
+    pub(super) fn claim_prefill_wave(
+        &self,
+        participant_count: usize,
+        request_id: Option<&RequestId>,
+        token_ids: Option<&[u32]>,
+        is_final_prefill: bool,
+    ) -> Result<Option<VNextCheckpointClaim>> {
+        self.claim_wave(
+            VNextCheckpointWaveKind::Prefill,
+            participant_count,
+            request_id,
+            token_ids,
+            is_final_prefill,
+        )
     }
 
-    pub(super) fn claim_decode_wave(&self) -> Option<VNextCheckpointClaim> {
-        self.claim_wave(VNextCheckpointWaveKind::Decode)
+    pub(super) fn claim_decode_wave(
+        &self,
+        participant_count: usize,
+        request_id: Option<&RequestId>,
+        token_ids: Option<&[u32]>,
+    ) -> Result<Option<VNextCheckpointClaim>> {
+        self.claim_wave(
+            VNextCheckpointWaveKind::Decode,
+            participant_count,
+            request_id,
+            token_ids,
+            true,
+        )
     }
 
-    fn claim_wave(&self, kind: VNextCheckpointWaveKind) -> Option<VNextCheckpointClaim> {
+    fn claim_wave(
+        &self,
+        kind: VNextCheckpointWaveKind,
+        participant_count: usize,
+        request_id: Option<&RequestId>,
+        token_ids: Option<&[u32]>,
+        is_final_prefill: bool,
+    ) -> Result<Option<VNextCheckpointClaim>> {
         if !self.armed.load(Ordering::Acquire) {
-            return None;
+            return Ok(None);
+        }
+        if let Some(teacher) = &self.teacher_forcing {
+            return self.claim_teacher_forced_wave(
+                teacher,
+                kind,
+                participant_count,
+                request_id,
+                token_ids,
+                is_final_prefill,
+            );
         }
         let (next_wave, maximum_waves) = match kind {
             VNextCheckpointWaveKind::Prefill => {
@@ -212,12 +338,158 @@ impl VNextCheckpointCapture {
             }
             VNextCheckpointWaveKind::Decode => (&self.next_decode_wave, self.maximum_decode_waves),
         };
-        next_wave
+        Ok(next_wave
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 (current < maximum_waves).then_some(current + 1)
             })
             .ok()
-            .map(|capture_index| VNextCheckpointClaim::new(kind, capture_index))
+            .map(|capture_index| VNextCheckpointClaim::new(kind, capture_index)))
+    }
+
+    fn claim_teacher_forced_wave(
+        &self,
+        teacher: &VNextTeacherForcingCapture,
+        kind: VNextCheckpointWaveKind,
+        participant_count: usize,
+        request_id: Option<&RequestId>,
+        token_ids: Option<&[u32]>,
+        is_final_prefill: bool,
+    ) -> Result<Option<VNextCheckpointClaim>> {
+        if participant_count != 1 {
+            return Err(FerrumError::request_validation(format!(
+                "vNext checkpoint teacher forcing requires one participant, got {participant_count}"
+            )));
+        }
+        let request_id = request_id.ok_or_else(|| {
+            FerrumError::internal("vNext checkpoint teacher-forced wave has no request identity")
+        })?;
+        let token_ids = token_ids.ok_or_else(|| {
+            FerrumError::internal("vNext checkpoint teacher-forced wave has no token history")
+        })?;
+        if token_ids.is_empty() {
+            return Err(FerrumError::request_validation(
+                "vNext checkpoint teacher-forced wave has an empty token history",
+            ));
+        }
+        let mut state = teacher.state.lock();
+        if let Some(owner) = &state.owner_request_id {
+            if owner != request_id {
+                return Err(FerrumError::request_validation(format!(
+                    "vNext checkpoint teacher-forced owner is `{owner}`, got `{request_id}`"
+                )));
+            }
+        }
+
+        match kind {
+            VNextCheckpointWaveKind::Prefill if !is_final_prefill => {
+                if state.owner_request_id.is_some() || state.next_token_index != 0 {
+                    return Err(FerrumError::request_validation(
+                        "vNext checkpoint teacher forcing observed prefill after final prefill",
+                    ));
+                }
+                if state.prompt_token_ids.is_some() {
+                    return Err(FerrumError::internal(
+                        "vNext checkpoint teacher forcing retained a prompt before final prefill",
+                    ));
+                }
+                Ok(None)
+            }
+            VNextCheckpointWaveKind::Prefill => {
+                if state.owner_request_id.is_some()
+                    || state.prompt_token_ids.is_some()
+                    || state.next_token_index != 0
+                {
+                    return Err(FerrumError::request_validation(
+                        "vNext checkpoint teacher forcing observed an extra final prefill wave",
+                    ));
+                }
+                state.owner_request_id = Some(request_id.clone());
+                state.prompt_token_ids = Some(token_ids.to_vec());
+                state.next_token_index = 1;
+                Ok(Some(VNextCheckpointClaim::new(
+                    VNextCheckpointWaveKind::Prefill,
+                    0,
+                )))
+            }
+            VNextCheckpointWaveKind::Decode => {
+                if state.owner_request_id.is_none() || state.next_token_index == 0 {
+                    return Err(FerrumError::request_validation(
+                        "vNext checkpoint teacher-forced decode arrived before final prefill",
+                    ));
+                }
+                let token_index = state.next_token_index;
+                if token_index >= teacher.config.token_count() {
+                    return Err(FerrumError::request_validation(
+                        "vNext checkpoint teacher forcing observed an extra decode wave",
+                    ));
+                }
+                let prompt_token_ids = state.prompt_token_ids.as_deref().ok_or_else(|| {
+                    FerrumError::internal(
+                        "vNext checkpoint teacher-forced decode has no canonical prompt",
+                    )
+                })?;
+                let expected_tokens =
+                    prompt_token_ids
+                        .len()
+                        .checked_add(token_index)
+                        .ok_or_else(|| {
+                            FerrumError::internal(
+                                "vNext checkpoint teacher-forced history length overflows usize",
+                            )
+                        })?;
+                let prompt_matches = token_ids.starts_with(prompt_token_ids);
+                let forced_prefix_matches =
+                    token_ids
+                        .get(prompt_token_ids.len()..)
+                        .is_some_and(|suffix| {
+                            suffix.len() == token_index
+                                && suffix
+                                    .iter()
+                                    .copied()
+                                    .eq(teacher.config.token_ids()[..token_index]
+                                        .iter()
+                                        .map(|token| token.get()))
+                        });
+                if token_ids.len() != expected_tokens || !prompt_matches || !forced_prefix_matches {
+                    return Err(FerrumError::request_validation(format!(
+                        "vNext checkpoint teacher-forced decode token history differs at decision {token_index}"
+                    )));
+                }
+                state.next_token_index += 1;
+                Ok(Some(VNextCheckpointClaim::new(
+                    VNextCheckpointWaveKind::Decode,
+                    token_index - 1,
+                )))
+            }
+        }
+    }
+
+    pub(super) fn teacher_forced_decision(
+        &self,
+        claim: VNextCheckpointClaim,
+    ) -> Result<Option<VNextTeacherForcedDecision>> {
+        let Some(teacher) = &self.teacher_forcing else {
+            return Ok(None);
+        };
+        let token_index = match claim.kind {
+            VNextCheckpointWaveKind::Prefill => 0,
+            VNextCheckpointWaveKind::Decode => {
+                claim.capture_index.checked_add(1).ok_or_else(|| {
+                    FerrumError::internal("vNext teacher-forced token index overflow")
+                })?
+            }
+        };
+        let token_id = teacher
+            .config
+            .token_ids()
+            .get(token_index)
+            .copied()
+            .ok_or_else(|| {
+                FerrumError::internal(format!(
+                    "vNext teacher-forced claim index {token_index} exceeds configured history"
+                ))
+            })?;
+        Ok(Some(VNextTeacherForcedDecision::new(token_index, token_id)))
     }
 
     pub(super) fn checkpoints(&self) -> &[RetainedCompletionValue] {
@@ -226,6 +498,14 @@ impl VNextCheckpointCapture {
 
     pub(super) const fn captures_product_output(&self) -> bool {
         self.capture_product_output
+    }
+
+    fn schema_version(&self) -> u32 {
+        if self.teacher_forcing.is_some() {
+            TEACHER_FORCING_CHECKPOINT_SCHEMA_VERSION
+        } else {
+            CHECKPOINT_SCHEMA_VERSION
+        }
     }
 
     pub(super) fn readback_batches(
@@ -346,6 +626,8 @@ impl VNextCheckpointCapture {
         mut records: Vec<VNextCheckpointArtifactRecord>,
         mut product_outputs: Vec<VNextCheckpointProductOutputRecord>,
     ) -> Result<()> {
+        let teacher_forced_decision = self.teacher_forced_decision(claim)?;
+        let mut teacher_prompt_manifest = None;
         let expected_records = self
             .checkpoints
             .len()
@@ -388,6 +670,66 @@ impl VNextCheckpointCapture {
                 "vNext checkpoint wave contains duplicate product-output participant records",
             ));
         }
+        if let Some(decision) = teacher_forced_decision {
+            if participant_count != 1 || product_outputs.len() != 1 {
+                return Err(FerrumError::internal(
+                    "vNext teacher-forced checkpoint wave must contain one product participant",
+                ));
+            }
+            let product = &product_outputs[0];
+            if product.output_mode != VNextCheckpointProductOutputMode::FullLogits {
+                return Err(FerrumError::internal(
+                    "vNext teacher-forced checkpoint wave must persist full logits",
+                ));
+            }
+            let teacher = self.teacher_forcing.as_ref().ok_or_else(|| {
+                FerrumError::internal("vNext teacher-forced decision has no capture contract")
+            })?;
+            let state = teacher.state.lock();
+            let owner = state.owner_request_id.as_ref().ok_or_else(|| {
+                FerrumError::internal("vNext teacher-forced checkpoint has no request owner")
+            })?;
+            let prompt_token_ids = state.prompt_token_ids.as_ref().ok_or_else(|| {
+                FerrumError::internal("vNext teacher-forced checkpoint has no canonical prompt")
+            })?;
+            if product.request_id != owner.to_string() {
+                return Err(FerrumError::internal(format!(
+                    "vNext teacher-forced checkpoint product request {} differs from owner {owner}",
+                    product.request_id
+                )));
+            }
+            if decision.token_index >= teacher.config.token_count() {
+                return Err(FerrumError::internal(
+                    "vNext teacher-forced checkpoint decision exceeds configured history",
+                ));
+            }
+            let mut expected_history = prompt_token_ids.clone();
+            expected_history.extend(
+                teacher.config.token_ids()[..decision.token_index]
+                    .iter()
+                    .map(|token| token.get()),
+            );
+            validate_teacher_forced_token_span(&expected_history, &product.token_span)?;
+            for record in &records {
+                if record.request_id != owner.to_string() {
+                    return Err(FerrumError::internal(format!(
+                        "vNext teacher-forced checkpoint record request {} differs from owner {owner}",
+                        record.request_id
+                    )));
+                }
+                validate_teacher_forced_token_span(&expected_history, &record.token_span)?;
+            }
+            if claim.kind == VNextCheckpointWaveKind::Prefill {
+                teacher_prompt_manifest = Some(VNextTeacherPromptManifest {
+                    schema_version: 1,
+                    encoding: "u32-le",
+                    request_id: owner.to_string(),
+                    token_count: prompt_token_ids.len(),
+                    token_ids_sha256: token_ids_sha256(prompt_token_ids),
+                    token_ids: prompt_token_ids.clone(),
+                });
+            }
+        }
         records.sort_by(|left, right| {
             left.value
                 .value_id()
@@ -395,8 +737,16 @@ impl VNextCheckpointCapture {
                 .then_with(|| left.participant_index.cmp(&right.participant_index))
         });
         product_outputs.sort_by_key(|record| record.participant_index);
+        if let Some(prompt_manifest) = &teacher_prompt_manifest {
+            let bytes = serde_json::to_vec_pretty(prompt_manifest).map_err(|error| {
+                FerrumError::internal(format!(
+                    "serialize vNext checkpoint teacher prompt: {error}"
+                ))
+            })?;
+            write_new_file(&self.output_dir.join(TEACHER_PROMPT_MANIFEST_FILE), &bytes)?;
+        }
         let manifest = VNextCheckpointWaveManifest {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            schema_version: self.schema_version(),
             capture_index: claim.capture_index,
             plan_id: &self.plan_id,
             plan_hash: &self.plan_hash,
@@ -408,6 +758,7 @@ impl VNextCheckpointCapture {
             participant_count,
             completion_fingerprint,
             receipt_fingerprint,
+            teacher_forced_decision,
             records: &records,
             product_outputs: &product_outputs,
         };
@@ -418,8 +769,18 @@ impl VNextCheckpointCapture {
     }
 
     fn write_plan_manifest(&self) -> Result<()> {
+        let teacher_forcing =
+            self.teacher_forcing
+                .as_ref()
+                .map(|teacher| VNextCheckpointTeacherForcingManifest {
+                    mode: "canonical-history",
+                    encoding: "u32-le",
+                    token_count: teacher.config.token_count(),
+                    token_ids_sha256: &teacher.token_ids_sha256,
+                    prompt_file: TEACHER_PROMPT_MANIFEST_FILE,
+                });
         let manifest = VNextCheckpointPlanManifest {
-            schema_version: CHECKPOINT_SCHEMA_VERSION,
+            schema_version: self.schema_version(),
             plan_id: &self.plan_id,
             plan_hash: &self.plan_hash,
             model_id: &self.model_id,
@@ -429,6 +790,7 @@ impl VNextCheckpointCapture {
             maximum_prefill_waves: self.maximum_prefill_waves,
             maximum_decode_waves: self.maximum_decode_waves,
             capture_product_output: self.capture_product_output,
+            teacher_forcing,
             checkpoints: &self.checkpoints,
         };
         let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
@@ -477,7 +839,28 @@ struct VNextCheckpointPlanManifest<'a> {
     maximum_prefill_waves: usize,
     maximum_decode_waves: usize,
     capture_product_output: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    teacher_forcing: Option<VNextCheckpointTeacherForcingManifest<'a>>,
     checkpoints: &'a [RetainedCompletionValue],
+}
+
+#[derive(Serialize)]
+struct VNextCheckpointTeacherForcingManifest<'a> {
+    mode: &'static str,
+    encoding: &'static str,
+    token_count: usize,
+    token_ids_sha256: &'a str,
+    prompt_file: &'static str,
+}
+
+#[derive(Serialize)]
+struct VNextTeacherPromptManifest {
+    schema_version: u32,
+    encoding: &'static str,
+    request_id: String,
+    token_count: usize,
+    token_ids_sha256: String,
+    token_ids: Vec<u32>,
 }
 
 #[derive(Serialize)]
@@ -494,8 +877,48 @@ struct VNextCheckpointWaveManifest<'a> {
     participant_count: usize,
     completion_fingerprint: &'a str,
     receipt_fingerprint: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    teacher_forced_decision: Option<VNextTeacherForcedDecision>,
     records: &'a [VNextCheckpointArtifactRecord],
     product_outputs: &'a [VNextCheckpointProductOutputRecord],
+}
+
+fn token_ids_sha256(token_ids: &[u32]) -> String {
+    let mut digest = Sha256::new();
+    for token_id in token_ids {
+        digest.update(token_id.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn validate_teacher_forced_token_span(
+    expected_history: &[u32],
+    token_span: &TokenSpanWork,
+) -> Result<()> {
+    let immediate_range = token_span.immediate_token_range();
+    let start = usize::try_from(immediate_range.start).map_err(|_| {
+        FerrumError::internal("vNext teacher-forced token-span start exceeds usize")
+    })?;
+    let end = usize::try_from(immediate_range.end)
+        .map_err(|_| FerrumError::internal("vNext teacher-forced token-span end exceeds usize"))?;
+    let fit_input_tokens = usize::try_from(token_span.fit_input_tokens()).map_err(|_| {
+        FerrumError::internal("vNext teacher-forced token-span fit ceiling exceeds usize")
+    })?;
+    let expected =
+        TokenSpanWork::from_token_ids_with_fit(expected_history, start..end, fit_input_tokens)
+            .map_err(|error| {
+                FerrumError::internal(format!(
+                    "reconstruct vNext teacher-forced token-span evidence: {error}"
+                ))
+            })?;
+    if expected != *token_span {
+        return Err(FerrumError::internal(format!(
+            "vNext teacher-forced token-span fingerprint {} differs from canonical history {}",
+            token_span.fingerprint(),
+            expected.fingerprint()
+        )));
+    }
+    Ok(())
 }
 
 fn prepare_empty_output_directory(path: &Path) -> Result<()> {
@@ -601,6 +1024,7 @@ mod tests {
             maximum_prefill_waves,
             maximum_decode_waves,
             capture_product_output: false,
+            teacher_forcing: None,
             next_prefill_wave: AtomicUsize::new(0),
             next_decode_wave: AtomicUsize::new(0),
             armed: AtomicBool::new(false),
@@ -629,6 +1053,7 @@ mod tests {
             maximum_prefill_waves: 2,
             maximum_decode_waves: 64,
             capture_product_output: false,
+            teacher_forcing: None,
         };
         let selection = VNextCheckpointSelection::from_config(Some(&config))
             .unwrap()
@@ -669,6 +1094,7 @@ mod tests {
             maximum_prefill_waves: 1,
             maximum_decode_waves: 64,
             capture_product_output: true,
+            teacher_forcing: None,
         };
         let selection = VNextCheckpointSelection::from_config(Some(&config))
             .unwrap()
@@ -687,32 +1113,109 @@ mod tests {
     #[test]
     fn capture_only_claims_bounded_prefill_and_decode_waves_after_startup_arm() {
         let capture = capture(2, 1);
-        assert_eq!(capture.claim_prefill_wave(), None);
-        assert_eq!(capture.claim_decode_wave(), None);
+        let request_id = RequestId::new();
+        assert_eq!(
+            capture
+                .claim_prefill_wave(1, Some(&request_id), None, true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            capture
+                .claim_decode_wave(1, Some(&request_id), None)
+                .unwrap(),
+            None
+        );
         capture.arm();
         assert_eq!(
-            capture.claim_prefill_wave(),
+            capture
+                .claim_prefill_wave(1, Some(&request_id), None, true)
+                .unwrap(),
             Some(VNextCheckpointClaim::new(
                 VNextCheckpointWaveKind::Prefill,
                 0
             ))
         );
         assert_eq!(
-            capture.claim_prefill_wave(),
+            capture
+                .claim_prefill_wave(1, Some(&request_id), None, true)
+                .unwrap(),
             Some(VNextCheckpointClaim::new(
                 VNextCheckpointWaveKind::Prefill,
                 1
             ))
         );
-        assert_eq!(capture.claim_prefill_wave(), None);
         assert_eq!(
-            capture.claim_decode_wave(),
+            capture
+                .claim_prefill_wave(1, Some(&request_id), None, true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            capture
+                .claim_decode_wave(1, Some(&request_id), None)
+                .unwrap(),
             Some(VNextCheckpointClaim::new(
                 VNextCheckpointWaveKind::Decode,
                 0
             ))
         );
-        assert_eq!(capture.claim_decode_wave(), None);
+        assert_eq!(
+            capture
+                .claim_decode_wave(1, Some(&request_id), None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn teacher_forcing_claims_final_prefill_then_same_owner_decode() {
+        let mut capture = capture(1, 1);
+        capture.capture_product_output = true;
+        capture.teacher_forcing = Some(VNextTeacherForcingCapture::new(
+            VNextTeacherForcingConfig::new(vec![TokenId::new(11690), TokenId::new(369)]).unwrap(),
+        ));
+        let owner = RequestId::new();
+        let other = RequestId::new();
+        capture.arm();
+
+        assert!(capture
+            .claim_prefill_wave(1, Some(&owner), Some(&[101]), false)
+            .unwrap()
+            .is_none());
+        assert!(capture
+            .claim_prefill_wave(2, Some(&owner), Some(&[101, 102]), true)
+            .is_err());
+        let prefill = capture
+            .claim_prefill_wave(1, Some(&owner), Some(&[101, 102]), true)
+            .unwrap()
+            .unwrap();
+        let decision = capture.teacher_forced_decision(prefill).unwrap().unwrap();
+        assert_eq!(decision.token_index(), 0);
+        assert_eq!(decision.token_id(), TokenId::new(11690));
+
+        assert!(capture
+            .claim_decode_wave(1, Some(&other), Some(&[101, 102, 11690]))
+            .is_err());
+        assert!(capture
+            .claim_decode_wave(1, Some(&owner), Some(&[101, 102, 369]))
+            .is_err());
+        let decode = capture
+            .claim_decode_wave(1, Some(&owner), Some(&[101, 102, 11690]))
+            .unwrap()
+            .unwrap();
+        let decision = capture.teacher_forced_decision(decode).unwrap().unwrap();
+        assert_eq!(decision.token_index(), 1);
+        assert_eq!(decision.token_id(), TokenId::new(369));
+        assert!(capture
+            .claim_decode_wave(1, Some(&owner), Some(&[101, 102, 11690, 369]))
+            .is_err());
+        assert!(capture
+            .claim_prefill_wave(1, Some(&owner), Some(&[101, 102]), false)
+            .is_err());
+        assert!(capture
+            .claim_prefill_wave(1, Some(&owner), Some(&[101, 102]), true)
+            .is_err());
     }
 
     #[test]

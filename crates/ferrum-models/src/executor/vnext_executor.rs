@@ -49,7 +49,7 @@ use super::{
     vnext_checkpoint::{
         VNextCheckpointArtifactRecord, VNextCheckpointCapture, VNextCheckpointClaim,
         VNextCheckpointProductOutputMode, VNextCheckpointProductOutputRecord,
-        VNextCheckpointSelection,
+        VNextCheckpointSelection, VNextTeacherForcedDecision,
     },
     vnext_completion_worker::{VNextCompletionTaskKind, VNextCompletionWorker},
     vnext_timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
@@ -960,6 +960,43 @@ fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<TokenId
         )));
     }
     Ok(TokenId::new(token))
+}
+
+fn apply_teacher_forced_decision(
+    outputs: &mut [ExecutorSamplingOutput],
+    decision: VNextTeacherForcedDecision,
+) -> Result<()> {
+    let [output] = outputs else {
+        return Err(FerrumError::internal(format!(
+            "vNext teacher-forced decision requires one output, got {}",
+            outputs.len()
+        )));
+    };
+    let ExecutorSamplingOutput::FullLogits(logits) = output else {
+        return Err(FerrumError::internal(
+            "vNext teacher-forced decision requires full logits",
+        ));
+    };
+    let token_index = usize::try_from(decision.token_id().get())
+        .map_err(|_| FerrumError::internal("vNext teacher-forced token id exceeds usize"))?;
+    let selected = logits.get(token_index).copied().ok_or_else(|| {
+        FerrumError::internal(format!(
+            "vNext teacher-forced token {} at decision {} exceeds logits width {}",
+            decision.token_id().get(),
+            decision.token_index(),
+            logits.len()
+        ))
+    })?;
+    if !selected.is_finite() {
+        return Err(FerrumError::model(format!(
+            "vNext teacher-forced token {} at decision {} has a non-finite raw logit",
+            decision.token_id().get(),
+            decision.token_index()
+        )));
+    }
+    logits.fill(f32::NEG_INFINITY);
+    logits[token_index] = 0.0;
+    Ok(())
 }
 
 fn nonterminal_completion_message(observation: &CompletionReadbackBatchObservation) -> String {
@@ -3871,6 +3908,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     family_fingerprint.clone(),
                     program_fingerprint.clone(),
                     &run_id,
+                    info.vocab_size,
                 )
             })
             .transpose()?;
@@ -6411,17 +6449,38 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let phase_timing = self.metrics.wave_timing_for(kind);
         let _phase_execution_timing = phase_timing.submitted_wave_total.start();
         let PreparedVNextPrefill { step, wave } = prepared;
-        let capture_claim = match kind {
-            VNextExecutionWaveKind::Prefill => self
-                .checkpoint_capture
-                .as_ref()
-                .and_then(VNextCheckpointCapture::claim_prefill_wave),
-            VNextExecutionWaveKind::Decode => self
-                .checkpoint_capture
-                .as_ref()
-                .and_then(VNextCheckpointCapture::claim_decode_wave),
+        let capture_claim = match (kind, self.checkpoint_capture.as_ref()) {
+            (VNextExecutionWaveKind::Prefill, Some(capture)) => {
+                let first = participants.first();
+                let is_final_prefill = first.is_some_and(|participant| {
+                    participant.span.immediate_token_range().end
+                        == participant.span.full_input_tokens()
+                });
+                capture.claim_prefill_wave(
+                    participants.len(),
+                    first.map(|participant| participant.sequence.request_id()),
+                    first.map(|participant| participant.tokens),
+                    is_final_prefill,
+                )?
+            }
+            (VNextExecutionWaveKind::Decode, Some(capture)) => capture.claim_decode_wave(
+                participants.len(),
+                participants
+                    .first()
+                    .map(|participant| participant.sequence.request_id()),
+                participants.first().map(|participant| participant.tokens),
+            )?,
+            (_, None) => None,
         };
-        let output_mode = Self::product_output_mode(participants, kind);
+        let teacher_forced_decision = match (capture_claim, self.checkpoint_capture.as_ref()) {
+            (Some(claim), Some(capture)) => capture.teacher_forced_decision(claim)?,
+            _ => None,
+        };
+        let output_mode = if teacher_forced_decision.is_some() {
+            VNextProductOutputMode::FullLogits
+        } else {
+            Self::product_output_mode(participants, kind)
+        };
         // Product inputs use lane-shared Step slices. Another wave may overwrite
         // the same slice, so request-owned residency cannot prove the mask is
         // still present. Refresh every participant before each submission.
@@ -6793,13 +6852,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 product_output_records,
             ))
         })();
-        let (logits, readback_bytes, checkpoint_records, product_output_records) = match processed {
-            Ok(processed) => processed,
-            Err(error) => {
-                drop(receipt);
-                return Err(self.abort_step(step, error.to_string()).await);
-            }
-        };
+        let (mut logits, readback_bytes, checkpoint_records, product_output_records) =
+            match processed {
+                Ok(processed) => processed,
+                Err(error) => {
+                    drop(receipt);
+                    return Err(self.abort_step(step, error.to_string()).await);
+                }
+            };
         if let (Some(capture_claim), Some(capture)) =
             (capture_claim, self.checkpoint_capture.as_ref())
         {
@@ -6811,6 +6871,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 checkpoint_records,
                 product_output_records,
             ) {
+                drop(receipt);
+                return Err(self.abort_step(step, error.to_string()).await);
+            }
+        }
+        if let Some(decision) = teacher_forced_decision {
+            if let Err(error) = apply_teacher_forced_decision(&mut logits, decision) {
                 drop(receipt);
                 return Err(self.abort_step(step, error.to_string()).await);
             }
@@ -8816,22 +8882,23 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        decode_output_width, decode_selected_token, is_language_masked_argmax_operation,
-        is_language_token_embedding_operation, nonterminal_completion_message,
-        normalized_product_token_mask, product_output_mode_for_policies, product_repetition_input,
-        reported_allocated_bytes, resolve_reusable_execution_policy,
-        resolve_runtime_attention_authority, resolved_sequence_fit_policy,
-        reusable_executable_inventory_matches, reusable_execution_program_catalog_is_usable,
-        reusable_execution_requires_eager_fallback, submission_execution_policy_for_timing,
-        validate_sequence_completion_accounting, AdmissionFitPolicy, DecodeFailureDisposition,
-        FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
-        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
-        VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        apply_teacher_forced_decision, decode_output_width, decode_selected_token,
+        is_language_masked_argmax_operation, is_language_token_embedding_operation,
+        nonterminal_completion_message, normalized_product_token_mask,
+        product_output_mode_for_policies, product_repetition_input, reported_allocated_bytes,
+        resolve_reusable_execution_policy, resolve_runtime_attention_authority,
+        resolved_sequence_fit_policy, reusable_executable_inventory_matches,
+        reusable_execution_program_catalog_is_usable, reusable_execution_requires_eager_fallback,
+        submission_execution_policy_for_timing, validate_sequence_completion_accounting,
+        AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
+        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
+        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
+        VNextTeacherForcedDecision, VNextWaveTimingMetrics, VNextWaveTimingSink,
     };
     use ferrum_interfaces::model_executor::{
-        ExecutorSequenceCompletion, GreedyRepetitionPenalty, LogitsReturnPolicy, PrefillChunk,
-        TokenSelectionMask,
+        ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
+        LogitsReturnPolicy, PrefillChunk, TokenSelectionMask,
     };
     use ferrum_interfaces::vnext::{
         CompletionReadbackBatchObservation, DeviceComputePathRequirement, DeviceExecutionInterval,
@@ -9386,6 +9453,35 @@ mod tests {
             product_output_mode_for_policies(VNextExecutionWaveKind::Decode, std::iter::empty(),),
             VNextProductOutputMode::FullLogits
         );
+    }
+
+    #[test]
+    fn teacher_forcing_masks_only_the_engine_facing_logits_copy() {
+        let mut outputs = vec![ExecutorSamplingOutput::full_logits(vec![1.0, 2.0, 3.0]).unwrap()];
+        apply_teacher_forced_decision(
+            &mut outputs,
+            VNextTeacherForcedDecision::new(7, TokenId::new(1)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outputs,
+            [ExecutorSamplingOutput::FullLogits(vec![
+                f32::NEG_INFINITY,
+                0.0,
+                f32::NEG_INFINITY,
+            ])]
+        );
+        assert!(apply_teacher_forced_decision(
+            &mut [ExecutorSamplingOutput::greedy_token(TokenId::new(1))],
+            VNextTeacherForcedDecision::new(0, TokenId::new(1)),
+        )
+        .is_err());
+        assert!(apply_teacher_forced_decision(
+            &mut [ExecutorSamplingOutput::full_logits(vec![0.0]).unwrap()],
+            VNextTeacherForcedDecision::new(0, TokenId::new(2)),
+        )
+        .is_err());
     }
 
     #[test]

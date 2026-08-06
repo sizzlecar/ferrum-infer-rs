@@ -1031,7 +1031,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     engine_config
         .apply_runtime_config_snapshot(&startup_auto_config.runtime_config)
         .map_err(ferrum_types::FerrumError::config)?;
-    engine_config.runtime.vnext_checkpoint_capture = cmd.vnext_checkpoint.to_config()?;
+    let vnext_checkpoint_capture = cmd.vnext_checkpoint.to_config()?;
+    validate_teacher_forced_checkpoint_run(&cmd, vnext_checkpoint_capture.as_ref())?;
+    let teacher_forcing = vnext_checkpoint_capture
+        .as_ref()
+        .and_then(|capture| capture.teacher_forcing.clone());
+    engine_config.runtime.vnext_checkpoint_capture = vnext_checkpoint_capture;
     if runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_PAGED_KV")
         .or_else(|| {
             runtime_config_bool(&startup_auto_config.runtime_config, "FERRUM_METAL_PAGED_KV")
@@ -1116,6 +1121,15 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             &cmd,
             &run_budget,
         )?;
+        if let Some(teacher) = &teacher_forcing {
+            if plan.sampling_params.max_tokens != teacher.token_count() {
+                return Err(ferrum_types::FerrumError::config(format!(
+                    "teacher-forced checkpoint requested {} tokens, but context planning resolved max_tokens={}",
+                    teacher.token_count(),
+                    plan.sampling_params.max_tokens
+                )));
+            }
+        }
         maybe_warn_context_shift(&plan, format);
         let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
         let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
@@ -1996,6 +2010,47 @@ fn build_sampling_params(cmd: &RunCommand) -> SamplingParams {
     }
 }
 
+fn validate_teacher_forced_checkpoint_run(
+    cmd: &RunCommand,
+    capture: Option<&ferrum_types::VNextCheckpointCaptureConfig>,
+) -> Result<()> {
+    let Some(teacher) = capture.and_then(|capture| capture.teacher_forcing.as_ref()) else {
+        return Ok(());
+    };
+    if cmd.prompt.is_none() {
+        return Err(ferrum_types::FerrumError::config(
+            "teacher-forced checkpoint capture requires one-shot --prompt",
+        ));
+    }
+    if cmd.max_tokens as usize != teacher.token_count() {
+        return Err(ferrum_types::FerrumError::config(format!(
+            "teacher-forced checkpoint requires --max-tokens {}, got {}",
+            teacher.token_count(),
+            cmd.max_tokens
+        )));
+    }
+    if cmd.max_num_seqs != Some(1) {
+        return Err(ferrum_types::FerrumError::config(
+            "teacher-forced checkpoint capture requires --max-num-seqs 1",
+        ));
+    }
+    if cmd.temperature != 0.0
+        || cmd.top_k != 0
+        || cmd.top_p != 1.0
+        || cmd.min_p != 0.0
+        || cmd.presence_penalty != 0.0
+        || cmd.repeat_penalty != 1.0
+        || !cmd.stop.is_empty()
+    {
+        return Err(ferrum_types::FerrumError::config(
+            "teacher-forced checkpoint capture requires unpenalized greedy settings: \
+             --temperature 0 --top-k 0 --top-p 1 --min-p 0 \
+             --presence-penalty 0 --repeat-penalty 1 and no --stop",
+        ));
+    }
+    Ok(())
+}
+
 fn sampling_params_for_prompt(mut sampling_params: SamplingParams, prompt: &str) -> SamplingParams {
     if has_unclosed_thinking_block(prompt) {
         sampling_params.response_completion_boundary =
@@ -2546,7 +2601,7 @@ pub fn apply_kv_dtype_override(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ferrum_types::{RuntimeConfigSource, SequenceFitPolicy};
+    use ferrum_types::{RuntimeConfigSource, SequenceFitPolicy, TokenId};
 
     fn default_params(max_tokens: usize) -> SamplingParams {
         SamplingParams {
@@ -2611,6 +2666,37 @@ mod tests {
             profile_sample_rate: crate::observability_product::default_profile_sample_rate(),
             output_format: OutputFormat::Text,
         }
+    }
+
+    #[test]
+    fn teacher_forced_checkpoint_is_one_shot_single_sequence_and_deterministic() {
+        let teacher =
+            ferrum_types::VNextTeacherForcingConfig::new(vec![TokenId::new(7), TokenId::new(11)])
+                .unwrap();
+        let capture = ferrum_types::VNextCheckpointCaptureConfig {
+            output_dir: PathBuf::from("capture"),
+            value_ids: Vec::new(),
+            maximum_prefill_waves: 1,
+            maximum_decode_waves: 1,
+            capture_product_output: true,
+            teacher_forcing: Some(teacher),
+        };
+        let mut cmd = test_run_cmd();
+        cmd.prompt = Some("hello".to_owned());
+        cmd.max_tokens = 2;
+        cmd.max_num_seqs = Some(1);
+        cmd.top_k = 0;
+        cmd.top_p = 1.0;
+        assert!(validate_teacher_forced_checkpoint_run(&cmd, Some(&capture)).is_ok());
+
+        cmd.prompt = None;
+        assert!(validate_teacher_forced_checkpoint_run(&cmd, Some(&capture)).is_err());
+        cmd.prompt = Some("hello".to_owned());
+        cmd.max_num_seqs = Some(2);
+        assert!(validate_teacher_forced_checkpoint_run(&cmd, Some(&capture)).is_err());
+        cmd.max_num_seqs = Some(1);
+        cmd.temperature = 0.5;
+        assert!(validate_teacher_forced_checkpoint_run(&cmd, Some(&capture)).is_err());
     }
 
     fn whitespace_budget(kv_capacity: usize) -> RunBudget {

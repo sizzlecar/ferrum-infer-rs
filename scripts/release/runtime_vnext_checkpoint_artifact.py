@@ -46,6 +46,7 @@ PLAN_FIELDS_V1 = frozenset(
 )
 PLAN_FIELDS_V2 = PLAN_FIELDS_V1 | {"maximum_decode_waves"}
 PLAN_FIELDS_V3 = PLAN_FIELDS_V2 | {"capture_product_output"}
+PLAN_FIELDS_V4 = PLAN_FIELDS_V3 | {"teacher_forcing"}
 WAVE_FIELDS = frozenset(
     {
         "schema_version",
@@ -64,6 +65,21 @@ WAVE_FIELDS = frozenset(
     }
 )
 WAVE_FIELDS_V3 = WAVE_FIELDS | {"product_outputs"}
+WAVE_FIELDS_V4 = WAVE_FIELDS_V3 | {"teacher_forced_decision"}
+TEACHER_FORCING_FIELDS = frozenset(
+    {"mode", "encoding", "token_count", "token_ids_sha256", "prompt_file"}
+)
+TEACHER_DECISION_FIELDS = frozenset({"token_index", "token_id"})
+TEACHER_PROMPT_FIELDS = frozenset(
+    {
+        "schema_version",
+        "encoding",
+        "request_id",
+        "token_count",
+        "token_ids_sha256",
+        "token_ids",
+    }
+)
 CHECKPOINT_FIELDS = frozenset(
     {
         "value_id",
@@ -121,6 +137,9 @@ IDENTITY_FIELDS = (
     "program_fingerprint",
     "run_id",
 )
+TOKEN_SPAN_FINGERPRINT_DOMAIN = b"ferrum.runtime-vnext.token-span-work.v3\0"
+MAX_TEACHER_TOKEN_COUNT = 512
+MAX_TOKEN_ID = (1 << 32) - 1
 
 
 class ArtifactError(RuntimeError):
@@ -188,6 +207,67 @@ def sha256(value: Any, label: str) -> str:
     digest = text(value, label)
     require(SHA256_RE.fullmatch(digest) is not None, f"{label} must be a lowercase SHA256")
     return digest
+
+
+def token_id(value: Any, label: str) -> int:
+    result = integer(value, label)
+    require(result <= MAX_TOKEN_ID, f"{label} must fit u32")
+    return result
+
+
+def token_ids_sha256(token_ids: list[int]) -> str:
+    digest = hashlib.sha256()
+    for item in token_ids:
+        digest.update(struct.pack("<I", item))
+    return digest.hexdigest()
+
+
+def token_span_fingerprint(token_ids: list[int], token_span: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    digest.update(TOKEN_SPAN_FINGERPRINT_DOMAIN)
+    digest.update(struct.pack("<Q", len(token_ids)))
+    digest.update(struct.pack("<Q", token_span["fit_input_tokens"]))
+    digest.update(struct.pack("<Q", token_span["immediate_start_token"]))
+    digest.update(struct.pack("<Q", token_span["immediate_end_token"]))
+    for item in token_ids:
+        digest.update(struct.pack("<I", item))
+    return digest.hexdigest()
+
+
+def validate_teacher_token_span(
+    token_span: dict[str, Any],
+    expected_history: list[int],
+    wave_kind: str,
+    expected_fit_tokens: int | None,
+    label: str,
+) -> int:
+    require(
+        token_span["full_input_tokens"] == len(expected_history),
+        f"{label}.full_input_tokens differs from canonical teacher history",
+    )
+    require(
+        token_span["immediate_end_token"] == len(expected_history),
+        f"{label}.immediate_end_token must end at the canonical history boundary",
+    )
+    if wave_kind == "decode":
+        require(
+            token_span["immediate_tokens"] == 1
+            and token_span["immediate_start_token"] + 1
+            == token_span["immediate_end_token"],
+            f"{label} decode span must contain exactly the appended token",
+        )
+    fit_tokens = token_span["fit_input_tokens"]
+    if expected_fit_tokens is not None:
+        require(
+            fit_tokens == expected_fit_tokens,
+            f"{label}.fit_input_tokens changed across teacher-forced waves",
+        )
+    require(
+        token_span["fingerprint"]
+        == token_span_fingerprint(expected_history, token_span),
+        f"{label}.fingerprint differs from canonical teacher history",
+    )
+    return fit_tokens
 
 
 def file_sha256(path: Path) -> str:
@@ -283,11 +363,15 @@ def validate_artifact(
     raw_plan = load_json(plan_path)
     require(isinstance(raw_plan, dict), "plan must be an object")
     schema_version = integer(raw_plan.get("schema_version"), "plan.schema_version", minimum=1)
-    require(schema_version in (1, 2, 3), "plan.schema_version must be 1, 2, or 3")
+    require(
+        schema_version in (1, 2, 3, 4),
+        "plan.schema_version must be 1, 2, 3, or 4",
+    )
     plan_fields = {
         1: PLAN_FIELDS_V1,
         2: PLAN_FIELDS_V2,
         3: PLAN_FIELDS_V3,
+        4: PLAN_FIELDS_V4,
     }[schema_version]
     plan = exact_object(
         raw_plan,
@@ -321,6 +405,98 @@ def validate_artifact(
         if schema_version >= 3
         else False
     )
+    teacher_forcing: dict[str, Any] | None = None
+    teacher_prompt: dict[str, Any] | None = None
+    teacher_prompt_tokens: list[int] = []
+    if schema_version == 4:
+        teacher_forcing = exact_object(
+            plan["teacher_forcing"],
+            TEACHER_FORCING_FIELDS,
+            "plan.teacher_forcing",
+        )
+        require(
+            teacher_forcing["mode"] == "canonical-history",
+            "plan.teacher_forcing.mode must be canonical-history",
+        )
+        require(
+            teacher_forcing["encoding"] == "u32-le",
+            "plan.teacher_forcing.encoding must be u32-le",
+        )
+        teacher_token_count = integer(
+            teacher_forcing["token_count"],
+            "plan.teacher_forcing.token_count",
+            minimum=1,
+        )
+        require(
+            teacher_token_count <= MAX_TEACHER_TOKEN_COUNT,
+            "plan.teacher_forcing.token_count exceeds the product limit",
+        )
+        teacher_token_sha256 = sha256(
+            teacher_forcing["token_ids_sha256"],
+            "plan.teacher_forcing.token_ids_sha256",
+        )
+        prompt_file = text(
+            teacher_forcing["prompt_file"],
+            "plan.teacher_forcing.prompt_file",
+        )
+        require(
+            prompt_file == "teacher-prompt.json",
+            "plan.teacher_forcing.prompt_file must be teacher-prompt.json",
+        )
+        require(
+            maximum_waves == 1,
+            "teacher forcing requires exactly one final-prefill wave",
+        )
+        require(
+            maximum_decode_waves == teacher_token_count - 1,
+            "teacher forcing decode waves must equal token_count - 1",
+        )
+        require(
+            capture_product_output,
+            "teacher forcing requires product-output capture",
+        )
+        prompt_path = capture_dir / prompt_file
+        require(
+            prompt_path.is_file() and not prompt_path.is_symlink(),
+            "teacher prompt manifest must be a real file",
+        )
+        teacher_prompt = exact_object(
+            load_json(prompt_path),
+            TEACHER_PROMPT_FIELDS,
+            "teacher_prompt",
+        )
+        require(
+            teacher_prompt["schema_version"] == 1,
+            "teacher_prompt.schema_version must be 1",
+        )
+        require(
+            teacher_prompt["encoding"] == "u32-le",
+            "teacher_prompt.encoding must be u32-le",
+        )
+        text(teacher_prompt["request_id"], "teacher_prompt.request_id")
+        prompt_token_count = integer(
+            teacher_prompt["token_count"],
+            "teacher_prompt.token_count",
+            minimum=1,
+        )
+        raw_prompt_tokens = teacher_prompt["token_ids"]
+        require(
+            isinstance(raw_prompt_tokens, list)
+            and len(raw_prompt_tokens) == prompt_token_count,
+            "teacher_prompt.token_ids must match token_count",
+        )
+        teacher_prompt_tokens = [
+            token_id(item, f"teacher_prompt.token_ids[{index}]")
+            for index, item in enumerate(raw_prompt_tokens)
+        ]
+        require(
+            token_ids_sha256(teacher_prompt_tokens)
+            == sha256(
+                teacher_prompt["token_ids_sha256"],
+                "teacher_prompt.token_ids_sha256",
+            ),
+            "teacher_prompt.token_ids_sha256 differs from token_ids",
+        )
     checkpoints_raw = plan["checkpoints"]
     require(
         isinstance(checkpoints_raw, list)
@@ -360,16 +536,22 @@ def validate_artifact(
     ]
     summaries: list[dict[str, Any]] = []
     referenced_raw: set[str] = set()
+    teacher_decisions: list[dict[str, int]] = []
+    teacher_fit_input_tokens: int | None = None
+    teacher_product_contract: tuple[str, str, int, str, int] | None = None
     for expected_kind, filename_prefix, expected_index, wave_path in wave_entries:
         require(
             wave_path.is_file() and not wave_path.is_symlink(),
             "wave manifest must be a real file",
         )
-        wave = exact_object(
-            load_json(wave_path),
-            WAVE_FIELDS_V3 if schema_version >= 3 else WAVE_FIELDS,
-            f"wave[{expected_index}]",
+        wave_fields = (
+            WAVE_FIELDS_V4
+            if schema_version == 4
+            else WAVE_FIELDS_V3
+            if schema_version == 3
+            else WAVE_FIELDS
         )
+        wave = exact_object(load_json(wave_path), wave_fields, f"wave[{expected_index}]")
         require(
             wave["schema_version"] == schema_version,
             "wave.schema_version must match plan.schema_version",
@@ -385,7 +567,45 @@ def validate_artifact(
             wave["wave_kind"] == expected_kind,
             f"wave.wave_kind must be {expected_kind}",
         )
+        teacher_decision: dict[str, int] | None = None
+        expected_teacher_history: list[int] = []
+        if schema_version == 4:
+            raw_decision = exact_object(
+                wave["teacher_forced_decision"],
+                TEACHER_DECISION_FIELDS,
+                "wave.teacher_forced_decision",
+            )
+            expected_token_index = 0 if expected_kind == "prefill" else expected_index + 1
+            actual_token_index = integer(
+                raw_decision["token_index"],
+                "wave.teacher_forced_decision.token_index",
+            )
+            require(
+                actual_token_index == expected_token_index,
+                "wave.teacher_forced_decision.token_index is not canonical",
+            )
+            actual_token_id = token_id(
+                raw_decision["token_id"],
+                "wave.teacher_forced_decision.token_id",
+            )
+            teacher_decision = {
+                "token_index": actual_token_index,
+                "token_id": actual_token_id,
+            }
+            expected_teacher_history = teacher_prompt_tokens + [
+                decision["token_id"] for decision in teacher_decisions
+            ]
+            require(
+                len(teacher_decisions) == actual_token_index,
+                "teacher-forced decisions are not contiguous",
+            )
+            teacher_decisions.append(teacher_decision)
         participant_count = integer(wave["participant_count"], "wave.participant_count", minimum=1)
+        if schema_version == 4:
+            require(
+                participant_count == 1,
+                "teacher-forced wave must have exactly one participant",
+            )
         sha256(wave["completion_fingerprint"], "wave.completion_fingerprint")
         sha256(wave["receipt_fingerprint"], "wave.receipt_fingerprint")
         records_raw = wave["records"]
@@ -490,6 +710,7 @@ def validate_artifact(
                     "raw_bytes": raw_bytes,
                     "raw_sha256": digest,
                     "element_type": element_type,
+                    "element_count": element_count,
                     "stats": tensor_stats(raw_path, element_type, element_count),
                 }
             )
@@ -639,6 +860,7 @@ def validate_artifact(
                     "raw_bytes": raw_bytes,
                     "raw_sha256": digest,
                     "element_type": element_type,
+                    "element_count": element_count,
                     "stats": tensor_stats(raw_path, element_type, element_count),
                 }
             )
@@ -646,18 +868,78 @@ def validate_artifact(
             product_output_keys == list(range(expected_product_outputs)),
             "wave product outputs must be unique and sorted by participant",
         )
+        if schema_version == 4:
+            require(
+                len(product_outputs_summary) == 1,
+                "teacher-forced wave must contain exactly one product output",
+            )
+            product_summary = product_outputs_summary[0]
+            require(
+                product_summary["participant_index"] == 0
+                and product_summary["output_mode"] == "full-logits",
+                "teacher-forced product output must be participant-0 full logits",
+            )
+            assert teacher_prompt is not None
+            require(
+                product_summary["request_id"] == teacher_prompt["request_id"],
+                "teacher-forced request_id differs from teacher prompt owner",
+            )
+            product_contract = (
+                product_summary["node_id"],
+                product_summary["resource_id"],
+                product_summary["logical_offset_bytes"],
+                product_summary["element_type"],
+                product_summary["element_count"],
+            )
+            if teacher_product_contract is None:
+                teacher_product_contract = product_contract
+            else:
+                require(
+                    product_contract == teacher_product_contract,
+                    "teacher-forced product-output contract changed across waves",
+                )
+            product_token_span = product_outputs_raw[0]["token_span"]
+            teacher_fit_input_tokens = validate_teacher_token_span(
+                product_token_span,
+                expected_teacher_history,
+                expected_kind,
+                teacher_fit_input_tokens,
+                "wave.product_outputs[0].token_span",
+            )
         summaries.append(
             {
                 "wave_kind": expected_kind,
                 "capture_index": expected_index,
                 "participant_count": participant_count,
+                "teacher_forced_decision": teacher_decision,
                 "records": records_summary,
                 "product_outputs": product_outputs_summary,
             }
         )
 
+    if schema_version == 4:
+        require(
+            len(teacher_decisions) == teacher_token_count,
+            "teacher-forced decision count differs from plan token_count",
+        )
+        decision_token_ids = [decision["token_id"] for decision in teacher_decisions]
+        require(
+            token_ids_sha256(decision_token_ids) == teacher_token_sha256,
+            "teacher-forced decision SHA differs from plan token_ids_sha256",
+        )
     actual_raw = {path.name for path in capture_dir.glob("*.bin")}
     require(actual_raw == referenced_raw, "raw file set differs from manifest references")
+    teacher_summary = None
+    if schema_version == 4:
+        assert teacher_forcing is not None and teacher_prompt is not None
+        teacher_summary = {
+            "mode": teacher_forcing["mode"],
+            "encoding": teacher_forcing["encoding"],
+            "token_count": teacher_token_count,
+            "token_ids_sha256": teacher_token_sha256,
+            "prompt_token_count": teacher_prompt["token_count"],
+            "prompt_token_ids_sha256": teacher_prompt["token_ids_sha256"],
+        }
     return {
         "schema_version": schema_version,
         "status": "pass",
@@ -670,6 +952,7 @@ def validate_artifact(
         "run_id": plan["run_id"],
         "checkpoint_values": value_ids,
         "capture_product_output": capture_product_output,
+        "teacher_forcing": teacher_summary,
         "maximum_prefill_waves": maximum_waves,
         "maximum_decode_waves": maximum_decode_waves,
         "wave_count": len(summaries),
@@ -717,6 +1000,7 @@ def compare_artifacts(
         "program_fingerprint",
         "checkpoint_values",
         "capture_product_output",
+        "teacher_forcing",
         "maximum_prefill_waves",
         "maximum_decode_waves",
     ):
@@ -888,6 +1172,109 @@ def write_summary(path: Path, summary: dict[str, Any]) -> None:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def write_self_test_teacher_capture(
+    capture_dir: Path,
+    target_token_ids: list[int],
+) -> None:
+    capture_dir.mkdir()
+    prompt_token_ids = [101, 102]
+    request_id = "request.teacher"
+    identity = {
+        "plan_id": f"plan/sha256/{'c' * 64}",
+        "plan_hash": "c" * 64,
+        "model_id": "model.teacher",
+        "family_fingerprint": "d" * 64,
+        "program_fingerprint": "e" * 64,
+        "run_id": "run.teacher",
+    }
+    plan = {
+        "schema_version": 4,
+        **identity,
+        "maximum_prefill_waves": 1,
+        "maximum_decode_waves": len(target_token_ids) - 1,
+        "capture_product_output": True,
+        "teacher_forcing": {
+            "mode": "canonical-history",
+            "encoding": "u32-le",
+            "token_count": len(target_token_ids),
+            "token_ids_sha256": token_ids_sha256(target_token_ids),
+            "prompt_file": "teacher-prompt.json",
+        },
+        "checkpoints": [],
+    }
+    prompt = {
+        "schema_version": 1,
+        "encoding": "u32-le",
+        "request_id": request_id,
+        "token_count": len(prompt_token_ids),
+        "token_ids_sha256": token_ids_sha256(prompt_token_ids),
+        "token_ids": prompt_token_ids,
+    }
+    (capture_dir / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+    (capture_dir / "teacher-prompt.json").write_text(
+        json.dumps(prompt),
+        encoding="utf-8",
+    )
+
+    for token_index, target_token_id in enumerate(target_token_ids):
+        wave_kind = "prefill" if token_index == 0 else "decode"
+        capture_index = 0 if token_index == 0 else token_index - 1
+        history = prompt_token_ids + target_token_ids[:token_index]
+        start = 0 if wave_kind == "prefill" else len(history) - 1
+        token_span = {
+            "immediate_tokens": len(history) - start,
+            "full_input_tokens": len(history),
+            "fit_input_tokens": 128,
+            "immediate_start_token": start,
+            "immediate_end_token": len(history),
+        }
+        token_span["fingerprint"] = token_span_fingerprint(history, token_span)
+        raw = struct.pack("<ff", float(token_index + 1), -float(token_index + 2))
+        prefix = "" if wave_kind == "prefill" else "decode-"
+        raw_name = (
+            f"{prefix}product-output-{capture_index:04}-participant-0000-full-logits.bin"
+        )
+        (capture_dir / raw_name).write_bytes(raw)
+        product = {
+            "output_mode": "full-logits",
+            "node_id": "node.logits",
+            "resource_id": "resource/step/logits",
+            "logical_offset_bytes": 0,
+            "participant_index": 0,
+            "request_id": request_id,
+            "token_span": token_span,
+            "output_layout": {"element_type": "f32", "element_count": 2},
+            "raw_file": raw_name,
+            "raw_bytes": len(raw),
+            "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        }
+        wave = {
+            "schema_version": 4,
+            "capture_index": capture_index,
+            **identity,
+            "wave_kind": wave_kind,
+            "participant_count": 1,
+            "completion_fingerprint": hashlib.sha256(
+                f"completion-{token_index}".encode()
+            ).hexdigest(),
+            "receipt_fingerprint": hashlib.sha256(
+                f"receipt-{token_index}".encode()
+            ).hexdigest(),
+            "teacher_forced_decision": {
+                "token_index": token_index,
+                "token_id": target_token_id,
+            },
+            "records": [],
+            "product_outputs": [product],
+        }
+        wave_name = (
+            f"wave-{capture_index:04}.json"
+            if wave_kind == "prefill"
+            else f"decode-wave-{capture_index:04}.json"
+        )
+        (capture_dir / wave_name).write_text(json.dumps(wave), encoding="utf-8")
 
 
 def self_test() -> None:
@@ -1157,6 +1544,127 @@ def self_test() -> None:
             and product_difference["first_difference"]["capture_index"] == 0,
             "comparison did not identify the first product-output difference",
         )
+
+        teacher_capture = Path(temporary) / "teacher-capture"
+        write_self_test_teacher_capture(teacher_capture, [7, 11, 13])
+        validated_teacher = validate_artifact(
+            teacher_capture,
+            "model.teacher",
+            [],
+        )
+        require(
+            validated_teacher["teacher_forcing"]["token_count"] == 3
+            and validated_teacher["teacher_forcing"]["prompt_token_count"] == 2
+            and [
+                wave["teacher_forced_decision"]["token_id"]
+                for wave in validated_teacher["waves"]
+            ]
+            == [7, 11, 13],
+            "teacher-forced fixture did not preserve canonical decisions",
+        )
+        compare_artifacts(
+            teacher_capture,
+            teacher_capture,
+            "model.teacher",
+            [],
+            "equal",
+        )
+
+        different_teacher = Path(temporary) / "different-teacher"
+        write_self_test_teacher_capture(different_teacher, [7, 11, 14])
+        try:
+            compare_artifacts(
+                teacher_capture,
+                different_teacher,
+                "model.teacher",
+                [],
+                "different",
+            )
+        except ArtifactError as error:
+            require(
+                "comparison teacher_forcing differs" in str(error),
+                "teacher comparison rejected the wrong contract",
+            )
+        else:
+            raise ArtifactError("self-test compared different teacher histories")
+
+        teacher_mutations = (
+            (
+                "prompt-token",
+                "teacher-prompt.json",
+                ("token_ids", 0),
+                103,
+                "token_ids_sha256 differs",
+            ),
+            (
+                "decision-index",
+                "decode-wave-0000.json",
+                ("teacher_forced_decision", "token_index"),
+                2,
+                "token_index is not canonical",
+            ),
+            (
+                "decision-u32",
+                "decode-wave-0000.json",
+                ("teacher_forced_decision", "token_id"),
+                MAX_TOKEN_ID + 1,
+                "must fit u32",
+            ),
+            (
+                "request-owner",
+                "decode-wave-0000.json",
+                ("product_outputs", 0, "request_id"),
+                "request.other",
+                "request_id differs",
+            ),
+            (
+                "greedy-output",
+                "decode-wave-0000.json",
+                ("product_outputs", 0, "output_mode"),
+                "greedy-token",
+                "greedy token must use u32[1]",
+            ),
+            (
+                "history-fingerprint",
+                "decode-wave-0001.json",
+                ("product_outputs", 0, "token_span", "fingerprint"),
+                "0" * 64,
+                "fingerprint differs from canonical teacher history",
+            ),
+            (
+                "participant-count",
+                "decode-wave-0000.json",
+                ("participant_count",),
+                2,
+                "exactly one participant",
+            ),
+            (
+                "capture-product",
+                "plan.json",
+                ("capture_product_output",),
+                False,
+                "requires product-output capture",
+            ),
+        )
+        for name, file_name, field_path, replacement, expected_error in teacher_mutations:
+            candidate = Path(temporary) / f"teacher-mutation-{name}"
+            shutil.copytree(teacher_capture, candidate)
+            document = load_json(candidate / file_name)
+            cursor = document
+            for field in field_path[:-1]:
+                cursor = cursor[field]
+            cursor[field_path[-1]] = replacement
+            (candidate / file_name).write_text(json.dumps(document), encoding="utf-8")
+            try:
+                validate_artifact(candidate, "model.teacher", [])
+            except ArtifactError as error:
+                require(
+                    expected_error in str(error),
+                    f"teacher mutation {name} rejected the wrong invariant: {error}",
+                )
+            else:
+                raise ArtifactError(f"self-test accepted teacher mutation {name}")
+            shutil.rmtree(candidate)
     print("RUNTIME VNEXT CHECKPOINT ARTIFACT SELF-TEST PASS")
 
 
