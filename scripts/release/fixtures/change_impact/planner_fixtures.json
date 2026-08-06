@@ -446,6 +446,33 @@
       "expect_unknown_files": []
     },
     {
+      "id": "vnext_s2_multiturn_product_identity_validator",
+      "changed_files": [
+        "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py"
+      ],
+      "expect_domains": ["release_gate", "vnext_s2_product_identity"],
+      "expect_required_gates": [
+        "vnext_s2_multiturn_concurrency_selftest",
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_cuda_product_contract",
+        "run_gate_selftest",
+        "planner_selftest",
+        "release_validator_selftest"
+      ],
+      "forbid_required_gates": [
+        "vnext_g08a_numerics",
+        "metal_sentinel",
+        "metal_full",
+        "cuda_full"
+      ],
+      "expect_invalidated_contains": [
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_cuda_product_contract",
+        "vnext_r0"
+      ],
+      "expect_unknown_files": []
+    },
+    {
       "id": "vnext_s2_aggregate_validator_only",
       "changed_files": [
         "scripts/release/runtime_vnext_s2_cuda_product_contract.py"
@@ -464,7 +491,29 @@
         "metal_sentinel",
         "cuda_sentinel"
       ],
-      "expect_invalidated_contains": ["vnext_s2_cuda_product_contract"],
+      "expect_invalidated_contains": ["vnext_s2_cuda_product_contract", "vnext_r0"],
+      "expect_unknown_files": []
+    },
+    {
+      "id": "vnext_r0_aggregate_validator_only",
+      "changed_files": [
+        "scripts/release/runtime_vnext_r0_core_closure.py"
+      ],
+      "expect_domains": ["release_gate", "vnext_r0_aggregate"],
+      "expect_required_gates": [
+        "vnext_r0_selftest",
+        "run_gate_selftest",
+        "planner_selftest",
+        "release_validator_selftest"
+      ],
+      "forbid_required_gates": [
+        "vnext_s2_multiturn_concurrency",
+        "vnext_s2_cuda_product_contract",
+        "vnext_g08a_numerics",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ],
+      "expect_invalidated_contains": ["vnext_r0"],
       "expect_unknown_files": []
     },
     {

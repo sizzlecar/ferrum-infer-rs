@@ -225,6 +225,9 @@ ACCEPTANCE = {
     "runner_and_validator_sources_bound": True,
     "single_rtx4090_hardware_class": True,
     "run_and_serve_product_paths_covered": True,
+    "run_and_serve_same_resolved_execution_plan": True,
+    "run_and_serve_same_runtime_implementation": True,
+    "production_legacy_selection_zero": True,
     "focused_scope_does_not_claim_full_g02_or_release": True,
 }
 DOES_NOT_PROVE = [
@@ -635,7 +638,7 @@ def product_binding(
                 effective_configs.append(sha256(path))
         require(effective_configs, f"{key} has no typed effective config evidence")
 
-    return {
+    binding = {
         "binary_sha256": next(iter(binary_values)),
         **model,
         "hardware": hardware,
@@ -647,6 +650,32 @@ def product_binding(
             "sha256": sha256(validator_path),
         },
     }
+    if key == "multiturn_concurrency":
+        observability = require_object(
+            evidence.get("observability"),
+            "multiturn_concurrency observability",
+        )
+        identity = require_object(
+            observability.get("product_execution_identity"),
+            "multiturn_concurrency product execution identity",
+        )
+        require(
+            identity.get("entrypoints") == ["run", "serve"]
+            and identity.get("same_resolved_execution_plan") is True
+            and identity.get("same_runtime_implementation") is True
+            and identity.get("production_legacy_selection_count") == 0,
+            "multiturn_concurrency product execution identity failed",
+        )
+        for field in (
+            "resolved_execution_plan_hash",
+            "runtime_implementation_fingerprint",
+        ):
+            require(
+                SHA256_RE.fullmatch(str(identity.get(field))) is not None,
+                f"multiturn_concurrency {field} is invalid",
+            )
+        binding["product_execution_identity"] = copy.deepcopy(identity)
+    return binding
 
 
 def require_evidence_match(
@@ -1068,6 +1097,17 @@ def cross_bindings(inputs: dict[str, dict[str, Any]], source: dict[str, Any]) ->
         if binding.get("model_file_closure_sha256")
     }
     require({"m1_determinism", "latency_first_failure"} <= set(closure_refs), "S2 model file closure anchors are incomplete")
+    product_identity = require_object(
+        products["multiturn_concurrency"].get("product_execution_identity"),
+        "S2 run/serve product execution identity",
+    )
+    require(
+        product_identity.get("entrypoints") == ["run", "serve"]
+        and product_identity.get("same_resolved_execution_plan") is True
+        and product_identity.get("same_runtime_implementation") is True
+        and product_identity.get("production_legacy_selection_count") == 0,
+        "S2 run/serve product execution identity failed",
+    )
     return {
         "source": source,
         "binary_sha256": next(iter(binaries)),
@@ -1094,6 +1134,7 @@ def cross_bindings(inputs: dict[str, dict[str, Any]], source: dict[str, Any]) ->
         "effective_config_sha256_by_lane": {
             key: products[key].get("effective_config_sha256", []) for key in sorted(PRODUCT_KEYS)
         },
+        "product_execution_identity": copy.deepcopy(product_identity),
         "validators": validator_refs,
     }
 
@@ -1468,6 +1509,15 @@ def self_test() -> int:
             if key == "m1_determinism":
                 binding["hardware_id"] = "fixture-instance"
                 binding["device_fingerprint"] = "c" * 64
+            if key == "multiturn_concurrency":
+                binding["product_execution_identity"] = {
+                    "entrypoints": ["run", "serve"],
+                    "resolved_execution_plan_hash": "1" * 64,
+                    "runtime_implementation_fingerprint": "2" * 64,
+                    "same_resolved_execution_plan": True,
+                    "same_runtime_implementation": True,
+                    "production_legacy_selection_count": 0,
+                }
         inputs[key] = {"source": source, "binding": binding}
     cross_bindings(inputs, source)
     forged = copy.deepcopy(inputs)
@@ -1479,6 +1529,11 @@ def self_test() -> int:
     forged = copy.deepcopy(inputs)
     forged["response_format"]["binding"]["model_revision"] = "e" * 40
     expect_reject(lambda: cross_bindings(forged, source), "revision")
+    forged = copy.deepcopy(inputs)
+    forged["multiturn_concurrency"]["binding"]["product_execution_identity"][
+        "production_legacy_selection_count"
+    ] = 1
+    expect_reject(lambda: cross_bindings(forged, source), "product execution identity")
     print(SELFTEST_PASS)
     return 0
 
