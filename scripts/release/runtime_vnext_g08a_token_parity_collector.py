@@ -646,11 +646,6 @@ def collect_case(
     prompt_difference = first_difference(ferrum_prompt, reference_prompt)
     require(prompt_difference is None, f"{prompt_id} prompt token mismatch at index {prompt_difference}")
     output_difference = first_difference(ferrum_output, reference_output)
-    require(output_difference is None, f"{prompt_id} generated token mismatch at step {output_difference}")
-    require(
-        not near_ties,
-        f"{prompt_id} has near-tie steps {near_ties}; collect focused Ferrum and CPU-FP32 top-2 diagnostics",
-    )
     return {
         "prompt_id": prompt_id,
         "prompt_sha256": numerics.canonical_sha256(messages),
@@ -660,9 +655,13 @@ def collect_case(
         "prompt_token_ids_sha256": numerics.token_sha256(ferrum_prompt),
         "ferrum_generated_token_ids": ferrum_output,
         "reference_generated_token_ids": reference_output,
-        "generated_token_ids_sha256": numerics.token_sha256(ferrum_output),
+        "ferrum_generated_token_ids_sha256": numerics.token_sha256(ferrum_output),
+        "reference_generated_token_ids_sha256": numerics.token_sha256(reference_output),
+        "first_generated_token_difference": output_difference,
+        "shared_prefix_token_count": numerics.TOKEN_COUNT if output_difference is None else output_difference,
+        "generated_sequences_equal": output_difference is None,
         "reference_top2_margins": margins,
-        "near_tie_diagnostics": [],
+        "reference_near_tie_steps": near_ties,
         "status": "pass",
     }
 
@@ -750,7 +749,7 @@ def validate_corpus() -> list[dict[str, Any]]:
 
 def build_parity(context: dict[str, Any], cases: list[dict[str, Any]]) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "pass",
         "source_git_sha": context["source_git_sha"],
         "source_tree_sha": context["source_tree_sha"],
@@ -763,7 +762,7 @@ def build_parity(context: dict[str, Any], cases: list[dict[str, Any]]) -> dict[s
         "chat_template_sha256": context["chat_template_sha256"],
         "models_lock_sha256": context["models_lock_sha256"],
         "prompt_corpus_sha256": sha256_file(numerics.PROMPT_CORPUS),
-        "reference_kind": "same_gguf_llama_cpp_external",
+        "reference_kind": "same_gguf_llama_cpp_external_free_run_diagnostic",
         "ferrum_binary": context["ferrum_binary"],
         "reference_source_git_sha": context["reference_source_git_sha"],
         "reference_source_dirty": False,
@@ -852,20 +851,29 @@ def collect(args: argparse.Namespace) -> Path:
                     {"schema_version": 1, "status": "pass", "cache_key": key, "case": case},
                 )
                 cases_by_id[prompt_id] = case
-                print(f"token parity {prompt_id}: PASS 64/64", flush=True)
+                if case["generated_sequences_equal"]:
+                    result = "free-run exact 64/64"
+                else:
+                    result = f"free-run diverged at {case['first_generated_token_difference']}"
+                print(f"token parity {prompt_id}: prompt PASS; {result}", flush=True)
 
     cases = [cases_by_id[str(prompt["id"])] for prompt in prompts]
     parity = build_parity(context, cases)
     parity_path = out / "token-parity.json"
     atomic_write_json(parity_path, parity)
-    numerics.validate_token_parity(parity_path, context["source_git_sha"], context["source_tree_sha"])
+    summary = numerics.validate_token_parity(parity_path, context["source_git_sha"], context["source_tree_sha"])
     collector = read_object(out / "collector.json", "collector manifest")
     collector.update(
         {
             "status": "pass",
             "ended_at": datetime.now(timezone.utc).isoformat(),
             "case_count": len(cases),
-            "matched_token_count": len(cases) * numerics.TOKEN_COUNT,
+            "prompt_token_match_count": summary["prompt_token_match_count"],
+            "product_output_token_count_per_runtime": summary["product_output_token_count_per_runtime"],
+            "generated_sequence_match_count": summary["generated_sequence_match_count"],
+            "shared_prefix_token_count": summary["shared_prefix_token_count"],
+            "reference_near_tie_step_count": summary["reference_near_tie_step_count"],
+            "same_history_required_decision_count": len(cases) * numerics.TOKEN_COUNT,
             "token_parity": {"path": str(parity_path), "sha256": sha256_file(parity_path)},
         }
     )

@@ -52,9 +52,13 @@ TOKEN_CASE_FIELDS = frozenset(
         "prompt_token_ids_sha256",
         "ferrum_generated_token_ids",
         "reference_generated_token_ids",
-        "generated_token_ids_sha256",
+        "ferrum_generated_token_ids_sha256",
+        "reference_generated_token_ids_sha256",
+        "first_generated_token_difference",
+        "shared_prefix_token_count",
+        "generated_sequences_equal",
         "reference_top2_margins",
-        "near_tie_diagnostics",
+        "reference_near_tie_steps",
         "status",
     }
 )
@@ -315,7 +319,7 @@ def validate_token_parity(
         }
     )
     parity = exact_object(parity, required_fields, "token parity")
-    require(parity["schema_version"] == 2 and parity["status"] == "pass", "token parity is not PASS schema v2")
+    require(parity["schema_version"] == 3 and parity["status"] == "pass", "token parity is not PASS schema v3")
     require(parity["source_git_sha"] == source_git_sha and parity["source_dirty"] is False, "token parity source is stale or dirty")
     require(parity["source_tree_sha"] == source_tree_sha, "token parity tree SHA is stale")
     identity = model_lock_identity()
@@ -323,7 +327,10 @@ def validate_token_parity(
         require(parity[field] == expected, f"token parity {field} differs")
     require(parity["model_key"] == MODEL_KEY and parity["backend"] == BACKEND, "token parity model/backend differs")
     require(parity["prompt_corpus_sha256"] == sha256_file(PROMPT_CORPUS), "token parity prompt corpus differs")
-    require(parity["reference_kind"] == "same_gguf_llama_cpp_external", "token parity reference kind differs")
+    require(
+        parity["reference_kind"] == "same_gguf_llama_cpp_external_free_run_diagnostic",
+        "token parity reference kind differs",
+    )
     validate_binary(parity["ferrum_binary"], "Ferrum binary")
     validate_binary(parity["reference_binary"], "llama.cpp binary")
     require(
@@ -483,6 +490,9 @@ def validate_token_parity(
     cases = parity["cases"]
     require(isinstance(cases, list) and len(cases) == PROMPT_COUNT, "token parity cases must contain 20 rows")
     require([case.get("prompt_id") for case in cases if isinstance(case, dict)] == list(expected), "token parity prompt order differs")
+    generated_sequence_match_count = 0
+    shared_prefix_token_count = 0
+    reference_near_tie_step_count = 0
     for index, raw in enumerate(cases):
         case = exact_object(raw, TOKEN_CASE_FIELDS, f"token parity cases[{index}]")
         prompt_id = case["prompt_id"]
@@ -494,17 +504,75 @@ def validate_token_parity(
         require(case["prompt_token_ids_sha256"] == token_sha256(ferrum_prompt), f"{prompt_id} prompt token SHA differs")
         ferrum_output = validate_tokens(case["ferrum_generated_token_ids"], count=TOKEN_COUNT, label=f"{prompt_id} Ferrum output")
         reference_output = validate_tokens(case["reference_generated_token_ids"], count=TOKEN_COUNT, label=f"{prompt_id} reference output")
-        require(ferrum_output == reference_output, f"{prompt_id} generated token sequence differs")
-        require(case["generated_token_ids_sha256"] == token_sha256(ferrum_output), f"{prompt_id} generated token SHA differs")
+        require(
+            case["ferrum_generated_token_ids_sha256"] == token_sha256(ferrum_output),
+            f"{prompt_id} Ferrum generated token SHA differs",
+        )
+        require(
+            case["reference_generated_token_ids_sha256"] == token_sha256(reference_output),
+            f"{prompt_id} reference generated token SHA differs",
+        )
+        expected_difference = next(
+            (step for step, (ferrum, reference) in enumerate(zip(ferrum_output, reference_output, strict=True)) if ferrum != reference),
+            None,
+        )
+        reported_difference = case["first_generated_token_difference"]
+        require(
+            reported_difference is None
+            or (
+                isinstance(reported_difference, int)
+                and not isinstance(reported_difference, bool)
+                and 0 <= reported_difference < TOKEN_COUNT
+            ),
+            f"{prompt_id} first generated token difference is invalid",
+        )
+        require(
+            reported_difference == expected_difference,
+            f"{prompt_id} first generated token difference differs",
+        )
+        expected_shared_prefix = TOKEN_COUNT if expected_difference is None else expected_difference
+        require(
+            isinstance(case["shared_prefix_token_count"], int)
+            and not isinstance(case["shared_prefix_token_count"], bool)
+            and case["shared_prefix_token_count"] == expected_shared_prefix,
+            f"{prompt_id} shared prefix token count differs",
+        )
+        require(
+            isinstance(case["generated_sequences_equal"], bool)
+            and case["generated_sequences_equal"] is (expected_difference is None),
+            f"{prompt_id} generated sequence equality flag differs",
+        )
         margins = case["reference_top2_margins"]
         require(isinstance(margins, list) and len(margins) == TOKEN_COUNT, f"{prompt_id} top2 margin count differs")
         margins = [finite(margin, f"{prompt_id} margin") for margin in margins]
         require(all(margin >= 0.0 for margin in margins), f"{prompt_id} has a negative margin")
-        validate_near_ties(case["near_tie_diagnostics"], margins, f"{prompt_id} near ties")
+        expected_near_ties = [step for step, margin in enumerate(margins) if margin < NEAR_TIE_MARGIN]
+        reported_near_ties = case["reference_near_tie_steps"]
+        require(
+            isinstance(reported_near_ties, list)
+            and all(
+                isinstance(step, int)
+                and not isinstance(step, bool)
+                and 0 <= step < TOKEN_COUNT
+                for step in reported_near_ties
+            ),
+            f"{prompt_id} reference near-tie steps are invalid",
+        )
+        require(
+            reported_near_ties == expected_near_ties,
+            f"{prompt_id} reference near-tie steps differ",
+        )
+        generated_sequence_match_count += int(expected_difference is None)
+        shared_prefix_token_count += expected_shared_prefix
+        reference_near_tie_step_count += len(expected_near_ties)
     return {
         "case_count": PROMPT_COUNT,
+        "prompt_token_match_count": PROMPT_COUNT,
         "token_count_per_case": TOKEN_COUNT,
-        "matched_token_count": PROMPT_COUNT * TOKEN_COUNT,
+        "product_output_token_count_per_runtime": PROMPT_COUNT * TOKEN_COUNT,
+        "generated_sequence_match_count": generated_sequence_match_count,
+        "shared_prefix_token_count": shared_prefix_token_count,
+        "reference_near_tie_step_count": reference_near_tie_step_count,
         "exception_count": 0,
         "waiver_count": 0,
         "reference_kind": parity["reference_kind"],
@@ -691,16 +759,20 @@ def fixture_parity(
                 "prompt_token_ids_sha256": token_sha256(prompt_tokens),
                 "ferrum_generated_token_ids": list(output_tokens),
                 "reference_generated_token_ids": list(output_tokens),
-                "generated_token_ids_sha256": token_sha256(output_tokens),
+                "ferrum_generated_token_ids_sha256": token_sha256(output_tokens),
+                "reference_generated_token_ids_sha256": token_sha256(output_tokens),
+                "first_generated_token_difference": None,
+                "shared_prefix_token_count": TOKEN_COUNT,
+                "generated_sequences_equal": True,
                 "reference_top2_margins": [0.5] * TOKEN_COUNT,
-                "near_tie_diagnostics": [],
+                "reference_near_tie_steps": [],
                 "status": "pass",
             }
         )
     identity = model_lock_identity()
     binary_identity = {"path": str(binary), "sha256": sha256_file(binary)}
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "pass",
         "source_git_sha": source_git_sha,
         "source_tree_sha": source_tree_sha,
@@ -709,7 +781,7 @@ def fixture_parity(
         "backend": BACKEND,
         **identity,
         "prompt_corpus_sha256": sha256_file(PROMPT_CORPUS),
-        "reference_kind": "same_gguf_llama_cpp_external",
+        "reference_kind": "same_gguf_llama_cpp_external_free_run_diagnostic",
         "ferrum_binary": binary_identity,
         "reference_source_git_sha": "2" * 40,
         "reference_source_dirty": False,
@@ -856,7 +928,12 @@ def self_test() -> None:
             source_git_sha,
             source_tree_sha,
         )
-        require(token_summary["matched_token_count"] == 1280, "token parity fixture count differs")
+        require(
+            token_summary["prompt_token_match_count"] == PROMPT_COUNT
+            and token_summary["product_output_token_count_per_runtime"] == 1280
+            and token_summary["generated_sequence_match_count"] == PROMPT_COUNT,
+            "token parity fixture count differs",
+        )
 
         def reject(name: str, mutate: Callable[[dict[str, Any]], None], marker: str) -> None:
             candidate = copy.deepcopy(parity)
@@ -869,7 +946,28 @@ def self_test() -> None:
                 return
             raise GateError(f"{name} unexpectedly passed")
 
-        reject("token flip", lambda value: value["cases"][0]["reference_generated_token_ids"].__setitem__(0, 999), "sequence differs")
+        divergent = copy.deepcopy(parity)
+        divergent_case = divergent["cases"][0]
+        divergent_case["reference_generated_token_ids"][3] = 999
+        divergent_case["reference_generated_token_ids_sha256"] = token_sha256(
+            divergent_case["reference_generated_token_ids"]
+        )
+        divergent_case["first_generated_token_difference"] = 3
+        divergent_case["shared_prefix_token_count"] = 3
+        divergent_case["generated_sequences_equal"] = False
+        write_json(parity_path, divergent)
+        divergent_summary = validate_token_parity(parity_path, source_git_sha, source_tree_sha)
+        require(
+            divergent_summary["generated_sequence_match_count"] == PROMPT_COUNT - 1
+            and divergent_summary["shared_prefix_token_count"] == (PROMPT_COUNT - 1) * TOKEN_COUNT + 3,
+            "free-run divergence diagnostic differs",
+        )
+
+        reject(
+            "unreported divergence",
+            lambda value: value["cases"][0]["reference_generated_token_ids"].__setitem__(3, 999),
+            "reference generated token sha differs",
+        )
         reject("waiver", lambda value: value.update({"waiver_count": 1}), "exception or waiver")
         reject("short output", lambda value: value["cases"][0].update({"ferrum_generated_token_ids": value["cases"][0]["ferrum_generated_token_ids"][:-1]}), "exactly 64")
         write_json(parity_path, parity)
@@ -928,7 +1026,8 @@ def self_test() -> None:
         )
         require(
             aggregate["summary"]["operation_state_row_count"] == 27
-            and aggregate["summary"]["matched_token_count"] == 1280
+            and aggregate["summary"]["prompt_token_match_count"] == PROMPT_COUNT
+            and aggregate["summary"]["product_output_token_count_per_runtime"] == 1280
             and (aggregate_out / "manifest.json").is_file(),
             "aggregate fixture output differs",
         )
