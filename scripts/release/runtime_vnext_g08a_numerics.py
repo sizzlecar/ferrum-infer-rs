@@ -315,7 +315,7 @@ def validate_token_parity(
         }
     )
     parity = exact_object(parity, required_fields, "token parity")
-    require(parity["schema_version"] == 1 and parity["status"] == "pass", "token parity is not PASS schema v1")
+    require(parity["schema_version"] == 2 and parity["status"] == "pass", "token parity is not PASS schema v2")
     require(parity["source_git_sha"] == source_git_sha and parity["source_dirty"] is False, "token parity source is stale or dirty")
     require(parity["source_tree_sha"] == source_tree_sha, "token parity tree SHA is stale")
     identity = model_lock_identity()
@@ -349,10 +349,24 @@ def validate_token_parity(
     )
     command = exact_object(
         parity["command_contract"],
-        frozenset({"ferrum_entrypoint", "ferrum_argv_prefix", "reference_entrypoint", "reference_argv_prefix", "ferrum_execution_count", "reference_execution_count"}),
+        frozenset(
+            {
+                "ferrum_entrypoint",
+                "ferrum_argv_prefix",
+                "reference_entrypoint",
+                "reference_argv_prefix",
+                "reference_http_contract",
+                "ferrum_execution_count",
+                "reference_execution_count",
+            }
+        ),
         "token parity command contract",
     )
-    require(command["ferrum_entrypoint"] == "run" and command["reference_entrypoint"] == "llama-cli", "token parity entrypoints differ")
+    require(
+        command["ferrum_entrypoint"] == "run"
+        and command["reference_entrypoint"] == "llama-server",
+        "token parity entrypoints differ",
+    )
     require(command["ferrum_execution_count"] == command["reference_execution_count"] == PROMPT_COUNT, "token parity command count differs")
     for field in ("ferrum_argv_prefix", "reference_argv_prefix"):
         require(isinstance(command[field], list) and all(isinstance(item, str) and item for item in command[field]), f"{field} is invalid")
@@ -361,6 +375,8 @@ def validate_token_parity(
     require(
         Path(ferrum_argv[0]).resolve() == Path(parity["ferrum_binary"]["path"]).resolve()
         and "run" in ferrum_argv
+        and "qwen3.5:4b-q4_k_m" in ferrum_argv
+        and "--prompt" in ferrum_argv
         and "--request-dump-dir" in ferrum_argv
         and "--disable-thinking" in ferrum_argv,
         "Ferrum parity command is not the explicit product run path",
@@ -370,38 +386,93 @@ def validate_token_parity(
         == Path(parity["reference_binary"]["path"]).resolve(),
         "llama.cpp command binary differs",
     )
-    for argv, label, flag_values in (
-        (
-            ferrum_argv,
-            "Ferrum parity command",
+    for flag, expected in {
+        "--backend": "metal",
+        "--max-tokens": "64",
+        "--temperature": "0",
+        "--seed": "9271",
+        "--top-k": "0",
+        "--top-p": "1",
+        "--min-p": "0",
+        "--presence-penalty": "0",
+        "--repeat-penalty": "1",
+        "--max-model-len": "1024",
+        "--max-num-seqs": "1",
+        "--max-num-batched-tokens": "1024",
+        "--output-format": "jsonl",
+    }.items():
+        require_flag_value(ferrum_argv, flag, expected, "Ferrum parity command")
+    for flag, expected in {
+        "--model": "MODEL",
+        "--host": "127.0.0.1",
+        "--port": "PORT",
+        "--ctx-size": "1024",
+        "--parallel": "1",
+        "--threads": "4",
+        "--threads-batch": "4",
+        "--n-gpu-layers": "99",
+        "--chat-template-kwargs": '{"enable_thinking":false}',
+        "--reasoning": "off",
+        "--cache-ram": "0",
+    }.items():
+        require_flag_value(reference_argv, flag, expected, "llama.cpp parity server command")
+    require(
+        reference_argv.count("--jinja") == 1
+        and reference_argv.count("--no-warmup") == 1,
+        "llama.cpp parity server must enable Jinja and disable warmup explicitly",
+    )
+    reference_http = exact_object(
+        command["reference_http_contract"],
+        frozenset(
             {
-                "--max-tokens": "64",
-                "--temperature": "0",
-                "--seed": "9271",
-                "--top-k": "0",
-                "--top-p": "1",
-                "--min-p": "0",
-                "--presence-penalty": "0",
-                "--repeat-penalty": "1",
-            },
+                "apply_template_path",
+                "tokenize_path",
+                "completion_path",
+                "apply_template_count",
+                "tokenize_count",
+                "completion_count",
+                "tokenize_add_special",
+                "tokenize_parse_special",
+                "completion_prompt_kind",
+                "completion_request",
+            }
         ),
-        (
-            reference_argv,
-            "llama.cpp parity command",
-            {
-                "--n-predict": "64",
-                "--temp": "0",
-                "--seed": "9271",
-                "--top-k": "0",
-                "--top-p": "1",
-                "--min-p": "0",
-                "--presence-penalty": "0",
-                "--repeat-penalty": "1",
+        "token parity reference HTTP contract",
+    )
+    require(
+        reference_http
+        == {
+            "apply_template_path": "/apply-template",
+            "tokenize_path": "/tokenize",
+            "completion_path": "/completion",
+            "apply_template_count": PROMPT_COUNT,
+            "tokenize_count": PROMPT_COUNT,
+            "completion_count": PROMPT_COUNT,
+            "tokenize_add_special": False,
+            "tokenize_parse_special": True,
+            "completion_prompt_kind": "exact_token_ids",
+            "completion_request": {
+                "n_predict": TOKEN_COUNT,
+                "temperature": 0.0,
+                "seed": 9271,
+                "top_k": 0,
+                "top_p": 1.0,
+                "min_p": 0.0,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+                "repeat_penalty": 1.0,
+                "repeat_last_n": 64,
+                "samplers": ["top_k", "top_p", "min_p", "temperature"],
+                "return_tokens": True,
+                "n_probs": 2,
+                "post_sampling_probs": False,
+                "cache_prompt": False,
+                "stream": False,
+                "ignore_eos": False,
             },
-        ),
-    ):
-        for flag, expected in flag_values.items():
-            require_flag_value(argv, flag, expected, label)
+        },
+        "token parity reference HTTP behavior differs",
+    )
     require(parity["case_count"] == parity["passed_count"] == PROMPT_COUNT, "token parity must pass 20/20")
     require(parity["exception_count"] == parity["waiver_count"] == 0, "token parity has an exception or waiver")
 
@@ -629,7 +700,7 @@ def fixture_parity(
     identity = model_lock_identity()
     binary_identity = {"path": str(binary), "sha256": sha256_file(binary)}
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "pass",
         "source_git_sha": source_git_sha,
         "source_tree_sha": source_tree_sha,
@@ -659,6 +730,11 @@ def fixture_parity(
             "ferrum_argv_prefix": [
                 str(binary),
                 "run",
+                "qwen3.5:4b-q4_k_m",
+                "--backend",
+                "metal",
+                "--prompt",
+                "PROMPT",
                 "--request-dump-dir",
                 "REQUEST_DUMP_DIR",
                 "--disable-thinking",
@@ -678,29 +754,73 @@ def fixture_parity(
                 "0",
                 "--repeat-penalty",
                 "1",
+                "--max-model-len",
+                "1024",
+                "--max-num-seqs",
+                "1",
+                "--max-num-batched-tokens",
+                "1024",
+                "--output-format",
+                "jsonl",
             ],
-            "reference_entrypoint": "llama-cli",
+            "reference_entrypoint": "llama-server",
             "reference_argv_prefix": [
                 str(binary),
                 "--model",
                 "MODEL",
-                "--n-predict",
-                "64",
-                "--temp",
-                "0",
-                "--seed",
-                "9271",
-                "--top-k",
-                "0",
-                "--top-p",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "PORT",
+                "--ctx-size",
+                "1024",
+                "--parallel",
                 "1",
-                "--min-p",
+                "--threads",
+                "4",
+                "--threads-batch",
+                "4",
+                "--n-gpu-layers",
+                "99",
+                "--jinja",
+                "--chat-template-kwargs",
+                '{"enable_thinking":false}',
+                "--reasoning",
+                "off",
+                "--no-warmup",
+                "--cache-ram",
                 "0",
-                "--presence-penalty",
-                "0",
-                "--repeat-penalty",
-                "1",
             ],
+            "reference_http_contract": {
+                "apply_template_path": "/apply-template",
+                "tokenize_path": "/tokenize",
+                "completion_path": "/completion",
+                "apply_template_count": PROMPT_COUNT,
+                "tokenize_count": PROMPT_COUNT,
+                "completion_count": PROMPT_COUNT,
+                "tokenize_add_special": False,
+                "tokenize_parse_special": True,
+                "completion_prompt_kind": "exact_token_ids",
+                "completion_request": {
+                    "n_predict": TOKEN_COUNT,
+                    "temperature": 0.0,
+                    "seed": 9271,
+                    "top_k": 0,
+                    "top_p": 1.0,
+                    "min_p": 0.0,
+                    "presence_penalty": 0.0,
+                    "frequency_penalty": 0.0,
+                    "repeat_penalty": 1.0,
+                    "repeat_last_n": 64,
+                    "samplers": ["top_k", "top_p", "min_p", "temperature"],
+                    "return_tokens": True,
+                    "n_probs": 2,
+                    "post_sampling_probs": False,
+                    "cache_prompt": False,
+                    "stream": False,
+                    "ignore_eos": False,
+                },
+            },
             "ferrum_execution_count": PROMPT_COUNT,
             "reference_execution_count": PROMPT_COUNT,
         },
