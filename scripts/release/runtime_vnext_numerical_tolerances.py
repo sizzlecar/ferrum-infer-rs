@@ -25,7 +25,7 @@ FOUNDATION_PASS = "RUNTIME VNEXT NUMERICAL TOLERANCE FOUNDATION PASS"
 COMPLETE_PASS = "RUNTIME VNEXT NUMERICAL TOLERANCE COMPLETE PASS"
 
 CATALOG_SCHEMA_VERSION = 1
-G08A_PROFILE = "g08a_m1_metal.v1"
+G08A_PROFILE = "g08a_m1_metal.v2"
 MINIMUM_COSINE = 0.999
 MAXIMUM_RELATIVE_L2 = 0.01
 
@@ -102,8 +102,9 @@ G08A_REQUIRED_COVERAGE = frozenset(
     }
 )
 G08A_SCOPE = (
-    "Exact Qwen3.5-4B Metal operation/state/layer/model/logit fixtures plus "
-    "canonical-history full-vocabulary decisions; prompt token identity remains exact"
+    "Exact Qwen3.5-4B Metal operation/state and GGUF FP32-master layer/model/logit "
+    "fixtures plus canonical-history full-vocabulary decisions; prompt token identity "
+    "remains exact"
 )
 
 # Coverage is awarded only to reviewed, exact oracle descriptors. An oracle name
@@ -245,6 +246,27 @@ TRUSTED_ORACLE_REGISTRY: dict[str, dict[str, str]] = {
     "cpu.fp32.python.qwen35_gguf_model_reference": {
         "oracle_precision": "fp32",
         "source_commit": "5947a4f86cd8a86c6ea845f2ff0ec30c3ca83afd",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_model_reference.py",
+        "test_name": "build_reference",
+    },
+    "cpu.fp32.python.qwen35_gguf_linear_attention_f32_master_capture_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_linear_attention_reference.py",
+        "test_name": "build_reference",
+    },
+    "cpu.fp32.python.qwen35_gguf_full_attention_f32_master_capture_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
+        "basis_kind": "checked_in_conformance_test",
+        "source_path": "scripts/release/qwen35_gguf_full_attention_reference.py",
+        "test_name": "build_reference",
+    },
+    "cpu.fp32.python.qwen35_gguf_model_f32_master_capture_reference": {
+        "oracle_precision": "fp32",
+        "source_commit": "05907ae04d9a6c16db45ab553345fa8ed27cf752",
         "basis_kind": "checked_in_conformance_test",
         "source_path": "scripts/release/qwen35_gguf_model_reference.py",
         "test_name": "build_reference",
@@ -553,8 +575,45 @@ _qwen35_linear_attention_v4_selector = _coverage_selector(
     },
     oracle_identity="cpu.fp32.python.qwen35_gguf_linear_attention_reference",
 )
+_qwen35_linear_attention_f32_master_selector = _coverage_selector(
+    model_scope="qwen3.5-4b",
+    operation_id="operation.gated_delta_recurrent_attention.f32-master",
+    operation_schema_version="1.0",
+    checkpoint_kind="layer_output",
+    checkpoint_name="layer_0_attention_residual",
+    dtype="fp32",
+    quant_format="gguf_q4_k_m",
+    shape_domain={
+        "fixture_id": (
+            "qwen35-4b.gguf-q4-k-m.f32-master.layer-0."
+            "linear-attention.tokens-24"
+        ),
+        "dimensions": {"hidden_size": 2560, "tokens": 24},
+        "semantics": {
+            "activation_profile": "gguf_f32_master_v1",
+            "branch_dtype": "fp16",
+            "decay_parameterization": "negative_rate",
+            "layer_index": 0,
+            "master_residual_dtype": "fp32",
+            "model_sha256": (
+                "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+            ),
+            "prompt_token_sequence_sha256": (
+                "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
+            ),
+            "value_head_mapping": "interleaved_by_key_head",
+            "weight_format": "gguf_q4_k_m",
+        },
+    },
+    oracle_identity=(
+        "cpu.fp32.python."
+        "qwen35_gguf_linear_attention_f32_master_capture_reference"
+    ),
+)
 for _marker in ("layer.linear_attention", "quant_format.gguf_q4_k_m"):
-    G08A_COVERAGE_RULES[_marker] = copy.deepcopy(_qwen35_linear_attention_v4_selector)
+    G08A_COVERAGE_RULES[_marker] = copy.deepcopy(
+        _qwen35_linear_attention_f32_master_selector
+    )
 
 G08A_COVERAGE_RULES["layer.linear_attention@5.0"] = _coverage_selector(
     model_scope="qwen3.5-4b",
@@ -581,14 +640,17 @@ G08A_COVERAGE_RULES["layer.linear_attention@6.0"] = _coverage_selector(
 
 G08A_COVERAGE_RULES["layer.full_attention"] = _coverage_selector(
     model_scope="qwen3.5-4b",
-    operation_id="operation.causal_paged_attention",
-    operation_schema_version="2.0",
+    operation_id="operation.causal_paged_attention.f32-master",
+    operation_schema_version="1.0",
     checkpoint_kind="layer_output",
     checkpoint_name="layer_3_attention_residual",
-    dtype="fp16",
+    dtype="fp32",
     quant_format="gguf_q4_k_m",
     shape_domain={
-        "fixture_id": "qwen35-4b.gguf-q4-k-m.layer-3.full-attention.tokens-24",
+        "fixture_id": (
+            "qwen35-4b.gguf-q4-k-m.f32-master.layer-3."
+            "full-attention.tokens-24"
+        ),
         "dimensions": {
             "head_dim": 256,
             "hidden_size": 2560,
@@ -598,9 +660,12 @@ G08A_COVERAGE_RULES["layer.full_attention"] = _coverage_selector(
             "tokens": 24,
         },
         "semantics": {
+            "activation_profile": "gguf_f32_master_v1",
+            "branch_dtype": "fp16",
             "causal": True,
             "input_value_id": "value.layer.2.output",
             "layer_index": 3,
+            "master_residual_dtype": "fp32",
             "model_sha256": (
                 "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
             ),
@@ -611,9 +676,12 @@ G08A_COVERAGE_RULES["layer.full_attention"] = _coverage_selector(
             ),
             "rope_interleaved": False,
             "rope_theta": "10000000",
+            "weight_format": "gguf_q4_k_m",
         },
     },
-    oracle_identity="cpu.fp32.python.qwen35_gguf_full_attention_reference",
+    oracle_identity=(
+        "cpu.fp32.python.qwen35_gguf_full_attention_f32_master_capture_reference"
+    ),
 )
 
 G08A_COVERAGE_RULES["checkpoint.full_model"] = _coverage_selector(
@@ -622,15 +690,18 @@ G08A_COVERAGE_RULES["checkpoint.full_model"] = _coverage_selector(
     operation_schema_version="1.0",
     checkpoint_kind="full_model",
     checkpoint_name="final_hidden",
-    dtype="fp16",
+    dtype="fp32",
     quant_format="gguf_q4_k_m",
     shape_domain={
-        "fixture_id": "qwen35-4b.gguf-q4-k-m.full-model.tokens-24",
+        "fixture_id": "qwen35-4b.gguf-q4-k-m.f32-master.full-model.tokens-24",
         "dimensions": {"hidden_size": 2560, "layers": 32, "tokens": 24},
         "semantics": {
+            "activation_profile": "gguf_f32_master_v1",
+            "branch_dtype": "fp16",
             "final_norm": "rms_norm",
             "full_attention_interval": 4,
             "layer_pattern": "three_linear_then_one_full",
+            "master_residual_dtype": "fp32",
             "model_sha256": (
                 "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
             ),
@@ -638,35 +709,42 @@ G08A_COVERAGE_RULES["checkpoint.full_model"] = _coverage_selector(
                 "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
             ),
             "quantized_embedding_is_model_input": True,
+            "weight_format": "gguf_q4_k_m",
         },
     },
-    oracle_identity="cpu.fp32.python.qwen35_gguf_model_reference",
+    oracle_identity="cpu.fp32.python.qwen35_gguf_model_f32_master_capture_reference",
 )
 
 G08A_COVERAGE_RULES["checkpoint.full_vocab_logits"] = _coverage_selector(
     model_scope="qwen3.5-4b",
-    operation_id="operation.qwen35_tied_lm_head",
+    operation_id="operation.last_token_dense_linear.f32",
     operation_schema_version="1.0",
     checkpoint_kind="full_vocab_logits",
     checkpoint_name="last_token_logits",
-    dtype="fp16",
+    dtype="fp32",
     quant_format="gguf_q4_k_m",
     shape_domain={
-        "fixture_id": "qwen35-4b.gguf-q4-k-m.full-vocab-logits.tokens-24",
+        "fixture_id": (
+            "qwen35-4b.gguf-q4-k-m.f32-master.full-vocab-logits.tokens-24"
+        ),
         "dimensions": {"vocabulary_size": 248320},
         "semantics": {
+            "activation_profile": "gguf_f32_master_v1",
             "argmax_token_id": 57590,
+            "input_master_dtype": "fp32",
             "last_token_index": 23,
             "model_sha256": (
                 "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
             ),
+            "output_dtype": "fp32",
             "prompt_token_sequence_sha256": (
                 "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
             ),
             "tied_embedding_lm_head": True,
+            "weight_format": "gguf_q4_k_m",
         },
     },
-    oracle_identity="cpu.fp32.python.qwen35_gguf_model_reference",
+    oracle_identity="cpu.fp32.python.qwen35_gguf_model_f32_master_capture_reference",
 )
 
 G08A_COVERAGE_RULES["checkpoint.teacher_forced_full_vocab_logits"] = _coverage_selector(
@@ -1053,8 +1131,10 @@ def _validate_row(
     row = _require_exact_fields(value, ROW_FIELDS, label)
     tolerance_id = _require_identifier(row["tolerance_id"], f"{label}.tolerance_id")
     markers = row["coverage_markers"]
-    _require(isinstance(markers, list) and bool(markers),
-             f"{label}.coverage_markers must be a non-empty list")
+    # Reviewed rows remain immutable history. An empty marker list retires a row
+    # from the current typed profile without deleting or rewriting its selector.
+    _require(isinstance(markers, list),
+             f"{label}.coverage_markers must be a list")
     normalized_markers = [
         _require_identifier(marker, f"{label}.coverage_markers[{marker_index}]")
         for marker_index, marker in enumerate(markers)
@@ -1467,6 +1547,28 @@ def _self_test() -> None:
         "forged complete coverage markers",
         lambda: validate_catalog_document(forged_markers, require_complete=True),
         "do not match the typed row selector",
+    )
+
+    cleared_active = copy.deepcopy(document)
+    cleared_active["rows"][0]["coverage_markers"] = []
+    cleared_active["rows"][0]["row_fingerprint"] = row_fingerprint(
+        cleared_active["rows"][0]
+    )
+    _expect_rejected(
+        "cleared active coverage markers",
+        lambda: validate_catalog_document(cleared_active),
+        "do not match the typed row selector",
+    )
+
+    retired = copy.deepcopy(document)
+    retired["rows"][0]["checkpoint_name"] = "retired_output"
+    retired["rows"][0]["coverage_markers"] = []
+    retired["rows"][0]["row_fingerprint"] = row_fingerprint(retired["rows"][0])
+    retired["coverage"]["missing_required_coverage"] = sorted(G08A_REQUIRED_COVERAGE)
+    retired_summary = validate_catalog_document(retired)
+    _require(
+        retired_summary["coverage_status"] == "foundation_only",
+        "retired rows must not contribute current coverage",
     )
 
     untrusted_oracle = copy.deepcopy(document)

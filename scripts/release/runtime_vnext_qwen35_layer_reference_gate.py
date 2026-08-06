@@ -11,6 +11,7 @@ import re
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path, PurePath
 from typing import Any
 
@@ -20,12 +21,12 @@ import runtime_vnext_numerical_tolerances as tolerances
 PASS_PREFIX = "RUNTIME VNEXT QWEN35 LINEAR ATTENTION NUMERICS PASS"
 SELF_TEST_PASS = "RUNTIME VNEXT QWEN35 LINEAR ATTENTION NUMERICS SELF-TEST PASS"
 TOLERANCE_ID = (
-    "runtime-vnext.metal.qwen35-4b.linear-attention.v6.layer."
-    "fp16.gguf-q4-k-m.tokens-24"
+    "runtime-vnext.metal.qwen35-4b.linear-attention-f32-master.v1.layer."
+    "fp32.gguf-q4-k-m.tokens-24"
 )
 EXPECTED_MODEL_SHA256 = "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
 EXPECTED_TOKEN_SHA256 = "8276dc19eb8a689a640328eb30be55725913ffd9aa291b01f040cbb9543e5e6f"
-EXPECTED_SOURCE_SHA256 = "9d5a85f2df899888d509fcd09bba3ea7ad2c2e4b4d204cb9e2a7d79860f44251"
+EXPECTED_SOURCE_SHA256 = "306d63ad0670d7507c432db235f579c80043ae7abcafc4b4a5d5c80838f26f16"
 EXPECTED_SHAPE = [24, 2560]
 EXPECTED_ELEMENTS = 24 * 2560
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
@@ -163,14 +164,12 @@ def require_git_commit(commit: Any, label: str) -> str:
     return commit
 
 
-def f16_as_f32_sha256(path: Path, expected_elements: int) -> str:
+def validated_f32_sha256(path: Path, expected_elements: int) -> str:
     payload = path.read_bytes()
-    require(len(payload) == expected_elements * 2, "actual FP16 checkpoint byte count differs")
-    digest = hashlib.sha256()
-    for (value,) in struct.iter_unpack("<e", payload):
-        require(math.isfinite(value), "actual FP16 checkpoint contains NaN or Inf")
-        digest.update(struct.pack("<f", value))
-    return digest.hexdigest()
+    require(len(payload) == expected_elements * 4, "actual FP32 checkpoint byte count differs")
+    for (value,) in struct.iter_unpack("<f", payload):
+        require(math.isfinite(value), "actual FP32 checkpoint contains NaN or Inf")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def validate_metrics(metrics: Any, row: dict[str, Any]) -> dict[str, float]:
@@ -323,13 +322,15 @@ def validate_report(
     require(isinstance(actual, dict), "report.actual must be an object")
     require(actual.get("value_id") == "value.layer.0.attention",
             "actual checkpoint value id differs")
-    require(actual.get("logical_dtype") == "fp16"
+    require(actual.get("logical_dtype") == "fp32"
             and actual.get("logical_shape") == EXPECTED_SHAPE,
             "actual checkpoint dtype/shape differs")
     actual_root = Path(str(actual.get("artifact_root", ""))).resolve()
     require(actual_root.is_dir(), "actual capture artifact root is unavailable")
     raw_actual = safe_child(actual_root / "capture", actual.get("raw_file"),
                             "actual.raw_file")
+    require(raw_actual.stat().st_size == EXPECTED_ELEMENTS * 4,
+            "actual checkpoint byte count differs")
     require(sha256_file(raw_actual) == actual.get("raw_sha256"),
             "actual raw checkpoint SHA256 mismatch")
     require(actual.get("tracked_diff_sha256") == EMPTY_SHA256,
@@ -362,7 +363,7 @@ def validate_report(
             "metric/reference FP32 SHA256 differs")
     require(
         report["metrics"]["actual_f32_sha256"]
-        == f16_as_f32_sha256(raw_actual, EXPECTED_ELEMENTS),
+        == validated_f32_sha256(raw_actual, EXPECTED_ELEMENTS),
         "metric/actual FP32 SHA256 differs",
     )
 
@@ -396,14 +397,14 @@ def validate_report(
 
 def self_test() -> None:
     row = {
-        "dtype": "fp16",
+        "dtype": "fp32",
         "oracle_precision": "fp32",
         "bounds": {"max_abs_max": 0.012, "relative_l2_max": 0.01, "cosine_min": 0.999},
     }
     metrics = {
         "shape": EXPECTED_SHAPE,
         "element_count": EXPECTED_ELEMENTS,
-        "actual_logical_dtype": "fp16",
+        "actual_logical_dtype": "fp32",
         "oracle_precision": "fp32",
         "actual_nan_count": 0,
         "actual_inf_count": 0,
@@ -432,6 +433,31 @@ def self_test() -> None:
         require("artifact-local tolerance" in str(error), "wrong tolerance rejection")
     else:
         raise GateError("artifact-local tolerance unexpectedly passed")
+    with tempfile.TemporaryDirectory(prefix="qwen35-f32-gate-") as tmp:
+        root = Path(tmp)
+        valid = root / "valid.f32"
+        payload = struct.pack("<f", 1.25) * 4
+        valid.write_bytes(payload)
+        require(validated_f32_sha256(valid, 4) == hashlib.sha256(payload).hexdigest(),
+                "valid FP32 payload hash differs")
+
+        short = root / "short.bin"
+        short.write_bytes(struct.pack("<e", 1.25) * 4)
+        try:
+            validated_f32_sha256(short, 4)
+        except GateError as error:
+            require("byte count" in str(error), "wrong short FP32 rejection")
+        else:
+            raise GateError("two-byte payload unexpectedly passed FP32 validation")
+
+        nonfinite = root / "nonfinite.f32"
+        nonfinite.write_bytes(struct.pack("<f", math.nan) * 4)
+        try:
+            validated_f32_sha256(nonfinite, 4)
+        except GateError as error:
+            require("NaN or Inf" in str(error), "wrong non-finite FP32 rejection")
+        else:
+            raise GateError("non-finite FP32 payload unexpectedly passed")
     print(SELF_TEST_PASS)
 
 
@@ -474,7 +500,9 @@ def main() -> int:
         rows = [row for row in catalog["rows"] if row["tolerance_id"] == TOLERANCE_ID]
         require(len(rows) == 1, "catalog does not contain exactly one reviewed layer row")
         row = rows[0]
-        require(row["coverage_markers"] == ["layer.linear_attention@6.0"],
+        require(
+            row["coverage_markers"]
+            == ["layer.linear_attention", "quant_format.gguf_q4_k_m"],
                 "layer row coverage markers differ")
         require(row["row_fingerprint"] == tolerances.row_fingerprint(row),
                 "layer row fingerprint differs")
