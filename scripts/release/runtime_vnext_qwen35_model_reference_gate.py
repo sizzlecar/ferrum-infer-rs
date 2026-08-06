@@ -256,7 +256,9 @@ def validate_actual(actual: Any) -> tuple[dict[str, Path], dict[str, Any]]:
                 "git_status",
                 "tracked_diff_sha256",
                 "binary_sha256_record",
+                "captured_tokens",
                 "checkpoints",
+                "wave_kind",
             }
         ),
         "report.actual",
@@ -279,6 +281,10 @@ def validate_actual(actual: Any) -> tuple[dict[str, Path], dict[str, Any]]:
                  and all(line.startswith("?? ") for line in status.splitlines()),
                  "actual capture Git status contains tracked changes")
     base.require_git_commit(actual["git_sha"], "actual capture commit")
+    base.require(
+        actual["wave_kind"] == "prefill" and actual["captured_tokens"] == TOKENS,
+        "actual capture must be the complete 24-token prefill wave",
+    )
 
     expected_shapes = {EMBEDDING_VALUE_ID: FULL_HIDDEN_SHAPE}
     expected_shapes.update(
