@@ -45,6 +45,8 @@ pub fn validate_compiled_native_operator_provider_catalog(
     }
     let catalog_sha256 = catalog.canonical_sha256()?;
     let mut binding_count = 0_usize;
+    let mut provenance_change_count = 0_usize;
+    let mut first_provenance_sha256 = None;
     for artifact in artifacts {
         if artifact.schema_version != NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION {
             return Err(format!(
@@ -58,11 +60,25 @@ pub fn validate_compiled_native_operator_provider_catalog(
                 artifact.operator, artifact.backend, catalog.backend
             ));
         }
-        if artifact.g03_catalog_sha256.as_deref() != Some(catalog_sha256.as_str()) {
+        let provenance_sha256 = artifact.g03_catalog_sha256.as_deref().ok_or_else(|| {
+            format!(
+                "compiled native operator {} has no provider catalog provenance",
+                artifact.operator
+            )
+        })?;
+        if !is_lowercase_sha256(provenance_sha256) {
             return Err(format!(
-                "compiled native operator {} is stale for the live provider catalog",
+                "compiled native operator {} has invalid provider catalog provenance",
                 artifact.operator
             ));
+        }
+        // The full catalog digest records build provenance. Runtime compatibility is
+        // binding-scoped so an unrelated provider cannot invalidate every artifact.
+        if provenance_sha256 != catalog_sha256 {
+            provenance_change_count = provenance_change_count.checked_add(1).ok_or_else(|| {
+                "compiled native operator provenance change count overflows usize".to_string()
+            })?;
+            first_provenance_sha256.get_or_insert(provenance_sha256);
         }
         for binding in &artifact.operation_bindings {
             binding_count = binding_count.checked_add(1).ok_or_else(|| {
@@ -99,7 +115,26 @@ pub fn validate_compiled_native_operator_provider_catalog(
                 .to_string(),
         );
     }
+    if provenance_change_count > 0 {
+        tracing::debug!(
+            target: "ferrum::native_ops",
+            event = "native_operator_catalog_provenance_changed",
+            artifact_count = artifacts.len(),
+            provenance_change_count,
+            validated_binding_count = binding_count,
+            artifact_catalog_sha256 = first_provenance_sha256.unwrap_or_default(),
+            live_catalog_sha256 = catalog_sha256,
+            "native operator catalog provenance changed; declared provider bindings remain compatible"
+        );
+    }
     Ok(())
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
