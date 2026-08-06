@@ -83,6 +83,7 @@ LANES = (
     "vnext-g08a-numerics",
     "vnext-g08a",
     "vnext-r0",
+    "vnext-r1",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
     "vnext-g08c-cuda",
@@ -779,6 +780,7 @@ FRESH_OUTPUT_PROVENANCE_KINDS = frozenset(
         "vnext-g08a-source",
         "vnext-g08a",
         "vnext-r0",
+        "vnext-r1",
     }
 )
 
@@ -1598,6 +1600,37 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-r0",
+        )
+    if lane == "vnext-r1":
+        required = {
+            "--r0": args.r0,
+            "--m1-cuda": args.m1_cuda,
+            "--m1-metal": args.m1_metal,
+            "--m2-cuda": args.m2_cuda,
+            "--m2-metal": args.m2_metal,
+            "--m3-cuda": args.m3_cuda,
+            "--m3-metal": args.m3_metal,
+            "--llama-cuda": args.llama_cuda,
+            "--llama-metal": args.llama_metal,
+        }
+        missing = [flag for flag, value in required.items() if value is None]
+        if missing:
+            raise GateError("vnext-r1 requires " + ", ".join(missing))
+        cmd = [
+            sys.executable,
+            "scripts/release/runtime_vnext_r1_product_correctness.py",
+        ]
+        for flag, value in required.items():
+            assert value is not None
+            cmd.extend([flag, str(value.resolve())])
+        cmd.extend(["--out", str(out_dir)])
+        return LaneCommand(
+            cmd=cmd,
+            expected_child_pass_line=(
+                f"FERRUM RUNTIME VNEXT R1 PRODUCT CORRECTNESS PASS: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind="vnext-r1",
         )
     if lane == "vnext-g08b-cuda":
         if args.g08b_artifact_root is None:
@@ -6371,6 +6404,43 @@ def validate_vnext_r0_provenance(
     return summary
 
 
+def validate_vnext_r1_provenance(
+    lane_command: LaneCommand,
+    child_manifest: dict[str, Any],
+    child_manifest_sha256: str,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    manifest_path = lane_command.child_manifest_path
+    require_gate(
+        manifest_path is not None,
+        "vnext-r1 delegated manifest path is missing",
+    )
+    try:
+        import runtime_vnext_r1_product_correctness as checkpoint
+
+        summary = checkpoint.verify_manifest(
+            manifest_path,
+            verify_checkout=verify_checkout,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise GateError(f"vnext-r1 provenance failed: {error}") from error
+    require_gate(
+        summary.get("kind") == "vnext-r1"
+        and summary.get("child_manifest", {}).get("sha256")
+        == require_sha256(
+            child_manifest_sha256,
+            "vnext-r1 child manifest SHA256",
+        ),
+        "vnext-r1 checkpoint summary binding mismatch",
+    )
+    require_gate(
+        summary.get("source") == child_manifest.get("source"),
+        "vnext-r1 source binding mismatch",
+    )
+    return summary
+
+
 def validate_vnext_g08a_dependency_provenance(
     lane_command: LaneCommand,
     child_manifest: dict[str, Any],
@@ -6790,6 +6860,13 @@ def verify_child_pass_line(
         )
     if lane_command.provenance_kind == "vnext-r0":
         return validate_vnext_r0_provenance(
+            lane_command,
+            child_manifest,
+            child_manifest_digest,
+            verify_checkout=verify_checkout,
+        )
+    if lane_command.provenance_kind == "vnext-r1":
+        return validate_vnext_r1_provenance(
             lane_command,
             child_manifest,
             child_manifest_digest,
@@ -8802,6 +8879,7 @@ def self_test() -> int:
                     "vnext-g08a-source",
                     "vnext-g08a",
                     "vnext-r0",
+                    "vnext-r1",
                 )
             )
             and not provenance_requires_fresh_output("vnext-g07a"),
@@ -9337,6 +9415,62 @@ def self_test() -> int:
             and r0_manifest["child_pass_line"]
             == f"FERRUM RUNTIME VNEXT R0 CORE CLOSURE PASS: {r0_out.resolve()}",
             r0_manifest,
+        )
+        r1_child_selftest = run_selftest_command(
+            [
+                sys.executable,
+                str(
+                    REPO_ROOT
+                    / "scripts/release/runtime_vnext_r1_product_correctness.py"
+                ),
+                "--self-test",
+            ]
+        )
+        require_selftest(
+            r1_child_selftest.returncode == 0
+            and "FERRUM RUNTIME VNEXT R1 PRODUCT CORRECTNESS SELFTEST PASS"
+            in r1_child_selftest.stdout.splitlines(),
+            r1_child_selftest.stderr or r1_child_selftest.stdout,
+        )
+        r1_inputs = {
+            "--r0": root / "r0/gate.manifest.json",
+            "--m1-cuda": root / "m1-cuda/gate.manifest.json",
+            "--m1-metal": root / "m1-metal/gate.manifest.json",
+            "--m2-cuda": root / "m2-cuda/gate.manifest.json",
+            "--m2-metal": root / "m2-metal/gate.manifest.json",
+            "--m3-cuda": root / "m3-cuda/gate.manifest.json",
+            "--m3-metal": root / "m3-metal/gate.manifest.json",
+            "--llama-cuda": root / "llama-cuda",
+            "--llama-metal": root / "llama-metal",
+        }
+        r1_out = root / "r1-dry-run"
+        r1_command = [sys.executable, str(this_script), "vnext-r1"]
+        for flag, value in r1_inputs.items():
+            r1_command.extend([flag, str(value)])
+        r1_command.extend(["--out", str(r1_out), "--dry-run"])
+        r1_dry = run_selftest_command(r1_command)
+        require_selftest(
+            r1_dry.returncode == 0,
+            r1_dry.stderr or r1_dry.stdout,
+        )
+        r1_manifest = json.loads((r1_out / "gate.manifest.json").read_text())
+        expected_r1_child = [
+            sys.executable,
+            "scripts/release/runtime_vnext_r1_product_correctness.py",
+        ]
+        for flag, value in r1_inputs.items():
+            expected_r1_child.extend([flag, str(value.resolve())])
+        expected_r1_child.extend(["--out", str(r1_out.resolve())])
+        require_selftest(
+            r1_manifest["status"] == "dry-run"
+            and r1_manifest["lane"] == "vnext-r1"
+            and r1_manifest["delegated_command_line"] == expected_r1_child
+            and r1_manifest["child_pass_line"]
+            == (
+                "FERRUM RUNTIME VNEXT R1 PRODUCT CORRECTNESS PASS: "
+                f"{r1_out.resolve()}"
+            ),
+            r1_manifest,
         )
         g08b_report = g08b_root / "correctness/m2-qwen35-35b-a3b/cuda/scenario-report.json"
         g08b_out = root / "g08b-cuda-dry-run"
@@ -11235,6 +11369,15 @@ def main() -> int:
     parser.add_argument("--g08a-s2", type=Path)
     parser.add_argument("--g08a-cuda-performance", type=Path)
     parser.add_argument("--g08a-metal-performance", type=Path)
+    parser.add_argument("--r0", type=Path)
+    parser.add_argument("--m1-cuda", type=Path)
+    parser.add_argument("--m1-metal", type=Path)
+    parser.add_argument("--m2-cuda", type=Path)
+    parser.add_argument("--m2-metal", type=Path)
+    parser.add_argument("--m3-cuda", type=Path)
+    parser.add_argument("--m3-metal", type=Path)
+    parser.add_argument("--llama-cuda", type=Path)
+    parser.add_argument("--llama-metal", type=Path)
     parser.add_argument("--g08b-artifact-root", type=Path)
     parser.add_argument("--g08b-scenario-report", type=Path)
     parser.add_argument("--g08c-artifact-root", type=Path)
@@ -11278,6 +11421,7 @@ def main() -> int:
         "vnext-g08a-source",
         "vnext-g08a",
         "vnext-r0",
+        "vnext-r1",
     }:
         try:
             require_external_vnext_g00_output(out_dir)

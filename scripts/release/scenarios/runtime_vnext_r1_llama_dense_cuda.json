@@ -1,0 +1,41 @@
+{
+  "backend": "cuda",
+  "ferrum_bin": "target/release/ferrum",
+  "model": "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
+  "schema_version": 1,
+  "server": {
+    "args": [
+      "--backend",
+      "cuda"
+    ],
+    "mode": "start"
+  },
+  "timeout_sec": 300,
+  "scenarios": [
+    {
+      "name": "run_multiturn_recall",
+      "type": "run_multiturn",
+      "secret": "ferrum-llama-blue",
+      "expected_recall": "ferrum-llama-blue",
+      "min_assistant_turns": 2,
+      "temperature": 0,
+      "use_default_max_tokens": true,
+      "prompts": [
+        "The code is ferrum-llama-blue. Reply with only OK.",
+        "What was the code from my previous message? Reply with only that code."
+      ]
+    },
+    {
+      "name": "serve_multiturn_recall",
+      "type": "serve_multiturn_recall",
+      "secret": "ferrum-llama-blue",
+      "temperature": 0
+    },
+    {
+      "name": "serve_stream_done_usage",
+      "type": "serve_stream",
+      "max_tokens": 128,
+      "temperature": 0
+    }
+  ]
+}
