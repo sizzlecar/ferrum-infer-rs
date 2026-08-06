@@ -23,7 +23,7 @@ use super::super::vnext_runtime::{
 };
 use super::linear::{
     append_shared_gate_up_weight, append_shared_matrix_weight, dispatch_linear, dispatch_swiglu,
-    linear_launch, same_resolved_weight, swiglu_launch, validate_launch_regions,
+    linear_launch, same_resolved_weight, swiglu_launch, validate_launch_regions_with_raw_workspace,
     MetalLinearPipelines,
 };
 use super::weights::{
@@ -643,7 +643,7 @@ fn encode_moe(
     linear_launches.push(shared_gate_launch);
     linear_launches.extend(shared_gate_up_launches.iter().copied());
     linear_launches.push(shared_down_launch);
-    validate_launch_regions(&regions, &linear_launches)?;
+    validate_launch_regions_with_raw_workspace(&regions, &linear_launches, &[scratch_region])?;
     validate_workspace_regions(&regions[scratch_region], &layout)?;
     let shared_swiglu = swiglu_launch(
         layout.shared_gate_up.offset_bytes,

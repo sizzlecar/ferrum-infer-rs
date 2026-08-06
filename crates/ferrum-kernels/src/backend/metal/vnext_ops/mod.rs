@@ -4,25 +4,33 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
-    gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
-    last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
-    routed_shared_swiglu_moe_contract, token_embedding_contract, AttributeId,
-    BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion, DeviceId,
-    DeviceRuntime, DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement,
-    DynamicStorageView, ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationRuntimeRegistry, ProfilePhase, ProviderExecutionSemantics, ProviderId,
-    ProviderReplayEquivalence, ProviderStorageBindingRequirement, QuantizationFormatId,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    SemanticValue, VNextError, WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
-    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-    IDENTITY_WEIGHT_MATERIALIZER_ID, LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
-    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RMS_NORM_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
-    TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+    causal_paged_attention_contract, causal_paged_attention_f32_master_contract,
+    dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
+    gated_delta_recurrent_attention_f32_master_contract, last_token_dense_linear_contract,
+    last_token_dense_linear_f32_contract, last_token_masked_argmax_contract,
+    last_token_masked_argmax_f32_contract, residual_add_contract, residual_add_f32_f16_contract,
+    rms_norm_contract, rms_norm_f32_contract, rms_norm_f32_to_f16_contract,
+    routed_shared_swiglu_moe_contract, token_embedding_contract,
+    token_embedding_f32_master_contract, AttributeId, BatchedOperationInvocation,
+    CapabilityCatalog, CapabilityId, ContractVersion, DeviceId, DeviceRuntime,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
+    ElementType, EngineProviderDescriptor, ExecutionIdentityEnvelope, OperationContract,
+    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationRuntimeRegistry,
+    ProfilePhase, ProviderExecutionSemantics, ProviderId, ProviderReplayEquivalence,
+    ProviderStorageBindingRequirement, QuantizationFormatId, ResolvedTensorLayout,
+    ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology, SemanticValue, VNextError,
+    WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_F32_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID,
+    RMS_NORM_F32_CAPABILITY_ID, RMS_NORM_F32_TO_F16_CAPABILITY_ID,
+    ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
+    TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -48,8 +56,10 @@ use linear::{
 };
 use moe::{MetalMoePipelines, MetalRoutedSharedSwiGluMoeProvider};
 use primitives::{
-    MetalLastTokenMaskedArgmaxProvider, MetalPrimitivePipelines, MetalResidualAddProvider,
-    MetalRmsNormProvider, MetalTokenEmbeddingProvider,
+    MetalLastTokenMaskedArgmaxF32Provider, MetalLastTokenMaskedArgmaxProvider,
+    MetalPrimitivePipelines, MetalResidualAddF32F16Provider, MetalResidualAddProvider,
+    MetalRmsNormF32Provider, MetalRmsNormF32ToF16Provider, MetalRmsNormProvider,
+    MetalTokenEmbeddingF32MasterProvider, MetalTokenEmbeddingProvider,
 };
 
 const METAL_ENGINE_PROVIDER_ID: &str = "provider.engine.metal.vnext";
@@ -75,6 +85,14 @@ pub fn metal_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> 
         ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+        TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
+        RMS_NORM_F32_TO_F16_CAPABILITY_ID,
+        RMS_NORM_F32_CAPABILITY_ID,
+        RESIDUAL_ADD_F32_F16_CAPABILITY_ID,
+        LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID,
+        LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
     ]
     .into_iter()
     .map(CapabilityId::new)
@@ -139,6 +157,14 @@ pub fn metal_vnext_operation_registry(
         Box::new(routed_shared_swiglu_moe_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
+        Box::new(token_embedding_f32_master_contract().map_err(contract_error)?),
+        Box::new(rms_norm_f32_to_f16_contract().map_err(contract_error)?),
+        Box::new(rms_norm_f32_contract().map_err(contract_error)?),
+        Box::new(residual_add_f32_f16_contract().map_err(contract_error)?),
+        Box::new(last_token_dense_linear_f32_contract().map_err(contract_error)?),
+        Box::new(last_token_masked_argmax_f32_contract().map_err(contract_error)?),
+        Box::new(gated_delta_recurrent_attention_f32_master_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_f32_master_contract().map_err(contract_error)?),
     ];
     let providers: Vec<Box<dyn OperationProvider<MetalDeviceRuntime>>> = vec![
         Box::new(MetalTokenEmbeddingProvider::new(
@@ -173,11 +199,47 @@ pub fn metal_vnext_operation_registry(
         )?),
         Box::new(MetalGatedDeltaRecurrentAttentionProvider::new(
             runtime,
-            gated_delta_pipelines,
+            Arc::clone(&gated_delta_pipelines),
             Arc::clone(&linear_pipelines),
             Arc::clone(&pipelines),
         )?),
         Box::new(MetalCausalPagedAttentionProvider::new(
+            runtime,
+            Arc::clone(&causal_attention_pipelines),
+            Arc::clone(&linear_pipelines),
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalTokenEmbeddingF32MasterProvider::new(
+            runtime,
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalRmsNormF32ToF16Provider::new(
+            runtime,
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalRmsNormF32Provider::new(
+            runtime,
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalResidualAddF32F16Provider::new(
+            runtime,
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalLastTokenDenseLinearProvider::new_f32(
+            runtime,
+            Arc::clone(&linear_pipelines),
+        )?),
+        Box::new(MetalLastTokenMaskedArgmaxF32Provider::new(
+            runtime,
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalGatedDeltaRecurrentAttentionProvider::new_f32_master(
+            runtime,
+            Arc::clone(&gated_delta_pipelines),
+            Arc::clone(&linear_pipelines),
+            Arc::clone(&pipelines),
+        )?),
+        Box::new(MetalCausalPagedAttentionProvider::new_f32_master(
             runtime,
             causal_attention_pipelines,
             linear_pipelines,
@@ -721,11 +783,15 @@ pub(crate) fn implementation_fingerprint(parts: &[&[u8]]) -> String {
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        OperationId, CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID,
-        DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
-        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
-        RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
-        TOKEN_EMBEDDING_OPERATION_ID,
+        OperationId, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+        CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+        GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+        LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+        LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F32_F16_OPERATION_ID,
+        RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F32_OPERATION_ID, RMS_NORM_F32_TO_F16_OPERATION_ID,
+        RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+        TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
     };
     use std::cell::Cell;
 
@@ -733,8 +799,8 @@ mod tests {
     fn partial_composition_advertises_only_installed_operation_capabilities() {
         let composition = MetalVNextComposition::create(DeviceId::new("device.metal.0").unwrap())
             .expect("create Metal primitive composition");
-        assert_eq!(composition.runtime().descriptor().capabilities.len(), 10);
-        assert_eq!(composition.catalog().device().capabilities.len(), 10);
+        assert_eq!(composition.runtime().descriptor().capabilities.len(), 18);
+        assert_eq!(composition.catalog().device().capabilities.len(), 18);
         for operation_id in [
             TOKEN_EMBEDDING_OPERATION_ID,
             RMS_NORM_OPERATION_ID,
@@ -746,6 +812,14 @@ mod tests {
             ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
             GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
             CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+            TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+            RMS_NORM_F32_TO_F16_OPERATION_ID,
+            RMS_NORM_F32_OPERATION_ID,
+            RESIDUAL_ADD_F32_F16_OPERATION_ID,
+            LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+            LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
         ] {
             assert_eq!(
                 composition

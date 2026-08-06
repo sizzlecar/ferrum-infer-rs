@@ -109,3 +109,70 @@ kernel void vnext_swiglu_f16(
     const float up = float(gate_up[base + params.intermediate_size + column]);
     activation[index] = half((gate / (1.0f + exp(-gate))) * up);
 }
+
+kernel void vnext_linear_dense_f32(
+    device const float * input [[buffer(0)]],
+    device const half * weight [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant LinearParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group.y;
+    const uint first_output = group.x * 4 + simd_group * 2;
+    float sums[2] = {0.0f, 0.0f};
+    const ulong input_base = ulong(row) * params.in_features;
+    for (uint column = simd_lane; column < params.in_features; column += 32) {
+        const float activation = input[input_base + column];
+        for (uint local_output = 0; local_output < 2; ++local_output) {
+            const uint output_column = first_output + local_output;
+            if (output_column < params.out_features) {
+                sums[local_output] += activation
+                    * float(weight[ulong(output_column) * params.in_features + column]);
+            }
+        }
+    }
+    for (uint local_output = 0; local_output < 2; ++local_output) {
+        const uint output_column = first_output + local_output;
+        const float total = simd_sum(sums[local_output]);
+        if (simd_lane == 0 && output_column < params.out_features) {
+            output[ulong(row) * params.output_stride
+                + params.output_column_offset + output_column] = total;
+        }
+    }
+}
+
+kernel void vnext_linear_q8_0_f32(
+    device const float * input [[buffer(0)]],
+    device const block_q8_0 * weight [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant LinearParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+    const uint row = group.y;
+    const uint first_output = group.x * 4 + simd_group * 2;
+    const uint blocks_per_row = params.in_features / QK8_0;
+    float sums[2] = {0.0f, 0.0f};
+    const ulong input_base = ulong(row) * params.in_features;
+    for (uint column = simd_lane; column < params.in_features; column += 32) {
+        const float activation = input[input_base + column];
+        for (uint local_output = 0; local_output < 2; ++local_output) {
+            const uint output_column = first_output + local_output;
+            if (output_column < params.out_features) {
+                const ulong weight_base = ulong(output_column) * blocks_per_row;
+                sums[local_output] += activation * q8_0_value(
+                    weight[weight_base + column / QK8_0], column % QK8_0
+                );
+            }
+        }
+    }
+    for (uint local_output = 0; local_output < 2; ++local_output) {
+        const uint output_column = first_output + local_output;
+        const float total = simd_sum(sums[local_output]);
+        if (simd_lane == 0 && output_column < params.out_features) {
+            output[ulong(row) * params.output_stride
+                + params.output_column_offset + output_column] = total;
+        }
+    }
+}

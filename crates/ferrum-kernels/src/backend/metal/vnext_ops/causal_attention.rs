@@ -5,16 +5,18 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    causal_paged_attention_contract, AttributeId, BatchedOperationInvocation, DeviceBatchingForm,
-    DeviceReusableExecutionTopologyFingerprint, DynamicStorageAllocator, DynamicStorageProfile,
-    DynamicStorageRequirement, DynamicStorageView, ElementType, EncodedDeviceOperation,
-    OperationBufferStorageKind, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
-    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    causal_paged_attention_contract, causal_paged_attention_f32_master_contract, AttributeId,
+    BatchedOperationInvocation, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
+    DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView,
+    ElementType, EncodedDeviceOperation, OperationBufferStorageKind, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator,
+    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedTensorLayout,
     ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
     ReusableExecutionTopologyRequest, SemanticValue, VNextError,
-    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
 };
 use metal::{
     ArgumentEncoder, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
@@ -27,10 +29,13 @@ use super::super::vnext_runtime::{
     MetalDeviceRuntimeError,
 };
 use super::linear::{
-    append_shared_matrix_weight, dispatch_linear, linear_launch, validate_launch_regions,
-    LinearLaunch, MetalLinearPipelines,
+    append_shared_matrix_weight, dispatch_linear, linear_launch,
+    validate_launch_regions_with_raw_workspace, LinearLaunch, MetalLinearPipelines,
 };
-use super::primitives::{dispatch_residual_add_at, dispatch_rms_norm_at, MetalPrimitivePipelines};
+use super::primitives::{
+    dispatch_residual_add_at, dispatch_residual_add_f32_f16_at, dispatch_rms_norm_at,
+    dispatch_rms_norm_f32_to_f16_at, MetalPrimitivePipelines,
+};
 use super::{
     authorize_reusable_topology, binding, checked_u32, contract_error, ensure_invocation,
     f16_contiguous, implementation_fingerprint, invalid_plan, provider_descriptor,
@@ -43,6 +48,9 @@ use super::{
 const SHADER_SOURCE: &str = include_str!("causal_attention.metal");
 const PROVIDER_ID: &str = "provider.metal.causal_paged_attention.f16.native";
 const ESTIMATOR_ID: &str = "resource-estimator.metal.causal_paged_attention.f16.native";
+const F32_MASTER_PROVIDER_ID: &str = "provider.metal.causal_paged_attention.f32-master.native";
+const F32_MASTER_ESTIMATOR_ID: &str =
+    "resource-estimator.metal.causal_paged_attention.f32-master.native";
 const PREPARE_KERNEL: &str = "vnext_causal_prepare_f16";
 const ATTENTION_KERNEL: &str = "vnext_causal_attention_f16";
 const PREPARE_PAGE_TABLE_INDEX: u64 = 6;
@@ -147,6 +155,9 @@ impl MetalCausalAttentionPipelines {
 
 pub(super) struct MetalCausalPagedAttentionProvider {
     descriptor: OperationProviderDescriptor,
+    operation_id: &'static str,
+    hidden_type: ElementType,
+    failure_stage: &'static str,
     attention: Arc<MetalCausalAttentionPipelines>,
     linear: Arc<MetalLinearPipelines>,
     primitives: Arc<MetalPrimitivePipelines>,
@@ -159,13 +170,55 @@ impl MetalCausalPagedAttentionProvider {
         linear: Arc<MetalLinearPipelines>,
         primitives: Arc<MetalPrimitivePipelines>,
     ) -> Result<Self, MetalDeviceRuntimeError> {
-        let contract = causal_paged_attention_contract().map_err(contract_error)?;
+        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F16)
+    }
+
+    pub(super) fn new_f32_master(
+        runtime: &MetalDeviceRuntime,
+        attention: Arc<MetalCausalAttentionPipelines>,
+        linear: Arc<MetalLinearPipelines>,
+        primitives: Arc<MetalPrimitivePipelines>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        Self::new_with_hidden_type(runtime, attention, linear, primitives, ElementType::F32)
+    }
+
+    fn new_with_hidden_type(
+        runtime: &MetalDeviceRuntime,
+        attention: Arc<MetalCausalAttentionPipelines>,
+        linear: Arc<MetalLinearPipelines>,
+        primitives: Arc<MetalPrimitivePipelines>,
+        hidden_type: ElementType,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        let (contract, operation_id, provider_id, capability_id, estimator_id, failure_stage) =
+            match hidden_type {
+                ElementType::F16 => (
+                    causal_paged_attention_contract().map_err(contract_error)?,
+                    CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+                    PROVIDER_ID,
+                    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+                    ESTIMATOR_ID,
+                    "metal.causal_paged_attention.encode",
+                ),
+                ElementType::F32 => (
+                    causal_paged_attention_f32_master_contract().map_err(contract_error)?,
+                    CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+                    F32_MASTER_PROVIDER_ID,
+                    CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+                    F32_MASTER_ESTIMATOR_ID,
+                    "metal.causal_paged_attention.f32_master.encode",
+                ),
+                _ => {
+                    return Err(MetalDeviceRuntimeError::contract(
+                        "Metal causal-attention hidden ABI supports only F16 or F32",
+                    ))
+                }
+            };
         let descriptor = provider_descriptor(
             runtime,
             &contract,
-            PROVIDER_ID,
-            CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-            ESTIMATOR_ID,
+            provider_id,
+            capability_id,
+            estimator_id,
             storage_bindings().map_err(contract_error)?,
             &[DENSE_SAFETENSORS_FORMAT_ID, GGUF_NATIVE_BLOCK_FORMAT_ID],
             &[
@@ -181,11 +234,14 @@ impl MetalCausalPagedAttentionProvider {
                 include_str!("linear.metal").as_bytes(),
                 include_str!("primitives.rs").as_bytes(),
                 include_str!("primitives.metal").as_bytes(),
-                PROVIDER_ID.as_bytes(),
+                provider_id.as_bytes(),
             ]),
         )?;
         Ok(Self {
             descriptor,
+            operation_id,
+            hidden_type,
+            failure_stage,
             attention,
             linear,
             primitives,
@@ -231,7 +287,7 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        if request.operation().id.as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID
+        if request.operation().id.as_str() != self.operation_id
             || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
         {
             return Err(invalid_plan(format!(
@@ -288,7 +344,7 @@ impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider
             {
                 return Ok(ReusableExecutionTopology::EagerBoundary);
             }
-            reusable_attention_topology(&request)
+            reusable_attention_topology(&request, self.operation_id)
                 .map(ReusableExecutionTopology::Dynamic)
                 .map_err(invalid_plan)
         })
@@ -303,18 +359,19 @@ impl OperationProvider<MetalDeviceRuntime> for MetalCausalPagedAttentionProvider
             Arc::clone(&self.attention),
             Arc::clone(&self.linear),
             Arc::clone(&self.primitives),
+            self.operation_id,
+            self.hidden_type,
             invocation,
         )
-        .map_err(|message| {
-            provider_failure(identity, "metal.causal_paged_attention.encode", message)
-        })
+        .map_err(|message| provider_failure(identity, self.failure_stage, message))
     }
 }
 
 fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
+    operation_id: &str,
 ) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
-    if request.operation_id().as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID {
+    if request.operation_id().as_str() != operation_id {
         return Err("Metal causal topology received another operation".to_owned());
     }
     let shape = CausalAttentionShape::from_attributes(request.attributes())?;
@@ -692,17 +749,19 @@ fn encode_attention(
     attention: Arc<MetalCausalAttentionPipelines>,
     linear: Arc<MetalLinearPipelines>,
     primitives: Arc<MetalPrimitivePipelines>,
+    operation_id: &'static str,
+    hidden_type: ElementType,
     invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, String> {
-    ensure_invocation(&invocation, CAUSAL_PAGED_ATTENTION_OPERATION_ID)?;
+    ensure_invocation(&invocation, operation_id)?;
     let first = &invocation.participants()[0];
     let shape = CausalAttentionShape::from_attributes(first.attributes())?;
-    validate_signature(first, shape)?;
+    validate_signature(first, shape, hidden_type)?;
     for participant in &invocation.participants()[1..] {
         if CausalAttentionShape::from_attributes(participant.attributes())? != shape {
             return Err("Metal causal-attention participant attributes disagree".to_owned());
         }
-        validate_signature(participant, shape)?;
+        validate_signature(participant, shape, hidden_type)?;
     }
 
     let total_tokens = invocation.work_shape().immediate_tokens();
@@ -793,7 +852,7 @@ fn encode_attention(
         regions.push(super::contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-            ElementType::F16,
+            hidden_type,
             if input_packed {
                 packed_start
             } else {
@@ -805,7 +864,7 @@ fn encode_attention(
         regions.push(super::contiguous_token_region(
             participant,
             binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-            ElementType::F16,
+            hidden_type,
             if output_packed {
                 packed_start
             } else {
@@ -931,7 +990,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Input,
             0,
-            ElementType::F16,
+            hidden_type,
             total_tokens,
         )?);
         let output = regions.len();
@@ -939,7 +998,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            hidden_type,
             total_tokens,
         )?);
         let packed = PackedLaunch {
@@ -1000,7 +1059,7 @@ fn encode_attention(
                 layout.projected,
             )?,
         };
-        validate_launch_regions(
+        validate_launch_regions_with_raw_workspace(
             &regions,
             &[
                 packed.query_projection,
@@ -1008,11 +1067,12 @@ fn encode_attention(
                 packed.value_projection,
                 packed.output_projection,
             ],
+            &[shared.scratch],
         )?;
         Some(packed)
     } else {
         for launch in &launches {
-            validate_launch_regions(
+            validate_launch_regions_with_raw_workspace(
                 &regions,
                 &[
                     launch.query_projection,
@@ -1020,6 +1080,7 @@ fn encode_attention(
                     launch.value_projection,
                     launch.output_projection,
                 ],
+                &[shared.scratch],
             )?;
         }
         None
@@ -1042,16 +1103,20 @@ fn encode_attention(
     let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
     let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled);
-    let compute_command = MetalDeviceCommand::operation(
-        "vnext_causal_paged_attention",
-        regions,
-        move |encoder, regions| {
+    let operation_label = if hidden_type == ElementType::F32 {
+        "vnext_causal_paged_attention_f32_master"
+    } else {
+        "vnext_causal_paged_attention"
+    };
+    let compute_command =
+        MetalDeviceCommand::operation(operation_label, regions, move |encoder, regions| {
             encoder.record_compute_dispatches(dispatch_count);
             if let Some(packed) = packed.as_ref() {
                 enqueue_packed_attention(
                     &attention,
                     &linear,
                     &primitives,
+                    hidden_type,
                     encoder.compute_encoder(),
                     regions,
                     shared,
@@ -1064,6 +1129,7 @@ fn encode_attention(
                         &attention,
                         &linear,
                         &primitives,
+                        hidden_type,
                         encoder.compute_encoder(),
                         regions,
                         shared,
@@ -1072,21 +1138,20 @@ fn encode_attention(
                 }
             }
             Ok(())
-        },
-    )
-    .map_err(|error| error.to_string())?
-    .with_work_shape(
-        if packed_enabled {
-            DeviceBatchingForm::Packed
-        } else if participant_count == 1 {
-            DeviceBatchingForm::Scalar
-        } else {
-            DeviceBatchingForm::ParticipantLoop
-        },
-        participant_count,
-        token_count,
-    )
-    .map_err(|error| error.to_string())?;
+        })
+        .map_err(|error| error.to_string())?
+        .with_work_shape(
+            if packed_enabled {
+                DeviceBatchingForm::Packed
+            } else if participant_count == 1 {
+                DeviceBatchingForm::Scalar
+            } else {
+                DeviceBatchingForm::ParticipantLoop
+            },
+            participant_count,
+            token_count,
+        )
+        .map_err(|error| error.to_string())?;
 
     Ok(invocation.attach_binding_command(
         EncodedDeviceOperation::compute(compute_command),
@@ -1100,6 +1165,89 @@ fn physical_dispatch_count(participant_count: usize, packed: bool) -> u64 {
         participants.saturating_mul(2).saturating_add(6)
     } else {
         participants.saturating_mul(8)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_input_rms_norm(
+    primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
+    encoder: &ComputeCommandEncoderRef,
+    input: &MetalBufferRegion,
+    input_offset_bytes: u64,
+    weight: &MetalBufferRegion,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    rows: u32,
+    hidden_size: u32,
+    epsilon: f32,
+) {
+    match hidden_type {
+        ElementType::F16 => dispatch_rms_norm_at(
+            primitives,
+            encoder,
+            input,
+            input_offset_bytes,
+            weight,
+            output,
+            output_offset_bytes,
+            rows,
+            hidden_size,
+            epsilon,
+        ),
+        ElementType::F32 => dispatch_rms_norm_f32_to_f16_at(
+            primitives,
+            encoder,
+            input,
+            input_offset_bytes,
+            weight,
+            output,
+            output_offset_bytes,
+            rows,
+            hidden_size,
+            epsilon,
+        ),
+        _ => unreachable!("validated Metal causal-attention hidden ABI"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_hidden_residual(
+    primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
+    encoder: &ComputeCommandEncoderRef,
+    left: &MetalBufferRegion,
+    left_offset_bytes: u64,
+    right: &MetalBufferRegion,
+    right_offset_bytes: u64,
+    output: &MetalBufferRegion,
+    output_offset_bytes: u64,
+    elements: u32,
+) {
+    match hidden_type {
+        ElementType::F16 => dispatch_residual_add_at(
+            primitives,
+            encoder,
+            left,
+            left_offset_bytes,
+            right,
+            right_offset_bytes,
+            output,
+            output_offset_bytes,
+            elements,
+        ),
+        ElementType::F32 => dispatch_residual_add_f32_f16_at(
+            primitives,
+            encoder,
+            left,
+            left_offset_bytes,
+            right,
+            right_offset_bytes,
+            output,
+            output_offset_bytes,
+            elements,
+        ),
+        _ => unreachable!("validated Metal causal-attention hidden ABI"),
     }
 }
 
@@ -1169,14 +1317,16 @@ fn enqueue_attention(
     attention: &MetalCausalAttentionPipelines,
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
     encoder: &ComputeCommandEncoderRef,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
     launch: &ParticipantLaunch,
 ) {
     let scratch = &regions[shared.scratch];
-    dispatch_rms_norm_at(
+    dispatch_input_rms_norm(
         primitives,
+        hidden_type,
         encoder,
         &regions[launch.input],
         0,
@@ -1197,8 +1347,9 @@ fn enqueue_attention(
     dispatch_prepare(attention, encoder, regions, shared, launch);
     dispatch_attention(attention, encoder, regions, shared, launch);
     dispatch_linear(linear, encoder, regions, launch.output_projection);
-    dispatch_residual_add_at(
+    dispatch_hidden_residual(
         primitives,
+        hidden_type,
         encoder,
         &regions[launch.input],
         0,
@@ -1215,6 +1366,7 @@ fn enqueue_packed_attention(
     attention: &MetalCausalAttentionPipelines,
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
+    hidden_type: ElementType,
     encoder: &ComputeCommandEncoderRef,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
@@ -1222,8 +1374,9 @@ fn enqueue_packed_attention(
     participants: &[ParticipantLaunch],
 ) {
     let scratch = &regions[shared.scratch];
-    dispatch_rms_norm_at(
+    dispatch_input_rms_norm(
         primitives,
+        hidden_type,
         encoder,
         &regions[packed.input],
         0,
@@ -1246,8 +1399,9 @@ fn enqueue_packed_attention(
         dispatch_attention(attention, encoder, regions, shared, participant);
     }
     dispatch_linear(linear, encoder, regions, packed.output_projection);
-    dispatch_residual_add_at(
+    dispatch_hidden_residual(
         primitives,
+        hidden_type,
         encoder,
         &regions[packed.input],
         0,
@@ -1451,6 +1605,7 @@ fn paged_state_regions(
 fn validate_signature(
     participant: &OperationInvocation<'_, MetalDeviceBuffer>,
     shape: CausalAttentionShape,
+    hidden_type: ElementType,
 ) -> Result<(), String> {
     let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
@@ -1474,8 +1629,8 @@ fn validate_signature(
     if *tokens == 0
         || *hidden_width != shape.hidden_size
         || output.tensor().dimensions() != [*tokens, shape.hidden_size]
-        || !f16_contiguous(hidden)
-        || !f16_contiguous(output)
+        || !contiguous(hidden, hidden_type)
+        || !contiguous(output, hidden_type)
         || expected.iter().any(|(binding, dimensions)| {
             binding.tensor().dimensions() != dimensions.as_slice() || !f16_contiguous(binding)
         })
@@ -1483,6 +1638,11 @@ fn validate_signature(
         return Err("Metal causal-attention signature differs from its shape".to_owned());
     }
     Ok(())
+}
+
+fn contiguous(binding: &ResolvedValueBinding, element_type: ElementType) -> bool {
+    binding.tensor().element_type() == element_type
+        && matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
 }
 
 fn push_shared_region(
