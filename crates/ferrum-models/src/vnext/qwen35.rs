@@ -20,10 +20,14 @@ use ferrum_interfaces::vnext::{
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
     WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
-    DENSE_SWIGLU_OPERATION_ID, GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
-    LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
-    RESIDUAL_ADD_F32_F16_OPERATION_ID, RMS_NORM_F32_OPERATION_ID, RMS_NORM_F32_TO_F16_OPERATION_ID,
-    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_F32_F16_OPERATION_ID,
+    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F32_OPERATION_ID, RMS_NORM_F32_TO_F16_OPERATION_ID,
+    RMS_NORM_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
 use ferrum_quantization::{
@@ -138,6 +142,86 @@ enum FamilyWeightFormat {
     SafetensorsDense,
     SafetensorsGptqMarlin,
     GgufNative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OperationSelection {
+    id: &'static str,
+    version: ContractVersion,
+}
+
+impl OperationSelection {
+    const fn new(id: &'static str, major: u16, minor: u16) -> Self {
+        Self {
+            id,
+            version: ContractVersion::new(major, minor),
+        }
+    }
+}
+
+/// The activation ABI is selected once from the typed physical package.
+/// It must never be inferred later from a backend name or hidden runtime flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen35OperationProfile {
+    token_embedding: OperationSelection,
+    linear_attention: OperationSelection,
+    causal_attention: OperationSelection,
+    post_attention_norm: OperationSelection,
+    dense_feed_forward: OperationSelection,
+    dense_residual: OperationSelection,
+    moe_residual: OperationSelection,
+    final_norm: OperationSelection,
+    logits: OperationSelection,
+    argmax: OperationSelection,
+}
+
+impl Qwen35OperationProfile {
+    const F16: Self = Self {
+        token_embedding: OperationSelection::new(TOKEN_EMBEDDING_OPERATION_ID, 1, 0),
+        linear_attention: OperationSelection::new(
+            GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+            6,
+            0,
+        ),
+        causal_attention: OperationSelection::new(CAUSAL_PAGED_ATTENTION_OPERATION_ID, 2, 0),
+        post_attention_norm: OperationSelection::new(RMS_NORM_OPERATION_ID, 1, 0),
+        dense_feed_forward: OperationSelection::new(DENSE_SWIGLU_OPERATION_ID, 1, 0),
+        dense_residual: OperationSelection::new(RESIDUAL_ADD_OPERATION_ID, 1, 0),
+        moe_residual: OperationSelection::new(RESIDUAL_ADD_OPERATION_ID, 1, 0),
+        final_norm: OperationSelection::new(RMS_NORM_OPERATION_ID, 1, 0),
+        logits: OperationSelection::new(LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, 1, 0),
+        argmax: OperationSelection::new(LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, 3, 0),
+    };
+
+    const F32_MASTER: Self = Self {
+        token_embedding: OperationSelection::new(TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, 1, 0),
+        linear_attention: OperationSelection::new(
+            GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+            1,
+            0,
+        ),
+        causal_attention: OperationSelection::new(
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+            1,
+            0,
+        ),
+        post_attention_norm: OperationSelection::new(RMS_NORM_F32_TO_F16_OPERATION_ID, 1, 0),
+        dense_feed_forward: OperationSelection::new(DENSE_SWIGLU_OPERATION_ID, 1, 0),
+        dense_residual: OperationSelection::new(RESIDUAL_ADD_F32_F16_OPERATION_ID, 1, 0),
+        moe_residual: OperationSelection::new(RESIDUAL_ADD_F32_F16_OPERATION_ID, 1, 0),
+        final_norm: OperationSelection::new(RMS_NORM_F32_OPERATION_ID, 1, 0),
+        logits: OperationSelection::new(LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID, 1, 0),
+        argmax: OperationSelection::new(LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, 1, 0),
+    };
+
+    const fn for_weight_format(weight_format: FamilyWeightFormat) -> Self {
+        match weight_format {
+            FamilyWeightFormat::SafetensorsDense | FamilyWeightFormat::SafetensorsGptqMarlin => {
+                Self::F16
+            }
+            FamilyWeightFormat::GgufNative => Self::F32_MASTER,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -443,6 +527,7 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
 
     fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
         let text = Self::text_config(config)?;
+        let operations = Qwen35OperationProfile::for_weight_format(config.weight_format);
         let mut weight_refs = Vec::with_capacity(config.weights.len());
         for weight in &config.weights {
             if is_moe_source_role(&weight.role) {
@@ -513,8 +598,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let mut hidden = value_id("value.hidden.embedding")?;
         nodes.push(ProgramNode {
             id: node_id("node.embedding")?,
-            operation_id: operation_id(TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID)?,
-            required_version: ContractVersion::new(1, 0),
+            operation_id: operation_id(operations.token_embedding.id)?,
+            required_version: operations.token_embedding.version,
             work: ProgramNodeWorkSpec::tokens(value_id("value.input.token_ids")?, 0),
             inputs: vec![
                 value_id("value.input.token_ids")?,
@@ -601,8 +686,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         ),
                     };
                     (
-                        GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
-                        ContractVersion::new(1, 0),
+                        operations.linear_attention.id,
+                        operations.linear_attention.version,
                         BTreeMap::from([
                             attribute("key_heads", text.linear_attention.num_key_heads as u64)?,
                             attribute("value_heads", text.linear_attention.num_value_heads as u64)?,
@@ -680,8 +765,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                         initialization: StateInitialization::None,
                     });
                     (
-                        CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
-                        ContractVersion::new(1, 0),
+                        operations.causal_attention.id,
+                        operations.causal_attention.version,
                         BTreeMap::from([
                             attribute("query_heads", text.num_attention_heads as u64)?,
                             attribute("key_value_heads", text.num_key_value_heads as u64)?,
@@ -736,8 +821,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                 required_weight(config, Some(layer_index as u32), "post_attention_layernorm")?;
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.post_attention_norm"))?,
-                operation_id: operation_id(RMS_NORM_F32_TO_F16_OPERATION_ID)?,
-                required_version: ContractVersion::new(1, 0),
+                operation_id: operation_id(operations.post_attention_norm.id)?,
+                required_version: operations.post_attention_norm.version,
                 work: ProgramNodeWorkSpec::tokens(attention_output.clone(), 0),
                 inputs: vec![
                     attention_output.clone(),
@@ -751,62 +836,69 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             });
 
             let mlp_output = value_id(format!("value.layer.{layer_index}.mlp"))?;
-            let (feed_forward_operation, feed_forward_inputs, feed_forward_attributes) =
-                if let Some(moe) = &text.moe {
-                    (
-                        ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
-                        vec![
-                            normalized,
-                            moe_weight_value_id(layer_index as u32, MOE_ROUTER_ROLE)?,
-                            moe_weight_value_id(layer_index as u32, MOE_ROUTED_GATE_UP_ROLE)?,
-                            moe_weight_value_id(layer_index as u32, MOE_ROUTED_DOWN_ROLE)?,
-                            moe_weight_value_id(layer_index as u32, MOE_SHARED_GATE_ROLE)?,
-                            moe_weight_value_id(layer_index as u32, MOE_SHARED_GATE_UP_ROLE)?,
-                            moe_weight_value_id(layer_index as u32, MOE_SHARED_DOWN_ROLE)?,
-                        ],
-                        BTreeMap::from([
-                            attribute("hidden_size", text.hidden_size as u64)?,
-                            attribute("expert_count", moe.num_experts as u64)?,
-                            attribute("experts_per_token", moe.num_experts_per_tok as u64)?,
-                            attribute(
-                                "routed_intermediate_size",
-                                moe.moe_intermediate_size as u64,
-                            )?,
-                            attribute(
-                                "shared_intermediate_size",
-                                moe.shared_expert_intermediate_size as u64,
-                            )?,
-                            attribute("normalize_topk", moe.norm_topk_prob)?,
-                        ]),
+            let (
+                feed_forward_operation,
+                residual_operation,
+                feed_forward_inputs,
+                feed_forward_attributes,
+            ) = if let Some(moe) = &text.moe {
+                (
+                    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+                    operations.moe_residual,
+                    vec![
+                        normalized,
+                        moe_weight_value_id(layer_index as u32, MOE_ROUTER_ROLE)?,
+                        moe_weight_value_id(layer_index as u32, MOE_ROUTED_GATE_UP_ROLE)?,
+                        moe_weight_value_id(layer_index as u32, MOE_ROUTED_DOWN_ROLE)?,
+                        moe_weight_value_id(layer_index as u32, MOE_SHARED_GATE_ROLE)?,
+                        moe_weight_value_id(layer_index as u32, MOE_SHARED_GATE_UP_ROLE)?,
+                        moe_weight_value_id(layer_index as u32, MOE_SHARED_DOWN_ROLE)?,
+                    ],
+                    BTreeMap::from([
+                        attribute("hidden_size", text.hidden_size as u64)?,
+                        attribute("expert_count", moe.num_experts as u64)?,
+                        attribute("experts_per_token", moe.num_experts_per_tok as u64)?,
+                        attribute("routed_intermediate_size", moe.moe_intermediate_size as u64)?,
+                        attribute(
+                            "shared_intermediate_size",
+                            moe.shared_expert_intermediate_size as u64,
+                        )?,
+                        attribute("normalize_topk", moe.norm_topk_prob)?,
+                    ]),
+                )
+            } else {
+                let intermediate_size = text.dense_intermediate_size.ok_or_else(|| {
+                    invalid_config(
+                        "hf_config.text_config.intermediate_size",
+                        "missing dense FFN size",
                     )
-                } else {
-                    let intermediate_size = text.dense_intermediate_size.ok_or_else(|| {
-                        invalid_config(
-                            "hf_config.text_config.intermediate_size",
-                            "missing dense FFN size",
-                        )
-                    })?;
-                    (
-                        DENSE_SWIGLU_OPERATION_ID,
-                        vec![
-                            normalized,
-                            packed_gate_up_value_id(layer_index as u32)?,
-                            weight_value_id(required_weight(
-                                config,
-                                Some(layer_index as u32),
-                                "mlp_down",
-                            )?)?,
-                        ],
-                        BTreeMap::from([
-                            attribute("hidden_size", text.hidden_size as u64)?,
-                            attribute("intermediate_size", intermediate_size as u64)?,
-                        ]),
-                    )
-                };
+                })?;
+                (
+                    operations.dense_feed_forward.id,
+                    operations.dense_residual,
+                    vec![
+                        normalized,
+                        packed_gate_up_value_id(layer_index as u32)?,
+                        weight_value_id(required_weight(
+                            config,
+                            Some(layer_index as u32),
+                            "mlp_down",
+                        )?)?,
+                    ],
+                    BTreeMap::from([
+                        attribute("hidden_size", text.hidden_size as u64)?,
+                        attribute("intermediate_size", intermediate_size as u64)?,
+                    ]),
+                )
+            };
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.feed_forward"))?,
                 operation_id: operation_id(feed_forward_operation)?,
-                required_version: ContractVersion::new(1, 0),
+                required_version: if text.moe.is_some() {
+                    ContractVersion::new(1, 0)
+                } else {
+                    operations.dense_feed_forward.version
+                },
                 work: ProgramNodeWorkSpec::tokens(feed_forward_inputs[0].clone(), 0),
                 inputs: feed_forward_inputs,
                 outputs: vec![mlp_output.clone()],
@@ -816,8 +908,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
             let layer_output = value_id(format!("value.layer.{layer_index}.output"))?;
             nodes.push(ProgramNode {
                 id: node_id(format!("node.layer.{layer_index}.residual"))?,
-                operation_id: operation_id(RESIDUAL_ADD_F32_F16_OPERATION_ID)?,
-                required_version: ContractVersion::new(1, 0),
+                operation_id: operation_id(residual_operation.id)?,
+                required_version: residual_operation.version,
                 work: ProgramNodeWorkSpec::tokens(attention_output.clone(), 0),
                 inputs: vec![attention_output, mlp_output],
                 outputs: vec![layer_output.clone()],
@@ -835,8 +927,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let final_hidden = value_id("value.output.final_hidden")?;
         nodes.push(ProgramNode {
             id: node_id("node.final_norm")?,
-            operation_id: operation_id(RMS_NORM_F32_OPERATION_ID)?,
-            required_version: ContractVersion::new(1, 0),
+            operation_id: operation_id(operations.final_norm.id)?,
+            required_version: operations.final_norm.version,
             work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
             inputs: vec![hidden, weight_value_id(final_norm)?],
             outputs: vec![final_hidden.clone()],
@@ -848,8 +940,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let logits = value_id("value.output.logits")?;
         nodes.push(ProgramNode {
             id: node_id("node.logits")?,
-            operation_id: operation_id(LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID)?,
-            required_version: ContractVersion::new(1, 0),
+            operation_id: operation_id(operations.logits.id)?,
+            required_version: operations.logits.version,
             work: ProgramNodeWorkSpec::tokens(final_hidden.clone(), 0),
             inputs: vec![final_hidden, weight_value_id(projection)?],
             outputs: vec![logits.clone()],
@@ -865,8 +957,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         let greedy_token = value_id("value.output.greedy_token")?;
         nodes.push(ProgramNode {
             id: node_id("node.greedy_token")?,
-            operation_id: operation_id(LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID)?,
-            required_version: ContractVersion::new(1, 0),
+            operation_id: operation_id(operations.argmax.id)?,
+            required_version: operations.argmax.version,
             work: ProgramNodeWorkSpec::Fixed,
             inputs: vec![
                 logits.clone(),
@@ -3260,7 +3352,7 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        gated_delta_recurrent_attention_f32_master_contract, routed_shared_swiglu_moe_contract,
+        gated_delta_recurrent_attention_contract, routed_shared_swiglu_moe_contract,
         ModelArtifactSourceRole, ModelSourceKind, OperationContract, OriginalModelSource,
         OriginalModelSources, PhysicalStorageLayout, PhysicalWeightComponentBinding,
         WeightComponentSource,
@@ -3553,6 +3645,19 @@ mod tests {
             weight_format: FamilyWeightFormat::SafetensorsDense,
             weights,
         }
+    }
+
+    fn test_dense_gguf_config() -> Qwen35FamilyConfig {
+        let mut config = test_config();
+        for weight in &mut config.weights {
+            weight.external_name =
+                ferrum_to_gguf_with_arch("qwen35", &weight.external_name).unwrap();
+            weight.source_encoding = FamilyWeightSourceEncoding::Dense {
+                element_type: ElementType::F16,
+            };
+        }
+        config.weight_format = FamilyWeightFormat::GgufNative;
+        config
     }
 
     fn test_moe_gguf_config() -> Qwen35FamilyConfig {
@@ -3951,6 +4056,13 @@ mod tests {
         assert!(!nodes
             .iter()
             .any(|node| node.operation_id.as_str() == DENSE_SWIGLU_OPERATION_ID));
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| { node.operation_id.as_str() == RESIDUAL_ADD_F32_F16_OPERATION_ID })
+                .count(),
+            4
+        );
 
         let contract = routed_shared_swiglu_moe_contract().unwrap();
         let first = moe_nodes[0];
@@ -4024,6 +4136,120 @@ mod tests {
     }
 
     #[test]
+    fn safetensors_programs_keep_the_portable_f16_operation_profile() {
+        for config in [test_config(), test_moe_gptq_config()] {
+            let is_moe = Qwen35TextConfig::from_hf_config_value(&config.hf_config)
+                .unwrap()
+                .is_moe();
+            let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+                .prepare(&serde_json::to_value(config).unwrap())
+                .unwrap();
+            let operation_ids = prepared.program().blocks()[0]
+                .nodes
+                .iter()
+                .map(|node| node.operation_id.as_str())
+                .collect::<Vec<_>>();
+
+            for (operation_id, expected_count) in [
+                (TOKEN_EMBEDDING_OPERATION_ID, 1),
+                (GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, 3),
+                (CAUSAL_PAGED_ATTENTION_OPERATION_ID, 1),
+                (RMS_NORM_OPERATION_ID, 5),
+                (RESIDUAL_ADD_OPERATION_ID, 4),
+                (LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, 1),
+                (LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, 1),
+            ] {
+                assert_eq!(
+                    operation_ids
+                        .iter()
+                        .filter(|candidate| **candidate == operation_id)
+                        .count(),
+                    expected_count,
+                    "unexpected {operation_id} count for {:?}",
+                    prepared.weight_schema().format_id
+                );
+            }
+            assert_eq!(
+                operation_ids
+                    .iter()
+                    .filter(|candidate| {
+                        **candidate
+                            == if is_moe {
+                                ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID
+                            } else {
+                                DENSE_SWIGLU_OPERATION_ID
+                            }
+                    })
+                    .count(),
+                4
+            );
+            for forbidden in [
+                TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
+                GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID,
+                CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
+                RMS_NORM_F32_TO_F16_OPERATION_ID,
+                RMS_NORM_F32_OPERATION_ID,
+                RESIDUAL_ADD_F32_F16_OPERATION_ID,
+                LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID,
+                LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
+            ] {
+                assert!(
+                    !operation_ids.contains(&forbidden),
+                    "safetensors program leaked F32-master operation {forbidden}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_gguf_program_uses_the_f32_master_operation_profile() {
+        let config = test_dense_gguf_config();
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .unwrap();
+        let operation_ids = prepared.program().blocks()[0]
+            .nodes
+            .iter()
+            .map(|node| node.operation_id.as_str())
+            .collect::<Vec<_>>();
+
+        for (operation_id, expected_count) in [
+            (TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, 1),
+            (GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID, 3),
+            (CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID, 1),
+            (RMS_NORM_F32_TO_F16_OPERATION_ID, 4),
+            (DENSE_SWIGLU_OPERATION_ID, 4),
+            (RESIDUAL_ADD_F32_F16_OPERATION_ID, 4),
+            (RMS_NORM_F32_OPERATION_ID, 1),
+            (LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID, 1),
+            (LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, 1),
+        ] {
+            assert_eq!(
+                operation_ids
+                    .iter()
+                    .filter(|candidate| **candidate == operation_id)
+                    .count(),
+                expected_count,
+                "unexpected {operation_id} count"
+            );
+        }
+        for forbidden in [
+            TOKEN_EMBEDDING_OPERATION_ID,
+            GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+            CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+            RMS_NORM_OPERATION_ID,
+            RESIDUAL_ADD_OPERATION_ID,
+            LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+        ] {
+            assert!(
+                !operation_ids.contains(&forbidden),
+                "GGUF dense program leaked F16 operation {forbidden}"
+            );
+        }
+    }
+
+    #[test]
     fn prepares_dense_hybrid_program_and_rejects_shape_drift() {
         let config = test_config();
         let descriptor = production_descriptor(&config).unwrap();
@@ -4056,7 +4282,7 @@ mod tests {
         assert_eq!(prepared.family_id().as_str(), FAMILY_ID);
         assert_eq!(prepared.program().blocks()[0].nodes.len(), 20);
         assert!(prepared.program().blocks()[0].nodes.iter().all(|node| {
-            if node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID {
+            if node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID {
                 matches!(&node.work, ProgramNodeWorkSpec::Fixed)
             } else {
                 matches!(
@@ -4074,16 +4300,9 @@ mod tests {
         assert_eq!(
             operation_ids
                 .iter()
-                .filter(|operation| **operation == RMS_NORM_F32_TO_F16_OPERATION_ID)
+                .filter(|operation| **operation == RMS_NORM_OPERATION_ID)
                 .count(),
-            4
-        );
-        assert_eq!(
-            operation_ids
-                .iter()
-                .filter(|operation| **operation == RMS_NORM_F32_OPERATION_ID)
-                .count(),
-            1
+            5
         );
         assert_eq!(
             operation_ids
@@ -4095,23 +4314,30 @@ mod tests {
         assert_eq!(
             operation_ids
                 .iter()
-                .filter(|operation| **operation == LAST_TOKEN_DENSE_LINEAR_F32_OPERATION_ID)
+                .filter(|operation| **operation == RESIDUAL_ADD_OPERATION_ID)
+                .count(),
+            4
+        );
+        assert_eq!(
+            operation_ids
+                .iter()
+                .filter(|operation| **operation == LAST_TOKEN_DENSE_LINEAR_OPERATION_ID)
                 .count(),
             1
         );
         assert_eq!(
             operation_ids
                 .iter()
-                .filter(|operation| **operation == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID)
+                .filter(|operation| **operation == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
                 .count(),
             1
         );
         let greedy = prepared.program().blocks()[0]
             .nodes
             .iter()
-            .find(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID)
+            .find(|node| node.operation_id.as_str() == LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID)
             .unwrap();
-        assert_eq!(greedy.required_version, ContractVersion::new(1, 0));
+        assert_eq!(greedy.required_version, ContractVersion::new(3, 0));
         assert_eq!(
             greedy
                 .inputs
@@ -4159,10 +4385,7 @@ mod tests {
         let linear_attention = prepared.program().blocks()[0]
             .nodes
             .iter()
-            .find(|node| {
-                node.operation_id.as_str()
-                    == GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_OPERATION_ID
-            })
+            .find(|node| node.operation_id.as_str() == GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID)
             .unwrap();
         let linear_inputs = linear_attention
             .inputs
@@ -4171,7 +4394,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             linear_attention.required_version,
-            ContractVersion::new(1, 0)
+            ContractVersion::new(6, 0)
         );
         assert_eq!(
             linear_attention
@@ -4209,16 +4432,14 @@ mod tests {
         let full_attention = prepared.program().blocks()[0]
             .nodes
             .iter()
-            .find(|node| {
-                node.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID
-            })
+            .find(|node| node.operation_id.as_str() == CAUSAL_PAGED_ATTENTION_OPERATION_ID)
             .unwrap();
         let full_inputs = full_attention
             .inputs
             .iter()
             .map(|value| value.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(full_attention.required_version, ContractVersion::new(1, 0));
+        assert_eq!(full_attention.required_version, ContractVersion::new(2, 0));
         assert_eq!(
             full_attention
                 .attributes
@@ -4442,7 +4663,7 @@ mod tests {
             .iter()
             .find(|node| node.id.as_str() == "node.layer.0.attention")
             .unwrap();
-        let contract = gated_delta_recurrent_attention_f32_master_contract().unwrap();
+        let contract = gated_delta_recurrent_attention_contract().unwrap();
         let descriptor = contract.descriptor();
         let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config).unwrap();
         let conv_channels = (text.linear_qk_total_dim() * 2 + text.linear_value_total_dim()) as u64;
@@ -4488,7 +4709,7 @@ mod tests {
                     .map(|state| (&state.value_id, &state.tensor)),
             )
             .collect::<BTreeMap<_, _>>();
-        let hidden = tensor_spec(vec![config.max_position_embeddings, 16], ElementType::F32);
+        let hidden = tensor_spec(vec![config.max_position_embeddings, 16], ElementType::F16);
 
         for (ordinal, (value_id, expected)) in
             node.inputs.iter().zip(&descriptor.inputs).enumerate()
