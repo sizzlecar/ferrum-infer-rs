@@ -31,8 +31,9 @@
 Metal token parity 必须由 checked-in collector 生成，不能手写 JSON 或用自定义 Qwen 模板替代模型内置
 chat template。collector 启动一个固定 `parallel=1`、固定线程上限的外部 `llama-server`，逐 case 调用
 `/apply-template`、`/tokenize`、`/completion`，并逐个执行真实 `ferrum run`。20 个 prompt 的 prompt token
-必须完全相同，每个 prompt 的 64 个 greedy output token 必须完全相同，共 `1280/1280`，waiver/exception
-均为 `0`：
+必须 `20/20` 完全相同，两侧每个 prompt 均须真实生成 64 个 greedy output token。自由生成的序列一致数、
+首个分歧和 shared prefix 是诊断指标，不作为新 Metal lane 的数值正确性裁决；一处 near-tie 翻转后两侧已
+不再处于同一历史，不能把后续自回归分歧重复计算为独立数值错误。waiver/exception 仍均为 `0`：
 
 ```text
 python3 scripts/release/runtime_vnext_g08a_token_parity_collector.py \
@@ -43,6 +44,42 @@ python3 scripts/release/runtime_vnext_g08a_token_parity_collector.py \
   --out <external-out>
 
 FERRUM RUNTIME VNEXT G08A TOKEN PARITY COLLECTOR PASS: <external-out>
+```
+
+硬数值门必须由 checked-in same-history collector 生成。它固定上述 reference 的 64 个 token 作为 canonical
+teacher history，在 Ferrum Metal、独立 CPU FP32 oracle 和同 GGUF llama.cpp 上逐位置采集 full-vocab
+logits。总分母为 `20 prompts x 64 decisions = 1280`：CPU top-2 margin `>=1e-3` 的 robust decision 要求
+Ferrum argmax 与 CPU 完全一致；margin `<1e-3` 的 ambiguous decision 要求 Ferrum argmax 位于 CPU
+top-2。`1280/1280` 必须被上述规则接受，cosine/relative-L2/absolute bounds 必须通过 checked-in
+tolerance row，NaN/Inf、waiver、exception 均为 `0`。llama.cpp argmax flip 只记录为独立外部实现诊断，
+不得替代 CPU oracle 或放宽 Ferrum 门：
+
+```text
+python3 scripts/release/runtime_vnext_g08a_same_history_collector.py \
+  --token-parity <token-parity.json> \
+  --ferrum-binary <ferrum> \
+  --llama-cpp-source <clean-llama.cpp-worktree> \
+  --model <locked-Qwen3.5-4B-Q4_K_M.gguf> \
+  --out <external-out>
+
+FERRUM RUNTIME VNEXT G08A SAME HISTORY COLLECTOR PASS: <external-out>
+```
+
+最终 numerics child 必须同时绑定 op、layer、full-model、prompt token parity 和 same-history 六份原始
+输入；缺少任一输入或仍使用旧 schema v1 artifact 都必须 fail closed：
+
+```text
+python3 scripts/release/run_gate.py vnext-g08a-numerics \
+  --g08a-op-numerics <metal-op-artifact> \
+  --g08a-linear-attention <linear-gate.json> \
+  --g08a-full-attention <full-attention-gate.json> \
+  --g08a-full-model <full-model-gate.json> \
+  --g08a-token-parity <token-parity.json> \
+  --g08a-same-history <same-history.json> \
+  --out <external-out>
+
+FERRUM RUNTIME VNEXT G08A NUMERICS PASS: <external-out>
+FERRUM GATE vnext-g08a-numerics PASS: <external-out>
 ```
 
 源码所有权与 legacy 删除先由独立、低成本 child gate 冻结：
@@ -91,7 +128,8 @@ python3 scripts/release/run_gate.py vnext-g08a \
 ```
 
 聚合器必须重新校验每个外层/child manifest、child stdout PASS、validation/input hash、source
-identity、case denominator、waiver、C18 active floor/duty-cycle、numerical tolerance/token parity、
+identity、case denominator、waiver、C18 active floor/duty-cycle、numerical tolerance、token parity、
+same-history、
 历史问题 denominator 和 performance ratio；matrix、numerics、performance 必须回到原始 artifact
 重新执行 canonical validator，performance 阈值固定为 legacy `0.90` / external `0.70`。仅凭手写
 summary、降低 artifact 自报阈值、伪造 delegated command/receipt 或使用旧 SHA 均不得通过。

@@ -170,10 +170,12 @@ C11/C12 的确定性 sampling 控制，也不得因 parity 子协议而跳过 C2
   量化 op 使用其 checked-in contract tolerance，且不得宽于现有 CUDA/GGUF conformance；provider
   不得在 artifact 中覆盖 tolerance。
 - 同 GGUF、同 token history 的 Ferrum Metal 与独立 CPU reference/llama.cpp next-token full-vocab
-  logits 必须达到 cosine `>=0.999`、relative L2 `<=1e-2`。固定 20 个 deterministic prompt 的前
-  64 个生成 token 必须 `20/20` 完全一致，PASS exception 数量 `0`。reference top-2 margin
-  `<1e-3` 时仍须保存两侧 logits、margin 和高精度裁决作为 near-tie diagnostic，但任何 generated
-  token flip 仍使本门失败；diagnostic 不得改写序列相等结果。
+  logits 必须达到 cosine `>=0.999`、relative L2 `<=1e-2`。固定 20 个 deterministic prompt 的
+  prompt token 必须 `20/20` 完全一致，两侧均须生成 64 token；自由生成的序列一致、首个分歧和 shared
+  prefix 只作路径诊断。硬门以 reference token 作为 canonical history，逐位置比较 `20 x 64 = 1280`
+  个 full-vocab decision：CPU top-2 margin `>=1e-3` 时 Ferrum argmax 必须精确一致，margin `<1e-3`
+  时 Ferrum argmax 必须在 CPU top-2 内；接受数必须 `1280/1280`，PASS exception/waiver 数量均为
+  `0`。llama.cpp flip 仅为 external diagnostic，不得改写 CPU oracle 裁决。
 - G03 在实现 provider 前必须提交
   `scripts/release/configs/runtime_vnext_numerical_tolerances.json`。每个 tolerance row 至少绑定
   `tolerance_id`、op/schema version、checkpoint kind、dtype、quant format、shape domain、oracle、

@@ -99,7 +99,8 @@ Qwen3-Coder 与 DeepSeek-R1 补充 lane必须迁移，因为它们承担 agent/r
 - 主模型 required correctness scenario 总失败数 `0`。
 - legacy 可比 lane token parity `20/20/model/backend`，generated token exception 数量 `0`；near-tie
   logits 只作 diagnostic。
-- Qwen3.5 Metal reference numerical gate PASS，waiver `0`。
+- Qwen3.5 Metal prompt token parity `20/20`，canonical-history full-vocab decision `1280/1280`，
+  reference numerical gate PASS，waiver/exception `0`；自由生成分歧只作诊断。
 - lifecycle ownership `5/5` 位于共享 runtime，模型重复实现 `0`。
 - Qwen3.5 架构专属脚手架 LOC 减少 `>=60%`。
 - arch-named backend API `0`；model-specific scheduler/KV manager `0`。

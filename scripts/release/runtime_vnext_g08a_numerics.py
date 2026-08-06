@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate G08A Metal op/layer/model/logit/token numerical evidence."""
+"""Aggregate G08A Metal op/layer/model/logit/canonical-history evidence."""
 
 from __future__ import annotations
 
@@ -60,6 +60,20 @@ TOKEN_CASE_FIELDS = frozenset(
         "reference_top2_margins",
         "reference_near_tie_steps",
         "status",
+    }
+)
+SAME_HISTORY_SUMMARY_FIELDS = frozenset(
+    {
+        "case_count",
+        "validated_decision_count",
+        "robust_decision_count",
+        "ambiguous_decision_count",
+        "ferrum_oracle_exact_count",
+        "ambiguous_top2_accepted_count",
+        "llama_oracle_exact_count",
+        "external_flip_count",
+        "exception_count",
+        "waiver_count",
     }
 )
 
@@ -586,6 +600,50 @@ def input_receipt(path: Path) -> dict[str, str]:
     return {"path": str(path), "sha256": sha256_file(path)}
 
 
+def validate_same_history_summary(value: Any) -> dict[str, int]:
+    summary = exact_object(value, SAME_HISTORY_SUMMARY_FIELDS, "same-history summary")
+    for field, raw in summary.items():
+        require(
+            isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0,
+            f"same-history {field} is invalid",
+        )
+    expected_decisions = PROMPT_COUNT * TOKEN_COUNT
+    require(summary["case_count"] == PROMPT_COUNT, "same-history must pass 20/20 prompts")
+    require(
+        summary["validated_decision_count"] == expected_decisions,
+        "same-history decision denominator mismatch",
+    )
+    require(
+        summary["robust_decision_count"] + summary["ambiguous_decision_count"]
+        == expected_decisions,
+        "same-history classification denominator mismatch",
+    )
+    require(
+        summary["robust_decision_count"]
+        + summary["ambiguous_top2_accepted_count"]
+        == expected_decisions,
+        "same-history accepted-decision denominator mismatch",
+    )
+    require(
+        summary["exception_count"] == summary["waiver_count"] == 0,
+        "same-history contains an exception or waiver",
+    )
+    return summary
+
+
+def validate_same_history_collection(
+    path: Path,
+    *,
+    require_clean: bool,
+) -> dict[str, int]:
+    # Imported lazily because the collector reuses this module's source/token validators.
+    import runtime_vnext_g08a_same_history_collector as collector
+
+    return validate_same_history_summary(
+        collector.validate_collection(path.expanduser().resolve(), require_clean=require_clean)
+    )
+
+
 def validate_and_write(
     *,
     op_artifact: Path,
@@ -593,11 +651,13 @@ def validate_and_write(
     full_attention_gate_path: Path,
     model_gate_path: Path,
     token_parity_path: Path,
+    same_history_path: Path,
     out: Path,
     require_clean: bool = True,
     child_raw_validators: dict[
         str, Callable[[Path, dict[str, Any]], dict[str, Any]]
     ] | None = None,
+    same_history_validator: Callable[[Path], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     source_git_sha, source_tree_sha, catalog_blob, catalog_summary = current_source_identity(
         require_clean=require_clean
@@ -659,6 +719,15 @@ def validate_and_write(
         source_git_sha,
         source_tree_sha,
     )
+    if same_history_validator is None:
+        same_history_summary = validate_same_history_collection(
+            same_history_path,
+            require_clean=require_clean,
+        )
+    else:
+        same_history_summary = validate_same_history_summary(
+            same_history_validator(same_history_path.expanduser().resolve())
+        )
     out = out.expanduser().resolve()
     require(not out.exists() or not any(out.iterdir()), "output directory is not empty")
     out.mkdir(parents=True, exist_ok=True)
@@ -669,9 +738,10 @@ def validate_and_write(
         "full_attention": input_receipt(full_attention_gate_path),
         "full_model": input_receipt(model_gate_path),
         "token_parity": input_receipt(token_parity_path),
+        "same_history": input_receipt(same_history_path),
     }
     validation = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "runtime_vnext_g08a_numerics_validation",
         "status": "pass",
         "validated_at": datetime.now(timezone.utc).astimezone().isoformat(),
@@ -685,13 +755,14 @@ def validate_and_write(
         "full_model_checkpoint_count": 1,
         "full_vocabulary_logits_checkpoint_count": 1,
         "token_parity": token_summary,
+        "same_history": same_history_summary,
         "inputs": inputs,
         "pass_line": pass_line,
     }
     validation_path = out / "validation.json"
     write_json(validation_path, validation)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "artifact_type": "runtime_vnext_g08a_numerics_manifest",
         "lane": "runtime-vnext-g08a-numerics",
         "status": "pass",
@@ -704,7 +775,8 @@ def validate_and_write(
         "summary": {
             "catalog_row_count": catalog_summary["row_count"],
             "operation_state_row_count": op_receipt["summary"]["row_count"],
-            **token_summary,
+            "token_parity": token_summary,
+            "same_history": same_history_summary,
         },
         "inputs": inputs,
         "does_not_prove": [
@@ -923,6 +995,33 @@ def self_test() -> None:
         parity_path = root / "token-parity.json"
         parity = fixture_parity(parity_path, source_git_sha, source_tree_sha, binary)
         write_json(parity_path, parity)
+        same_history_path = root / "same-history.json"
+        write_json(same_history_path, {"fixture": "same-history"})
+        same_history_summary = {
+            "case_count": PROMPT_COUNT,
+            "validated_decision_count": PROMPT_COUNT * TOKEN_COUNT,
+            "robust_decision_count": PROMPT_COUNT * TOKEN_COUNT - 1,
+            "ambiguous_decision_count": 1,
+            "ferrum_oracle_exact_count": PROMPT_COUNT * TOKEN_COUNT - 1,
+            "ambiguous_top2_accepted_count": 1,
+            "llama_oracle_exact_count": PROMPT_COUNT * TOKEN_COUNT - 2,
+            "external_flip_count": 2,
+            "exception_count": 0,
+            "waiver_count": 0,
+        }
+        validate_same_history_summary(same_history_summary)
+        for field, value, marker in (
+            ("validated_decision_count", PROMPT_COUNT * TOKEN_COUNT - 1, "denominator"),
+            ("waiver_count", 1, "waiver"),
+        ):
+            candidate = copy.deepcopy(same_history_summary)
+            candidate[field] = value
+            try:
+                validate_same_history_summary(candidate)
+            except GateError as error:
+                require(marker in str(error).lower(), f"same-history {field} rejected unexpectedly: {error}")
+            else:
+                raise GateError(f"same-history {field} unexpectedly passed")
         token_summary = validate_token_parity(
             parity_path,
             source_git_sha,
@@ -1016,6 +1115,7 @@ def self_test() -> None:
             full_attention_gate_path=full_attention,
             model_gate_path=model,
             token_parity_path=parity_path,
+            same_history_path=same_history_path,
             out=aggregate_out,
             require_clean=False,
             child_raw_validators={
@@ -1023,11 +1123,13 @@ def self_test() -> None:
                 "full-attention": lambda _artifact_dir, _report: {},
                 "full-model": lambda _artifact_dir, _report: {},
             },
+            same_history_validator=lambda _path: copy.deepcopy(same_history_summary),
         )
         require(
             aggregate["summary"]["operation_state_row_count"] == 27
-            and aggregate["summary"]["prompt_token_match_count"] == PROMPT_COUNT
-            and aggregate["summary"]["product_output_token_count_per_runtime"] == 1280
+            and aggregate["summary"]["token_parity"]["prompt_token_match_count"] == PROMPT_COUNT
+            and aggregate["summary"]["token_parity"]["product_output_token_count_per_runtime"] == 1280
+            and aggregate["summary"]["same_history"]["validated_decision_count"] == 1280
             and (aggregate_out / "manifest.json").is_file(),
             "aggregate fixture output differs",
         )
@@ -1079,6 +1181,7 @@ def main() -> int:
     parser.add_argument("--full-attention", type=Path)
     parser.add_argument("--full-model", type=Path)
     parser.add_argument("--token-parity", type=Path)
+    parser.add_argument("--same-history", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -1086,7 +1189,15 @@ def main() -> int:
         if args.self_test:
             self_test()
             return 0
-        required = [args.op_artifact, args.linear_attention, args.full_attention, args.full_model, args.token_parity, args.out]
+        required = [
+            args.op_artifact,
+            args.linear_attention,
+            args.full_attention,
+            args.full_model,
+            args.token_parity,
+            args.same_history,
+            args.out,
+        ]
         require(all(path is not None for path in required), "all evidence inputs and --out are required")
         manifest = validate_and_write(
             op_artifact=args.op_artifact,
@@ -1094,6 +1205,7 @@ def main() -> int:
             full_attention_gate_path=args.full_attention,
             model_gate_path=args.full_model,
             token_parity_path=args.token_parity,
+            same_history_path=args.same_history,
             out=args.out,
         )
         print(manifest["pass_line"])
