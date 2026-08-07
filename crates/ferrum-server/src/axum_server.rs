@@ -7,6 +7,7 @@ use crate::{
     chat_template::{
         render_chat_prompt_with_model_template_options,
         render_chat_prompt_with_tools_and_model_template, ChatTemplateOptions, ModelChatTemplate,
+        ModelReasoningProtocol,
     },
     model_registry::{LoraAdapterModel, ServedModelKind, ServedModelRegistry},
     openai::*,
@@ -3137,9 +3138,21 @@ fn convert_chat_request_with_template_model(
         .then(|| requested_response_format_for_sampling(request))
         .transpose()?
         .flatten();
-    let render_messages =
-        render_messages_with_response_format_instruction(request, output_contract);
     let chat_template_options = chat_template_options_for_request(request, model_template)?;
+    let response_format = forced_response_format
+        .or(requested_response_format)
+        .unwrap_or(ferrum_types::ResponseFormat::Text);
+    let model_generated_thinking = model_template.is_some_and(|template| {
+        template.reasoning_protocol == ModelReasoningProtocol::ModelGenerated
+            && template.reasoning_enabled(chat_template_options.enable_thinking)
+    });
+    let reasoning_enabled = model_template
+        .is_some_and(|template| template.reasoning_enabled(chat_template_options.enable_thinking));
+    let render_messages = render_messages_with_response_format_instruction(
+        request,
+        output_contract,
+        reasoning_enabled,
+    );
     let prompt = if tools.is_empty() && functions.is_empty() {
         render_chat_prompt_with_model_template_options(
             &render_messages,
@@ -3221,24 +3234,24 @@ fn convert_chat_request_with_template_model(
             serde_json::json!(forbidden),
         );
     }
-    let response_format = forced_response_format
-        .or(requested_response_format)
-        .unwrap_or(ferrum_types::ResponseFormat::Text);
-    let structured_output_start = if matches!(response_format, ferrum_types::ResponseFormat::Text)
-        || !has_unclosed_thinking_block(&prompt)
-    {
-        StructuredOutputStart::Immediate
-    } else {
+    let prompt_opened_thinking = has_unclosed_thinking_block(&prompt);
+    let structured_output_after_reasoning =
+        !matches!(response_format, ferrum_types::ResponseFormat::Text)
+            && (prompt_opened_thinking || model_generated_thinking);
+    let structured_output_start = if structured_output_after_reasoning {
         StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
-    };
-    let response_completion_boundary = if has_unclosed_thinking_block(&prompt) {
-        ResponseCompletionBoundary::AfterDelimiterAndPayload {
-            delimiter: THINK_END_TAG.to_string(),
-            alternate_envelope: api_chat.generated_response_envelope(),
-        }
     } else {
-        ResponseCompletionBoundary::Immediate
+        StructuredOutputStart::Immediate
     };
+    let response_completion_boundary =
+        if prompt_opened_thinking || structured_output_after_reasoning {
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: api_chat.generated_response_envelope(),
+            }
+        } else {
+            ResponseCompletionBoundary::Immediate
+        };
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),
@@ -3332,8 +3345,11 @@ fn chat_template_options_for_request(
 fn render_messages_with_response_format_instruction(
     request: &ChatCompletionsRequest,
     output_contract: EffectiveChatOutputContract,
+    reasoning_enabled: bool,
 ) -> Vec<ChatMessage> {
-    let Some(instruction) = response_format_prompt_instruction(request, output_contract) else {
+    let Some(instruction) =
+        response_format_prompt_instruction(request, output_contract, reasoning_enabled)
+    else {
         return request.messages.clone();
     };
     let mut messages = Vec::with_capacity(request.messages.len() + 1);
@@ -3353,22 +3369,32 @@ fn render_messages_with_response_format_instruction(
 fn response_format_prompt_instruction(
     request: &ChatCompletionsRequest,
     output_contract: EffectiveChatOutputContract,
+    reasoning_enabled: bool,
 ) -> Option<String> {
     if !output_contract.accepts_requested_response_format() {
         return None;
     }
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
-            "json_object" => Some(
+            "json_object" => Some(if reasoning_enabled {
+                "The response_format requires a single valid JSON object. Keep any reasoning inside <think>...</think>. After </think>, output only JSON, with no markdown fences, no explanation, and no extra text."
+                    .to_string()
+            } else {
                 "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
-                    .to_string(),
-            ),
+                    .to_string()
+            }),
             "json_schema" => {
                 let schema = format.json_schema.as_ref()?.schema.as_ref()?;
                 let schema_text = serde_json::to_string(schema).ok()?;
-                Some(format!(
-                    "The response_format requires a single valid JSON value satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
-                ))
+                Some(if reasoning_enabled {
+                    format!(
+                        "The response_format requires a single valid JSON value satisfying this JSON Schema. Keep any reasoning inside <think>...</think>. After </think>, output only JSON, with no markdown fences, no explanation, and no extra text. Schema: {schema_text}"
+                    )
+                } else {
+                    format!(
+                        "The response_format requires a single valid JSON value satisfying this JSON Schema. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text. Schema: {schema_text}"
+                    )
+                })
             }
             _ => None,
         };
@@ -11105,6 +11131,63 @@ mod tests {
                 alternate_envelope: None,
             }
         );
+    }
+
+    #[test]
+    fn json_object_model_generated_thinking_activates_after_typed_end_delimiter() {
+        let request = chat_request(json!({
+            "response_format": {"type": "json_object"},
+            "chat_template_kwargs": {"enable_thinking": true}
+        }));
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "qwen3-model-generated-thinking-template",
+        );
+
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert model-generated thinking json_object");
+
+        assert!(!has_unclosed_thinking_block(&internal.prompt));
+        assert!(internal.prompt.ends_with("<assistant>"));
+        assert!(internal.prompt.contains("After </think>, output only JSON"));
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
+        );
+        assert_eq!(
+            internal.sampling_params.response_completion_boundary,
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: None,
+            }
+        );
+    }
+
+    #[test]
+    fn json_object_model_generated_thinking_hard_off_starts_immediately() {
+        let request = chat_request(json!({
+            "response_format": {"type": "json_object"},
+            "chat_template_kwargs": {"enable_thinking": false}
+        }));
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "qwen3-model-generated-thinking-template",
+        );
+
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert disabled model-generated thinking json_object");
+
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::Immediate
+        );
+        assert_eq!(
+            internal.sampling_params.response_completion_boundary,
+            ResponseCompletionBoundary::Immediate
+        );
+        assert!(internal.prompt.contains("no chain-of-thought"));
     }
 
     #[test]
