@@ -56,6 +56,25 @@
 M2/M3 的旧 703/702/783/782 candidate 重复矩阵转入 v0.8.1/0.9 nightly hardening，
 不得被报告为 v0.8.0 已完成工作。
 
+## C17 Unicode oracle 边界
+
+C17 验证产品字节边界，不验证生成模型是否逐字服从复述提示。正式 PASS 必须同时证明：
+
+- Unicode marker 逐字进入 `ferrum run` 的 user event 和 `ferrum serve` 的 HTTP request；
+- `run` 的全部 `assistant_delta.raw_text_delta` 按连续 index 拼接后与最终 assistant content
+  完全相等，每段 `utf8_bytes` 和最终 `raw_text_sha256` 均与真实 UTF-8 bytes 一致；
+- `serve` 的 non-stream reference 与 streaming reconstruction 内容、reasoning、finish reason 和
+  usage 完全相等；
+- 逐字节读取 SSE 时确实跨越多字节 UTF-8 边界，重组 bytes SHA 一致，且 replacement character、
+  mojibake、invalid UTF-8、malformed SSE 均为 0；
+- 生成内容必须非空且实际包含至少一个多字节 Unicode scalar。
+
+不得把“模型输出与提示 marker 完全相等”作为 engine/transport 正确性 oracle。M3 历史
+`cff4c477` 和当前 `f0f61a17` 的 `c17-001` 都稳定将“中文正确”回答为“正确”；输入事件、
+assistant delta、最终 content 与 SHA 均保持一致。这属于模型措辞行为，不是 Ferrum 丢失了
+“中文”两个字。本修订后的预测是该 case 只有在上述真实字节链全部闭合时才从
+`c17-contract-violation` 变为 PASS；任何乱码、截断、delta/content 不一致仍必须 REJECT。
+
 ## 失败后的执行策略
 
 1. 首次失败只运行 exact case reproducer。
@@ -69,4 +88,3 @@ M2/M3 的旧 703/702/783/782 candidate 重复矩阵转入 v0.8.1/0.9 nightly har
 M1 已通过工件只有在记录 SHA 是当前 SHA 的祖先，且中间变化严格限于本修订的文档与 R1
 矩阵控制面文件时才可复用。任何 `crates/`、Cargo、模型锁、运行配置、产品场景 manifest 或生产
 实现变化都会使工件 stale。M2/M3 工件必须与当前 source 完全一致。
-
