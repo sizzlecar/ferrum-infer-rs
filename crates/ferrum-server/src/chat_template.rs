@@ -1,7 +1,9 @@
 use crate::openai::{
     ChatFunction, ChatMessage, ChatTool, FunctionCallChoice, MessageRole, ToolChoice,
 };
-use ferrum_types::{ApiToolCallProtocol, FerrumError};
+use ferrum_types::{
+    has_unclosed_thinking_block, ApiToolCallProtocol, FerrumError, THINK_END_TAG, THINK_START_TAG,
+};
 use minijinja::Environment;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
@@ -9,6 +11,13 @@ use serde_json::Value;
 
 /// Model-provided chat template, usually from GGUF `tokenizer.chat_template`
 /// or HuggingFace `tokenizer_config.json`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelReasoningProtocol {
+    None,
+    PromptOpened,
+    ModelGenerated,
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelChatTemplate {
     pub template: String,
@@ -16,18 +25,32 @@ pub struct ModelChatTemplate {
     pub bos_token: Option<String>,
     pub eos_token: Option<String>,
     pub tool_call_protocol: ApiToolCallProtocol,
+    pub reasoning_protocol: ModelReasoningProtocol,
+    pub reasoning_default_enabled: bool,
 }
 
 impl ModelChatTemplate {
     pub fn new(template: impl Into<String>, source: impl Into<String>) -> Self {
         let template = template.into();
-        Self {
+        let mut model_template = Self {
             tool_call_protocol: tool_call_protocol_for_template(&template),
             template,
             source: source.into(),
             bos_token: None,
             eos_token: None,
-        }
+            reasoning_protocol: ModelReasoningProtocol::None,
+            reasoning_default_enabled: false,
+        };
+        let (reasoning_protocol, reasoning_default_enabled) =
+            detect_model_reasoning_protocol(&model_template);
+        model_template.reasoning_protocol = reasoning_protocol;
+        model_template.reasoning_default_enabled = reasoning_default_enabled;
+        model_template
+    }
+
+    pub fn reasoning_enabled(&self, requested: Option<bool>) -> bool {
+        self.reasoning_protocol != ModelReasoningProtocol::None
+            && requested.unwrap_or(self.reasoning_default_enabled)
     }
 }
 
@@ -360,6 +383,61 @@ fn render_model_template(
         functions: functions.and_then(|f| serde_json::to_value(f).ok()),
         function_call,
     })
+}
+
+fn detect_model_reasoning_protocol(
+    model_template: &ModelChatTemplate,
+) -> (ModelReasoningProtocol, bool) {
+    let messages = [PromptMessage {
+        role: "user".to_string(),
+        content: "reasoning protocol probe".to_string(),
+        reasoning_content: None,
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        function_call: None,
+    }];
+    let now =
+        chrono::NaiveDate::from_ymd_opt(2000, 1, 1).and_then(|date| date.and_hms_opt(0, 0, 0));
+    let render = |enable_thinking| {
+        render_model_template(
+            &messages,
+            model_template,
+            &ChatTemplateOptions {
+                enable_thinking,
+                now_override: now,
+            },
+            None,
+            None,
+            None,
+            None,
+        )
+        .ok()
+    };
+    let Some(enabled) = render(Some(true)) else {
+        return (ModelReasoningProtocol::None, false);
+    };
+    let default = render(None);
+    if has_unclosed_thinking_block(&enabled) {
+        let default_enabled = default.as_deref().is_some_and(has_unclosed_thinking_block);
+        return (ModelReasoningProtocol::PromptOpened, default_enabled);
+    }
+    let Some(disabled) = render(Some(false)) else {
+        return (ModelReasoningProtocol::None, false);
+    };
+    let completed_blocks = |prompt: &str| {
+        prompt
+            .matches(THINK_START_TAG)
+            .count()
+            .min(prompt.matches(THINK_END_TAG).count())
+    };
+    if completed_blocks(&disabled) > completed_blocks(&enabled) {
+        return (
+            ModelReasoningProtocol::ModelGenerated,
+            default.as_deref() == Some(enabled.as_str()),
+        );
+    }
+    (ModelReasoningProtocol::None, false)
 }
 
 /// `tojson` matching Python's `json.dumps(..., ensure_ascii=False)` as used
@@ -1021,6 +1099,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(disabled, "<assistant><think>\n\n</think>\n\n");
+    }
+
+    #[test]
+    fn qwen3_model_generated_thinking_is_a_typed_template_capability() {
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "qwen3-model-generated-thinking-template",
+        );
+
+        assert_eq!(
+            template.reasoning_protocol,
+            ModelReasoningProtocol::ModelGenerated
+        );
+        assert!(template.reasoning_default_enabled);
+        assert!(template.reasoning_enabled(None));
+        assert!(template.reasoning_enabled(Some(true)));
+        assert!(!template.reasoning_enabled(Some(false)));
     }
 
     #[test]
