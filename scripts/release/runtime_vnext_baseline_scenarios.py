@@ -2580,6 +2580,19 @@ def history_response_message(exchange: dict[str, Any], label: str, errors: list[
         return None
 
 
+def validate_unicode_generated_text(raw: Any, label: str) -> tuple[str, bytes]:
+    content = require_string(raw, label)
+    require(content.strip(), f"{label} is empty")
+    encoded = content.encode("utf-8")
+    require(any(ord(character) > 0x7F for character in content), f"{label} contains no multibyte Unicode scalar")
+    require("\ufffd" not in content, f"{label} contains a Unicode replacement character")
+    require(
+        not any(marker in content.lower() for marker in ("mojibake", "invalid utf-8")),
+        f"{label} contains a Unicode corruption marker",
+    )
+    return content, encoded
+
+
 def validate_case_output(
     scenario_id: str,
     variant: str,
@@ -2685,11 +2698,51 @@ def validate_case_output(
                 require_sha256(history.get("sha256"), f"{label}.{record_label}.history_before.sha256")
         if scenario_id == "C17":
             expected_text = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
-            require(assistants[-1].get("content") == expected_text, f"{label} Unicode run content mismatch")
-            require(require_count(assistants[-1].get("chunk_count"), f"{label}.chunk_count", minimum=2) >= 2, f"{label} Unicode run was not incremental")
-            require("\ufffd" not in expected_text, f"{label} Unicode run contains replacement characters")
+            require(input_document is not None, f"{label} Unicode run input evidence is missing")
+            persisted_prompt = input_document.get("stdin", input_document.get("prompt"))
+            expected_prompt = require_string(persisted_prompt, f"{label}.input.prompt").rstrip("\r\n")
+            require(expected_text in expected_prompt, f"{label} Unicode run input lost its marker")
+            users = [row for row in rows if row.get("event") == "user"]
+            require(users and users[-1].get("content") == expected_prompt, f"{label} Unicode run input mismatch")
+            assistant = assistants[-1]
+            content, encoded = validate_unicode_generated_text(
+                assistant.get("content"),
+                f"{label} Unicode run content",
+            )
+            request_id = require_string(assistant.get("request_id"), f"{label}.assistant.request_id")
+            deltas = [
+                row
+                for row in rows
+                if row.get("event") == "assistant_delta"
+                and row.get("request_id") == request_id
+            ]
+            require(deltas, f"{label} Unicode run emitted no assistant deltas")
+            require(
+                [require_count(row.get("index"), f"{label}.delta.index") for row in deltas]
+                == list(range(len(deltas))),
+                f"{label} Unicode run delta indexes are not contiguous",
+            )
+            fragments = [
+                require_string(row.get("raw_text_delta"), f"{label}.delta.raw_text_delta")
+                for row in deltas
+            ]
+            require("".join(fragments) == content, f"{label} Unicode run delta reconstruction mismatch")
+            require(
+                all(
+                    require_count(row.get("utf8_bytes"), f"{label}.delta.utf8_bytes", minimum=1)
+                    == len(fragment.encode("utf-8"))
+                    for row, fragment in zip(deltas, fragments)
+                ),
+                f"{label} Unicode run delta byte count mismatch",
+            )
+            require(
+                require_sha256(assistant.get("raw_text_sha256"), f"{label}.raw_text_sha256")
+                == hashlib.sha256(encoded).hexdigest(),
+                f"{label} Unicode run content SHA mismatch",
+            )
+            require_count(assistant.get("chunk_count"), f"{label}.chunk_count", minimum=1)
         marker = observed.get("expected_marker")
-        if isinstance(marker, str) and marker and scenario_id not in {"C03", "C04"}:
+        if isinstance(marker, str) and marker and scenario_id not in {"C03", "C04", "C17"}:
             require(marker in str(assistants[-1].get("content")), f"{label} missing expected marker")
         return
 
@@ -2856,7 +2909,20 @@ def validate_case_output(
             require(stream_usage == reference_usage, f"{label} stream usage differs from non-stream")
             require(streamed_reasoning == reference_reasoning, f"{label} stream reasoning differs from non-stream")
             require(reconstruction.get("content") == reference_content, f"{label} stream content differs from non-stream")
-            require(reference_content == observed.get("expected_marker"), f"{label} paired reference returned unexpected content")
+            if scenario_id == "C17":
+                validate_unicode_generated_text(reference_content, f"{label} paired Unicode content")
+                expected_marker = require_string(
+                    observed.get("expected_marker"),
+                    f"{label}.observed.expected_marker",
+                )
+                messages = require_list(reference_request.get("messages"), f"{label}.reference.messages")
+                prompt = require_string(
+                    require_object(messages[-1], f"{label}.reference.messages[-1]").get("content"),
+                    f"{label}.reference.messages[-1].content",
+                )
+                require(expected_marker in prompt, f"{label} Unicode request lost its input marker")
+            else:
+                require(reference_content == observed.get("expected_marker"), f"{label} paired reference returned unexpected content")
         if scenario_id == "C12":
             require(
                 reference_choice.get("finish_reason") == "tool_calls"
@@ -10173,6 +10239,8 @@ def make_case_fixture(
             }
             request_id = f"{session_id}-request-{turn + 1:04d}"
             rows.append({"event": "user", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": user_content, "history_before": history_before})
+            if scenario_id == "C17":
+                rows.append({"event": "assistant_delta", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "index": 0, "raw_text_delta": content, "utf8_bytes": len(content.encode("utf-8")), "token_id": 1})
             assistant_row = {
                     "event": "assistant",
                     "session_id": session_id,
@@ -10186,6 +10254,8 @@ def make_case_fixture(
                     "chunk_count": 512 if scenario_id == "C04" else 2,
                     "ms": 10.0,
                 }
+            if scenario_id == "C17":
+                assistant_row["raw_text_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()
             if scenario_id == "C19":
                 if thinking_reasoning_expected(base["model_key"], variant):
                     assistant_row["reasoning"] = f"fixture reasoning turn {turn}"
@@ -10991,7 +11061,7 @@ def run_mode(argv):
         f"Remember this identifier for later: {marker}. Reply with exactly ACKNOWLEDGED and do not include the identifier.",
         "Reply with exactly CONTINUE.",
         "What identifier did I ask you to remember in the first message? Reply with only the identifier.",
-    ] if scenario == "C03" else [f"Return the exact marker {marker}-H{turn + 1}." for turn in range(turns)] if scenario == "C19" else ["fixture input"]
+    ] if scenario == "C03" else [f"Return the exact marker {marker}-H{turn + 1}." for turn in range(turns)] if scenario == "C19" else [f"Return the exact marker {marker} and no other text."] if scenario == "C17" else ["fixture input"]
     session_id = f"fixture-session-{os.getpid()}"
     identity = product_identity(argv)
     print(json.dumps({"schema_version": 1, "event": "ready", "session_id": session_id, "history_epoch": 0, "model": identity["resolved_model"], "requested_model": identity["requested_model"], "resolved_model": identity["resolved_model"], "backend": value_after(argv, "--backend", "auto")}))
@@ -11003,7 +11073,11 @@ def run_mode(argv):
             request_id = f"{session_id}-request-{turn + 1:04d}"
             evidence = history_evidence(history)
             print(json.dumps({"schema_version": 1, "event": "user", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": prompt, "history_before": evidence}))
+            if scenario == "C17":
+                print(json.dumps({"schema_version": 1, "event": "assistant_delta", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "index": 0, "raw_text_delta": content, "utf8_bytes": len(content.encode()), "token_id": 1}, ensure_ascii=False))
             row = {"schema_version": 1, "event": "assistant", "session_id": session_id, "history_epoch": 0, "request_id": request_id, "turn": turn, "content": content, "reasoning": None, "history_before": evidence, "finish_reason": "eos", "n_tokens": 512 if scenario == "C04" else 4, "chunk_count": 512 if scenario == "C04" else 2, "ms": 1.0}
+            if scenario == "C17":
+                row["raw_text_sha256"] = hashlib.sha256(content.encode()).hexdigest()
             print(json.dumps(row, ensure_ascii=False))
             history.extend([["user", prompt], ["assistant", content]])
         else:
@@ -12913,27 +12987,62 @@ def self_test() -> int:
         else:
             raise AssertionError("JSONL reader silently skipped a complete invalid row")
 
-    with tempfile.TemporaryDirectory(prefix="runtime-vnext-c17-normalization-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-c17-roundtrip-") as tmp:
         stdout_path = Path(tmp) / "stdout.jsonl"
         nfd_marker = "e\u0301"
         nfc_marker = unicodedata.normalize("NFC", nfd_marker)
-        require(nfc_marker != nfd_marker, "C17 normalization negative fixture must differ by bytes")
-        stdout_path.write_text(
-            json.dumps(
+        require(nfc_marker != nfd_marker, "C17 normalization fixture must differ by bytes")
+
+        def write_c17_roundtrip(delta: str) -> None:
+            request_id = "c17-roundtrip-request"
+            rows = [
+                {
+                    "schema_version": 2,
+                    "event": "user",
+                    "request_id": request_id,
+                    "content": f"Return the exact marker {nfd_marker} and no other text.",
+                },
+                {
+                    "schema_version": 2,
+                    "event": "assistant_delta",
+                    "request_id": request_id,
+                    "index": 0,
+                    "raw_text_delta": delta,
+                    "utf8_bytes": len(delta.encode("utf-8")),
+                    "token_id": 1,
+                },
                 {
                     "schema_version": 2,
                     "event": "assistant",
+                    "request_id": request_id,
                     "content": nfc_marker,
                     "finish_reason": "stop",
-                    "n_tokens": 2,
-                    "chunk_count": 2,
+                    "n_tokens": 1,
+                    "chunk_count": 1,
+                    "raw_text_sha256": hashlib.sha256(nfc_marker.encode("utf-8")).hexdigest(),
                 },
-                ensure_ascii=False,
+            ]
+            stdout_path.write_text(
+                "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+                encoding="utf-8",
             )
-            + "\n",
-            encoding="utf-8",
+
+        write_c17_roundtrip(nfc_marker)
+        roundtrip_input = {
+            "prompt": f"Return the exact marker {nfd_marker} and no other text."
+        }
+        validate_case_output(
+            "C17",
+            "combining",
+            "run",
+            stdout_path,
+            None,
+            {"expected_marker": nfd_marker},
+            "c17-roundtrip-valid",
+            input_document=roundtrip_input,
         )
-        normalization_failure = capture_case_output_error(
+        write_c17_roundtrip("x")
+        roundtrip_failure = capture_case_output_error(
             lambda: validate_case_output(
                 "C17",
                 "combining",
@@ -12941,13 +13050,14 @@ def self_test() -> int:
                 stdout_path,
                 None,
                 {"expected_marker": nfd_marker},
-                "c17-normalization-negative",
+                "c17-roundtrip-negative",
+                input_document=roundtrip_input,
             )
         )
         require(
-            isinstance(normalization_failure, ScenarioError)
-            and "Unicode run content mismatch" in str(normalization_failure),
-            "C17 exact-byte oracle accepted canonically equivalent but byte-distinct output",
+            isinstance(roundtrip_failure, ScenarioError)
+            and "Unicode run delta reconstruction mismatch" in str(roundtrip_failure),
+            "C17 roundtrip oracle accepted corrupted assistant deltas",
         )
     json_failure = capture_case_output_error(lambda: json.loads(""))
     scenario_failure = capture_case_output_error(lambda: require(False, "case-output scenario failure"))
