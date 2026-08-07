@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-CONTRACT_ID = "c13-tool-result-continuation-v2"
+CONTRACT_ID = "c13-tool-result-continuation-v3"
 SAMPLING_CONTRACT_ID = "c13-deterministic-semantic-correctness-v1"
 CASE_COUNT = 60
 TOOL_NAME = "calculator"
@@ -48,7 +48,9 @@ class C13CaseContract:
     def user_prompt(self) -> str:
         prompt = (
             f"Calculate {self.expression} using the calculator. "
-            "Return the calculator result and its receipt."
+            "After the calculator result is provided, your final answer must copy "
+            "both values from that result: the calculation result and the complete "
+            "opaque receipt. Do not omit or shorten the receipt."
         )
         if self.variant == "soft-think":
             return f"{prompt} /think"
@@ -359,6 +361,9 @@ def self_test() -> None:
             sort_keys=True,
         )
         assert contract.expected_receipt not in history_without_tool_result
+        assert contract.expected_receipt not in contract.user_prompt
+        assert "complete opaque receipt" in contract.user_prompt
+        assert "Do not omit or shorten the receipt." in contract.user_prompt
     for invalid_ordinal in (0, CASE_COUNT + 1, True, "1"):
         try:
             case_contract(  # type: ignore[arg-type]

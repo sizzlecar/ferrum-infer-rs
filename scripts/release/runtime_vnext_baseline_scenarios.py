@@ -12144,7 +12144,7 @@ def self_test_http_request_byte_binding() -> None:
     request_bytes = json_document_bytes(payload)
     require(
         hashlib.sha256(request_bytes).hexdigest()
-        == "243c9820ea83bc2cc306cb3286b61ace2f66b247f0c50e946c2e84f905d51517",
+        == "14a568377b92e2c14b04f9a31daf6fb8f0e1a94719417fd8d4cb1f7113711d87",
         "C13-038 canonical request bytes drifted",
     )
     captured: dict[str, bytes | None] = {}
