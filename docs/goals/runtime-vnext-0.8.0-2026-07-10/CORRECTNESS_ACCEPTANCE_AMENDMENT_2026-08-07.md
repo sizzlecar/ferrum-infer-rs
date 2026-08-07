@@ -75,6 +75,24 @@ assistant delta、最终 content 与 SHA 均保持一致。这属于模型措辞
 “中文”两个字。本修订后的预测是该 case 只有在上述真实字节链全部闭合时才从
 `c17-contract-violation` 变为 PASS；任何乱码、截断、delta/content 不一致仍必须 REJECT。
 
+## C19 thinking oracle 边界
+
+C19 验证 reasoning 开关、final 分离和真实两轮 history，不把模型逐字服从提示当成运行时
+正确性。两种状态分别执行：
+
+- reasoning 开启时，两个 response 都必须有非空 reasoning，final 必须严格等于本轮 marker，
+  且 `<think>` 标签和 reasoning 文本不得泄漏到 final；
+- reasoning 关闭时，两个 response 都不得出现 reasoning 字段或 `<think>` 标签；普通 content
+  可以包含模型给出的计算过程，但必须且只能包含一次本轮 marker，不能包含另一轮 marker；
+- `run` 必须记录连续的两轮 user/assistant 事件和递增 history receipt；`serve` 第二个 request
+  必须逐字段携带第一个 assistant message，包括 reasoning；硬开关必须覆盖 soft prompt，M3 的
+  `/think`、`/no_think` 不得被错误转换为硬开关。
+
+不得要求 no-thinking 模式把所有计算内容隐藏到不存在的 reasoning 通道。当前
+`093d684f` M3 CUDA `c19-009` 正确关闭 reasoning、正确保持两轮历史并生成本轮 marker，但在
+marker 前复述算式；这类输出只要满足上述边界即为 PASS。缺少 marker、混入另一轮 marker、
+reasoning 模式错误或 history 不一致仍必须 REJECT。
+
 ## 失败后的执行策略
 
 1. 首次失败只运行 exact case reproducer。
