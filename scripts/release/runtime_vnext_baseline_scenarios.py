@@ -124,6 +124,11 @@ R1_ARCHITECTURE_PROFILE = "r1-architecture-differential-v1"
 R1_DIFFERENTIAL_MODELS = frozenset(
     {"m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}
 )
+REQUIRED_TOOL_PROMPT = "Use lookup_weather for Paris."
+AUTO_TOOL_STRONG_TRIGGER_PROMPT = (
+    "Call lookup_weather exactly once with city set to Paris. "
+    "Do not output natural language."
+)
 CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
 CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL = Path(
     "build/candidate/native-operator-set.lock.json"
@@ -5773,7 +5778,12 @@ def case_http_payload(
             }
         )
     if scenario_id in {"C10", "C11", "C12"}:
-        payload["messages"] = [{"role": "user", "content": "Use lookup_weather for Paris."}]
+        prompt = (
+            REQUIRED_TOOL_PROMPT
+            if scenario_id == "C10"
+            else AUTO_TOOL_STRONG_TRIGGER_PROMPT
+        )
+        payload["messages"] = [{"role": "user", "content": prompt}]
         payload["tools"] = [
             {
                 "type": "function",
@@ -13852,6 +13862,16 @@ def self_test() -> int:
                         "model_key": model_key,
                     }
                     pair_payload = case_http_payload(pair_case, model_key)
+                    require(
+                        pair_payload["messages"]
+                        == [
+                            {
+                                "role": "user",
+                                "content": AUTO_TOOL_STRONG_TRIGGER_PROMPT,
+                            }
+                        ],
+                        f"{model_key} {scenario_id}/{preset_name} lost its strong auto-tool trigger",
+                    )
                     deterministic = preset_values(model_key, "P_DETERMINISTIC")
                     require(
                         all(

@@ -148,7 +148,7 @@ C11/C12 的确定性 sampling 控制，也不得因 parity 子协议而跳过 C2
 | C08 | stop/EOS/max_tokens | 每类 20 | finish reason 正确；stop 不泄漏；EOS 来源为模型元数据；max-token 子组关闭 EOS/stop 或使用不会早停的 fixture，精确生成 N 个 usage-counted token、无第 N+1 个 token、`finish_reason=length`；natural-EOS 子组允许 `<N` |
 | C09 | cancel/timeout/disconnect | 每类 20 | cancel 被 runtime 接收后 `<=2` 个 scheduler tick 且 wall `<=5s` 到达 released/expected-cache 终态；后续同容量请求成功；无 double release/leak |
 | C10 | required tool | 每模型 `P_NO_THINKING`/`P_THINKING` 各 20；M3 soft mode 各 10 | `finish_reason=tool_calls`；name/arguments/schema 正确；reasoning 不污染 arguments |
-| C11 | auto tool | 同 C10，强触发 prompt | 产生预期 tool；不得把 JSON 塞入 content |
+| C11 | auto tool | 同 C10；强触发 prompt 必须明确命名 tool、参数、exactly once 和禁止自然语言 | 产生预期 tool；不得把 JSON 塞入 content |
 | C12 | streamed tool delta | M1/M2 40：P_NO/P_THINK=`20/20`；M3 60：P_NO/P_THINK=`30/30`，其中 base/soft-think/soft-no-think=`40/10/10` | 每个 ordinal 与同 model/preset/ordinal 的 C11 auto-tool 配对，先 non-stream 后 stream；使用相同 payload，两个响应均 `finish_reason=tool_calls` 且不得伪造 content；按 tool index/id 重组 name/arguments 后与 C11 deep-equal；arguments JSON/schema valid；两侧 usage 各自结构和算术有效、prompt token 相等，completion/total token 可不同；一个 `[DONE]`、一个 usage；只统计 delta 数量不计 PASS |
 | C13 | tool result continuation | 同 C10；保留 thinking/template/budget，使用版本化 deterministic semantic sampling contract | tool role/template 正确；最终回答引用 exact tool result 和 opaque receipt；自然终止；无重复 call/history 污染 |
 | C14 | strict `json_schema` | 每模型 `P_NO_THINKING` 50：required/type/additionalProperties/enum=`13/13/12/12`；`P_THINKING` 20：四类各 `5` | non-thinking 50/50、thinking 20/20 valid；四类使用不同 schema、prompt 和预期值，不能用同一 payload 重复计数；reasoning 与最终 JSON 分离 |
