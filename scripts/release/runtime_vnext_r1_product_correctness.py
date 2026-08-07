@@ -53,6 +53,17 @@ CONTROL_PLANE_FILES = frozenset(
         "scripts/release/scenarios/runtime_vnext_r1_llama_dense_metal.json",
     }
 )
+MATRIX_EVIDENCE_CLOSURE_FILES = frozenset(
+    {
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md",
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md",
+        "scripts/release/runtime_vnext_baseline_scenarios.py",
+        "scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py",
+        "scripts/release/runtime_vnext_g08c_cuda_matrix_checkpoint.py",
+        "scripts/release/runtime_vnext_r1_product_correctness.py",
+    }
+)
 OUTER_GATE_FIELDS = {
     "artifact_dir",
     "binary",
@@ -316,6 +327,69 @@ def source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[st
         "changed_files": changed,
         "changed_file_count": len(changed),
         "policy": "r1-control-plane-only",
+    }
+
+
+def matrix_source_closure(
+    recorded: dict[str, Any],
+    current: dict[str, Any],
+    lane: MatrixLane,
+) -> dict[str, Any]:
+    recorded_sha = recorded["git_sha"]
+    require(
+        git_text("rev-parse", f"{recorded_sha}^{{tree}}")
+        == recorded["git_tree_sha"],
+        f"{lane.key} recorded source tree differs from git",
+    )
+    if recorded == current:
+        return {
+            "from_git_sha": recorded_sha,
+            "to_git_sha": current["git_sha"],
+            "changed_files": [],
+            "changed_file_count": 0,
+            "policy": "exact-source",
+        }
+    require(
+        lane.model_key == "m1-qwen35-4b",
+        f"{lane.key} matrix evidence must match current source exactly",
+    )
+    ancestor = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", recorded_sha, current["git_sha"]],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        check=False,
+    )
+    require(
+        ancestor.returncode == 0,
+        f"{lane.key} recorded source is not an ancestor of current source",
+    )
+    changed = [
+        line
+        for line in git_text(
+            "diff",
+            "--name-only",
+            "--diff-filter=ACDMRTUXB",
+            f"{recorded_sha}..{current['git_sha']}",
+        ).splitlines()
+        if line
+    ]
+    rejected = [
+        path for path in changed if path not in MATRIX_EVIDENCE_CLOSURE_FILES
+    ]
+    require(
+        not rejected,
+        f"{lane.key} matrix evidence is stale after non-control-plane changes: {rejected[:8]}",
+    )
+    require(
+        changed,
+        f"{lane.key} source identity differs without an observable git diff",
+    )
+    return {
+        "from_git_sha": recorded_sha,
+        "to_git_sha": current["git_sha"],
+        "changed_files": changed,
+        "changed_file_count": len(changed),
+        "policy": "m1-r1-matrix-control-plane-only",
     }
 
 
@@ -708,10 +782,12 @@ def validate_matrix(path: Path, lane: MatrixLane, source: dict[str, Any]) -> dic
         and outer.get("status") == "pass"
         and outer.get("child_returncode") == 0
         and outer.get("error") is None
-        and outer.get("git_sha") == source["git_sha"]
+        and isinstance(outer.get("git_sha"), str)
+        and GIT_SHA_RE.fullmatch(outer["git_sha"]) is not None
         and outer.get("dirty_status") == {"is_dirty": False, "status_short": []},
         f"{lane.key} outer identity/source/status mismatch",
     )
+    recorded_git_sha = outer["git_sha"]
     delegated = outer.get("delegated_command_line")
     require(isinstance(delegated, list) and len(delegated) >= 8, f"{lane.key} delegated command is missing")
     require(
@@ -761,12 +837,19 @@ def validate_matrix(path: Path, lane: MatrixLane, source: dict[str, Any]) -> dic
         and child.get("status") == "pass"
         and child.get("canonical") is True
         and child.get("artifact_dir") == str(recorded_out)
-        and child.get("source_git_sha") == source["git_sha"]
-        and child.get("source_tree_sha") == source["git_tree_sha"]
+        and child.get("source_git_sha") == recorded_git_sha
+        and isinstance(child.get("source_tree_sha"), str)
+        and GIT_SHA_RE.fullmatch(child["source_tree_sha"]) is not None
         and child.get("dirty") is False
         and child.get("pass_line") == expected_child_pass,
         f"{lane.key} child identity/source/status mismatch",
     )
+    recorded_source = {
+        "git_sha": recorded_git_sha,
+        "git_tree_sha": child["source_tree_sha"],
+        "dirty": False,
+    }
+    closure = matrix_source_closure(recorded_source, source, lane)
     report_path = validate_portable_ref(
         child.get("scenario_report"),
         actual_artifact,
@@ -780,8 +863,8 @@ def validate_matrix(path: Path, lane: MatrixLane, source: dict[str, Any]) -> dic
     require(
         report.get("status") == "pass"
         and report.get("execution_contract") == matrix_checkpoint.matrix.G08_EXECUTION_CONTRACT
-        and report.get("source_git_sha") == source["git_sha"]
-        and report.get("source_tree_sha") == source["git_tree_sha"]
+        and report.get("source_git_sha") == recorded_source["git_sha"]
+        and report.get("source_tree_sha") == recorded_source["git_tree_sha"]
         and report.get("dirty_status") == {"is_dirty": False, "status_short": []}
         and report.get("model_key") == lane.model_key
         and report.get("backend") == lane.backend,
@@ -816,8 +899,8 @@ def validate_matrix(path: Path, lane: MatrixLane, source: dict[str, Any]) -> dic
     validation = read_json(validation_path, f"{lane.key} validation")
     require(
         validation.get("status") == "pass"
-        and validation.get("source_git_sha") == source["git_sha"]
-        and validation.get("source_tree_sha") == source["git_tree_sha"]
+        and validation.get("source_git_sha") == recorded_source["git_sha"]
+        and validation.get("source_tree_sha") == recorded_source["git_tree_sha"]
         and validation.get("model_key") == lane.model_key
         and validation.get("backend") == lane.backend
         and validation.get("summary") == summary
@@ -846,6 +929,7 @@ def validate_matrix(path: Path, lane: MatrixLane, source: dict[str, Any]) -> dic
         "product_execution_identity": startup,
         "provider_execution": providers,
         "resource_contract": resources,
+        "source_closure": closure,
     }
 
 
@@ -1388,6 +1472,16 @@ def self_test() -> int:
         "git_tree_sha": git_text("rev-parse", "HEAD^{tree}"),
         "dirty": False,
     }
+    exact_closure = matrix_source_closure(
+        source,
+        source,
+        MATRIX_LANES["m1_cuda"],
+    )
+    require(
+        exact_closure["policy"] == "exact-source"
+        and exact_closure["changed_file_count"] == 0,
+        "matrix exact-source closure differs",
+    )
     with tempfile.TemporaryDirectory(prefix="ferrum-r1-selftest-") as temporary:
         root = Path(temporary).resolve()
         binaries = {"cuda": "1" * 64, "metal": "2" * 64}

@@ -9,6 +9,9 @@
 - 性能范围随后由
   [`PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md`](PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md)
   进一步收敛；该文件优先于本修订中的 external comparator、ABBA 和 ratio 条款。
+- R1 correctness 重复采样规模随后由
+  [`CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md`](CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md)
+  收敛；该文件优先于本修订中要求三个模型各自执行同一 exhaustive 分母的条款。
 - 本修订不降低真实产品正确性、动态资源、profile、编译效率、CUDA/Metal 或发布后安装验证标准。
 - G00-G10 的未完成项目不删除。未列为本修订 v0.8.0 硬门的项目转入 v0.8.1/0.9 hardening backlog，
   不能被误报为已经完成。
@@ -36,7 +39,8 @@
 以下要求继续阻塞发布：
 
 1. 主三模型固定为 Qwen3.5-4B、Qwen3.5-35B-A3B、Qwen3-30B-A3B。
-2. 三主模型 CUDA/Metal correctness 共 `6/6 PASS`，required failure、skip、waiver、stale 均为 `0`。
+2. 三主模型 CUDA/Metal correctness 共 `6/6 PASS`；M1 使用 `703/702` 公共全矩阵，M2 使用
+   `112/111`、M3 使用 `120/119` 架构差异矩阵。required failure、skip、waiver、stale 均为 `0`。
 3. 三主模型及其共享 Qwen production path 的 legacy entry、factory、runner、fallback 在 release
    binary 中不可达，运行时 legacy selection 次数为 `0`；不得用 hidden env、模型名、GPU 名或固定
    并发切换到另一套实现。非三主模型的既有 legacy path 可以冻结保留到 post-release，但新增 legacy
@@ -97,7 +101,8 @@ FERRUM GATE vnext-r0 PASS: <out_dir>
 必须满足：
 
 - M1/M2/M3 x CUDA/Metal C01-C21 `6/6 PASS`，每 lane 使用真实 model weights、产品默认 typed config、
-  `run` 和 `serve`；不得把 focused sentinel 冒充完整分母。
+  `run` 和 `serve`；精确分母按 2026-08-07 correctness 修订执行，不得把 focused sentinel 冒充
+  对应的 `703/702/112/111/120/119` 正式分母。
 - CUDA/Metal 修复共享源码后使用 change-impact 选择 affected sentinel；只有 affected sentinel 通过后才
   运行该阶段的一次 full matrix。单 case 失败不得从 case 0 重跑。
 - 三模型 resolved plans 中 supported provider 均有实际 execution/conformance evidence；未被三模型解析到的
