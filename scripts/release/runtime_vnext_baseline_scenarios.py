@@ -2682,7 +2682,13 @@ def validate_case_output(
                 reasoning = assistant.get("reasoning")
                 require(bool(isinstance(reasoning, str) and reasoning.strip()) is reasoning_expected, f"{label} assistant[{index}] reasoning mode mismatch")
                 require("<think>" not in str(assistant.get("content")) and "</think>" not in str(assistant.get("content")), f"{label} reasoning leaked into final content")
-                require(assistant.get("content") == c19_expected_final(expected_marker, index + 1), f"{label} assistant[{index}] final answer mismatch")
+                validate_c19_final_content(
+                    assistant.get("content"),
+                    expected_marker,
+                    index + 1,
+                    reasoning_expected=reasoning_expected,
+                    label=f"{label} assistant[{index}]",
+                )
             for record_label, record, expected_messages, expected_turns in (
                 ("first user", users[0], 0, 0),
                 ("first assistant", assistants[0], 0, 0),
@@ -3208,8 +3214,20 @@ def validate_case_output(
                 require(bool(isinstance(reasoning, str) and reasoning.strip()) is reasoning_expected, f"{label} {response_label} reasoning mode mismatch")
                 require("<think>" not in response_content and "</think>" not in response_content, f"{label} reasoning tags leaked into final content")
             expected_marker = require_string(observed.get("expected_marker"), f"{label}.observed.expected_marker")
-            require(first_content == c19_expected_final(expected_marker, 1), f"{label} first final answer mismatch")
-            require(content == c19_expected_final(expected_marker, 2), f"{label} second final answer mismatch")
+            validate_c19_final_content(
+                first_content,
+                expected_marker,
+                1,
+                reasoning_expected=reasoning_expected,
+                label=f"{label} first",
+            )
+            validate_c19_final_content(
+                content,
+                expected_marker,
+                2,
+                reasoning_expected=reasoning_expected,
+                label=f"{label} second",
+            )
             first_request = require_object(exchanges[0].get("request"), f"{label}.first.request")
             kwargs = first_request.get("chat_template_kwargs")
             hard_thinking = c19_hard_thinking_override(variant)
@@ -5549,6 +5567,24 @@ def c19_hard_thinking_override(variant: str) -> bool | str:
 def c19_expected_final(marker: str, turn: int) -> str:
     require(turn in {1, 2}, f"C19 turn must be 1 or 2, got {turn}")
     return f"{marker}-H{turn}"
+
+
+def validate_c19_final_content(
+    content: Any,
+    marker: str,
+    turn: int,
+    *,
+    reasoning_expected: bool,
+    label: str,
+) -> None:
+    final = require_string(content, f"{label}.content")
+    expected = c19_expected_final(marker, turn)
+    other = c19_expected_final(marker, 2 if turn == 1 else 1)
+    if reasoning_expected:
+        require(final == expected, f"{label} final answer mismatch")
+        return
+    require(final.count(expected) == 1, f"{label} final answer marker mismatch")
+    require(other not in final, f"{label} final answer crossed history turns")
 
 
 def c19_turn_prompt(marker: str, turn: int, variant: str) -> str:
@@ -12654,6 +12690,30 @@ def self_test() -> int:
     self_test_c18_trace_scope()
     self_test_stream_pair_contracts()
     validate_c17_markers()
+    validate_c19_final_content(
+        "714 - 29 = 685\n\nG00-c19-009-OK-H2",
+        "G00-c19-009-OK",
+        2,
+        reasoning_expected=False,
+        label="C19 no-thinking fixture",
+    )
+    for content, reasoning_expected, marker in (
+        ("714 - 29 = 685", False, "final answer marker mismatch"),
+        ("G00-c19-009-OK-H1\nG00-c19-009-OK-H2", False, "crossed history turns"),
+        ("714 - 29 = 685\n\nG00-c19-009-OK-H2", True, "final answer mismatch"),
+    ):
+        try:
+            validate_c19_final_content(
+                content,
+                "G00-c19-009-OK",
+                2,
+                reasoning_expected=reasoning_expected,
+                label="C19 negative fixture",
+            )
+        except ScenarioError as error:
+            require(marker in str(error), f"C19 final-content oracle rejected for unexpected reason: {error}")
+        else:
+            raise AssertionError(f"C19 final-content oracle accepted invalid content: {content!r}")
     focus_fixture_rows = [
         {"case_id": "c01-001", "scenario_id": "C01"},
         {"case_id": "c01-002", "scenario_id": "C01"},
