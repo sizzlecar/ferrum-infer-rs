@@ -11,6 +11,11 @@ artifact 一致。
 为准。本文件的三模型、双后端、并发档位和 correctness 矩阵继续生效；下文 external
 ABBA、vLLM/llama.cpp ratio 和更大的采样规模保留为 v0.8.1/0.9 hardening 目标。
 
+2026-08-07 起，R1 correctness 的跨模型重复采样规模以
+[`CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md`](CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md)
+为准。M1 保留公共全矩阵，M2/M3 使用架构差异矩阵；C01-C21 语义、三模型、双后端、
+`run`/`serve`、工具、结构化输出、流式、并发资源和 legacy=0 硬断言不变。
+
 热度数据是 2026-07-10 的 Hugging Face 近 30 天快照，只用于解释模型选择，不作为
 Goal PASS 条件。
 
@@ -88,7 +93,8 @@ Llama 默认配置。
 
 ## 6. 正确性场景
 
-每一行必须在 M1-M3 x CUDA/Metal 的六个 lane 上执行，除非表中明确只属于某个模型。
+每一行必须在 M1-M3 x CUDA/Metal 的六个 lane 上执行，除非表中明确只属于某个模型；
+每行的重复次数按 2026-08-07 correctness 修订的分层分母执行。
 
 ### 6.1 生成 preset
 

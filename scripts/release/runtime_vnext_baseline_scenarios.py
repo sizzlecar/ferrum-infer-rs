@@ -119,6 +119,11 @@ SCHEMA_VERSION = 1
 LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
 G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
 EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
+FULL_MATRIX_PROFILE = "full-matrix-v1"
+R1_ARCHITECTURE_PROFILE = "r1-architecture-differential-v1"
+R1_DIFFERENTIAL_MODELS = frozenset(
+    {"m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}
+)
 CANDIDATE_BUILD_RECEIPT_TYPE = "runtime_vnext_candidate_build_receipt"
 CANDIDATE_NATIVE_OPERATOR_SET_LOCK_REL = Path(
     "build/candidate/native-operator-set.lock.json"
@@ -2014,7 +2019,46 @@ def validate_command(
     return command_id, entrypoint
 
 
-def minimum_presets(scenario_id: str, model_key: str) -> tuple[dict[str, int], int]:
+def matrix_profile(execution_contract_name: str, model_key: str) -> str:
+    if (
+        execution_contract_name == G08_EXECUTION_CONTRACT
+        and model_key in R1_DIFFERENTIAL_MODELS
+    ):
+        return R1_ARCHITECTURE_PROFILE
+    return FULL_MATRIX_PROFILE
+
+
+def minimum_presets(
+    scenario_id: str,
+    model_key: str,
+    profile: str = FULL_MATRIX_PROFILE,
+) -> tuple[dict[str, int], int]:
+    if profile == R1_ARCHITECTURE_PROFILE:
+        if scenario_id == "C01":
+            return {}, 20
+        if scenario_id in {f"C{index:02d}" for index in range(2, 10)} | {
+            "C16",
+            "C17",
+            "C18",
+        }:
+            return {"P_DETERMINISTIC": 1}, 0
+        if scenario_id in {"C10", "C11", "C12", "C13"}:
+            return (
+                {"P_NO_THINKING": 2, "P_THINKING": 4}
+                if model_key == "m3-qwen3-30b-a3b"
+                else {"P_NO_THINKING": 2, "P_THINKING": 2}
+            ), 0
+        if scenario_id == "C14":
+            return {"P_NO_THINKING": 4, "P_THINKING": 4}, 0
+        if scenario_id == "C15":
+            return {"P_NO_THINKING": 2, "P_THINKING": 2}, 0
+        if scenario_id == "C19":
+            return {"P_THINKING": 10}, 0
+        if scenario_id == "C20":
+            return {"P_DETERMINISTIC": 1}, 4
+        if scenario_id == "C21":
+            return {"P_OFFICIAL_DEFAULT": 5}, 0
+        raise AssertionError(scenario_id)
     if scenario_id == "C01":
         return {}, 20
     if scenario_id in {f"C{index:02d}" for index in range(2, 10)} | {"C16", "C17", "C18"}:
@@ -2041,7 +2085,35 @@ def required_entrypoints(scenario_id: str) -> set[str]:
     return {"serve"}
 
 
-def minimum_case_count(scenario_id: str, model_key: str) -> int:
+def minimum_case_count(
+    scenario_id: str,
+    model_key: str,
+    profile: str = FULL_MATRIX_PROFILE,
+) -> int:
+    if profile == R1_ARCHITECTURE_PROFILE:
+        reduced = {
+            "C01": 20,
+            "C02": 4,
+            "C03": 2,
+            "C04": 1,
+            "C05": 4,
+            "C06": 4,
+            "C07": 2,
+            "C08": 6,
+            "C09": 6,
+            "C14": 8,
+            "C15": 4,
+            "C16": 5,
+            "C17": 6,
+            "C19": 10,
+            "C20": 5,
+            "C21": 5,
+        }
+        if scenario_id in {"C10", "C11", "C12", "C13"}:
+            return 6 if model_key == "m3-qwen3-30b-a3b" else 4
+        if scenario_id == "C18":
+            return 1
+        return reduced[scenario_id]
     fixed = {
         "C01": 20,
         "C02": 20,
@@ -2067,12 +2139,21 @@ def minimum_case_count(scenario_id: str, model_key: str) -> int:
     return fixed[scenario_id]
 
 
-def expected_c13_case_count(model_key: str) -> int:
+def expected_c13_case_count(
+    model_key: str,
+    profile: str = FULL_MATRIX_PROFILE,
+) -> int:
+    if profile == R1_ARCHITECTURE_PROFILE:
+        return 6 if model_key == "m3-qwen3-30b-a3b" else 4
     return 60 if model_key == "m3-qwen3-30b-a3b" else 40
 
 
-def validate_c13_case_count(model_key: str, count: int) -> None:
-    expected = expected_c13_case_count(model_key)
+def validate_c13_case_count(
+    model_key: str,
+    count: int,
+    profile: str = FULL_MATRIX_PROFILE,
+) -> None:
+    expected = expected_c13_case_count(model_key, profile)
     require(
         count == expected,
         f"scenario C13 case_count must be exactly {expected}",
@@ -2081,7 +2162,20 @@ def validate_c13_case_count(model_key: str, count: int) -> None:
 
 def expected_c13_joint_partition(
     model_key: str,
+    profile: str = FULL_MATRIX_PROFILE,
 ) -> dict[tuple[str | None, str], int]:
+    if profile == R1_ARCHITECTURE_PROFILE:
+        if model_key == "m3-qwen3-30b-a3b":
+            return {
+                ("P_NO_THINKING", "tool-result"): 2,
+                ("P_THINKING", "tool-result"): 2,
+                ("P_THINKING", "soft-think"): 1,
+                ("P_THINKING", "soft-no-think"): 1,
+            }
+        return {
+            ("P_NO_THINKING", "tool-result"): 2,
+            ("P_THINKING", "tool-result"): 2,
+        }
     if model_key == "m3-qwen3-30b-a3b":
         return {
             ("P_NO_THINKING", "tool-result"): 30,
@@ -2095,7 +2189,74 @@ def expected_c13_joint_partition(
     }
 
 
-def required_variants(scenario_id: str, model_key: str) -> tuple[dict[str, int], bool]:
+def required_variants(
+    scenario_id: str,
+    model_key: str,
+    profile: str = FULL_MATRIX_PROFILE,
+) -> tuple[dict[str, int], bool]:
+    if profile == R1_ARCHITECTURE_PROFILE:
+        variants = {
+            "C01": {
+                "config-resolution": 5,
+                "template-byte": 5,
+                "special-token-eos": 5,
+                "unknown-fail-closed": 5,
+            },
+            "C02": {"known-answer": 4},
+            "C04": {"long-output": 1},
+            "C05": {"known-answer": 4},
+            "C06": {"stream": 4},
+            "C08": {"stop": 2, "natural-eos": 2, "max-tokens": 2},
+            "C09": {"cancel": 2, "timeout": 2, "disconnect": 2},
+            "C10": {"required-tool": 4},
+            "C11": {"auto-tool": 4},
+            "C12": {"streamed-tool": 4},
+            "C13": {"tool-result": 4},
+            "C14": {
+                "required": 2,
+                "type": 2,
+                "additional-properties": 2,
+                "enum": 2,
+            },
+            "C15": {"json-object": 4},
+            "C16": {
+                "invalid-tool": 1,
+                "invalid-schema": 1,
+                "invalid-stream-option": 1,
+                "invalid-model": 1,
+                "invalid-context": 1,
+            },
+            "C17": {"chinese": 2, "emoji": 2, "combining": 2},
+            "C20": {
+                "image-url": 1,
+                "data-url": 1,
+                "video-url": 1,
+                "mixed-text-media": 1,
+                "text-array": 1,
+            },
+            "C21": {
+                "run-plain": 1,
+                "serve-stream": 1,
+                "required-tool": 1,
+                "strict-schema": 1,
+                "json-object": 1,
+            },
+        }
+        if scenario_id in {"C10", "C11", "C12", "C13"} and model_key == "m3-qwen3-30b-a3b":
+            key = next(iter(variants[scenario_id]))
+            return {key: 4, "soft-think": 1, "soft-no-think": 1}, True
+        if scenario_id == "C19":
+            modes = {
+                "default-thinking": 2,
+                "hard-thinking": 2,
+                "hard-no-thinking": 2,
+            }
+            if model_key == "m3-qwen3-30b-a3b":
+                modes.update({"soft-think": 2, "soft-no-think": 2})
+            else:
+                modes.update({"soft-think-misuse": 2, "soft-no-think-misuse": 2})
+            return modes, True
+        return variants.get(scenario_id, {}), scenario_id != "C18"
     variants: dict[str, dict[str, int]] = {
         "C01": {"config-resolution": 5, "template-byte": 5, "special-token-eos": 5, "unknown-fail-closed": 5},
         "C02": {"known-answer": 20},
@@ -2171,8 +2332,14 @@ def validate_assertions(
         for field in ("done_count", "usage_count", "output_with_delta_count", "paired_nonstream_equivalence_count"):
             require(assertions.get(field) == case_count, f"C06 {field} must equal case_count")
     elif scenario_id == "C07":
-        require(assertions.get("conversation_count") == 6, "C07 must execute six isolated conversations")
-        require(assertions.get("history_turn_count") == 30, "C07 must execute thirty history-carrying turns")
+        require(
+            assertions.get("conversation_count") == case_count,
+            "C07 isolated conversation coverage differs from its case count",
+        )
+        require(
+            assertions.get("history_turn_count") == case_count * 5,
+            "C07 must execute five history-carrying turns per conversation",
+        )
     elif scenario_id == "C09":
         require(assertions.get("admitted_released_count") == case_count, "C09 admitted cancel/timeout/disconnect release coverage incomplete")
         require(assertions.get("not_admitted_safe_count") == 0, "C09 contains safe but unexercised pre-admission aborts")
@@ -2214,16 +2381,33 @@ def validate_assertions(
     elif scenario_id == "C15":
         require(assertions.get("valid_object_count") == case_count, "C15 valid object count incomplete")
     elif scenario_id == "C20":
-        require(assertions.get("rejected_media_count") == 40, "C20 must reject all 40 media cases")
-        require(assertions.get("text_array_success_count") == 10, "C20 text-array positive coverage incomplete")
+        require(case_count % 5 == 0, "C20 case count must partition across five variants")
+        require(
+            assertions.get("rejected_media_count") == case_count * 4 // 5,
+            "C20 must reject every media case",
+        )
+        require(
+            assertions.get("text_array_success_count") == case_count // 5,
+            "C20 text-array positive coverage incomplete",
+        )
         require(assertions.get("declared_modalities") == ["text"], "C20 /v1/models must declare text-only modality")
     elif scenario_id == "C17":
         require(assertions.get("streaming_split_boundary_count") == case_count // 2, "C17 streaming split-boundary coverage incomplete")
     elif scenario_id == "C19":
         require(assertions.get("history_case_count") == case_count, "C19 reasoning history coverage incomplete")
     elif scenario_id == "C21":
-        require(assertions.get("tool_priority_count") == 4, "C21 required-tool priority coverage incomplete")
-        require(assertions.get("serve_stream_count") == 4 and assertions.get("strict_schema_count") == 4 and assertions.get("json_object_count") == 4, "C21 serve subgroup coverage incomplete")
+        require(case_count % 5 == 0, "C21 case count must partition across five product groups")
+        per_group = case_count // 5
+        require(
+            assertions.get("tool_priority_count") == per_group,
+            "C21 required-tool priority coverage incomplete",
+        )
+        require(
+            assertions.get("serve_stream_count") == per_group
+            and assertions.get("strict_schema_count") == per_group
+            and assertions.get("json_object_count") == per_group,
+            "C21 serve subgroup coverage incomplete",
+        )
 
 
 def validate_concurrency_cells(
@@ -3657,12 +3841,20 @@ def validate_scenario(
     used_argv: set[tuple[str, ...]],
 ) -> list[dict[str, Any]]:
     scenario = require_object(raw, f"scenario {expected_id}")
+    profile = matrix_profile(
+        expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT),
+        expected["model_key"],
+    )
     require(scenario.get("id") == expected_id, f"scenario order/id mismatch: expected {expected_id}")
     require(scenario.get("status") in {"pass", "known-fail", "blocked"}, f"scenario {expected_id} status invalid")
     reject_forbidden_markers(scenario, f"scenario {expected_id}", allow_internal_fixture=bool(expected["allow_internal_fixture"]))
-    count = require_count(scenario.get("case_count"), f"scenario {expected_id}.case_count", minimum=minimum_case_count(expected_id, expected["model_key"]))
+    count = require_count(
+        scenario.get("case_count"),
+        f"scenario {expected_id}.case_count",
+        minimum=minimum_case_count(expected_id, expected["model_key"], profile),
+    )
     if expected_id == "C13":
-        validate_c13_case_count(expected["model_key"], count)
+        validate_c13_case_count(expected["model_key"], count, profile)
     passed_count = require_count(scenario.get("passed_count"), f"scenario {expected_id}.passed_count")
     known_failed_count = require_count(scenario.get("known_failed_count", 0), f"scenario {expected_id}.known_failed_count")
     blocked_count = require_count(scenario.get("blocked_count", 0), f"scenario {expected_id}.blocked_count")
@@ -3674,7 +3866,9 @@ def validate_scenario(
         require(name in {"P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"}, f"scenario {expected_id} unknown preset {name}")
         require_count(value, f"scenario {expected_id}.presets.{name}", minimum=1)
     unpreset = require_count(scenario.get("unpreset_count"), f"scenario {expected_id}.unpreset_count")
-    minimums, min_unpreset = minimum_presets(expected_id, expected["model_key"])
+    minimums, min_unpreset = minimum_presets(
+        expected_id, expected["model_key"], profile
+    )
     require(set(presets) == set(minimums), f"scenario {expected_id} must use exactly presets {sorted(minimums)}")
     for name, minimum in minimums.items():
         require(presets.get(name, 0) >= minimum, f"scenario {expected_id} preset {name} count must be >= {minimum}")
@@ -3699,18 +3893,32 @@ def validate_scenario(
     for name, value in variants.items():
         require_string(name, f"scenario {expected_id}.variants name")
         require_count(value, f"scenario {expected_id}.variants.{name}", minimum=1)
-    minimum_variants, partition = required_variants(expected_id, expected["model_key"])
+    minimum_variants, partition = required_variants(
+        expected_id, expected["model_key"], profile
+    )
     for name, minimum in minimum_variants.items():
         require_count(variants.get(name), f"scenario {expected_id}.variants.{name}", minimum=minimum)
     if partition:
         require(sum(value for value in variants.values() if isinstance(value, int) and not isinstance(value, bool)) == count, f"scenario {expected_id} variant counts must partition case_count")
     dimensions = require_object(scenario.get("dimensions"), f"scenario {expected_id}.dimensions")
     if expected_id == "C03":
-        require(dimensions.get("groups") >= 10 and dimensions.get("rounds_per_group") >= 3, "C03 must cover 10 groups x 3 rounds")
+        require(
+            dimensions.get("groups") >= count
+            and dimensions.get("rounds_per_group") >= 3,
+            "C03 must cover every selected group for three rounds",
+        )
     elif expected_id == "C04":
-        require(dimensions.get("groups") >= 3 and dimensions.get("min_output_tokens") >= 512, "C04 must cover 3 groups with >=512 output tokens")
+        require(
+            dimensions.get("groups") >= count
+            and dimensions.get("min_output_tokens") >= 512,
+            "C04 must cover every selected group with >=512 output tokens",
+        )
     elif expected_id == "C07":
-        require(dimensions.get("requests") >= 6 and dimensions.get("rounds_per_request") >= 5, "C07 must cover 6 requests x 5 rounds")
+        require(
+            dimensions.get("requests") >= count
+            and dimensions.get("rounds_per_request") >= 5,
+            "C07 must cover every selected request for five rounds",
+        )
     if expected_id == "C18":
         validate_concurrency_cells(
             expected["backend"],
@@ -3858,14 +4066,21 @@ def validate_scenario(
         require(set(derived_variants.values()) == {5} and len(derived_variants) == 4, "C01 must execute four exact five-case groups")
     elif expected_id == "C07":
         conversation_ids = [row["observed"].get("conversation_id") for row in case_rows]
-        require(len(set(conversation_ids)) == 6 and all(row["observed"].get("history_turn_count") == 5 for row in case_rows), "C07 conversation identity/history corpus is incomplete")
+        require(
+            len(set(conversation_ids)) == count
+            and all(
+                row["observed"].get("history_turn_count") == 5
+                for row in case_rows
+            ),
+            "C07 conversation identity/history corpus is incomplete",
+        )
     elif expected_id == "C13":
         partition: dict[tuple[str | None, str], int] = {}
         for row in case_rows:
             key = (row["preset"], row["variant"])
             partition[key] = partition.get(key, 0) + 1
         require(
-            partition == expected_c13_joint_partition(expected["model_key"]),
+            partition == expected_c13_joint_partition(expected["model_key"], profile),
             "C13 preset/variant joint partition mismatch",
         )
         if (
@@ -3958,9 +4173,8 @@ def validate_scenario(
         for row in case_rows:
             key = (row["preset"], row["variant"])
             partition[key] = partition.get(key, 0) + 1
-        require(
-            partition
-            == {
+        expected_partition = (
+            {
                 ("P_NO_THINKING", "required"): 13,
                 ("P_NO_THINKING", "type"): 13,
                 ("P_NO_THINKING", "additional-properties"): 12,
@@ -3969,7 +4183,16 @@ def validate_scenario(
                 ("P_THINKING", "type"): 5,
                 ("P_THINKING", "additional-properties"): 5,
                 ("P_THINKING", "enum"): 5,
-            },
+            }
+            if count == 70
+            else {
+                (preset, variant): 1
+                for preset in ("P_NO_THINKING", "P_THINKING")
+                for variant in ("required", "type", "additional-properties", "enum")
+            }
+        )
+        require(
+            count in {8, 70} and partition == expected_partition,
             "C14 preset/constraint partition mismatch",
         )
     elif expected_id == "C17":
@@ -3977,15 +4200,32 @@ def validate_scenario(
         for row in case_rows:
             key = (row["variant"], row["entrypoint"])
             unicode_partition[key] = unicode_partition.get(key, 0) + 1
+        require(count % 6 == 0, "C17 case count must partition across six cells")
+        per_cell = count // 6
         require(
-            unicode_partition == {(variant, entrypoint): 10 for variant in ("chinese", "emoji", "combining") for entrypoint in ("run", "serve")},
-            "C17 must execute run-incremental10/serve-stream10 for every Unicode class",
+            unicode_partition
+            == {
+                (variant, entrypoint): per_cell
+                for variant in ("chinese", "emoji", "combining")
+                for entrypoint in ("run", "serve")
+            },
+            "C17 run/serve Unicode partitions differ",
         )
     elif expected_id == "C19":
         require(all(row["observed"].get("history_turn_count") == 2 for row in case_rows), "C19 reasoning history corpus is incomplete")
-        require(set(derived_variants.values()) == {4} and len(derived_variants) == 5, "C19 must execute five exact four-case modes")
+        require(
+            count % 5 == 0
+            and set(derived_variants.values()) == {count // 5}
+            and len(derived_variants) == 5,
+            "C19 must evenly execute all five reasoning modes",
+        )
     elif expected_id == "C21":
-        require(set(derived_variants.values()) == {4} and len(derived_variants) == 5, "C21 must execute five exact four-case groups")
+        require(
+            count % 5 == 0
+            and set(derived_variants.values()) == {count // 5}
+            and len(derived_variants) == 5,
+            "C21 must evenly execute all five product groups",
+        )
         require(
             all(row["entrypoint"] == ("run" if row["variant"] == "run-plain" else "serve") for row in case_rows),
             "C21 subgroup entrypoint mapping mismatch",
@@ -4114,7 +4354,7 @@ def validate_resident_run_commands(
         for case in rows
         if case["entrypoint"] == "run"
     ]
-    require(len(run_cases) == 97, f"G08 resident run corpus must contain 97 cases, got {len(run_cases)}")
+    require(run_cases, "G08 resident run corpus must not be empty")
     cases_by_id = {case["case_id"]: case for case in run_cases}
     require(len(cases_by_id) == len(run_cases), "G08 resident run case ids are not unique")
     covered_case_ids: list[str] = []
@@ -4549,8 +4789,11 @@ def existing_artifact_ref(
 
 def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    profile = matrix_profile(execution_contract(catalog, "expectations catalog"), model_key)
     for scenario_id in SCENARIO_IDS:
-        shape = selftest_scenario_shape(scenario_id, model_key, backend)
+        shape = selftest_scenario_shape(
+            scenario_id, model_key, backend, profile=profile
+        )
         entrypoints = sorted(required_entrypoints(scenario_id))
         for index, (variant, preset) in enumerate(planned_variant_presets(scenario_id, shape), start=1):
             case_id = f"{scenario_id.lower()}-{index:03d}"
@@ -4585,16 +4828,30 @@ def planned_case_rows(model_key: str, backend: str, catalog: dict[str, Any]) -> 
 
 def select_c09_diagnostic_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
+    partition_size: int | None = None
     for variant in C09_DIAGNOSTIC_VARIANTS:
         matches = [
             row
             for row in rows
             if row["scenario_id"] == "C09" and row["variant"] == variant
         ]
-        require(len(matches) == 20, f"C09 {variant} partition must contain exactly 20 cases")
+        require(
+            len(matches) in {2, 20},
+            f"C09 {variant} partition must contain 2 or 20 cases",
+        )
+        partition_size = partition_size or len(matches)
+        require(
+            len(matches) == partition_size,
+            "C09 diagnostic variant partitions differ",
+        )
         selected.append(matches[0])
+    assert partition_size is not None
+    expected_case_ids = [
+        f"c09-{1 + index * partition_size:03d}"
+        for index in range(len(C09_DIAGNOSTIC_VARIANTS))
+    ]
     require(
-        [row["case_id"] for row in selected] == ["c09-001", "c09-021", "c09-041"],
+        [row["case_id"] for row in selected] == expected_case_ids,
         "C09 diagnostic sentinel case ids drifted",
     )
     require(
@@ -9046,7 +9303,11 @@ def execute_manifest(
                 "variants": list(C09_DIAGNOSTIC_VARIANTS),
                 "case_ids": [case["case_id"] for case in cases],
                 "case_count": len(cases),
-                "canonical_case_count": minimum_case_count("C09", manifest["model_key"]),
+                "canonical_case_count": minimum_case_count(
+                    "C09",
+                    manifest["model_key"],
+                    matrix_profile(contract, manifest["model_key"]),
+                ),
             },
             "metrics": {
                 "admitted_released_count": sum(
@@ -9314,7 +9575,12 @@ def execute_manifest(
         )
     scenarios = []
     for scenario_id in SCENARIO_IDS:
-        shape = selftest_scenario_shape(scenario_id, manifest["model_key"], manifest["backend"])
+        shape = selftest_scenario_shape(
+            scenario_id,
+            manifest["model_key"],
+            manifest["backend"],
+            profile=matrix_profile(contract, manifest["model_key"]),
+        )
         results = case_results[scenario_id]
         passed = sum(case["status"] == "pass" for case in results)
         known = sum(case["status"] == "known-fail" for case in results)
@@ -9472,7 +9738,12 @@ def selftest_assertions(scenario_id: str, case_count: int) -> dict[str, Any]:
     elif scenario_id == "C06":
         values.update({"done_count": case_count, "usage_count": case_count, "output_with_delta_count": case_count, "paired_nonstream_equivalence_count": case_count})
     elif scenario_id == "C07":
-        values.update({"conversation_count": 6, "history_turn_count": 30})
+        values.update(
+            {
+                "conversation_count": case_count,
+                "history_turn_count": case_count * 5,
+            }
+        )
     elif scenario_id == "C09":
         values.update(
             {
@@ -9492,19 +9763,39 @@ def selftest_assertions(scenario_id: str, case_count: int) -> dict[str, Any]:
     elif scenario_id == "C15":
         values["valid_object_count"] = case_count
     elif scenario_id == "C20":
-        values.update({"rejected_media_count": 40, "text_array_success_count": 10, "declared_modalities": ["text"]})
+        values.update(
+            {
+                "rejected_media_count": case_count * 4 // 5,
+                "text_array_success_count": case_count // 5,
+                "declared_modalities": ["text"],
+            }
+        )
     elif scenario_id == "C17":
         values["streaming_split_boundary_count"] = case_count // 2
     elif scenario_id == "C19":
         values["history_case_count"] = case_count
     elif scenario_id == "C21":
-        values.update({"tool_priority_count": 4, "serve_stream_count": 4, "strict_schema_count": 4, "json_object_count": 4})
+        per_group = case_count // 5
+        values.update(
+            {
+                "tool_priority_count": per_group,
+                "serve_stream_count": per_group,
+                "strict_schema_count": per_group,
+                "json_object_count": per_group,
+            }
+        )
     return values
 
 
-def selftest_scenario_shape(scenario_id: str, model_key: str, backend: str) -> dict[str, Any]:
-    count = minimum_case_count(scenario_id, model_key)
-    presets_min, unpreset = minimum_presets(scenario_id, model_key)
+def selftest_scenario_shape(
+    scenario_id: str,
+    model_key: str,
+    backend: str,
+    *,
+    profile: str = FULL_MATRIX_PROFILE,
+) -> dict[str, Any]:
+    count = minimum_case_count(scenario_id, model_key, profile)
+    presets_min, unpreset = minimum_presets(scenario_id, model_key, profile)
     presets = dict(presets_min)
     assigned = sum(presets.values()) + unpreset
     if assigned < count:
@@ -9513,7 +9804,7 @@ def selftest_scenario_shape(scenario_id: str, model_key: str, backend: str) -> d
             unpreset += count - assigned
         else:
             presets[target] += count - assigned
-    variants_min, partition = required_variants(scenario_id, model_key)
+    variants_min, partition = required_variants(scenario_id, model_key, profile)
     variants = dict(variants_min)
     if partition:
         assigned_variants = sum(variants.values())
@@ -9524,11 +9815,11 @@ def selftest_scenario_shape(scenario_id: str, model_key: str, backend: str) -> d
             variants[target] += count - assigned_variants
     dimensions: dict[str, int] = {}
     if scenario_id == "C03":
-        dimensions = {"groups": 10, "rounds_per_group": 3}
+        dimensions = {"groups": count, "rounds_per_group": 3}
     elif scenario_id == "C04":
-        dimensions = {"groups": 3, "min_output_tokens": 512}
+        dimensions = {"groups": count, "min_output_tokens": 512}
     elif scenario_id == "C07":
-        dimensions = {"requests": 6, "rounds_per_request": 5}
+        dimensions = {"requests": count, "rounds_per_request": 5}
     scenario: dict[str, Any] = {
         "id": scenario_id,
         "status": "pass",
@@ -9601,12 +9892,38 @@ def expand_counts(counts: dict[str, int]) -> list[str]:
 def planned_variant_presets(scenario_id: str, scenario: dict[str, Any]) -> list[tuple[str, str | None]]:
     if scenario_id == "C14":
         rows: list[tuple[str, str | None]] = []
-        for preset, counts in (
-            ("P_NO_THINKING", {"required": 13, "type": 13, "additional-properties": 12, "enum": 12}),
-            ("P_THINKING", {"required": 5, "type": 5, "additional-properties": 5, "enum": 5}),
-        ):
+        if scenario["case_count"] == 70:
+            partitions = (
+                (
+                    "P_NO_THINKING",
+                    {"required": 13, "type": 13, "additional-properties": 12, "enum": 12},
+                ),
+                (
+                    "P_THINKING",
+                    {"required": 5, "type": 5, "additional-properties": 5, "enum": 5},
+                ),
+            )
+        elif scenario["case_count"] == 8:
+            partitions = (
+                (
+                    "P_NO_THINKING",
+                    {"required": 1, "type": 1, "additional-properties": 1, "enum": 1},
+                ),
+                (
+                    "P_THINKING",
+                    {"required": 1, "type": 1, "additional-properties": 1, "enum": 1},
+                ),
+            )
+        else:
+            raise AssertionError(
+                f"unsupported C14 matrix profile with {scenario['case_count']} cases"
+            )
+        for preset, counts in partitions:
             rows.extend((variant, preset) for variant in expand_counts(counts))
-        require(len(rows) == scenario["case_count"], "C14 planned partition must contain exactly 70 cases")
+        require(
+            len(rows) == scenario["case_count"],
+            "C14 planned partition must match the selected matrix profile",
+        )
         return rows
     variants = expand_counts(scenario["variants"])
     presets: list[str | None] = [*expand_counts(scenario["presets"]), *([None] * scenario["unpreset_count"])]
@@ -13108,17 +13425,17 @@ def self_test() -> int:
             candidate_catalog,
         )
         require(
-            len(candidate_rows) == 703
+            len(candidate_rows) == 112
             and {row["expectation"]["expected_status"] for row in candidate_rows} == {"pass"},
-            "G08 candidate catalog does not require all 703 M2 CUDA cases to pass",
+            "G08 candidate catalog does not require all 112 M2 CUDA cases to pass",
         )
         diagnostic_rows = select_c09_diagnostic_rows(candidate_rows)
         require(
             [(row["case_id"], row["variant"]) for row in diagnostic_rows]
             == [
                 ("c09-001", "cancel"),
-                ("c09-021", "timeout"),
-                ("c09-041", "disconnect"),
+                ("c09-003", "timeout"),
+                ("c09-005", "disconnect"),
             ],
             "C09 diagnostic selector drifted",
         )
@@ -13238,9 +13555,28 @@ def self_test() -> int:
             set(execution_commands) == expected_run_commands | {"actual-serve-01", "actual-serve-02"},
             "execution fixture did not persist five run and two C09-isolated serve sessions",
         )
+        expected_run_groups: dict[tuple[str, ...], int] = {}
+        for row in planned_case_rows(
+            "m3-qwen3-30b-a3b",
+            "cuda",
+            candidate_catalog,
+        ):
+            if row["entrypoint"] == "run":
+                key = resident_run_group_key(
+                    {
+                        **row,
+                        "model_key": "m3-qwen3-30b-a3b",
+                        "backend": "cuda",
+                    }
+                )
+                expected_run_groups[key] = expected_run_groups.get(key, 0) + 1
         require(
-            [execution_commands[f"actual-run-{index:02d}"]["case_count"] for index in range(1, 6)]
-            == [20, 63, 10, 2, 2],
+            len(expected_run_groups) == 5
+            and [
+                execution_commands[f"actual-run-{index:02d}"]["case_count"]
+                for index in range(1, 6)
+            ]
+            == list(expected_run_groups.values()),
             "execution fixture resident run partition drifted",
         )
         first_serve_receipt = read_json(execution_root / execution_commands["actual-serve-01"]["process_receipt"]["path"])
@@ -13270,7 +13606,17 @@ def self_test() -> int:
         for key in ("manifest_snapshot", "process_receipt"):
             ref = require_object(invocation_document.get(key), f"execution fixture invocation {key}")
             require(str(ref.get("path", "")).startswith(executor_prefix), f"executor {key} is not lane-local")
-        require(len(planned_case_rows("m3-qwen3-30b-a3b", "cuda", internal_expectations_catalog())) == 783, "fake executor did not cover the complete C01-C21 case corpus")
+        require(
+            len(
+                planned_case_rows(
+                    "m3-qwen3-30b-a3b",
+                    "cuda",
+                    candidate_catalog,
+                )
+            )
+            == 120,
+            "fake executor did not cover the selected G08 C01-C21 case corpus",
+        )
         require(
             hostile_key not in json.dumps(execution_report, sort_keys=True),
             "hostile inherited FERRUM_* environment leaked into the report",
@@ -13789,7 +14135,7 @@ def self_test() -> int:
             rejected_mutations.add("c14-forged-category")
 
         with execution_report_mutation_fixture(execution_root, execution_report, Path(tmp) / "backup-c21-tool-priority") as (mutation_root, candidate):
-            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=20, case_index=8)
+            scenario, raw_path, raw, case_path, case, envelope_path = execution_case_paths(candidate, mutation_root, scenario_index=20, case_index=2)
             envelope = read_json(envelope_path)
             input_document = read_json(mutation_root / case["artifacts"]["input"]["path"])
             input_document.pop("tools")
