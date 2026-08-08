@@ -1073,13 +1073,58 @@ impl ContinuousBatchScheduler {
 
     /// Snapshot queue lengths and counters for explicit scheduler trace artifacts.
     pub fn trace_snapshot(&self) -> ContinuousSchedulerTraceSnapshot {
+        self.trace_snapshot_with_prefill_read_observer(|| {})
+    }
+
+    fn trace_snapshot_with_prefill_read_observer(
+        &self,
+        prefill_read_observer: impl FnOnce(),
+    ) -> ContinuousSchedulerTraceSnapshot {
         let waiting_queue_len = self.waiting_queue.read().len();
-        let prefill_queue_len = self.prefill_queue.read().len();
-        let (decode_queue_len, decode_selection_cursor) = {
+        // Keep exactly one fair read guard per queue. Reacquiring one of these
+        // locks while its first guard is alive can self-deadlock when a writer
+        // queues between the two reads: parking_lot then blocks the recursive
+        // read behind the writer, while the writer waits for the first guard.
+        let (
+            prefill_queue_len,
+            execution_capacity_blocked_prefill_len,
+            execution_readiness_blocked_prefill_len,
+        ) = {
+            let prefill_queue = self.prefill_queue.read();
+            let counts = (
+                prefill_queue.len(),
+                prefill_queue
+                    .iter()
+                    .filter(|request| request.execution_capacity_deferral.is_some())
+                    .count(),
+                prefill_queue
+                    .iter()
+                    .filter(|request| request.execution_readiness_block.is_some())
+                    .count(),
+            );
+            prefill_read_observer();
+            counts
+        };
+        let (
+            decode_queue_len,
+            decode_selection_cursor,
+            execution_capacity_blocked_decode_len,
+            execution_readiness_blocked_decode_len,
+        ) = {
             let decode_queue = self.decode_queue.read();
             (
                 decode_queue.requests.len(),
                 decode_queue.selection_cursor.clone(),
+                decode_queue
+                    .requests
+                    .values()
+                    .filter(|request| request.execution_capacity_deferral.is_some())
+                    .count(),
+                decode_queue
+                    .requests
+                    .values()
+                    .filter(|request| request.execution_readiness_block.is_some())
+                    .count(),
             )
         };
         let preempted_queue_len = self.preempted_requests.read().len();
@@ -1102,35 +1147,13 @@ impl ContinuousBatchScheduler {
             capacity_backpressure_admit_limit: self.capacity_backpressure_admit_limit(),
             decode_capacity_backpressure_admit_limit: self.decode_capacity_backpressure_limit(),
             capacity_blocked_waiting_len: self.capacity_blocked_waiting_len(),
-            execution_capacity_blocked_prefill_len: self
-                .prefill_queue
-                .read()
-                .iter()
-                .filter(|request| request.execution_capacity_deferral.is_some())
-                .count(),
-            execution_capacity_blocked_decode_len: self
-                .decode_queue
-                .read()
-                .requests
-                .values()
-                .filter(|request| request.execution_capacity_deferral.is_some())
-                .count(),
+            execution_capacity_blocked_prefill_len,
+            execution_capacity_blocked_decode_len,
             execution_readiness_deferred_total: self
                 .execution_readiness_deferred_counter
                 .load(Ordering::Relaxed),
-            execution_readiness_blocked_prefill_len: self
-                .prefill_queue
-                .read()
-                .iter()
-                .filter(|request| request.execution_readiness_block.is_some())
-                .count(),
-            execution_readiness_blocked_decode_len: self
-                .decode_queue
-                .read()
-                .requests
-                .values()
-                .filter(|request| request.execution_readiness_block.is_some())
-                .count(),
+            execution_readiness_blocked_prefill_len,
+            execution_readiness_blocked_decode_len,
             capacity_release_epoch: self.capacity_release_epoch.load(Ordering::Relaxed),
             capacity_mixed_recompute_epoch: self
                 .capacity_mixed_recompute_epoch
@@ -4377,6 +4400,50 @@ mod tests {
             scheduler.trace_phase(&request_id),
             Some(RequestPhase::Prefilling)
         );
+    }
+
+    #[test]
+    fn trace_snapshot_releases_prefill_read_before_later_snapshot_work() {
+        use std::sync::{mpsc::sync_channel, Arc, Barrier};
+        use std::time::Duration;
+
+        const WRITER_WAIT: Duration = Duration::from_millis(250);
+
+        let scheduler = Arc::new(ContinuousBatchScheduler::new(SchedulerConfig::default()));
+        let writer_scheduler = Arc::clone(&scheduler);
+        let writer_start = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&writer_start);
+        let (attempting_tx, attempting_rx) = sync_channel(1);
+        let (acquired_tx, acquired_rx) = sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            writer_barrier.wait();
+            attempting_tx.send(()).unwrap();
+            let acquired = writer_scheduler
+                .prefill_queue
+                .try_write_for(WRITER_WAIT)
+                .is_some();
+            acquired_tx.send(acquired).unwrap();
+        });
+
+        let snapshot = scheduler.trace_snapshot_with_prefill_read_observer(|| {
+            writer_start.wait();
+            attempting_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("bounded writer must begin its fair-lock attempt");
+            std::thread::sleep(Duration::from_millis(20));
+        });
+        let writer_acquired = acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded writer must finish its fair-lock attempt");
+        writer.join().expect("bounded snapshot writer must join");
+
+        assert!(
+            writer_acquired,
+            "trace snapshot must release its first prefill read before later snapshot work"
+        );
+        assert_eq!(snapshot.prefill_queue_len, 0);
+        assert_eq!(snapshot.execution_capacity_blocked_prefill_len, 0);
+        assert_eq!(snapshot.execution_readiness_blocked_prefill_len, 0);
     }
 
     #[tokio::test]
