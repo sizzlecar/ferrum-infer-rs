@@ -2548,6 +2548,16 @@ def response_message(response: dict[str, Any], label: str) -> tuple[dict[str, An
     return message, content or ""
 
 
+def json_string_value_contains(raw: Any, marker: str) -> bool:
+    if isinstance(raw, str):
+        return marker in raw
+    if isinstance(raw, list):
+        return any(json_string_value_contains(item, marker) for item in raw)
+    if isinstance(raw, dict):
+        return any(json_string_value_contains(value, marker) for value in raw.values())
+    return False
+
+
 def validate_completion_usage(raw: Any, label: str) -> dict[str, Any]:
     usage = require_object(raw, label)
     prompt_tokens = require_count(
@@ -3204,6 +3214,15 @@ def validate_case_output(
                 prompt = require_string(require_object(require_list(request.get("messages"), f"{label}.messages")[0], f"{label}.message").get("content"), f"{label}.prompt")
                 require(observed.get("strict_schema_sha256") == canonical_json_sha256(schema), f"{label} strict schema digest mismatch")
                 require(observed.get("strict_prompt_sha256") == hashlib.sha256(prompt.encode("utf-8")).hexdigest(), f"{label} strict prompt digest mismatch")
+            else:
+                expected_marker = require_string(
+                    observed.get("expected_marker"),
+                    f"{label}.observed.expected_marker",
+                )
+                require(
+                    json_string_value_contains(parsed, expected_marker),
+                    f"{label} structured output lost its expected marker",
+                )
         elif scenario_id == "C19":
             require(len(exchanges) == 2, f"{label} thinking case must execute two history-carrying turns")
             first_response = require_object(exchanges[0].get("response"), f"{label}.first.response")
@@ -12073,6 +12092,178 @@ def self_test_stream_pair_contracts() -> None:
     ) as tmp:
         stdout_path = Path(tmp) / "stdout.log"
         stdout_path.write_text("{}\n", encoding="utf-8")
+        c15_marker = "G00-c15-003-OK"
+        c15 = {
+            "case_id": "c15-003",
+            "exchanges": [
+                {
+                    "request": {
+                        "model": "m2-qwen35-35b-a3b",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": f"Return a JSON object containing marker {c15_marker}.",
+                            }
+                        ],
+                        "response_format": {"type": "json_object"},
+                    },
+                    "status": 200,
+                    "response": {
+                        "id": "chatcmpl-c15-003",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": json.dumps(
+                                        {"result": c15_marker},
+                                        separators=(",", ":"),
+                                    ),
+                                    "reasoning": "reasoning that discusses the formatting constraint",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 12,
+                            "completion_tokens": 8,
+                            "total_tokens": 20,
+                        },
+                    },
+                }
+            ],
+        }
+        validate_case_output(
+            "C15",
+            "json-object",
+            "serve",
+            stdout_path,
+            c15,
+            {"case_id": "c15-003", "expected_marker": c15_marker},
+            "C15 thinking structured-output fixture",
+        )
+        c15_empty_object = copy.deepcopy(c15)
+        c15_empty_object["exchanges"][0]["response"]["choices"][0]["message"][
+            "content"
+        ] = "{}"
+        c15_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C15",
+                "json-object",
+                "serve",
+                stdout_path,
+                c15_empty_object,
+                {"case_id": "c15-003", "expected_marker": c15_marker},
+                "C15 empty-object fixture",
+            )
+        )
+        require(
+            isinstance(c15_failure, ScenarioError)
+            and "lost its expected marker" in str(c15_failure),
+            "C15 accepted a valid JSON object that dropped the requested marker",
+        )
+        c15_marker_key_only = copy.deepcopy(c15)
+        c15_marker_key_only["exchanges"][0]["response"]["choices"][0]["message"][
+            "content"
+        ] = json.dumps({c15_marker: "unrelated"}, separators=(",", ":"))
+        c15_key_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C15",
+                "json-object",
+                "serve",
+                stdout_path,
+                c15_marker_key_only,
+                {"case_id": "c15-003", "expected_marker": c15_marker},
+                "C15 marker-key-only fixture",
+            )
+        )
+        require(
+            isinstance(c15_key_failure, ScenarioError)
+            and "lost its expected marker" in str(c15_key_failure),
+            "C15 accepted a marker that appeared only as a JSON key",
+        )
+
+        c21_case = {
+            "case_id": "c21-005",
+            "scenario_id": "C21",
+            "ordinal": 5,
+            "variant": "json-object",
+            "preset": "P_OFFICIAL_DEFAULT",
+        }
+        c21_marker = expected_case_text(c21_case)
+        c21_request = case_http_payload(
+            c21_case,
+            "m2-qwen35-35b-a3b",
+            execution_contract_name=G08_EXECUTION_CONTRACT,
+        )
+        require(
+            c21_request.get("seed") == 9271
+            and "max_tokens" not in c21_request
+            and c21_request.get("response_format") == {"type": "json_object"},
+            "canonical c21-005 request drifted from the official-default blocker",
+        )
+        c21_json_object = {
+            "case_id": "c21-005",
+            "exchanges": [
+                {
+                    "request": c21_request,
+                    "status": 200,
+                    "response": {
+                        "id": "chatcmpl-c21-005",
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": json.dumps(
+                                        {"result": c21_marker},
+                                        separators=(",", ":"),
+                                    ),
+                                    "reasoning": "reasoning that discusses the formatting constraint",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 74,
+                            "completion_tokens": 74,
+                            "total_tokens": 148,
+                        },
+                    },
+                }
+            ],
+        }
+        validate_case_output(
+            "C21",
+            "json-object",
+            "serve",
+            stdout_path,
+            c21_json_object,
+            {"case_id": "c21-005", "expected_marker": c21_marker},
+            "canonical c21-005 JSON-object fixture",
+        )
+        c21_empty_object = copy.deepcopy(c21_json_object)
+        c21_empty_object["exchanges"][0]["response"]["choices"][0]["message"][
+            "content"
+        ] = "{}"
+        c21_empty_failure = capture_case_output_error(
+            lambda: validate_case_output(
+                "C21",
+                "json-object",
+                "serve",
+                stdout_path,
+                c21_empty_object,
+                {"case_id": "c21-005", "expected_marker": c21_marker},
+                "canonical c21-005 empty-object fixture",
+            )
+        )
+        require(
+            isinstance(c21_empty_failure, ScenarioError)
+            and "empty or unrelated" in str(c21_empty_failure),
+            "C21 accepted the canonical empty-object blocker response",
+        )
         tool_calls = [
             {
                 "id": "call-c12-023",
@@ -12197,14 +12388,14 @@ def self_test_stream_pair_contracts() -> None:
             "C06 lost its exact stream parity contract",
         )
 
-        c21_request = {
+        c21_stream_request = {
             "model": "m2-qwen35-35b-a3b",
             "messages": [{"role": "user", "content": "Discuss C21-MARKER."}],
             "metadata": {"g00_ordinal": 1},
         }
         c21 = transcript(
-            case_id="c21-005",
-            reference_request=c21_request,
+            case_id="c21-002",
+            reference_request=c21_stream_request,
             reference_message={
                 "content": "C21-MARKER reference answer",
                 "reasoning_content": "reference sampled reasoning",
@@ -12223,7 +12414,7 @@ def self_test_stream_pair_contracts() -> None:
             "serve",
             stdout_path,
             c21,
-            {"case_id": "c21-005", "expected_marker": "C21-MARKER"},
+            {"case_id": "c21-002", "expected_marker": "C21-MARKER"},
             "C21 stochastic stream fixture",
         )
         c21_missing_marker = copy.deepcopy(c21)
@@ -12235,7 +12426,7 @@ def self_test_stream_pair_contracts() -> None:
                 "serve",
                 stdout_path,
                 c21_missing_marker,
-                {"case_id": "c21-005", "expected_marker": "C21-MARKER"},
+                {"case_id": "c21-002", "expected_marker": "C21-MARKER"},
                 "C21 missing marker fixture",
             )
         )
