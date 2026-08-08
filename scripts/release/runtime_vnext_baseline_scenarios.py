@@ -5700,6 +5700,11 @@ def legacy_c13_messages() -> list[dict[str, Any]]:
     ]
 
 
+def json_object_marker_prompt(marker: str) -> str:
+    expected = json.dumps({"result": marker}, separators=(",", ":"))
+    return f"Return exactly this JSON object and nothing else: {expected}"
+
+
 def case_http_payload(
     case: dict[str, Any],
     model_key: str,
@@ -5846,7 +5851,9 @@ def case_http_payload(
             },
         }
     elif scenario_id == "C15":
-        payload["messages"] = [{"role": "user", "content": f"Return a JSON object containing marker {marker}."}]
+        payload["messages"] = [
+            {"role": "user", "content": json_object_marker_prompt(marker)}
+        ]
         payload["response_format"] = {"type": "json_object"}
     elif scenario_id == "C16":
         if variant == "invalid-tool":
@@ -12093,6 +12100,12 @@ def self_test_stream_pair_contracts() -> None:
         stdout_path = Path(tmp) / "stdout.log"
         stdout_path.write_text("{}\n", encoding="utf-8")
         c15_marker = "G00-c15-003-OK"
+        c15_prompt = json_object_marker_prompt(c15_marker)
+        require(
+            c15_prompt
+            == 'Return exactly this JSON object and nothing else: {"result":"G00-c15-003-OK"}',
+            "C15 marker prompt does not require the marker as a JSON string value",
+        )
         c15 = {
             "case_id": "c15-003",
             "exchanges": [
@@ -12102,7 +12115,7 @@ def self_test_stream_pair_contracts() -> None:
                         "messages": [
                             {
                                 "role": "user",
-                                "content": f"Return a JSON object containing marker {c15_marker}.",
+                                "content": c15_prompt,
                             }
                         ],
                         "response_format": {"type": "json_object"},
