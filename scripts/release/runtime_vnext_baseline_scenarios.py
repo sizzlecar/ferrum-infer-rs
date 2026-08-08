@@ -5931,7 +5931,9 @@ def case_http_payload(
             },
         }
     elif scenario_id == "C21" and variant == "json-object":
-        payload["messages"] = [{"role": "user", "content": f"Return a JSON object with result {marker}."}]
+        payload["messages"] = [
+            {"role": "user", "content": json_object_marker_prompt(marker)}
+        ]
         payload["response_format"] = {"type": "json_object"}
     return payload
 
@@ -12215,6 +12217,16 @@ def self_test_stream_pair_contracts() -> None:
             and "max_tokens" not in c21_request
             and c21_request.get("response_format") == {"type": "json_object"},
             "canonical c21-005 request drifted from the official-default blocker",
+        )
+        require(
+            c21_request.get("messages")
+            == [
+                {
+                    "role": "user",
+                    "content": 'Return exactly this JSON object and nothing else: {"result":"G00-c21-005-OK"}',
+                }
+            ],
+            "C21 json_object request no longer binds the exact expected key/value",
         )
         c21_json_object = {
             "case_id": "c21-005",
