@@ -3376,13 +3376,10 @@ fn response_format_prompt_instruction(
     }
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
-            "json_object" => Some(if reasoning_enabled {
-                "The response_format requires a single valid JSON object. Complete any enabled reasoning before the final answer. In the final answer, output only JSON, with no markdown fences, no explanation, and no extra text."
-                    .to_string()
-            } else {
+            "json_object" => Some(
                 "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
-                    .to_string()
-            }),
+                    .to_string(),
+            ),
             "json_schema" => {
                 let schema = format.json_schema.as_ref()?.schema.as_ref()?;
                 let schema_text = serde_json::to_string(schema).ok()?;
@@ -11126,7 +11123,7 @@ mod tests {
         assert!(internal.prompt.ends_with("<assistant><think>\n"));
         assert!(internal
             .prompt
-            .contains("Complete any enabled reasoning before the final answer"));
+            .contains("Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text"));
         assert!(
             !internal.prompt.contains(THINK_END_TAG),
             "the instruction must not echo the typed end delimiter: {}",
@@ -11164,7 +11161,7 @@ mod tests {
         assert!(internal.prompt.ends_with("<assistant>"));
         assert!(internal
             .prompt
-            .contains("Complete any enabled reasoning before the final answer"));
+            .contains("Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text"));
         assert!(
             !internal.prompt.contains(THINK_START_TAG) && !internal.prompt.contains(THINK_END_TAG),
             "the instruction must not teach the model the typed reasoning delimiter: {}",
