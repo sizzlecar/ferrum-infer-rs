@@ -3377,7 +3377,7 @@ fn response_format_prompt_instruction(
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
             "json_object" => Some(if reasoning_enabled {
-                "The response_format requires a single valid JSON object. Keep any reasoning inside <think>...</think>. After </think>, output only JSON, with no markdown fences, no explanation, and no extra text."
+                "The response_format requires a single valid JSON object. Complete any enabled reasoning before the final answer. In the final answer, output only JSON, with no markdown fences, no explanation, and no extra text."
                     .to_string()
             } else {
                 "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
@@ -3388,7 +3388,7 @@ fn response_format_prompt_instruction(
                 let schema_text = serde_json::to_string(schema).ok()?;
                 Some(if reasoning_enabled {
                     format!(
-                        "The response_format requires a single valid JSON value satisfying this JSON Schema. Keep any reasoning inside <think>...</think>. After </think>, output only JSON, with no markdown fences, no explanation, and no extra text. Schema: {schema_text}"
+                        "The response_format requires a single valid JSON value satisfying this JSON Schema. Complete any enabled reasoning before the final answer. In the final answer, output only JSON, with no markdown fences, no explanation, and no extra text. Schema: {schema_text}"
                     )
                 } else {
                     format!(
@@ -11111,15 +11111,27 @@ mod tests {
             "response_format": {"type": "json_object"}
         }));
         let template = ModelChatTemplate::new(
-            "{% if add_generation_prompt %}<assistant><think>\n{% endif %}",
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant><think>\n{% endif %}",
             "thinking-test-template",
         );
 
+        assert_eq!(
+            template.reasoning_protocol,
+            ModelReasoningProtocol::PromptOpened
+        );
         let internal =
             convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
                 .expect("convert thinking json_object");
 
         assert!(internal.prompt.ends_with("<assistant><think>\n"));
+        assert!(internal
+            .prompt
+            .contains("Complete any enabled reasoning before the final answer"));
+        assert!(
+            !internal.prompt.contains(THINK_END_TAG),
+            "the instruction must not echo the typed end delimiter: {}",
+            internal.prompt
+        );
         assert_eq!(
             internal.sampling_params.structured_output_start,
             StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
@@ -11150,7 +11162,64 @@ mod tests {
 
         assert!(!has_unclosed_thinking_block(&internal.prompt));
         assert!(internal.prompt.ends_with("<assistant>"));
-        assert!(internal.prompt.contains("After </think>, output only JSON"));
+        assert!(internal
+            .prompt
+            .contains("Complete any enabled reasoning before the final answer"));
+        assert!(
+            !internal.prompt.contains(THINK_START_TAG) && !internal.prompt.contains(THINK_END_TAG),
+            "the instruction must not teach the model the typed reasoning delimiter: {}",
+            internal.prompt
+        );
+        assert_eq!(
+            internal.sampling_params.structured_output_start,
+            StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
+        );
+        assert_eq!(
+            internal.sampling_params.response_completion_boundary,
+            ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                delimiter: THINK_END_TAG.to_string(),
+                alternate_envelope: None,
+            }
+        );
+    }
+
+    #[test]
+    fn strict_schema_model_generated_thinking_does_not_echo_typed_delimiter() {
+        let request = chat_request(json!({
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "reasoning_result",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "result": {"type": "string", "const": "G00-c21-schema-OK"}
+                        },
+                        "required": ["result"],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "chat_template_kwargs": {"enable_thinking": true}
+        }));
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}{% endif %}",
+            "qwen3-model-generated-thinking-template",
+        );
+
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert model-generated thinking strict schema");
+
+        assert!(!has_unclosed_thinking_block(&internal.prompt));
+        assert!(internal.prompt.ends_with("<assistant>"));
+        assert!(internal.prompt.contains("G00-c21-schema-OK"));
+        assert!(
+            !internal.prompt.contains(THINK_START_TAG) && !internal.prompt.contains(THINK_END_TAG),
+            "the instruction must not teach the model the typed reasoning delimiter: {}",
+            internal.prompt
+        );
         assert_eq!(
             internal.sampling_params.structured_output_start,
             StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
