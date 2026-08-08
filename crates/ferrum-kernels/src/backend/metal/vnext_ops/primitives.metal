@@ -26,6 +26,13 @@ struct LastTokenMaskedArgmaxParams {
     uint repetition_capacity;
 };
 
+struct block_q4_K {
+    half d;
+    half dmin;
+    uchar scales[12];
+    uchar qs[QK_K / 2];
+};
+
 struct block_q6_K {
     uchar ql[QK_K / 2];
     uchar qh[QK_K / 4];
@@ -37,6 +44,26 @@ struct block_q8_0 {
     half d;
     char qs[QK8_0];
 };
+
+static inline float q4_k_value(device const block_q4_K & block, uint index) {
+    const uint subblock = index / 32;
+    uchar scale;
+    uchar minimum;
+    if (subblock < 4) {
+        scale = block.scales[subblock] & 63;
+        minimum = block.scales[subblock + 4] & 63;
+    } else {
+        scale = (block.scales[subblock + 4] & 0x0f)
+            | ((block.scales[subblock - 4] >> 6) << 4);
+        minimum = (block.scales[subblock + 4] >> 4)
+            | ((block.scales[subblock] >> 6) << 4);
+    }
+    const uint packed_index = (subblock / 2) * 32 + index % 32;
+    const uchar packed = block.qs[packed_index];
+    const uint quantized = (subblock & 1) == 0 ? packed & 0x0f : packed >> 4;
+    return float(block.d) * float(scale) * float(quantized)
+        - float(block.dmin) * float(minimum);
+}
 
 static inline float q6_k_value(device const block_q6_K & block, uint index) {
     const uint half_block = index / 128;
@@ -88,6 +115,29 @@ kernel void vnext_embedding_dense_f16(
     output[output_index] = token_id < params.vocabulary_size
         ? table[ulong(token_id) * params.hidden_size + column]
         : half(0.0h);
+}
+
+kernel void vnext_embedding_q4_k_f16(
+    device const block_q4_K * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device half * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint token = group.y;
+    const uint column = group.x * THREADS_PER_GROUP + lane;
+    if (token >= params.token_count || column >= params.hidden_size) {
+        return;
+    }
+    const uint token_id = token_ids[token];
+    const ulong output_index = ulong(token) * params.hidden_size + column;
+    if (token_id >= params.vocabulary_size) {
+        output[output_index] = half(0.0h);
+        return;
+    }
+    const uint blocks_per_row = params.hidden_size / QK_K;
+    const ulong block_index = ulong(token_id) * blocks_per_row + column / QK_K;
+    output[output_index] = half(q4_k_value(table[block_index], column % QK_K));
 }
 
 kernel void vnext_embedding_q6_k_f16(
@@ -290,6 +340,29 @@ kernel void vnext_embedding_dense_f32(
     output[output_index] = token_id < params.vocabulary_size
         ? float(table[ulong(token_id) * params.hidden_size + column])
         : 0.0f;
+}
+
+kernel void vnext_embedding_q4_k_f32(
+    device const block_q4_K * table [[buffer(0)]],
+    device const uint * token_ids [[buffer(1)]],
+    device float * output [[buffer(2)]],
+    constant EmbeddingParams & params [[buffer(3)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]]) {
+    const uint token = group.y;
+    const uint column = group.x * THREADS_PER_GROUP + lane;
+    if (token >= params.token_count || column >= params.hidden_size) {
+        return;
+    }
+    const uint token_id = token_ids[token];
+    const ulong output_index = ulong(token) * params.hidden_size + column;
+    if (token_id >= params.vocabulary_size) {
+        output[output_index] = 0.0f;
+        return;
+    }
+    const uint blocks_per_row = params.hidden_size / QK_K;
+    const ulong block_index = ulong(token_id) * blocks_per_row + column / QK_K;
+    output[output_index] = q4_k_value(table[block_index], column % QK_K);
 }
 
 kernel void vnext_embedding_q6_k_f32(

@@ -33,7 +33,6 @@ pub(super) struct Qwen3MoeSemanticConfig {
     pub rms_norm_epsilon: CanonicalRational,
     pub rope_theta: CanonicalRational,
     pub tie_word_embeddings: bool,
-    pub quantization: Qwen3MoeGptqConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,10 +55,31 @@ struct ParsedQwen3MoeSemantics {
 
 impl Qwen3MoeSemanticConfig {
     pub(super) fn parse(raw: &[u8]) -> Result<Self, String> {
-        Self::parse_sources(raw, raw)
+        Self::parse_sources(raw, raw).map(|(semantic, _)| semantic)
     }
 
-    pub(super) fn parse_sources(semantic_raw: &[u8], physical_raw: &[u8]) -> Result<Self, String> {
+    pub(super) fn parse_semantic_source(raw: &[u8]) -> Result<Self, String> {
+        let value: Value = serde_json::from_slice(raw)
+            .map_err(|error| format!("parse semantic config.json: {error}"))?;
+        let root = value
+            .as_object()
+            .ok_or_else(|| "semantic config.json root must be an object".to_owned())?;
+        if root
+            .get("quantization_config")
+            .is_some_and(|value| !value.is_null())
+        {
+            return Err(
+                "GGUF physical quantization must not be duplicated in Hugging Face semantic metadata"
+                    .to_owned(),
+            );
+        }
+        ParsedQwen3MoeSemantics::parse(root).map(ParsedQwen3MoeSemantics::into_semantic)
+    }
+
+    pub(super) fn parse_sources(
+        semantic_raw: &[u8],
+        physical_raw: &[u8],
+    ) -> Result<(Self, Qwen3MoeGptqConfig), String> {
         let semantic_value: Value = serde_json::from_slice(semantic_raw)
             .map_err(|error| format!("parse semantic config.json: {error}"))?;
         let semantic_root = semantic_value
@@ -100,9 +120,10 @@ impl Qwen3MoeSemanticConfig {
             );
         }
 
-        let config = semantic.with_quantization(parse_quantization(physical_root)?);
-        config.validate()?;
-        Ok(config)
+        let quantization = parse_quantization(physical_root)?;
+        let config = semantic.into_semantic();
+        config.validate_gptq(&quantization)?;
+        Ok((config, quantization))
     }
 
     pub(super) fn validate_semantic_source(raw: &[u8]) -> Result<(), String> {
@@ -127,8 +148,13 @@ impl Qwen3MoeSemanticConfig {
     }
 
     pub(super) fn validate(&self) -> Result<(), String> {
-        ParsedQwen3MoeSemantics::from(self).validate()?;
-        let group_size = u64::from(self.quantization.group_size);
+        ParsedQwen3MoeSemantics::from(self).validate()
+    }
+
+    pub(super) fn validate_gptq(&self, quantization: &Qwen3MoeGptqConfig) -> Result<(), String> {
+        self.validate()?;
+        quantization.validate()?;
+        let group_size = u64::from(quantization.group_size);
         for (field, value) in [
             ("hidden_size", self.hidden_size),
             ("moe_intermediate_size", self.expert_intermediate_size),
@@ -139,7 +165,29 @@ impl Qwen3MoeSemanticConfig {
                 ));
             }
         }
-        self.quantization.validate()
+        let query_features = self.query_features()?;
+        let kv_features = self.kv_features()?;
+        for (field, output_features, input_features) in [
+            ("q_proj", query_features, self.hidden_size),
+            ("k_proj", kv_features, self.hidden_size),
+            ("v_proj", kv_features, self.hidden_size),
+            ("o_proj", self.hidden_size, query_features),
+            (
+                "expert gate/up",
+                self.expert_intermediate_size
+                    .checked_mul(2)
+                    .ok_or_else(|| "expert gate/up width overflows u64".to_owned())?,
+                self.hidden_size,
+            ),
+            (
+                "expert down",
+                self.hidden_size,
+                self.expert_intermediate_size,
+            ),
+        ] {
+            validate_marlin_thread_tile(field, output_features, input_features)?;
+        }
+        Ok(())
     }
 
     pub(super) fn external_metadata_id(&self) -> &'static str {
@@ -171,18 +219,6 @@ impl ParsedQwen3MoeSemantics {
         Ok(parsed)
     }
 
-    fn query_features(&self) -> Result<u64, String> {
-        self.attention_head_count
-            .checked_mul(self.head_dim)
-            .ok_or_else(|| "query projection width overflows u64".to_owned())
-    }
-
-    fn kv_features(&self) -> Result<u64, String> {
-        self.kv_head_count
-            .checked_mul(self.head_dim)
-            .ok_or_else(|| "key/value projection width overflows u64".to_owned())
-    }
-
     fn validate(&self) -> Result<(), String> {
         if self.kv_head_count > self.attention_head_count
             || !self.attention_head_count.is_multiple_of(self.kv_head_count)
@@ -191,39 +227,6 @@ impl ParsedQwen3MoeSemantics {
         }
         if self.experts_per_token > self.expert_count {
             return Err("num_experts_per_tok must not exceed num_experts".to_owned());
-        }
-        let query_features = self.query_features()?;
-        let kv_features = self.kv_features()?;
-        for (field, value) in [
-            ("hidden_size", self.hidden_size),
-            ("query projection width", query_features),
-            ("key/value projection width", kv_features),
-            ("vocab_size", self.vocabulary_size),
-            ("moe_intermediate_size", self.expert_intermediate_size),
-        ] {
-            if !value.is_multiple_of(16) {
-                return Err(format!("{field} must be divisible by 16 for Marlin"));
-            }
-        }
-        for (field, output_features, input_features) in [
-            ("q_proj", query_features, self.hidden_size),
-            ("k_proj", kv_features, self.hidden_size),
-            ("v_proj", kv_features, self.hidden_size),
-            ("o_proj", self.hidden_size, query_features),
-            (
-                "expert gate/up",
-                self.expert_intermediate_size
-                    .checked_mul(2)
-                    .ok_or_else(|| "expert gate/up width overflows u64".to_owned())?,
-                self.hidden_size,
-            ),
-            (
-                "expert down",
-                self.hidden_size,
-                self.expert_intermediate_size,
-            ),
-        ] {
-            validate_marlin_thread_tile(field, output_features, input_features)?;
         }
         if self.rms_norm_epsilon.numerator() <= 0
             || self.rms_norm_epsilon.numerator() as u64 > self.rms_norm_epsilon.denominator()
@@ -234,7 +237,7 @@ impl ParsedQwen3MoeSemantics {
         Ok(())
     }
 
-    fn with_quantization(self, quantization: Qwen3MoeGptqConfig) -> Qwen3MoeSemanticConfig {
+    fn into_semantic(self) -> Qwen3MoeSemanticConfig {
         Qwen3MoeSemanticConfig {
             hidden_size: self.hidden_size,
             layer_count: self.layer_count,
@@ -250,7 +253,6 @@ impl ParsedQwen3MoeSemantics {
             rms_norm_epsilon: self.rms_norm_epsilon,
             rope_theta: self.rope_theta,
             tie_word_embeddings: self.tie_word_embeddings,
-            quantization,
         }
     }
 }
@@ -506,15 +508,42 @@ mod tests {
 
         Qwen3MoeSemanticConfig::validate_semantic_source(&serde_json::to_vec(&semantic).unwrap())
             .unwrap();
-        let parsed = Qwen3MoeSemanticConfig::parse_sources(
+        let (parsed, quantization) = Qwen3MoeSemanticConfig::parse_sources(
             &serde_json::to_vec(&semantic).unwrap(),
             &serde_json::to_vec(&physical).unwrap(),
         )
         .unwrap();
 
-        assert_eq!(parsed.quantization.bits, 4);
-        assert_eq!(parsed.quantization.group_size, 128);
+        assert_eq!(quantization.bits, 4);
+        assert_eq!(quantization.group_size, 128);
         assert_eq!(parsed.hidden_size, 2048);
+    }
+
+    #[test]
+    fn gguf_semantics_do_not_require_gptq_physical_metadata() {
+        let mut semantic = reference_config();
+        semantic["torch_dtype"] = Value::String("bfloat16".to_owned());
+        semantic
+            .as_object_mut()
+            .unwrap()
+            .remove("quantization_config");
+
+        let parsed =
+            Qwen3MoeSemanticConfig::parse_semantic_source(&serde_json::to_vec(&semantic).unwrap())
+                .unwrap();
+
+        assert_eq!(parsed.hidden_size, 2048);
+        assert_eq!(parsed.expert_count, 128);
+    }
+
+    #[test]
+    fn gguf_semantics_reject_duplicated_physical_quantization() {
+        let error = Qwen3MoeSemanticConfig::parse_semantic_source(
+            &serde_json::to_vec(&reference_config()).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("must not be duplicated"), "{error}");
     }
 
     #[test]
