@@ -392,11 +392,140 @@ kernel void vnext_moe_q4k_down_f16(
     }
 }
 
+// Q6_K routed expert down projection. This keeps both the expert stack and
+// the activation/output ABI native: packed Q6_K bytes in, F16 slots out.
+struct VNextBlockQ6K {
+    uchar ql[VNEXT_QK_K / 2];
+    uchar qh[VNEXT_QK_K / 4];
+    int8_t scales[VNEXT_QK_K / 16];
+    half d;
+};
+
+kernel void vnext_moe_q6k_down_f16(
+    device const VNextBlockQ6K *weights [[buffer(0)]],
+    device const half *activation [[buffer(1)]],
+    device const int *route_ids [[buffer(2)]],
+    device half *down_slots [[buffer(3)]],
+    constant MoeQ4DownParams &p [[buffer(4)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort simdgroup [[simdgroup_index_in_threadgroup]]) {
+    const uint pair = group.z;
+    if (pair >= p.pair_count) {
+        return;
+    }
+    const int expert = route_ids[pair];
+    if (expert < 0 || uint(expert) >= p.expert_count) {
+        return;
+    }
+
+    constexpr uint8_t mask_0 = 0x03;
+    constexpr uint8_t mask_1 = 0x0c;
+    constexpr uint8_t mask_2 = 0x30;
+    constexpr uint8_t mask_3 = 0xc0;
+    const uint blocks_per_row = p.input_features / VNEXT_QK_K;
+    const uint first_row =
+        (group.x * VNEXT_MOE_SIMDGROUPS + simdgroup) * VNEXT_MOE_ROWS_PER_SIMDGROUP;
+    if (first_row >= p.output_features) {
+        return;
+    }
+
+    device const VNextBlockQ6K *expert_weights =
+        reinterpret_cast<device const VNextBlockQ6K *>(
+            reinterpret_cast<device const char *>(weights)
+            + uint(expert) * p.expert_stride_bytes
+            + first_row * p.row_stride_bytes);
+    device const half *input = activation + pair * p.input_features;
+    float sums[VNEXT_MOE_ROWS_PER_SIMDGROUP] = {0.0f};
+    float inputs[16];
+
+    const short lane_pair = lane / 2;
+    const short block_parity = lane % 2;
+    const short input_partition = lane_pair / 8;
+    const short input_lane = lane_pair % 8;
+    const short lane_offset = 4 * input_lane;
+    const short scale_offset = 8 * input_partition + lane_offset / 16;
+    const short input_offset = 128 * input_partition + lane_offset;
+    const short low_offset = 64 * input_partition + lane_offset;
+    const short high_offset = 32 * input_partition + lane_offset;
+
+    for (uint block = uint(block_parity); block < blocks_per_row; block += 2) {
+        device const uchar *low = expert_weights[block].ql + low_offset;
+        device const uchar *low_second = low + 32;
+        device const uchar *high = expert_weights[block].qh + high_offset;
+        device const int8_t *scales = expert_weights[block].scales + scale_offset;
+        device const half *delta = &expert_weights[block].d;
+        device const half *input_block = input + block * VNEXT_QK_K + input_offset;
+
+        VNEXT_UNROLL for (short index = 0; index < 4; ++index) {
+            inputs[4 * index + 0] = float(input_block[index + 0]);
+            inputs[4 * index + 1] = float(input_block[index + 32]);
+            inputs[4 * index + 2] = float(input_block[index + 64]);
+            inputs[4 * index + 3] = float(input_block[index + 96]);
+        }
+
+        for (short row = 0; row < VNEXT_MOE_ROWS_PER_SIMDGROUP; ++row) {
+            float4 partial = 0.0f;
+            VNEXT_UNROLL for (short index = 0; index < 4; ++index) {
+                partial[0] += inputs[4 * index + 0]
+                    * (int8_t((low[index] & 0x0f) | ((high[index] & mask_0) << 4)) - 32);
+                partial[1] += inputs[4 * index + 1]
+                    * (int8_t((low_second[index] & 0x0f) | ((high[index] & mask_1) << 2)) - 32);
+                partial[2] += inputs[4 * index + 2]
+                    * (int8_t((low[index] >> 4) | (high[index] & mask_2)) - 32);
+                partial[3] += inputs[4 * index + 3]
+                    * (int8_t((low_second[index] >> 4) | ((high[index] & mask_3) >> 2)) - 32);
+            }
+            sums[row] += float(delta[0]) * (
+                partial[0] * float(scales[0])
+                + partial[1] * float(scales[2])
+                + partial[2] * float(scales[4])
+                + partial[3] * float(scales[6]));
+            low += p.row_stride_bytes;
+            low_second += p.row_stride_bytes;
+            high += p.row_stride_bytes;
+            scales += p.row_stride_bytes;
+            delta += p.row_stride_bytes / 2;
+        }
+    }
+
+    device half *output = down_slots + pair * p.output_features;
+    for (short row = 0;
+         row < VNEXT_MOE_ROWS_PER_SIMDGROUP && first_row + uint(row) < p.output_features;
+         ++row) {
+        const float value = simd_sum(sums[row]);
+        if (lane == 0) {
+            output[first_row + uint(row)] = half(value);
+        }
+    }
+}
+
 struct MoeCombineParams {
     uint tokens;
     uint experts_per_token;
     uint hidden_size;
 };
+
+kernel void vnext_moe_combine_routed_f16(
+    device const half *routed_slots [[buffer(0)]],
+    device const float *route_weights [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant MoeCombineParams &p [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint element_count = p.tokens * p.hidden_size;
+    if (index >= element_count) {
+        return;
+    }
+    const uint token = index / p.hidden_size;
+    const uint column = index - token * p.hidden_size;
+    float value = 0.0f;
+    for (uint slot = 0; slot < p.experts_per_token; ++slot) {
+        const uint pair = token * p.experts_per_token + slot;
+        value += route_weights[pair]
+            * float(routed_slots[pair * p.hidden_size + column]);
+    }
+    output[index] = half(value);
+}
 
 kernel void vnext_moe_combine_f16(
     device const half *routed_slots [[buffer(0)]],

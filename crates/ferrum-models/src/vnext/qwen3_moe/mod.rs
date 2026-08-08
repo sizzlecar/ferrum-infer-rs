@@ -12,7 +12,9 @@ use ferrum_interfaces::vnext::{
     ModelProgram, ModelSemanticMetadata, PreparedModelFamily, TypedFamilyRegistration, VNextError,
     WeightComponentSource, WeightSchema,
 };
-use ferrum_quantization::{GptqMarlinSafetensorsSource, SafetensorsArchive};
+use ferrum_quantization::{
+    GgufWeightComponentSource, GptqMarlinSafetensorsSource, SafetensorsArchive,
+};
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -155,13 +157,6 @@ pub fn prepare_from_model_dir(model_dir: &Path) -> ferrum_types::Result<Prepared
 pub(super) fn prepare_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
 ) -> ferrum_types::Result<PreparedProductionModel> {
-    let weight_config = sources.weight_config_json().ok_or_else(|| {
-        ferrum_types::FerrumError::model(
-            "Qwen3 MoE GPTQ weight source is missing physical config.json",
-        )
-    })?;
-    let semantic = Qwen3MoeSemanticConfig::parse_sources(sources.config_json(), weight_config)
-        .map_err(ferrum_types::FerrumError::model)?;
     let tokenizer_config = sources.tokenizer_config_json().ok_or_else(|| {
         ferrum_types::FerrumError::model("tokenizer source missing tokenizer_config.json")
     })?;
@@ -169,20 +164,40 @@ pub(super) fn prepare_from_sources(
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
     let metadata = parse_hf_model_semantic_metadata(&model_config, tokenizer_config)
         .map_err(ferrum_types::FerrumError::model)?;
-    let ProductionWeightArtifact::SafetensorsDirectory(weight_root) = sources.weights() else {
-        return Err(ferrum_types::FerrumError::unsupported(
-            "Qwen3 MoE vNext currently requires a Hugging Face GPTQ safetensors checkpoint",
-        ));
-    };
-    let archive = SafetensorsArchive::open(weight_root)?;
-    let weights = Qwen3MoeWeightManifest::load(&archive, &semantic)
-        .map_err(ferrum_types::FerrumError::model)?;
-    let config = Qwen3MoeFamilyConfig {
-        semantic,
-        metadata,
-        weights,
-    };
-    finish_preparation(sources, GptqMarlinSafetensorsSource::new(archive), config)
+    match sources.weights() {
+        ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
+            let weight_config = sources.weight_config_json().ok_or_else(|| {
+                ferrum_types::FerrumError::model(
+                    "Qwen3 MoE GPTQ weight source is missing physical config.json",
+                )
+            })?;
+            let (semantic, quantization) =
+                Qwen3MoeSemanticConfig::parse_sources(sources.config_json(), weight_config)
+                    .map_err(ferrum_types::FerrumError::model)?;
+            let archive = SafetensorsArchive::open(weight_root)?;
+            let weights = Qwen3MoeWeightManifest::load(&archive, &semantic, &quantization)
+                .map_err(ferrum_types::FerrumError::model)?;
+            let config = Qwen3MoeFamilyConfig {
+                semantic,
+                metadata,
+                weights,
+            };
+            finish_preparation(sources, GptqMarlinSafetensorsSource::new(archive), config)
+        }
+        ProductionWeightArtifact::GgufFile(path) => {
+            let semantic = Qwen3MoeSemanticConfig::parse_semantic_source(sources.config_json())
+                .map_err(ferrum_types::FerrumError::model)?;
+            let source = GgufWeightComponentSource::open(path)?;
+            let weights = Qwen3MoeWeightManifest::load_gguf(&source, &semantic)
+                .map_err(ferrum_types::FerrumError::model)?;
+            let config = Qwen3MoeFamilyConfig {
+                semantic,
+                metadata,
+                weights,
+            };
+            finish_preparation(sources, source, config)
+        }
+    }
 }
 
 fn finish_preparation<W>(
@@ -285,15 +300,15 @@ mod tests {
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             rope_theta: CanonicalRational::new(1_000_000, 1).unwrap(),
             tie_word_embeddings: false,
-            quantization: config::Qwen3MoeGptqConfig {
-                bits: 4,
-                group_size: 128,
-                desc_act: false,
-                sym: true,
-            },
+        };
+        let quantization = config::Qwen3MoeGptqConfig {
+            bits: 4,
+            group_size: 128,
+            desc_act: false,
+            sym: true,
         };
         Qwen3MoeFamilyConfig {
-            weights: weights::expected_manifest(&semantic).unwrap(),
+            weights: weights::expected_manifest(&semantic, &quantization).unwrap(),
             semantic,
             metadata: ModelSemanticMetadata {
                 template: TemplateMetadata {

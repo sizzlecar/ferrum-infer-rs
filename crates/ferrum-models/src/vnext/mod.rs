@@ -57,7 +57,7 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
     },
     ModelLoaderRegistration {
         external_metadata_ids: &[qwen3_moe::EXTERNAL_METADATA_ID],
-        gguf_architectures: &[],
+        gguf_architectures: &["qwen3moe"],
         execution_kind: ProductionExecutionKind::CausalLanguage,
         validate_semantic_config: qwen3_moe::validate_semantic_config,
         prepare: qwen3_moe::prepare_from_sources,
@@ -894,6 +894,7 @@ mod tests {
         assert!(gguf_architecture_requires_typed_product_sources(
             "qwen35moe"
         ));
+        assert!(gguf_architecture_requires_typed_product_sources("qwen3moe"));
         assert!(!gguf_architecture_requires_typed_product_sources("qwen3"));
     }
 

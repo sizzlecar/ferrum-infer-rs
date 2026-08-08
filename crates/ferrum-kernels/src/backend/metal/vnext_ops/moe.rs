@@ -5,15 +5,16 @@ use std::ffi::c_void;
 use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    routed_shared_swiglu_moe_contract, AttributeId, BatchedOperationInvocation, DeviceBatchingForm,
-    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationFailure,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, PhysicalWeightPadding,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole,
+    routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract, AttributeId,
+    BatchedOperationInvocation, DeviceBatchingForm, DynamicStorageRequirement, ElementType,
+    EncodedDeviceOperation, OperationFailure, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    PhysicalWeightPadding, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, ResolvedValueBinding, ResolvedValueRole,
     ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue, VNextError,
     WeightEncoding, ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
-    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
+    ROUTED_SWIGLU_MOE_OPERATION_ID,
 };
 use metal::{CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device, MTLSize};
 
@@ -33,27 +34,36 @@ use super::{
     authorize_reusable_topology, binding, checked_u32, contiguous_bindings, ensure_invocation,
     f16_contiguous, implementation_fingerprint, invalid_plan, provider_descriptor,
     provider_failure, shared_scratch_region, shared_token_region, GGUF_NATIVE_BLOCK_FORMAT_ID,
-    Q4_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
+    Q4_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID, THREADS_PER_GROUP, VALUE_ALIGNMENT_BYTES,
 };
 
 const SHADER_SOURCE: &str = include_str!("moe.metal");
 const PROVIDER_ID: &str = "provider.metal.routed_shared_swiglu_moe.f16.q4k";
 const ESTIMATOR_ID: &str = "resource-estimator.metal.routed_shared_swiglu_moe.f16.q4k";
+const ROUTED_PROVIDER_ID: &str = "provider.metal.routed_swiglu_moe.f16.q4k_q6k";
+const ROUTED_ESTIMATOR_ID: &str = "resource-estimator.metal.routed_swiglu_moe.f16.q4k_q6k";
 const ROUTE_KERNEL: &str = "vnext_moe_route_topk_f16";
 const ROUTED_GATE_UP_KERNEL: &str = "vnext_moe_q4k_gate_up_silu_f16";
 const ROUTED_DOWN_KERNEL: &str = "vnext_moe_q4k_down_f16";
+const ROUTED_DOWN_Q6_K_KERNEL: &str = "vnext_moe_q6k_down_f16";
 const COMBINE_KERNEL: &str = "vnext_moe_combine_f16";
+const ROUTED_COMBINE_KERNEL: &str = "vnext_moe_combine_routed_f16";
 const Q4_K_VALUES_PER_BLOCK: u64 = 256;
 const Q4_K_BYTES_PER_BLOCK: u64 = 144;
+const Q6_K_VALUES_PER_BLOCK: u64 = 256;
+const Q6_K_BYTES_PER_BLOCK: u64 = 210;
 const MAX_ROUTER_EXPERTS: u64 = 256;
 const MAX_ROUTER_TOP_K: u64 = 32;
 const WORKSPACE_REGION_COUNT: u64 = 9;
+const ROUTED_WORKSPACE_REGION_COUNT: u64 = 5;
 
 pub(super) struct MetalMoePipelines {
     route: ComputePipelineState,
     routed_gate_up: ComputePipelineState,
     routed_down: ComputePipelineState,
+    routed_down_q6_k: ComputePipelineState,
     combine: ComputePipelineState,
+    routed_combine: ComputePipelineState,
 }
 
 impl MetalMoePipelines {
@@ -81,7 +91,9 @@ impl MetalMoePipelines {
             route: pipeline(ROUTE_KERNEL)?,
             routed_gate_up: pipeline(ROUTED_GATE_UP_KERNEL)?,
             routed_down: pipeline(ROUTED_DOWN_KERNEL)?,
+            routed_down_q6_k: pipeline(ROUTED_DOWN_Q6_K_KERNEL)?,
             combine: pipeline(COMBINE_KERNEL)?,
+            routed_combine: pipeline(ROUTED_COMBINE_KERNEL)?,
         })
     }
 }
@@ -191,6 +203,113 @@ impl OperationProvider<MetalDeviceRuntime> for MetalRoutedSharedSwiGluMoeProvide
     }
 }
 
+/// Native routed-only Qwen3 MoE provider. The expert gate/up stack remains
+/// Q4_K while the down stack may use Q6_K, matching the GGUF physical ABI
+/// without expanding either stack into a dense allocation.
+pub(super) struct MetalRoutedSwiGluMoeProvider {
+    descriptor: OperationProviderDescriptor,
+    pipelines: Arc<MetalMoePipelines>,
+    linear_pipelines: Arc<MetalLinearPipelines>,
+}
+
+impl MetalRoutedSwiGluMoeProvider {
+    pub(super) fn new(
+        runtime: &MetalDeviceRuntime,
+        pipelines: Arc<MetalMoePipelines>,
+        linear_pipelines: Arc<MetalLinearPipelines>,
+    ) -> Result<Self, MetalDeviceRuntimeError> {
+        let contract = routed_swiglu_moe_contract().map_err(super::contract_error)?;
+        let descriptor = provider_descriptor(
+            runtime,
+            &contract,
+            ROUTED_PROVIDER_ID,
+            ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
+            ROUTED_ESTIMATOR_ID,
+            contiguous_bindings(4),
+            &[GGUF_NATIVE_BLOCK_FORMAT_ID],
+            &[Q4_K_FORMAT_ID, Q6_K_FORMAT_ID, Q8_0_FORMAT_ID],
+            implementation_fingerprint(&[
+                include_str!("moe.rs").as_bytes(),
+                SHADER_SOURCE.as_bytes(),
+                include_str!("linear.rs").as_bytes(),
+                include_str!("linear.metal").as_bytes(),
+                ROUTED_PROVIDER_ID.as_bytes(),
+            ]),
+        )?;
+        Ok(Self {
+            descriptor,
+            pipelines,
+            linear_pipelines,
+        })
+    }
+}
+
+impl OperationResourceEstimator for MetalRoutedSwiGluMoeProvider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        if request.operation().id.as_str() != ROUTED_SWIGLU_MOE_OPERATION_ID
+            || request.operation().fingerprint()? != self.descriptor.operation_fingerprint()
+        {
+            return Err(invalid_plan(format!(
+                "Metal estimator `{}` received another operation",
+                self.descriptor.resource_estimator_id()
+            )));
+        }
+        let attributes =
+            RoutedMoeAttributes::from_values(request.attributes()).map_err(invalid_plan)?;
+        let (fixed_bytes, bytes_per_token) =
+            routed_workspace_formula_terms(attributes).map_err(invalid_plan)?;
+        let scratch = ProviderWorkspaceRequirement::from_formula(
+            ProviderWorkspaceSizeFormula::affine(fixed_bytes, 0, bytes_per_token)?,
+            VALUE_ALIGNMENT_BYTES,
+            ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
+            DynamicStorageRequirement::contiguous(),
+        )?;
+        Ok(OperationResourceEstimate::new(
+            self.descriptor.resource_estimator_id(),
+            self.descriptor.resource_estimator_version(),
+            self.descriptor
+                .resource_estimator_implementation_fingerprint(),
+            request.input_fingerprint(),
+            VALUE_ALIGNMENT_BYTES,
+            Some(scratch),
+            None,
+        ))
+    }
+}
+
+impl OperationProvider<MetalDeviceRuntime> for MetalRoutedSwiGluMoeProvider {
+    fn reusable_execution_topology(
+        &self,
+        _request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        authorize_reusable_topology(self.descriptor.execution_semantics(), || {
+            Ok(ReusableExecutionTopology::Static)
+        })
+    }
+
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    ) -> Result<EncodedDeviceOperation<MetalDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_routed_moe(
+            Arc::clone(&self.pipelines),
+            Arc::clone(&self.linear_pipelines),
+            invocation,
+        )
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| provider_failure(identity, "metal.routed_swiglu_moe.encode", message))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MoeAttributes {
     hidden_size: u64,
@@ -242,6 +361,57 @@ impl MoeAttributes {
             (self.shared_intermediate_size, "shared intermediate size"),
         ] {
             checked_u32(value, &format!("Metal MoE {name}"))?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RoutedMoeAttributes {
+    hidden_size: u64,
+    expert_count: u64,
+    experts_per_token: u64,
+    routed_intermediate_size: u64,
+    normalize_topk: bool,
+}
+
+impl RoutedMoeAttributes {
+    fn from_values(attributes: &BTreeMap<AttributeId, SemanticValue>) -> Result<Self, String> {
+        let values = Self {
+            hidden_size: unsigned_attribute(attributes, "hidden_size")?,
+            expert_count: unsigned_attribute(attributes, "expert_count")?,
+            experts_per_token: unsigned_attribute(attributes, "experts_per_token")?,
+            routed_intermediate_size: unsigned_attribute(attributes, "routed_intermediate_size")?,
+            normalize_topk: bool_attribute(attributes, "normalize_topk")?,
+        };
+        values.validate()?;
+        Ok(values)
+    }
+
+    fn validate(self) -> Result<(), String> {
+        if self.hidden_size == 0
+            || self.expert_count == 0
+            || self.expert_count > MAX_ROUTER_EXPERTS
+            || self.experts_per_token == 0
+            || self.experts_per_token > self.expert_count
+            || self.experts_per_token > MAX_ROUTER_TOP_K
+            || self.routed_intermediate_size == 0
+            || !self.hidden_size.is_multiple_of(Q4_K_VALUES_PER_BLOCK)
+            || !self
+                .routed_intermediate_size
+                .is_multiple_of(Q6_K_VALUES_PER_BLOCK)
+        {
+            return Err(format!(
+                "Metal Q4_K/Q6_K routed-only MoE attributes are unsupported: {self:?}"
+            ));
+        }
+        for (value, name) in [
+            (self.hidden_size, "hidden size"),
+            (self.expert_count, "expert count"),
+            (self.experts_per_token, "experts per token"),
+            (self.routed_intermediate_size, "routed intermediate size"),
+        ] {
+            checked_u32(value, &format!("Metal routed-only MoE {name}"))?;
         }
         Ok(())
     }
@@ -375,6 +545,92 @@ impl MoeWorkspaceLayout {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoutedMoeWorkspaceLayout {
+    router_logits: WorkspaceRegion,
+    route_ids: WorkspaceRegion,
+    route_weights: WorkspaceRegion,
+    routed_activation: WorkspaceRegion,
+    routed_down_slots: WorkspaceRegion,
+    total_bytes: u64,
+    pair_count: u64,
+}
+
+impl RoutedMoeWorkspaceLayout {
+    fn new(tokens: u64, attributes: RoutedMoeAttributes) -> Result<Self, String> {
+        if tokens == 0 {
+            return Err("Metal routed-only MoE workspace requires at least one token".to_owned());
+        }
+        attributes.validate()?;
+        let pair_count = checked_mul(
+            tokens,
+            attributes.experts_per_token,
+            "Metal routed-only MoE pair count",
+        )?;
+        let mut cursor = WorkspaceCursor::default();
+        let router_logits = cursor.allocate(elements_bytes(
+            checked_mul(
+                tokens,
+                attributes.expert_count,
+                "Metal routed-only MoE router logits",
+            )?,
+            ElementType::F16.size_bytes(),
+            "Metal routed-only MoE router logits",
+        )?)?;
+        let route_ids = cursor.allocate(elements_bytes(
+            pair_count,
+            ElementType::I32.size_bytes(),
+            "Metal routed-only MoE route IDs",
+        )?)?;
+        let route_weights = cursor.allocate(elements_bytes(
+            pair_count,
+            ElementType::F32.size_bytes(),
+            "Metal routed-only MoE route weights",
+        )?)?;
+        let routed_activation = cursor.allocate(elements_bytes(
+            checked_mul(
+                pair_count,
+                attributes.routed_intermediate_size,
+                "Metal routed-only MoE activation",
+            )?,
+            ElementType::F16.size_bytes(),
+            "Metal routed-only MoE activation",
+        )?)?;
+        let routed_down_slots = cursor.allocate(elements_bytes(
+            checked_mul(
+                pair_count,
+                attributes.hidden_size,
+                "Metal routed-only MoE down slots",
+            )?,
+            ElementType::F16.size_bytes(),
+            "Metal routed-only MoE down slots",
+        )?)?;
+        let total_bytes = align_up(cursor.offset, VALUE_ALIGNMENT_BYTES)?;
+        let (fixed_bytes, bytes_per_token) = routed_workspace_formula_terms(attributes)?;
+        let admitted = fixed_bytes
+            .checked_add(checked_mul(
+                bytes_per_token,
+                tokens,
+                "Metal routed-only MoE admitted workspace",
+            )?)
+            .ok_or_else(|| "Metal routed-only MoE admitted workspace overflows".to_owned())?;
+        if total_bytes > admitted {
+            return Err(format!(
+                "Metal routed-only MoE workspace {total_bytes} exceeds affine estimate {admitted}"
+            ));
+        }
+        Ok(Self {
+            router_logits,
+            route_ids,
+            route_weights,
+            routed_activation,
+            routed_down_slots,
+            total_bytes,
+            pair_count,
+        })
+    }
+}
+
 #[derive(Default)]
 struct WorkspaceCursor {
     offset: u64,
@@ -471,11 +727,90 @@ fn workspace_formula_terms(attributes: MoeAttributes) -> Result<(u64, u64), Stri
     Ok((fixed_bytes, bytes_per_token))
 }
 
+fn routed_workspace_formula_terms(attributes: RoutedMoeAttributes) -> Result<(u64, u64), String> {
+    attributes.validate()?;
+    let terms = [
+        checked_mul(
+            attributes.expert_count,
+            ElementType::F16.size_bytes(),
+            "Metal routed-only MoE router bytes per token",
+        )?,
+        checked_mul(
+            attributes.experts_per_token,
+            ElementType::I32.size_bytes(),
+            "Metal routed-only MoE route ID bytes per token",
+        )?,
+        checked_mul(
+            attributes.experts_per_token,
+            ElementType::F32.size_bytes(),
+            "Metal routed-only MoE route weight bytes per token",
+        )?,
+        checked_mul(
+            checked_mul(
+                attributes.experts_per_token,
+                attributes.routed_intermediate_size,
+                "Metal routed-only MoE activation bytes per token",
+            )?,
+            ElementType::F16.size_bytes(),
+            "Metal routed-only MoE activation bytes per token",
+        )?,
+        checked_mul(
+            checked_mul(
+                attributes.experts_per_token,
+                attributes.hidden_size,
+                "Metal routed-only MoE down bytes per token",
+            )?,
+            ElementType::F16.size_bytes(),
+            "Metal routed-only MoE down bytes per token",
+        )?,
+    ];
+    let bytes_per_token = terms.into_iter().try_fold(0_u64, |total, value| {
+        total
+            .checked_add(value)
+            .ok_or_else(|| "Metal routed-only MoE bytes per token overflow".to_owned())
+    })?;
+    let fixed_bytes = checked_mul(
+        ROUTED_WORKSPACE_REGION_COUNT + 1,
+        VALUE_ALIGNMENT_BYTES,
+        "Metal routed-only MoE workspace alignment reserve",
+    )?;
+    Ok((fixed_bytes, bytes_per_token))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Q4ExpertPart {
     region: usize,
     row_stride_bytes: u32,
     expert_stride_bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Q6ExpertPart {
+    region: usize,
+    row_stride_bytes: u32,
+    expert_stride_bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RoutedDown {
+    Q4K(Q4ExpertPart),
+    Q6K(Q6ExpertPart),
+}
+
+impl RoutedDown {
+    const fn row_stride_bytes(self) -> u32 {
+        match self {
+            Self::Q4K(part) => part.row_stride_bytes,
+            Self::Q6K(part) => part.row_stride_bytes,
+        }
+    }
+
+    const fn expert_stride_bytes(self) -> u32 {
+        match self {
+            Self::Q4K(part) => part.expert_stride_bytes,
+            Self::Q6K(part) => part.expert_stride_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -511,6 +846,189 @@ struct CombineParams {
     tokens: u32,
     experts_per_token: u32,
     hidden_size: u32,
+}
+
+fn encode_routed_moe(
+    pipelines: Arc<MetalMoePipelines>,
+    linear_pipelines: Arc<MetalLinearPipelines>,
+    invocation: BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+) -> Result<MetalDeviceCommand, String> {
+    ensure_invocation(&invocation, ROUTED_SWIGLU_MOE_OPERATION_ID)?;
+    let first = &invocation.participants()[0];
+    let attributes = RoutedMoeAttributes::from_values(first.attributes())?;
+    let tokens = invocation.work_shape().immediate_tokens();
+    if tokens == 0 {
+        return Err("Metal routed-only MoE invocation has no immediate tokens".to_owned());
+    }
+    for participant in invocation.participants() {
+        if RoutedMoeAttributes::from_values(participant.attributes())? != attributes {
+            return Err("Metal routed-only MoE participant attributes disagree".to_owned());
+        }
+        validate_routed_participant(participant.bindings(), attributes)?;
+    }
+
+    let layout = RoutedMoeWorkspaceLayout::new(tokens, attributes)?;
+    let mut regions = Vec::new();
+    let routed_gate_up = append_routed_gate_up_shape(
+        &mut regions,
+        &invocation,
+        attributes.expert_count,
+        attributes.routed_intermediate_size,
+        attributes.hidden_size,
+    )?;
+    let routed_down = append_routed_only_down(&mut regions, &invocation, attributes)?;
+    let router = append_shared_matrix_weight(
+        &mut regions,
+        &invocation,
+        1,
+        attributes.expert_count,
+        attributes.hidden_size,
+        "Metal routed-only MoE router",
+    )?;
+    let input_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let output_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Output,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let scratch_region = regions.len();
+    regions.push(shared_scratch_region(&invocation, layout.total_bytes)?);
+
+    let router_launch = linear_launch(
+        router,
+        input_region,
+        scratch_region,
+        tokens,
+        attributes.hidden_size,
+        attributes.expert_count,
+        0,
+        layout.router_logits.offset_bytes,
+    )?;
+    validate_launch_regions_with_raw_workspace(&regions, &[router_launch], &[scratch_region])?;
+    validate_routed_workspace_regions(&regions[scratch_region], &layout)?;
+
+    let route_params = RouteParams {
+        tokens: checked_u32(tokens, "Metal routed-only MoE token count")?,
+        expert_count: checked_u32(
+            attributes.expert_count,
+            "Metal routed-only MoE expert count",
+        )?,
+        experts_per_token: checked_u32(
+            attributes.experts_per_token,
+            "Metal routed-only MoE experts per token",
+        )?,
+        normalize_topk: u32::from(attributes.normalize_topk),
+    };
+    if routed_gate_up.gate.row_stride_bytes != routed_gate_up.up.row_stride_bytes
+        || routed_gate_up.gate.expert_stride_bytes != routed_gate_up.up.expert_stride_bytes
+    {
+        return Err("Metal routed-only MoE gate/up Q4_K physical strides disagree".to_owned());
+    }
+    let pair_count = checked_u32(layout.pair_count, "Metal routed-only MoE pair count")?;
+    let gate_up_params = Q4ExpertParams {
+        output_features: checked_u32(
+            attributes.routed_intermediate_size,
+            "Metal routed-only MoE intermediate size",
+        )?,
+        input_features: checked_u32(attributes.hidden_size, "Metal routed-only MoE hidden size")?,
+        row_stride_bytes: routed_gate_up.gate.row_stride_bytes,
+        expert_stride_bytes: routed_gate_up.gate.expert_stride_bytes,
+        expert_count: route_params.expert_count,
+        experts_per_token: route_params.experts_per_token,
+        pair_count,
+    };
+    let down_params = Q4ExpertParams {
+        output_features: checked_u32(attributes.hidden_size, "Metal routed-only MoE hidden size")?,
+        input_features: checked_u32(
+            attributes.routed_intermediate_size,
+            "Metal routed-only MoE intermediate size",
+        )?,
+        row_stride_bytes: routed_down.row_stride_bytes(),
+        expert_stride_bytes: routed_down.expert_stride_bytes(),
+        expert_count: route_params.expert_count,
+        experts_per_token: route_params.experts_per_token,
+        pair_count,
+    };
+    let combine_params = CombineParams {
+        tokens: route_params.tokens,
+        experts_per_token: route_params.experts_per_token,
+        hidden_size: down_params.output_features,
+    };
+    let router_threadgroup_bytes = routed_router_threadgroup_bytes(attributes)?;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Metal routed-only MoE participant count",
+    )?;
+
+    MetalDeviceCommand::operation(
+        "vnext_routed_swiglu_moe",
+        regions,
+        move |encoder, regions| {
+            encoder.record_compute_dispatches(5);
+            let compute = encoder.compute_encoder();
+            dispatch_linear(&linear_pipelines, compute, regions, router_launch);
+            dispatch_route(
+                &pipelines,
+                compute,
+                &regions[scratch_region],
+                layout.router_logits,
+                layout.route_ids,
+                layout.route_weights,
+                route_params,
+                router_threadgroup_bytes,
+            );
+            dispatch_routed_only_gate_up(
+                &pipelines,
+                compute,
+                regions,
+                routed_gate_up,
+                input_region,
+                scratch_region,
+                &layout,
+                gate_up_params,
+            );
+            dispatch_routed_only_down(
+                &pipelines,
+                compute,
+                regions,
+                routed_down,
+                scratch_region,
+                &layout,
+                down_params,
+            );
+            dispatch_routed_only_combine(
+                &pipelines,
+                compute,
+                regions,
+                scratch_region,
+                output_region,
+                &layout,
+                combine_params,
+            );
+            Ok(())
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .with_work_shape(
+        if participant_count == 1 {
+            DeviceBatchingForm::Scalar
+        } else {
+            DeviceBatchingForm::Packed
+        },
+        participant_count,
+        tokens,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn encode_moe(
@@ -889,6 +1407,131 @@ fn dispatch_routed_down(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn dispatch_routed_only_gate_up(
+    pipelines: &MetalMoePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    weight: RoutedGateUp,
+    input_region: usize,
+    scratch_region: usize,
+    layout: &RoutedMoeWorkspaceLayout,
+    params: Q4ExpertParams,
+) {
+    encoder.set_compute_pipeline_state(&pipelines.routed_gate_up);
+    set_region_offset(encoder, 0, &regions[weight.gate.region], 0);
+    set_region_offset(encoder, 1, &regions[weight.up.region], 0);
+    set_region_offset(encoder, 2, &regions[input_region], 0);
+    set_region_offset(
+        encoder,
+        3,
+        &regions[scratch_region],
+        layout.route_ids.offset_bytes,
+    );
+    set_region_offset(
+        encoder,
+        4,
+        &regions[scratch_region],
+        layout.routed_activation.offset_bytes,
+    );
+    encoder.set_bytes(
+        5,
+        std::mem::size_of::<Q4ExpertParams>() as u64,
+        &params as *const _ as *const c_void,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            u64::from(params.output_features).div_ceil(4),
+            1,
+            u64::from(params.pair_count),
+        ),
+        MTLSize::new(32, 2, 1),
+    );
+}
+
+fn dispatch_routed_only_down(
+    pipelines: &MetalMoePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    weight: RoutedDown,
+    scratch_region: usize,
+    layout: &RoutedMoeWorkspaceLayout,
+    params: Q4ExpertParams,
+) {
+    let (pipeline, region) = match weight {
+        RoutedDown::Q4K(part) => (&pipelines.routed_down, part.region),
+        RoutedDown::Q6K(part) => (&pipelines.routed_down_q6_k, part.region),
+    };
+    encoder.set_compute_pipeline_state(pipeline);
+    set_region_offset(encoder, 0, &regions[region], 0);
+    set_region_offset(
+        encoder,
+        1,
+        &regions[scratch_region],
+        layout.routed_activation.offset_bytes,
+    );
+    set_region_offset(
+        encoder,
+        2,
+        &regions[scratch_region],
+        layout.route_ids.offset_bytes,
+    );
+    set_region_offset(
+        encoder,
+        3,
+        &regions[scratch_region],
+        layout.routed_down_slots.offset_bytes,
+    );
+    encoder.set_bytes(
+        4,
+        std::mem::size_of::<Q4ExpertParams>() as u64,
+        &params as *const _ as *const c_void,
+    );
+    encoder.dispatch_thread_groups(
+        MTLSize::new(
+            u64::from(params.output_features).div_ceil(4),
+            1,
+            u64::from(params.pair_count),
+        ),
+        MTLSize::new(32, 2, 1),
+    );
+}
+
+fn dispatch_routed_only_combine(
+    pipelines: &MetalMoePipelines,
+    encoder: &ComputeCommandEncoderRef,
+    regions: &[MetalBufferRegion],
+    scratch_region: usize,
+    output_region: usize,
+    layout: &RoutedMoeWorkspaceLayout,
+    params: CombineParams,
+) {
+    encoder.set_compute_pipeline_state(&pipelines.routed_combine);
+    set_region_offset(
+        encoder,
+        0,
+        &regions[scratch_region],
+        layout.routed_down_slots.offset_bytes,
+    );
+    set_region_offset(
+        encoder,
+        1,
+        &regions[scratch_region],
+        layout.route_weights.offset_bytes,
+    );
+    set_region_offset(encoder, 2, &regions[output_region], 0);
+    encoder.set_bytes(
+        3,
+        std::mem::size_of::<CombineParams>() as u64,
+        &params as *const _ as *const c_void,
+    );
+    let elements = u64::from(params.tokens) * u64::from(params.hidden_size);
+    encoder.dispatch_thread_groups(
+        MTLSize::new(elements.div_ceil(THREADS_PER_GROUP), 1, 1),
+        MTLSize::new(THREADS_PER_GROUP, 1, 1),
+    );
+}
+
 fn dispatch_combine(
     pipelines: &MetalMoePipelines,
     encoder: &ComputeCommandEncoderRef,
@@ -954,15 +1597,25 @@ fn append_routed_gate_up(
     invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
     attributes: MoeAttributes,
 ) -> Result<RoutedGateUp, String> {
+    append_routed_gate_up_shape(
+        regions,
+        invocation,
+        attributes.expert_count,
+        attributes.routed_intermediate_size,
+        attributes.hidden_size,
+    )
+}
+
+fn append_routed_gate_up_shape(
+    regions: &mut Vec<MetalBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    expert_count: u64,
+    routed_intermediate_size: u64,
+    hidden_size: u64,
+) -> Result<RoutedGateUp, String> {
     let resolved = resolve_shared_weight(invocation, 2, "Metal MoE routed gate/up")?;
     if resolved.logical_element_type() != ElementType::F16
-        || resolved.logical_dimensions()
-            != [
-                attributes.expert_count,
-                2,
-                attributes.routed_intermediate_size,
-                attributes.hidden_size,
-            ]
+        || resolved.logical_dimensions() != [expert_count, 2, routed_intermediate_size, hidden_size]
     {
         return Err("Metal MoE routed gate/up logical weight differs".to_owned());
     }
@@ -976,13 +1629,7 @@ fn append_routed_gate_up(
     let mut prepared = [None, None];
     for part in parts {
         if part.logical_offsets.len() != 4
-            || part.extents
-                != [
-                    attributes.expert_count,
-                    1,
-                    attributes.routed_intermediate_size,
-                    attributes.hidden_size,
-                ]
+            || part.extents != [expert_count, 1, routed_intermediate_size, hidden_size]
             || part.logical_offsets[0] != 0
             || part.logical_offsets[2..] != [0, 0]
             || part.logical_offsets[1] > 1
@@ -997,9 +1644,9 @@ fn append_routed_gate_up(
             &prepared_regions,
             &components,
             &part.layout,
-            attributes.expert_count,
-            attributes.routed_intermediate_size,
-            attributes.hidden_size,
+            expert_count,
+            routed_intermediate_size,
+            hidden_size,
             3,
             "Metal MoE routed gate/up",
         )?);
@@ -1051,6 +1698,72 @@ fn append_routed_down(
         .region
         .checked_add(regions.len())
         .ok_or_else(|| "Metal MoE down region index overflows".to_owned())?;
+    regions.extend(prepared_regions);
+    Ok(part)
+}
+
+fn append_routed_only_down(
+    regions: &mut Vec<MetalBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, MetalDeviceBuffer>,
+    attributes: RoutedMoeAttributes,
+) -> Result<RoutedDown, String> {
+    let resolved = resolve_shared_weight(invocation, 3, "Metal routed-only MoE down")?;
+    if resolved.logical_element_type() != ElementType::F16
+        || resolved.logical_dimensions()
+            != [
+                attributes.expert_count,
+                attributes.hidden_size,
+                attributes.routed_intermediate_size,
+            ]
+    {
+        return Err("Metal routed-only MoE down logical weight differs".to_owned());
+    }
+    let (prepared_regions, components, layout) = resolved.into_command_parts();
+    let MetalResolvedWeightLayout::BlockQuantized { spec, .. } = &layout else {
+        return Err(
+            "Metal routed-only MoE down is not one Q4_K/Q6_K physical block stack".to_owned(),
+        );
+    };
+    let region_base = regions.len();
+    let part = match spec.format_id.as_str() {
+        Q4_K_FORMAT_ID => {
+            let mut part = prepare_q4_expert_part(
+                &prepared_regions,
+                &components,
+                &layout,
+                attributes.expert_count,
+                attributes.hidden_size,
+                attributes.routed_intermediate_size,
+                2,
+                "Metal routed-only MoE down",
+            )?;
+            part.region = part.region.checked_add(region_base).ok_or_else(|| {
+                "Metal routed-only MoE Q4_K down region index overflows".to_owned()
+            })?;
+            RoutedDown::Q4K(part)
+        }
+        Q6_K_FORMAT_ID => {
+            let mut part = prepare_q6_expert_part(
+                &prepared_regions,
+                &components,
+                &layout,
+                attributes.expert_count,
+                attributes.hidden_size,
+                attributes.routed_intermediate_size,
+                2,
+                "Metal routed-only MoE down",
+            )?;
+            part.region = part.region.checked_add(region_base).ok_or_else(|| {
+                "Metal routed-only MoE Q6_K down region index overflows".to_owned()
+            })?;
+            RoutedDown::Q6K(part)
+        }
+        format => {
+            return Err(format!(
+                "Metal routed-only MoE down block format `{format}` is not Q4_K or Q6_K"
+            ))
+        }
+    };
     regions.extend(prepared_regions);
     Ok(part)
 }
@@ -1131,6 +1844,88 @@ fn prepare_q4_expert_part(
         return Err(format!("{context} physical byte length differs"));
     }
     Ok(Q4ExpertPart {
+        region: *component,
+        row_stride_bytes: checked_u32(row_stride_bytes, &format!("{context} row stride"))?,
+        expert_stride_bytes: checked_u32(expert_stride_bytes, &format!("{context} expert stride"))?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_q6_expert_part(
+    regions: &[MetalBufferRegion],
+    components: &[MetalResolvedWeightComponent],
+    layout: &MetalResolvedWeightLayout,
+    expert_count: u64,
+    output_features: u64,
+    input_features: u64,
+    expected_block_axis: u32,
+    context: &str,
+) -> Result<Q6ExpertPart, String> {
+    let MetalResolvedWeightLayout::BlockQuantized {
+        component,
+        spec,
+        block_axis,
+        block_padding,
+    } = layout
+    else {
+        return Err(format!("{context} is not one Q6_K physical block stack"));
+    };
+    if spec.format_id.as_str() != Q6_K_FORMAT_ID
+        || spec.logical_values_per_block != Q6_K_VALUES_PER_BLOCK as u32
+        || spec.bytes_per_block != Q6_K_BYTES_PER_BLOCK as u32
+        || *block_axis != expected_block_axis
+        || block_padding != &PhysicalWeightPadding::Exact
+        || !input_features.is_multiple_of(Q6_K_VALUES_PER_BLOCK)
+    {
+        return Err(format!("{context} Q6_K physical ABI differs"));
+    }
+    let metadata = components
+        .get(*component)
+        .ok_or_else(|| format!("{context} component metadata is absent"))?;
+    if metadata.encoding() != &WeightEncoding::BlockQuantized(spec.clone()) {
+        return Err(format!("{context} component encoding differs"));
+    }
+    let blocks_per_row = input_features / Q6_K_VALUES_PER_BLOCK;
+    let dimensions = metadata.physical_dimensions();
+    let element_count = dimensions.iter().try_fold(1_u64, |total, extent| {
+        total
+            .checked_mul(*extent)
+            .ok_or_else(|| format!("{context} physical shape overflows"))
+    })?;
+    if dimensions.first() != Some(&expert_count)
+        || dimensions.last() != Some(&blocks_per_row)
+        || element_count
+            != expert_count
+                .checked_mul(output_features)
+                .and_then(|value| value.checked_mul(blocks_per_row))
+                .ok_or_else(|| format!("{context} physical element count overflows"))?
+    {
+        return Err(format!(
+            "{context} physical stack is not expert-major row-major Q6_K"
+        ));
+    }
+    let region = regions
+        .get(*component)
+        .ok_or_else(|| format!("{context} physical region is absent"))?;
+    let row_stride_bytes = checked_mul(
+        blocks_per_row,
+        Q6_K_BYTES_PER_BLOCK,
+        &format!("{context} row stride"),
+    )?;
+    let expert_stride_bytes = checked_mul(
+        output_features,
+        row_stride_bytes,
+        &format!("{context} expert stride"),
+    )?;
+    let expected_bytes = checked_mul(
+        expert_count,
+        expert_stride_bytes,
+        &format!("{context} total bytes"),
+    )?;
+    if region.length_bytes() != expected_bytes {
+        return Err(format!("{context} physical byte length differs"));
+    }
+    Ok(Q6ExpertPart {
         region: *component,
         row_stride_bytes: checked_u32(row_stride_bytes, &format!("{context} row stride"))?,
         expert_stride_bytes: checked_u32(expert_stride_bytes, &format!("{context} expert stride"))?,
@@ -1227,6 +2022,58 @@ fn validate_participant(
     Ok(())
 }
 
+fn validate_routed_participant(
+    bindings: &[ResolvedValueBinding],
+    attributes: RoutedMoeAttributes,
+) -> Result<(), String> {
+    let input = binding(bindings, ResolvedValueRole::Input, 0)?;
+    let [canonical_tokens, hidden_size] = input.tensor().dimensions() else {
+        return Err("Metal routed-only MoE input is not two-dimensional".to_owned());
+    };
+    if *hidden_size != attributes.hidden_size || !f16_contiguous(input) {
+        return Err(
+            "Metal routed-only MoE input differs from [tokens, hidden] F16 contiguous".to_owned(),
+        );
+    }
+    let expected = [
+        (1, vec![attributes.expert_count, attributes.hidden_size]),
+        (
+            2,
+            vec![
+                attributes.expert_count,
+                2,
+                attributes.routed_intermediate_size,
+                attributes.hidden_size,
+            ],
+        ),
+        (
+            3,
+            vec![
+                attributes.expert_count,
+                attributes.hidden_size,
+                attributes.routed_intermediate_size,
+            ],
+        ),
+    ];
+    for (ordinal, dimensions) in expected {
+        let value = binding(bindings, ResolvedValueRole::Input, ordinal)?;
+        if value.tensor().dimensions() != dimensions || !f16_contiguous(value) {
+            return Err(format!(
+                "Metal routed-only MoE input {ordinal} differs from shape {dimensions:?} F16 contiguous"
+            ));
+        }
+    }
+    let output = binding(bindings, ResolvedValueRole::Output, 0)?;
+    if output.tensor().dimensions() != [*canonical_tokens, attributes.hidden_size]
+        || !f16_contiguous(output)
+    {
+        return Err(
+            "Metal routed-only MoE output differs from [tokens, hidden] F16 contiguous".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_workspace_regions(
     scratch: &MetalBufferRegion,
     layout: &MoeWorkspaceLayout,
@@ -1254,6 +2101,31 @@ fn validate_workspace_regions(
     Ok(())
 }
 
+fn validate_routed_workspace_regions(
+    scratch: &MetalBufferRegion,
+    layout: &RoutedMoeWorkspaceLayout,
+) -> Result<(), String> {
+    for (name, region) in [
+        ("router logits", layout.router_logits),
+        ("route IDs", layout.route_ids),
+        ("route weights", layout.route_weights),
+        ("routed activation", layout.routed_activation),
+        ("routed down slots", layout.routed_down_slots),
+    ] {
+        if region.length_bytes == 0
+            || region
+                .offset_bytes
+                .checked_add(region.length_bytes)
+                .is_none_or(|end| end > scratch.length_bytes())
+        {
+            return Err(format!(
+                "Metal routed-only MoE {name} exceeds admitted scratch"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn router_threadgroup_bytes(attributes: MoeAttributes) -> Result<u64, String> {
     let float_count = attributes
         .expert_count
@@ -1273,6 +2145,29 @@ fn router_threadgroup_bytes(attributes: MoeAttributes) -> Result<u64, String> {
     float_bytes
         .checked_add(id_bytes)
         .ok_or_else(|| "Metal MoE router threadgroup bytes overflow".to_owned())
+}
+
+fn routed_router_threadgroup_bytes(attributes: RoutedMoeAttributes) -> Result<u64, String> {
+    let float_count = attributes
+        .expert_count
+        .checked_add(attributes.experts_per_token)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            "Metal routed-only MoE router threadgroup float count overflows".to_owned()
+        })?;
+    let float_bytes = checked_mul(
+        float_count,
+        ElementType::F32.size_bytes(),
+        "Metal routed-only MoE router threadgroup float bytes",
+    )?;
+    let id_bytes = checked_mul(
+        attributes.experts_per_token,
+        ElementType::I32.size_bytes(),
+        "Metal routed-only MoE router threadgroup ID bytes",
+    )?;
+    float_bytes
+        .checked_add(id_bytes)
+        .ok_or_else(|| "Metal routed-only MoE router threadgroup bytes overflow".to_owned())
 }
 
 fn unsigned_attribute(
@@ -1366,7 +2261,24 @@ mod tests {
     }
 
     #[test]
-    fn q4k_routed_half_kernels_match_dequantized_cpu() {
+    fn q4k_q6k_routed_workspace_formula_covers_runtime_layout() {
+        let attributes = RoutedMoeAttributes {
+            hidden_size: 2048,
+            expert_count: 128,
+            experts_per_token: 8,
+            routed_intermediate_size: 768,
+            normalize_topk: true,
+        };
+        let (fixed, per_token) = routed_workspace_formula_terms(attributes).unwrap();
+        for tokens in [1_u64, 4, 16, 96] {
+            let layout = RoutedMoeWorkspaceLayout::new(tokens, attributes).unwrap();
+            assert!(layout.total_bytes <= fixed + tokens * per_token);
+            assert_eq!(layout.pair_count, tokens * attributes.experts_per_token);
+        }
+    }
+
+    #[test]
+    fn mixed_q4k_q6k_routed_down_kernels_match_dequantized_cpu() {
         const EXPERTS: usize = 2;
         const TOKENS: usize = 2;
         const TOP_K: usize = 1;
@@ -1378,7 +2290,7 @@ mod tests {
             return;
         };
         let cpu = CandleDevice::Cpu;
-        let quantized_stack = |seed: usize, rows: usize, columns: usize| {
+        let quantized_stack = |seed: usize, rows: usize, columns: usize, dtype: GgmlDType| {
             let mut bytes = Vec::new();
             let mut dequantized = Vec::new();
             for expert in 0..EXPERTS {
@@ -1386,7 +2298,7 @@ mod tests {
                     .map(|index| (((index + expert * 131 + seed) as f32) * 0.017).sin() * 0.08)
                     .collect::<Vec<_>>();
                 let dense = Tensor::from_vec(values, (rows, columns), &cpu).unwrap();
-                let quantized = QTensor::quantize(&dense, GgmlDType::Q4K).unwrap();
+                let quantized = QTensor::quantize(&dense, dtype).unwrap();
                 bytes.extend_from_slice(&quantized.data().unwrap());
                 dequantized.push(
                     quantized
@@ -1400,9 +2312,10 @@ mod tests {
             }
             (bytes, dequantized)
         };
-        let (gate_bytes, gate) = quantized_stack(7, INTERMEDIATE, HIDDEN);
-        let (up_bytes, up) = quantized_stack(23, INTERMEDIATE, HIDDEN);
-        let (down_bytes, down) = quantized_stack(41, HIDDEN, INTERMEDIATE);
+        let (gate_bytes, gate) = quantized_stack(7, INTERMEDIATE, HIDDEN, GgmlDType::Q4K);
+        let (up_bytes, up) = quantized_stack(23, INTERMEDIATE, HIDDEN, GgmlDType::Q4K);
+        let (down_q4_bytes, down_q4) = quantized_stack(41, HIDDEN, INTERMEDIATE, GgmlDType::Q4K);
+        let (down_q6_bytes, down_q6) = quantized_stack(59, HIDDEN, INTERMEDIATE, GgmlDType::Q6K);
         let input = (0..TOKENS * HIDDEN)
             .map(|index| f16::from_f32(((index as f32) * 0.031).cos() * 0.12))
             .collect::<Vec<_>>();
@@ -1412,7 +2325,10 @@ mod tests {
         };
         let gate_buffer = shared_buffer(gate_bytes.as_ptr() as *const c_void, gate_bytes.len());
         let up_buffer = shared_buffer(up_bytes.as_ptr() as *const c_void, up_bytes.len());
-        let down_buffer = shared_buffer(down_bytes.as_ptr() as *const c_void, down_bytes.len());
+        let down_buffers = [
+            shared_buffer(down_q4_bytes.as_ptr() as *const c_void, down_q4_bytes.len()),
+            shared_buffer(down_q6_bytes.as_ptr() as *const c_void, down_q6_bytes.len()),
+        ];
         let input_buffer = shared_buffer(
             input.as_ptr() as *const c_void,
             input.len() * std::mem::size_of::<f16>(),
@@ -1425,10 +2341,16 @@ mod tests {
             (TOKENS * TOP_K * INTERMEDIATE * std::mem::size_of::<f16>()) as u64,
             MTLResourceOptions::StorageModeShared,
         );
-        let output_buffer = device.new_buffer(
-            (TOKENS * TOP_K * HIDDEN * std::mem::size_of::<f16>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let output_buffers = [
+            device.new_buffer(
+                (TOKENS * TOP_K * HIDDEN * std::mem::size_of::<f16>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            device.new_buffer(
+                (TOKENS * TOP_K * HIDDEN * std::mem::size_of::<f16>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+        ];
 
         let pipelines = MetalMoePipelines::new(&device).unwrap();
         let queue = device.new_command_queue();
@@ -1462,71 +2384,85 @@ mod tests {
             ),
             MTLSize::new(32, 2, 1),
         );
-        let down_params = Q4ExpertParams {
-            output_features: HIDDEN as u32,
-            input_features: INTERMEDIATE as u32,
-            row_stride_bytes: Q4_K_BYTES_PER_BLOCK as u32,
-            expert_stride_bytes: (HIDDEN as u64 * Q4_K_BYTES_PER_BLOCK) as u32,
-            ..gate_up_params
-        };
-        encoder.set_compute_pipeline_state(&pipelines.routed_down);
-        encoder.set_buffer(0, Some(&down_buffer), 0);
-        encoder.set_buffer(1, Some(&activation_buffer), 0);
-        encoder.set_buffer(2, Some(&ids_buffer), 0);
-        encoder.set_buffer(3, Some(&output_buffer), 0);
-        encoder.set_bytes(
-            4,
-            std::mem::size_of::<Q4ExpertParams>() as u64,
-            &down_params as *const _ as *const c_void,
-        );
-        encoder.dispatch_thread_groups(
-            MTLSize::new((HIDDEN as u64).div_ceil(4), 1, (TOKENS * TOP_K) as u64),
-            MTLSize::new(32, 2, 1),
-        );
+        for (index, (pipeline, block_bytes)) in [
+            (&pipelines.routed_down, Q4_K_BYTES_PER_BLOCK),
+            (&pipelines.routed_down_q6_k, Q6_K_BYTES_PER_BLOCK),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let down_params = Q4ExpertParams {
+                output_features: HIDDEN as u32,
+                input_features: INTERMEDIATE as u32,
+                row_stride_bytes: block_bytes as u32,
+                expert_stride_bytes: (HIDDEN as u64 * block_bytes) as u32,
+                ..gate_up_params
+            };
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&down_buffers[index]), 0);
+            encoder.set_buffer(1, Some(&activation_buffer), 0);
+            encoder.set_buffer(2, Some(&ids_buffer), 0);
+            encoder.set_buffer(3, Some(&output_buffers[index]), 0);
+            encoder.set_bytes(
+                4,
+                std::mem::size_of::<Q4ExpertParams>() as u64,
+                &down_params as *const _ as *const c_void,
+            );
+            encoder.dispatch_thread_groups(
+                MTLSize::new((HIDDEN as u64).div_ceil(4), 1, (TOKENS * TOP_K) as u64),
+                MTLSize::new(32, 2, 1),
+            );
+        }
         encoder.end_encoding();
         command.commit();
         command.wait_until_completed();
         assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
 
-        let actual = unsafe {
-            std::slice::from_raw_parts(
-                output_buffer.contents() as *const f16,
-                TOKENS * TOP_K * HIDDEN,
-            )
-        };
-        for token in 0..TOKENS {
-            let expert = route_ids[token] as usize;
-            let input_row = &input[token * HIDDEN..(token + 1) * HIDDEN];
-            let mut activation = vec![0.0_f32; INTERMEDIATE];
-            for row in 0..INTERMEDIATE {
-                let gate_value = input_row
-                    .iter()
-                    .zip(&gate[expert][row * HIDDEN..(row + 1) * HIDDEN])
-                    .map(|(input, weight)| input.to_f32() * weight)
-                    .sum::<f32>();
-                let up_value = input_row
-                    .iter()
-                    .zip(&up[expert][row * HIDDEN..(row + 1) * HIDDEN])
-                    .map(|(input, weight)| input.to_f32() * weight)
-                    .sum::<f32>();
-                activation[row] =
-                    f16::from_f32((gate_value / (1.0 + (-gate_value).exp())) * up_value).to_f32();
-            }
-            for row in 0..HIDDEN {
-                let expected = f16::from_f32(
-                    activation
-                        .iter()
-                        .zip(&down[expert][row * INTERMEDIATE..(row + 1) * INTERMEDIATE])
-                        .map(|(input, weight)| input * weight)
-                        .sum::<f32>(),
+        for (format, output_buffer, down) in [
+            ("Q4_K", &output_buffers[0], &down_q4),
+            ("Q6_K", &output_buffers[1], &down_q6),
+        ] {
+            let actual = unsafe {
+                std::slice::from_raw_parts(
+                    output_buffer.contents() as *const f16,
+                    TOKENS * TOP_K * HIDDEN,
                 )
-                .to_f32();
-                let observed = actual[token * HIDDEN + row].to_f32();
-                let tolerance = 0.02 + expected.abs() * 0.04;
-                assert!(
-                    (observed - expected).abs() <= tolerance,
-                    "token={token} row={row} observed={observed} expected={expected} tolerance={tolerance}"
-                );
+            };
+            for token in 0..TOKENS {
+                let expert = route_ids[token] as usize;
+                let input_row = &input[token * HIDDEN..(token + 1) * HIDDEN];
+                let mut activation = vec![0.0_f32; INTERMEDIATE];
+                for row in 0..INTERMEDIATE {
+                    let gate_value = input_row
+                        .iter()
+                        .zip(&gate[expert][row * HIDDEN..(row + 1) * HIDDEN])
+                        .map(|(input, weight)| input.to_f32() * weight)
+                        .sum::<f32>();
+                    let up_value = input_row
+                        .iter()
+                        .zip(&up[expert][row * HIDDEN..(row + 1) * HIDDEN])
+                        .map(|(input, weight)| input.to_f32() * weight)
+                        .sum::<f32>();
+                    activation[row] =
+                        f16::from_f32((gate_value / (1.0 + (-gate_value).exp())) * up_value)
+                            .to_f32();
+                }
+                for row in 0..HIDDEN {
+                    let expected = f16::from_f32(
+                        activation
+                            .iter()
+                            .zip(&down[expert][row * INTERMEDIATE..(row + 1) * INTERMEDIATE])
+                            .map(|(input, weight)| input * weight)
+                            .sum::<f32>(),
+                    )
+                    .to_f32();
+                    let observed = actual[token * HIDDEN + row].to_f32();
+                    let tolerance = 0.02 + expected.abs() * 0.04;
+                    assert!(
+                        (observed - expected).abs() <= tolerance,
+                        "format={format} token={token} row={row} observed={observed} expected={expected} tolerance={tolerance}"
+                    );
+                }
             }
         }
     }
