@@ -64,6 +64,13 @@ MATRIX_EVIDENCE_CLOSURE_FILES = frozenset(
         "scripts/release/runtime_vnext_r1_product_correctness.py",
     }
 )
+LLAMA_RUNNER_EVIDENCE_CLOSURE_FILES = frozenset(
+    {
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
+        "scripts/release/run_scenarios.py",
+        "scripts/release/runtime_vnext_r1_product_correctness.py",
+    }
+)
 OUTER_GATE_FIELDS = {
     "artifact_dir",
     "binary",
@@ -330,6 +337,24 @@ def source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[st
     }
 
 
+def matrix_source_change_policy(changed: list[str], lane: MatrixLane) -> str:
+    allowed = LLAMA_RUNNER_EVIDENCE_CLOSURE_FILES
+    policy = "llama-runner-r1-control-plane-only"
+    if lane.model_key == "m1-qwen35-4b":
+        allowed = allowed | MATRIX_EVIDENCE_CLOSURE_FILES
+        policy = "m1-r1-matrix-control-plane-only"
+    rejected = [path for path in changed if path not in allowed]
+    require(
+        not rejected,
+        f"{lane.key} matrix evidence is stale after non-control-plane changes: {rejected[:8]}",
+    )
+    require(
+        changed,
+        f"{lane.key} source identity differs without an observable git diff",
+    )
+    return policy
+
+
 def matrix_source_closure(
     recorded: dict[str, Any],
     current: dict[str, Any],
@@ -349,10 +374,6 @@ def matrix_source_closure(
             "changed_file_count": 0,
             "policy": "exact-source",
         }
-    require(
-        lane.model_key == "m1-qwen35-4b",
-        f"{lane.key} matrix evidence must match current source exactly",
-    )
     ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", recorded_sha, current["git_sha"]],
         cwd=REPO_ROOT,
@@ -373,23 +394,13 @@ def matrix_source_closure(
         ).splitlines()
         if line
     ]
-    rejected = [
-        path for path in changed if path not in MATRIX_EVIDENCE_CLOSURE_FILES
-    ]
-    require(
-        not rejected,
-        f"{lane.key} matrix evidence is stale after non-control-plane changes: {rejected[:8]}",
-    )
-    require(
-        changed,
-        f"{lane.key} source identity differs without an observable git diff",
-    )
+    policy = matrix_source_change_policy(changed, lane)
     return {
         "from_git_sha": recorded_sha,
         "to_git_sha": current["git_sha"],
         "changed_files": changed,
         "changed_file_count": len(changed),
-        "policy": "m1-r1-matrix-control-plane-only",
+        "policy": policy,
     }
 
 
@@ -1481,6 +1492,21 @@ def self_test() -> int:
         exact_closure["policy"] == "exact-source"
         and exact_closure["changed_file_count"] == 0,
         "matrix exact-source closure differs",
+    )
+    require(
+        matrix_source_change_policy(
+            ["scripts/release/run_scenarios.py"],
+            MATRIX_LANES["m2_metal"],
+        )
+        == "llama-runner-r1-control-plane-only",
+        "Llama runner closure rejected its sole execution input",
+    )
+    expect_reject(
+        lambda: matrix_source_change_policy(
+            ["crates/ferrum-cli/src/commands/serve.rs"],
+            MATRIX_LANES["m2_metal"],
+        ),
+        "Llama runner closure product source",
     )
     with tempfile.TemporaryDirectory(prefix="ferrum-r1-selftest-") as temporary:
         root = Path(temporary).resolve()
