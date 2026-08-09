@@ -106,8 +106,9 @@ reasoning 模式错误或 history 不一致仍必须 REJECT。
 M1 已通过工件只有在记录 SHA 是当前 SHA 的祖先，且中间变化严格限于本修订的文档与 R1
 矩阵控制面文件时才可复用。任何 `crates/`、Cargo、模型锁、运行配置、产品场景 manifest 或生产
 实现变化都会使工件 stale。M2/M3 工件原则上必须与当前 source 完全一致；唯一的祖先复用例外
-是 diff 严格限于 Llama supplemental 控制面：`scripts/release/run_scenarios.py`、本修订文档和
-`scripts/release/runtime_vnext_r1_product_correctness.py`。该例外不覆盖任何 `crates/`、Cargo、模型锁、
-运行配置、matrix runner、matrix scenario manifest 或生产实现变化，也不免除 Llama 自身在当前
-source 上重跑完整 `run`/`serve`/stream 三用例。validator 必须有正例接受 runner-only diff，并有
-反例拒绝任一产品源码 diff。
+是 diff 严格限于不参与 matrix 执行的 R1 控制面：`scripts/release/run_scenarios.py`、本修订文档、
+`scripts/release/runtime_vnext_r1_product_correctness.py`，以及只记录 reviewed source SHA 的
+`scripts/release/configs/runtime_vnext_g08a_source_contract.json`。该例外不覆盖任何 `crates/`、Cargo、
+模型锁、运行配置、matrix runner、matrix scenario manifest 或生产实现变化，也不免除 Llama 自身
+在当前 source 上重跑完整 `run`/`serve`/stream 三用例。validator 必须有正例接受上述因果隔离 diff，
+并有反例拒绝任一产品源码 diff。

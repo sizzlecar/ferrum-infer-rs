@@ -64,9 +64,10 @@ MATRIX_EVIDENCE_CLOSURE_FILES = frozenset(
         "scripts/release/runtime_vnext_r1_product_correctness.py",
     }
 )
-LLAMA_RUNNER_EVIDENCE_CLOSURE_FILES = frozenset(
+R1_CAUSALLY_ISOLATED_EVIDENCE_FILES = frozenset(
     {
         "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
+        "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
         "scripts/release/run_scenarios.py",
         "scripts/release/runtime_vnext_r1_product_correctness.py",
     }
@@ -338,8 +339,8 @@ def source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[st
 
 
 def matrix_source_change_policy(changed: list[str], lane: MatrixLane) -> str:
-    allowed = LLAMA_RUNNER_EVIDENCE_CLOSURE_FILES
-    policy = "llama-runner-r1-control-plane-only"
+    allowed = R1_CAUSALLY_ISOLATED_EVIDENCE_FILES
+    policy = "r1-causally-isolated-control-plane-only"
     if lane.model_key == "m1-qwen35-4b":
         allowed = allowed | MATRIX_EVIDENCE_CLOSURE_FILES
         policy = "m1-r1-matrix-control-plane-only"
@@ -1495,11 +1496,14 @@ def self_test() -> int:
     )
     require(
         matrix_source_change_policy(
-            ["scripts/release/run_scenarios.py"],
+            [
+                "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
+                "scripts/release/run_scenarios.py",
+            ],
             MATRIX_LANES["m2_metal"],
         )
-        == "llama-runner-r1-control-plane-only",
-        "Llama runner closure rejected its sole execution input",
+        == "r1-causally-isolated-control-plane-only",
+        "R1 causal closure rejected isolated gate inputs",
     )
     expect_reject(
         lambda: matrix_source_change_policy(

@@ -54,7 +54,7 @@
         {
             "path": "crates/ferrum-models/src/vnext/mod.rs",
             "owner": "ferrum-models/vnext-product-registry",
-            "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+            "reviewed_at_git_sha": "4a6e2c8e52da4dd4b2a802a4e581b7a8544647a8",
             "reason": "The product registry owns the unique Qwen3.5 metadata-to-provider route and the explicit legacy migration ledger."
         }
     ],
@@ -216,7 +216,7 @@
             "symbol": "qwen35_family_registration",
             "line_hint": 78,
             "owner": "ferrum-models/vnext-product-registry",
-            "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+            "reviewed_at_git_sha": "4a6e2c8e52da4dd4b2a802a4e581b7a8544647a8",
             "required_fragments": [
                 "Qwen35FamilyProvider::new",
                 "TypedFamilyRegistration::new"
@@ -227,7 +227,7 @@
 	            "symbol": "resolve_registered_model",
 	            "line_hint": 759,
 	            "owner": "ferrum-models/vnext-product-registry",
-	            "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+	            "reviewed_at_git_sha": "4a6e2c8e52da4dd4b2a802a4e581b7a8544647a8",
 	            "required_fragments": [
 	                "MODEL_LOADERS.iter",
 	                "LEGACY_MODELS",
