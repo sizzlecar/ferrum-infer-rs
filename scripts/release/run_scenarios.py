@@ -1561,6 +1561,12 @@ class ScenarioRunner:
             extra_args = server.get("args")
             if isinstance(extra_args, list):
                 cmd.extend(str(part) for part in extra_args)
+        model_path = Path(self.model)
+        if model_path.is_file() and model_path.suffix.lower() == ".gguf":
+            # Direct GGUF sources default to a file-stem public id. The
+            # scenarios send the requested model verbatim, so register that
+            # same path as an explicit public alias for the started server.
+            cmd.extend(["--served-model-name", self.model])
         cmd.append(self.model)
         binary_path = self.ferrum_bin
         if not binary_path.is_absolute():
