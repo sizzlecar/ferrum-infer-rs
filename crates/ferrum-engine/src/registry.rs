@@ -1460,24 +1460,26 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             model_def.architecture, model_def.num_hidden_layers, model_def.vocab_size
         );
 
-        // Determine device
-        let candle_device = match &config.device {
-            Device::CPU => CandleDevice::Cpu,
-            #[cfg(feature = "candle-cuda-compat")]
-            Device::CUDA(id) => CandleDevice::new_cuda(*id)
-                .map_err(|e| FerrumError::device(format!("CUDA error: {}", e)))?,
-            #[cfg(not(feature = "candle-cuda-compat"))]
-            Device::CUDA(_) => {
-                return Err(FerrumError::unsupported(
-                    "legacy CUDA registry path requires the candle-cuda-compat feature; \
-                     migrated CUDA models must use the vNext product path",
-                ));
-            }
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            Device::Metal => CandleDevice::new_metal(0)
-                .map_err(|e| FerrumError::device(format!("Metal error: {}", e)))?,
-            Device::ROCm(_) => {
-                return Err(FerrumError::device("ROCm not yet supported"));
+        // Dense decoder families below use Ferrum's Backend<B> stack and do
+        // not need a Candle device. Resolve the legacy Candle device lazily so
+        // the official CUDA graph can run those families without enabling the
+        // explicit candle-cuda-compat feature. Candle-backed BERT/CLIP/Whisper
+        // arms still fail closed on CUDA unless that compatibility feature is
+        // intentionally selected.
+        let legacy_candle_device = || -> Result<CandleDevice> {
+            match &config.device {
+                Device::CPU => Ok(CandleDevice::Cpu),
+                #[cfg(feature = "candle-cuda-compat")]
+                Device::CUDA(id) => CandleDevice::new_cuda(*id)
+                    .map_err(|e| FerrumError::device(format!("CUDA error: {}", e))),
+                #[cfg(not(feature = "candle-cuda-compat"))]
+                Device::CUDA(_) => Err(FerrumError::unsupported(
+                    "legacy Candle CUDA executors require the candle-cuda-compat feature",
+                )),
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                Device::Metal => CandleDevice::new_metal(0)
+                    .map_err(|e| FerrumError::device(format!("Metal error: {}", e))),
+                Device::ROCm(_) => Err(FerrumError::device("ROCm not yet supported")),
             }
         };
 
@@ -1709,7 +1711,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 let executor = ferrum_models::BertModelExecutor::from_path(
                     &model_path,
                     &model_def,
-                    candle_device.clone(),
+                    legacy_candle_device()?,
                 )
                 .await?;
 
@@ -1719,7 +1721,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 info!("Using CLIP executor for multimodal embeddings");
                 let executor = ferrum_models::ClipModelExecutor::from_path(
                     &model_path,
-                    candle_device.clone(),
+                    legacy_candle_device()?,
                     dtype,
                 )?;
                 Ok(Arc::new(executor))
@@ -1728,7 +1730,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                 info!("Using Whisper executor for ASR");
                 let executor = ferrum_models::WhisperModelExecutor::from_path(
                     &model_path,
-                    candle_device.clone(),
+                    legacy_candle_device()?,
                     dtype,
                 )?;
                 Ok(Arc::new(executor))
