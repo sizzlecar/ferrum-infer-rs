@@ -1,0 +1,2346 @@
+#!/usr/bin/env python3
+"""Collect one formal R2 Ferrum-only model/backend performance lane.
+
+The collector intentionally has no external-engine, legacy-binary, or ABBA
+execution path.  One Ferrum server process executes the complete backend cell
+matrix in order, followed by three independent ``ferrum run`` processes.
+Collection PASS means the immutable raw lane evidence is complete; the R2
+aggregate validator remains responsible for baseline and threshold decisions.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import os
+import re
+import selectors
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+try:
+    import runtime_vnext_performance_collector as collector_support
+except ModuleNotFoundError:
+    from scripts.release import runtime_vnext_performance_collector as collector_support
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+COLLECTOR_PATH = Path(__file__).resolve()
+COLLECTOR_RELATIVE_PATH = COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
+SUPPORT_PATH = Path(collector_support.__file__).resolve()
+RESOURCE_SAMPLER_PATH = Path(collector_support.RESOURCE_SAMPLER_PATH).resolve()
+SCHEMA_VERSION = 1
+CONTRACT = "ferrum.runtime-vnext.r2.ferrum-collector.v1"
+PASS_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR PASS"
+PLAN_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR PLAN"
+SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR SELFTEST PASS"
+TEMPLATE_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR CONFIG TEMPLATE"
+MODEL_KEYS = {
+    "m1-qwen35-4b",
+    "m2-qwen35-35b-a3b",
+    "m3-qwen3-30b-a3b",
+}
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+RUN_PROMPT = (
+    "Write the integers from 1 through 100 in ascending order, separated only "
+    "by single spaces. Do not add commentary."
+)
+RUN_SAMPLE_COUNT = 3
+RUN_MAX_TOKENS = 128
+WARMUP_REQUESTS = 10
+SEED = 9271
+ACTIVE_PROBE = {
+    "format": "json",
+    "path": "/health",
+    "selector": "engine.active_requests",
+}
+RESERVED_EXTRA_OPTIONS = {
+    "--backend",
+    "--host",
+    "--port",
+    "--max-num-seqs",
+    "--runtime-memory-budget-bytes",
+    "--effective-config-json",
+    "--semantic-source",
+    "--tokenizer-source",
+    "--served-model-name",
+    "--profile-detail",
+    "--profile-jsonl",
+    "--memory-profile-jsonl",
+    "--scheduler-trace-jsonl",
+    "--prompt",
+    "--max-tokens",
+    "--seed",
+    "--temperature",
+    "--top-k",
+    "--top-p",
+    "--repeat-penalty",
+    "--output-format",
+    "--enable-thinking",
+    "--disable-thinking",
+}
+
+
+class R2CollectorError(RuntimeError):
+    pass
+
+
+def require(condition: bool, message: str) -> None:
+    if not condition:
+        raise R2CollectorError(message)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def config_template() -> dict[str, Any]:
+    """Return the complete minimum operator-authored config shape.
+
+    The template defaults to the locked Metal lane.  For CUDA, operators change
+    ``backend``, the backend-specific candidate/hardware values, and provide the
+    ``sharegpt`` path; both realistic dataset keys remain visible so that one
+    template documents the complete two-backend schema.
+    """
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "model_key": "m1-qwen35-4b",
+        "backend": "metal",
+        "request_model": "m1-qwen35-4b",
+        "models_lock_path": "/absolute/path/to/models.lock.json",
+        "correctness_manifest_path": "/absolute/path/to/r1-aggregate-manifest.json",
+        "model_origin_path": "/absolute/path/to/locked-model",
+        "semantic_source_root": "/absolute/path/to/semantic-source",
+        "tokenizer_source_root": "/absolute/path/to/tokenizer-source",
+        "candidate": {
+            "binary_path": "/absolute/path/to/ferrum",
+            "build_log_path": "/absolute/path/to/clean-build.log",
+            "build_receipt_path": "/absolute/path/to/clean-build-receipt.json",
+            "source_git_sha": "0000000000000000000000000000000000000000",
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "cargo_features": ["metal"],
+            "env": {},
+        },
+        "hardware": {
+            "id": "m1-max-24gpu-32g",
+            "fingerprint": "replace-with-immutable-hardware-fingerprint",
+            "accelerator_model": "Apple M1 Max",
+            "accelerator_count": 1,
+            "gpu_core_count": 24,
+            "memory_bytes": 34359738368,
+        },
+        "typed_active_cap": 16,
+        "memory_budget_bytes": 30064771072,
+        "server": {
+            "host": "127.0.0.1",
+            "port": 18080,
+            "ready_timeout_sec": 900,
+            "shutdown_timeout_sec": 60,
+            "command_timeout_sec": 7200,
+            "extra_serve_argv": [],
+        },
+        "run": {"extra_argv": []},
+        "datasets": {
+            "real-chat": "/absolute/path/to/real-chat.jsonl",
+            "sharegpt": "/absolute/path/to/sharegpt.jsonl",
+        },
+        "goodput_slo": {"ttft": 500.0, "tpot": 50.0, "e2e": 30000.0},
+    }
+
+
+def write_config_template(path: Path) -> Path:
+    output = path.expanduser().resolve()
+    require(not output.exists(), f"refusing to overwrite config template: {output}")
+    atomic_write_json(output, config_template())
+    print(f"{TEMPLATE_PREFIX}: {output}")
+    return output
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise R2CollectorError(f"cannot read JSON {path}: {exc}") from exc
+    require(isinstance(value, dict), f"JSON root must be an object: {path}")
+    return value
+
+
+def file_sha256(path: Path) -> str:
+    return collector_support.file_sha256(path)
+
+
+def canonical_json_sha256(value: Any) -> str:
+    return collector_support.canonical_json_sha256(value)
+
+
+def artifact_relative(root: Path, path: Path) -> str:
+    return collector_support.artifact_relative(root, path)
+
+
+def artifact_ref(root: Path, path: Path, *, kind: str) -> dict[str, Any]:
+    require(path.is_file(), f"artifact is missing: {path}")
+    return {
+        "kind": kind,
+        "path": artifact_relative(root, path),
+        "sha256": file_sha256(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    collector_support.atomic_write_json(path, value)
+
+
+def atomic_write_text(path: Path, value: str) -> None:
+    collector_support.atomic_write_text(path, value)
+
+
+def duration_seconds(started_at: str, finished_at: str) -> float:
+    return collector_support.duration_seconds(started_at, finished_at)
+
+
+def expected_cells(backend: str) -> tuple[dict[str, Any], ...]:
+    require(backend in {"cuda", "metal"}, f"unsupported backend: {backend}")
+    random_input = 256 if backend == "cuda" else 64
+    random_concurrency = (1, 4, 16, 32) if backend == "cuda" else (1, 4, 16)
+    realistic = "sharegpt" if backend == "cuda" else "real-chat"
+    top = 32 if backend == "cuda" else 16
+    cells = [
+        {
+            "sequence": sequence,
+            "dataset": "random",
+            "concurrency": concurrency,
+            "input_tokens": random_input,
+            "output_tokens": 128,
+            "num_prompts": 100,
+            "n_repeats": 3,
+            "warmup_requests": WARMUP_REQUESTS,
+        }
+        for sequence, concurrency in enumerate(random_concurrency, start=1)
+    ]
+    for concurrency in (1, top):
+        cells.append(
+            {
+                "sequence": len(cells) + 1,
+                "dataset": realistic,
+                "concurrency": concurrency,
+                "input_tokens": random_input,
+                "output_tokens": 128,
+                "num_prompts": 30,
+                "n_repeats": 3,
+                "warmup_requests": WARMUP_REQUESTS,
+            }
+        )
+    return tuple(cells)
+
+
+def run_parity_cell(backend: str) -> dict[str, Any]:
+    require(backend in {"cuda", "metal"}, f"unsupported backend: {backend}")
+    return {
+        "sequence": len(expected_cells(backend)) + 1,
+        "dataset": "run-parity",
+        "concurrency": 1,
+        "input_tokens": 256 if backend == "cuda" else 64,
+        "output_tokens": RUN_MAX_TOKENS,
+        "num_prompts": RUN_SAMPLE_COUNT,
+        "n_repeats": 3,
+        "warmup_requests": WARMUP_REQUESTS,
+        "formal_matrix_cell": False,
+        "purpose": "same-prompt-output serve-c1 denominator for ferrum run parity",
+    }
+
+
+def cell_id(cell: dict[str, Any]) -> str:
+    return f"{cell['dataset']}:c{cell['concurrency']}"
+
+
+def parse_extra_argv(raw: Any, label: str) -> list[str]:
+    require(isinstance(raw, list), f"{label} must be an argv list")
+    require(all(isinstance(value, str) and value for value in raw), f"{label} contains an invalid token")
+    for token in raw:
+        option = token.split("=", 1)[0]
+        require(option not in RESERVED_EXTRA_OPTIONS, f"{label} overrides collector-owned option {option}")
+    collector_support.reject_secret_material(raw, label)
+    return list(raw)
+
+
+def resolve_file(raw: Any, label: str, *, executable: bool = False) -> Path:
+    require(isinstance(raw, str) and raw, f"{label} is required")
+    path = Path(raw).expanduser().resolve()
+    require(path.is_file(), f"{label} is not a file: {path}")
+    if executable:
+        require(os.access(path, os.X_OK), f"{label} is not executable: {path}")
+    return path
+
+
+def resolve_directory(raw: Any, label: str) -> Path:
+    require(isinstance(raw, str) and raw, f"{label} is required")
+    path = Path(raw).expanduser().resolve()
+    require(path.is_dir(), f"{label} is not a directory: {path}")
+    return path
+
+
+def git_output(argv: list[str]) -> str:
+    process = subprocess.run(
+        ["git", *argv],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(process.returncode == 0, f"git {' '.join(argv)} failed: {process.stderr.strip()}")
+    return process.stdout.strip()
+
+
+def load_locked_model(models_lock: dict[str, Any], model_key: str, backend: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    rows = [row for row in models_lock.get("models", []) if isinstance(row, dict) and row.get("key") == model_key]
+    require(len(rows) == 1, f"models lock does not contain one {model_key} row")
+    model = rows[0]
+    lanes = model.get("lanes")
+    require(isinstance(lanes, dict) and isinstance(lanes.get(backend), dict), f"models lock lacks {model_key}/{backend}")
+    return model, lanes[backend]
+
+
+def locked_model_files(lane: dict[str, Any]) -> dict[str, str]:
+    rows = lane.get("files")
+    require(isinstance(rows, list) and rows, "model lane files must be non-empty")
+    result: dict[str, str] = {}
+    for index, row in enumerate(rows):
+        require(isinstance(row, dict), f"model lane files[{index}] must be an object")
+        path = row.get("path")
+        digest = row.get("sha256")
+        require(isinstance(path, str) and path and not Path(path).is_absolute(), f"model lane files[{index}].path is invalid")
+        require(isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None, f"model lane files[{index}].sha256 is invalid")
+        require(path not in result, f"duplicate locked model path: {path}")
+        result[path] = digest
+    return result
+
+
+def tokenizer_lock(lane: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    source = lane.get("tokenizer_source") or lane.get("semantic_source")
+    require(isinstance(source, dict), "model lane lacks tokenizer/semantic source")
+    rows = [row for row in source.get("files", []) if isinstance(row, dict) and row.get("path") == "tokenizer.json"]
+    require(len(rows) == 1, "model lane must lock exactly one tokenizer.json")
+    digest = rows[0].get("sha256")
+    require(isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None, "tokenizer SHA256 is invalid")
+    return source, rows[0]
+
+
+def verify_model_origin(origin: Path, locked: dict[str, str]) -> dict[str, str]:
+    if origin.is_file():
+        require(len(locked) == 1 and origin.name in locked, "model file origin does not match the locked filename")
+        actual = file_sha256(origin)
+        require(actual == locked[origin.name], f"model SHA256 mismatch: {origin}")
+        return {origin.name: actual}
+    require(origin.is_dir(), f"model origin is neither file nor directory: {origin}")
+    actual_files: dict[str, str] = {}
+    for relative, expected in sorted(locked.items()):
+        path = origin / relative
+        require(path.is_file(), f"locked model file is missing: {path}")
+        actual = file_sha256(path)
+        require(actual == expected, f"model SHA256 mismatch: {path}")
+        actual_files[relative] = actual
+    return actual_files
+
+
+def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    collector_support.reject_secret_material(raw)
+    require(raw.get("schema_version") == SCHEMA_VERSION, "config.schema_version must be 1")
+    config = copy.deepcopy(raw)
+    model_key = config.get("model_key")
+    backend = config.get("backend")
+    require(model_key in MODEL_KEYS, f"config.model_key must be one of {sorted(MODEL_KEYS)}")
+    require(backend in {"cuda", "metal"}, "config.backend must be cuda or metal")
+    require(isinstance(config.get("request_model"), str) and config["request_model"], "config.request_model is required")
+
+    models_lock_path = resolve_file(config.get("models_lock_path"), "config.models_lock_path")
+    correctness_path = resolve_file(config.get("correctness_manifest_path"), "config.correctness_manifest_path")
+    models_lock = read_json(models_lock_path)
+    correctness = read_json(correctness_path)
+    model, lane = load_locked_model(models_lock, str(model_key), str(backend))
+    require(isinstance(lane.get("revision"), str) and GIT_SHA_RE.fullmatch(lane["revision"]) is not None, "locked model revision is invalid")
+
+    model_origin_raw = config.get("model_origin_path")
+    require(isinstance(model_origin_raw, str) and model_origin_raw, "config.model_origin_path is required")
+    model_origin = Path(model_origin_raw).expanduser().resolve()
+    model_files = verify_model_origin(model_origin, locked_model_files(lane))
+    semantic_root = resolve_directory(config.get("semantic_source_root"), "config.semantic_source_root")
+    tokenizer_root = resolve_directory(config.get("tokenizer_source_root", str(semantic_root)), "config.tokenizer_source_root")
+    tokenizer_source, tokenizer_row = tokenizer_lock(lane)
+    tokenizer_path = tokenizer_root / "tokenizer.json"
+    require(tokenizer_path.is_file(), f"locked tokenizer is missing: {tokenizer_path}")
+    require(file_sha256(tokenizer_path) == tokenizer_row["sha256"], "tokenizer SHA256 differs from models lock")
+
+    candidate = config.get("candidate")
+    require(isinstance(candidate, dict), "config.candidate is required")
+    binary_path = resolve_file(candidate.get("binary_path"), "config.candidate.binary_path", executable=True)
+    require(binary_path.name == "ferrum", "candidate binary must be named ferrum")
+    build_log_path = resolve_file(candidate.get("build_log_path"), "config.candidate.build_log_path")
+    build_receipt_path = resolve_file(candidate.get("build_receipt_path"), "config.candidate.build_receipt_path")
+    source_sha = candidate.get("source_git_sha")
+    require(isinstance(source_sha, str) and GIT_SHA_RE.fullmatch(source_sha) is not None, "candidate.source_git_sha is invalid")
+    require(git_output(["cat-file", "-t", source_sha]) == "commit", "candidate source commit is unavailable")
+    source_tree_sha = git_output(["rev-parse", f"{source_sha}^{{tree}}"])
+    dirty = candidate.get("dirty_status")
+    require(
+        isinstance(dirty, dict)
+        and dirty.get("is_dirty") is False
+        and dirty.get("status_short") == [],
+        "candidate.dirty_status must prove a clean build",
+    )
+    features = candidate.get("cargo_features")
+    require(isinstance(features, list) and features and all(isinstance(item, str) and item for item in features), "candidate.cargo_features is required")
+    require(backend in features, f"candidate.cargo_features must include {backend}")
+    candidate_env = collector_support.sanitized_environment(candidate.get("env"))
+
+    hardware = config.get("hardware")
+    require(isinstance(hardware, dict), "config.hardware is required")
+    for field in ("id", "fingerprint", "accelerator_model"):
+        require(isinstance(hardware.get(field), str) and hardware[field], f"hardware.{field} is required")
+    require(hardware.get("accelerator_count") == 1, "R2 requires exactly one accelerator")
+    memory_bytes = hardware.get("memory_bytes")
+    require(isinstance(memory_bytes, int) and not isinstance(memory_bytes, bool) and memory_bytes > 0, "hardware.memory_bytes must be positive")
+    if backend == "cuda":
+        require("4090" in hardware["accelerator_model"], "CUDA R2 hardware must be one RTX 4090")
+    else:
+        require(hardware["accelerator_model"] == "Apple M1 Max", "Metal R2 hardware must be Apple M1 Max")
+        require(hardware.get("gpu_core_count") == 24, "Metal R2 hardware must have 24 GPU cores")
+        require(memory_bytes == 32 * 1024**3, "Metal R2 hardware must have 32 GiB unified memory")
+
+    typed_active_cap = config.get("typed_active_cap")
+    memory_budget_bytes = config.get("memory_budget_bytes")
+    top = 32 if backend == "cuda" else 16
+    require(isinstance(typed_active_cap, int) and not isinstance(typed_active_cap, bool) and typed_active_cap >= top, f"typed_active_cap must cover c{top}")
+    require(
+        isinstance(memory_budget_bytes, int)
+        and not isinstance(memory_budget_bytes, bool)
+        and 0 < memory_budget_bytes <= memory_bytes,
+        "memory_budget_bytes must fit locked hardware",
+    )
+
+    server = config.get("server")
+    require(isinstance(server, dict), "config.server is required")
+    require(isinstance(server.get("host"), str) and server["host"], "server.host is required")
+    require(isinstance(server.get("port"), int) and 1024 <= server["port"] <= 65535, "server.port must be 1024..65535")
+    for field, default in (("ready_timeout_sec", 900), ("shutdown_timeout_sec", 60), ("command_timeout_sec", 7200)):
+        server.setdefault(field, default)
+        require(isinstance(server[field], (int, float)) and not isinstance(server[field], bool) and server[field] > 0, f"server.{field} must be positive")
+    server["extra_serve_argv"] = parse_extra_argv(server.get("extra_serve_argv", []), "server.extra_serve_argv")
+    run = config.setdefault("run", {})
+    require(isinstance(run, dict), "config.run must be an object")
+    run["extra_argv"] = parse_extra_argv(run.get("extra_argv", []), "run.extra_argv")
+
+    datasets = config.get("datasets")
+    require(isinstance(datasets, dict), "config.datasets is required")
+    realistic = "sharegpt" if backend == "cuda" else "real-chat"
+    dataset_path = resolve_file(datasets.get(realistic), f"config.datasets.{realistic}")
+    slo = config.setdefault("goodput_slo", {"ttft": 500.0, "tpot": 50.0, "e2e": 30000.0})
+    require(isinstance(slo, dict) and set(slo) == {"ttft", "tpot", "e2e"}, "goodput_slo must contain ttft/tpot/e2e")
+    require(
+        all(isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0 for value in slo.values()),
+        "goodput_slo values must be positive finite",
+    )
+
+    config.update(
+        {
+            "models_lock_path": str(models_lock_path),
+            "correctness_manifest_path": str(correctness_path),
+            "model_origin_path": str(model_origin),
+            "semantic_source_root": str(semantic_root),
+            "tokenizer_source_root": str(tokenizer_root),
+        }
+    )
+    candidate.update(
+        {
+            "binary_path": str(binary_path),
+            "build_log_path": str(build_log_path),
+            "build_receipt_path": str(build_receipt_path),
+            "source_tree_sha": source_tree_sha,
+            "env": candidate_env,
+        }
+    )
+    datasets[realistic] = str(dataset_path)
+    context = {
+        "models_lock": models_lock,
+        "models_lock_path": models_lock_path,
+        "correctness": correctness,
+        "correctness_path": correctness_path,
+        "model": model,
+        "lane": lane,
+        "model_files": model_files,
+        "tokenizer_source": tokenizer_source,
+        "tokenizer_row": tokenizer_row,
+        "tokenizer_path": tokenizer_path,
+        "dataset_path": dataset_path,
+        "binary_path": binary_path,
+        "build_log_path": build_log_path,
+        "build_receipt_path": build_receipt_path,
+    }
+    return config, context
+
+
+def collection_fingerprint(config: dict[str, Any], context: dict[str, Any]) -> str:
+    material = {
+        "contract": CONTRACT,
+        "collector_sha256": file_sha256(COLLECTOR_PATH),
+        "support_sha256": file_sha256(SUPPORT_PATH),
+        "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+        "models_lock_sha256": file_sha256(context["models_lock_path"]),
+        "correctness_manifest_sha256": file_sha256(context["correctness_path"]),
+        "candidate_binary_sha256": file_sha256(context["binary_path"]),
+        "candidate_build_log_sha256": file_sha256(context["build_log_path"]),
+        "candidate_build_receipt_sha256": file_sha256(context["build_receipt_path"]),
+        "model_files": context["model_files"],
+        "tokenizer_sha256": file_sha256(context["tokenizer_path"]),
+        "realistic_dataset_sha256": file_sha256(context["dataset_path"]),
+        "config": config,
+    }
+    return canonical_json_sha256(material)
+
+
+def lane_dir(root: Path, config: dict[str, Any]) -> Path:
+    return root / "r2-ferrum" / config["model_key"] / config["backend"]
+
+
+def prepare_plan(root: Path, config: dict[str, Any], context: dict[str, Any], *, resume: bool) -> tuple[Path, str]:
+    lane = lane_dir(root, config)
+    lane.mkdir(parents=True, exist_ok=True)
+    fingerprint = collection_fingerprint(config, context)
+    normalized_path = lane / "config.normalized.json"
+    plan_path = lane / "plan.json"
+    if normalized_path.exists():
+        require(resume, f"normalized config already exists; pass --resume: {normalized_path}")
+        require(read_json(normalized_path) == config, "resume config differs from frozen normalized config")
+    else:
+        atomic_write_json(normalized_path, config)
+    plan = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": CONTRACT,
+        "artifact_type": "runtime_vnext_r2_ferrum_collection_plan",
+        "collector": {
+            "path": COLLECTOR_RELATIVE_PATH,
+            "sha256": file_sha256(COLLECTOR_PATH),
+            "support_path": SUPPORT_PATH.relative_to(REPO_ROOT).as_posix(),
+            "support_sha256": file_sha256(SUPPORT_PATH),
+            "resource_sampler_path": RESOURCE_SAMPLER_PATH.relative_to(REPO_ROOT).as_posix(),
+            "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+        },
+        "config_fingerprint": fingerprint,
+        "config": artifact_ref(root, normalized_path, kind="normalized-config"),
+        "model_key": config["model_key"],
+        "backend": config["backend"],
+        "hardware": copy.deepcopy(config["hardware"]),
+        "profile_detail": "off",
+        "server_process_count": 1,
+        "server_cell_order": [copy.deepcopy(cell) for cell in expected_cells(config["backend"])],
+        "run_serve_parity_probe": copy.deepcopy(run_parity_cell(config["backend"])),
+        "run_process_count": RUN_SAMPLE_COUNT,
+        "run_policy": {
+            "prompt_sha256": hashlib.sha256(RUN_PROMPT.encode("utf-8")).hexdigest(),
+            "max_tokens": RUN_MAX_TOKENS,
+            "seed": SEED,
+            "temperature": 0.0,
+            "top_k": 20,
+            "top_p": 0.8,
+            "repeat_penalty": 1.0,
+            "enable_thinking": False,
+            "profile_detail": "off",
+        },
+        "external_engine": None,
+        "legacy_binary": None,
+        "abba_order": None,
+    }
+    if plan_path.exists():
+        require(resume, f"collection plan already exists; pass --resume: {plan_path}")
+        require(read_json(plan_path) == plan, "resume plan differs from frozen plan")
+    else:
+        atomic_write_json(plan_path, plan)
+    return lane, fingerprint
+
+
+def stage_inputs(root: Path, lane: Path, config: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    prefix = artifact_relative(root, lane / "inputs")
+    binary = collector_support.stage_file(root, context["binary_path"], f"{prefix}/candidate/ferrum")
+    binary.chmod(binary.stat().st_mode | 0o100)
+    build_log = collector_support.stage_file(root, context["build_log_path"], f"{prefix}/candidate/build.log")
+    build_receipt = collector_support.stage_file(root, context["build_receipt_path"], f"{prefix}/candidate/build-receipt.json")
+    models_lock = collector_support.stage_file(root, context["models_lock_path"], f"{prefix}/models.lock.json")
+    correctness = collector_support.stage_file(root, context["correctness_path"], f"{prefix}/correctness-manifest.json")
+    tokenizer = collector_support.stage_file(
+        root,
+        context["tokenizer_path"],
+        f"{prefix}/tokenizer/tokenizer.json",
+        context["tokenizer_row"]["sha256"],
+    )
+    realistic = "sharegpt" if config["backend"] == "cuda" else "real-chat"
+    dataset = collector_support.stage_file(root, context["dataset_path"], f"{prefix}/datasets/{realistic}.jsonl")
+    parity_dataset = lane / "inputs" / "datasets" / "run-parity.jsonl"
+    parity_payload = "".join(
+        json.dumps({"input": RUN_PROMPT}, sort_keys=True, separators=(",", ":")) + "\n"
+        for _ in range(RUN_SAMPLE_COUNT)
+    )
+    if parity_dataset.exists():
+        require(parity_dataset.read_text(encoding="utf-8") == parity_payload, "run parity dataset changed during resume")
+    else:
+        atomic_write_text(parity_dataset, parity_payload)
+    run_prompt = lane / "inputs" / "run-prompt.json"
+    prompt_document = {
+        "schema_version": SCHEMA_VERSION,
+        "prompt": RUN_PROMPT,
+        "prompt_sha256": hashlib.sha256(RUN_PROMPT.encode("utf-8")).hexdigest(),
+        "max_tokens": RUN_MAX_TOKENS,
+        "eos_policy": "model-metadata",
+    }
+    if run_prompt.exists():
+        require(read_json(run_prompt) == prompt_document, "run prompt changed during resume")
+    else:
+        atomic_write_json(run_prompt, prompt_document)
+    return {
+        "binary_path": binary,
+        "binary": artifact_ref(root, binary, kind="candidate-binary"),
+        "build_log": artifact_ref(root, build_log, kind="build-log"),
+        "build_receipt": artifact_ref(root, build_receipt, kind="build-receipt"),
+        "models_lock": artifact_ref(root, models_lock, kind="models-lock"),
+        "correctness_manifest": artifact_ref(root, correctness, kind="correctness-manifest"),
+        "tokenizer_path": tokenizer,
+        "tokenizer": artifact_ref(root, tokenizer, kind="tokenizer"),
+        "realistic_dataset_path": dataset,
+        "realistic_dataset": artifact_ref(root, dataset, kind="realistic-dataset"),
+        "run_parity_dataset_path": parity_dataset,
+        "run_parity_dataset": artifact_ref(root, parity_dataset, kind="run-parity-dataset"),
+        "run_prompt": artifact_ref(root, run_prompt, kind="run-prompt"),
+    }
+
+
+def server_argv(binary: Path, attempt_dir: Path, config: dict[str, Any]) -> tuple[list[str], Path, Path]:
+    effective = attempt_dir / "server-effective-config.json"
+    scheduler_trace = attempt_dir / "server-scheduler-trace.jsonl"
+    argv = [
+        str(binary),
+        "serve",
+        config["model_origin_path"],
+        "--backend",
+        config["backend"],
+        "--host",
+        config["server"]["host"],
+        "--port",
+        str(config["server"]["port"]),
+        "--max-num-seqs",
+        str(config["typed_active_cap"]),
+        "--runtime-memory-budget-bytes",
+        str(config["memory_budget_bytes"]),
+        "--semantic-source",
+        config["semantic_source_root"],
+        "--tokenizer-source",
+        config["tokenizer_source_root"],
+        "--served-model-name",
+        config["request_model"],
+        "--profile-detail",
+        "off",
+        "--scheduler-trace-jsonl",
+        str(scheduler_trace),
+        "--effective-config-json",
+        str(effective),
+        *config["server"]["extra_serve_argv"],
+    ]
+    return argv, effective, scheduler_trace
+
+
+def bench_argv(
+    binary: Path,
+    raw_report: Path,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    cell: dict[str, Any],
+) -> list[str]:
+    slo = config["goodput_slo"]
+    dataset = cell["dataset"]
+    argv = [
+        str(binary),
+        "bench-serve",
+        "--base-url",
+        f"http://{config['server']['host']}:{config['server']['port']}",
+        "--model",
+        config["request_model"],
+        "--tokenizer",
+        str(inputs["tokenizer_path"].parent),
+        "--target-backend",
+        config["backend"],
+        "--http-connection-mode",
+        "fresh",
+        "--concurrency",
+        str(cell["concurrency"]),
+        "--dataset",
+        "random" if dataset == "random" else "sharegpt",
+        "--random-input-len",
+        str(cell["input_tokens"]),
+        "--random-output-len",
+        str(cell["output_tokens"]),
+        "--num-prompts",
+        str(cell["num_prompts"]),
+        "--warmup-requests",
+        str(cell["warmup_requests"]),
+        "--n-repeats",
+        str(cell["n_repeats"]),
+        "--seed",
+        str(SEED),
+        "--output",
+        "json",
+        "--out",
+        str(raw_report),
+        "--hw-id",
+        config["hardware"]["id"],
+        "--commit-sha",
+        config["candidate"]["source_git_sha"],
+        "--goodput",
+        f"ttft:{slo['ttft']},tpot:{slo['tpot']},e2el:{slo['e2e']}",
+        "--enable-thinking",
+        "false",
+        "--timeout",
+        str(config["server"]["command_timeout_sec"]),
+        "--fail-on-error",
+        "--require-ci",
+    ]
+    if dataset == "random":
+        argv.append("--ignore-eos")
+    else:
+        dataset_path = (
+            inputs["run_parity_dataset_path"]
+            if dataset == "run-parity"
+            else inputs["realistic_dataset_path"]
+        )
+        argv.extend(["--sharegpt-path", str(dataset_path)])
+    return argv
+
+
+def run_argv(binary: Path, effective: Path, config: dict[str, Any]) -> list[str]:
+    return [
+        str(binary),
+        "run",
+        config["model_origin_path"],
+        "--prompt",
+        RUN_PROMPT,
+        "--semantic-source",
+        config["semantic_source_root"],
+        "--tokenizer-source",
+        config["tokenizer_source_root"],
+        "--max-tokens",
+        str(RUN_MAX_TOKENS),
+        "--disable-thinking",
+        "--seed",
+        str(SEED),
+        "--temperature",
+        "0.0",
+        "--top-k",
+        "20",
+        "--top-p",
+        "0.8",
+        "--repeat-penalty",
+        "1.0",
+        "--backend",
+        config["backend"],
+        "--runtime-memory-budget-bytes",
+        str(config["memory_budget_bytes"]),
+        "--profile-detail",
+        "off",
+        "--output-format",
+        "jsonl",
+        "--effective-config-json",
+        str(effective),
+        *config["run"]["extra_argv"],
+    ]
+
+
+def start_cell_sampler(
+    root: Path,
+    attempt_dir: Path,
+    session: dict[str, Any],
+    config: dict[str, Any],
+    cell: dict[str, Any],
+) -> dict[str, Any]:
+    """Start the shared sampler with a cell deadline longer than the benchmark."""
+    identifier = cell_id(cell)
+    stem = identifier.replace(":", "-")
+    observations = attempt_dir / f"{stem}.resource-observations.jsonl"
+    stop_file = attempt_dir / f"{stem}.resource-stop"
+    stdout_path = attempt_dir / f"{stem}.resource-sampler.stdout.log"
+    stderr_path = attempt_dir / f"{stem}.resource-sampler.stderr.log"
+    require(not observations.exists(), f"resource observation already exists: {observations}")
+    max_duration = int(math.ceil(float(config["server"]["command_timeout_sec"]))) + 120
+    argv = [
+        sys.executable,
+        str(RESOURCE_SAMPLER_PATH),
+        "--out",
+        str(observations),
+        "--pid",
+        str(session["pid"]),
+        "--pgid",
+        str(session["pgid"]),
+        "--session-id",
+        session["session_id"],
+        "--cell-id",
+        identifier,
+        "--backend",
+        config["backend"],
+        "--hardware-id",
+        config["hardware"]["id"],
+        "--base-url",
+        session["base_url"],
+        "--active-probe-format",
+        ACTIVE_PROBE["format"],
+        "--active-selector",
+        ACTIVE_PROBE["selector"],
+        "--active-semantics",
+        "scheduler-active-high-water",
+        "--runtime-log",
+        session["runtime_log_origin_path"],
+        "--stop-file",
+        str(stop_file),
+        "--interval-ms",
+        "250",
+        "--max-duration-sec",
+        str(max_duration),
+        "--active-probe-timeout-ms",
+        str(collector_support.resource_sampler.ACTIVE_PROBE_TIMEOUT_MS),
+        "--active-probe-max-attempts",
+        str(collector_support.resource_sampler.ACTIVE_PROBE_MAX_ATTEMPTS),
+        "--active-path",
+        ACTIVE_PROBE["path"],
+    ]
+    stdout_handle = stdout_path.open("x", encoding="utf-8")
+    stderr_handle = stderr_path.open("x", encoding="utf-8")
+    process: subprocess.Popen[Any] | None = None
+    try:
+        stdout_handle.write("[r2-collector] resource sampler stdout follows\n")
+        stderr_handle.write("[r2-collector] resource sampler stderr follows\n")
+        stdout_handle.flush()
+        stderr_handle.flush()
+        process = subprocess.Popen(
+            argv,
+            env=collector_support.sanitized_environment(),
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+            start_new_session=True,
+        )
+        meta = {
+            "process": process,
+            "argv": argv,
+            "observations": observations,
+            "stop_file": stop_file,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "stdout_handle": stdout_handle,
+            "stderr_handle": stderr_handle,
+            "finished": False,
+        }
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            require(process.poll() is None, f"resource sampler exited during startup with {process.returncode}")
+            if observations.exists() and observations.stat().st_size > 0:
+                if len(observations.read_text(encoding="utf-8", errors="replace").splitlines()) >= 2:
+                    return meta
+            time.sleep(0.05)
+        raise R2CollectorError("resource sampler did not produce its first observation")
+    except BaseException:
+        if process is not None:
+            collector_support.cleanup_process_group_noexcept(process, 5.0)
+        for handle in (stdout_handle, stderr_handle):
+            try:
+                handle.close()
+            except BaseException:
+                pass
+        collector_support.ensure_nonempty_log(stdout_path, "resource sampler stdout")
+        collector_support.ensure_nonempty_log(stderr_path, "resource sampler stderr")
+        raise
+
+
+def validate_bench_report(report: dict[str, Any], config: dict[str, Any], cell: dict[str, Any]) -> None:
+    label = cell_id(cell)
+    expected = cell["num_prompts"]
+    require(report.get("model") == config["request_model"], f"{label} report model mismatch")
+    require(report.get("backend") == config["backend"], f"{label} report backend mismatch")
+    require(report.get("scenario") == "closed_loop", f"{label} report scenario must be closed_loop")
+    require(report.get("concurrency") == cell["concurrency"], f"{label} report concurrency mismatch")
+    require(report.get("n_gen") == 128, f"{label} report output length mismatch")
+    require(report.get("n_repeats") == 3, f"{label} report must contain three repeats")
+    require(report.get("n_requests_per_run") == expected, f"{label} report request count mismatch")
+    require(report.get("warmup_requests") == WARMUP_REQUESTS, f"{label} report warmup mismatch")
+    require(report.get("output_token_count_source") == "usage", f"{label} output tokens must come from usage")
+    repeats = report.get("repeat_metrics")
+    require(isinstance(repeats, list) and len(repeats) == 3, f"{label} repeat_metrics must have length 3")
+    quality_names = {
+        "bad_output",
+        "malformed_stream",
+        "missing_done",
+        "duplicate_done",
+        "zero_output_tokens",
+        "stream_bulk_flush",
+        "http_500",
+        "panic",
+    }
+    for index, row in enumerate(repeats, start=1):
+        require(isinstance(row, dict), f"{label} repeat {index} is not an object")
+        require(row.get("repeat") == index, f"{label} repeat numbering mismatch")
+        require(row.get("expected_requests") == expected, f"{label} repeat {index} expected count mismatch")
+        require(row.get("completed_requests") == expected, f"{label} repeat {index} completion mismatch")
+        require(row.get("errored_requests") == 0, f"{label} repeat {index} has errors")
+        require(row.get("warmup_expected") == WARMUP_REQUESTS, f"{label} repeat {index} warmup expected mismatch")
+        require(row.get("warmup_completed") == WARMUP_REQUESTS, f"{label} repeat {index} warmup completion mismatch")
+        require(row.get("warmup_errored") == 0, f"{label} repeat {index} warmup errors")
+        require(row.get("output_token_count_source") == "usage", f"{label} repeat {index} output token source mismatch")
+        for field in ("quality_issues", "warmup_quality_issues"):
+            quality = row.get(field)
+            require(isinstance(quality, dict) and quality_names <= set(quality), f"{label} repeat {index} lacks {field}")
+            require(all(quality[name] == 0 for name in quality_names), f"{label} repeat {index} has {field}")
+    for field in ("completed_per_run", "errored_per_run"):
+        values = report.get(field)
+        expected_values = [expected] * 3 if field == "completed_per_run" else [0, 0, 0]
+        require(values == expected_values, f"{label} {field} mismatch")
+    for field in (
+        "bad_output_per_run",
+        "malformed_stream_per_run",
+        "missing_done_per_run",
+        "duplicate_done_per_run",
+        "zero_output_tokens_per_run",
+        "stream_bulk_flush_per_run",
+        "http_500_per_run",
+        "panic_per_run",
+    ):
+        require(report.get(field) == [0, 0, 0], f"{label} {field} is non-zero")
+    for field in ("actual_input_tokens_per_request", "output_tokens_per_request", "itl_evidence_per_request"):
+        rows = report.get(field)
+        require(
+            isinstance(rows, list)
+            and len(rows) == 3
+            and all(isinstance(row, list) and len(row) == expected for row in rows),
+            f"{label} {field} must be a 3x{expected} matrix",
+        )
+    if cell["dataset"] == "run-parity":
+        outputs = report["output_tokens_per_request"]
+        require(
+            all(value == RUN_MAX_TOKENS for row in outputs for value in row),
+            f"{label} must use the same fixed {RUN_MAX_TOKENS}-token output boundary as ferrum run",
+        )
+
+
+def write_bench_request_sidecar(
+    root: Path,
+    path: Path,
+    raw_report: Path,
+    report: dict[str, Any],
+    cell: dict[str, Any],
+) -> dict[str, Any]:
+    per_repeat: list[dict[str, Any]] = []
+    inputs = report["actual_input_tokens_per_request"]
+    outputs = report["output_tokens_per_request"]
+    itl = report["itl_evidence_per_request"]
+    repeats = report["repeat_metrics"]
+    for repeat_index in range(3):
+        requests = [
+            {
+                "request_ordinal": request_index + 1,
+                "actual_input_tokens": inputs[repeat_index][request_index],
+                "usage_output_tokens": outputs[repeat_index][request_index],
+                "itl_evidence": itl[repeat_index][request_index],
+                "output_token_count_source": "usage",
+            }
+            for request_index in range(cell["num_prompts"])
+        ]
+        per_repeat.append(
+            {
+                "repeat": repeat_index + 1,
+                "requests": requests,
+                "aggregate_metrics": copy.deepcopy(repeats[repeat_index]),
+            }
+        )
+    sidecar = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "runtime_vnext_r2_bench_request_evidence_sidecar",
+        "source_report": artifact_ref(root, raw_report, kind="raw-bench-report"),
+        "cell": copy.deepcopy(cell),
+        "output_token_count_source": "usage",
+        "per_request_token_and_itl_evidence_complete": True,
+        "per_request_latency_samples_exposed_by_b72_report": False,
+        "latency_evidence_scope": "three immutable repeat-level percentile sets from BenchReport",
+        "repeats": per_repeat,
+    }
+    atomic_write_json(path, sidecar)
+    return artifact_ref(root, path, kind="bench-request-evidence-sidecar")
+
+
+def parity_metrics(report: dict[str, Any]) -> dict[str, Any]:
+    tpot_p50_ms = [float(row["tpot_ms"]["p50"]) for row in report["repeat_metrics"]]
+    require(all(math.isfinite(value) and value > 0 for value in tpot_p50_ms), "run parity TPOT must be positive")
+    steady_tps = [1000.0 / value for value in tpot_p50_ms]
+    return {
+        "metric_definition": "1000 / per-repeat request TPOT p50 milliseconds",
+        "tpot_p50_ms_per_repeat": tpot_p50_ms,
+        "steady_decode_tps_per_repeat": steady_tps,
+        "steady_decode_tps_median": statistics.median(steady_tps),
+        "engine_infer_e2e_ms_p50_per_repeat": [
+            float(row["e2e_ms"]["p50"]) for row in report["repeat_metrics"]
+        ],
+    }
+
+
+def run_bench_cell(
+    root: Path,
+    attempt_dir: Path,
+    session: dict[str, Any],
+    binary: Path,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    cell: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    identifier = cell_id(cell)
+    stem = identifier.replace(":", "-")
+    raw_report = attempt_dir / f"{stem}.bench-report.json"
+    stdout_path = attempt_dir / f"{stem}.bench.stdout.log"
+    stderr_path = attempt_dir / f"{stem}.bench.stderr.log"
+    sampler: dict[str, Any] | None = None
+    process: subprocess.Popen[Any] | None = None
+    try:
+        sampler = start_cell_sampler(root, attempt_dir, session, config, cell)
+        argv = bench_argv(binary, raw_report, config, inputs, cell)
+        environment = collector_support.sanitized_environment()
+        started_at = now_iso()
+        with stdout_path.open("x", encoding="utf-8") as stdout_handle, stderr_path.open("x", encoding="utf-8") as stderr_handle:
+            stdout_handle.write("[r2-collector] benchmark client stdout follows\n")
+            stderr_handle.write("[r2-collector] benchmark client stderr follows\n")
+            stdout_handle.flush()
+            stderr_handle.flush()
+            process = subprocess.Popen(
+                argv,
+                env=environment,
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                text=True,
+                start_new_session=True,
+            )
+            try:
+                returncode = process.wait(timeout=config["server"]["command_timeout_sec"])
+                returncode, group_gone = collector_support.terminate_process_group(process, 2.0)
+            except subprocess.TimeoutExpired:
+                _, group_gone = collector_support.terminate_process_group(process, 5.0)
+                returncode = 124
+        finished_at = now_iso()
+        collector_support.finish_resource_sampler(sampler)
+        require(group_gone, f"benchmark cell {identifier} process group survived cleanup")
+        process = None
+        collector_support.ensure_nonempty_log(stdout_path, "benchmark stdout")
+        collector_support.ensure_nonempty_log(stderr_path, "benchmark stderr")
+        require(returncode == 0, f"benchmark cell {identifier} failed with returncode {returncode}")
+        require(raw_report.is_file() and raw_report.stat().st_size > 0, f"benchmark cell did not write report: {raw_report}")
+        report = read_json(raw_report)
+        validate_bench_report(report, config, cell)
+        request_sidecar = write_bench_request_sidecar(
+            root,
+            attempt_dir / f"{stem}.bench-request-evidence.json",
+            raw_report,
+            report,
+            cell,
+        )
+        record = {
+            "sequence": cell["sequence"],
+            "cell_id": identifier,
+            "dataset": cell["dataset"],
+            "concurrency": cell["concurrency"],
+            "num_prompts": cell["num_prompts"],
+            "n_repeats": 3,
+            "warmup_requests": WARMUP_REQUESTS,
+            "formal_matrix_cell": cell.get("formal_matrix_cell", True),
+            "session_id": session["session_id"],
+            "server_pid": session["pid"],
+            "candidate_binary_sha256": file_sha256(binary),
+            "bench_argv": argv,
+            "bench_argv_sha256": canonical_json_sha256(argv),
+            "environment": environment,
+            "environment_sha256": canonical_json_sha256(environment),
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_sec": duration_seconds(started_at, finished_at),
+            "returncode": returncode,
+            "stdout": artifact_ref(root, stdout_path, kind="bench-stdout"),
+            "stderr": artifact_ref(root, stderr_path, kind="bench-stderr"),
+            "raw_report": artifact_ref(root, raw_report, kind="raw-bench-report"),
+            "raw_request_evidence": request_sidecar,
+        }
+        if cell["dataset"] == "run-parity":
+            record["serve_c1_parity_metrics"] = parity_metrics(report)
+        return record, sampler
+    finally:
+        if process is not None:
+            collector_support.cleanup_process_group_noexcept(process, 5.0)
+        if sampler is not None and sampler.get("finished") is not True:
+            try:
+                sampler["stop_file"].write_text("stop\n", encoding="utf-8")
+                collector_support.finish_resource_sampler(sampler, bracket_after_measurement=False)
+            except BaseException:
+                collector_support.cleanup_process_group_noexcept(sampler["process"], 5.0)
+                collector_support.close_sampler_handles(sampler)
+                sampler["finished"] = True
+        collector_support.ensure_nonempty_log(stdout_path, "benchmark stdout")
+        collector_support.ensure_nonempty_log(stderr_path, "benchmark stderr")
+
+
+def cell_resource_evidence(
+    root: Path,
+    session: dict[str, Any],
+    record: dict[str, Any],
+    sampler: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    observations: Path = sampler["observations"]
+    summary = collector_support.resource_sampler.derive_summary(
+        observations,
+        session_id=session["session_id"],
+        cell_id=record["cell_id"],
+        backend=config["backend"],
+        hardware_id=config["hardware"]["id"],
+        pid=session["pid"],
+        pgid=session["pgid"],
+        process_start_marker=session["process_start_marker"],
+        base_url=session["base_url"],
+        session_started_at=session["started_at"],
+        session_finished_at=session["finished_at"],
+        measurement_started_at=record["started_at"],
+        measurement_finished_at=record["finished_at"],
+        memory_budget_bytes=config["memory_budget_bytes"],
+        requested_concurrency=record["concurrency"],
+        typed_active_cap=config["typed_active_cap"],
+        runtime_log_path=session["runtime_log_origin_path"],
+        runtime_log_evidence_path=Path(session["runtime_log_origin_path"]),
+    )
+    interval_path = observations.with_name(
+        observations.name.replace(".resource-observations.jsonl", ".active-intervals.json")
+    )
+    interval_rows: list[dict[str, Any]] = []
+    raw_rows = [json.loads(line) for line in observations.read_text(encoding="utf-8").splitlines() if line.strip()]
+    samples = [row for row in raw_rows if row.get("record_type") == "sample"]
+    measurement_start = collector_support.parse_timestamp(record["started_at"])
+    measurement_finish = collector_support.parse_timestamp(record["finished_at"])
+    for left, right in zip(samples, samples[1:]):
+        left_at = collector_support.parse_timestamp(left["sampled_at"])
+        right_at = collector_support.parse_timestamp(right["sampled_at"])
+        clipped_start = max(left_at, measurement_start)
+        clipped_finish = min(right_at, measurement_finish)
+        duration_ms = (clipped_finish - clipped_start).total_seconds() * 1000.0
+        if duration_ms <= 0:
+            continue
+        errors = [*left.get("active_probe_errors", []), *right.get("active_probe_errors", [])]
+        eligible = (
+            left.get("process_alive") is True
+            and right.get("process_alive") is True
+            and not errors
+            and isinstance(left.get("active_requests"), int)
+            and isinstance(right.get("active_requests"), int)
+        )
+        interval_rows.append(
+            {
+                "sequence": len(interval_rows) + 1,
+                "started_at": clipped_start.isoformat().replace("+00:00", "Z"),
+                "finished_at": clipped_finish.isoformat().replace("+00:00", "Z"),
+                "duration_ms": duration_ms,
+                "eligible": eligible,
+                "active_requests_conservative": (
+                    min(left["active_requests"], right["active_requests"])
+                    if eligible
+                    else None
+                ),
+                "left_sample_sequence": left.get("sequence"),
+                "right_sample_sequence": right.get("sequence"),
+                "probe_errors": errors,
+            }
+        )
+    eligible_ms = sum(row["duration_ms"] for row in interval_rows if row["eligible"])
+    require(interval_rows and eligible_ms > 0, f"{record['cell_id']} has no eligible active intervals")
+    interval_document = {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": "runtime_vnext_r2_active_interval_sidecar",
+        "source_observations": artifact_ref(root, observations, kind="resource-observations"),
+        "cell_id": record["cell_id"],
+        "measurement_started_at": record["started_at"],
+        "measurement_finished_at": record["finished_at"],
+        "definition": "adjacent 250ms samples clipped to the measured window; eligible only when both probes are live and error-free; active count is conservative interval minimum",
+        "eligible_duration_ms": eligible_ms,
+        "total_interval_duration_ms": sum(row["duration_ms"] for row in interval_rows),
+        "intervals": interval_rows,
+    }
+    atomic_write_json(interval_path, interval_document)
+    return {
+        "collector": artifact_ref(root, RESOURCE_SAMPLER_PATH, kind="resource-sampler-source")
+        if RESOURCE_SAMPLER_PATH.is_relative_to(root)
+        else {
+            "kind": "resource-sampler-source",
+            "path": RESOURCE_SAMPLER_PATH.relative_to(REPO_ROOT).as_posix(),
+            "sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+            "size_bytes": RESOURCE_SAMPLER_PATH.stat().st_size,
+        },
+        "sampler_argv": sampler["argv"],
+        "sampler_argv_sha256": canonical_json_sha256(sampler["argv"]),
+        "observations": artifact_ref(root, observations, kind="resource-observations"),
+        "active_intervals": artifact_ref(root, interval_path, kind="active-interval-sidecar"),
+        "summary": summary,
+    }
+
+
+def validate_artifact_ref(root: Path, raw: Any, label: str) -> Path:
+    require(isinstance(raw, dict), f"{label} must be an artifact reference")
+    relative = raw.get("path")
+    digest = raw.get("sha256")
+    size = raw.get("size_bytes")
+    require(isinstance(relative, str) and relative and not Path(relative).is_absolute(), f"{label}.path is invalid")
+    require(isinstance(digest, str) and SHA256_RE.fullmatch(digest) is not None, f"{label}.sha256 is invalid")
+    require(isinstance(size, int) and not isinstance(size, bool) and size > 0, f"{label}.size_bytes is invalid")
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as exc:
+        raise R2CollectorError(f"{label} escapes artifact root") from exc
+    require(path.is_file(), f"{label} is missing: {path}")
+    require(path.stat().st_size == size, f"{label} size changed")
+    require(file_sha256(path) == digest, f"{label} SHA256 changed")
+    return path
+
+
+def wait_for_quiescence(
+    root: Path,
+    attempt_dir: Path,
+    name: str,
+    base_url: str,
+    environment: dict[str, str],
+    timeout_sec: float = 60.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_sec
+    sequence = 0
+    while time.monotonic() < deadline:
+        sequence += 1
+        evidence, body = collector_support.collect_endpoint_probe(
+            root,
+            attempt_dir,
+            f"{name}-{sequence:03d}",
+            f"{base_url}/health",
+            environment,
+        )
+        engine = body.get("engine")
+        admission = body.get("admission")
+        active = engine.get("active_requests") if isinstance(engine, dict) else None
+        queued = engine.get("queued_requests", 0) if isinstance(engine, dict) else None
+        admission_queue = admission.get("queue_depth", 0) if isinstance(admission, dict) else 0
+        if active == 0 and queued == 0 and admission_queue == 0:
+            return {
+                "status": "quiescent",
+                "attempts": sequence,
+                "probe": evidence,
+                "active_requests": active,
+                "queued_requests": queued,
+                "admission_queue_depth": admission_queue,
+            }
+        time.sleep(0.25)
+    raise R2CollectorError(f"server failed to become quiescent after {name}")
+
+
+def validate_server_bundle(
+    root: Path,
+    bundle: dict[str, Any],
+    fingerprint: str,
+    config: dict[str, Any],
+) -> None:
+    require(bundle.get("schema_version") == SCHEMA_VERSION, "server bundle schema mismatch")
+    require(bundle.get("config_fingerprint") == fingerprint, "server bundle fingerprint mismatch")
+    session = bundle.get("session")
+    reports = bundle.get("formal_reports")
+    parity = bundle.get("run_serve_parity_report")
+    require(isinstance(session, dict), "server bundle session is missing")
+    require(session.get("server_process_ordinal") == 1, "server bundle must use one server process")
+    require(isinstance(reports, list) and len(reports) == len(expected_cells(config["backend"])), "server bundle formal cell count mismatch")
+    require(isinstance(parity, dict), "server bundle lacks run/serve parity probe")
+    expected = list(expected_cells(config["backend"]))
+    for index, (record, cell) in enumerate(zip(reports, expected), start=1):
+        require(record.get("sequence") == index and record.get("cell_id") == cell_id(cell), "server bundle cell order mismatch")
+        report_path = validate_artifact_ref(root, record.get("raw_report"), f"formal_reports[{index}].raw_report")
+        validate_bench_report(read_json(report_path), config, cell)
+        for key in ("stdout", "stderr"):
+            validate_artifact_ref(root, record.get(key), f"formal_reports[{index}].{key}")
+        validate_artifact_ref(root, record.get("raw_request_evidence"), f"formal_reports[{index}].raw_request_evidence")
+        resources = record.get("resources")
+        require(isinstance(resources, dict), f"formal_reports[{index}].resources is missing")
+        validate_artifact_ref(root, resources.get("observations"), f"formal_reports[{index}].resources.observations")
+        validate_artifact_ref(root, resources.get("active_intervals"), f"formal_reports[{index}].resources.active_intervals")
+    parity_path = validate_artifact_ref(root, parity.get("raw_report"), "run_serve_parity_report.raw_report")
+    validate_bench_report(read_json(parity_path), config, run_parity_cell(config["backend"]))
+    for key in ("stdout", "stderr"):
+        validate_artifact_ref(root, parity.get(key), f"run_serve_parity_report.{key}")
+    validate_artifact_ref(root, parity.get("raw_request_evidence"), "run_serve_parity_report.raw_request_evidence")
+    validate_artifact_ref(root, parity.get("resources", {}).get("observations"), "run_serve_parity_report.resources.observations")
+    validate_artifact_ref(root, parity.get("resources", {}).get("active_intervals"), "run_serve_parity_report.resources.active_intervals")
+    for key in ("runtime_log", "scheduler_trace", "product_effective_config"):
+        validate_artifact_ref(root, session.get(key), f"session.{key}")
+    require(session.get("shutdown_clean") is True, "server bundle is not a clean-shutdown session")
+
+
+def collect_server_session(
+    root: Path,
+    lane: Path,
+    fingerprint: str,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    *,
+    resume: bool,
+) -> dict[str, Any]:
+    bundle_path = lane / "server-session.json"
+    if bundle_path.exists():
+        require(resume, f"server session already exists; pass --resume: {bundle_path}")
+        bundle = read_json(bundle_path)
+        validate_server_bundle(root, bundle, fingerprint, config)
+        return bundle
+
+    attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    attempt_dir = lane / "attempts" / f"server-{attempt_id}"
+    attempt_dir.mkdir(parents=True, exist_ok=False)
+    runtime_log = attempt_dir / "server-runtime.log"
+    argv, product_config, scheduler_trace = server_argv(inputs["binary_path"], attempt_dir, config)
+    environment = dict(config["candidate"]["env"])
+    base_url = f"http://{config['server']['host']}:{config['server']['port']}"
+    started_at = now_iso()
+    runtime_handle = runtime_log.open("x", encoding="utf-8")
+    runtime_handle.write(f"[r2-collector] server argv={json.dumps(argv)}\n")
+    runtime_handle.flush()
+    process: subprocess.Popen[Any] | None = None
+    failure: BaseException | None = None
+    try:
+        process = subprocess.Popen(
+            argv,
+            env=environment,
+            stdout=runtime_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        pid = process.pid
+        pgid = os.getpgid(pid)
+        require(pgid == pid, "server must own an independent process group")
+        marker, marker_source = collector_support.process_identity(pid)
+        receipt = collector_support.write_process_receipt(
+            root,
+            attempt_dir / "server-process-receipt.json",
+            pid=pid,
+            pgid=pgid,
+            argv=argv,
+            environment=environment,
+            marker=marker,
+            source=marker_source,
+        )
+        session: dict[str, Any] = {
+            "session_id": f"r2-{config['model_key']}-{config['backend']}-{attempt_id}",
+            "server_process_ordinal": 1,
+            "hardware": copy.deepcopy(config["hardware"]),
+            "candidate_binary_sha256": inputs["binary"]["sha256"],
+            "source_git_sha": config["candidate"]["source_git_sha"],
+            "source_tree_sha": config["candidate"]["source_tree_sha"],
+            "dirty_status": copy.deepcopy(config["candidate"]["dirty_status"]),
+            "profile_detail": "off",
+            "pid": pid,
+            "pgid": pgid,
+            "process_start_marker": marker,
+            "process_start_source": marker_source,
+            "process_receipt": receipt,
+            "server_argv": argv,
+            "server_argv_sha256": canonical_json_sha256(argv),
+            "environment": environment,
+            "environment_sha256": canonical_json_sha256(environment),
+            "base_url": base_url,
+            "started_at": started_at,
+            "runtime_log_origin_path": str(runtime_log),
+        }
+        collector_support.wait_for_server(process, f"{base_url}/v1/models", config["server"]["ready_timeout_sec"])
+        ready_probe, ready_body = collector_support.collect_endpoint_probe(
+            root, attempt_dir, "ready-probe", f"{base_url}/v1/models", environment
+        )
+        observed_models = [row.get("id") for row in ready_body.get("data", []) if isinstance(row, dict)]
+        require(observed_models == [config["request_model"]], f"server exposed unexpected model ids: {observed_models}")
+        session["ready_at"] = now_iso()
+        session["ready_probe"] = ready_probe
+        session["pre_measurement_quiescence"] = wait_for_quiescence(
+            root, attempt_dir, "pre-measurement", base_url, environment
+        )
+
+        records: list[dict[str, Any]] = []
+        samplers: list[dict[str, Any]] = []
+        quiescence: list[dict[str, Any]] = []
+        all_cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
+        for cell in all_cells:
+            record, sampler = run_bench_cell(
+                root,
+                attempt_dir,
+                session,
+                inputs["binary_path"],
+                config,
+                inputs,
+                cell,
+            )
+            records.append(record)
+            samplers.append(sampler)
+            quiescence.append(
+                wait_for_quiescence(
+                    root,
+                    attempt_dir,
+                    f"post-{cell['sequence']:02d}-{cell['dataset']}-c{cell['concurrency']}",
+                    base_url,
+                    environment,
+                )
+            )
+        session["formal_measurement_started_at"] = records[0]["started_at"]
+        session["formal_measurement_finished_at"] = records[len(expected_cells(config["backend"])) - 1]["finished_at"]
+        session["parity_measurement_started_at"] = records[-1]["started_at"]
+        session["parity_measurement_finished_at"] = records[-1]["finished_at"]
+        session["cell_quiescence"] = quiescence
+        session["shutdown_started_at"] = now_iso()
+        returncode, group_gone = collector_support.terminate_process_group(
+            process, config["server"]["shutdown_timeout_sec"]
+        )
+        session["finished_at"] = now_iso()
+        session["duration_sec"] = duration_seconds(started_at, session["finished_at"])
+        session["returncode"] = returncode
+        session["shutdown_clean"] = returncode == 0 and group_gone
+        require(session["shutdown_clean"], f"server shutdown failed: returncode={returncode}, group_gone={group_gone}")
+        process = None
+        runtime_handle.flush()
+        os.fsync(runtime_handle.fileno())
+        runtime_handle.close()
+        runtime_handle = None
+        collector_support.ensure_nonempty_log(runtime_log, "server runtime")
+        require(product_config.is_file(), "server did not write effective config")
+        require(scheduler_trace.is_file() and scheduler_trace.stat().st_size > 0, "server did not write scheduler trace")
+        product = read_json(product_config)
+        admission = product.get("admission")
+        require(
+            isinstance(admission, dict) and admission.get("effective_max_concurrent") == config["typed_active_cap"],
+            "server effective active cap differs from typed_active_cap",
+        )
+        session["runtime_log"] = artifact_ref(root, runtime_log, kind="server-runtime-log")
+        session["scheduler_trace"] = artifact_ref(root, scheduler_trace, kind="scheduler-trace")
+        session["product_effective_config"] = artifact_ref(root, product_config, kind="product-effective-config")
+        for record, sampler in zip(records, samplers):
+            record["resources"] = cell_resource_evidence(root, session, record, sampler, config)
+        formal_count = len(expected_cells(config["backend"]))
+        bundle = {
+            "schema_version": SCHEMA_VERSION,
+            "contract": CONTRACT,
+            "config_fingerprint": fingerprint,
+            "session": session,
+            "formal_reports": records[:formal_count],
+            "run_serve_parity_report": records[formal_count],
+        }
+        atomic_write_json(bundle_path, bundle)
+        collector_support.append_jsonl(
+            lane / "command-log.jsonl",
+            {
+                "event": "server-session-complete",
+                "session_id": session["session_id"],
+                "started_at": started_at,
+                "finished_at": session["finished_at"],
+                "bundle": artifact_relative(root, bundle_path),
+                "bundle_sha256": file_sha256(bundle_path),
+            },
+        )
+        validate_server_bundle(root, bundle, fingerprint, config)
+        return bundle
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        if process is not None:
+            cleanup_returncode, cleanup_gone, cleanup_error = collector_support.cleanup_process_group_noexcept(process, 10.0)
+        else:
+            cleanup_returncode, cleanup_gone, cleanup_error = None, True, None
+        if runtime_handle is not None:
+            try:
+                runtime_handle.flush()
+                runtime_handle.close()
+            except BaseException:
+                pass
+        collector_support.ensure_nonempty_log(runtime_log, "server runtime")
+        if failure is not None:
+            atomic_write_json(
+                attempt_dir / "failure.json",
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "failed_at": now_iso(),
+                    "error_type": type(failure).__name__,
+                    "error": str(failure),
+                    "cleanup_returncode": cleanup_returncode,
+                    "cleanup_process_group_gone": cleanup_gone,
+                    "cleanup_error": cleanup_error,
+                    "resume_policy": "preserve attempt and restart all server cells in one new process",
+                },
+            )
+
+
+def exec_barrier_launcher_argv(release_file: Path, product_argv: list[str]) -> list[str]:
+    require(product_argv and all(isinstance(item, str) and item for item in product_argv), "exec barrier product argv is invalid")
+    return [
+        sys.executable,
+        str(COLLECTOR_PATH),
+        "--exec-barrier-child",
+        "--release-file",
+        str(release_file),
+        "--",
+        *product_argv,
+    ]
+
+
+def run_exec_barrier_child(release_file: Path, raw_argv: list[str]) -> int:
+    argv = list(raw_argv)
+    if argv and argv[0] == "--":
+        argv.pop(0)
+    require(argv and all(isinstance(item, str) and item for item in argv), "exec barrier requires product argv")
+    deadline = time.monotonic() + 120.0
+    while not release_file.exists():
+        if time.monotonic() >= deadline:
+            raise R2CollectorError(f"exec barrier release timed out: {release_file}")
+        time.sleep(0.01)
+    require(release_file.read_text(encoding="utf-8") == "release\n", "exec barrier release artifact is invalid")
+    os.execvpe(argv[0], argv, os.environ)
+    raise R2CollectorError("exec barrier os.execvpe unexpectedly returned")
+
+
+def collect_jsonl_stream(
+    process: subprocess.Popen[Any],
+    stdout_path: Path,
+    arrival_path: Path,
+    timeout_sec: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, bool]:
+    require(process.stdout is not None, "run stdout pipe is missing")
+    fd = process.stdout.fileno()
+    os.set_blocking(fd, False)
+    selector = selectors.DefaultSelector()
+    selector.register(fd, selectors.EVENT_READ)
+    deadline = time.monotonic() + timeout_sec
+    pending = b""
+    raw = bytearray()
+    events: list[dict[str, Any]] = []
+    arrivals: list[dict[str, Any]] = []
+    chunk_sequence = 0
+    eof = False
+    timed_out = False
+    try:
+        while not eof:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            ready = selector.select(timeout=min(0.25, max(0.0, deadline - time.monotonic())))
+            if not ready:
+                if process.poll() is not None:
+                    try:
+                        payload = os.read(fd, 65536)
+                    except BlockingIOError:
+                        payload = b""
+                    if not payload:
+                        eof = True
+                        continue
+                continue
+            for _, _ in ready:
+                try:
+                    payload = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not payload:
+                    eof = True
+                    break
+                chunk_sequence += 1
+                observed_at = now_iso()
+                observed_monotonic_ns = time.monotonic_ns()
+                raw.extend(payload)
+                pending += payload
+                complete = pending.split(b"\n")
+                pending = complete.pop()
+                line_count = len([line for line in complete if line.strip()])
+                for line in complete:
+                    if not line.strip():
+                        continue
+                    try:
+                        event = json.loads(line.decode("utf-8", errors="strict"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise R2CollectorError(f"invalid run JSONL: {exc}") from exc
+                    require(isinstance(event, dict), "run JSONL event must be an object")
+                    events.append(event)
+                    arrivals.append(
+                        {
+                            "event_ordinal": len(events),
+                            "event": event.get("event"),
+                            "assistant_delta_index": event.get("index") if event.get("event") == "assistant_delta" else None,
+                            "token_id": event.get("token_id") if event.get("event") == "assistant_delta" else None,
+                            "observed_at": observed_at,
+                            "observed_monotonic_ns": observed_monotonic_ns,
+                            "read_chunk_sequence": chunk_sequence,
+                            "read_chunk_jsonl_line_count": line_count,
+                        }
+                    )
+        if pending.strip() and not timed_out:
+            raise R2CollectorError("run JSONL ended with an unterminated record")
+    finally:
+        selector.close()
+    stdout_path.write_bytes(bytes(raw))
+    arrival_path.write_text(
+        "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in arrivals),
+        encoding="utf-8",
+    )
+    if timed_out:
+        return events, arrivals, 124, False
+    try:
+        returncode = process.wait(timeout=10.0)
+    except subprocess.TimeoutExpired:
+        returncode = 124
+    returncode, group_gone = collector_support.terminate_process_group(process, 2.0)
+    return events, arrivals, returncode, group_gone
+
+
+def validate_run_events(
+    events: list[dict[str, Any]],
+    arrivals: list[dict[str, Any]],
+    label: str,
+) -> dict[str, Any]:
+    assistant = [event for event in events if event.get("event") == "assistant"]
+    require(len(assistant) == 1, f"{label} must contain exactly one assistant event")
+    row = assistant[0]
+    output_tokens = row.get("n_tokens")
+    require(output_tokens == RUN_MAX_TOKENS, f"{label} must produce exactly {RUN_MAX_TOKENS} output tokens")
+    usage = row.get("usage")
+    require(isinstance(usage, dict) and usage.get("completion_tokens") == RUN_MAX_TOKENS, f"{label} usage output count mismatch")
+    require(row.get("finish_reason") == "length", f"{label} must use the fixed max-token boundary")
+    content = row.get("content")
+    require(isinstance(content, str) and content, f"{label} assistant content is empty")
+    forbidden = ("<unk>", "[PAD", "<pad>", "<|reserved_special_token", "\ufffd", "Ã©", "Â©", "â€")
+    require(not any(marker in content for marker in forbidden), f"{label} output contains reserved-token/UTF-8 corruption")
+    e2e_ms = row.get("ms")
+    require(isinstance(e2e_ms, (int, float)) and not isinstance(e2e_ms, bool) and math.isfinite(e2e_ms) and e2e_ms > 0, f"{label} engine.infer E2E is invalid")
+    deltas = [entry for entry in arrivals if entry.get("event") == "assistant_delta"]
+    require(len(deltas) >= 2, f"{label} lacks two token arrivals for steady decode")
+    require(all(isinstance(entry.get("token_id"), int) for entry in deltas), f"{label} token arrival lacks token_id")
+    delta_indexes = [entry.get("assistant_delta_index") for entry in deltas]
+    require(delta_indexes == list(range(len(deltas))), f"{label} assistant delta indexes are not contiguous")
+    first_ns = deltas[0]["observed_monotonic_ns"]
+    last_ns = deltas[-1]["observed_monotonic_ns"]
+    require(isinstance(first_ns, int) and isinstance(last_ns, int) and last_ns > first_ns, f"{label} steady decode interval is not positive")
+    interval_sec = (last_ns - first_ns) / 1_000_000_000.0
+    steady_tokens = len(deltas) - 1
+    steady_tps = steady_tokens / interval_sec
+    require(math.isfinite(steady_tps) and steady_tps > 0, f"{label} steady decode TPS is invalid")
+    return {
+        "output_tokens": output_tokens,
+        "visible_token_arrivals": len(deltas),
+        "steady_decode_interval_tokens": steady_tokens,
+        "steady_decode_interval_ms": interval_sec * 1000.0,
+        "steady_decode_tps": steady_tps,
+        "steady_decode_definition": "visible token intervals from first through last flushed assistant_delta arrival; first-token interval excluded",
+        "engine_infer_e2e_ms": float(e2e_ms),
+        "engine_infer_e2e_output_tps": output_tokens * 1000.0 / float(e2e_ms),
+        "finish_reason": row["finish_reason"],
+        "usage_output_tokens": usage["completion_tokens"],
+    }
+
+
+def validate_run_bundle(
+    root: Path,
+    bundle: dict[str, Any],
+    fingerprint: str,
+    sample_ordinal: int,
+) -> None:
+    require(bundle.get("schema_version") == SCHEMA_VERSION, "run bundle schema mismatch")
+    require(bundle.get("config_fingerprint") == fingerprint, "run bundle fingerprint mismatch")
+    sample = bundle.get("sample")
+    require(isinstance(sample, dict) and sample.get("sample_ordinal") == sample_ordinal, "run sample ordinal mismatch")
+    stdout = validate_artifact_ref(root, sample.get("stdout"), f"run sample {sample_ordinal}.stdout")
+    arrival = validate_artifact_ref(root, sample.get("arrival_timeline"), f"run sample {sample_ordinal}.arrival_timeline")
+    for key in ("stderr", "product_effective_config"):
+        validate_artifact_ref(root, sample.get(key), f"run sample {sample_ordinal}.{key}")
+    validate_artifact_ref(root, sample.get("resources", {}).get("observations"), f"run sample {sample_ordinal}.resources.observations")
+    events = [json.loads(line) for line in stdout.read_text(encoding="utf-8").splitlines() if line.strip()]
+    arrivals = [json.loads(line) for line in arrival.read_text(encoding="utf-8").splitlines() if line.strip()]
+    metrics = validate_run_events(events, arrivals, f"run sample {sample_ordinal}")
+    require(metrics == sample.get("metrics"), f"run sample {sample_ordinal} metrics no longer match raw evidence")
+
+
+def collect_run_sample(
+    root: Path,
+    lane: Path,
+    fingerprint: str,
+    sample_ordinal: int,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    *,
+    resume: bool,
+) -> dict[str, Any]:
+    bundle_path = lane / "run-samples" / f"sample-{sample_ordinal}.json"
+    if bundle_path.exists():
+        require(resume, f"run sample already exists; pass --resume: {bundle_path}")
+        bundle = read_json(bundle_path)
+        validate_run_bundle(root, bundle, fingerprint, sample_ordinal)
+        return bundle
+    attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    sample_id = f"r2-{config['model_key']}-{config['backend']}-run-{sample_ordinal}"
+    attempt_dir = lane / "attempts" / f"run-{sample_ordinal}-{attempt_id}"
+    attempt_dir.mkdir(parents=True, exist_ok=False)
+    stdout_path = attempt_dir / "run.stdout.jsonl"
+    stderr_path = attempt_dir / "run.stderr.log"
+    arrival_path = attempt_dir / "run.arrival-timeline.jsonl"
+    effective = attempt_dir / "run-effective-config.json"
+    barrier_release = attempt_dir / "exec-barrier.release"
+    argv = run_argv(inputs["binary_path"], effective, config)
+    launcher = exec_barrier_launcher_argv(barrier_release, argv)
+    environment = dict(config["candidate"]["env"])
+    started_at = now_iso()
+    process: subprocess.Popen[Any] | None = None
+    sampler: dict[str, Any] | None = None
+    failure: BaseException | None = None
+    with stderr_path.open("x", encoding="utf-8") as stderr_handle:
+        stderr_handle.write("[r2-collector] ferrum run stderr follows\n")
+        stderr_handle.flush()
+        try:
+            process = subprocess.Popen(
+                launcher,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=stderr_handle,
+                text=False,
+                bufsize=0,
+                start_new_session=True,
+            )
+            pid = process.pid
+            pgid = os.getpgid(pid)
+            require(pgid == pid, "run process must own an independent process group")
+            marker, marker_source = collector_support.process_identity(pid)
+            sampler = collector_support.run_sampler_for_process(
+                root,
+                attempt_dir,
+                pid=pid,
+                pgid=pgid,
+                sample_id=sample_id,
+                config=config,
+                hardware_id=config["hardware"]["id"],
+                stderr_path=stderr_path,
+            )
+            atomic_write_text(barrier_release, "release\n")
+            collector_support.wait_for_process_exec(process, inputs["binary_path"], 30.0)
+            receipt = collector_support.write_process_receipt(
+                root,
+                attempt_dir / "run-process-receipt.json",
+                pid=pid,
+                pgid=pgid,
+                argv=argv,
+                environment=environment,
+                marker=marker,
+                source=marker_source,
+            )
+            events, arrivals, returncode, group_gone = collect_jsonl_stream(
+                process,
+                stdout_path,
+                arrival_path,
+                float(config["server"]["command_timeout_sec"]),
+            )
+            if returncode == 124:
+                _, group_gone = collector_support.terminate_process_group(process, 5.0)
+            finished_at = now_iso()
+            samples = collector_support.wait_process_sampler(sampler)
+            sampler_meta = sampler
+            sampler = None
+            require(group_gone, f"run sample {sample_ordinal} process group survived cleanup")
+            process = None
+            require(returncode == 0, f"run sample {sample_ordinal} failed with returncode {returncode}")
+            require(effective.is_file(), f"run sample {sample_ordinal} did not write effective config")
+            metrics = validate_run_events(events, arrivals, f"run sample {sample_ordinal}")
+            measurement_started_at = samples[0]["sampled_at"]
+            measurement_finished_at = samples[-1]["sampled_at"]
+            resource_summary = collector_support.resource_sampler.derive_summary(
+                sampler_meta["observations"],
+                session_id=sample_id,
+                cell_id="run:c1",
+                backend=config["backend"],
+                hardware_id=config["hardware"]["id"],
+                pid=pid,
+                pgid=pgid,
+                process_start_marker=marker,
+                base_url=f"process://{sample_id}",
+                session_started_at=started_at,
+                session_finished_at=finished_at,
+                measurement_started_at=measurement_started_at,
+                measurement_finished_at=measurement_finished_at,
+                memory_budget_bytes=config["memory_budget_bytes"],
+                requested_concurrency=1,
+                typed_active_cap=1,
+                runtime_log_path=str(stderr_path),
+            )
+            resources = {
+                "sampler_argv": sampler_meta["argv"],
+                "sampler_argv_sha256": canonical_json_sha256(sampler_meta["argv"]),
+                "observations": artifact_ref(root, sampler_meta["observations"], kind="run-resource-observations"),
+                "summary": resource_summary,
+            }
+            sample = {
+                "sample_id": sample_id,
+                "sample_ordinal": sample_ordinal,
+                "independent_process": True,
+                "pid": pid,
+                "pgid": pgid,
+                "process_start_marker": marker,
+                "process_start_source": marker_source,
+                "process_receipt": receipt,
+                "candidate_binary_sha256": inputs["binary"]["sha256"],
+                "source_git_sha": config["candidate"]["source_git_sha"],
+                "hardware": copy.deepcopy(config["hardware"]),
+                "prompt": copy.deepcopy(inputs["run_prompt"]),
+                "profile_detail": "off",
+                "eos_policy": "model-metadata",
+                "max_tokens": RUN_MAX_TOKENS,
+                "argv": argv,
+                "argv_sha256": canonical_json_sha256(argv),
+                "launcher_argv": launcher,
+                "environment": environment,
+                "environment_sha256": canonical_json_sha256(environment),
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_sec": duration_seconds(started_at, finished_at),
+                "returncode": returncode,
+                "stdout": artifact_ref(root, stdout_path, kind="run-stdout-jsonl"),
+                "stderr": artifact_ref(root, stderr_path, kind="run-stderr"),
+                "arrival_timeline": artifact_ref(root, arrival_path, kind="run-token-arrival-timeline"),
+                "product_effective_config": artifact_ref(root, effective, kind="run-effective-config"),
+                "metrics": metrics,
+                "resources": resources,
+            }
+            bundle = {
+                "schema_version": SCHEMA_VERSION,
+                "contract": CONTRACT,
+                "config_fingerprint": fingerprint,
+                "sample": sample,
+            }
+            bundle_path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(bundle_path, bundle)
+            collector_support.append_jsonl(
+                lane / "command-log.jsonl",
+                {
+                    "event": "run-sample-complete",
+                    "sample_id": sample_id,
+                    "sample_ordinal": sample_ordinal,
+                    "started_at": started_at,
+                    "finished_at": finished_at,
+                    "bundle": artifact_relative(root, bundle_path),
+                    "bundle_sha256": file_sha256(bundle_path),
+                },
+            )
+            validate_run_bundle(root, bundle, fingerprint, sample_ordinal)
+            return bundle
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            if process is not None:
+                collector_support.cleanup_process_group_noexcept(process, 10.0)
+            if sampler is not None and sampler.get("finished") is not True:
+                try:
+                    sampler["stop_file"].write_text("stop\n", encoding="utf-8")
+                    collector_support.finish_resource_sampler(sampler, bracket_after_measurement=False)
+                except BaseException:
+                    collector_support.cleanup_process_group_noexcept(sampler["process"], 5.0)
+                    collector_support.close_sampler_handles(sampler)
+                    sampler["finished"] = True
+            collector_support.ensure_nonempty_log(stderr_path, "run stderr")
+            if failure is not None:
+                atomic_write_json(
+                    attempt_dir / "failure.json",
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "failed_at": now_iso(),
+                        "error_type": type(failure).__name__,
+                        "error": str(failure),
+                    },
+                )
+
+
+def run_summary(run_bundles: list[dict[str, Any]], parity_record: dict[str, Any]) -> dict[str, Any]:
+    require(len(run_bundles) == RUN_SAMPLE_COUNT, "run summary requires exactly three process samples")
+    metrics = [bundle["sample"]["metrics"] for bundle in run_bundles]
+    steady = [float(row["steady_decode_tps"]) for row in metrics]
+    e2e_ms = [float(row["engine_infer_e2e_ms"]) for row in metrics]
+    e2e_tps = [float(row["engine_infer_e2e_output_tps"]) for row in metrics]
+    parity = parity_record.get("serve_c1_parity_metrics")
+    require(isinstance(parity, dict), "run/serve parity metrics are missing")
+    serve_steady = float(parity["steady_decode_tps_median"])
+    require(math.isfinite(serve_steady) and serve_steady > 0, "serve parity steady decode is invalid")
+    run_steady = statistics.median(steady)
+    return {
+        "sample_count": RUN_SAMPLE_COUNT,
+        "independent_process_count": len({bundle["sample"]["pid"] for bundle in run_bundles}),
+        "prompt_sha256": hashlib.sha256(RUN_PROMPT.encode("utf-8")).hexdigest(),
+        "max_tokens": RUN_MAX_TOKENS,
+        "eos_policy": "model-metadata",
+        "steady_decode_tps_per_process": steady,
+        "steady_decode_tps_median": run_steady,
+        "engine_infer_e2e_ms_per_process": e2e_ms,
+        "engine_infer_e2e_ms_median": statistics.median(e2e_ms),
+        "engine_infer_e2e_output_tps_per_process": e2e_tps,
+        "engine_infer_e2e_output_tps_median": statistics.median(e2e_tps),
+        "serve_c1_same_prompt_steady_decode_tps_median": serve_steady,
+        "run_to_serve_c1_steady_decode_ratio": run_steady / serve_steady,
+        "ratio_threshold_evaluated_by_aggregate": 0.90,
+        "ratio_status": "unjudged-by-collector",
+    }
+
+
+def collect_artifact_refs(root: Path, value: Any, output: dict[str, dict[str, Any]]) -> None:
+    if isinstance(value, dict):
+        if {"kind", "path", "sha256", "size_bytes"} <= set(value):
+            relative = value.get("path")
+            if isinstance(relative, str) and not Path(relative).is_absolute():
+                path = (root / relative).resolve()
+                try:
+                    path.relative_to(root.resolve())
+                except ValueError:
+                    path = Path("/__outside_artifact_root__")
+                if path.is_file():
+                    validated = validate_artifact_ref(root, value, f"artifact index candidate {relative}")
+                    output[relative] = {
+                        "kind": value["kind"],
+                        "path": relative,
+                        "sha256": file_sha256(validated),
+                        "size_bytes": validated.stat().st_size,
+                    }
+        for child in value.values():
+            collect_artifact_refs(root, child, output)
+    elif isinstance(value, list):
+        for child in value:
+            collect_artifact_refs(root, child, output)
+
+
+def write_artifact_index(
+    root: Path,
+    lane: Path,
+    plan_path: Path,
+    inputs: dict[str, Any],
+    server_bundle: dict[str, Any],
+    server_bundle_path: Path,
+    run_bundles: list[dict[str, Any]],
+    run_bundle_paths: list[Path],
+) -> Path:
+    refs: dict[str, dict[str, Any]] = {}
+    collect_artifact_refs(root, inputs, refs)
+    collect_artifact_refs(root, server_bundle, refs)
+    collect_artifact_refs(root, run_bundles, refs)
+    for path, kind in [
+        (plan_path, "collection-plan"),
+        (lane / "config.normalized.json", "normalized-config"),
+        (server_bundle_path, "server-session-bundle"),
+        *((path, "run-sample-bundle") for path in run_bundle_paths),
+        (lane / "command-log.jsonl", "command-log"),
+    ]:
+        ref = artifact_ref(root, path, kind=kind)
+        refs[ref["path"]] = ref
+    document = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": CONTRACT,
+        "artifact_type": "runtime_vnext_r2_ferrum_raw_artifact_index",
+        "selected_evidence_only": True,
+        "failed_attempts_excluded": True,
+        "artifact_count": len(refs),
+        "artifacts": [refs[key] for key in sorted(refs)],
+    }
+    path = lane / "raw-artifact-index.json"
+    if path.exists():
+        require(read_json(path) == document, "raw artifact index changed during resume")
+    else:
+        atomic_write_json(path, document)
+    return path
+
+
+def validate_final_manifest(root: Path, manifest: dict[str, Any], fingerprint: str) -> None:
+    require(manifest.get("schema_version") == SCHEMA_VERSION, "final manifest schema mismatch")
+    require(manifest.get("contract") == CONTRACT, "final manifest contract mismatch")
+    require(manifest.get("status") == "pass", "final manifest status is not pass")
+    require(manifest.get("config_fingerprint") == fingerprint, "final manifest fingerprint mismatch")
+    for key in ("plan", "server_session", "raw_artifact_index"):
+        validate_artifact_ref(root, manifest.get(key), f"manifest.{key}")
+    runs = manifest.get("run_samples")
+    require(isinstance(runs, list) and len(runs) == RUN_SAMPLE_COUNT, "manifest must reference three run samples")
+    for index, ref in enumerate(runs, start=1):
+        validate_artifact_ref(root, ref, f"manifest.run_samples[{index}]")
+    raw_index_path = validate_artifact_ref(root, manifest["raw_artifact_index"], "manifest.raw_artifact_index")
+    raw_index = read_json(raw_index_path)
+    artifacts = raw_index.get("artifacts")
+    require(isinstance(artifacts, list) and len(artifacts) == raw_index.get("artifact_count"), "raw artifact index count mismatch")
+    for index, ref in enumerate(artifacts, start=1):
+        validate_artifact_ref(root, ref, f"raw artifact index[{index}]")
+
+
+def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool) -> Path | None:
+    require(root.is_dir(), f"artifact root does not exist: {root}")
+    try:
+        root.resolve().relative_to(REPO_ROOT.resolve())
+    except ValueError:
+        pass
+    else:
+        raise R2CollectorError("artifact root must stay outside the Git worktree")
+    raw = read_json(config_path)
+    config, context = normalize_config(raw)
+    lane, fingerprint = prepare_plan(root, config, context, resume=resume)
+    plan_path = lane / "plan.json"
+    if plan_only:
+        print(f"{PLAN_PREFIX}: {plan_path}")
+        return None
+
+    inputs = stage_inputs(root, lane, config, context)
+    server_bundle = collect_server_session(root, lane, fingerprint, config, inputs, resume=resume)
+    existing = [
+        ordinal
+        for ordinal in range(1, RUN_SAMPLE_COUNT + 1)
+        if (lane / "run-samples" / f"sample-{ordinal}.json").exists()
+    ]
+    require(existing == list(range(1, len(existing) + 1)), "run resume state is not a chronological prefix")
+    run_bundles = [
+        collect_run_sample(root, lane, fingerprint, ordinal, config, inputs, resume=resume)
+        for ordinal in range(1, RUN_SAMPLE_COUNT + 1)
+    ]
+    server_bundle_path = lane / "server-session.json"
+    run_bundle_paths = [lane / "run-samples" / f"sample-{ordinal}.json" for ordinal in range(1, RUN_SAMPLE_COUNT + 1)]
+    index_path = write_artifact_index(
+        root,
+        lane,
+        plan_path,
+        inputs,
+        server_bundle,
+        server_bundle_path,
+        run_bundles,
+        run_bundle_paths,
+    )
+    summary = run_summary(run_bundles, server_bundle["run_serve_parity_report"])
+    manifest_path = lane / "manifest.json"
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": CONTRACT,
+        "artifact_type": "runtime_vnext_r2_ferrum_lane_manifest",
+        "status": "pass",
+        "formal_r2_aggregate_status": "not-evaluated",
+        "model_key": config["model_key"],
+        "backend": config["backend"],
+        "hardware": copy.deepcopy(config["hardware"]),
+        "config_fingerprint": fingerprint,
+        "profile_detail": "off",
+        "source_git_sha": config["candidate"]["source_git_sha"],
+        "source_tree_sha": config["candidate"]["source_tree_sha"],
+        "dirty_status": copy.deepcopy(config["candidate"]["dirty_status"]),
+        "candidate_binary_sha256": inputs["binary"]["sha256"],
+        "model_revision": context["lane"]["revision"],
+        "model_files": copy.deepcopy(context["model_files"]),
+        "plan": artifact_ref(root, plan_path, kind="collection-plan"),
+        "inputs": {key: copy.deepcopy(value) for key, value in inputs.items() if isinstance(value, dict)},
+        "server_session": artifact_ref(root, server_bundle_path, kind="server-session-bundle"),
+        "formal_http_cell_count": len(expected_cells(config["backend"])),
+        "formal_http_cells": [cell_id(cell) for cell in expected_cells(config["backend"])],
+        "run_serve_parity_probe": copy.deepcopy(server_bundle["run_serve_parity_report"]),
+        "run_samples": [artifact_ref(root, path, kind="run-sample-bundle") for path in run_bundle_paths],
+        "run_performance": summary,
+        "raw_artifact_index": artifact_ref(root, index_path, kind="raw-artifact-index"),
+        "pass_line": f"{PASS_PREFIX}: {config['model_key']}/{config['backend']}: {manifest_path}",
+    }
+    if manifest_path.exists():
+        require(resume, f"final manifest already exists; pass --resume: {manifest_path}")
+        require(read_json(manifest_path) == manifest, "final manifest changed during resume")
+    else:
+        atomic_write_json(manifest_path, manifest)
+    validate_server_bundle(root, server_bundle, fingerprint, config)
+    for ordinal, bundle in enumerate(run_bundles, start=1):
+        validate_run_bundle(root, bundle, fingerprint, ordinal)
+    validate_final_manifest(root, manifest, fingerprint)
+    print(manifest["pass_line"])
+    return manifest_path
+
+
+def synthetic_bench_report(config: dict[str, Any], cell: dict[str, Any]) -> dict[str, Any]:
+    count = cell["num_prompts"]
+    quality = {
+        "bad_output": 0,
+        "malformed_stream": 0,
+        "missing_done": 0,
+        "duplicate_done": 0,
+        "zero_output_tokens": 0,
+        "stream_bulk_flush": 0,
+        "http_500": 0,
+        "panic": 0,
+    }
+    repeats = [
+        {
+            "repeat": repeat,
+            "expected_requests": count,
+            "completed_requests": count,
+            "errored_requests": 0,
+            "warmup_expected": WARMUP_REQUESTS,
+            "warmup_completed": WARMUP_REQUESTS,
+            "warmup_errored": 0,
+            "output_token_count_source": "usage",
+            "quality_issues": copy.deepcopy(quality),
+            "warmup_quality_issues": copy.deepcopy(quality),
+            "tpot_ms": {"p50": 10.0 + repeat, "p75": 11.0 + repeat, "p95": 12.0 + repeat, "p99": 13.0 + repeat},
+            "ttft_ms": {"p50": 20.0, "p75": 21.0, "p95": 22.0, "p99": 23.0},
+            "e2e_ms": {"p50": 1300.0, "p75": 1310.0, "p95": 1320.0, "p99": 1330.0},
+            "output_throughput_tps": 100.0,
+            "actual_input_tokens": count * cell["input_tokens"],
+            "output_tokens": count * cell["output_tokens"],
+        }
+        for repeat in range(1, 4)
+    ]
+    output_len = RUN_MAX_TOKENS if cell["dataset"] in {"random", "run-parity"} else 120
+    report = {
+        "model": config["request_model"],
+        "backend": config["backend"],
+        "scenario": "closed_loop",
+        "concurrency": cell["concurrency"],
+        "n_prompt": cell["input_tokens"],
+        "n_gen": 128,
+        "n_repeats": 3,
+        "n_requests_per_run": count,
+        "warmup_requests": WARMUP_REQUESTS,
+        "output_token_count_source": "usage",
+        "repeat_metrics": repeats,
+        "completed_per_run": [count, count, count],
+        "errored_per_run": [0, 0, 0],
+        "actual_input_tokens_per_request": [[cell["input_tokens"]] * count for _ in range(3)],
+        "output_tokens_per_request": [[output_len] * count for _ in range(3)],
+        "itl_evidence_per_request": [[{"eligible": True}] * count for _ in range(3)],
+    }
+    for name in quality:
+        report[f"{name}_per_run"] = [0, 0, 0]
+    return report
+
+
+def self_test() -> int:
+    template = config_template()
+    require(
+        set(template)
+        == {
+            "schema_version",
+            "model_key",
+            "backend",
+            "request_model",
+            "models_lock_path",
+            "correctness_manifest_path",
+            "model_origin_path",
+            "semantic_source_root",
+            "tokenizer_source_root",
+            "candidate",
+            "hardware",
+            "typed_active_cap",
+            "memory_budget_bytes",
+            "server",
+            "run",
+            "datasets",
+            "goodput_slo",
+        },
+        "config template top-level schema self-test failed",
+    )
+    require(
+        set(template["candidate"])
+        == {
+            "binary_path",
+            "build_log_path",
+            "build_receipt_path",
+            "source_git_sha",
+            "dirty_status",
+            "cargo_features",
+            "env",
+        },
+        "config template candidate schema self-test failed",
+    )
+    require(
+        {"real-chat", "sharegpt"} == set(template["datasets"]),
+        "config template dataset schema self-test failed",
+    )
+    cuda = expected_cells("cuda")
+    metal = expected_cells("metal")
+    require(
+        [(row["dataset"], row["concurrency"], row["num_prompts"]) for row in cuda]
+        == [
+            ("random", 1, 100),
+            ("random", 4, 100),
+            ("random", 16, 100),
+            ("random", 32, 100),
+            ("sharegpt", 1, 30),
+            ("sharegpt", 32, 30),
+        ],
+        "CUDA formal matrix self-test failed",
+    )
+    require(
+        [(row["dataset"], row["concurrency"], row["num_prompts"]) for row in metal]
+        == [
+            ("random", 1, 100),
+            ("random", 4, 100),
+            ("random", 16, 100),
+            ("real-chat", 1, 30),
+            ("real-chat", 16, 30),
+        ],
+        "Metal formal matrix self-test failed",
+    )
+    for backend, cells in (("cuda", cuda), ("metal", metal)):
+        config = {
+            "backend": backend,
+            "request_model": "selftest-model",
+            "server": {"host": "127.0.0.1", "port": 18080, "command_timeout_sec": 7200},
+            "hardware": {"id": f"selftest-{backend}"},
+            "candidate": {"source_git_sha": "1" * 40},
+            "goodput_slo": {"ttft": 500.0, "tpot": 50.0, "e2e": 30000.0},
+        }
+        inputs = {
+            "tokenizer_path": Path("/tmp/r2-selftest/tokenizer/tokenizer.json"),
+            "realistic_dataset_path": Path("/tmp/r2-selftest/real.jsonl"),
+            "run_parity_dataset_path": Path("/tmp/r2-selftest/parity.jsonl"),
+        }
+        for cell in [*cells, run_parity_cell(backend)]:
+            argv = bench_argv(
+                Path("/tmp/r2-selftest/ferrum"),
+                Path("/tmp/r2-selftest/report.json"),
+                config,
+                inputs,
+                cell,
+            )
+            _, options, switches = collector_support.baseline_gate.parse_argv(argv, "selftest.bench")
+            require(options["--concurrency"] == str(cell["concurrency"]), "bench concurrency self-test failed")
+            require(options["--num-prompts"] == str(cell["num_prompts"]), "bench prompt count self-test failed")
+            require(options["--n-repeats"] == "3" and options["--seed"] == "9271", "bench repeat/seed self-test failed")
+            require("--fail-on-error" in switches and "--require-ci" in switches, "formal bench switches self-test failed")
+            require(("--ignore-eos" in switches) == (cell["dataset"] == "random"), "EOS policy self-test failed")
+            report = synthetic_bench_report(config, cell)
+            validate_bench_report(report, config, cell)
+        parity_argv = bench_argv(
+            Path("/tmp/r2-selftest/ferrum"),
+            Path("/tmp/r2-selftest/report.json"),
+            config,
+            inputs,
+            run_parity_cell(backend),
+        )
+        require(str(inputs["run_parity_dataset_path"]) in parity_argv, "run parity dataset self-test failed")
+
+    events = [
+        {
+            "event": "assistant",
+            "n_tokens": RUN_MAX_TOKENS,
+            "usage": {"completion_tokens": RUN_MAX_TOKENS},
+            "finish_reason": "length",
+            "content": "1 2 3",
+            "ms": 1280.0,
+        }
+    ]
+    arrivals = [
+        {
+            "event": "assistant_delta",
+            "assistant_delta_index": index,
+            "token_id": index + 1,
+            "observed_monotonic_ns": 1_000_000_000 + index * 10_000_000,
+        }
+        for index in range(RUN_MAX_TOKENS)
+    ]
+    run_metrics = validate_run_events(events, arrivals, "selftest.run")
+    require(abs(run_metrics["steady_decode_tps"] - 100.0) < 1e-9, "steady decode self-test failed")
+    require(abs(run_metrics["engine_infer_e2e_output_tps"] - 100.0) < 1e-9, "engine.infer E2E self-test failed")
+
+    try:
+        parse_extra_argv(["--profile-detail", "basic"], "selftest.extra")
+        raise R2CollectorError("reserved profile override unexpectedly passed")
+    except R2CollectorError as exc:
+        require("collector-owned" in str(exc), "reserved option failed for the wrong reason")
+
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-r2-ferrum-selftest-") as temporary:
+        root = Path(temporary)
+        template_path = root / "nested" / "config.json"
+        write_config_template(template_path)
+        require(read_json(template_path) == template, "written config template self-test failed")
+        raw = root / "raw.json"
+        raw.write_text("{}\n", encoding="utf-8")
+        ref = artifact_ref(root, raw, kind="selftest")
+        validate_artifact_ref(root, ref, "selftest.ref")
+        raw.write_text('{"changed":true}\n', encoding="utf-8")
+        try:
+            validate_artifact_ref(root, ref, "selftest.tampered")
+            raise R2CollectorError("tampered artifact unexpectedly passed")
+        except R2CollectorError as exc:
+            require("changed" in str(exc), "tamper self-test failed for the wrong reason")
+
+    print(SELFTEST_PASS_LINE)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifact-root", type=Path)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument(
+        "--write-config-template",
+        type=Path,
+        metavar="PATH",
+        help="write the complete minimum operator config shape and exit",
+    )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--exec-barrier-child", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--release-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("exec_argv", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.exec_barrier_child:
+        require(args.release_file is not None, "--exec-barrier-child requires --release-file")
+        return run_exec_barrier_child(args.release_file, args.exec_argv)
+    if args.self_test:
+        require(
+            args.artifact_root is None
+            and args.config is None
+            and args.write_config_template is None
+            and not args.resume
+            and not args.plan_only,
+            "--self-test cannot collect or plan a lane",
+        )
+        return self_test()
+    if args.write_config_template is not None:
+        require(
+            args.artifact_root is None and args.config is None and not args.resume and not args.plan_only,
+            "--write-config-template cannot collect or plan a lane",
+        )
+        write_config_template(args.write_config_template)
+        return 0
+    require(args.artifact_root is not None and args.config is not None, "--artifact-root and --config are required")
+    collect_lane(
+        args.artifact_root.expanduser().resolve(),
+        args.config.expanduser().resolve(),
+        resume=args.resume,
+        plan_only=args.plan_only,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (
+        R2CollectorError,
+        collector_support.CollectorError,
+        collector_support.baseline_gate.BaselineError,
+        collector_support.resource_sampler.ResourceEvidenceError,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
+        print(f"runtime vNext R2 Ferrum collector failed: {exc}", file=sys.stderr)
+        raise SystemExit(1)
