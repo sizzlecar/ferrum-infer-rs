@@ -112,3 +112,9 @@ M1 已通过工件只有在记录 SHA 是当前 SHA 的祖先，且中间变化�
 模型锁、运行配置、matrix runner、matrix scenario manifest 或生产实现变化，也不免除 Llama 自身
 在当前 source 上重跑完整 `run`/`serve`/stream 三用例。validator 必须有正例接受上述因果隔离 diff，
 并有反例拒绝任一产品源码 diff。
+
+`scripts/release/runtime_vnext_g08a_same_history_collector.py` 的 bounded worker containment 只参与
+G08A numerics，不参与 S2 或 R1 模型矩阵执行。R0 可跨该文件的单独 containment 变化消费内部所有
+child 仍严格同 SHA 的 S2 聚合证据，但不得因此复用旧 numerics；R1 模型矩阵可跨该 exact 文件及
+R0/R1 aggregator 的因果隔离变化。该例外不扩展为目录或相邻文件白名单，Llama 三用例仍必须在
+最终 source SHA 上重跑。

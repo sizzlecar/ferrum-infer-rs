@@ -27,9 +27,12 @@ SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT R0 CORE CLOSURE SELFTEST PASS"
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 DEPENDENCY_KEYS = ("source", "numerics", "s2")
 CONTROL_PLANE_PREFIXES = ("docs/",)
+SAME_HISTORY_COLLECTOR = "scripts/release/runtime_vnext_g08a_same_history_collector.py"
+R1_AGGREGATOR = "scripts/release/runtime_vnext_r1_product_correctness.py"
 CONTROL_PLANE_FILES = frozenset(
     {
         "scripts/release/runtime_vnext_r0_core_closure.py",
+        R1_AGGREGATOR,
         "scripts/release/run_gate.py",
         "scripts/release/change_impact_rules.json",
         "scripts/release/fixtures/change_impact/planner_fixtures.json",
@@ -53,7 +56,7 @@ DEPENDENCY_LOCAL_FILES = {
             S2_MULTITURN_SCENARIO,
         }
     ),
-    "s2": frozenset(),
+    "s2": frozenset({SAME_HISTORY_COLLECTOR}),
 }
 DOES_NOT_PROVE = [
     "R1 three-model CUDA and Metal correctness",
@@ -527,6 +530,28 @@ def self_test() -> int:
         "numerics",
     )
     require(len(allowed) == 5 and not rejected, "R0 control-plane closure rejected allowed paths")
+    patch_control_plane = [
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
+        "scripts/release/runtime_vnext_r0_core_closure.py",
+        R1_AGGREGATOR,
+    ]
+    for key in DEPENDENCY_KEYS:
+        allowed, rejected = control_plane_only(patch_control_plane, key)
+        require(
+            allowed == patch_control_plane and not rejected,
+            f"R0 {key} closure rejected aggregate control-plane patch paths",
+        )
+    s2_patch_paths = [SAME_HISTORY_COLLECTOR, *patch_control_plane]
+    allowed, rejected = control_plane_only(s2_patch_paths, "s2")
+    require(
+        allowed == s2_patch_paths and not rejected,
+        "R0 S2 closure rejected numerics-only collector containment",
+    )
+    allowed, rejected = control_plane_only(s2_patch_paths, "numerics")
+    require(
+        allowed == patch_control_plane and rejected == [SAME_HISTORY_COLLECTOR],
+        "R0 numerics closure accepted stale same-history collector evidence",
+    )
     _, rejected = control_plane_only([S2_MULTITURN_SCENARIO], "s2")
     require(
         rejected == [S2_MULTITURN_SCENARIO],
