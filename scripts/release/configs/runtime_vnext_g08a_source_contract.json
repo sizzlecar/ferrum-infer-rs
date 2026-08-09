@@ -239,7 +239,7 @@
 	            "symbol": "create",
 	            "line_hint": 1352,
 	            "owner": "ferrum-engine/llm-executor-factory",
-	            "reviewed_at_git_sha": "6ddd2d621127b12ce588ac739119c09a95738307",
+	            "reviewed_at_git_sha": "086759e5edd0e4ad9b4ea4d7d655bf19f48c2bda",
 	            "required_fragments": [
 	                "resolve_registered_model_from_sources",
 	                "resolve_registered_model_from_dir",
