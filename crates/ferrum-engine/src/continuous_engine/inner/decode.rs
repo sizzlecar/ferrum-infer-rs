@@ -148,7 +148,7 @@ impl EngineInner {
         request_ids: &[RequestId],
     ) -> Result<()> {
         let mut stack = vec![self.decode_ready_request_ids(request_ids)];
-        let mut execution_pressure_root_width = None;
+        let mut capacity_pressure_root_width = None;
         while let Some(chunk) = stack.pop() {
             let chunk = self.decode_ready_request_ids(&chunk);
             if chunk.is_empty() {
@@ -252,11 +252,28 @@ impl EngineInner {
                         "split_cohort",
                         None,
                     );
-                    if execution_pressure_root_width.is_none() {
-                        let root_width = request_ids.len();
-                        self.scheduler
-                            .record_decode_execution_capacity_pressure(root_width);
-                        execution_pressure_root_width = Some(root_width);
+                    let first_capacity_split = capacity_pressure_root_width.is_none();
+                    let root_width = capacity_pressure_root_width.unwrap_or(request_ids.len());
+                    capacity_pressure_root_width = Some(root_width);
+                    match deferral.stage() {
+                        ExecutorExecutionCapacityStage::SequenceExtension
+                            if first_capacity_split =>
+                        {
+                            // Sequence extension is request-scoped. Keep the
+                            // learned width, but do not cap unrelated decode
+                            // survivors while a recompute frontier exists.
+                            self.scheduler
+                                .record_decode_capacity_pressure(root_width, None);
+                        }
+                        ExecutorExecutionCapacityStage::SequenceExtension => {}
+                        ExecutorExecutionCapacityStage::StepAdmission
+                        | ExecutorExecutionCapacityStage::SubmissionWave => {
+                            // These stages admit the complete submitted
+                            // cohort, so their limit must remain effective
+                            // while a recompute frontier makes progress.
+                            self.scheduler
+                                .record_decode_execution_capacity_pressure(root_width);
+                        }
                     }
                     let mid = request_ids.len() / 2;
                     stack.push(request_ids[mid..].to_vec());
@@ -318,7 +335,7 @@ impl EngineInner {
                             let progress_owner_resumable = self
                                 .execute_capacity_yield(
                                     &transaction,
-                                    execution_pressure_root_width
+                                    capacity_pressure_root_width
                                         .unwrap_or_else(|| request_ids.len().max(1)),
                                     None,
                                 )
