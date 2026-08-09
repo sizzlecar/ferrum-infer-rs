@@ -4218,6 +4218,29 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
 }
 
 #[tokio::test]
+async fn plan_runtime_execution_pressure_preserves_root_width_across_recursive_split_and_yield() {
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
+        PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
+    );
+    let (request_ids, _, _) =
+        install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8]).await;
+    let decode_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(8))
+        .await
+        .expect("ready decode cohort");
+    assert_eq!(decode_batch.requests.len(), 8);
+
+    engine.inner.process_batch(&decode_batch).await.unwrap();
+
+    let pressure = scheduler.trace_snapshot();
+    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
+    assert_eq!(pressure.decode_capacity_backpressure_admit_limit, Some(4));
+    assert!(pressure.decode_execution_pressure_enforced);
+    assert_eq!(pressure.waiting_queue_len, 1);
+    assert_eq!(pressure.decode_queue_len, request_ids.len() - 1);
+}
+
+#[tokio::test]
 async fn plan_runtime_capacity_yield_preemption_failure_aborts_pending_transaction() {
     let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
         PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails,

@@ -148,6 +148,7 @@ impl EngineInner {
         request_ids: &[RequestId],
     ) -> Result<()> {
         let mut stack = vec![self.decode_ready_request_ids(request_ids)];
+        let mut execution_pressure_root_width = None;
         while let Some(chunk) = stack.pop() {
             let chunk = self.decode_ready_request_ids(&chunk);
             if chunk.is_empty() {
@@ -251,8 +252,12 @@ impl EngineInner {
                         "split_cohort",
                         None,
                     );
-                    self.scheduler
-                        .record_decode_capacity_pressure(request_ids.len(), None);
+                    if execution_pressure_root_width.is_none() {
+                        let root_width = request_ids.len();
+                        self.scheduler
+                            .record_decode_execution_capacity_pressure(root_width);
+                        execution_pressure_root_width = Some(root_width);
+                    }
                     let mid = request_ids.len() / 2;
                     stack.push(request_ids[mid..].to_vec());
                     stack.push(request_ids[..mid].to_vec());
@@ -313,7 +318,8 @@ impl EngineInner {
                             let progress_owner_resumable = self
                                 .execute_capacity_yield(
                                     &transaction,
-                                    request_ids.len().max(1),
+                                    execution_pressure_root_width
+                                        .unwrap_or_else(|| request_ids.len().max(1)),
                                     None,
                                 )
                                 .await?;
