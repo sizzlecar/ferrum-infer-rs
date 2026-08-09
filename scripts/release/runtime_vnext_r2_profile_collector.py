@@ -226,6 +226,12 @@ def path_closure_identity(path: Path) -> dict[str, Any]:
     }
 
 
+def lexical_absolute_path(path: Path) -> Path:
+    """Make a path absolute without dereferencing its final symlink."""
+
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
+
+
 def sanitized_environment() -> dict[str, str]:
     environment: dict[str, str] = {
         "HOME": os.environ.get("HOME", str(Path.home())),
@@ -1471,7 +1477,7 @@ def write_collection_plan(
 def collect_backend(args: argparse.Namespace) -> int:
     out = args.out.expanduser().resolve()
     binary = args.binary.expanduser().resolve()
-    model = args.model.expanduser().resolve()
+    model = lexical_absolute_path(args.model)
     semantic_model = args.semantic_model.expanduser().resolve()
     manifest_path = out / "manifest.json"
     if manifest_path.exists():
@@ -1979,6 +1985,17 @@ def run_selftest() -> int:
     else:
         raise CollectorError("over-limit profile overhead unexpectedly passed")
     require(negative_identity_rejected and negative_overhead_rejected, "negative fixtures did not reject")
+    with tempfile.TemporaryDirectory(prefix="runtime-vnext-r2-profile-selftest-") as temporary:
+        root = Path(temporary)
+        blob = root / "model-blob"
+        blob.write_bytes(b"locked-profile-model")
+        logical_model = root / "Qwen3.5-4B-Q4_K_M.gguf"
+        logical_model.symlink_to(blob)
+        lexical_model = lexical_absolute_path(logical_model)
+        require(
+            lexical_model.name == logical_model.name and lexical_model.is_symlink(),
+            "profile model path dereferenced the logical GGUF filename",
+        )
     print(SELFTEST_PASS_LINE)
     return 0
 
