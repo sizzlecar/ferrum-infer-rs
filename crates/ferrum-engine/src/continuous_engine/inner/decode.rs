@@ -2,7 +2,9 @@ use super::*;
 
 #[derive(Debug)]
 pub(in crate::continuous_engine) enum PlanRuntimeDecodeBatchOutcome {
-    Completed,
+    Completed {
+        submitted_width: usize,
+    },
     Deferred {
         request_ids: Vec<RequestId>,
         deferral: ExecutorExecutionDeferral,
@@ -41,7 +43,7 @@ impl EngineInner {
             }
         }
         if inputs.is_empty() {
-            return Ok(PlanRuntimeDecodeBatchOutcome::Completed);
+            return Ok(PlanRuntimeDecodeBatchOutcome::Completed { submitted_width: 0 });
         }
 
         let input_cache_ids = inputs
@@ -140,15 +142,21 @@ impl EngineInner {
                 self.complete_request(rid, reason).await?;
             }
         }
-        Ok(PlanRuntimeDecodeBatchOutcome::Completed)
+        Ok(PlanRuntimeDecodeBatchOutcome::Completed {
+            submitted_width: rids.len(),
+        })
     }
 
     pub(in crate::continuous_engine) async fn run_plan_runtime_batch_decode_adaptive(
         &self,
         request_ids: &[RequestId],
     ) -> Result<()> {
-        let mut stack = vec![self.decode_ready_request_ids(request_ids)];
+        let root_request_ids = self.decode_ready_request_ids(request_ids);
+        let root_width = root_request_ids.len();
+        let mut stack = vec![root_request_ids];
         let mut capacity_pressure_root_width = None;
+        let mut completed_root_width = None;
+        let mut root_cohort_deferred = false;
         while let Some(chunk) = stack.pop() {
             let chunk = self.decode_ready_request_ids(&chunk);
             if chunk.is_empty() {
@@ -172,15 +180,27 @@ impl EngineInner {
                         self.complete_request(request_id, FinishReason::Error)
                             .await?;
                     }
+                    root_cohort_deferred = true;
+                    completed_root_width = None;
                     continue;
                 }
             };
             match outcome {
-                PlanRuntimeDecodeBatchOutcome::Completed => {}
+                PlanRuntimeDecodeBatchOutcome::Completed { submitted_width } => {
+                    if !root_cohort_deferred
+                        && capacity_pressure_root_width.is_none()
+                        && completed_root_width.is_none()
+                        && submitted_width == root_width
+                    {
+                        completed_root_width = Some(submitted_width);
+                    }
+                }
                 PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids,
                     deferral: ExecutorExecutionDeferral::RequestState(deferral),
                 } => {
+                    root_cohort_deferred = true;
+                    completed_root_width = None;
                     let affected_request_ids = deferral.request_ids();
                     if affected_request_ids
                         .iter()
@@ -201,6 +221,8 @@ impl EngineInner {
                     request_ids,
                     deferral: ExecutorExecutionDeferral::Capacity(deferral),
                 } if deferral.maintenance_retry().is_some() => {
+                    root_cohort_deferred = true;
+                    completed_root_width = None;
                     let retry = deferral
                         .validated_maintenance_retry_scope(&request_ids)?
                         .expect("guarded maintenance retry remains present");
@@ -246,6 +268,8 @@ impl EngineInner {
                     request_ids,
                     deferral: ExecutorExecutionDeferral::Capacity(deferral),
                 } if request_ids.len() > 1 => {
+                    root_cohort_deferred = true;
+                    completed_root_width = None;
                     self.trace_executor_decode_capacity_decision(
                         &request_ids,
                         &deferral,
@@ -283,6 +307,8 @@ impl EngineInner {
                     request_ids,
                     deferral: ExecutorExecutionDeferral::Capacity(deferral),
                 } => {
+                    root_cohort_deferred = true;
+                    completed_root_width = None;
                     let observed = deferral.observed();
                     let scheduler_deferral = AdmissionDeferral::new(
                         DeferredAction::WaitForRelease,
@@ -371,6 +397,18 @@ impl EngineInner {
                         }
                     }
                 }
+            }
+        }
+        if let Some(successful_width) = completed_root_width {
+            if self
+                .scheduler
+                .record_decode_execution_capacity_success(successful_width)
+            {
+                self.write_scheduler_trace_event(serde_json::json!({
+                    "event": "engine_plan_runtime_decode_execution_capacity_success",
+                    "successful_width": successful_width,
+                    "scheduler": self.scheduler.trace_snapshot(),
+                }));
             }
         }
         Ok(())

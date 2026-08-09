@@ -4380,6 +4380,58 @@ async fn plan_runtime_recursive_cohort_pressure_upgrades_sequence_extension_feed
 }
 
 #[tokio::test]
+async fn plan_runtime_saturated_root_success_recovers_execution_pressure_additively() {
+    let (engine, scheduler, _executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
+    let (request_ids, _, _) =
+        install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8]).await;
+
+    scheduler.record_decode_execution_capacity_pressure(8);
+    assert_eq!(
+        scheduler
+            .trace_snapshot()
+            .decode_capacity_backpressure_admit_limit,
+        Some(4)
+    );
+
+    engine
+        .inner
+        .run_plan_runtime_batch_decode_adaptive(&request_ids[..4])
+        .await
+        .unwrap();
+    let after_saturated_success = scheduler.trace_snapshot();
+    assert_eq!(
+        after_saturated_success.decode_capacity_backpressure_admit_limit,
+        Some(5)
+    );
+    assert!(after_saturated_success.decode_execution_pressure_enforced);
+
+    engine
+        .inner
+        .run_plan_runtime_batch_decode_adaptive(&request_ids[..3])
+        .await
+        .unwrap();
+    let after_small_tail = scheduler.trace_snapshot();
+    assert_eq!(
+        after_small_tail.decode_capacity_backpressure_admit_limit,
+        Some(5)
+    );
+    assert!(after_small_tail.decode_execution_pressure_enforced);
+
+    engine
+        .inner
+        .run_plan_runtime_batch_decode_adaptive(&request_ids[..5])
+        .await
+        .unwrap();
+    let after_next_saturated_success = scheduler.trace_snapshot();
+    assert_eq!(
+        after_next_saturated_success.decode_capacity_backpressure_admit_limit,
+        Some(6)
+    );
+    assert!(after_next_saturated_success.decode_execution_pressure_enforced);
+}
+
+#[tokio::test]
 async fn plan_runtime_capacity_yield_preemption_failure_aborts_pending_transaction() {
     let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
         PlanRuntimeBatchDecodeBehavior::DeferThenPreemptionFails,
