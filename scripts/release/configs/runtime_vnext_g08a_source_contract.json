@@ -263,7 +263,7 @@
             "symbol": "create_registered_vnext_executor",
             "line_hint": 1159,
             "owner": "ferrum-engine/registered-vnext-selection",
-            "reviewed_at_git_sha": "6ddd2d621127b12ce588ac739119c09a95738307",
+            "reviewed_at_git_sha": "086759e5edd0e4ad9b4ea4d7d655bf19f48c2bda",
 	            "required_fragments": [
 	                "ProductionExecutionKind::CausalLanguage",
 	                "CudaVNextComposition::create",
