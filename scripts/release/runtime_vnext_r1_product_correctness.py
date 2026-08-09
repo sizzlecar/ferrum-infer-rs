@@ -69,6 +69,8 @@ R1_CAUSALLY_ISOLATED_EVIDENCE_FILES = frozenset(
         "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
         "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
         "scripts/release/run_scenarios.py",
+        "scripts/release/runtime_vnext_g08a_same_history_collector.py",
+        "scripts/release/runtime_vnext_r0_core_closure.py",
         "scripts/release/runtime_vnext_r1_product_correctness.py",
     }
 )
@@ -1505,6 +1507,35 @@ def self_test() -> int:
         == "r1-causally-isolated-control-plane-only",
         "R1 causal closure rejected isolated gate inputs",
     )
+    causal_patch_paths = [
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
+        "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
+        "scripts/release/run_scenarios.py",
+        "scripts/release/runtime_vnext_g08a_same_history_collector.py",
+        "scripts/release/runtime_vnext_r0_core_closure.py",
+        "scripts/release/runtime_vnext_r1_product_correctness.py",
+    ]
+    for key, expected_policy in (
+        ("m1_metal", "m1-r1-matrix-control-plane-only"),
+        ("m2_metal", "r1-causally-isolated-control-plane-only"),
+        ("m3_metal", "r1-causally-isolated-control-plane-only"),
+    ):
+        require(
+            matrix_source_change_policy(causal_patch_paths, MATRIX_LANES[key])
+            == expected_policy,
+            f"{key} causal closure rejected the bounded numerics patch",
+        )
+    for path in (
+        "scripts/release/runtime_vnext_g08a_same_history.py",
+        "scripts/release/runtime_vnext_g08b_metal_matrix_checkpoint.py",
+        "crates/ferrum-cli/src/commands/serve.rs",
+    ):
+        expect_reject(
+            lambda path=path: matrix_source_change_policy(
+                [path], MATRIX_LANES["m2_metal"]
+            ),
+            f"R1 causal closure non-isolated path {path}",
+        )
     expect_reject(
         lambda: matrix_source_change_policy(
             ["crates/ferrum-cli/src/commands/serve.rs"],
