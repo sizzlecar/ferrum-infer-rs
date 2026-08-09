@@ -374,7 +374,10 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
 
     model_origin_raw = config.get("model_origin_path")
     require(isinstance(model_origin_raw, str) and model_origin_raw, "config.model_origin_path is required")
-    model_origin = Path(model_origin_raw).expanduser().resolve()
+    # Hugging Face snapshot files are normally logical-name symlinks into the
+    # blob store.  Keep the final path component intact for lock matching and
+    # for the product argv; file hashing below intentionally follows it.
+    model_origin = Path(os.path.abspath(os.path.expanduser(model_origin_raw)))
     model_files = verify_model_origin(model_origin, locked_model_files(lane))
     semantic_root = resolve_directory(config.get("semantic_source_root"), "config.semantic_source_root")
     tokenizer_root = resolve_directory(config.get("tokenizer_source_root", str(semantic_root)), "config.tokenizer_source_root")
@@ -2262,6 +2265,23 @@ def self_test() -> int:
 
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-r2-ferrum-selftest-") as temporary:
         root = Path(temporary)
+        blob = root / "blob"
+        blob.write_bytes(b"locked-model-bytes")
+        logical_model = root / "Qwen3.5-4B-Q4_K_M.gguf"
+        logical_model.symlink_to(blob)
+        lexical_model = Path(os.path.abspath(os.path.expanduser(str(logical_model))))
+        require(
+            lexical_model.name == logical_model.name and lexical_model.is_symlink(),
+            "logical Hugging Face model path was dereferenced",
+        )
+        require(
+            verify_model_origin(
+                lexical_model,
+                {logical_model.name: file_sha256(blob)},
+            )
+            == {logical_model.name: file_sha256(blob)},
+            "logical Hugging Face model symlink lock self-test failed",
+        )
         template_path = root / "nested" / "config.json"
         write_config_template(template_path)
         require(read_json(template_path) == template, "written config template self-test failed")
