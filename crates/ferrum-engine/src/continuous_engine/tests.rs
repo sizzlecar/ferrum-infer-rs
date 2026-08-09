@@ -146,6 +146,8 @@ enum PlanRuntimeBatchDecodeBehavior {
 struct PlanRuntimeBatchDecodeTestExecutor {
     inner: MockModelExecutor,
     behavior: PlanRuntimeBatchDecodeBehavior,
+    capacity_stage: ExecutorExecutionCapacityStage,
+    capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
     decode_calls: AtomicU64,
     batch_decode_calls: AtomicU64,
     released_cache_count: AtomicU64,
@@ -202,13 +204,28 @@ fn plan_runtime_prefill_outcome_from_mock(
 }
 
 impl PlanRuntimeBatchDecodeTestExecutor {
-    fn new(behavior: PlanRuntimeBatchDecodeBehavior) -> Self {
+    fn with_capacity_stage_transition(
+        behavior: PlanRuntimeBatchDecodeBehavior,
+        capacity_stage: ExecutorExecutionCapacityStage,
+        capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
+    ) -> Self {
         Self {
             inner: MockModelExecutor::instant(64),
             behavior,
+            capacity_stage,
+            capacity_stage_after_first_call,
             decode_calls: AtomicU64::new(0),
             batch_decode_calls: AtomicU64::new(0),
             released_cache_count: AtomicU64::new(0),
+        }
+    }
+
+    fn capacity_stage_for_call(&self, call_index: u64) -> ExecutorExecutionCapacityStage {
+        if call_index > 0 {
+            self.capacity_stage_after_first_call
+                .unwrap_or(self.capacity_stage)
+        } else {
+            self.capacity_stage
         }
     }
 }
@@ -542,7 +559,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
                 .await
                 .map(ExecutorBatchDecodeOutcome::Completed);
         }
-        self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
+        let call_index = self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
         if matches!(
             self.behavior,
             PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
@@ -580,7 +597,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             test_execution_capacity_deferral(
                 ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
                 wait_condition,
-                ExecutorExecutionCapacityStage::StepAdmission,
+                self.capacity_stage_for_call(call_index),
             )
             .into(),
         ))
@@ -590,7 +607,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
         &self,
         inputs: &[PlanRuntimeDecodeInput],
     ) -> Result<PlanRuntimeBatchDecodeOutcome> {
-        self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
+        let call_index = self.batch_decode_calls.fetch_add(1, Ordering::Relaxed);
         let deferred_behavior = matches!(
             self.behavior,
             PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease
@@ -655,7 +672,7 @@ impl ModelExecutor for PlanRuntimeBatchDecodeTestExecutor {
             test_execution_capacity_deferral(
                 ExecutorAdmissionEpochs::new(std::num::NonZeroU64::new(47).unwrap(), 0, 0),
                 wait_condition,
-                ExecutorExecutionCapacityStage::StepAdmission,
+                self.capacity_stage_for_call(call_index),
             )
             .into(),
         ))
@@ -3511,6 +3528,43 @@ fn plan_runtime_batch_decode_test_engine(
     plan_runtime_batch_decode_test_engine_with_trace(behavior, None)
 }
 
+fn plan_runtime_batch_decode_test_engine_with_stage(
+    behavior: PlanRuntimeBatchDecodeBehavior,
+    capacity_stage: ExecutorExecutionCapacityStage,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
+    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
+        behavior,
+        None,
+        Arc::new(MockTensorFactory),
+        capacity_stage,
+        None,
+    )
+}
+
+fn plan_runtime_batch_decode_test_engine_with_stage_transition(
+    behavior: PlanRuntimeBatchDecodeBehavior,
+    capacity_stage: ExecutorExecutionCapacityStage,
+    capacity_stage_after_first_call: ExecutorExecutionCapacityStage,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
+    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
+        behavior,
+        None,
+        Arc::new(MockTensorFactory),
+        capacity_stage,
+        Some(capacity_stage_after_first_call),
+    )
+}
+
 fn plan_runtime_batch_decode_test_engine_with_trace(
     behavior: PlanRuntimeBatchDecodeBehavior,
     trace_path: Option<PathBuf>,
@@ -3537,6 +3591,27 @@ fn plan_runtime_batch_decode_test_engine_with_trace_and_factory(
     Arc<PlanRuntimeBatchDecodeTestExecutor>,
     Arc<dyn Tokenizer + Send + Sync>,
 ) {
+    plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
+        behavior,
+        trace_path,
+        tensor_factory,
+        ExecutorExecutionCapacityStage::StepAdmission,
+        None,
+    )
+}
+
+fn plan_runtime_batch_decode_test_engine_with_trace_factory_and_stage(
+    behavior: PlanRuntimeBatchDecodeBehavior,
+    trace_path: Option<PathBuf>,
+    tensor_factory: Arc<dyn TensorFactory>,
+    capacity_stage: ExecutorExecutionCapacityStage,
+    capacity_stage_after_first_call: Option<ExecutorExecutionCapacityStage>,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
     let mut config = EngineConfig::default();
     config.kv_cache.max_blocks = 128;
     config.runtime.scheduler_trace_jsonl = trace_path;
@@ -3545,7 +3620,13 @@ fn plan_runtime_batch_decode_test_engine_with_trace_and_factory(
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(PolicyTokenizer::new(64, &[("test", 5), ("ok", 6)]));
     let sampler: Arc<dyn Sampler + Send + Sync> = Arc::new(crate::registry::GreedySampler);
-    let executor = Arc::new(PlanRuntimeBatchDecodeTestExecutor::new(behavior));
+    let executor = Arc::new(
+        PlanRuntimeBatchDecodeTestExecutor::with_capacity_stage_transition(
+            behavior,
+            capacity_stage,
+            capacity_stage_after_first_call,
+        ),
+    );
     let engine = ContinuousBatchEngine::new_plan_runtime(
         config,
         scheduler.clone(),
@@ -4219,9 +4300,67 @@ async fn plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progre
 
 #[tokio::test]
 async fn plan_runtime_execution_pressure_preserves_root_width_across_recursive_split_and_yield() {
-    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine(
+    for capacity_stage in [
+        ExecutorExecutionCapacityStage::StepAdmission,
+        ExecutorExecutionCapacityStage::SubmissionWave,
+    ] {
+        let (engine, scheduler, executor, tokenizer) =
+            plan_runtime_batch_decode_test_engine_with_stage(
+                PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
+                capacity_stage,
+            );
+        let (request_ids, _, _) =
+            install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8])
+                .await;
+        let decode_batch = scheduler
+            .next_batch(ferrum_interfaces::BatchHint::simple(8))
+            .await
+            .expect("ready decode cohort");
+        assert_eq!(decode_batch.requests.len(), 8);
+
+        engine.inner.process_batch(&decode_batch).await.unwrap();
+
+        let pressure = scheduler.trace_snapshot();
+        assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
+        assert_eq!(pressure.decode_capacity_backpressure_admit_limit, Some(4));
+        assert!(pressure.decode_execution_pressure_enforced);
+        assert_eq!(pressure.waiting_queue_len, 1);
+        assert_eq!(pressure.decode_queue_len, request_ids.len() - 1);
+    }
+}
+
+#[tokio::test]
+async fn plan_runtime_sequence_extension_pressure_does_not_cap_decode_survivors_during_recompute() {
+    let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_stage(
         PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
+        ExecutorExecutionCapacityStage::SequenceExtension,
     );
+    let (request_ids, _, _) =
+        install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8]).await;
+    let decode_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(8))
+        .await
+        .expect("ready decode cohort");
+    assert_eq!(decode_batch.requests.len(), 8);
+
+    engine.inner.process_batch(&decode_batch).await.unwrap();
+
+    let pressure = scheduler.trace_snapshot();
+    assert_eq!(executor.released_cache_count.load(Ordering::Acquire), 1);
+    assert_eq!(pressure.decode_capacity_backpressure_admit_limit, Some(4));
+    assert!(!pressure.decode_execution_pressure_enforced);
+    assert_eq!(pressure.waiting_queue_len, 1);
+    assert_eq!(pressure.decode_queue_len, request_ids.len() - 1);
+}
+
+#[tokio::test]
+async fn plan_runtime_recursive_cohort_pressure_upgrades_sequence_extension_feedback() {
+    let (engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine_with_stage_transition(
+            PlanRuntimeBatchDecodeBehavior::DeferUntilPeerCacheRelease,
+            ExecutorExecutionCapacityStage::SequenceExtension,
+            ExecutorExecutionCapacityStage::StepAdmission,
+        );
     let (request_ids, _, _) =
         install_plan_runtime_decode_frontiers(&engine, &scheduler, tokenizer, &["test"; 8]).await;
     let decode_batch = scheduler
