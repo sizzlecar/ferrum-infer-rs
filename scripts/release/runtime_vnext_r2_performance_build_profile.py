@@ -99,6 +99,7 @@ PROFILE_IDENTITY_FIELDS = {
 }
 R2_CONTROL_PLANE_FILES = frozenset(
     {
+        "scripts/release/runtime_vnext_r2_ferrum_collector.py",
         "scripts/release/runtime_vnext_r2_performance_build_profile.py",
         "scripts/release/runtime_vnext_r2_profile_collector.py",
         "scripts/release/run_gate.py",
