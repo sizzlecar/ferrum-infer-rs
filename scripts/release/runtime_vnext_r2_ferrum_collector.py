@@ -1757,8 +1757,8 @@ def collect_run_sample(
             )
             if returncode == 124:
                 _, group_gone = collector_support.terminate_process_group(process, 5.0)
-            finished_at = now_iso()
             samples = collector_support.wait_process_sampler(sampler)
+            finished_at = now_iso()
             sampler_meta = sampler
             sampler = None
             require(group_gone, f"run sample {sample_ordinal} process group survived cleanup")
