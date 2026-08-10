@@ -42,6 +42,9 @@ SUPPORT_PATH = Path(collector_support.__file__).resolve()
 RESOURCE_SAMPLER_PATH = Path(collector_support.RESOURCE_SAMPLER_PATH).resolve()
 SCHEMA_VERSION = 1
 CONTRACT = "ferrum.runtime-vnext.r2.ferrum-collector.v1"
+R1_CORRECTNESS_ARTIFACT_TYPE = (
+    "runtime_vnext_r1_product_correctness_manifest"
+)
 PASS_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR PASS"
 PLAN_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR PLAN"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR SELFTEST PASS"
@@ -789,6 +792,39 @@ def verify_model_origin(origin: Path, locked: dict[str, str]) -> dict[str, str]:
     return actual_files
 
 
+def validate_r1_correctness_authority(
+    correctness: dict[str, Any],
+    *,
+    backend: str,
+    candidate_source: dict[str, Any],
+    candidate_binary_sha256: str,
+) -> None:
+    """Fail before model startup when R1 did not authorize this candidate."""
+
+    require(
+        correctness.get("artifact_type") == R1_CORRECTNESS_ARTIFACT_TYPE
+        and correctness.get("checkpoint_id") == "R1"
+        and correctness.get("status") == "pass"
+        and correctness.get("canonical") is True,
+        "correctness manifest is not a canonical R1 PASS",
+    )
+    require(
+        correctness.get("source") == candidate_source,
+        "candidate source differs from the R1 correctness authority",
+    )
+    acceptance = correctness.get("acceptance")
+    binaries = (
+        acceptance.get("backend_binary_sha256")
+        if isinstance(acceptance, dict)
+        else None
+    )
+    require(
+        isinstance(binaries, dict)
+        and binaries.get(backend) == candidate_binary_sha256,
+        f"candidate binary differs from the R1 correctness authority for {backend}",
+    )
+
+
 def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     collector_support.reject_secret_material(raw)
     require(raw.get("schema_version") == SCHEMA_VERSION, "config.schema_version must be 1")
@@ -841,6 +877,17 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
     require(isinstance(features, list) and features and all(isinstance(item, str) and item for item in features), "candidate.cargo_features is required")
     require(backend in features, f"candidate.cargo_features must include {backend}")
     candidate_env = collector_support.sanitized_environment(candidate.get("env"))
+    candidate_binary_sha256 = file_sha256(binary_path)
+    validate_r1_correctness_authority(
+        correctness,
+        backend=str(backend),
+        candidate_source={
+            "git_sha": source_sha,
+            "git_tree_sha": source_tree_sha,
+            "dirty": False,
+        },
+        candidate_binary_sha256=candidate_binary_sha256,
+    )
 
     hardware = config.get("hardware")
     require(isinstance(hardware, dict), "config.hardware is required")
@@ -2744,6 +2791,52 @@ def synthetic_bench_report(config: dict[str, Any], cell: dict[str, Any]) -> dict
 
 def self_test() -> int:
     template = config_template()
+    authority_source = {
+        "git_sha": "1" * 40,
+        "git_tree_sha": "2" * 40,
+        "dirty": False,
+    }
+    authority_binary = "3" * 64
+    authority = {
+        "artifact_type": R1_CORRECTNESS_ARTIFACT_TYPE,
+        "checkpoint_id": "R1",
+        "status": "pass",
+        "canonical": True,
+        "source": authority_source,
+        "acceptance": {
+            "backend_binary_sha256": {
+                "cuda": authority_binary,
+                "metal": "4" * 64,
+            }
+        },
+    }
+    validate_r1_correctness_authority(
+        authority,
+        backend="cuda",
+        candidate_source=authority_source,
+        candidate_binary_sha256=authority_binary,
+    )
+    for candidate_source, candidate_binary, expected_error in (
+        (
+            {**authority_source, "git_sha": "5" * 40},
+            authority_binary,
+            "candidate source differs",
+        ),
+        (authority_source, "6" * 64, "candidate binary differs"),
+    ):
+        try:
+            validate_r1_correctness_authority(
+                authority,
+                backend="cuda",
+                candidate_source=candidate_source,
+                candidate_binary_sha256=candidate_binary,
+            )
+            raise R2CollectorError("R1 authority mismatch unexpectedly passed")
+        except R2CollectorError as exc:
+            require(
+                expected_error in str(exc),
+                "R1 authority mismatch failed for the wrong reason",
+            )
     native_rows = [{"pid": 101, "used_gpu_memory_mib": 2048}]
     normalized, strategy = normalize_cuda_compute_rows(
         native_rows,
