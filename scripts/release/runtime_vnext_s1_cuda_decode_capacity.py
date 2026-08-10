@@ -55,6 +55,7 @@ CANONICAL_DECODE_PROMPT_SHA256_BY_SLOT = {
     "C": "e3135728e0cc1a68b6c7af061931d5be5fe9dd4bb1ae40e1e778ea2b0fac325c",
 }
 MAX_DECODE_CAPACITY_EVENTS = 2048
+MIN_PRESSURE_OWNER_ROTATIONS = 1
 PREFILL_MAINTENANCE_PHASE = "vnext.prefill_backing_maintenance"
 EXECUTION_MAINTENANCE_PHASE = "vnext.execution_backing_maintenance"
 EXECUTION_MAINTENANCE_SCHEMA_VERSION = 2
@@ -90,6 +91,7 @@ STOP_POLICY = {
     "joint_stream_timeout_seconds": common.MAX_PRESSURE_JOINT_STREAM_SECONDS,
     "max_trace_bytes": common.MAX_PRESSURE_TRACE_BYTES,
     "max_decode_capacity_events": MAX_DECODE_CAPACITY_EVENTS,
+    "min_pressure_owner_rotations": MIN_PRESSURE_OWNER_ROTATIONS,
 }
 STABLE_EXECUTOR_IDENTITY_FIELDS = (
     "model_id",
@@ -3903,6 +3905,11 @@ def collect(args: argparse.Namespace) -> int:
             finished_wall_ns=target_finished,
             require_maintenance_boundary=True,
         )
+        require(
+            decode_summary["pressure_owner_rotation_events"]
+            >= MIN_PRESSURE_OWNER_ROTATIONS,
+            "target never exercised typed bounded-progress owner rotation",
+        )
         collection["target"]["decode_summary"] = decode_summary
 
         collection.update(
@@ -4397,6 +4404,11 @@ def validate(root: Path, out: Path) -> int:
         started_wall_ns=target_started,
         finished_wall_ns=target_finished,
         require_maintenance_boundary=True,
+    )
+    require(
+        decode_summary["pressure_owner_rotation_events"]
+        >= MIN_PRESSURE_OWNER_ROTATIONS,
+        "target never exercised typed bounded-progress owner rotation",
     )
     require(target.get("decode_summary") == decode_summary, "decode summary differs from raw trace")
     probe_maintenance_summary = validate_rebalance_trace(
