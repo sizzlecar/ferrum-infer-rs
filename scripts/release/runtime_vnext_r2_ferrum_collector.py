@@ -18,6 +18,7 @@ import math
 import os
 import re
 import selectors
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -65,6 +66,17 @@ ACTIVE_PROBE = {
     "path": "/health",
     "selector": "engine.active_requests",
 }
+CUDA_COMPUTE_QUERY = (
+    "--query-compute-apps=pid,used_gpu_memory",
+    "--format=csv,noheader,nounits",
+)
+CUDA_GPU_UUID_QUERY = (
+    "--query-gpu=uuid",
+    "--format=csv,noheader,nounits",
+)
+CUDA_PID_NAMESPACE_BRIDGE_CONTRACT = (
+    "ferrum.runtime-vnext.r2.cuda-pid-namespace-bridge.v1"
+)
 RESERVED_EXTRA_OPTIONS = {
     "--backend",
     "--host",
@@ -205,6 +217,381 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
 def atomic_write_text(path: Path, value: str) -> None:
     collector_support.atomic_write_text(path, value)
+
+
+def parse_cuda_compute_rows(raw: str, label: str) -> list[dict[str, int]]:
+    rows: list[dict[str, int]] = []
+    for line_number, line in enumerate(raw.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fields = [field.strip() for field in stripped.split(",")]
+        require(
+            len(fields) == 2 and all(field.isdigit() for field in fields),
+            f"{label} row {line_number} is not numeric pid,memory evidence",
+        )
+        pid = int(fields[0])
+        memory_mib = int(fields[1])
+        require(pid > 0 and memory_mib > 0, f"{label} row {line_number} is not positive")
+        rows.append({"pid": pid, "used_gpu_memory_mib": memory_mib})
+    return rows
+
+
+def process_group_pids(pgid: int) -> set[int]:
+    process = subprocess.run(
+        ["ps", "-eo", "pid=,pgid="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(process.returncode == 0, "ps failed while binding CUDA process evidence")
+    pids: set[int] = set()
+    for line in process.stdout.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and all(field.isdigit() for field in fields):
+            pid, observed_pgid = (int(field) for field in fields)
+            if observed_pgid == pgid:
+                pids.add(pid)
+    return pids
+
+
+def normalize_cuda_compute_rows(
+    rows: list[dict[str, int]],
+    *,
+    server_pid: int,
+    group_pids: set[int],
+    preflight_rows: list[dict[str, int]],
+    proc_exists: Any = None,
+) -> tuple[list[dict[str, int]], str]:
+    """Bind a host-PID NVIDIA row to a container-local server group.
+
+    Native PID matches always pass through.  The namespace fallback is only
+    allowed for a dedicated, initially idle one-GPU lane with exactly one new
+    compute application whose host PID is absent from the container /proc.
+    """
+
+    exists = proc_exists or (lambda pid: Path(f"/proc/{pid}").exists())
+    require(server_pid in group_pids, "CUDA bridge server PID left its process group")
+    native = [row for row in rows if row["pid"] in group_pids]
+    if native:
+        return rows, "native-process-group-pid"
+    require(not preflight_rows, "CUDA namespace fallback requires an idle preflight")
+    require(len(rows) == 1, "CUDA namespace fallback requires exactly one compute application")
+    host_pid = rows[0]["pid"]
+    require(host_pid not in group_pids, "CUDA namespace fallback received an ambiguous local PID")
+    require(not exists(host_pid), "CUDA namespace fallback host PID is visible in container /proc")
+    return (
+        [
+            {
+                "pid": server_pid,
+                "used_gpu_memory_mib": rows[0]["used_gpu_memory_mib"],
+            }
+        ],
+        "single-new-host-pid-mapped-to-container-server",
+    )
+
+
+def append_bridge_audit(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def cuda_pid_namespace_bridge(args: argparse.Namespace) -> int:
+    child_argv = list(args.exec_argv)
+    if child_argv and child_argv[0] == "--":
+        child_argv = child_argv[1:]
+    audit_path = args.bridge_audit_log.expanduser().resolve()
+    audit: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": CUDA_PID_NAMESPACE_BRIDGE_CONTRACT,
+        "observed_at": now_iso(),
+        "collector_path": COLLECTOR_RELATIVE_PATH,
+        "collector_sha256": file_sha256(COLLECTOR_PATH),
+        "server_pid": args.bridge_server_pid,
+        "server_pgid": args.bridge_server_pgid,
+        "nvidia_smi_argv": child_argv,
+        "status": "reject",
+    }
+    try:
+        real_binary = args.real_nvidia_smi.expanduser().resolve()
+        require(real_binary.is_file(), f"real nvidia-smi is missing: {real_binary}")
+        preflight = read_json(args.bridge_preflight.expanduser().resolve())
+        require(
+            preflight.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
+            and preflight.get("collector_sha256") == file_sha256(COLLECTOR_PATH)
+            and preflight.get("real_nvidia_smi_path") == str(real_binary)
+            and preflight.get("real_nvidia_smi_sha256") == file_sha256(real_binary)
+            and preflight.get("gpu_count") == 1
+            and isinstance(preflight.get("compute_apps"), list),
+            "CUDA bridge preflight identity is invalid",
+        )
+        process = subprocess.run(
+            [str(real_binary), *child_argv],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        audit.update(
+            {
+                "real_nvidia_smi_path": str(real_binary),
+                "real_returncode": process.returncode,
+                "raw_stdout": process.stdout,
+                "raw_stderr": process.stderr,
+            }
+        )
+        if process.returncode != 0:
+            sys.stdout.write(process.stdout)
+            sys.stderr.write(process.stderr)
+            audit["error"] = "real nvidia-smi returned non-zero"
+            return process.returncode
+        is_compute_query = all(option in child_argv for option in CUDA_COMPUTE_QUERY)
+        if not is_compute_query:
+            sys.stdout.write(process.stdout)
+            sys.stderr.write(process.stderr)
+            audit.update({"status": "pass", "strategy": "transparent-passthrough"})
+            return 0
+        raw_rows = parse_cuda_compute_rows(process.stdout, "CUDA compute query")
+        group_pids = process_group_pids(args.bridge_server_pgid)
+        normalized, strategy = normalize_cuda_compute_rows(
+            raw_rows,
+            server_pid=args.bridge_server_pid,
+            group_pids=group_pids,
+            preflight_rows=preflight["compute_apps"],
+        )
+        normalized_stdout = "".join(
+            f"{row['pid']}, {row['used_gpu_memory_mib']}\n" for row in normalized
+        )
+        sys.stdout.write(normalized_stdout)
+        sys.stderr.write(process.stderr)
+        audit.update(
+            {
+                "status": "pass",
+                "strategy": strategy,
+                "group_pids": sorted(group_pids),
+                "raw_compute_apps": raw_rows,
+                "normalized_compute_apps": normalized,
+                "normalized_stdout": normalized_stdout,
+            }
+        )
+        return 0
+    except (OSError, R2CollectorError, subprocess.SubprocessError) as exc:
+        audit["error"] = f"{type(exc).__name__}: {exc}"
+        print(f"CUDA PID namespace bridge failed: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        append_bridge_audit(audit_path, audit)
+
+
+def capture_cuda_bridge_preflight(attempt_dir: Path) -> dict[str, Any]:
+    resolved = shutil.which("nvidia-smi")
+    require(resolved is not None, "CUDA resource evidence requires nvidia-smi")
+    real_binary = Path(resolved).resolve()
+    compute = subprocess.run(
+        [str(real_binary), *CUDA_COMPUTE_QUERY],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(compute.returncode == 0, "CUDA process preflight nvidia-smi query failed")
+    compute_rows = parse_cuda_compute_rows(compute.stdout, "CUDA process preflight")
+    require(not compute_rows, "CUDA performance lane did not start from an idle accelerator")
+    gpu = subprocess.run(
+        [str(real_binary), *CUDA_GPU_UUID_QUERY],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    gpu_rows = [line.strip() for line in gpu.stdout.splitlines() if line.strip()]
+    require(gpu.returncode == 0 and len(gpu_rows) == 1, "CUDA bridge requires exactly one visible GPU")
+    path = attempt_dir / "cuda-pid-namespace-preflight.json"
+    document = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": CUDA_PID_NAMESPACE_BRIDGE_CONTRACT,
+        "artifact_type": "runtime_vnext_r2_cuda_pid_namespace_preflight",
+        "captured_at": now_iso(),
+        "collector_path": COLLECTOR_RELATIVE_PATH,
+        "collector_sha256": file_sha256(COLLECTOR_PATH),
+        "real_nvidia_smi_path": str(real_binary),
+        "real_nvidia_smi_sha256": file_sha256(real_binary),
+        "compute_query": [str(real_binary), *CUDA_COMPUTE_QUERY],
+        "compute_stdout": compute.stdout,
+        "compute_stderr": compute.stderr,
+        "compute_apps": compute_rows,
+        "gpu_query": [str(real_binary), *CUDA_GPU_UUID_QUERY],
+        "gpu_stdout": gpu.stdout,
+        "gpu_stderr": gpu.stderr,
+        "gpu_count": len(gpu_rows),
+        "gpu_uuids": gpu_rows,
+    }
+    atomic_write_json(path, document)
+    return {"path": path, "document": document, "real_binary": real_binary}
+
+
+def prepare_cuda_bridge(
+    attempt_dir: Path,
+    stem: str,
+    *,
+    pid: int,
+    pgid: int,
+    preflight: dict[str, Any],
+) -> dict[str, Any]:
+    bridge_dir = attempt_dir / f"{stem}.cuda-pid-bridge-bin"
+    bridge_dir.mkdir(parents=True, exist_ok=False)
+    wrapper = bridge_dir / "nvidia-smi"
+    audit = attempt_dir / f"{stem}.cuda-pid-bridge-audit.jsonl"
+    argv = [
+        sys.executable,
+        str(COLLECTOR_PATH),
+        "--cuda-pid-namespace-bridge",
+        "--real-nvidia-smi",
+        str(preflight["real_binary"]),
+        "--bridge-server-pid",
+        str(pid),
+        "--bridge-server-pgid",
+        str(pgid),
+        "--bridge-preflight",
+        str(preflight["path"]),
+        "--bridge-audit-log",
+        str(audit),
+        "--",
+        '"$@"',
+    ]
+    script = "#!/bin/sh\nexec " + " ".join(
+        '"$@"' if value == '"$@"' else shlex.quote(value) for value in argv
+    ) + "\n"
+    atomic_write_text(wrapper, script)
+    wrapper.chmod(0o755)
+    environment = collector_support.sanitized_environment()
+    environment["PATH"] = f"{bridge_dir}{os.pathsep}{environment.get('PATH', '')}"
+    return {
+        "dir": bridge_dir,
+        "wrapper": wrapper,
+        "audit": audit,
+        "preflight": preflight["path"],
+        "real_binary": preflight["real_binary"],
+        "server_pid": pid,
+        "server_pgid": pgid,
+        "environment": dict(sorted(environment.items())),
+    }
+
+
+def cuda_bridge_evidence(root: Path, sampler: dict[str, Any]) -> dict[str, Any] | None:
+    bridge = sampler.get("cuda_pid_namespace_bridge")
+    if bridge is None:
+        return None
+    audit_path: Path = bridge["audit"]
+    require(audit_path.is_file() and audit_path.stat().st_size > 0, "CUDA PID bridge audit is missing")
+    return {
+        "contract": CUDA_PID_NAMESPACE_BRIDGE_CONTRACT,
+        "bridge_source_path": COLLECTOR_RELATIVE_PATH,
+        "bridge_source_sha256": file_sha256(COLLECTOR_PATH),
+        "wrapper": artifact_ref(root, bridge["wrapper"], kind="cuda-pid-namespace-wrapper"),
+        "preflight": artifact_ref(root, bridge["preflight"], kind="cuda-pid-namespace-preflight"),
+        "audit": artifact_ref(root, audit_path, kind="cuda-pid-namespace-audit"),
+        "real_nvidia_smi_path": str(bridge["real_binary"]),
+        "real_nvidia_smi_sha256": file_sha256(bridge["real_binary"]),
+        "server_pid": bridge["server_pid"],
+        "server_pgid": bridge["server_pgid"],
+        "sampler_environment_sha256": canonical_json_sha256(bridge["environment"]),
+        "product_environment_unchanged": True,
+    }
+
+
+def validate_cuda_bridge_evidence(
+    root: Path,
+    resources: dict[str, Any],
+    *,
+    backend: str,
+    label: str,
+) -> None:
+    evidence = resources.get("cuda_pid_namespace_bridge")
+    if backend != "cuda":
+        require(evidence is None, f"{label} unexpectedly contains a CUDA PID bridge")
+        return
+    require(isinstance(evidence, dict), f"{label} CUDA PID bridge evidence is missing")
+    require(
+        evidence.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
+        and evidence.get("bridge_source_path") == COLLECTOR_RELATIVE_PATH
+        and evidence.get("bridge_source_sha256") == file_sha256(COLLECTOR_PATH)
+        and evidence.get("product_environment_unchanged") is True
+        and isinstance(evidence.get("sampler_environment_sha256"), str)
+        and SHA256_RE.fullmatch(evidence["sampler_environment_sha256"]) is not None,
+        f"{label} CUDA PID bridge identity is invalid",
+    )
+    validate_artifact_ref(root, evidence.get("wrapper"), f"{label}.bridge.wrapper")
+    preflight_path = validate_artifact_ref(
+        root, evidence.get("preflight"), f"{label}.bridge.preflight"
+    )
+    audit_path = validate_artifact_ref(root, evidence.get("audit"), f"{label}.bridge.audit")
+    preflight = read_json(preflight_path)
+    require(
+        preflight.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
+        and preflight.get("collector_sha256") == file_sha256(COLLECTOR_PATH)
+        and preflight.get("compute_apps") == []
+        and preflight.get("gpu_count") == 1
+        and preflight.get("real_nvidia_smi_path") == evidence.get("real_nvidia_smi_path")
+        and preflight.get("real_nvidia_smi_sha256") == evidence.get("real_nvidia_smi_sha256"),
+        f"{label} CUDA PID bridge preflight is invalid",
+    )
+    audit_rows = [
+        json.loads(line)
+        for line in audit_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    require(audit_rows, f"{label} CUDA PID bridge audit is empty")
+    require(
+        all(
+            isinstance(row, dict)
+            and row.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
+            and row.get("collector_sha256") == file_sha256(COLLECTOR_PATH)
+            and row.get("server_pid") == evidence.get("server_pid")
+            and row.get("server_pgid") == evidence.get("server_pgid")
+            and row.get("status") == "pass"
+            and row.get("real_returncode") == 0
+            for row in audit_rows
+        ),
+        f"{label} CUDA PID bridge audit contains a rejection or identity mismatch",
+    )
+    compute_rows = [
+        row
+        for row in audit_rows
+        if all(option in row.get("nvidia_smi_argv", []) for option in CUDA_COMPUTE_QUERY)
+    ]
+    require(len(compute_rows) >= 3, f"{label} CUDA PID bridge lacks three compute samples")
+    for row in compute_rows:
+        normalized = row.get("normalized_compute_apps")
+        require(
+            row.get("strategy")
+            in {
+                "native-process-group-pid",
+                "single-new-host-pid-mapped-to-container-server",
+            }
+            and isinstance(normalized, list)
+            and len(normalized) >= 1
+            and all(
+                isinstance(app, dict)
+                and isinstance(app.get("pid"), int)
+                and isinstance(app.get("used_gpu_memory_mib"), int)
+                and app["used_gpu_memory_mib"] > 0
+                for app in normalized
+            ),
+            f"{label} CUDA PID bridge compute mapping is invalid",
+        )
+        if row["strategy"] == "single-new-host-pid-mapped-to-container-server":
+            require(
+                normalized == [
+                    {
+                        "pid": evidence["server_pid"],
+                        "used_gpu_memory_mib": row["raw_compute_apps"][0]["used_gpu_memory_mib"],
+                    }
+                ]
+                and len(row.get("raw_compute_apps", [])) == 1
+                and row["raw_compute_apps"][0]["pid"] != evidence["server_pid"],
+                f"{label} CUDA namespace mapping is not one-to-one",
+            )
 
 
 def duration_seconds(started_at: str, finished_at: str) -> float:
@@ -772,6 +1159,7 @@ def start_cell_sampler(
     session: dict[str, Any],
     config: dict[str, Any],
     cell: dict[str, Any],
+    cuda_preflight: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Start the shared sampler with a cell deadline longer than the benchmark."""
     identifier = cell_id(cell)
@@ -781,6 +1169,18 @@ def start_cell_sampler(
     stdout_path = attempt_dir / f"{stem}.resource-sampler.stdout.log"
     stderr_path = attempt_dir / f"{stem}.resource-sampler.stderr.log"
     require(not observations.exists(), f"resource observation already exists: {observations}")
+    bridge = None
+    sampler_environment = collector_support.sanitized_environment()
+    if config["backend"] == "cuda":
+        require(cuda_preflight is not None, "CUDA sampler requires an idle process preflight")
+        bridge = prepare_cuda_bridge(
+            attempt_dir,
+            stem,
+            pid=session["pid"],
+            pgid=session["pgid"],
+            preflight=cuda_preflight,
+        )
+        sampler_environment = bridge["environment"]
     max_duration = int(math.ceil(float(config["server"]["command_timeout_sec"]))) + 120
     argv = [
         sys.executable,
@@ -832,7 +1232,7 @@ def start_cell_sampler(
         stderr_handle.flush()
         process = subprocess.Popen(
             argv,
-            env=collector_support.sanitized_environment(),
+            env=sampler_environment,
             stdout=stdout_handle,
             stderr=stderr_handle,
             text=True,
@@ -848,6 +1248,7 @@ def start_cell_sampler(
             "stdout_handle": stdout_handle,
             "stderr_handle": stderr_handle,
             "finished": False,
+            "cuda_pid_namespace_bridge": bridge,
         }
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
@@ -867,6 +1268,119 @@ def start_cell_sampler(
                 pass
         collector_support.ensure_nonempty_log(stdout_path, "resource sampler stdout")
         collector_support.ensure_nonempty_log(stderr_path, "resource sampler stderr")
+        raise
+
+
+def start_run_resource_sampler(
+    root: Path,
+    attempt_dir: Path,
+    *,
+    pid: int,
+    pgid: int,
+    sample_id: str,
+    config: dict[str, Any],
+    stderr_path: Path,
+    cuda_preflight: dict[str, Any] | None,
+) -> dict[str, Any]:
+    observations = attempt_dir / "resource-observations.jsonl"
+    stop_file = attempt_dir / "resource-stop"
+    stdout_path = attempt_dir / "resource-sampler.stdout.log"
+    sampler_stderr_path = attempt_dir / "resource-sampler.stderr.log"
+    bridge = None
+    sampler_environment = collector_support.sanitized_environment()
+    if config["backend"] == "cuda":
+        require(cuda_preflight is not None, "CUDA run sampler requires an idle process preflight")
+        bridge = prepare_cuda_bridge(
+            attempt_dir,
+            "run-c1",
+            pid=pid,
+            pgid=pgid,
+            preflight=cuda_preflight,
+        )
+        sampler_environment = bridge["environment"]
+    argv = [
+        sys.executable,
+        str(RESOURCE_SAMPLER_PATH),
+        "--out",
+        str(observations),
+        "--pid",
+        str(pid),
+        "--pgid",
+        str(pgid),
+        "--session-id",
+        sample_id,
+        "--cell-id",
+        "run:c1",
+        "--backend",
+        config["backend"],
+        "--hardware-id",
+        config["hardware"]["id"],
+        "--base-url",
+        f"process://{sample_id}",
+        "--active-probe-format",
+        "process",
+        "--active-selector",
+        "process-alive",
+        "--active-semantics",
+        "process-alive",
+        "--runtime-log",
+        str(stderr_path),
+        "--stop-file",
+        str(stop_file),
+        "--interval-ms",
+        "250",
+        "--max-duration-sec",
+        str(int(math.ceil(float(config["server"]["command_timeout_sec"]))) + 120),
+    ]
+    stdout_handle = stdout_path.open("x", encoding="utf-8")
+    stderr_handle = sampler_stderr_path.open("x", encoding="utf-8")
+    process: subprocess.Popen[Any] | None = None
+    try:
+        stdout_handle.write("[r2-collector] process resource sampler stdout follows\n")
+        stderr_handle.write("[r2-collector] process resource sampler stderr follows\n")
+        stdout_handle.flush()
+        stderr_handle.flush()
+        process = subprocess.Popen(
+            argv,
+            env=sampler_environment,
+            stdout=stdout_handle,
+            stderr=stderr_handle,
+            text=True,
+            start_new_session=True,
+        )
+        meta = {
+            "process": process,
+            "argv": argv,
+            "observations": observations,
+            "stop_file": stop_file,
+            "stdout_path": stdout_path,
+            "stderr_path": sampler_stderr_path,
+            "stdout_handle": stdout_handle,
+            "stderr_handle": stderr_handle,
+            "finished": False,
+            "cuda_pid_namespace_bridge": bridge,
+        }
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            require(
+                process.poll() is None,
+                f"process resource sampler exited during startup with {process.returncode}",
+            )
+            if observations.exists() and observations.stat().st_size > 0:
+                if len(observations.read_text(encoding="utf-8", errors="replace").splitlines()) >= 2:
+                    return meta
+            time.sleep(0.05)
+        raise R2CollectorError("process resource sampler did not produce its first observation")
+    except BaseException:
+        if process is not None:
+            collector_support.cleanup_process_group_noexcept(process, 5.0)
+        for handle in (stdout_handle, stderr_handle):
+            try:
+                handle.close()
+            except BaseException:
+                pass
+        collector_support.ensure_nonempty_log(stdout_path, "process resource sampler stdout")
+        collector_support.ensure_nonempty_log(sampler_stderr_path, "process resource sampler stderr")
         raise
 
 
@@ -1007,6 +1521,7 @@ def run_bench_cell(
     config: dict[str, Any],
     inputs: dict[str, Any],
     cell: dict[str, Any],
+    cuda_preflight: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     identifier = cell_id(cell)
     stem = identifier.replace(":", "-")
@@ -1016,7 +1531,14 @@ def run_bench_cell(
     sampler: dict[str, Any] | None = None
     process: subprocess.Popen[Any] | None = None
     try:
-        sampler = start_cell_sampler(root, attempt_dir, session, config, cell)
+        sampler = start_cell_sampler(
+            root,
+            attempt_dir,
+            session,
+            config,
+            cell,
+            cuda_preflight,
+        )
         argv = bench_argv(binary, raw_report, config, inputs, cell)
         environment = collector_support.sanitized_environment()
         started_at = now_iso()
@@ -1197,6 +1719,7 @@ def cell_resource_evidence(
         "observations": artifact_ref(root, observations, kind="resource-observations"),
         "active_intervals": artifact_ref(root, interval_path, kind="active-interval-sidecar"),
         "summary": summary,
+        "cuda_pid_namespace_bridge": cuda_bridge_evidence(root, sampler),
     }
 
 
@@ -1283,6 +1806,12 @@ def validate_server_bundle(
         require(isinstance(resources, dict), f"formal_reports[{index}].resources is missing")
         validate_artifact_ref(root, resources.get("observations"), f"formal_reports[{index}].resources.observations")
         validate_artifact_ref(root, resources.get("active_intervals"), f"formal_reports[{index}].resources.active_intervals")
+        validate_cuda_bridge_evidence(
+            root,
+            resources,
+            backend=config["backend"],
+            label=f"formal_reports[{index}].resources",
+        )
     parity_path = validate_artifact_ref(root, parity.get("raw_report"), "run_serve_parity_report.raw_report")
     validate_bench_report(read_json(parity_path), config, run_parity_cell(config["backend"]))
     for key in ("stdout", "stderr"):
@@ -1290,6 +1819,12 @@ def validate_server_bundle(
     validate_artifact_ref(root, parity.get("raw_request_evidence"), "run_serve_parity_report.raw_request_evidence")
     validate_artifact_ref(root, parity.get("resources", {}).get("observations"), "run_serve_parity_report.resources.observations")
     validate_artifact_ref(root, parity.get("resources", {}).get("active_intervals"), "run_serve_parity_report.resources.active_intervals")
+    validate_cuda_bridge_evidence(
+        root,
+        parity.get("resources", {}),
+        backend=config["backend"],
+        label="run_serve_parity_report.resources",
+    )
     for key in ("runtime_log", "scheduler_trace", "product_effective_config"):
         validate_artifact_ref(root, session.get(key), f"session.{key}")
     require(session.get("shutdown_clean") is True, "server bundle is not a clean-shutdown session")
@@ -1324,7 +1859,10 @@ def collect_server_session(
     runtime_handle.flush()
     process: subprocess.Popen[Any] | None = None
     failure: BaseException | None = None
+    cuda_preflight: dict[str, Any] | None = None
     try:
+        if config["backend"] == "cuda":
+            cuda_preflight = capture_cuda_bridge_preflight(attempt_dir)
         process = subprocess.Popen(
             argv,
             env=environment,
@@ -1394,6 +1932,7 @@ def collect_server_session(
                 config,
                 inputs,
                 cell,
+                cuda_preflight,
             )
             records.append(record)
             samplers.append(sampler)
@@ -1671,7 +2210,18 @@ def validate_run_bundle(
     arrival = validate_artifact_ref(root, sample.get("arrival_timeline"), f"run sample {sample_ordinal}.arrival_timeline")
     for key in ("stderr", "product_effective_config"):
         validate_artifact_ref(root, sample.get(key), f"run sample {sample_ordinal}.{key}")
-    validate_artifact_ref(root, sample.get("resources", {}).get("observations"), f"run sample {sample_ordinal}.resources.observations")
+    resources = sample.get("resources", {})
+    validate_artifact_ref(root, resources.get("observations"), f"run sample {sample_ordinal}.resources.observations")
+    argv = sample.get("argv")
+    require(isinstance(argv, list) and "--backend" in argv, f"run sample {sample_ordinal} lacks backend argv")
+    backend_index = argv.index("--backend")
+    require(backend_index + 1 < len(argv), f"run sample {sample_ordinal} backend argv is incomplete")
+    validate_cuda_bridge_evidence(
+        root,
+        resources,
+        backend=argv[backend_index + 1],
+        label=f"run sample {sample_ordinal}.resources",
+    )
     events = [json.loads(line) for line in stdout.read_text(encoding="utf-8").splitlines() if line.strip()]
     arrivals = [json.loads(line) for line in arrival.read_text(encoding="utf-8").splitlines() if line.strip()]
     metrics = validate_run_events(events, arrivals, f"run sample {sample_ordinal}")
@@ -1727,15 +2277,20 @@ def collect_run_sample(
             pgid = os.getpgid(pid)
             require(pgid == pid, "run process must own an independent process group")
             marker, marker_source = collector_support.process_identity(pid)
-            sampler = collector_support.run_sampler_for_process(
+            cuda_preflight = (
+                capture_cuda_bridge_preflight(attempt_dir)
+                if config["backend"] == "cuda"
+                else None
+            )
+            sampler = start_run_resource_sampler(
                 root,
                 attempt_dir,
                 pid=pid,
                 pgid=pgid,
                 sample_id=sample_id,
                 config=config,
-                hardware_id=config["hardware"]["id"],
                 stderr_path=stderr_path,
+                cuda_preflight=cuda_preflight,
             )
             atomic_write_text(barrier_release, "release\n")
             collector_support.wait_for_process_exec(process, inputs["binary_path"], 30.0)
@@ -1792,6 +2347,7 @@ def collect_run_sample(
                 "sampler_argv_sha256": canonical_json_sha256(sampler_meta["argv"]),
                 "observations": artifact_ref(root, sampler_meta["observations"], kind="run-resource-observations"),
                 "summary": resource_summary,
+                "cuda_pid_namespace_bridge": cuda_bridge_evidence(root, sampler_meta),
             }
             sample = {
                 "sample_id": sample_id,
@@ -2130,6 +2686,44 @@ def synthetic_bench_report(config: dict[str, Any], cell: dict[str, Any]) -> dict
 
 def self_test() -> int:
     template = config_template()
+    native_rows = [{"pid": 101, "used_gpu_memory_mib": 2048}]
+    normalized, strategy = normalize_cuda_compute_rows(
+        native_rows,
+        server_pid=101,
+        group_pids={101, 102},
+        preflight_rows=[],
+        proc_exists=lambda _pid: True,
+    )
+    require(normalized == native_rows and strategy == "native-process-group-pid", "native CUDA PID binding self-test failed")
+    host_rows = [{"pid": 900001, "used_gpu_memory_mib": 10294}]
+    normalized, strategy = normalize_cuda_compute_rows(
+        host_rows,
+        server_pid=101,
+        group_pids={101, 102},
+        preflight_rows=[],
+        proc_exists=lambda _pid: False,
+    )
+    require(
+        normalized == [{"pid": 101, "used_gpu_memory_mib": 10294}]
+        and strategy == "single-new-host-pid-mapped-to-container-server",
+        "container CUDA PID namespace binding self-test failed",
+    )
+    for rows, preflight_rows, visible, expected_error in (
+        (host_rows, [{"pid": 8, "used_gpu_memory_mib": 1}], False, "idle preflight"),
+        (host_rows * 2, [], False, "exactly one compute application"),
+        (host_rows, [], True, "visible in container /proc"),
+    ):
+        try:
+            normalize_cuda_compute_rows(
+                rows,
+                server_pid=101,
+                group_pids={101},
+                preflight_rows=preflight_rows,
+                proc_exists=lambda _pid, value=visible: value,
+            )
+            raise R2CollectorError("unsafe CUDA PID namespace input unexpectedly passed")
+        except R2CollectorError as exc:
+            require(expected_error in str(exc), "CUDA PID namespace rejection self-test failed")
     require(
         set(template)
         == {
@@ -2315,12 +2909,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--exec-barrier-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--release-file", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--cuda-pid-namespace-bridge", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--real-nvidia-smi", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-server-pid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-server-pgid", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-preflight", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-audit-log", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("exec_argv", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.cuda_pid_namespace_bridge:
+        require(
+            args.real_nvidia_smi is not None
+            and isinstance(args.bridge_server_pid, int)
+            and args.bridge_server_pid > 0
+            and isinstance(args.bridge_server_pgid, int)
+            and args.bridge_server_pgid > 0
+            and args.bridge_preflight is not None
+            and args.bridge_audit_log is not None
+            and bool(args.exec_argv),
+            "CUDA PID namespace bridge arguments are incomplete",
+        )
+        return cuda_pid_namespace_bridge(args)
     if args.exec_barrier_child:
         require(args.release_file is not None, "--exec-barrier-child requires --release-file")
         return run_exec_barrier_child(args.release_file, args.exec_argv)
