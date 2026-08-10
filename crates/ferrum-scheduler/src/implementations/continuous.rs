@@ -293,11 +293,12 @@ impl ExecutionCapacityPressureHoldReceipt {
 
 /// Terminal result of one physical execution-capacity yield transaction.
 ///
-/// A completed release can make a peer progress owner runnable, queue the same
+/// A completed release can make a peer progress owner runnable, require typed
+/// admission for a held peer promoted by a safe owner rotation, queue the same
 /// logical frontier for recompute, or close because the owner became terminal.
-/// The engine only resubmits a peer owner for
-/// `ProgressOwnerResumable`; self recompute progresses through normal waiting
-/// admission after the release fence.
+/// The engine only directly resubmits a peer owner for
+/// `ProgressOwnerResumable`; rotated owners and self recompute progress through
+/// normal waiting admission after the release fence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCapacityYieldCompletion {
     victim_requeued: bool,
@@ -5099,11 +5100,20 @@ mod tests {
             transaction: owner_transaction,
         } = owner_action
         else {
-            panic!("the stable progress owner must self recompute under renewed pressure");
+            panic!("the progressed owner must rotate at renewed pressure");
         };
-        assert_eq!(owner_transaction.kind(), PressureYieldKind::SelfRecompute);
-        assert_eq!(owner_transaction.progress_owner_id(), &blocked_id);
+        assert_eq!(owner_transaction.kind(), PressureYieldKind::PeerHandoff);
+        assert_eq!(owner_transaction.progress_owner_id(), &runnable_id);
         assert_eq!(owner_transaction.victim_request_id(), &blocked_id);
+        assert_eq!(
+            owner_transaction.rotated_from_progress_owner_id(),
+            Some(&blocked_id)
+        );
+        assert!(owner_transaction
+            .rotated_from_progress_current()
+            .is_some_and(
+                |current| current > owner_transaction.rotated_from_progress_baseline().unwrap()
+            ));
         scheduler
             .arm_execution_capacity_yield(&owner_transaction)
             .unwrap();
@@ -5121,7 +5131,7 @@ mod tests {
         assert_eq!(scheduler.trace_snapshot().waiting_queue_len, 2);
 
         let mut owner_recompute_probes = Vec::new();
-        let owner_recompute = scheduler
+        let rotated_owner = scheduler
             .next_batch_with_dynamic_admission(
                 BatchHint::simple(2),
                 AdmissionWakeSnapshot::new(wake2, &availability2),
@@ -5133,12 +5143,12 @@ mod tests {
                 },
             )
             .unwrap()
-            .expect("the stable owner must be the only admission-eligible recompute");
-        assert_eq!(owner_recompute_probes, vec![blocked_id.clone()]);
-        assert_eq!(owner_recompute.requests.len(), 1);
-        assert_eq!(owner_recompute.requests[0].request.id, blocked_id);
+            .expect("the oldest held peer must be the only admission-eligible recompute");
+        assert_eq!(owner_recompute_probes, vec![runnable_id.clone()]);
+        assert_eq!(rotated_owner.requests.len(), 1);
+        assert_eq!(rotated_owner.requests[0].request.id, runnable_id);
         batches.push(scheduler_replay_batch(
-            &owner_recompute,
+            &rotated_owner,
             &blocked_id,
             &runnable_id,
         ));
@@ -5146,23 +5156,23 @@ mod tests {
             scheduler
                 .pressure_coordinator
                 .lock()
-                .hold_status(&runnable_id),
+                .hold_status(&blocked_id),
             PressureHoldStatus::Held { .. }
         ));
         let journal = scheduler.pressure_transition_journal();
         let admission_pending = journal
             .iter()
             .find(|event| event.kind() == PressureTransitionKind::OwnerAdmissionPending)
-            .expect("owner self recompute must publish admission-pending state");
+            .expect("owner rotation must publish admission-pending state");
         let owner_admitted = journal
             .iter()
             .find(|event| event.kind() == PressureTransitionKind::OwnerAdmitted)
             .expect("typed admission receipt must commit owner admission");
         assert!(admission_pending.ordinal() < owner_admitted.ordinal());
-        scheduler.mark_prefill_complete(&blocked_id, 1);
+        scheduler.mark_prefill_complete(&runnable_id, 1);
 
         let response = InferenceResponse {
-            request_id: blocked_id.clone(),
+            request_id: runnable_id.clone(),
             text: String::new(),
             tokens: Vec::new(),
             finish_reason: ferrum_types::FinishReason::Length,
@@ -5174,7 +5184,7 @@ mod tests {
             execution_evidence: None,
         };
         scheduler
-            .complete(blocked_id.clone(), &response)
+            .complete(runnable_id.clone(), &response)
             .await
             .unwrap();
 
@@ -5201,14 +5211,14 @@ mod tests {
                 },
             )
             .unwrap()
-            .expect("owner terminal release must admit the yielded frontier");
+            .expect("rotated owner terminal release must admit the prior owner");
         assert_eq!(
             callback_order.into_inner(),
             vec!["pressure_hold_released", "admission_probe"],
             "the trace capture boundary must observe causal hold release before re-admission"
         );
         assert_eq!(admitted.requests.len(), 1);
-        assert_eq!(admitted.requests[0].request.id, runnable_id);
+        assert_eq!(admitted.requests[0].request.id, blocked_id);
         batches.push(scheduler_replay_batch(&admitted, &blocked_id, &runnable_id));
         assert!(observations.iter().any(|observation| matches!(
             observation,
@@ -5217,7 +5227,7 @@ mod tests {
                 progress_owner_id,
                 reason: PressureHoldReleaseReason::OwnerTerminal,
                 ..
-            } if request_id == &runnable_id && progress_owner_id == &blocked_id
+            } if request_id == &blocked_id && progress_owner_id == &runnable_id
         )));
         observation_batches.push(observations.clone());
         let journal = scheduler.pressure_transition_journal();
@@ -5237,7 +5247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_phase_pressure_yield_holds_victim_until_owner_terminal() {
+    async fn cross_phase_pressure_yield_rotates_progressed_owner_to_oldest_held_peer() {
         let projection = collect_cross_phase_pressure_replay().await;
         assert_eq!(projection.batches.len(), 6);
         assert!(!projection.journal.is_empty());

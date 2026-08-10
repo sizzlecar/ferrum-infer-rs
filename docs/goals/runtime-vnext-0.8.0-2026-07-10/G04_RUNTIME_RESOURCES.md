@@ -108,14 +108,21 @@ frontier 和同轮 preemption 的原则，但不复制 Python object graph、裸
 运行时字典拼装或无 fence 的立即复用。
 
 权威 allocator 返回 temporary capacity failure 后才创建 cold-path `PressureEpisode`，并按 canonical
-exact capacity source 建立索引。episode 必须分别保存 immutable `progress_owner`、held participant set 和
-last transaction victim，禁止用一个可变 victim/owner 字段同时表达三者。状态至少覆盖
+exact capacity source 建立索引。episode 必须分别保存 generation-scoped stable `progress_owner`、
+按 release-fence ordinal 排序的 held participant set 和 last transaction victim，禁止用一个字段同时
+表达三者。状态至少覆盖
 `Open -> YieldPlanned -> AwaitReleaseFence -> Resumable -> Closed`；当 stable owner 在仍有 held peer 时
 释放自身资源进入 recompute，还必须经过
 `OwnerAdmissionPending --typed admission receipt--> Resumable`。token progress、wait-source topology 变化和
-另一个 participant 的排队顺序都不能转移 owner，也不能解除 held peer；owner 只有在 terminal release 后
-才释放 peer。若 recompute owner 无法取得执行 claim，必须返回 typed invariant/blocker，不能把 held peer
-晋升为新 owner 或静默轮转。一次 scheduler transaction 在提交 batch 前必须满足二选一：至少一个
+另一个 participant 的排队顺序都不能直接转移 owner 或解除 held peer。terminal release 仍是普通 hold
+释放路径；此外，stable owner 只有在自己再次命中 authoritative exact-source capacity failure、相对本代
+baseline 已提交严格新逻辑进度、且自己的 typed release footprint 能推进该 exact source 时，才允许通过
+新的 `peer_handoff` transaction 把 owner 角色转给最早 Held participant。旧 owner 必须成为本次 victim，
+完整经过 `YieldPlanned -> ReleaseFenceArmed -> ReleaseFenceCompleted -> Held`；新 owner 在 fence terminal
+之后只能进入 `OwnerAdmissionPending`，并在 typed admission receipt 后进入 `Resumable`。transaction 必须
+记录 prior owner identity、prior baseline 和 prior current generation，且满足 `current > baseline`；缺失
+任一证据时必须保持 stable owner 或返回 typed invariant，禁止静默轮转。一次 scheduler transaction 在
+提交 batch 前必须满足二选一：至少一个
 frontier 获得可执行 claim，或已经产生一个 typed yield/release transaction，且被让渡资源在 fence
 terminal 前不能复用；禁止把所有 frontier 先标成 passive wait 再期待另一个 phase 推进 source。
 unchanged exact source 不重新调用 allocator，也不产生逐 tick event 洪泛，只更新预分配 episode counter
@@ -124,9 +131,27 @@ unchanged exact source 不重新调用 allocator，也不产生逐 tick event �
 机制与策略必须分离。资源机制只负责 exact claim、rollback、fence-delayed release 和 transition
 ordering；调度策略基于 priority、相关 bypass age、resident/recompute cost、剩余 logical work、可形成的
 batch width 和预计释放收益选择继续当前 cohort、yield victim 或等待。选择只发生在真实 capacity
-boundary，不能按每 token、时间、模型名、GPU 型号或显存档位轮转。backend/provider 只提供 typed
+boundary；owner 轮转同样只能发生在上述带 strict progress 与 exact release authority 的新 failure
+boundary，不能按每 token、时间、模型名、GPU 型号、显存档位或单纯队列顺序轮转。backend/provider 只提供 typed
 capacity snapshot、cost/capability hint 和 release fence；scheduler 核心不得出现 CUDA/Metal/model
 分支。
+
+### 2026-08-10 bounded-progress 合同修订
+
+Clean source `629771bc` 的 1x RTX 4090 S1 decode-capacity artifact 否定了 episode-wide immutable
+owner 必然满足产品活性的假设。A 在 `417` 个 content chunk 后被 Held，直到 C terminal 才释放；相邻
+content 的真实静默为 `30.2860864s`，门禁在 `30.028s >= 30.000s` 正确 REJECT。A 在释放后继续推进，
+且全程无 OOM、panic 或 fence 因果缺口，因此失败类别是 terminal-only hold 造成的 bounded-progress
+starvation，不是 allocator deadlock 或 watchdog 误报。失败 archive 已以
+`runtime-vnext-r0-s2-629771bc-20260810-r1-REJECT-decode-progress-timeout.tar.zst` 保存到 GitHub
+diagnostic asset，SHA256 为
+`91cad2c54e22097c7ab6ededbc22ee0f59d32d17ca90bc1df51ccc96d50977ad`。
+
+本修订不允许调高 30 秒门槛或凭 token progress 直接解除 hold；它只把 owner 的稳定范围从整个 episode
+收紧到一个 `handoff_generation`，并要求上述完整 typed rotation evidence。三 frontier replay 必须证明
+多个 Held participant 按 release ordinal 选择最早者；`progress == baseline`、旧 owner 非本次 requested
+frontier、缺少 exact-source release authority、fence 未 terminal 或 typed admission 未完成时，轮转成功数
+必须为 `0`。
 
 ## Transaction 与 Lease 状态机
 
@@ -315,7 +340,7 @@ scratch 和 graph workspace 多个 lease：
   再到 decode 的 transition 使用同一 frontier/pressure episode；跨 phase 复制或丢失 exact wait、
   fairness age、logical progress 和 release obligation 的 case 数为 `0`。
 - transition journal 使用 scheduler-owned 单调 ordinal；同一 transaction 的 yield、release-fence、
-  admission、submit 顺序必须由 ordinal 验证，不能用 wall-clock timestamp 推断。trace sink 延迟、批量
+  owner-rotation、admission、submit 顺序必须由 ordinal 验证，不能用 wall-clock timestamp 推断。trace sink 延迟、批量
   flush 或关闭时 replay transition 与 batch membership 保持完全一致。
 - 对 ceiling=`1/32/4096/u32::MAX` 的同一 graph，plan descriptor 数和 build allocation 数保持
   不变；除 `0` 外无任意固定 concurrency guard，实际资源 claim 只随 admitted request 数增长。
