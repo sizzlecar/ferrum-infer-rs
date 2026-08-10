@@ -432,6 +432,42 @@ def capture_cuda_bridge_preflight(attempt_dir: Path) -> dict[str, Any]:
     return {"path": path, "document": document, "real_binary": real_binary}
 
 
+def wait_for_cuda_device_allocation(
+    process: subprocess.Popen[Any],
+    *,
+    pid: int,
+    pgid: int,
+    preflight: dict[str, Any],
+    timeout_sec: float = 30.0,
+    query_compute_rows: Any = None,
+    group_pids_fn: Any = process_group_pids,
+) -> None:
+    if query_compute_rows is None:
+        def query_compute_rows() -> list[dict[str, int]]:
+            query = subprocess.run(
+                [str(preflight["real_binary"]), *CUDA_COMPUTE_QUERY],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            require(query.returncode == 0, "CUDA allocation nvidia-smi query failed")
+            return parse_cuda_compute_rows(query.stdout, "CUDA allocation query")
+
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        require(process.poll() is None, f"run process exited before CUDA allocation with {process.returncode}")
+        normalized, _ = normalize_cuda_compute_rows(
+            query_compute_rows(),
+            server_pid=pid,
+            group_pids=group_pids_fn(pgid),
+            preflight_rows=preflight["document"]["compute_apps"],
+        )
+        if normalized:
+            return
+        time.sleep(0.05)
+    raise R2CollectorError("run process did not allocate CUDA device memory before sampler startup")
+
+
 def prepare_cuda_bridge(
     attempt_dir: Path,
     stem: str,
@@ -2293,6 +2329,16 @@ def collect_run_sample(
                 if config["backend"] == "cuda"
                 else None
             )
+            if config["backend"] == "cuda":
+                atomic_write_text(barrier_release, "release\n")
+                collector_support.wait_for_process_exec(process, inputs["binary_path"], 30.0)
+                require(cuda_preflight is not None, "CUDA run requires an idle process preflight")
+                wait_for_cuda_device_allocation(
+                    process,
+                    pid=pid,
+                    pgid=pgid,
+                    preflight=cuda_preflight,
+                )
             sampler = start_run_resource_sampler(
                 root,
                 attempt_dir,
@@ -2303,8 +2349,9 @@ def collect_run_sample(
                 stderr_path=stderr_path,
                 cuda_preflight=cuda_preflight,
             )
-            atomic_write_text(barrier_release, "release\n")
-            collector_support.wait_for_process_exec(process, inputs["binary_path"], 30.0)
+            if config["backend"] != "cuda":
+                atomic_write_text(barrier_release, "release\n")
+                collector_support.wait_for_process_exec(process, inputs["binary_path"], 30.0)
             receipt = collector_support.write_process_receipt(
                 root,
                 attempt_dir / "run-process-receipt.json",
@@ -2729,6 +2776,24 @@ def self_test() -> int:
     require(
         normalized == [] and strategy == "idle-before-device-allocation",
         "CUDA PID bridge pre-allocation idle self-test failed",
+    )
+    allocation_rows = iter([[], native_rows])
+
+    class FakeRunningProcess:
+        returncode = None
+
+        @staticmethod
+        def poll() -> None:
+            return None
+
+    wait_for_cuda_device_allocation(
+        FakeRunningProcess(),
+        pid=101,
+        pgid=101,
+        preflight={"document": {"compute_apps": []}},
+        timeout_sec=0.2,
+        query_compute_rows=lambda: next(allocation_rows),
+        group_pids_fn=lambda _pgid: {101},
     )
     for rows, preflight_rows, visible, expected_error in (
         (host_rows, [{"pid": 8, "used_gpu_memory_mib": 1}], False, "idle preflight"),
