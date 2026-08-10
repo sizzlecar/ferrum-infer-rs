@@ -375,6 +375,12 @@ def expected_cells(backend: str) -> set[tuple[str, int]]:
     }
 
 
+def requires_active_floor(dataset: str, concurrency: int, backend: str) -> bool:
+    """The active-floor proof belongs to the high-concurrency random cell."""
+
+    return dataset == "random" and concurrency == max(MAIN_CONCURRENCY[backend])
+
+
 def requests_per_repeat(dataset: str) -> int:
     return 100 if dataset == "random" else 30
 
@@ -1781,7 +1787,7 @@ def load_ferrum_collector_lane(
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
             raise R2Error(f"resource evidence failed for {key}: {error}") from error
         require(recomputed_resource == resource_summary, f"resource summary is not raw-derived: {key}")
-        highest = key[1] == max(MAIN_CONCURRENCY[expected_backend])
+        highest = requires_active_floor(key[0], key[1], expected_backend)
         duty = validate_active_intervals(
             root,
             resources.get("active_intervals"),
@@ -3484,6 +3490,13 @@ def expect_reject(action: Callable[[], Any], label: str) -> None:
 
 
 def self_test() -> None:
+    require(
+        requires_active_floor("random", 32, "cuda")
+        and requires_active_floor("random", 16, "metal")
+        and not requires_active_floor("sharegpt", 32, "cuda")
+        and not requires_active_floor("real-chat", 16, "metal"),
+        "active-floor cell selection differs",
+    )
     source = {
         "git_sha": "a" * 40,
         "git_tree_sha": "b" * 40,
