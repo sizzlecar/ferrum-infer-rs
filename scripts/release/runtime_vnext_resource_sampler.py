@@ -436,6 +436,29 @@ def _process_group_rows(pgid: int) -> list[tuple[int, int]]:
     return rows
 
 
+def _live_process_group_rows(
+    pgid: int,
+    pid: int,
+    *,
+    fetch: Callable[[int], list[tuple[int, int]]] = _process_group_rows,
+) -> list[tuple[int, int]] | None:
+    rows = fetch(pgid)
+    pids = {row_pid for row_pid, _ in rows}
+    if pid not in pids:
+        return None
+    if sum(rss for _, rss in rows) > 0:
+        return rows
+
+    # A process can become a zero-RSS zombie between the process-group and
+    # memory probes. Confirm that terminal edge once so it is recorded by the
+    # footer instead of emitting a contradictory process_alive/RSS=0 sample.
+    confirmed = fetch(pgid)
+    confirmed_pids = {row_pid for row_pid, _ in confirmed}
+    if pid not in confirmed_pids or sum(rss for _, rss in confirmed) <= 0:
+        return None
+    return confirmed
+
+
 def _process_start_identity(pid: int) -> tuple[str, dict[str, str]]:
     if platform.system() == "Linux":
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
@@ -510,6 +533,22 @@ def _cuda_memory(group_pids: set[int]) -> tuple[int, int]:
     free = sum(int(row.strip()) * 1024**2 for row in free_rows if row.strip().isdigit())
     _require(used > 0 and free >= 0, "nvidia-smi did not bind device memory to the server process group")
     return used, free
+
+
+def _cuda_memory_or_process_exit(
+    group_pids: set[int],
+    pgid: int,
+    pid: int,
+    *,
+    query: Callable[[set[int]], tuple[int, int]] = _cuda_memory,
+    fetch: Callable[[int], list[tuple[int, int]]] = _process_group_rows,
+) -> tuple[int, int] | None:
+    try:
+        return query(group_pids)
+    except (ResourceEvidenceError, subprocess.CalledProcessError):
+        if _live_process_group_rows(pgid, pid, fetch=fetch) is None:
+            return None
+        raise
 
 
 def _json_path(value: Any, selector: str) -> Any:
@@ -801,15 +840,23 @@ def collect(args: argparse.Namespace) -> None:
                 break
             if time.monotonic() - started_monotonic >= args.max_duration_sec:
                 break
-            group_rows = _process_group_rows(args.pgid)
-            group_pids = {row[0] for row in group_rows}
-            process_alive = args.pid in group_pids
-            if not process_alive:
+            group_rows = _live_process_group_rows(args.pgid, args.pid)
+            if group_rows is None:
                 exit_reason = "process-exit"
                 break
+            group_pids = {row[0] for row in group_rows}
+            process_alive = True
             rss = sum(row[1] for row in group_rows)
             if args.backend == "cuda":
-                memory_used, headroom = _cuda_memory(group_pids)
+                cuda_memory = _cuda_memory_or_process_exit(
+                    group_pids,
+                    args.pgid,
+                    args.pid,
+                )
+                if cuda_memory is None:
+                    exit_reason = "process-exit"
+                    break
+                memory_used, headroom = cuda_memory
                 _, swap = _linux_memory()
                 extra = {"device_memory_bytes": memory_used}
             else:
@@ -940,6 +987,30 @@ def self_test() -> int:
     _require(bool(ADMISSION_ERROR_RE.search("KV admission failed")), "admission classifier self-test failed")
     marker, source = _process_start_identity(os.getpid())
     _require(process_marker_from_source(os.getpid(), source) == marker, "process start identity self-test failed")
+    snapshots = iter([[(11, 0)], [(11, 4096)]])
+    _require(
+        _live_process_group_rows(11, 11, fetch=lambda _pgid: next(snapshots)) == [(11, 4096)],
+        "zero-RSS process-group confirmation self-test failed",
+    )
+    terminal = iter([[(11, 0)], [(11, 0)]])
+    _require(
+        _live_process_group_rows(11, 11, fetch=lambda _pgid: next(terminal)) is None,
+        "terminal zero-RSS process-group self-test failed",
+    )
+    cuda_terminal = iter([[(11, 0)], [(11, 0)]])
+    _require(
+        _cuda_memory_or_process_exit(
+            {11},
+            11,
+            11,
+            query=lambda _pids: (_ for _ in ()).throw(
+                subprocess.CalledProcessError(1, ["nvidia-smi"])
+            ),
+            fetch=lambda _pgid: next(cuda_terminal),
+        )
+        is None,
+        "terminal CUDA query failure self-test failed",
+    )
     require_active_coverage([0, 1, 0], process_probe=False)
     require_active_coverage([1, 1, 1], process_probe=True)
     try:
