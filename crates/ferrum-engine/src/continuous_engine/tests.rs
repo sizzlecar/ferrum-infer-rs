@@ -4419,6 +4419,15 @@ async fn plan_runtime_saturated_root_success_recovers_execution_pressure_additiv
         Some(4)
     );
 
+    assert!(!scheduler.record_decode_execution_capacity_success(4));
+    let before_capacity_release = scheduler.trace_snapshot();
+    assert_eq!(
+        before_capacity_release.decode_capacity_backpressure_admit_limit,
+        Some(4)
+    );
+    assert!(before_capacity_release.decode_execution_pressure_enforced);
+
+    scheduler.record_external_capacity_release();
     engine
         .inner
         .run_plan_runtime_batch_decode_adaptive(&request_ids[..4])
@@ -4443,6 +4452,7 @@ async fn plan_runtime_saturated_root_success_recovers_execution_pressure_additiv
     );
     assert!(after_small_tail.decode_execution_pressure_enforced);
 
+    scheduler.record_external_capacity_release();
     engine
         .inner
         .run_plan_runtime_batch_decode_adaptive(&request_ids[..5])
