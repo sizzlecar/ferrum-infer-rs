@@ -102,6 +102,7 @@ R2_CONTROL_PLANE_FILES = frozenset(
         "scripts/release/runtime_vnext_r2_ferrum_collector.py",
         "scripts/release/runtime_vnext_r2_performance_build_profile.py",
         "scripts/release/runtime_vnext_r2_profile_collector.py",
+        "scripts/release/runtime_vnext_g07a_build_iteration.py",
         "scripts/release/run_gate.py",
         "scripts/release/configs/runtime_vnext_r2_ferrum_floors.json",
     }

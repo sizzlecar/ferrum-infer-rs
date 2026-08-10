@@ -976,40 +976,34 @@ def reset_worktree(
     git_sha: str,
 ) -> None:
     if worktree.exists():
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(worktree)],
-            cwd=source_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=120,
-            check=False,
-        )
-        if worktree.exists():
-            shutil.rmtree(worktree)
-    run_text(source_root, ["git", "worktree", "prune"], timeout=120)
+        shutil.rmtree(worktree)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
     run_text(
         source_root,
-        ["git", "worktree", "add", "--detach", str(worktree), git_sha],
+        [
+            "git",
+            "clone",
+            "--shared",
+            "--no-checkout",
+            str(source_root),
+            str(worktree),
+        ],
         timeout=180,
     )
+    run_text(worktree, ["git", "checkout", "--detach", git_sha], timeout=180)
     require(
         run_text(worktree, ["git", "status", "--short"]) == "",
-        "fresh timing worktree is dirty",
+        "fresh timing clone is dirty",
     )
 
 
 def remove_worktree(source_root: Path, worktree: Path) -> None:
+    del source_root
     if not worktree.exists():
         return
     status = run_text(worktree, ["git", "status", "--short"]).splitlines()
-    require(not status, f"timing worktree is dirty at removal: {status}")
-    run_text(
-        source_root,
-        ["git", "worktree", "remove", "--force", str(worktree)],
-        timeout=180,
-    )
-    run_text(source_root, ["git", "worktree", "prune"], timeout=120)
+    require(not status, f"timing clone is dirty at removal: {status}")
+    shutil.rmtree(worktree)
 
 
 def store_blob(evidence_root: Path, path: Path, kind: str) -> dict[str, Any]:
