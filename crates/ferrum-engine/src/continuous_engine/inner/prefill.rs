@@ -518,6 +518,9 @@ impl EngineInner {
                             "planned_transition_ordinal": transaction.planned_ordinal().get(),
                             "victim_request_id": transaction.victim_request_id(),
                             "progress_owner_id": transaction.progress_owner_id(),
+                            "rotated_from_progress_owner_id": transaction.rotated_from_progress_owner_id(),
+                            "rotated_from_progress_baseline": transaction.rotated_from_progress_baseline().map(|generation| generation.get()),
+                            "rotated_from_progress_current": transaction.rotated_from_progress_current().map(|generation| generation.get()),
                             "scheduler": self.scheduler.trace_snapshot(),
                         }));
                     }

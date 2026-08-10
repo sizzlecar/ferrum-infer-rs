@@ -899,6 +899,10 @@ impl EngineInner {
                 serde_json::json!(transaction.planned_ordinal().get()),
             );
             attributes.insert(
+                "handoff_generation".to_string(),
+                serde_json::json!(transaction.handoff_generation()),
+            );
+            attributes.insert(
                 "yield_kind".to_string(),
                 serde_json::json!(transaction.kind().as_str()),
             );
@@ -913,6 +917,22 @@ impl EngineInner {
             attributes.insert(
                 "progress_baseline".to_string(),
                 serde_json::json!(transaction.progress_baseline().get()),
+            );
+            attributes.insert(
+                "rotated_from_progress_owner_id".to_string(),
+                serde_json::json!(transaction.rotated_from_progress_owner_id()),
+            );
+            attributes.insert(
+                "rotated_from_progress_baseline".to_string(),
+                serde_json::json!(transaction
+                    .rotated_from_progress_baseline()
+                    .map(|generation| generation.get())),
+            );
+            attributes.insert(
+                "rotated_from_progress_current".to_string(),
+                serde_json::json!(transaction
+                    .rotated_from_progress_current()
+                    .map(|generation| generation.get())),
             );
         }
         self.write_executor_scheduler_profile_event(

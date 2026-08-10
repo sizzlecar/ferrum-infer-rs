@@ -3794,7 +3794,7 @@ async fn plan_runtime_lone_decode_self_recompute_releases_exact_cache_before_req
 }
 
 #[tokio::test]
-async fn plan_runtime_pressure_keeps_owner_identity_across_two_physical_releases() {
+async fn plan_runtime_pressure_rotates_progressed_owner_after_two_physical_releases() {
     let trace_path = resource_trace_temp_path("plan-runtime-stable-pressure-owner");
     let _ = std::fs::remove_file(&trace_path);
     let (engine, scheduler, executor, tokenizer) = plan_runtime_batch_decode_test_engine_with_trace(
@@ -3866,15 +3866,24 @@ async fn plan_runtime_pressure_keeps_owner_identity_across_two_physical_releases
         transaction: second_transaction,
     } = second_action
     else {
-        panic!("the stable progress owner must self recompute under renewed pressure");
+        panic!("the progressed owner must rotate to the oldest held peer");
     };
-    assert_eq!(second_transaction.kind(), PressureYieldKind::SelfRecompute);
-    assert_eq!(second_transaction.progress_owner_id(), &progress_owner_id);
+    assert_eq!(second_transaction.kind(), PressureYieldKind::PeerHandoff);
+    assert_eq!(second_transaction.progress_owner_id(), &held_peer_id);
     assert_eq!(second_transaction.victim_request_id(), &progress_owner_id);
     assert_eq!(
-        second_transaction.progress_baseline(),
-        first_transaction.progress_baseline(),
-        "one pressure episode must retain its original logical progress baseline"
+        second_transaction.rotated_from_progress_owner_id(),
+        Some(&progress_owner_id)
+    );
+    assert_eq!(
+        second_transaction.rotated_from_progress_baseline(),
+        Some(first_transaction.progress_baseline())
+    );
+    assert!(
+        second_transaction
+            .rotated_from_progress_current()
+            .is_some_and(|current| current > first_transaction.progress_baseline()),
+        "owner rotation requires new logical progress beyond its generation baseline"
     );
 
     assert!(!engine
@@ -3939,24 +3948,40 @@ async fn plan_runtime_pressure_keeps_owner_identity_across_two_physical_releases
     );
     assert_eq!(
         completions[1].attributes.get("progress_owner_id"),
-        Some(&serde_json::json!(progress_owner_id))
+        Some(&serde_json::json!(held_peer_id))
     );
     assert_eq!(completions[1].request_id, progress_owner_id.to_string());
     let holds = profile_events
         .iter()
         .filter(|event| event.phase == "vnext.execution_capacity_pressure_hold_active")
         .collect::<Vec<_>>();
-    assert_eq!(holds.len(), 1);
-    assert_eq!(holds[0].request_id, held_peer_id.to_string());
+    assert_eq!(holds.len(), 2);
+    let first_hold = holds
+        .iter()
+        .find(|event| event.request_id == held_peer_id.to_string())
+        .expect("the first yielded peer must publish its physical hold");
+    let rotated_hold = holds
+        .iter()
+        .find(|event| event.request_id == progress_owner_id.to_string())
+        .expect("the rotated-out owner must publish its physical hold");
     assert_eq!(
-        holds[0].shape.get("progress_owner_id"),
+        first_hold.shape.get("progress_owner_id"),
         Some(&serde_json::json!(progress_owner_id))
     );
     assert_eq!(
-        holds[0].shape.get("hold_transition_ordinal"),
+        first_hold.shape.get("hold_transition_ordinal"),
         completions[0].shape.get("release_transition_ordinal")
     );
-    assert!(holds[0].shape["waiting_ticket"].as_u64().is_some());
+    assert_eq!(
+        rotated_hold.shape.get("progress_owner_id"),
+        Some(&serde_json::json!(held_peer_id))
+    );
+    assert_eq!(
+        rotated_hold.shape.get("hold_transition_ordinal"),
+        completions[1].shape.get("release_transition_ordinal")
+    );
+    assert!(first_hold.shape["waiting_ticket"].as_u64().is_some());
+    assert!(rotated_hold.shape["waiting_ticket"].as_u64().is_some());
     let _ = std::fs::remove_file(trace_path);
 }
 

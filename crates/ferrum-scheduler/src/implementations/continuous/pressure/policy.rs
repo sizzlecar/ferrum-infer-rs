@@ -52,6 +52,28 @@ impl PressureSelectionPolicy for FairPressureSelectionPolicy {
             .and_then(|request_id| episode.participants.get(request_id))
             .filter(|participant| participant.work_kind != LogicalWorkKind::Terminal);
         if let Some(participant) = stable_owner {
+            let can_rotate = requested.contains(&participant.request_id)
+                && participant.advances_wait_source
+                && participant.progress > episode.owner_progress_baseline
+                && matches!(participant.state, ParticipantState::Blocked { .. });
+            if can_rotate {
+                if let Some(held) = episode
+                    .participants
+                    .values()
+                    .filter(|candidate| {
+                        candidate.state == ParticipantState::Held
+                            && candidate.held_since_ordinal.is_some()
+                    })
+                    .min_by(|left, right| {
+                        left.held_since_ordinal
+                            .cmp(&right.held_since_ordinal)
+                            .then_with(|| right.priority.cmp(&left.priority))
+                            .then_with(|| left.request_id.0.cmp(&right.request_id.0))
+                    })
+                {
+                    return Some(held.request_id.clone());
+                }
+            }
             return Some(participant.request_id.clone());
         }
 
@@ -141,6 +163,24 @@ impl PressureSelectionPolicy for FairPressureSelectionPolicy {
         requested: &HashSet<RequestId>,
         owner_id: &RequestId,
     ) -> Option<PressureYieldSelection> {
+        if let Some(stable_owner_id) = episode
+            .progress_owner
+            .as_ref()
+            .filter(|stable_owner_id| *stable_owner_id != owner_id)
+        {
+            return episode
+                .participants
+                .get(stable_owner_id)
+                .filter(|stable_owner| {
+                    requested.contains(stable_owner_id)
+                        && stable_owner.advances_wait_source
+                        && matches!(stable_owner.state, ParticipantState::Blocked { .. })
+                })
+                .map(|stable_owner| {
+                    PressureYieldSelection::PeerHandoff(stable_owner.request_id.clone())
+                });
+        }
+
         let peer = episode
             .participants
             .values()

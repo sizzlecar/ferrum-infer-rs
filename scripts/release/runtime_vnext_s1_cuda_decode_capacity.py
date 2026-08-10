@@ -1198,15 +1198,32 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
     victim_request_id = attributes.get("victim_request_id")
     progress_owner_id = attributes.get("progress_owner_id")
     progress_baseline = attributes.get("progress_baseline")
+    rotated_from_progress_owner_id = attributes.get(
+        "rotated_from_progress_owner_id"
+    )
+    rotated_from_progress_baseline = attributes.get(
+        "rotated_from_progress_baseline"
+    )
+    rotated_from_progress_current = attributes.get(
+        "rotated_from_progress_current"
+    )
     episode_id = attributes.get("episode_id")
     planned_transition_ordinal = attributes.get("planned_transition_ordinal")
+    handoff_generation = attributes.get("handoff_generation")
     yield_kind = attributes.get("yield_kind")
     if decision == "split_cohort":
         require(width >= 2, f"{label}: split cohort is not wide")
         require(victim_request_id is None, f"{label}: split cohort named a victim")
         require(progress_owner_id is None, f"{label}: split cohort named a progress owner")
         require(progress_baseline is None, f"{label}: split cohort named a progress baseline")
+        require(
+            rotated_from_progress_owner_id is None
+            and rotated_from_progress_baseline is None
+            and rotated_from_progress_current is None,
+            f"{label}: split cohort named a progress-owner rotation",
+        )
         require(yield_kind is None, f"{label}: split cohort named a yield kind")
+        require(handoff_generation is None, f"{label}: split cohort named a handoff generation")
     elif decision == "pressure_yield_planned":
         require(width == 1, f"{label}: pressure-yield cohort is not exact")
         require(
@@ -1242,12 +1259,49 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
             and planned_transition_ordinal > 0,
             f"{label}: planned transition ordinal is invalid",
         )
+        require(
+            isinstance(handoff_generation, int) and handoff_generation > 0,
+            f"{label}: handoff generation is invalid",
+        )
+        if rotated_from_progress_owner_id is None:
+            require(
+                rotated_from_progress_baseline is None
+                and rotated_from_progress_current is None,
+                f"{label}: partial progress-owner rotation evidence",
+            )
+        else:
+            require(
+                yield_kind == "peer_handoff"
+                and isinstance(rotated_from_progress_owner_id, str)
+                and common.request_identity_matches(
+                    rotated_from_progress_owner_id, victim_request_id
+                )
+                and not common.request_identity_matches(
+                    rotated_from_progress_owner_id, progress_owner_id
+                ),
+                f"{label}: rotation does not yield the prior progress owner",
+            )
+            require(
+                isinstance(rotated_from_progress_baseline, int)
+                and isinstance(rotated_from_progress_current, int)
+                and rotated_from_progress_current
+                > rotated_from_progress_baseline
+                >= 0,
+                f"{label}: rotation has no strict prior-owner progress evidence",
+            )
     else:
         require(width == 1, f"{label}: a non-exact cohort was parked")
         require(victim_request_id is None, f"{label}: parked decode named a victim")
         require(progress_owner_id is None, f"{label}: parked decode named a progress owner")
         require(progress_baseline is None, f"{label}: parked decode named a progress baseline")
+        require(
+            rotated_from_progress_owner_id is None
+            and rotated_from_progress_baseline is None
+            and rotated_from_progress_current is None,
+            f"{label}: parked decode named a progress-owner rotation",
+        )
         require(yield_kind is None, f"{label}: parked decode named a yield kind")
+        require(handoff_generation is None, f"{label}: parked decode named a handoff generation")
 
     evidence = attributes.get("capacity_evidence")
     require(isinstance(evidence, dict), f"{label}: capacity evidence is missing")
@@ -1344,8 +1398,12 @@ def validate_decode_deferral(row: dict[str, Any], label: str) -> dict[str, Any]:
         "victim_request_id": victim_request_id,
         "progress_owner_id": progress_owner_id,
         "progress_baseline": progress_baseline,
+        "rotated_from_progress_owner_id": rotated_from_progress_owner_id,
+        "rotated_from_progress_baseline": rotated_from_progress_baseline,
+        "rotated_from_progress_current": rotated_from_progress_current,
         "episode_id": episode_id,
         "planned_transition_ordinal": planned_transition_ordinal,
+        "handoff_generation": handoff_generation,
         "yield_kind": yield_kind,
         "observed": observed,
         "wait_condition": wait_condition,
@@ -1542,10 +1600,15 @@ def validate_pressure_fence_armed(row: dict[str, Any], label: str) -> dict[str, 
     require(isinstance(request_id, str) and request_id, f"{label}: victim identity is missing")
     require(isinstance(shape, dict) and isinstance(attributes, dict), f"{label}: payload is missing")
     episode_id = shape.get("episode_id")
+    handoff_generation = shape.get("handoff_generation")
     planned = shape.get("planned_transition_ordinal")
     armed = shape.get("transition_ordinal")
     yield_kind = shape.get("yield_kind")
     require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
+    require(
+        isinstance(handoff_generation, int) and handoff_generation > 0,
+        f"{label}: handoff generation is invalid",
+    )
     require(
         isinstance(planned, int) and isinstance(armed, int) and 0 < planned < armed,
         f"{label}: planned/armed ordinal order is invalid",
@@ -1566,6 +1629,7 @@ def validate_pressure_fence_armed(row: dict[str, Any], label: str) -> dict[str, 
     return {
         "ts_unix_nanos": common.event_wall_ns(row),
         "episode_id": episode_id,
+        "handoff_generation": handoff_generation,
         "victim_request_id": request_id,
         "progress_owner_id": progress_owner_id,
         "yield_kind": yield_kind,
@@ -1582,6 +1646,7 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     require(isinstance(request_id, str) and request_id, f"{label}: victim identity is missing")
     require(isinstance(shape, dict) and isinstance(attributes, dict), f"{label}: payload is missing")
     episode_id = shape.get("episode_id")
+    handoff_generation = shape.get("handoff_generation")
     released = shape.get("release_transition_ordinal")
     resumable = shape.get("resumable_transition_ordinal")
     owner_admission_pending = shape.get(
@@ -1592,6 +1657,10 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     disposition = shape.get("completion_disposition")
     yield_kind = shape.get("yield_kind")
     require(isinstance(episode_id, int) and episode_id > 0, f"{label}: episode id is invalid")
+    require(
+        isinstance(handoff_generation, int) and handoff_generation > 0,
+        f"{label}: handoff generation is invalid",
+    )
     require(isinstance(released, int) and released > 0, f"{label}: release ordinal is invalid")
     require(
         shape.get("physical_release_completed") is True,
@@ -1631,6 +1700,20 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
                 f"{label}: self-recompute completion disposition is invalid",
             )
             completion_ordinal = closed
+    elif (
+        yield_kind == "peer_handoff"
+        and disposition == "progress_owner_admission_pending"
+    ):
+        require(
+            progress_owner_resumable is False
+            and resumable is None
+            and closed is None
+            and closed_reason is None
+            and isinstance(owner_admission_pending, int)
+            and released < owner_admission_pending,
+            f"{label}: rotated-owner admission-pending ordinal order is invalid",
+        )
+        completion_ordinal = owner_admission_pending
     elif progress_owner_resumable is True:
         require(
             isinstance(resumable, int) and released < resumable,
@@ -1681,6 +1764,7 @@ def validate_pressure_fence_completed(row: dict[str, Any], label: str) -> dict[s
     return {
         "ts_unix_nanos": common.event_wall_ns(row),
         "episode_id": episode_id,
+        "handoff_generation": handoff_generation,
         "victim_request_id": request_id,
         "progress_owner_id": progress_owner_id,
         "yield_kind": yield_kind,
@@ -1827,242 +1911,423 @@ def validate_decode_trace(
             f"parked decode {request_id} neither resumed after an exact-source change nor received a released progress role",
         )
     completed_rows = [
-        row for row in rows if str(row.get("phase", "")).endswith("request_completed")
+        row
+        for row in window
+        if str(row.get("phase", "")).endswith("request_completed")
     ]
     admitted_rows = [
         row
-        for row in rows
+        for row in window
         if row.get("phase") == "vnext.prefill_admission"
         and row.get("shape", {}).get("decision") == "admitted"
     ]
-    progress_owner_by_episode: dict[int, str] = {}
-    progress_baseline_by_episode: dict[int, int] = {}
-    for pressure_yield in yields:
-        episode_id = pressure_yield["episode_id"]
-        progress_owner_id = pressure_yield["progress_owner_id"]
-        prior_owner = progress_owner_by_episode.setdefault(
-            episode_id, progress_owner_id
-        )
-        require(
-            common.request_identity_matches(prior_owner, progress_owner_id),
-            f"pressure episode {episode_id} transferred its stable progress owner",
-        )
-        prior_baseline = progress_baseline_by_episode.setdefault(
-            episode_id, pressure_yield["progress_baseline"]
-        )
-        require(
-            prior_baseline == pressure_yield["progress_baseline"],
-            f"pressure episode {episode_id} changed its logical progress baseline",
-        )
-    for hold in holds:
-        require(
-            hold["episode_id"] in progress_owner_by_episode,
-            f"pressure episode {hold['episode_id']} hold has no planned yield",
-        )
-        require(
-            common.request_identity_matches(
-                progress_owner_by_episode[hold["episode_id"]],
-                hold["progress_owner_id"],
-            ),
-            f"pressure episode {hold['episode_id']} hold has a foreign progress owner",
-        )
-        require(
-            not any(
-                pressure_yield["episode_id"] == hold["episode_id"]
-                and common.request_identity_matches(
-                    pressure_yield["progress_owner_id"], hold["victim_request_id"]
-                )
+
+    def handoff_key(event: dict[str, Any]) -> tuple[int, int]:
+        return (event["episode_id"], event["handoff_generation"])
+
+    def index_handoffs(
+        events: list[dict[str, Any]], label: str
+    ) -> dict[tuple[int, int], dict[str, Any]]:
+        indexed: dict[tuple[int, int], dict[str, Any]] = {}
+        for event in events:
+            key = handoff_key(event)
+            require(key not in indexed, f"duplicate {label} for handoff {key}")
+            indexed[key] = event
+        return indexed
+
+    yields_by_handoff = index_handoffs(yields, "yield")
+    armed_by_handoff = index_handoffs(armed_fences, "armed fence")
+    completed_by_handoff = index_handoffs(completed_fences, "completed fence")
+    require(
+        yields_by_handoff.keys()
+        == armed_by_handoff.keys()
+        == completed_by_handoff.keys(),
+        "pressure yield/armed/completed handoff sets are not one-to-one",
+    )
+
+    peer_release_wall_ns_by_handoff: dict[tuple[int, int], int] = {}
+    matched_hold_indices: set[int] = set()
+    consumed_hold_indices: set[int] = set()
+    consumed_release_indices: set[int] = set()
+    hold_origin_by_index: dict[int, tuple[int, int]] = {}
+    waiting_ticket_owner: dict[tuple[int, int], str] = {}
+    episode_ids = sorted({pressure_yield["episode_id"] for pressure_yield in yields})
+    for episode_id in episode_ids:
+        episode_yields = sorted(
+            (
+                pressure_yield
                 for pressure_yield in yields
+                if pressure_yield["episode_id"] == episode_id
             ),
-            f"pressure episode {hold['episode_id']} promoted a held victim to owner",
+            key=lambda pressure_yield: pressure_yield[
+                "planned_transition_ordinal"
+            ],
         )
-    for pressure_yield in yields:
-        episode_id = pressure_yield["episode_id"]
-        victim_request_id = pressure_yield["victim_request_id"]
-        progress_owner_id = pressure_yield["progress_owner_id"]
-        progress_baseline = pressure_yield["progress_baseline"]
-        yield_kind = pressure_yield["yield_kind"]
-        if yield_kind == "peer_handoff":
+        require(
+            [event["handoff_generation"] for event in episode_yields]
+            == list(range(1, len(episode_yields) + 1)),
+            f"pressure episode {episode_id} handoff generations are not unique and contiguous",
+        )
+        active_owner_id: str | None = None
+        active_owner_baseline: int | None = None
+        active_owner_admission_wall_ns: int | None = None
+        live_hold_indices: list[int] = []
+        previous_completion_ordinal: int | None = None
+
+        for position, pressure_yield in enumerate(episode_yields):
+            key = handoff_key(pressure_yield)
+            armed = armed_by_handoff[key]
+            completed = completed_by_handoff[key]
+            victim_request_id = pressure_yield["victim_request_id"]
+            progress_owner_id = pressure_yield["progress_owner_id"]
+            progress_baseline = pressure_yield["progress_baseline"]
+            yield_kind = pressure_yield["yield_kind"]
             require(
-                any(
-                    park["ts_unix_nanos"] < pressure_yield["ts_unix_nanos"]
+                common.request_identity_matches(
+                    armed["victim_request_id"], victim_request_id
+                )
+                and common.request_identity_matches(
+                    armed["progress_owner_id"], progress_owner_id
+                )
+                and armed["yield_kind"] == yield_kind
+                and common.request_identity_matches(
+                    completed["victim_request_id"], victim_request_id
+                )
+                and common.request_identity_matches(
+                    completed["progress_owner_id"], progress_owner_id
+                )
+                and completed["yield_kind"] == yield_kind,
+                f"pressure handoff {key} changed frontier identity or yield kind",
+            )
+            require(
+                pressure_yield["planned_transition_ordinal"]
+                == armed["planned_transition_ordinal"]
+                < armed["armed_transition_ordinal"]
+                < completed["release_transition_ordinal"]
+                < completed["completion_transition_ordinal"],
+                f"pressure handoff {key} violated release-fence ordinal order",
+            )
+            if previous_completion_ordinal is not None:
+                require(
+                    previous_completion_ordinal
+                    < pressure_yield["planned_transition_ordinal"],
+                    f"pressure episode {episode_id} overlapped handoff generations",
+                )
+            previous_completion_ordinal = completed[
+                "completion_transition_ordinal"
+            ]
+
+            rotated_from = pressure_yield["rotated_from_progress_owner_id"]
+            rotated_hold_index: int | None = None
+            owner_changed = active_owner_id is not None and not common.request_identity_matches(
+                active_owner_id, progress_owner_id
+            )
+            if active_owner_id is None:
+                require(
+                    rotated_from is None,
+                    f"pressure episode {episode_id} starts with unexplained rotation evidence",
+                )
+            elif common.request_identity_matches(
+                active_owner_id, progress_owner_id
+            ):
+                require(
+                    rotated_from is None
+                    and active_owner_baseline == progress_baseline,
+                    f"pressure episode {episode_id} drifted its stable owner generation",
+                )
+            else:
+                require(
+                    yield_kind == "peer_handoff"
+                    and isinstance(rotated_from, str)
                     and common.request_identity_matches(
-                        park["request_ids"][0], progress_owner_id
+                        rotated_from, active_owner_id
                     )
-                    for park in parks
+                    and common.request_identity_matches(
+                        victim_request_id, active_owner_id
+                    )
+                    and pressure_yield["rotated_from_progress_baseline"]
+                    == active_owner_baseline
+                    and pressure_yield["rotated_from_progress_current"]
+                    > active_owner_baseline,
+                    f"pressure episode {episode_id} has an unproven owner rotation",
+                )
+                matching_live_holds = [
+                    hold_index
+                    for hold_index in live_hold_indices
+                    if common.request_identity_matches(
+                        holds[hold_index]["victim_request_id"],
+                        progress_owner_id,
+                    )
+                ]
+                require(
+                    len(matching_live_holds) == 1,
+                    f"pressure episode {episode_id} rotated to a frontier without one live hold",
+                )
+                rotated_hold_index = matching_live_holds[0]
+                require(
+                    holds[rotated_hold_index]["hold_transition_ordinal"]
+                    == min(
+                        holds[hold_index]["hold_transition_ordinal"]
+                        for hold_index in live_hold_indices
+                    ),
+                    f"pressure episode {episode_id} did not rotate to its oldest held frontier",
+                )
+                require(
+                    not any(
+                        common.request_identity_matches(
+                            row.get("request_id"), progress_owner_id
+                        )
+                        and common.event_wall_ns(row)
+                        <= completed["ts_unix_nanos"]
+                        for row in completed_rows
+                    ),
+                    f"pressure episode {episode_id} rotated to a terminal frontier",
+                )
+                require(
+                    completed["completion_disposition"]
+                    == "progress_owner_admission_pending",
+                    f"pressure episode {episode_id} rotation skipped typed owner admission",
+                )
+                require(
+                    not any(
+                        common.request_identity_matches(
+                            row.get("request_id"), progress_owner_id
+                        )
+                        and holds[rotated_hold_index]["ts_unix_nanos"]
+                        < common.event_wall_ns(row)
+                        < completed["ts_unix_nanos"]
+                        for row in admitted_rows
+                    ),
+                    f"pressure episode {episode_id} admitted its rotated owner before the release fence",
+                )
+                live_hold_indices.remove(rotated_hold_index)
+                consumed_hold_indices.add(rotated_hold_index)
+                origin_key = hold_origin_by_index[rotated_hold_index]
+                require(
+                    origin_key not in peer_release_wall_ns_by_handoff,
+                    f"pressure hold {origin_key} was consumed twice",
+                )
+                peer_release_wall_ns_by_handoff[origin_key] = completed[
+                    "ts_unix_nanos"
+                ]
+
+            if owner_changed:
+                active_owner_admission_wall_ns = None
+            active_owner_id = progress_owner_id
+            active_owner_baseline = progress_baseline
+            require(
+                not any(
+                    common.request_identity_matches(
+                        row.get("request_id"), active_owner_id
+                    )
+                    and common.event_wall_ns(row)
+                    <= pressure_yield["ts_unix_nanos"]
+                    for row in completed_rows
                 ),
-                f"pressure progress owner {progress_owner_id} was not previously parked",
+                f"pressure episode {episode_id} planned work for a terminal owner",
             )
-        matching_armed = [
-            fence
-            for fence in armed_fences
-            if fence["episode_id"] == episode_id
-            and common.request_identity_matches(fence["victim_request_id"], victim_request_id)
-            and common.request_identity_matches(fence["progress_owner_id"], progress_owner_id)
-            and fence["yield_kind"] == yield_kind
-        ]
-        matching_completed = [
-            fence
-            for fence in completed_fences
-            if fence["episode_id"] == episode_id
-            and common.request_identity_matches(fence["victim_request_id"], victim_request_id)
-            and common.request_identity_matches(fence["progress_owner_id"], progress_owner_id)
-            and fence["yield_kind"] == yield_kind
-        ]
-        require(len(matching_armed) == 1, f"pressure episode {episode_id} has no unique armed fence")
-        require(
-            len(matching_completed) == 1,
-            f"pressure episode {episode_id} has no unique completed fence",
-        )
-        armed = matching_armed[0]
-        completed = matching_completed[0]
-        require(
-            pressure_yield["planned_transition_ordinal"]
-            == armed["planned_transition_ordinal"]
-            < armed["armed_transition_ordinal"]
-            < completed["release_transition_ordinal"]
-            < completed["completion_transition_ordinal"],
-            f"pressure episode {episode_id} violated release-fence ordinal order",
-        )
-        matching_holds = [
-            hold
-            for hold in holds
-            if hold["episode_id"] == episode_id
-            and common.request_identity_matches(hold["victim_request_id"], victim_request_id)
-            and common.request_identity_matches(hold["progress_owner_id"], progress_owner_id)
-            and hold["progress_baseline"] == progress_baseline
-            and hold["hold_transition_ordinal"]
-            == completed["release_transition_ordinal"]
-        ]
-        if yield_kind == "self_recompute":
-            require(
-                completed["completion_disposition"]
-                in {
-                    "self_recompute_queued",
-                    "progress_owner_admission_pending",
-                },
-                f"self-recompute episode {episode_id} has an invalid reconstruction state",
-            )
-            require(
-                not matching_holds,
-                f"self-recompute episode {episode_id} incorrectly published a peer hold",
-            )
+            if yield_kind == "peer_handoff" and rotated_from is None:
+                require(
+                    any(
+                        park["ts_unix_nanos"]
+                        < pressure_yield["ts_unix_nanos"]
+                        and common.request_identity_matches(
+                            park["request_ids"][0], progress_owner_id
+                        )
+                        for park in parks
+                    ),
+                    f"pressure progress owner {progress_owner_id} was never parked",
+                )
+
+            matching_holds = [
+                (hold_index, hold)
+                for hold_index, hold in enumerate(holds)
+                if hold["episode_id"] == episode_id
+                and hold["hold_transition_ordinal"]
+                == completed["release_transition_ordinal"]
+            ]
+            if yield_kind == "self_recompute":
+                require(
+                    not matching_holds,
+                    f"self-recompute handoff {key} incorrectly published a peer hold",
+                )
+                require(
+                    completed["completion_disposition"]
+                    in {
+                        "self_recompute_queued",
+                        "progress_owner_admission_pending",
+                    },
+                    f"self-recompute handoff {key} has an invalid reconstruction state",
+                )
+                if (
+                    completed["completion_disposition"]
+                    == "progress_owner_admission_pending"
+                ):
+                    require(
+                        live_hold_indices,
+                        f"self-recompute handoff {key} entered admission-pending without a held peer",
+                    )
+                else:
+                    require(
+                        not live_hold_indices
+                        and position == len(episode_yields) - 1,
+                        f"self-recompute handoff {key} closed a live pressure episode",
+                    )
+            else:
+                require(
+                    len(matching_holds) == 1,
+                    f"peer handoff {key} has no unique physical hold",
+                )
+                hold_index, hold = matching_holds[0]
+                require(
+                    hold_index not in matched_hold_indices
+                    and common.request_identity_matches(
+                        hold["victim_request_id"], victim_request_id
+                    )
+                    and common.request_identity_matches(
+                        hold["progress_owner_id"], progress_owner_id
+                    )
+                    and hold["progress_baseline"] == progress_baseline,
+                    f"peer handoff {key} produced a foreign physical hold",
+                )
+                ticket_key = (episode_id, hold["waiting_ticket"])
+                prior_ticket_owner = waiting_ticket_owner.get(ticket_key)
+                if prior_ticket_owner is None:
+                    waiting_ticket_owner[ticket_key] = victim_request_id
+                else:
+                    require(
+                        common.request_identity_matches(
+                            prior_ticket_owner, victim_request_id
+                        ),
+                        f"pressure episode {episode_id} transferred a waiting ticket across requests",
+                    )
+                matched_hold_indices.add(hold_index)
+                hold_origin_by_index[hold_index] = key
+                live_hold_indices.append(hold_index)
+                if rotated_from is None:
+                    require(
+                        completed["completion_disposition"]
+                        in {"progress_owner_resumable", "owner_terminal"},
+                        f"peer handoff {key} has an invalid completion disposition",
+                    )
+
             if (
                 completed["completion_disposition"]
                 == "progress_owner_admission_pending"
             ):
-                require(
-                    any(
-                        hold["episode_id"] == episode_id
-                        and common.request_identity_matches(
-                            hold["progress_owner_id"], progress_owner_id
-                        )
-                        and not common.request_identity_matches(
-                            hold["victim_request_id"], progress_owner_id
-                        )
-                        for hold in holds
-                    ),
-                    f"pressure owner {progress_owner_id} entered admission-pending without a held peer",
+                next_yield_ts = (
+                    episode_yields[position + 1]["ts_unix_nanos"]
+                    if position + 1 < len(episode_yields)
+                    else None
                 )
-        elif completed["completion_disposition"] == "progress_owner_resumable":
-            require(
-                matching_holds,
-                f"pressure victim {victim_request_id} was not held for owner {progress_owner_id}",
-            )
-        matching_releases = [
-            release
-            for release in releases
-            if release["episode_id"] == episode_id
-            and common.request_identity_matches(release["victim_request_id"], victim_request_id)
-            and common.request_identity_matches(release["progress_owner_id"], progress_owner_id)
-            and release["progress_baseline"] == progress_baseline
-        ]
-        handoff_releases = [
-            release
-            for release in matching_releases
-            if release["decision"] == "owner_terminal"
-        ]
-        if yield_kind == "self_recompute":
-            require(
-                not matching_releases,
-                f"self-recompute episode {episode_id} incorrectly released a peer hold",
-            )
-            continue
-        require(
-            handoff_releases,
-            f"pressure hold for {victim_request_id} has no owner-terminal release",
-        )
-        first_handoff_release = min(
-            release["ts_unix_nanos"]
-            for release in handoff_releases
-        )
-        require(
-            all(hold["ts_unix_nanos"] < first_handoff_release for hold in matching_holds),
-            f"pressure victim {victim_request_id} remained held after handoff completion",
-        )
-        require(
-            not any(
-                common.request_identity_matches(row.get("request_id"), victim_request_id)
-                and completed["ts_unix_nanos"]
-                < common.event_wall_ns(row)
-                < first_handoff_release
-                for row in admitted_rows
-            ),
-            f"pressure victim {victim_request_id} was re-admitted before its owner released capacity",
-        )
-        for release in handoff_releases:
-            if release["decision"] == "owner_terminal":
+                generation_admissions = [
+                    common.event_wall_ns(row)
+                    for row in admitted_rows
+                    if common.request_identity_matches(
+                        row.get("request_id"), progress_owner_id
+                    )
+                    and common.event_wall_ns(row)
+                    > completed["ts_unix_nanos"]
+                    and (
+                        next_yield_ts is None
+                        or common.event_wall_ns(row) < next_yield_ts
+                    )
+                ]
                 require(
-                    any(
-                        common.request_identity_matches(
-                            row.get("request_id"), progress_owner_id
-                        )
-                        and common.event_wall_ns(row) <= release["ts_unix_nanos"]
-                        for row in completed_rows
-                    ),
-                    f"pressure owner {progress_owner_id} did not terminate before victim release",
+                    generation_admissions,
+                    f"pressure owner {progress_owner_id} never completed typed admission",
                 )
-        require(
-            all(
-                release["transition_ordinal"]
-                >= completed["completion_transition_ordinal"]
-                for release in matching_releases
-            ),
-            f"pressure episode {episode_id} released a hold before fence completion",
-        )
-        if matching_holds:
+                active_owner_admission_wall_ns = min(generation_admissions)
+
+        require(active_owner_id is not None, f"pressure episode {episode_id} has no owner")
+        final_completed = completed_by_handoff[handoff_key(episode_yields[-1])]
+        for hold_index in live_hold_indices:
+            hold = holds[hold_index]
+            matching_releases = [
+                (release_index, release)
+                for release_index, release in enumerate(releases)
+                if release["episode_id"] == episode_id
+                and release["waiting_ticket"] == hold["waiting_ticket"]
+                and common.request_identity_matches(
+                    release["victim_request_id"],
+                    hold["victim_request_id"],
+                )
+            ]
+            require(
+                len(matching_releases) == 1,
+                f"live pressure hold for {hold['victim_request_id']} has no unique terminal release",
+            )
+            release_index, release = matching_releases[0]
+            require(
+                release_index not in consumed_release_indices
+                and release["decision"] == "owner_terminal"
+                and common.request_identity_matches(
+                    release["progress_owner_id"], active_owner_id
+                )
+                and release["progress_baseline"] == active_owner_baseline
+                and (
+                    release["transition_ordinal"]
+                    > previous_completion_ordinal
+                    or (
+                        final_completed["completion_disposition"]
+                        == "owner_terminal"
+                        and release["transition_ordinal"]
+                        == previous_completion_ordinal
+                    )
+                ),
+                f"pressure hold for {hold['victim_request_id']} was released by a stale owner generation",
+            )
             require(
                 any(
-                    release["waiting_ticket"] == hold["waiting_ticket"]
-                    for release in matching_releases
-                    for hold in matching_holds
+                    common.request_identity_matches(
+                        row.get("request_id"), active_owner_id
+                    )
+                    and common.event_wall_ns(row)
+                    <= release["ts_unix_nanos"]
+                    and (
+                        active_owner_admission_wall_ns is None
+                        or common.event_wall_ns(row)
+                        > active_owner_admission_wall_ns
+                    )
+                    for row in completed_rows
                 ),
-                f"pressure hold for {victim_request_id} changed waiting identity",
+                f"pressure owner {active_owner_id} did not terminate before hold release",
             )
+            require(
+                not any(
+                    common.request_identity_matches(
+                        row.get("request_id"), hold["victim_request_id"]
+                    )
+                    and hold["ts_unix_nanos"]
+                    < common.event_wall_ns(row)
+                    < release["ts_unix_nanos"]
+                    for row in admitted_rows
+                ),
+                f"pressure victim {hold['victim_request_id']} was admitted while still held",
+            )
+            consumed_release_indices.add(release_index)
+            consumed_hold_indices.add(hold_index)
+            origin_key = hold_origin_by_index[hold_index]
+            require(
+                origin_key not in peer_release_wall_ns_by_handoff,
+                f"pressure hold {origin_key} was consumed twice",
+            )
+            peer_release_wall_ns_by_handoff[origin_key] = release[
+                "ts_unix_nanos"
+            ]
 
-    for hold in holds:
-        require(
-            any(
-                pressure_yield["episode_id"] == hold["episode_id"]
-                and common.request_identity_matches(
-                    pressure_yield["victim_request_id"], hold["victim_request_id"]
-                )
-                for pressure_yield in yields
-            ),
-            f"pressure hold for {hold['victim_request_id']} has no typed yield decision",
-        )
-
-    for release in releases:
-        require(
-            any(
-                pressure_yield["episode_id"] == release["episode_id"]
-                and common.request_identity_matches(
-                    pressure_yield["victim_request_id"], release["victim_request_id"]
-                )
-                for pressure_yield in yields
-            ),
-            f"pressure-hold release for {release['victim_request_id']} has no typed yield decision",
-        )
+    require(
+        matched_hold_indices == set(range(len(holds))),
+        "pressure trace contains a hold without one producing peer handoff",
+    )
+    require(
+        consumed_hold_indices == matched_hold_indices,
+        "pressure trace contains an unconsumed or multiply consumed hold",
+    )
+    require(
+        consumed_release_indices == set(range(len(releases))),
+        "pressure trace contains a terminal release without one live hold",
+    )
 
     deferred_request_ids = sorted(
         {
@@ -2087,6 +2352,8 @@ def validate_decode_trace(
                 fence
                 for fence in completed_fences
                 if fence["episode_id"] == pressure_yield["episode_id"]
+                and fence["handoff_generation"]
+                == pressure_yield["handoff_generation"]
                 and fence["yield_kind"] == "self_recompute"
             )
             require(
@@ -2098,25 +2365,12 @@ def validate_decode_trace(
                 f"self-recompute frontier {victim_request_id} was not re-admitted after its fence",
             )
             continue
-        handoff_releases = [
-            release
-            for release in releases
-            if release["decision"] == "owner_terminal"
-            and release["episode_id"] == pressure_yield["episode_id"]
-            and common.request_identity_matches(
-                release["victim_request_id"], victim_request_id
-            )
-            and common.request_identity_matches(
-                release["progress_owner_id"], progress_owner_id
-            )
-            and release["progress_baseline"] == progress_baseline
-        ]
-        require(
-            handoff_releases,
-            f"decode progress owner {progress_owner_id} did not terminate before releasing its peer",
+        handoff_released_at = peer_release_wall_ns_by_handoff.get(
+            (pressure_yield["episode_id"], pressure_yield["handoff_generation"])
         )
-        handoff_released_at = min(
-            release["ts_unix_nanos"] for release in handoff_releases
+        require(
+            isinstance(handoff_released_at, int),
+            f"decode progress owner {progress_owner_id} did not safely release its peer",
         )
         require(
             any(
@@ -2141,6 +2395,10 @@ def validate_decode_trace(
         "split_events": len(splits),
         "park_events": len(parks),
         "pressure_yield_events": len(yields),
+        "pressure_owner_rotation_events": sum(
+            event["rotated_from_progress_owner_id"] is not None
+            for event in yields
+        ),
         "pressure_yield_kinds": sorted({event["yield_kind"] for event in yields}),
         "pressure_yield_stages": sorted({event["stage"] for event in yields}),
         "pressure_fence_armed_events": len(armed_fences),
@@ -5311,7 +5569,11 @@ def self_test() -> int:
         progress_baseline: int | None = None,
         episode_id: int | None = None,
         planned_transition_ordinal: int | None = None,
+        handoff_generation: int | None = None,
         yield_kind: str | None = None,
+        rotated_from_progress_owner_id: str | None = None,
+        rotated_from_progress_baseline: int | None = None,
+        rotated_from_progress_current: int | None = None,
         execution_stage: str = "step_admission",
     ) -> dict[str, Any]:
         attributes = {
@@ -5325,7 +5587,17 @@ def self_test() -> int:
             attributes["progress_baseline"] = progress_baseline
             attributes["episode_id"] = episode_id
             attributes["planned_transition_ordinal"] = planned_transition_ordinal
+            attributes["handoff_generation"] = handoff_generation
             attributes["yield_kind"] = yield_kind
+            attributes["rotated_from_progress_owner_id"] = (
+                rotated_from_progress_owner_id
+            )
+            attributes["rotated_from_progress_baseline"] = (
+                rotated_from_progress_baseline
+            )
+            attributes["rotated_from_progress_current"] = (
+                rotated_from_progress_current
+            )
         return {
             "ts_unix_nanos": ts,
             "phase": "vnext.decode_capacity_deferred",
@@ -5340,6 +5612,152 @@ def self_test() -> int:
             "attributes": attributes,
         }
 
+    def peer_handoff_fixture(
+        ts: int,
+        *,
+        episode_id: int,
+        handoff_generation: int,
+        victim_request_id: str,
+        progress_owner_id: str,
+        progress_baseline: int,
+        planned_ordinal: int,
+        armed_ordinal: int,
+        release_ordinal: int,
+        completion_ordinal: int,
+        waiting_ticket: int,
+        admission_pending: bool = False,
+        rotated_from_progress_owner_id: str | None = None,
+        rotated_from_progress_baseline: int | None = None,
+        rotated_from_progress_current: int | None = None,
+    ) -> list[dict[str, Any]]:
+        disposition = (
+            "progress_owner_admission_pending"
+            if admission_pending
+            else "progress_owner_resumable"
+        )
+        return [
+            deferral(
+                ts,
+                "pressure_yield_planned",
+                [victim_request_id],
+                victim_request_id=victim_request_id,
+                progress_owner_id=progress_owner_id,
+                progress_baseline=progress_baseline,
+                episode_id=episode_id,
+                planned_transition_ordinal=planned_ordinal,
+                handoff_generation=handoff_generation,
+                yield_kind="peer_handoff",
+                rotated_from_progress_owner_id=rotated_from_progress_owner_id,
+                rotated_from_progress_baseline=rotated_from_progress_baseline,
+                rotated_from_progress_current=rotated_from_progress_current,
+                execution_stage="sequence_extension",
+            ),
+            {
+                "ts_unix_nanos": ts + 1,
+                "phase": "vnext.execution_capacity_pressure_release_fence_armed",
+                "status": "ok",
+                "error": None,
+                "request_id": victim_request_id,
+                "shape": {
+                    "episode_id": episode_id,
+                    "handoff_generation": handoff_generation,
+                    "planned_transition_ordinal": planned_ordinal,
+                    "transition_ordinal": armed_ordinal,
+                    "yield_kind": "peer_handoff",
+                    "physical_release_completed": False,
+                },
+                "attributes": {"progress_owner_id": progress_owner_id},
+            },
+            {
+                "ts_unix_nanos": ts + 2,
+                "phase": "vnext.execution_capacity_pressure_release_fence_completed",
+                "status": "ok",
+                "error": None,
+                "request_id": victim_request_id,
+                "shape": {
+                    "episode_id": episode_id,
+                    "handoff_generation": handoff_generation,
+                    "release_transition_ordinal": release_ordinal,
+                    "resumable_transition_ordinal": (
+                        None if admission_pending else completion_ordinal
+                    ),
+                    "owner_admission_pending_transition_ordinal": (
+                        completion_ordinal if admission_pending else None
+                    ),
+                    "closed_transition_ordinal": None,
+                    "closed_reason": None,
+                    "yield_kind": "peer_handoff",
+                    "physical_release_completed": True,
+                    "exact_source_advanced": True,
+                    "transaction_wait_condition_advanced": True,
+                    "release_authority": "active_sequence",
+                    "progress_owner_resumable": not admission_pending,
+                    "completion_disposition": disposition,
+                    "victim_requeued": True,
+                },
+                "attributes": {
+                    "progress_owner_id": progress_owner_id,
+                    "current_capacity_availability": [
+                        {
+                            "source": {"domain": 5},
+                            "epoch": handoff_generation + 3,
+                        }
+                    ],
+                },
+            },
+            {
+                "ts_unix_nanos": ts + 3,
+                "phase": "vnext.execution_capacity_pressure_hold_active",
+                "status": "ok",
+                "error": None,
+                "request_id": victim_request_id,
+                "shape": {
+                    "decision": "held_for_owner_progress",
+                    "episode_id": episode_id,
+                    "hold_transition_ordinal": release_ordinal,
+                    "waiting_ticket": waiting_ticket,
+                    "progress_owner_id": progress_owner_id,
+                    "progress_baseline": progress_baseline,
+                    "progress_current": progress_baseline,
+                    "prefill_submit_observed": False,
+                    "probe_performed": False,
+                },
+            },
+        ]
+
+    def terminal_hold_release_fixture(
+        ts: int,
+        *,
+        episode_id: int,
+        victim_request_id: str,
+        progress_owner_id: str,
+        progress_baseline: int,
+        progress_current: int,
+        waiting_ticket: int,
+        transition_ordinal: int,
+    ) -> dict[str, Any]:
+        return {
+            "ts_unix_nanos": ts,
+            "phase": "vnext.execution_capacity_pressure_hold_released",
+            "status": "ok",
+            "error": None,
+            "request_id": victim_request_id,
+            "shape": {
+                "decision": "owner_terminal",
+                "episode_id": episode_id,
+                "transition_ordinal": transition_ordinal,
+                "waiting_ticket": waiting_ticket,
+                "progress_owner_id": progress_owner_id,
+                "progress_baseline": progress_baseline,
+                "progress_current": progress_current,
+                "previous_wait_condition": None,
+                "current_wait_condition": None,
+                "admission_eligible": True,
+                "probe_performed": False,
+                "prefill_submit_observed": False,
+            },
+        }
+
     owner_cohort_handoff = validate_decode_deferral(
         deferral(
             90,
@@ -5350,6 +5768,7 @@ def self_test() -> int:
             progress_baseline=52,
             episode_id=1,
             planned_transition_ordinal=1,
+            handoff_generation=1,
             yield_kind="peer_handoff",
             execution_stage="sequence_extension",
         ),
@@ -5371,6 +5790,7 @@ def self_test() -> int:
                 progress_baseline=52,
                 episode_id=1,
                 planned_transition_ordinal=2,
+                handoff_generation=1,
                 yield_kind="peer_handoff",
                 execution_stage="sequence_extension",
             ),
@@ -5436,6 +5856,7 @@ def self_test() -> int:
             progress_baseline=53,
             episode_id=1,
             planned_transition_ordinal=3,
+            handoff_generation=1,
             yield_kind="peer_handoff",
             execution_stage="sequence_extension",
         ),
@@ -5447,6 +5868,7 @@ def self_test() -> int:
             "request_id": "C",
             "shape": {
                 "episode_id": 1,
+                "handoff_generation": 1,
                 "planned_transition_ordinal": 3,
                 "transition_ordinal": 4,
                 "yield_kind": "peer_handoff",
@@ -5462,6 +5884,7 @@ def self_test() -> int:
             "request_id": "C",
             "shape": {
                 "episode_id": 1,
+                "handoff_generation": 1,
                 "release_transition_ordinal": 5,
                 "resumable_transition_ordinal": 6,
                 "owner_admission_pending_transition_ordinal": None,
@@ -5510,6 +5933,7 @@ def self_test() -> int:
             progress_baseline=53,
             episode_id=1,
             planned_transition_ordinal=7,
+            handoff_generation=2,
             yield_kind="self_recompute",
             execution_stage="sequence_extension",
         ),
@@ -5521,6 +5945,7 @@ def self_test() -> int:
             "request_id": "A",
             "shape": {
                 "episode_id": 1,
+                "handoff_generation": 2,
                 "planned_transition_ordinal": 7,
                 "transition_ordinal": 8,
                 "yield_kind": "self_recompute",
@@ -5536,6 +5961,7 @@ def self_test() -> int:
             "request_id": "A",
             "shape": {
                 "episode_id": 1,
+                "handoff_generation": 2,
                 "release_transition_ordinal": 9,
                 "resumable_transition_ordinal": None,
                 "owner_admission_pending_transition_ordinal": 10,
@@ -5603,6 +6029,7 @@ def self_test() -> int:
                 progress_baseline=21,
                 episode_id=2,
                 planned_transition_ordinal=13,
+                handoff_generation=1,
                 yield_kind="self_recompute",
                 execution_stage="sequence_extension",
             ),
@@ -5614,6 +6041,7 @@ def self_test() -> int:
                 "request_id": "D",
                 "shape": {
                     "episode_id": 2,
+                    "handoff_generation": 1,
                     "planned_transition_ordinal": 13,
                     "transition_ordinal": 14,
                     "yield_kind": "self_recompute",
@@ -5629,6 +6057,7 @@ def self_test() -> int:
                 "request_id": "D",
                 "shape": {
                     "episode_id": 2,
+                    "handoff_generation": 1,
                     "release_transition_ordinal": 15,
                     "resumable_transition_ordinal": None,
                     "owner_admission_pending_transition_ordinal": None,
@@ -5857,6 +6286,403 @@ def self_test() -> int:
         }
     ]
     summary = validate_decode_trace(rows, started_wall_ns=90, finished_wall_ns=170)
+    require(
+        summary["pressure_owner_rotation_events"] == 0,
+        "no-rotation baseline self-test unexpectedly recorded owner rotation",
+    )
+
+    rotation_rows = json.loads(json.dumps(rows))
+    rotation_yield_index = next(
+        index
+        for index, row in enumerate(rotation_rows)
+        if row.get("ts_unix_nanos") == 146
+        and row.get("phase") == "vnext.decode_capacity_deferred"
+    )
+    rotation_rows[rotation_yield_index] = deferral(
+        146,
+        "pressure_yield_planned",
+        ["A"],
+        victim_request_id="A",
+        progress_owner_id="C",
+        progress_baseline=33,
+        episode_id=1,
+        planned_transition_ordinal=7,
+        handoff_generation=2,
+        yield_kind="peer_handoff",
+        rotated_from_progress_owner_id="A",
+        rotated_from_progress_baseline=53,
+        rotated_from_progress_current=54,
+        execution_stage="sequence_extension",
+    )
+    rotation_armed = next(
+        row
+        for row in rotation_rows
+        if row.get("ts_unix_nanos") == 147
+        and row.get("phase")
+        == "vnext.execution_capacity_pressure_release_fence_armed"
+    )
+    rotation_armed["request_id"] = "A"
+    rotation_armed["shape"]["yield_kind"] = "peer_handoff"
+    rotation_armed["attributes"]["progress_owner_id"] = "C"
+    rotation_completed = next(
+        row
+        for row in rotation_rows
+        if row.get("ts_unix_nanos") == 148
+        and row.get("phase")
+        == "vnext.execution_capacity_pressure_release_fence_completed"
+    )
+    rotation_completed["request_id"] = "A"
+    rotation_completed["shape"].update(
+        {
+            "yield_kind": "peer_handoff",
+            "resumable_transition_ordinal": None,
+            "owner_admission_pending_transition_ordinal": 10,
+            "closed_transition_ordinal": None,
+            "closed_reason": None,
+            "progress_owner_resumable": False,
+            "completion_disposition": "progress_owner_admission_pending",
+        }
+    )
+    rotation_completed["attributes"]["progress_owner_id"] = "C"
+    for row in rotation_rows:
+        timestamp = row.get("ts_unix_nanos")
+        if timestamp == 149 and row.get("phase") == "vnext.prefill_admission":
+            row["ts_unix_nanos"] = 150
+            row["request_id"] = "C"
+        elif timestamp == 150 and str(row.get("phase", "")).endswith(
+            "request_completed"
+        ):
+            row["ts_unix_nanos"] = 151
+            row["request_id"] = "C"
+        elif timestamp == 151 and row.get("phase") == (
+            "vnext.execution_capacity_pressure_hold_released"
+        ):
+            row["ts_unix_nanos"] = 152
+            row["request_id"] = "A"
+            row["shape"].update(
+                {
+                    "transition_ordinal": 13,
+                    "waiting_ticket": 2,
+                    "progress_owner_id": "C",
+                    "progress_baseline": 33,
+                    "progress_current": 34,
+                }
+            )
+        elif timestamp == 152 and row.get("phase") == "vnext.prefill_admission":
+            row["ts_unix_nanos"] = 153
+            row["request_id"] = "A"
+        elif timestamp == 153 and str(row.get("phase", "")).endswith(
+            "request_completed"
+        ):
+            row["ts_unix_nanos"] = 154
+            row["request_id"] = "A"
+        elif timestamp == 154 and str(row.get("phase", "")).endswith(
+            "request_completed"
+        ):
+            row["ts_unix_nanos"] = 155
+    rotation_rows.append(
+        {
+            "ts_unix_nanos": 149,
+            "phase": "vnext.execution_capacity_pressure_hold_active",
+            "status": "ok",
+            "error": None,
+            "request_id": "A",
+            "shape": {
+                "decision": "held_for_owner_progress",
+                "episode_id": 1,
+                "hold_transition_ordinal": 9,
+                "waiting_ticket": 2,
+                "progress_owner_id": "C",
+                "progress_baseline": 33,
+                "progress_current": 33,
+                "prefill_submit_observed": False,
+                "probe_performed": False,
+            },
+        }
+    )
+    rotation_summary = validate_decode_trace(
+        rotation_rows, started_wall_ns=90, finished_wall_ns=170
+    )
+    require(
+        rotation_summary["pressure_owner_rotation_events"] == 1
+        and rotation_summary["pressure_hold_events"] == 2
+        and rotation_summary["pressure_hold_release_events"] == 1,
+        "self-test lost typed bounded-progress owner rotation",
+    )
+    unsafe_rotation = json.loads(json.dumps(rotation_rows))
+    unsafe_rotation_yield = next(
+        row
+        for row in unsafe_rotation
+        if row.get("ts_unix_nanos") == 146
+        and row.get("phase") == "vnext.decode_capacity_deferred"
+    )
+    unsafe_rotation_yield["attributes"]["rotated_from_progress_current"] = 53
+    expect_reject(
+        lambda: validate_decode_trace(
+            unsafe_rotation, started_wall_ns=90, finished_wall_ns=170
+        ),
+        "owner rotation without strict prior-owner progress",
+    )
+
+    chained_rotation_rows = [
+        deferral(200, "split_cohort", ["A", "B", "C"]),
+        deferral(201, "wait_for_release", ["A"]),
+    ]
+    chained_rotation_rows.extend(
+        peer_handoff_fixture(
+            210,
+            episode_id=2,
+            handoff_generation=1,
+            victim_request_id="B",
+            progress_owner_id="A",
+            progress_baseline=10,
+            planned_ordinal=1,
+            armed_ordinal=2,
+            release_ordinal=3,
+            completion_ordinal=4,
+            waiting_ticket=1,
+        )
+    )
+    chained_rotation_rows.extend(
+        peer_handoff_fixture(
+            220,
+            episode_id=2,
+            handoff_generation=2,
+            victim_request_id="C",
+            progress_owner_id="A",
+            progress_baseline=10,
+            planned_ordinal=5,
+            armed_ordinal=6,
+            release_ordinal=7,
+            completion_ordinal=8,
+            waiting_ticket=2,
+        )
+    )
+    chained_rotation_rows.extend(
+        peer_handoff_fixture(
+            230,
+            episode_id=2,
+            handoff_generation=3,
+            victim_request_id="A",
+            progress_owner_id="B",
+            progress_baseline=20,
+            planned_ordinal=9,
+            armed_ordinal=10,
+            release_ordinal=11,
+            completion_ordinal=12,
+            waiting_ticket=3,
+            admission_pending=True,
+            rotated_from_progress_owner_id="A",
+            rotated_from_progress_baseline=10,
+            rotated_from_progress_current=12,
+        )
+    )
+    chained_rotation_rows.append(
+        {
+            "ts_unix_nanos": 234,
+            "phase": "vnext.prefill_admission",
+            "request_id": "B",
+            "shape": {"decision": "admitted"},
+        }
+    )
+    chained_rotation_rows.extend(
+        peer_handoff_fixture(
+            240,
+            episode_id=2,
+            handoff_generation=4,
+            victim_request_id="B",
+            progress_owner_id="C",
+            progress_baseline=30,
+            planned_ordinal=13,
+            armed_ordinal=14,
+            release_ordinal=15,
+            completion_ordinal=16,
+            waiting_ticket=1,
+            admission_pending=True,
+            rotated_from_progress_owner_id="B",
+            rotated_from_progress_baseline=20,
+            rotated_from_progress_current=21,
+        )
+    )
+    chained_rotation_rows.extend(
+        [
+            {
+                "ts_unix_nanos": 244,
+                "phase": "vnext.prefill_admission",
+                "request_id": "C",
+                "shape": {"decision": "admitted"},
+            },
+            {
+                "ts_unix_nanos": 250,
+                "phase": "vnext.request_completed",
+                "request_id": "C",
+            },
+            terminal_hold_release_fixture(
+                251,
+                episode_id=2,
+                victim_request_id="A",
+                progress_owner_id="C",
+                progress_baseline=30,
+                progress_current=31,
+                waiting_ticket=3,
+                transition_ordinal=17,
+            ),
+            terminal_hold_release_fixture(
+                252,
+                episode_id=2,
+                victim_request_id="B",
+                progress_owner_id="C",
+                progress_baseline=30,
+                progress_current=31,
+                waiting_ticket=1,
+                transition_ordinal=17,
+            ),
+            {
+                "ts_unix_nanos": 253,
+                "phase": "vnext.prefill_admission",
+                "request_id": "A",
+                "shape": {"decision": "admitted"},
+            },
+            {
+                "ts_unix_nanos": 254,
+                "phase": "vnext.prefill_admission",
+                "request_id": "B",
+                "shape": {"decision": "admitted"},
+            },
+            {
+                "ts_unix_nanos": 260,
+                "phase": "vnext.request_completed",
+                "request_id": "A",
+            },
+            {
+                "ts_unix_nanos": 261,
+                "phase": "vnext.request_completed",
+                "request_id": "B",
+            },
+        ]
+    )
+    chained_rotation_summary = validate_decode_trace(
+        chained_rotation_rows, started_wall_ns=190, finished_wall_ns=270
+    )
+    require(
+        chained_rotation_summary["pressure_owner_rotation_events"] == 2
+        and chained_rotation_summary["pressure_hold_events"] == 4
+        and chained_rotation_summary["pressure_hold_release_events"] == 2,
+        "self-test lost the A-to-B-to-C live-hold state machine",
+    )
+
+    duplicate_handoff = json.loads(json.dumps(rows))
+    duplicate_handoff.insert(6, json.loads(json.dumps(duplicate_handoff[5])))
+    expect_reject(
+        lambda: validate_decode_trace(
+            duplicate_handoff, started_wall_ns=90, finished_wall_ns=170
+        ),
+        "duplicate yield consuming one release fence",
+    )
+    reused_generation = json.loads(json.dumps(rows))
+    for row in reused_generation:
+        if row.get("ts_unix_nanos") in {146, 147, 148}:
+            if row.get("phase") == "vnext.decode_capacity_deferred":
+                row["attributes"]["handoff_generation"] = 1
+            else:
+                row["shape"]["handoff_generation"] = 1
+    expect_reject(
+        lambda: validate_decode_trace(
+            reused_generation, started_wall_ns=90, finished_wall_ns=170
+        ),
+        "reused pressure handoff generation",
+    )
+    orphan_fences = json.loads(json.dumps(rows))
+    orphan_armed = json.loads(json.dumps(orphan_fences[6]))
+    orphan_completed = json.loads(json.dumps(orphan_fences[7]))
+    orphan_armed["shape"].update(
+        {
+            "handoff_generation": 99,
+            "planned_transition_ordinal": 100,
+            "transition_ordinal": 101,
+        }
+    )
+    orphan_completed["shape"].update(
+        {
+            "handoff_generation": 99,
+            "release_transition_ordinal": 102,
+            "resumable_transition_ordinal": 103,
+        }
+    )
+    orphan_fences.extend([orphan_armed, orphan_completed])
+    expect_reject(
+        lambda: validate_decode_trace(
+            orphan_fences, started_wall_ns=90, finished_wall_ns=170
+        ),
+        "orphan pressure release fence pair",
+    )
+    terminal_rotation_target = json.loads(json.dumps(rotation_rows))
+    terminal_rotation_target.append(
+        {
+            "ts_unix_nanos": 145,
+            "phase": "vnext.request_completed",
+            "request_id": "C",
+        }
+    )
+    expect_reject(
+        lambda: validate_decode_trace(
+            terminal_rotation_target, started_wall_ns=90, finished_wall_ns=170
+        ),
+        "owner rotation to a terminal held frontier",
+    )
+    stale_terminal_release_ordinal = json.loads(json.dumps(rotation_rows))
+    next(
+        row
+        for row in stale_terminal_release_ordinal
+        if row.get("phase")
+        == "vnext.execution_capacity_pressure_hold_released"
+    )["shape"]["transition_ordinal"] = 10
+    expect_reject(
+        lambda: validate_decode_trace(
+            stale_terminal_release_ordinal,
+            started_wall_ns=90,
+            finished_wall_ns=170,
+        ),
+        "terminal hold release reusing its prior handoff completion ordinal",
+    )
+    terminal_before_owner_admission = json.loads(json.dumps(rotation_rows))
+    next(
+        row
+        for row in terminal_before_owner_admission
+        if common.request_identity_matches(row.get("request_id"), "C")
+        and str(row.get("phase", "")).endswith("request_completed")
+    )["ts_unix_nanos"] = 149
+    expect_reject(
+        lambda: validate_decode_trace(
+            terminal_before_owner_admission,
+            started_wall_ns=90,
+            finished_wall_ns=170,
+        ),
+        "progress owner terminal completion before its typed admission",
+    )
+    stale_window_completion = json.loads(json.dumps(rows))
+    stale_window_completion = [
+        row
+        for row in stale_window_completion
+        if not (
+            row.get("ts_unix_nanos") == 150
+            and common.request_identity_matches(row.get("request_id"), "A")
+            and str(row.get("phase", "")).endswith("request_completed")
+        )
+    ]
+    stale_window_completion.append(
+        {
+            "ts_unix_nanos": 80,
+            "phase": "vnext.request_completed",
+            "request_id": "A",
+        }
+    )
+    expect_reject(
+        lambda: validate_decode_trace(
+            stale_window_completion, started_wall_ns=90, finished_wall_ns=170
+        ),
+        "terminal release justified only by a completion outside the trace window",
+    )
     insufficient_boundary = json.loads(json.dumps(maintenance_boundary))
     insufficient_boundary["pressure"]["requested_bytes"] = 96
     insufficient_boundary["reclaim_sufficient"] = False
@@ -6422,7 +7248,9 @@ def self_test() -> int:
     rotated_owner[11]["attributes"]["progress_owner_id"] = "C"
     try:
         validate_decode_trace(rotated_owner, started_wall_ns=90, finished_wall_ns=170)
-        raise AssertionError("held victim unexpectedly became the pressure owner")
+        raise AssertionError(
+            "held victim became owner without typed rotation evidence"
+        )
     except common.CapacityGateError:
         pass
     for obsolete_reason in ["role_transferred", "source_retargeted"]:

@@ -293,6 +293,7 @@ struct PressureParticipant {
     recompute_cost: usize,
     advances_wait_source: bool,
     state: ParticipantState,
+    held_since_ordinal: Option<PressureTransitionOrdinal>,
 }
 
 #[derive(Debug)]
@@ -357,6 +358,9 @@ pub struct PressureYieldTransaction {
     victim_request_id: RequestId,
     progress_owner_id: RequestId,
     progress_baseline: LogicalWorkGeneration,
+    rotated_from_progress_owner_id: Option<RequestId>,
+    rotated_from_progress_baseline: Option<LogicalWorkGeneration>,
+    rotated_from_progress_current: Option<LogicalWorkGeneration>,
     planned_ordinal: PressureTransitionOrdinal,
     wait_condition: CapacityWaitCondition,
 }
@@ -438,6 +442,18 @@ impl PressureYieldTransaction {
 
     pub const fn progress_baseline(&self) -> LogicalWorkGeneration {
         self.progress_baseline
+    }
+
+    pub const fn rotated_from_progress_owner_id(&self) -> Option<&RequestId> {
+        self.rotated_from_progress_owner_id.as_ref()
+    }
+
+    pub const fn rotated_from_progress_baseline(&self) -> Option<LogicalWorkGeneration> {
+        self.rotated_from_progress_baseline
+    }
+
+    pub const fn rotated_from_progress_current(&self) -> Option<LogicalWorkGeneration> {
+        self.rotated_from_progress_current
     }
 
     pub const fn planned_ordinal(&self) -> PressureTransitionOrdinal {
@@ -846,6 +862,7 @@ impl PressureCoordinator {
                         recompute_cost: candidate.recompute_cost,
                         advances_wait_source: candidate.advances_wait_source,
                         state: ParticipantState::Runnable,
+                        held_since_ordinal: None,
                     });
                 participant.work_kind = candidate.work_kind;
                 participant.priority = candidate.priority;
@@ -886,6 +903,7 @@ impl PressureCoordinator {
                 .and_then(|episode| episode.participants.get_mut(&request_id))
             {
                 participant.state = ParticipantState::Blocked { ordinal };
+                participant.held_since_ordinal = None;
             }
         }
 
@@ -983,7 +1001,13 @@ impl PressureCoordinator {
         let yield_kind = selection.kind();
         let victim_id = selection.into_victim();
 
-        let (progress_baseline, handoff_generation) = {
+        let (
+            progress_baseline,
+            handoff_generation,
+            rotated_from_progress_owner_id,
+            rotated_from_progress_baseline,
+            rotated_from_progress_current,
+        ) = {
             let episode = self
                 .episodes
                 .get_mut(&episode_id)
@@ -995,7 +1019,27 @@ impl PressureCoordinator {
                 .progress;
             episode.handoff_generation = episode.handoff_generation.saturating_add(1);
             episode.state = PressureEpisodeState::YieldPlanned;
-            let progress_baseline = if episode.progress_owner.is_none() {
+            let owner_changed = episode.progress_owner.as_ref() != Some(&owner_id);
+            let owner_was_held = episode
+                .participants
+                .get(&owner_id)
+                .is_some_and(|owner| owner.state == ParticipantState::Held);
+            let rotated_from = owner_changed.then(|| {
+                episode.progress_owner.as_ref().map(|prior_owner_id| {
+                    let prior_progress = episode
+                        .participants
+                        .get(prior_owner_id)
+                        .expect("prior progress owner remains registered")
+                        .progress;
+                    (
+                        prior_owner_id.clone(),
+                        episode.owner_progress_baseline,
+                        prior_progress,
+                    )
+                })
+            });
+            let rotated_from = rotated_from.flatten();
+            let progress_baseline = if owner_changed {
                 episode.progress_owner = Some(owner_id.clone());
                 episode.owner_progress_baseline = progress_current;
                 progress_current
@@ -1006,12 +1050,24 @@ impl PressureCoordinator {
             episode.owner_admission_pending_ordinal = None;
             episode.last_release_condition = Some(condition.clone());
             if let Some(owner) = episode.participants.get_mut(&owner_id) {
-                owner.state = ParticipantState::PendingResume;
+                if !owner_was_held {
+                    owner.state = ParticipantState::PendingResume;
+                    owner.held_since_ordinal = None;
+                }
             }
             if let Some(victim) = episode.participants.get_mut(&victim_id) {
                 victim.state = ParticipantState::YieldPlanned;
+                victim.held_since_ordinal = None;
             }
-            (progress_baseline, episode.handoff_generation)
+            (
+                progress_baseline,
+                episode.handoff_generation,
+                rotated_from
+                    .as_ref()
+                    .map(|(request_id, _, _)| request_id.clone()),
+                rotated_from.as_ref().map(|(_, baseline, _)| *baseline),
+                rotated_from.map(|(_, _, current)| current),
+            )
         };
         let planned_ordinal = self.record_transition(
             episode_id,
@@ -1027,6 +1083,9 @@ impl PressureCoordinator {
             victim_request_id: victim_id,
             progress_owner_id: owner_id,
             progress_baseline,
+            rotated_from_progress_owner_id,
+            rotated_from_progress_baseline,
+            rotated_from_progress_current,
             planned_ordinal,
             wait_condition: condition.clone(),
         }))
@@ -1071,6 +1130,12 @@ impl PressureCoordinator {
             .get(&transaction.episode_id)
             .and_then(|episode| episode.participants.get(&transaction.progress_owner_id))
             .is_none_or(|owner| owner.state == ParticipantState::Terminal);
+        let promoted_held_owner = transaction.kind == PressureYieldKind::PeerHandoff
+            && self
+                .episodes
+                .get(&transaction.episode_id)
+                .and_then(|episode| episode.participants.get(&transaction.progress_owner_id))
+                .is_some_and(|owner| owner.state == ParticipantState::Held);
         let retargeted_wait_condition = progress_owner_wait_condition
             .filter(|current| !same_source_topology(transaction.wait_condition(), current))
             .cloned();
@@ -1093,19 +1158,31 @@ impl PressureCoordinator {
                 if let Some(victim) = episode.participants.get_mut(&transaction.victim_request_id) {
                     if victim.state != ParticipantState::Terminal {
                         victim.state = ParticipantState::Held;
+                        victim.held_since_ordinal = Some(release_ordinal);
+                    } else {
+                        victim.held_since_ordinal = None;
                     }
                     victim.advances_wait_source = false;
                 }
             }
-            if !owner_terminal && transaction.kind == PressureYieldKind::PeerHandoff {
+            if !owner_terminal && promoted_held_owner {
+                episode.state = PressureEpisodeState::OwnerAdmissionPending;
+                if let Some(owner) = episode.participants.get_mut(&transaction.progress_owner_id) {
+                    owner.state = ParticipantState::OwnerAdmissionPending;
+                    owner.held_since_ordinal = None;
+                    owner.advances_wait_source = false;
+                }
+            } else if !owner_terminal && transaction.kind == PressureYieldKind::PeerHandoff {
                 episode.state = PressureEpisodeState::Resumable;
                 if let Some(owner) = episode.participants.get_mut(&transaction.progress_owner_id) {
                     owner.state = ParticipantState::ProgressOwner;
+                    owner.held_since_ordinal = None;
                 }
             } else if !owner_terminal && retained_peer_hold {
                 episode.state = PressureEpisodeState::OwnerAdmissionPending;
                 if let Some(owner) = episode.participants.get_mut(&transaction.progress_owner_id) {
                     owner.state = ParticipantState::OwnerAdmissionPending;
+                    owner.held_since_ordinal = None;
                     owner.advances_wait_source = false;
                 }
             }
@@ -1123,24 +1200,24 @@ impl PressureCoordinator {
                 },
             ));
         }
+        if promoted_held_owner || retained_peer_hold {
+            let pending_ordinal = self.record_transition(
+                transaction.episode_id,
+                PressureTransitionKind::OwnerAdmissionPending,
+                Some(transaction.progress_owner_id.clone()),
+                None,
+                PressureEpisodeState::OwnerAdmissionPending,
+            )?;
+            self.episodes
+                .get_mut(&transaction.episode_id)
+                .expect("retained pressure episode remains registered")
+                .owner_admission_pending_ordinal = Some(pending_ordinal);
+            return Ok((
+                release_ordinal,
+                PressureReleaseFenceDisposition::OwnerAdmissionPending(pending_ordinal),
+            ));
+        }
         if transaction.kind == PressureYieldKind::SelfRecompute {
-            if retained_peer_hold {
-                let pending_ordinal = self.record_transition(
-                    transaction.episode_id,
-                    PressureTransitionKind::OwnerAdmissionPending,
-                    Some(transaction.progress_owner_id.clone()),
-                    None,
-                    PressureEpisodeState::OwnerAdmissionPending,
-                )?;
-                self.episodes
-                    .get_mut(&transaction.episode_id)
-                    .expect("retained pressure episode remains registered")
-                    .owner_admission_pending_ordinal = Some(pending_ordinal);
-                return Ok((
-                    release_ordinal,
-                    PressureReleaseFenceDisposition::OwnerAdmissionPending(pending_ordinal),
-                ));
-            }
             let closed_ordinal = self.close_episode(transaction.episode_id, None)?;
             return Ok((
                 release_ordinal,
@@ -1267,8 +1344,9 @@ impl PressureCoordinator {
             self.close_episode(episode_id, None)?;
         }
         // Logical token progress consumes resident capacity; it does not prove
-        // that a held peer can be re-admitted. Keep the peer held until the
-        // stable owner reaches a terminal release.
+        // that a held peer can be re-admitted. A progressed owner may rotate at
+        // its next authoritative capacity failure, where a release fence can
+        // safely transfer admission to the oldest held peer.
         Ok(())
     }
 
@@ -1309,6 +1387,7 @@ impl PressureCoordinator {
                 participant.work_kind = LogicalWorkKind::Terminal;
                 participant.advances_wait_source = false;
                 participant.state = ParticipantState::Terminal;
+                participant.held_since_ordinal = None;
             }
             return Ok(Some(ordinal));
         }
@@ -1422,6 +1501,11 @@ impl PressureCoordinator {
             .get_mut(request_id)
             .expect("progress owner remains registered")
             .state = ParticipantState::ProgressOwner;
+        episode
+            .participants
+            .get_mut(request_id)
+            .expect("progress owner remains registered")
+            .held_since_ordinal = None;
         self.record_transition(
             episode_id,
             PressureTransitionKind::OwnerAdmitted,
@@ -3639,10 +3723,11 @@ mod tests {
     }
 
     #[test]
-    fn stable_owner_recomputes_without_promoting_held_peer() {
+    fn progressed_owner_rotates_to_oldest_held_peer_at_release_fence() {
         let mut coordinator = PressureCoordinator::default();
         let owner = RequestId::new();
         let held_peer = RequestId::new();
+        let newer_held_peer = RequestId::new();
         let first_wait = condition(73);
         coordinator
             .plan_failure(
@@ -3689,62 +3774,212 @@ mod tests {
             PressureHoldStatus::Held { .. }
         ));
 
+        let second_wait = condition(74);
+        let newer_peer_yield = match coordinator
+            .plan_failure(
+                std::slice::from_ref(&newer_held_peer),
+                &second_wait,
+                &[
+                    candidate(
+                        &owner,
+                        LogicalWorkKind::Decode,
+                        81,
+                        true,
+                        Some(second_wait.clone()),
+                    ),
+                    candidate(&held_peer, LogicalWorkKind::Waiting, 33, false, None),
+                    candidate(&newer_held_peer, LogicalWorkKind::Decode, 16, true, None),
+                ],
+            )
+            .unwrap()
+        {
+            PressureDecision::YieldPlanned(transaction) => transaction,
+            other => panic!("expected the newer peer to yield, got {other:?}"),
+        };
+        assert_eq!(newer_peer_yield.progress_owner_id(), &owner);
+        assert_eq!(newer_peer_yield.victim_request_id(), &newer_held_peer);
+        coordinator.arm_release_fence(&newer_peer_yield).unwrap();
+        assert!(matches!(
+            coordinator
+                .complete_release_fence(&newer_peer_yield, None)
+                .unwrap()
+                .1,
+            PressureReleaseFenceDisposition::Resumable(_)
+        ));
+
         let advanced_wait = condition(154);
-        let owner_recompute = match coordinator
+        let rotation = match coordinator
             .plan_failure(
                 std::slice::from_ref(&owner),
                 &advanced_wait,
                 &[
                     candidate(&owner, LogicalWorkKind::Decode, 145, true, None),
                     candidate(&held_peer, LogicalWorkKind::Waiting, 33, false, None),
+                    candidate(&newer_held_peer, LogicalWorkKind::Waiting, 16, false, None),
                 ],
             )
             .unwrap()
         {
             PressureDecision::YieldPlanned(transaction) => transaction,
-            other => panic!("blocked stable owner must self recompute, got {other:?}"),
+            other => panic!("a progressed stable owner must rotate, got {other:?}"),
         };
-        assert_eq!(owner_recompute.kind(), PressureYieldKind::SelfRecompute);
-        assert_eq!(owner_recompute.progress_owner_id(), &owner);
-        assert_eq!(owner_recompute.victim_request_id(), &owner);
-        coordinator.arm_release_fence(&owner_recompute).unwrap();
-        let (_, disposition) = coordinator
-            .complete_release_fence(&owner_recompute, None)
-            .unwrap();
-        assert!(matches!(
-            disposition,
-            PressureReleaseFenceDisposition::OwnerAdmissionPending(_)
-        ));
+        assert_eq!(rotation.kind(), PressureYieldKind::PeerHandoff);
+        assert_eq!(rotation.progress_owner_id(), &held_peer);
+        assert_eq!(rotation.victim_request_id(), &owner);
+        assert_eq!(rotation.progress_baseline(), LogicalWorkGeneration(33));
+        assert_eq!(rotation.rotated_from_progress_owner_id(), Some(&owner));
+        assert_eq!(
+            rotation.rotated_from_progress_baseline(),
+            Some(LogicalWorkGeneration(81))
+        );
+        assert_eq!(
+            rotation.rotated_from_progress_current(),
+            Some(LogicalWorkGeneration(145))
+        );
+        let armed = coordinator.arm_release_fence(&rotation).unwrap();
+        let (released, disposition) = coordinator.complete_release_fence(&rotation, None).unwrap();
+        let PressureReleaseFenceDisposition::OwnerAdmissionPending(pending) = disposition else {
+            panic!("the promoted held peer must wait for typed admission");
+        };
+        assert!(rotation.planned_ordinal() < armed);
+        assert!(armed < released);
+        assert!(released < pending);
         assert_eq!(coordinator.stats().active_episodes, 1);
         assert!(matches!(
             coordinator.hold_status(&owner),
-            PressureHoldStatus::OwnerAdmissionEligible { .. }
+            PressureHoldStatus::Held { .. }
         ));
         assert!(matches!(
             coordinator.hold_status(&held_peer),
-            PressureHoldStatus::Held { .. }
+            PressureHoldStatus::OwnerAdmissionEligible { .. }
         ));
 
-        let admitted = coordinator.consume_released_hold(&owner).unwrap();
-        assert!(admitted.is_some());
+        let admitted = coordinator
+            .consume_released_hold(&held_peer)
+            .unwrap()
+            .expect("typed admission must commit the rotated owner");
+        assert!(pending < admitted);
         assert!(matches!(
-            coordinator.hold_status(&owner),
+            coordinator.hold_status(&held_peer),
             PressureHoldStatus::None
         ));
         assert!(matches!(
-            coordinator.hold_status(&held_peer),
+            coordinator.hold_status(&owner),
+            PressureHoldStatus::Held { .. }
+        ));
+        assert!(matches!(
+            coordinator.hold_status(&newer_held_peer),
             PressureHoldStatus::Held { .. }
         ));
 
-        coordinator.record_terminal(&owner).unwrap();
+        coordinator.record_terminal(&held_peer).unwrap();
         assert!(matches!(
-            coordinator.hold_status(&held_peer),
+            coordinator.hold_status(&owner),
+            PressureHoldStatus::Released {
+                reason: PressureHoldReleaseReason::OwnerTerminal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            coordinator.hold_status(&newer_held_peer),
             PressureHoldStatus::Released {
                 reason: PressureHoldReleaseReason::OwnerTerminal,
                 ..
             }
         ));
         assert_eq!(coordinator.stats().active_episodes, 0);
+    }
+
+    #[test]
+    fn owner_rotation_requires_new_progress_and_exact_release_authority() {
+        let wait = condition(73);
+        let advanced_wait = condition(74);
+
+        let owner_without_progress = RequestId::new();
+        let held_without_progress = RequestId::new();
+        let mut no_progress = PressureCoordinator::default();
+        make_resumable_episode(
+            &mut no_progress,
+            &wait,
+            &owner_without_progress,
+            &held_without_progress,
+            33,
+        );
+        let PressureDecision::YieldPlanned(no_progress_transaction) = no_progress
+            .plan_failure(
+                std::slice::from_ref(&owner_without_progress),
+                &advanced_wait,
+                &[
+                    candidate(
+                        &owner_without_progress,
+                        LogicalWorkKind::Decode,
+                        33,
+                        true,
+                        None,
+                    ),
+                    candidate(
+                        &held_without_progress,
+                        LogicalWorkKind::Waiting,
+                        34,
+                        false,
+                        None,
+                    ),
+                ],
+            )
+            .unwrap()
+        else {
+            panic!("an unchanged decode owner must retain the recompute role");
+        };
+        assert_eq!(
+            no_progress_transaction.kind(),
+            PressureYieldKind::SelfRecompute
+        );
+        assert_eq!(
+            no_progress_transaction.progress_owner_id(),
+            &owner_without_progress
+        );
+        assert!(no_progress_transaction
+            .rotated_from_progress_owner_id()
+            .is_none());
+
+        let owner_without_release = RequestId::new();
+        let held_without_release = RequestId::new();
+        let mut no_release = PressureCoordinator::default();
+        make_resumable_episode(
+            &mut no_release,
+            &wait,
+            &owner_without_release,
+            &held_without_release,
+            33,
+        );
+        assert!(matches!(
+            no_release
+                .plan_failure(
+                    std::slice::from_ref(&owner_without_release),
+                    &advanced_wait,
+                    &[
+                        candidate(
+                            &owner_without_release,
+                            LogicalWorkKind::Decode,
+                            34,
+                            false,
+                            None,
+                        ),
+                        candidate(
+                            &held_without_release,
+                            LogicalWorkKind::Waiting,
+                            34,
+                            false,
+                            None,
+                        ),
+                    ],
+                )
+                .unwrap(),
+            PressureDecision::InvariantViolation(PressureInvariantViolation {
+                class: PressureInvariantViolationClass::NoReleasableFrontier,
+                ..
+            })
+        ));
     }
 
     #[test]
