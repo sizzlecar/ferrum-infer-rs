@@ -276,6 +276,8 @@ def normalize_cuda_compute_rows(
     if native:
         return rows, "native-process-group-pid"
     require(not preflight_rows, "CUDA namespace fallback requires an idle preflight")
+    if not rows:
+        return [], "idle-before-device-allocation"
     require(len(rows) == 1, "CUDA namespace fallback requires exactly one compute application")
     host_pid = rows[0]["pid"]
     require(host_pid not in group_pids, "CUDA namespace fallback received an ambiguous local PID")
@@ -560,9 +562,18 @@ def validate_cuda_bridge_evidence(
         for row in audit_rows
         if all(option in row.get("nvidia_smi_argv", []) for option in CUDA_COMPUTE_QUERY)
     ]
-    require(len(compute_rows) >= 3, f"{label} CUDA PID bridge lacks three compute samples")
+    mapped_compute_rows = [
+        row for row in compute_rows if row.get("strategy") != "idle-before-device-allocation"
+    ]
+    require(len(mapped_compute_rows) >= 3, f"{label} CUDA PID bridge lacks three mapped compute samples")
     for row in compute_rows:
         normalized = row.get("normalized_compute_apps")
+        if row.get("strategy") == "idle-before-device-allocation":
+            require(
+                row.get("raw_compute_apps") == [] and normalized == [],
+                f"{label} CUDA PID bridge idle sample is invalid",
+            )
+            continue
         require(
             row.get("strategy")
             in {
@@ -2707,6 +2718,17 @@ def self_test() -> int:
         normalized == [{"pid": 101, "used_gpu_memory_mib": 10294}]
         and strategy == "single-new-host-pid-mapped-to-container-server",
         "container CUDA PID namespace binding self-test failed",
+    )
+    normalized, strategy = normalize_cuda_compute_rows(
+        [],
+        server_pid=101,
+        group_pids={101, 102},
+        preflight_rows=[],
+        proc_exists=lambda _pid: False,
+    )
+    require(
+        normalized == [] and strategy == "idle-before-device-allocation",
+        "CUDA PID bridge pre-allocation idle self-test failed",
     )
     for rows, preflight_rows, visible, expected_error in (
         (host_rows, [{"pid": 8, "used_gpu_memory_mib": 1}], False, "idle preflight"),
