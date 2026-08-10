@@ -759,6 +759,7 @@ pub struct ContinuousBatchScheduler {
     capacity_backpressure_limit: AtomicUsize,
     decode_capacity_backpressure_limit: AtomicUsize,
     decode_execution_pressure_enforced: AtomicBool,
+    decode_execution_recovery_release_epoch: AtomicU64,
     decode_capacity_feedback_lock: Mutex<()>,
     capacity_backpressure_iteration: AtomicU64,
     capacity_release_epoch: AtomicU64,
@@ -906,6 +907,7 @@ impl ContinuousBatchScheduler {
             capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             decode_capacity_backpressure_limit: AtomicUsize::new(NO_CAPACITY_BACKPRESSURE_LIMIT),
             decode_execution_pressure_enforced: AtomicBool::new(false),
+            decode_execution_recovery_release_epoch: AtomicU64::new(0),
             decode_capacity_feedback_lock: Mutex::new(()),
             capacity_backpressure_iteration: AtomicU64::new(u64::MAX),
             capacity_release_epoch: AtomicU64::new(0),
@@ -1840,14 +1842,19 @@ impl ContinuousBatchScheduler {
     pub fn record_decode_execution_capacity_pressure(&self, attempted_decode_width: usize) {
         let _feedback = self.decode_capacity_feedback_lock.lock();
         self.record_decode_capacity_pressure_inner(attempted_decode_width, None);
+        self.decode_execution_recovery_release_epoch.store(
+            self.capacity_release_epoch.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.decode_execution_pressure_enforced
             .store(true, Ordering::Release);
     }
 
     /// Recover an execution-scoped decode limit only from an authoritative
     /// root-cohort success. Capacity failures use multiplicative decrease;
-    /// successful saturated cohorts recover additively so one completion does
-    /// not immediately recreate the oversized submission wave that failed.
+    /// successful saturated cohorts recover additively after physical capacity
+    /// has been released. Token progress alone cannot recreate the oversized
+    /// submission wave that just failed.
     pub fn record_decode_execution_capacity_success(&self, successful_decode_width: usize) -> bool {
         if successful_decode_width == 0 {
             return false;
@@ -1862,6 +1869,14 @@ impl ContinuousBatchScheduler {
 
         let max_running = self.config.max_running_requests.max(1);
         let successful_decode_width = successful_decode_width.max(1).min(max_running);
+        let release_epoch = self.capacity_release_epoch.load(Ordering::Relaxed);
+        if release_epoch
+            <= self
+                .decode_execution_recovery_release_epoch
+                .load(Ordering::Relaxed)
+        {
+            return false;
+        }
         let relaxed = self
             .decode_capacity_backpressure_limit
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -1881,6 +1896,10 @@ impl ContinuousBatchScheduler {
             })
             .is_ok();
 
+        if relaxed {
+            self.decode_execution_recovery_release_epoch
+                .store(release_epoch, Ordering::Relaxed);
+        }
         if relaxed && self.decode_capacity_backpressure_limit().is_none() {
             self.decode_execution_pressure_enforced
                 .store(false, Ordering::Release);
@@ -6490,6 +6509,21 @@ mod tests {
             "execution pressure must not block the bounded mixed recompute"
         );
 
+        let before_release = scheduler.trace_snapshot();
+        assert_eq!(
+            before_release.decode_capacity_backpressure_admit_limit,
+            Some(2)
+        );
+        assert!(before_release.decode_execution_pressure_enforced);
+
+        assert!(!scheduler.record_decode_execution_capacity_success(2));
+        assert_eq!(
+            scheduler
+                .trace_snapshot()
+                .decode_capacity_backpressure_admit_limit,
+            Some(2)
+        );
+
         scheduler.record_external_capacity_release();
         let still_bounded = scheduler.trace_snapshot();
         assert_eq!(
@@ -6512,6 +6546,14 @@ mod tests {
                 .decode_capacity_backpressure_admit_limit,
             Some(3)
         );
+        assert!(!scheduler.record_decode_execution_capacity_success(3));
+        assert_eq!(
+            scheduler
+                .trace_snapshot()
+                .decode_capacity_backpressure_admit_limit,
+            Some(3)
+        );
+        scheduler.record_external_capacity_release();
         assert!(scheduler.record_decode_execution_capacity_success(3));
         let recovered = scheduler.trace_snapshot();
         assert_eq!(recovered.decode_capacity_backpressure_admit_limit, None);
