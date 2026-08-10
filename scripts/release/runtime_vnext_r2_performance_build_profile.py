@@ -1931,10 +1931,9 @@ def validate_ferrum_performance_lane(
     closure = source_closure(lane["source"], source)
     require(
         lane["binary_sha256"] == r1["backend_binary_sha256"][expected_backend]
-        and lane["hardware_id"] == r1["backend_hardware_id"][expected_backend]
         and lane["correctness_manifest_sha256"]
         == r1["child_manifest"]["sha256"],
-        "Ferrum collector binary/hardware/correctness authority differs from R1",
+        "Ferrum collector binary/correctness authority differs from R1",
     )
     throughput_ratios: list[float] = []
     calibration = False
@@ -2032,6 +2031,7 @@ def validate_ferrum_performance_lane(
         "backend": expected_backend,
         "binary_sha256": lane["binary_sha256"],
         "hardware_id": lane["hardware_id"],
+        "r1_correctness_hardware_id": r1["backend_hardware_id"][expected_backend],
         "model_sha256": lane["model_sha256"],
         "typed_config_sha256": lane["typed_config_sha256"],
         "cell_count": len(lane["summaries"]),
@@ -3275,6 +3275,7 @@ def validate_inputs(
         )
         for key, (model_key, backend) in LANE_KEYS.items()
     }
+    validate_performance_hardware_cohort(lanes)
     profile = profile_validator(paths["profile"], source=source, r1=r1)
     build = validate_build(paths["build"], source=source, verifier=build_verifier)
     candidate_sources = {
@@ -3290,6 +3291,19 @@ def validate_inputs(
         "build": build,
         "acceptance": accepted,
     }
+
+
+def validate_performance_hardware_cohort(lanes: dict[str, dict[str, Any]]) -> None:
+    for backend in BACKENDS:
+        hardware_ids = {
+            lanes[key]["hardware_id"]
+            for key, (_, lane_backend) in LANE_KEYS.items()
+            if lane_backend == backend
+        }
+        require(
+            len(hardware_ids) == 1,
+            f"three {backend} performance lanes must share one R2 hardware identity",
+        )
 
 
 def build_with_source(
@@ -4040,6 +4054,15 @@ def self_test() -> None:
             and dependencies["acceptance"]["measured_request_count"] == 7380
             and dependencies["acceptance"]["run_sample_count"] == 18,
             "positive fixture denominator differs",
+        )
+        mixed_hardware_lanes = {
+            key: {"hardware_id": hardware[backend]}
+            for key, (_, backend) in LANE_KEYS.items()
+        }
+        mixed_hardware_lanes["m3_cuda"]["hardware_id"] = "other-rtx4090"
+        expect_reject(
+            lambda: validate_performance_hardware_cohort(mixed_hardware_lanes),
+            "mixed R2 hardware cohort",
         )
         output = temp / "r2-output"
         pass_line = build_with_source(
