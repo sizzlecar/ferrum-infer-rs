@@ -22,6 +22,116 @@ fn runtime_policy_roundtrip_preserves_sequence_fit_policy() {
 }
 
 #[test]
+fn legacy_reusable_runtime_policy_wire_and_fingerprint_remain_stable() {
+    let reusable_execution = ReusableExecutionPolicy::new(
+        2,
+        vec![ReusableExecutionBucketSpec::new(
+            ReusableExecutionClassId::new("execution.test-decode").unwrap(),
+            ReusableExecutionCapacity::new(4, 64, 1).unwrap(),
+        )
+        .unwrap()],
+    )
+    .unwrap();
+    let policy = ResolvedRuntimePolicy::new(
+        "runtime-policy.reusable-legacy-test",
+        ContractVersion::new(2, 0),
+        SchedulingDiscipline::FirstReady,
+        RuntimeMemoryPolicy {
+            capacity_bytes: 4096,
+            reserve_bytes: 128,
+            maximum_active_sequences: 4,
+            dynamic_storage_profile_order: vec![contiguous_storage_profile()],
+        },
+        serde_json::from_value(json!({
+            "maximum_queue_depth": 8,
+            "maximum_scheduled_tokens": 64,
+            "sequence_fit_policy": "immediate_only",
+            "allow_defer": true,
+            "cancellation_check_interval_steps": 1
+        }))
+        .unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        Some(reusable_execution),
+    )
+    .unwrap();
+
+    let wire = serde_json::to_value(&policy).unwrap();
+    assert!(wire["reusable_execution"].get("program_policy").is_none());
+    assert_eq!(
+        policy.fingerprint_str(),
+        "a88106cfae6108cea2fb070908de8c9b923563ab84d2596a46709a3643da9cb0"
+    );
+    assert_eq!(
+        serde_json::from_value::<ResolvedRuntimePolicy>(wire).unwrap(),
+        policy
+    );
+}
+
+fn reusable_runtime_policy(
+    maximum_active_sequences: u32,
+    exact_decode_widths: &[u32],
+) -> Result<ResolvedRuntimePolicy, VNextError> {
+    let class_id = ReusableExecutionClassId::new("execution.test-decode")?;
+    let workspace_policy = ReusableExecutionPolicy::new(
+        1,
+        vec![ReusableExecutionBucketSpec::new(
+            class_id.clone(),
+            ReusableExecutionCapacity::new(maximum_active_sequences, 64, 1)?,
+        )?],
+    )?;
+    let program_policy = ReusableExecutionProgramPolicy::exact_startup_sealed(
+        1,
+        1,
+        1,
+        exact_decode_widths
+            .iter()
+            .copied()
+            .map(|width| {
+                ReusableExecutionProgramShape::uniform_decode(width, 1)
+                    .and_then(|shape| ReusableExecutionProgramSpec::new(class_id.clone(), shape))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    )?;
+    ResolvedRuntimePolicy::new(
+        "runtime-policy.reusable-program-test",
+        ContractVersion::new(3, 0),
+        SchedulingDiscipline::FirstReady,
+        RuntimeMemoryPolicy {
+            capacity_bytes: 4096,
+            reserve_bytes: 128,
+            maximum_active_sequences,
+            dynamic_storage_profile_order: vec![contiguous_storage_profile()],
+        },
+        serde_json::from_value(json!({
+            "maximum_queue_depth": 8,
+            "maximum_scheduled_tokens": 64,
+            "sequence_fit_policy": "immediate_only",
+            "allow_defer": true,
+            "cancellation_check_interval_steps": 1
+        }))
+        .unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        Some(workspace_policy.with_program_policy(program_policy)?),
+    )
+}
+
+#[test]
+fn reusable_program_matrix_is_fingerprinted_and_scheduler_bounded() {
+    let narrow = reusable_runtime_policy(4, &[1, 2]).unwrap();
+    let wide = reusable_runtime_policy(4, &[1, 2, 3, 4]).unwrap();
+
+    assert_ne!(narrow.fingerprint_str(), wide.fingerprint_str());
+    assert_eq!(
+        serde_json::from_value::<ResolvedRuntimePolicy>(serde_json::to_value(&wide).unwrap())
+            .unwrap(),
+        wide
+    );
+    assert!(reusable_runtime_policy(3, &[1, 4]).is_err());
+}
+
+#[test]
 fn product_source_identity_rejects_cross_role_and_stale_bindings() {
     let original = |location: &str| OriginalModelSource {
         kind: ModelSourceKind::Repository,

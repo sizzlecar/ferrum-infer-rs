@@ -210,21 +210,47 @@ fn reusable_execution_workspace_is_core_derived_plan_data() {
     let registry = TestRegistry::new();
     let family = registry.prepare();
     let catalog = catalog();
-    let reusable_execution = ReusableExecutionPolicy::new(
-        2,
+    let reusable_class = ReusableExecutionClassId::new("execution.test-token").unwrap();
+    let program_policy = ReusableExecutionProgramPolicy::exact_startup_sealed(
+        1,
+        1,
+        1,
         vec![
-            ReusableExecutionBucketSpec::new(
-                ReusableExecutionClassId::new("execution.test-token").unwrap(),
-                ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+            ReusableExecutionProgramSpec::new(
+                reusable_class.clone(),
+                ReusableExecutionProgramShape::uniform_decode(1, 1).unwrap(),
             )
             .unwrap(),
-            ReusableExecutionBucketSpec::new(
-                ReusableExecutionClassId::new("execution.test-token").unwrap(),
-                ReusableExecutionCapacity::new(1, 64, 1).unwrap(),
+            ReusableExecutionProgramSpec::new(
+                reusable_class.clone(),
+                ReusableExecutionProgramShape::uniform_decode(2, 1).unwrap(),
+            )
+            .unwrap(),
+            ReusableExecutionProgramSpec::new(
+                reusable_class.clone(),
+                ReusableExecutionProgramShape::prefill(0, 64, 64).unwrap(),
             )
             .unwrap(),
         ],
     )
+    .unwrap();
+    let reusable_execution = ReusableExecutionPolicy::new(
+        2,
+        vec![
+            ReusableExecutionBucketSpec::new(
+                reusable_class.clone(),
+                ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+            )
+            .unwrap(),
+            ReusableExecutionBucketSpec::new(
+                reusable_class,
+                ReusableExecutionCapacity::new(2, 64, 1).unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap()
+    .with_program_policy(program_policy.clone())
     .unwrap();
     let policy = ResolvedRuntimePolicy::new(
         "runtime-policy.reusable-test",
@@ -264,8 +290,9 @@ fn reusable_execution_workspace_is_core_derived_plan_data() {
     assert_eq!(reusable.buckets().len(), 2);
     assert_eq!(
         reusable.maximum_device_executables(),
-        u64::try_from(plan.payload().nodes().len()).unwrap() * 2 * 2
+        u64::try_from(plan.payload().nodes().len()).unwrap() * 3 * 2
     );
+    assert_eq!(reusable.program_policy(), Some(&program_policy));
     assert!(reusable
         .buckets()
         .iter()
@@ -306,6 +333,90 @@ fn reusable_execution_workspace_is_core_derived_plan_data() {
         node_resolutions,
     )
     .is_err());
+}
+
+#[test]
+fn legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable() {
+    let registry = TestRegistry::new();
+    let family = registry.prepare();
+    let catalog = catalog();
+    let reusable_class = ReusableExecutionClassId::new("execution.test-token").unwrap();
+    let reusable_execution = ReusableExecutionPolicy::new(
+        2,
+        vec![
+            ReusableExecutionBucketSpec::new(
+                reusable_class.clone(),
+                ReusableExecutionCapacity::new(1, 1, 1).unwrap(),
+            )
+            .unwrap(),
+            ReusableExecutionBucketSpec::new(
+                reusable_class,
+                ReusableExecutionCapacity::new(2, 64, 1).unwrap(),
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    let policy = ResolvedRuntimePolicy::new(
+        "runtime-policy.reusable-legacy-test",
+        ContractVersion::new(2, 0),
+        SchedulingDiscipline::FirstReady,
+        RuntimeMemoryPolicy {
+            capacity_bytes: 4096,
+            reserve_bytes: 128,
+            maximum_active_sequences: 3,
+            dynamic_storage_profile_order: vec![contiguous_storage_profile()],
+        },
+        serde_json::from_value(json!({
+            "maximum_queue_depth": 8,
+            "maximum_scheduled_tokens": 4096,
+            "sequence_fit_policy": "immediate_only",
+            "allow_defer": true,
+            "cancellation_check_interval_steps": 1
+        }))
+        .unwrap(),
+        ferrum_types::AttentionExecutionPolicy::Portable,
+        ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay,
+        Some(reusable_execution),
+    )
+    .unwrap();
+    let planning = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
+    let node_resolutions = vec![node_resolution(&family, &catalog, &policy, 0, &planning)];
+    let plan = ExecutionPlan::build(
+        PlanBuildRequest::new(&family, &catalog, &policy, node_resolutions.clone()).unwrap(),
+    )
+    .unwrap();
+
+    let reusable = plan
+        .payload()
+        .memory()
+        .reusable_execution()
+        .expect("legacy reusable execution memory plan");
+    assert!(reusable.program_policy().is_none());
+    assert_eq!(
+        reusable.maximum_device_executables(),
+        u64::try_from(plan.payload().nodes().len()).unwrap() * 2 * 2
+    );
+    let wire = plan.to_json().unwrap();
+    let value: Value = serde_json::from_slice(&wire).unwrap();
+    assert!(value["payload"]["memory"]["reusable_execution"]
+        .get("program_policy")
+        .is_none());
+    assert_eq!(
+        plan.plan_hash().as_str(),
+        "3dabd1b3a27d89d720b95a7e4035f94faf19f92eccc159218af0aafab9dd91a7"
+    );
+    let restored =
+        ExecutionPlan::from_json_validated(&wire, &family, &catalog, &policy, node_resolutions)
+            .unwrap();
+    assert_eq!(restored.plan_hash(), plan.plan_hash());
+    assert!(restored
+        .payload()
+        .memory()
+        .reusable_execution()
+        .unwrap()
+        .program_policy()
+        .is_none());
 }
 
 #[test]

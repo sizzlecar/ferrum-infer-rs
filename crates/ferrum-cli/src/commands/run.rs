@@ -880,6 +880,18 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     );
     let mut startup_cli_runtime_entries =
         run_startup_cli_runtime_entries(&cmd, gpu_selection.as_ref());
+    // The source resolver still contains a small environment compatibility
+    // bridge for GPU autosizing. Materialize only the two typed run-entrypoint
+    // defaults it must see before model resolution, then remove those bridge
+    // values from the later environment snapshot so effective-config evidence
+    // retains the real Default/ConfigFile/CLI source.
+    let early_runtime_config =
+        run_base_runtime_config(&config, RuntimeConfigSnapshot::capture_current());
+    let early_effective_runtime_config =
+        run_effective_runtime_config(&early_runtime_config, &startup_cli_runtime_entries);
+    let run_product_bridge = run_product_runtime_bridge(&early_effective_runtime_config);
+    let materialized_run_product_keys =
+        crate::runtime_env::materialize_runtime_env_effective(&run_product_bridge);
     materialize_run_cli_runtime_entries(&startup_cli_runtime_entries);
     let autosize = run_autosize_for_device(&device, cmd.gpu_memory_utilization);
 
@@ -985,7 +997,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         "model_path".to_string(),
         serde_json::Value::String(engine_model_path),
     );
-    let runtime_config = run_base_runtime_config(&config, RuntimeConfigSnapshot::capture_current());
+    let runtime_config = run_base_runtime_config(
+        &config,
+        runtime_config_without_keys(
+            RuntimeConfigSnapshot::capture_current(),
+            &materialized_run_product_keys,
+        ),
+    );
     if let Some(selection) = &gpu_selection {
         selection.insert_backend_options(&mut engine_config.backend.backend_options);
     }
@@ -2376,11 +2394,46 @@ fn run_base_runtime_config(
     config: &CliConfig,
     env_snapshot: RuntimeConfigSnapshot,
 ) -> RuntimeConfigSnapshot {
-    crate::commands::serve::merge_runtime_config_sources(
-        config.runtime.runtime_config_entries(),
-        env_snapshot,
-        Vec::new(),
+    let mut config_entries = run_product_default_runtime_entries();
+    config_entries.extend(config.runtime.runtime_config_entries());
+    crate::commands::serve::merge_runtime_config_sources(config_entries, env_snapshot, Vec::new())
+}
+
+const RUN_PRODUCT_RUNTIME_KEYS: [&str; 2] = [
+    "FERRUM_PAGED_MAX_SEQS",
+    "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
+];
+
+fn run_product_default_runtime_entries() -> Vec<RuntimeConfigEntry> {
+    vec![
+        RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "1", RuntimeConfigSource::Default),
+        RuntimeConfigEntry::new(
+            "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
+            "1",
+            RuntimeConfigSource::Default,
+        ),
+    ]
+}
+
+fn run_product_runtime_bridge(snapshot: &RuntimeConfigSnapshot) -> RuntimeConfigSnapshot {
+    RuntimeConfigSnapshot::from_entries(
+        snapshot
+            .entries
+            .iter()
+            .filter(|entry| RUN_PRODUCT_RUNTIME_KEYS.contains(&entry.key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>(),
     )
+}
+
+fn runtime_config_without_keys(
+    mut snapshot: RuntimeConfigSnapshot,
+    keys: &[String],
+) -> RuntimeConfigSnapshot {
+    snapshot
+        .entries
+        .retain(|entry| !keys.iter().any(|key| key == &entry.key));
+    snapshot
 }
 
 fn run_startup_cli_runtime_entries(
@@ -2547,7 +2600,7 @@ fn run_startup_auto_config(
             )
         }))
         .unwrap_or_else(ModelCapabilities::unknown);
-    let workload = WorkloadProfile::serving_default_for_hardware(&hardware);
+    let workload = WorkloadProfile::serving_default();
     FerrumConfigBuilder::new(runtime_config)
         .with_model_capabilities(model)
         .with_hardware_capabilities(hardware)
@@ -3082,6 +3135,113 @@ mod tests {
     }
 
     #[test]
+    fn run_product_defaults_are_typed_and_apply_to_engine_config() {
+        let config = CliConfig::default();
+        let effective =
+            run_base_runtime_config(&config, RuntimeConfigSnapshot::from_entries(Vec::new()));
+        let entry = |key: &str| {
+            effective
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+
+        assert_eq!(entry("FERRUM_PAGED_MAX_SEQS").effective_value, "1");
+        assert_eq!(
+            entry("FERRUM_PAGED_MAX_SEQS").source,
+            RuntimeConfigSource::Default
+        );
+        assert_eq!(
+            entry("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS").effective_value,
+            "1"
+        );
+        assert_eq!(
+            entry("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS").source,
+            RuntimeConfigSource::Default
+        );
+
+        let mut engine_config = ferrum_types::EngineConfig::default();
+        engine_config
+            .apply_runtime_config_snapshot(&effective)
+            .expect("run defaults should apply to engine config");
+        assert_eq!(engine_config.scheduler.max_running_requests, 1);
+        assert_eq!(
+            engine_config
+                .backend
+                .reusable_execution_capture
+                .exact_decode_widths,
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn run_product_config_and_env_override_entrypoint_defaults() {
+        let mut config = CliConfig::default();
+        config.runtime.paged_max_seqs = Some(4);
+        config.runtime.reusable_execution_exact_decode_widths = Some(vec![1, 2, 4]);
+
+        let config_only =
+            run_base_runtime_config(&config, RuntimeConfigSnapshot::from_entries(Vec::new()));
+        let config_entry = |key: &str| {
+            config_only
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        assert_eq!(config_entry("FERRUM_PAGED_MAX_SEQS").effective_value, "4");
+        assert_eq!(
+            config_entry("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS").effective_value,
+            "1,2,4"
+        );
+        assert_eq!(
+            config_entry("FERRUM_PAGED_MAX_SEQS").source,
+            RuntimeConfigSource::ConfigFile
+        );
+
+        let env_wins = run_base_runtime_config(
+            &config,
+            RuntimeConfigSnapshot::from_entries([
+                RuntimeConfigEntry::new("FERRUM_PAGED_MAX_SEQS", "8", RuntimeConfigSource::Env),
+                RuntimeConfigEntry::new(
+                    "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
+                    "1,2,4,8",
+                    RuntimeConfigSource::Env,
+                ),
+            ]),
+        );
+        let env_entry = |key: &str| {
+            env_wins
+                .entries
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("missing {key}"))
+        };
+        assert_eq!(env_entry("FERRUM_PAGED_MAX_SEQS").effective_value, "8");
+        assert_eq!(
+            env_entry("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS").effective_value,
+            "1,2,4,8"
+        );
+        assert_eq!(
+            env_entry("FERRUM_PAGED_MAX_SEQS").source,
+            RuntimeConfigSource::Env
+        );
+
+        let mut cmd = test_run_cmd();
+        cmd.max_num_seqs = Some(16);
+        let cli_wins =
+            run_effective_runtime_config(&env_wins, &run_startup_cli_runtime_entries(&cmd, None));
+        let admission = cli_wins
+            .entries
+            .iter()
+            .find(|entry| entry.key == "FERRUM_PAGED_MAX_SEQS")
+            .expect("CLI admission is missing");
+        assert_eq!(admission.effective_value, "16");
+        assert_eq!(admission.source, RuntimeConfigSource::Cli);
+    }
+
+    #[test]
     fn run_effective_runtime_config_applies_recurrent_state_slots_to_engine_config() {
         let cmd = test_run_cmd();
         let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
@@ -3117,6 +3277,8 @@ mod tests {
         assert!(doc["model_capabilities"].is_object());
         assert!(doc["hardware_capabilities"].is_object());
         assert!(doc["workload_profile"].is_object());
+        assert_eq!(doc["workload_profile"]["target_concurrency"], 1);
+        assert_eq!(doc["admission"]["effective_max_concurrent"], 1);
         assert!(doc["decisions"].is_array());
     }
 

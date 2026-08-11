@@ -224,6 +224,38 @@ impl EngineConfig {
         if let Some(value) = runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION") {
             self.backend.enable_reusable_execution = parse_presence_bool(value)?;
         }
+        if let Some(value) =
+            runtime_config_value(snapshot, "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS")
+        {
+            let widths =
+                parse_positive_usize_list("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS", value)?;
+            if widths
+                .iter()
+                .any(|width| *width > MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH)
+            {
+                return Err(format!(
+                    "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS: startup capture widths must be within 1..={MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH}"
+                ));
+            }
+            self.backend.reusable_execution_capture.exact_decode_widths = Some(widths);
+        }
+        if let Some(value) = runtime_config_value(
+            snapshot,
+            "FERRUM_REUSABLE_EXECUTION_MAX_AUTOMATIC_EXACT_DECODE_WIDTH",
+        ) {
+            let maximum = parse_required_positive_usize(
+                "FERRUM_REUSABLE_EXECUTION_MAX_AUTOMATIC_EXACT_DECODE_WIDTH",
+                value,
+            )?;
+            if maximum > MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH {
+                return Err(format!(
+                    "FERRUM_REUSABLE_EXECUTION_MAX_AUTOMATIC_EXACT_DECODE_WIDTH: must be within 1..={MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH}"
+                ));
+            }
+            self.backend
+                .reusable_execution_capture
+                .maximum_automatic_exact_decode_width = maximum;
+        }
         // Engine runtime knobs (previously read by the engine from env). The
         // CLI/autosizer resolves these into the snapshot; the engine reads the
         // typed `runtime` field instead of `std::env::vars()`.
@@ -474,6 +506,19 @@ fn parse_required_positive_usize(key: &str, value: &str) -> std::result::Result<
     }
 }
 
+fn parse_positive_usize_list(key: &str, value: &str) -> std::result::Result<Vec<usize>, String> {
+    let values = value
+        .split(',')
+        .map(str::trim)
+        .map(|value| parse_required_positive_usize(key, value))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        Err(format!("{key}: must contain at least one width"))
+    } else {
+        Ok(values)
+    }
+}
+
 fn parse_profile_entrypoint(
     key: &str,
     value: &str,
@@ -713,6 +758,53 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Non-configurable upper bound for startup decode capture width.
+///
+/// This bound is independent from scheduler admission. It protects startup
+/// worker/resource creation even when a user supplies an extreme concurrency
+/// value or an explicit capture list. Wider runtime batches remain valid and
+/// use the documented eager fallback.
+pub const MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH: usize = 32;
+
+/// Default upper bound for automatically generated exact decode capture widths.
+///
+/// This is an independent startup-work safety bound, not a concurrency limit.
+/// A resolver may automatically request every exact width through the minimum
+/// of admission, this ceiling, and the hard startup bound. Admission above the
+/// bound remains valid; wider runtime waves use eager fallback unless a future
+/// independently bounded policy supports them.
+pub const DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH: usize =
+    MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH;
+
+/// Product policy for reusable-execution startup capture.
+///
+/// `None` requests an automatically resolved exact-width matrix. Explicit
+/// widths let operators bound startup work deliberately; widths omitted from
+/// that matrix remain eligible for the runtime's documented eager fallback.
+/// Neither form may exceed
+/// [`MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH`].
+/// Validation against scheduler admission and backend capabilities belongs to
+/// the runtime-policy resolver, where those resolved limits are available.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReusableExecutionCaptureConfig {
+    /// Exact concurrent decode widths to prepare. `None` selects automatic
+    /// resolution from the admitted runtime capacity.
+    pub exact_decode_widths: Option<Vec<usize>>,
+    /// Safety ceiling for automatic exact-width expansion. This does not cap
+    /// user concurrency and may only lower the independent startup hard bound.
+    pub maximum_automatic_exact_decode_width: usize,
+}
+
+impl Default for ReusableExecutionCaptureConfig {
+    fn default() -> Self {
+        Self {
+            exact_decode_widths: None,
+            maximum_automatic_exact_decode_width: DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH,
+        }
+    }
+}
+
 /// Backend configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -731,6 +823,11 @@ pub struct BackendConfig {
     /// Prepare backend-owned reusable device programs when supported.
     #[serde(default = "default_enable_reusable_execution")]
     pub enable_reusable_execution: bool,
+    /// Typed reusable-program capture policy shared by every product
+    /// entrypoint. This is deliberately not a backend option or hidden env
+    /// bridge: the resolved execution policy must fingerprint its outcome.
+    #[serde(default)]
+    pub reusable_execution_capture: ReusableExecutionCaptureConfig,
     /// Enable kernel fusion
     pub enable_kernel_fusion: bool,
     /// Custom backend-specific options
@@ -747,6 +844,7 @@ impl Default for BackendConfig {
             optimization_level: 2,
             enable_cuda_graphs: false,
             enable_reusable_execution: default_enable_reusable_execution(),
+            reusable_execution_capture: ReusableExecutionCaptureConfig::default(),
             enable_kernel_fusion: true,
             backend_options: HashMap::new(),
         }

@@ -535,10 +535,12 @@ impl MemoryPlan {
             .ok()
             .filter(|count| *count > 0)
             .ok_or_else(|| invalid_plan("reusable execution requires at least one plan node"))?;
-        let bucket_count = u64::try_from(policy.buckets().len())
-            .map_err(|_| invalid_plan("reusable execution bucket count exceeds u64"))?;
+        let startup_capture_case_count = u64::try_from(policy.startup_capture_case_count())
+            .map_err(|_| {
+                invalid_plan("reusable execution startup capture case count exceeds u64")
+            })?;
         let maximum_device_executables = node_count
-            .checked_mul(bucket_count)
+            .checked_mul(startup_capture_case_count)
             .and_then(|count| count.checked_mul(u64::from(policy.maximum_reusable_lanes())))
             .ok_or_else(|| invalid_plan("reusable device executable count overflows u64"))?;
         let descriptors = dynamic_descriptors
@@ -571,10 +573,11 @@ impl MemoryPlan {
                 pool_budgets,
             )?);
         }
-        ReusableExecutionMemoryPlan::new(
+        ReusableExecutionMemoryPlan::new_with_program_policy(
             policy.maximum_reusable_lanes(),
             maximum_device_executables,
             buckets,
+            policy.program_policy().cloned(),
         )
     }
 
