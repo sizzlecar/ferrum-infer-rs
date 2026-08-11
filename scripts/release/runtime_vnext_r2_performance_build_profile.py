@@ -385,6 +385,20 @@ def requests_per_repeat(dataset: str) -> int:
     return 100 if dataset == "random" else 30
 
 
+def validate_metal_resource_contract(summary: dict[str, Any], label: str) -> None:
+    swap_start = finite_nonnegative(
+        summary.get("swap_start_bytes"), f"{label} Metal swap start"
+    )
+    swap_end = finite_nonnegative(
+        summary.get("swap_end_bytes"), f"{label} Metal swap end"
+    )
+    require(
+        swap_end <= swap_start
+        and summary.get("thermal_throttling_count") == 0,
+        f"{label} Metal swap growth/thermal contract failed",
+    )
+
+
 def nearest_rank(values: list[float], percentile: float) -> float:
     require(values, "percentile input is empty")
     ordered = sorted(values)
@@ -1812,11 +1826,8 @@ def load_ferrum_collector_lane(
                 f"CUDA headroom is below 512 MiB: {key}",
             )
         else:
-            require(
-                resource_summary.get("swap_end_bytes")
-                == resource_summary.get("swap_start_bytes")
-                and resource_summary.get("thermal_throttling_count") == 0,
-                f"Metal swap/thermal contract failed: {key}",
+            validate_metal_resource_contract(
+                resource_summary, f"Ferrum collector cell {key}"
             )
         throughputs = [finite_positive(row.get("output_throughput_tps"), "repeat throughput") for row in repeats]
         cv = statistics.pstdev(throughputs) / statistics.mean(throughputs)
@@ -3496,6 +3507,44 @@ def self_test() -> None:
         and not requires_active_floor("sharegpt", 32, "cuda")
         and not requires_active_floor("real-chat", 16, "metal"),
         "active-floor cell selection differs",
+    )
+    validate_metal_resource_contract(
+        {
+            "swap_start_bytes": 10,
+            "swap_end_bytes": 9,
+            "thermal_throttling_count": 0,
+        },
+        "decreasing-swap fixture",
+    )
+    validate_metal_resource_contract(
+        {
+            "swap_start_bytes": 10,
+            "swap_end_bytes": 10,
+            "thermal_throttling_count": 0,
+        },
+        "stable-swap fixture",
+    )
+    expect_reject(
+        lambda: validate_metal_resource_contract(
+            {
+                "swap_start_bytes": 10,
+                "swap_end_bytes": 11,
+                "thermal_throttling_count": 0,
+            },
+            "growing-swap fixture",
+        ),
+        "Metal swap growth",
+    )
+    expect_reject(
+        lambda: validate_metal_resource_contract(
+            {
+                "swap_start_bytes": 10,
+                "swap_end_bytes": 10,
+                "thermal_throttling_count": 1,
+            },
+            "thermal-throttling fixture",
+        ),
+        "Metal thermal throttling",
     )
     source = {
         "git_sha": "a" * 40,
