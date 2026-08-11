@@ -99,6 +99,7 @@ PROFILE_IDENTITY_FIELDS = {
 }
 R2_CONTROL_PLANE_FILES = frozenset(
     {
+        "scripts/release/bounded_command.py",
         "scripts/release/runtime_vnext_r2_ferrum_collector.py",
         "scripts/release/runtime_vnext_r2_performance_build_profile.py",
         "scripts/release/runtime_vnext_r2_profile_collector.py",
@@ -3501,6 +3502,10 @@ def expect_reject(action: Callable[[], Any], label: str) -> None:
 
 
 def self_test() -> None:
+    require(
+        "scripts/release/bounded_command.py" in R2_CONTROL_PLANE_FILES,
+        "bounded command must remain an R2 evidence-control-plane file",
+    )
     require(
         requires_active_floor("random", 32, "cuda")
         and requires_active_floor("random", 16, "metal")
