@@ -790,7 +790,7 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
     decode_end = request_origin + commits[-1]
     require(decode_end > decode_start, "decode wall interval is not positive")
 
-    starts: dict[tuple[Any, Any, Any], int] = {}
+    starts: dict[tuple[Any, Any, Any, Any], tuple[int, str]] = {}
     intervals: list[tuple[int, int]] = []
     pair_count = 0
     for event in events:
@@ -799,19 +799,45 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
         attributes = event_attributes(event)
         identity = attributes.get("execution_identity")
         require(isinstance(identity, dict), "node event lacks typed execution_identity")
+        event_request_id = event.get("request_id")
+        identity_request_id = identity.get("request_id")
+        require(non_empty(event_request_id), "node event lacks request_id")
+        require(non_empty(identity_request_id), "node identity lacks request_id")
+        require(
+            event_request_id == identity_request_id,
+            "node event request_id differs from its execution identity",
+        )
+        if event_request_id != request_id:
+            continue
+        run_id = identity.get("run_id")
+        frame_id = identity.get("frame_id")
+        node_invocation_id = identity.get("node_invocation_id")
+        span_id = identity.get("span_id")
+        require(non_empty(run_id), "node identity lacks run_id")
+        require(type(frame_id) is int and frame_id > 0, "node identity lacks frame_id")
+        require(
+            type(node_invocation_id) is int and node_invocation_id > 0,
+            "node identity lacks node_invocation_id",
+        )
+        require(non_empty(span_id), "node identity lacks span_id")
         key = (
-            identity.get("run_id"),
-            identity.get("frame_id"),
-            identity.get("node_invocation_id"),
+            run_id,
+            identity_request_id,
+            frame_id,
+            node_invocation_id,
         )
         timestamp = attributes.get("monotonic_nanos_since_run_start")
         require(type(timestamp) is int and timestamp >= 0, "node event lacks monotonic timestamp")
         if event.get("phase") == "vnext.node_started":
             require(key not in starts, f"duplicate node start identity: {key}")
-            starts[key] = timestamp
+            starts[key] = (timestamp, str(span_id))
             continue
         require(key in starts, f"node retirement lacks start: {key}")
-        start = starts.pop(key)
+        start, started_span_id = starts.pop(key)
+        require(
+            span_id == started_span_id,
+            f"node retirement span differs from start: {key}",
+        )
         require(timestamp >= start, f"node interval is reversed: {key}")
         pair_count += 1
         intervals.append((max(start, decode_start), min(timestamp, decode_end)))
@@ -1858,12 +1884,14 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
                     "monotonic_nanos_since_run_start": event["shape"]["execution_sequence"],
                     "execution_identity": {
                         "run_id": run_id,
+                        "request_id": request_id,
                         "frame_id": 1,
                         "node_invocation_id": 1,
                         "node_id": "node.decode",
                         "operation_id": "operation.decode",
                         "provider_id": f"provider.{backend}.decode",
                         "resource_pool_id": 1,
+                        "span_id": f"span/{request_id}/frame/1/node/1",
                     },
                 }
             )
@@ -1938,6 +1966,32 @@ def run_selftest() -> int:
         backend="cuda", basic_events=cuda[0], replay_events=cuda[1], full_events=cuda[2]
     )
     require(cuda_result["status"] == "pass", "positive CUDA fixture did not pass")
+    baseline_stage = calculate_stage_coverage(cuda[2])
+    concurrent = json.loads(json.dumps(cuda[2]))
+    foreign_request_id = "request.startup.concurrent"
+    foreign_started = json.loads(json.dumps(concurrent[2]))
+    foreign_retired = json.loads(json.dumps(concurrent[3]))
+    for event, timestamp in ((foreign_started, 120), (foreign_retired, 980)):
+        event["request_id"] = foreign_request_id
+        event["correlation_id"] = foreign_request_id
+        event["attributes"]["monotonic_nanos_since_run_start"] = timestamp
+        identity = event["attributes"]["execution_identity"]
+        identity["request_id"] = foreign_request_id
+        identity["span_id"] = f"span/{foreign_request_id}/frame/1/node/1"
+    concurrent[2:4] = [concurrent[2], foreign_started, concurrent[3], foreign_retired]
+    concurrent_stage = calculate_stage_coverage(concurrent)
+    require(
+        concurrent_stage == baseline_stage,
+        "foreign concurrent request changed target stage coverage",
+    )
+    duplicate = json.loads(json.dumps(cuda[2]))
+    duplicate.insert(3, json.loads(json.dumps(duplicate[2])))
+    try:
+        calculate_stage_coverage(duplicate)
+    except CollectorError:
+        target_duplicate_rejected = True
+    else:
+        raise CollectorError("target-request duplicate node start unexpectedly passed")
     metal = fixture_profile_events("metal")
     metal_result = validate_identity_and_device_contract(
         backend="metal", basic_events=metal[0], replay_events=metal[1], full_events=metal[2]
@@ -1984,7 +2038,12 @@ def run_selftest() -> int:
         negative_overhead_rejected = True
     else:
         raise CollectorError("over-limit profile overhead unexpectedly passed")
-    require(negative_identity_rejected and negative_overhead_rejected, "negative fixtures did not reject")
+    require(
+        negative_identity_rejected
+        and negative_overhead_rejected
+        and target_duplicate_rejected,
+        "negative fixtures did not reject",
+    )
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-r2-profile-selftest-") as temporary:
         root = Path(temporary)
         blob = root / "model-blob"
