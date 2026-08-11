@@ -84,6 +84,16 @@ fn engine_config_applies_runtime_snapshot() {
         RuntimeConfigEntry::new("FERRUM_BATCHED_GRAPH", "1", RuntimeConfigSource::Cli),
         RuntimeConfigEntry::new("FERRUM_REUSABLE_EXECUTION", "0", RuntimeConfigSource::Cli),
         RuntimeConfigEntry::new(
+            "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
+            "1,3,7",
+            RuntimeConfigSource::ConfigFile,
+        ),
+        RuntimeConfigEntry::new(
+            "FERRUM_REUSABLE_EXECUTION_MAX_AUTOMATIC_EXACT_DECODE_WIDTH",
+            "24",
+            RuntimeConfigSource::ConfigFile,
+        ),
+        RuntimeConfigEntry::new(
             "FERRUM_SCHEDULER_TRACE_JSONL",
             "/tmp/sched.jsonl",
             RuntimeConfigSource::Env,
@@ -101,9 +111,56 @@ fn engine_config_applies_runtime_snapshot() {
     assert!(cfg.backend.enable_cuda_graphs);
     assert!(!cfg.backend.enable_reusable_execution);
     assert_eq!(
+        cfg.backend.reusable_execution_capture.exact_decode_widths,
+        Some(vec![1, 3, 7])
+    );
+    assert_eq!(
+        cfg.backend
+            .reusable_execution_capture
+            .maximum_automatic_exact_decode_width,
+        24
+    );
+    assert_eq!(
         cfg.runtime.scheduler_trace_jsonl.as_deref(),
         Some(std::path::Path::new("/tmp/sched.jsonl"))
     );
+}
+
+#[test]
+fn engine_config_rejects_empty_reusable_exact_width_list() {
+    let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+        "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
+        "",
+        RuntimeConfigSource::ConfigFile,
+    )]);
+    let mut cfg = EngineConfig::default();
+
+    let error = cfg.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+
+    assert!(error.contains("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS"));
+}
+
+#[test]
+fn engine_config_rejects_reusable_capture_widths_above_independent_hard_bound() {
+    for (key, value) in [
+        ("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS", "1,32,33"),
+        (
+            "FERRUM_REUSABLE_EXECUTION_MAX_AUTOMATIC_EXACT_DECODE_WIDTH",
+            "33",
+        ),
+    ] {
+        let snapshot = RuntimeConfigSnapshot::from_entries([RuntimeConfigEntry::new(
+            key,
+            value,
+            RuntimeConfigSource::ConfigFile,
+        )]);
+        let mut cfg = EngineConfig::default();
+
+        let error = cfg.apply_runtime_config_snapshot(&snapshot).unwrap_err();
+
+        assert!(error.contains(key));
+        assert!(error.contains("1..=32"));
+    }
 }
 
 #[test]
@@ -255,6 +312,62 @@ fn backend_config_default_sane() {
     assert!(matches!(cfg.backend_type, BackendType::Candle));
     assert!(cfg.enable_optimizations);
     assert!(cfg.enable_reusable_execution);
+    assert_eq!(cfg.reusable_execution_capture.exact_decode_widths, None);
+    assert_eq!(
+        cfg.reusable_execution_capture
+            .maximum_automatic_exact_decode_width,
+        DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH
+    );
+    assert_eq!(
+        DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH,
+        MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH
+    );
+}
+
+#[test]
+fn backend_config_without_capture_policy_uses_backward_compatible_default() {
+    let mut serialized = serde_json::to_value(BackendConfig::default()).unwrap();
+    serialized
+        .as_object_mut()
+        .unwrap()
+        .remove("reusable_execution_capture");
+
+    let cfg: BackendConfig = serde_json::from_value(serialized).unwrap();
+
+    assert_eq!(
+        cfg.reusable_execution_capture,
+        ReusableExecutionCaptureConfig::default()
+    );
+}
+
+#[test]
+fn reusable_execution_capture_partial_config_keeps_automatic_safety_default() {
+    let capture: ReusableExecutionCaptureConfig = serde_json::from_value(serde_json::json!({
+        "exact_decode_widths": [1, 2, 4, 8, 16, 24, 32]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        capture.exact_decode_widths,
+        Some(vec![1, 2, 4, 8, 16, 24, 32])
+    );
+    assert_eq!(
+        capture.maximum_automatic_exact_decode_width,
+        DEFAULT_MAXIMUM_AUTOMATIC_EXACT_DECODE_WIDTH
+    );
+}
+
+#[test]
+fn reusable_execution_capture_explicit_policy_round_trips() {
+    let expected = ReusableExecutionCaptureConfig {
+        exact_decode_widths: Some(vec![1, 3, 7, 32]),
+        maximum_automatic_exact_decode_width: 16,
+    };
+
+    let serialized = serde_json::to_value(&expected).unwrap();
+    let actual: ReusableExecutionCaptureConfig = serde_json::from_value(serialized).unwrap();
+
+    assert_eq!(actual, expected);
 }
 
 #[test]

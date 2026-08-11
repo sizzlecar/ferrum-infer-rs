@@ -235,6 +235,16 @@ pub struct RuntimeCliConfig {
     #[serde(default)]
     pub reusable_execution: Option<bool>,
 
+    /// Exact vNext reusable decode widths prepared at startup. Omitted means
+    /// automatic exact resolution up to the admission and startup hard bounds.
+    #[serde(default)]
+    pub reusable_execution_exact_decode_widths: Option<Vec<usize>>,
+
+    /// Configurable automatic ceiling, bounded by the independent hard startup
+    /// capture limit. It does not cap runtime concurrency.
+    #[serde(default)]
+    pub reusable_execution_max_automatic_exact_decode_width: Option<usize>,
+
     /// Unified Llama/Gemma decode CUDA graph policy override,
     /// equivalent to `FERRUM_UNIFIED_GRAPH`.
     #[serde(default)]
@@ -423,6 +433,16 @@ impl RuntimeCliConfig {
             "FERRUM_REUSABLE_EXECUTION",
             self.reusable_execution,
         );
+        push_usize_list_entry(
+            &mut entries,
+            "FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS",
+            self.reusable_execution_exact_decode_widths.as_deref(),
+        );
+        push_usize_entry(
+            &mut entries,
+            "FERRUM_REUSABLE_EXECUTION_MAX_AUTOMATIC_EXACT_DECODE_WIDTH",
+            self.reusable_execution_max_automatic_exact_decode_width,
+        );
         push_bool_entry(&mut entries, "FERRUM_UNIFIED_GRAPH", self.unified_graph);
         push_bool_entry(
             &mut entries,
@@ -552,6 +572,24 @@ fn push_usize_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opt
         entries.push(RuntimeConfigEntry::new(
             key,
             value.to_string(),
+            RuntimeConfigSource::ConfigFile,
+        ));
+    }
+}
+
+fn push_usize_list_entry(
+    entries: &mut Vec<RuntimeConfigEntry>,
+    key: &str,
+    value: Option<&[usize]>,
+) {
+    if let Some(value) = value {
+        entries.push(RuntimeConfigEntry::new(
+            key,
+            value
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
             RuntimeConfigSource::ConfigFile,
         ));
     }
@@ -773,6 +811,8 @@ mod tests {
             moe_graph: Some(true),
             batched_graph: Some(true),
             reusable_execution: Some(false),
+            reusable_execution_exact_decode_widths: Some(vec![1, 2, 4, 8, 16, 24, 32]),
+            reusable_execution_max_automatic_exact_decode_width: Some(32),
             unified_graph: Some(true),
             unified_graph_layers_only: Some(true),
             unified_graph_lm_head_eager: Some(true),
@@ -809,7 +849,7 @@ mod tests {
             ..Default::default()
         };
         let entries = runtime.runtime_config_entries();
-        assert_eq!(entries.len(), 43);
+        assert_eq!(entries.len(), 45);
         let entry = |key: &str| {
             entries
                 .iter()
@@ -861,6 +901,14 @@ mod tests {
         assert_eq!(entry("FERRUM_MOE_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_BATCHED_GRAPH").effective_value, "1");
         assert_eq!(entry("FERRUM_REUSABLE_EXECUTION").effective_value, "0");
+        assert_eq!(
+            entry("FERRUM_REUSABLE_EXECUTION_EXACT_DECODE_WIDTHS").effective_value,
+            "1,2,4,8,16,24,32"
+        );
+        assert_eq!(
+            entry("FERRUM_REUSABLE_EXECUTION_MAX_AUTOMATIC_EXACT_DECODE_WIDTH").effective_value,
+            "32"
+        );
         assert_eq!(entry("FERRUM_UNIFIED_GRAPH").effective_value, "1");
         assert_eq!(
             entry("FERRUM_UNIFIED_GRAPH_LAYERS_ONLY").effective_value,

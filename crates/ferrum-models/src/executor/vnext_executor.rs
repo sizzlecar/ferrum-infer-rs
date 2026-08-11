@@ -35,8 +35,9 @@ use ferrum_interfaces::vnext::*;
 use ferrum_interfaces::{KvCacheHandle, ModelExecutor, TensorRef};
 use ferrum_types::{
     AttentionExecutionPolicy, Device, EngineConfig, ExecutorAdmissionLimits, FerrumError,
-    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RequestId, Result, SchedulingPolicy,
-    SequenceFitPolicy, TokenId, VNextDiagnosticFault,
+    ModelInfo, ObservabilityProfileDetail, ProfileEntrypoint, RequestId, Result,
+    ReusableExecutionCaptureConfig, SchedulingPolicy, SequenceFitPolicy, TokenId,
+    VNextDiagnosticFault, MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -75,6 +76,9 @@ const MAX_DEFINITELY_NOT_SUBMITTED_RETRIES: u32 = 1;
 const MAX_BACKING_MAINTENANCE_ATTEMPTS: u32 = 2;
 const MAX_EXTENSION_RECHECKS: u32 = 2;
 const MAX_PROFILED_REUSABLE_EXECUTABLES: usize = 256;
+const REUSABLE_EXECUTION_WARMUP_PASSES: u32 = 1;
+const REUSABLE_EXECUTION_CAPTURE_PASSES: u32 = 1;
+const REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES: u32 = 1;
 type VNextDriver<R> = RuntimeResourceDriver<R>;
 
 const fn submission_execution_policy_for_timing(
@@ -87,6 +91,16 @@ const fn submission_execution_policy_for_timing(
         | DeviceTimingMode::Replay
         | DeviceTimingMode::Kernel => SubmissionExecutionPolicy::adaptive(),
     }
+}
+
+const fn reusable_catalog_lookup_allowed(
+    has_startup_plan: bool,
+    direct_reusable_execution_allowed: bool,
+    direct_reusable_execution_already_attempted: bool,
+) -> bool {
+    has_startup_plan
+        && direct_reusable_execution_allowed
+        && !direct_reusable_execution_already_attempted
 }
 
 const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {
@@ -123,12 +137,72 @@ fn resolve_runtime_attention_authority(
     Ok(installed)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VNextReusableExecutionDecodeWidthSource {
+    Automatic,
+    Explicit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VNextPrefillFrontierPolicy {
+    Adaptive,
+    ExactStartup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct VNextReusableExecutionCaptureResolution {
+    source: VNextReusableExecutionDecodeWidthSource,
+    admission_maximum_decode_width: usize,
+    requested_decode_widths: Vec<usize>,
+    effective_decode_widths: Vec<usize>,
+    reduction_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct VNextReusableExecutionPolicyResolution {
+    policy: ReusableExecutionPolicy,
+    capture: Option<VNextReusableExecutionCaptureResolution>,
+}
+
+fn reusable_execution_anchor_decode_widths(maximum_width: usize) -> Vec<usize> {
+    let mut widths = Vec::new();
+    let mut width = 1_usize;
+    while width < maximum_width {
+        widths.push(width);
+        width = width
+            .checked_mul(2)
+            .unwrap_or(maximum_width)
+            .min(maximum_width);
+    }
+    if widths.last().copied() != Some(maximum_width) {
+        widths.push(maximum_width);
+    }
+    widths
+}
+
+fn reusable_execution_maximum_decode_sequence_tokens(decode_width_count: usize) -> Result<usize> {
+    let passes_per_width = usize::try_from(
+        REUSABLE_EXECUTION_WARMUP_PASSES
+            .checked_add(REUSABLE_EXECUTION_CAPTURE_PASSES)
+            .and_then(|passes| passes.checked_add(REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES))
+            .ok_or_else(|| FerrumError::config("vNext reusable startup pass count overflowed"))?,
+    )
+    .map_err(|_| FerrumError::config("vNext reusable startup pass count exceeds usize"))?;
+    decode_width_count
+        .checked_mul(passes_per_width)
+        .and_then(|decode_tokens| decode_tokens.checked_add(1))
+        .ok_or_else(|| FerrumError::config("vNext reusable startup token ceiling overflowed"))
+}
+
 fn resolve_reusable_execution_policy(
     maximum_active_sequences: u32,
     maximum_scheduled_tokens: u64,
     maximum_model_tokens: usize,
     prefill_chunks: &[PrefillChunk],
-) -> Result<ReusableExecutionPolicy> {
+    capture_config: &ReusableExecutionCaptureConfig,
+    prepare_device_programs: bool,
+) -> Result<VNextReusableExecutionPolicyResolution> {
     let maximum_active_sequences = usize::try_from(maximum_active_sequences)
         .map_err(|_| FerrumError::config("vNext active sequence limit exceeds usize"))?;
     let maximum_scheduled_tokens = usize::try_from(maximum_scheduled_tokens)
@@ -145,8 +219,7 @@ fn resolve_reusable_execution_policy(
     let packed_class = ReusableExecutionClassId::new(PACKED_TOKEN_REUSABLE_CLASS)
         .map_err(|error| FerrumError::config(error.to_string()))?;
     let mut buckets = Vec::new();
-    let mut width = 1_usize;
-    loop {
+    for width in reusable_execution_anchor_decode_widths(maximum_width) {
         let width_u32 = u32::try_from(width)
             .map_err(|_| FerrumError::config("vNext decode width exceeds u32"))?;
         let width_u64 = u64::try_from(width)
@@ -159,10 +232,6 @@ fn resolve_reusable_execution_policy(
             )
             .map_err(|error| FerrumError::config(error.to_string()))?,
         );
-        if width == maximum_width {
-            break;
-        }
-        width = width.saturating_mul(2).min(maximum_width);
     }
 
     let mut prefill_token_counts = prefill_chunks
@@ -193,7 +262,162 @@ fn resolve_reusable_execution_policy(
             .map_err(|error| FerrumError::config(error.to_string()))?,
         );
     }
-    ReusableExecutionPolicy::new(1, buckets).map_err(|error| FerrumError::config(error.to_string()))
+    let mut policy = ReusableExecutionPolicy::new(1, buckets)
+        .map_err(|error| FerrumError::config(error.to_string()))?;
+    if !prepare_device_programs {
+        return Ok(VNextReusableExecutionPolicyResolution {
+            policy,
+            capture: None,
+        });
+    }
+
+    if capture_config.maximum_automatic_exact_decode_width == 0
+        || capture_config.maximum_automatic_exact_decode_width
+            > MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH
+    {
+        return Err(FerrumError::config(format!(
+            "runtime.reusable_execution_max_automatic_exact_decode_width must be within 1..={MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH}"
+        )));
+    }
+    let mut resolution_reasons = Vec::new();
+    let (source, mut requested_decode_widths) = match &capture_config.exact_decode_widths {
+        Some(widths) => {
+            if widths.is_empty() {
+                return Err(FerrumError::config(
+                    "runtime.reusable_execution_exact_decode_widths must not be empty",
+                ));
+            }
+            (
+                VNextReusableExecutionDecodeWidthSource::Explicit,
+                widths.clone(),
+            )
+        }
+        None => {
+            let automatic_maximum_width = maximum_width
+                .min(capture_config.maximum_automatic_exact_decode_width)
+                .min(MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH);
+            if automatic_maximum_width < maximum_width {
+                resolution_reasons.push(format!(
+                    "automatic startup capture is bounded at width {automatic_maximum_width}; admitted widths {}..={maximum_width} use eager fallback",
+                    automatic_maximum_width + 1
+                ));
+            }
+            (
+                VNextReusableExecutionDecodeWidthSource::Automatic,
+                (1..=automatic_maximum_width).collect(),
+            )
+        }
+    };
+    requested_decode_widths.sort_unstable();
+    requested_decode_widths.dedup();
+    if requested_decode_widths.iter().any(|width| {
+        *width == 0
+            || *width > maximum_width
+            || *width > MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH
+    }) {
+        return Err(FerrumError::config(format!(
+            "vNext reusable exact decode widths must be within 1..={} and may not exceed the independent startup capture hard bound {MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH}",
+            maximum_width.min(MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH)
+        )));
+    }
+
+    let requested_sequence_tokens =
+        reusable_execution_maximum_decode_sequence_tokens(requested_decode_widths.len())?;
+    let (effective_decode_widths, budget_reduction_reason) = if requested_sequence_tokens
+        <= maximum_model_tokens
+    {
+        (requested_decode_widths.clone(), None)
+    } else if source == VNextReusableExecutionDecodeWidthSource::Automatic {
+        let requested_maximum_width = requested_decode_widths.last().copied().ok_or_else(|| {
+            FerrumError::config("vNext automatic reusable decode matrix is empty")
+        })?;
+        let anchors = reusable_execution_anchor_decode_widths(requested_maximum_width);
+        let anchor_sequence_tokens =
+            reusable_execution_maximum_decode_sequence_tokens(anchors.len())?;
+        if anchor_sequence_tokens > maximum_model_tokens {
+            return Err(FerrumError::config(format!(
+                    "vNext model length {maximum_model_tokens} cannot cover reusable execution startup ceiling {anchor_sequence_tokens}"
+                )));
+        }
+        (
+                anchors,
+                Some(format!(
+                    "automatic exact matrix needs {requested_sequence_tokens} synthetic sequence tokens, exceeding model length {maximum_model_tokens}; reduced to canonical power-of-two anchors"
+                )),
+            )
+    } else {
+        return Err(FerrumError::config(format!(
+                "explicit reusable exact decode matrix needs {requested_sequence_tokens} synthetic sequence tokens, exceeding model length {maximum_model_tokens}"
+            )));
+    };
+    if let Some(reason) = budget_reduction_reason {
+        resolution_reasons.push(reason);
+    }
+    let reduction_reason = (!resolution_reasons.is_empty()).then(|| resolution_reasons.join("; "));
+
+    let mut program_specs = effective_decode_widths
+        .iter()
+        .copied()
+        .map(|width| {
+            let shape = ReusableExecutionProgramShape::uniform_decode(
+                u32::try_from(width)
+                    .map_err(|_| FerrumError::config("vNext decode width exceeds u32"))?,
+                1,
+            )
+            .map_err(|error| FerrumError::config(error.to_string()))?;
+            ReusableExecutionProgramSpec::new(uniform_class.clone(), shape)
+                .map_err(|error| FerrumError::config(error.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for chunk in prefill_chunks.iter().copied() {
+        if chunk.tokens_processed() > 0 {
+            let shape = ReusableExecutionProgramShape::prefill(
+                0,
+                u64::try_from(chunk.tokens_processed())
+                    .map_err(|_| FerrumError::config("vNext prefill prefix exceeds u64"))?,
+                u64::try_from(chunk.total_prompt_tokens())
+                    .map_err(|_| FerrumError::config("vNext prefill prompt exceeds u64"))?,
+            )
+            .map_err(|error| FerrumError::config(error.to_string()))?;
+            program_specs.push(
+                ReusableExecutionProgramSpec::new(packed_class.clone(), shape)
+                    .map_err(|error| FerrumError::config(error.to_string()))?,
+            );
+        }
+        let shape = ReusableExecutionProgramShape::prefill(
+            u64::try_from(chunk.tokens_processed())
+                .map_err(|_| FerrumError::config("vNext prefill frontier exceeds u64"))?,
+            u64::try_from(chunk.tokens_to_process())
+                .map_err(|_| FerrumError::config("vNext prefill chunk exceeds u64"))?,
+            u64::try_from(chunk.total_prompt_tokens())
+                .map_err(|_| FerrumError::config("vNext prefill prompt exceeds u64"))?,
+        )
+        .map_err(|error| FerrumError::config(error.to_string()))?;
+        program_specs.push(
+            ReusableExecutionProgramSpec::new(packed_class.clone(), shape)
+                .map_err(|error| FerrumError::config(error.to_string()))?,
+        );
+    }
+    let program_policy = ReusableExecutionProgramPolicy::exact_startup_sealed(
+        REUSABLE_EXECUTION_WARMUP_PASSES,
+        REUSABLE_EXECUTION_CAPTURE_PASSES,
+        REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
+        program_specs,
+    )
+    .map_err(|error| FerrumError::config(error.to_string()))?;
+    policy = policy
+        .with_program_policy(program_policy)
+        .map_err(|error| FerrumError::config(error.to_string()))?;
+    Ok(VNextReusableExecutionPolicyResolution {
+        policy,
+        capture: Some(VNextReusableExecutionCaptureResolution {
+            source,
+            admission_maximum_decode_width: maximum_width,
+            requested_decode_widths,
+            effective_decode_widths,
+            reduction_reason,
+        }),
+    })
 }
 
 /// Typed lifetime policy for values observed after a terminal device fence.
@@ -263,6 +487,7 @@ pub struct VNextExecutorConfig {
     pub runtime_policy: ResolvedRuntimePolicy,
     pub device_reusable_execution_enabled: bool,
     pub reusable_execution_prefill_chunks: Vec<PrefillChunk>,
+    reusable_execution_capture_resolution: Option<VNextReusableExecutionCaptureResolution>,
     pub diagnostic_fault: Option<VNextDiagnosticFault>,
     plan_observation: VNextPlanObservationPolicy,
 }
@@ -400,20 +625,26 @@ impl VNextExecutorConfig {
                 .then_with(|| left.total_prompt_tokens().cmp(&right.total_prompt_tokens()))
         });
         reusable_execution_prefill_chunks.dedup();
-        // Stable workspace buckets are backend-independent memory policy.
-        // Device executable capture remains capability/config gated at startup.
-        let reusable_execution_policy = Some(resolve_reusable_execution_policy(
+        let device_reusable_execution_supported = descriptor
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
+        let prepare_device_programs =
+            engine.backend.enable_reusable_execution && device_reusable_execution_supported;
+        // Workspace buckets remain backend-independent capacity policy. The
+        // exact device-program matrix is attached only when this runtime will
+        // prepare it, and becomes part of the resolved policy fingerprint.
+        let reusable_execution_resolution = resolve_reusable_execution_policy(
             maximum_active_sequences,
             maximum_scheduled_tokens,
             maximum_model_tokens,
             &reusable_execution_prefill_chunks,
-        )?);
-        let execution_determinism = if engine.backend.enable_reusable_execution
-            && descriptor
-                .capabilities
-                .iter()
-                .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID)
-        {
+            &engine.backend.reusable_execution_capture,
+            prepare_device_programs,
+        )?;
+        let reusable_execution_policy = Some(reusable_execution_resolution.policy);
+        let reusable_execution_capture_resolution = reusable_execution_resolution.capture;
+        let execution_determinism = if prepare_device_programs {
             ExecutionDeterminismRequirement::BitwiseSameRuntimeWithReplay
         } else {
             ExecutionDeterminismRequirement::BitwiseSameRuntime
@@ -475,21 +706,14 @@ impl VNextExecutorConfig {
             runtime_policy,
             device_reusable_execution_enabled: engine.backend.enable_reusable_execution,
             reusable_execution_prefill_chunks,
+            reusable_execution_capture_resolution,
             diagnostic_fault,
             plan_observation,
         })
     }
 }
 
-const REUSABLE_EXECUTION_WARMUP_PASSES: usize = 1;
-const REUSABLE_EXECUTION_CAPTURE_PASSES: usize = 1;
-const REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES: usize = 1;
-// Program identity includes the exact immediate shape, so power-of-two workspace
-// buckets cannot substitute for uncaptured decode widths. Keep exact startup
-// capture independently bounded from configured concurrency.
-const REUSABLE_EXECUTION_EXACT_DECODE_WIDTH_LIMIT: usize = 32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "topology", rename_all = "snake_case")]
 enum VNextReusableExecutionDescriptor {
     UniformDecode {
@@ -522,6 +746,38 @@ impl VNextReusableExecutionDescriptor {
             request_capacity: 1,
         }
     }
+
+    fn from_program_shape(shape: ReusableExecutionProgramShape) -> Result<Self> {
+        match shape {
+            ReusableExecutionProgramShape::UniformDecode {
+                query_tokens_per_sequence,
+                token_capacity,
+                request_capacity,
+            } => Ok(Self::UniformDecode {
+                query_tokens_per_sequence: usize::try_from(query_tokens_per_sequence)
+                    .map_err(|_| FerrumError::config("vNext decode query width exceeds usize"))?,
+                token_capacity: usize::try_from(token_capacity).map_err(|_| {
+                    FerrumError::config("vNext decode token capacity exceeds usize")
+                })?,
+                request_capacity: usize::try_from(request_capacity).map_err(|_| {
+                    FerrumError::config("vNext decode request capacity exceeds usize")
+                })?,
+            }),
+            ReusableExecutionProgramShape::Prefill {
+                tokens_processed,
+                token_capacity,
+                total_prompt_tokens,
+            } => Ok(Self::Prefill {
+                tokens_processed: usize::try_from(tokens_processed)
+                    .map_err(|_| FerrumError::config("vNext prefill frontier exceeds usize"))?,
+                token_capacity: usize::try_from(token_capacity)
+                    .map_err(|_| FerrumError::config("vNext prefill capacity exceeds usize"))?,
+                total_prompt_tokens: usize::try_from(total_prompt_tokens)
+                    .map_err(|_| FerrumError::config("vNext prefill prompt exceeds usize"))?,
+                request_capacity: 1,
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -529,70 +785,27 @@ struct VNextReusableExecutionStartupPlan {
     descriptors: Vec<VNextReusableExecutionDescriptor>,
     prefill_chunks: Vec<PrefillChunk>,
     maximum_decode_sequence_tokens: usize,
+    warmup_passes: usize,
+    capture_passes: usize,
+    replay_validation_passes: usize,
+    program_policy: ReusableExecutionProgramPolicy,
+    capture_resolution: VNextReusableExecutionCaptureResolution,
     device_plan: DeviceReusableExecutionPlan,
 }
 
 impl VNextReusableExecutionStartupPlan {
     fn resolve(
-        maximum_active_sequences: u32,
-        maximum_scheduled_tokens: u64,
+        program_policy: &ReusableExecutionProgramPolicy,
+        capture_resolution: VNextReusableExecutionCaptureResolution,
         maximum_model_tokens: usize,
         prefill_chunks: &[PrefillChunk],
-        execution_node_count: usize,
+        maximum_device_executables: u64,
     ) -> Result<Self> {
-        let maximum_active_sequences = usize::try_from(maximum_active_sequences)
-            .map_err(|_| FerrumError::config("vNext active sequence limit exceeds usize"))?;
-        let maximum_scheduled_tokens = usize::try_from(maximum_scheduled_tokens)
-            .map_err(|_| FerrumError::config("vNext scheduled token limit exceeds usize"))?;
-        let maximum_width = maximum_active_sequences.min(maximum_scheduled_tokens);
-        if maximum_width == 0 {
-            return Err(FerrumError::config(
-                "vNext reusable execution requires a non-zero decode width",
-            ));
-        }
-
-        let mut anchor_decode_widths = Vec::new();
-        let mut width = 1_usize;
-        while width < maximum_width {
-            anchor_decode_widths.push(width);
-            width = width.checked_mul(2).unwrap_or(maximum_width);
-        }
-        if anchor_decode_widths.last().copied() != Some(maximum_width) {
-            anchor_decode_widths.push(maximum_width);
-        }
-        anchor_decode_widths.sort_unstable_by(|left, right| right.cmp(left));
-
-        let exact_width_limit = maximum_width.min(REUSABLE_EXECUTION_EXACT_DECODE_WIDTH_LIMIT);
-        let mut exact_decode_widths = (1..=exact_width_limit).collect::<Vec<_>>();
-        exact_decode_widths.extend(
-            anchor_decode_widths
-                .iter()
-                .copied()
-                .filter(|width| *width > exact_width_limit),
-        );
-        exact_decode_widths.sort_unstable_by(|left, right| right.cmp(left));
-        exact_decode_widths.dedup();
-
-        let passes_per_width = REUSABLE_EXECUTION_WARMUP_PASSES
-            + REUSABLE_EXECUTION_CAPTURE_PASSES
-            + REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES;
-        let exact_widths_fit_model_length = exact_decode_widths
-            .len()
-            .checked_mul(passes_per_width)
-            .and_then(|decode_tokens| decode_tokens.checked_add(1))
-            .is_some_and(|decode_tokens| decode_tokens <= maximum_model_tokens);
-        let decode_widths = if exact_widths_fit_model_length {
-            exact_decode_widths
-        } else {
-            anchor_decode_widths
-        };
-
         let mut prefill_chunks = prefill_chunks.iter().copied().collect::<Vec<_>>();
-        if prefill_chunks.iter().any(|chunk| {
-            !chunk.is_final()
-                || chunk.total_prompt_tokens() > maximum_model_tokens
-                || chunk.tokens_to_process() > maximum_scheduled_tokens
-        }) {
+        if prefill_chunks
+            .iter()
+            .any(|chunk| !chunk.is_final() || chunk.total_prompt_tokens() > maximum_model_tokens)
+        {
             return Err(FerrumError::config(
                 "vNext reusable execution prefill chunk exceeds its immutable startup limits",
             ));
@@ -606,6 +819,72 @@ impl VNextReusableExecutionStartupPlan {
         });
         prefill_chunks.dedup();
 
+        let mut descriptors = program_policy
+            .programs()
+            .iter()
+            .map(|program| {
+                let shape = program.shape();
+                let expected_class = match shape {
+                    ReusableExecutionProgramShape::UniformDecode { .. } => {
+                        UNIFORM_QUERY_REUSABLE_CLASS
+                    }
+                    ReusableExecutionProgramShape::Prefill { .. } => {
+                        PACKED_TOKEN_REUSABLE_CLASS
+                    }
+                };
+                if program.class_id().as_str() != expected_class {
+                    return Err(FerrumError::config(format!(
+                        "vNext reusable {:?} program is bound to workspace class `{}`, expected `{expected_class}`",
+                        shape,
+                        program.class_id().as_str()
+                    )));
+                }
+                VNextReusableExecutionDescriptor::from_program_shape(shape)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut decode_widths = descriptors
+            .iter()
+            .filter_map(|descriptor| match descriptor {
+                VNextReusableExecutionDescriptor::UniformDecode {
+                    query_tokens_per_sequence,
+                    token_capacity,
+                    request_capacity,
+                } if *query_tokens_per_sequence == 1 && token_capacity == request_capacity => {
+                    Some(*request_capacity)
+                }
+                VNextReusableExecutionDescriptor::UniformDecode { .. } => None,
+                VNextReusableExecutionDescriptor::Prefill { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        decode_widths.sort_unstable();
+        if decode_widths.is_empty()
+            || decode_widths
+                .iter()
+                .any(|width| *width > MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH)
+        {
+            return Err(FerrumError::config(format!(
+                "vNext reusable startup decode widths must be non-empty and within the independent hard bound 1..={MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH}"
+            )));
+        }
+        if decode_widths != capture_resolution.effective_decode_widths {
+            return Err(FerrumError::config(
+                "vNext reusable startup widths differ from the resolved program policy",
+            ));
+        }
+        decode_widths.sort_unstable_by(|left, right| right.cmp(left));
+
+        let warmup_passes = usize::try_from(program_policy.warmup_passes())
+            .map_err(|_| FerrumError::config("vNext reusable warmup passes exceed usize"))?;
+        let capture_passes = usize::try_from(program_policy.capture_passes())
+            .map_err(|_| FerrumError::config("vNext reusable capture passes exceed usize"))?;
+        let replay_validation_passes = usize::try_from(program_policy.replay_validation_passes())
+            .map_err(|_| {
+            FerrumError::config("vNext reusable replay validation passes exceed usize")
+        })?;
+        let passes_per_width = warmup_passes
+            .checked_add(capture_passes)
+            .and_then(|passes| passes.checked_add(replay_validation_passes))
+            .ok_or_else(|| FerrumError::config("vNext reusable startup passes overflow usize"))?;
         let maximum_decode_sequence_tokens = decode_widths
             .len()
             .checked_mul(passes_per_width)
@@ -617,34 +896,66 @@ impl VNextReusableExecutionStartupPlan {
             )));
         }
 
-        let descriptors = decode_widths
+        let expected_prefill_descriptors = prefill_chunks
             .iter()
             .copied()
-            .map(VNextReusableExecutionDescriptor::uniform_decode)
-            .chain(
-                prefill_chunks
-                    .iter()
-                    .copied()
-                    .map(VNextReusableExecutionDescriptor::prefill),
-            )
-            .collect::<Vec<_>>();
-
-        let prefill_wave_shapes = prefill_chunks
+            .flat_map(|chunk| {
+                let prefix = (chunk.tokens_processed() > 0).then(|| {
+                    VNextReusableExecutionDescriptor::Prefill {
+                        tokens_processed: 0,
+                        token_capacity: chunk.tokens_processed(),
+                        total_prompt_tokens: chunk.total_prompt_tokens(),
+                        request_capacity: 1,
+                    }
+                });
+                prefix
+                    .into_iter()
+                    .chain([Self::descriptor_for_chunk(chunk)])
+            })
+            .collect::<BTreeSet<_>>();
+        let resolved_prefill_descriptors = descriptors
             .iter()
-            .map(|chunk| usize::from(chunk.tokens_processed() > 0) + 1)
-            .sum::<usize>();
-        let maximum_executables = execution_node_count
-            .max(1)
-            .checked_mul(decode_widths.len().saturating_add(prefill_wave_shapes))
-            .ok_or_else(|| FerrumError::config("vNext reusable executable capacity overflowed"))?;
+            .copied()
+            .filter(|descriptor| {
+                matches!(descriptor, VNextReusableExecutionDescriptor::Prefill { .. })
+            })
+            .collect::<BTreeSet<_>>();
+        if expected_prefill_descriptors != resolved_prefill_descriptors {
+            return Err(FerrumError::config(
+                "vNext reusable prefill startup work differs from the resolved program policy",
+            ));
+        }
+        descriptors.sort_unstable();
+        let decode_descriptor_count = descriptors
+            .iter()
+            .take_while(|descriptor| {
+                matches!(
+                    descriptor,
+                    VNextReusableExecutionDescriptor::UniformDecode { .. }
+                )
+            })
+            .count();
+        descriptors[..decode_descriptor_count].reverse();
+
+        let maximum_executables = usize::try_from(maximum_device_executables)
+            .map_err(|_| FerrumError::config("vNext reusable executable capacity exceeds usize"))?;
         let device_plan = DeviceReusableExecutionPlan::new(maximum_executables)
             .map_err(|error| FerrumError::config(error.to_string()))?;
         Ok(Self {
             descriptors,
             prefill_chunks,
             maximum_decode_sequence_tokens,
+            warmup_passes,
+            capture_passes,
+            replay_validation_passes,
+            program_policy: program_policy.clone(),
+            capture_resolution,
             device_plan,
         })
+    }
+
+    const fn descriptor_for_chunk(chunk: PrefillChunk) -> VNextReusableExecutionDescriptor {
+        VNextReusableExecutionDescriptor::prefill(chunk)
     }
 
     fn decode_widths(&self) -> Vec<usize> {
@@ -681,17 +992,47 @@ impl VNextReusableExecutionStartupPlan {
             .sum()
     }
 
-    fn widths_for_available_sequences(&self, available: usize) -> Vec<usize> {
-        let mut widths = self
-            .decode_widths()
-            .into_iter()
-            .filter(|width| *width <= available)
-            .collect::<Vec<_>>();
-        if available > 0 && !widths.contains(&available) {
-            widths.insert(0, available);
-        }
-        widths
+    fn decode_catalog_omits_admitted_widths(&self) -> bool {
+        self.capture_resolution
+            .effective_decode_widths
+            .iter()
+            .copied()
+            .ne(1..=self.capture_resolution.admission_maximum_decode_width)
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VNextReusableExecutionCatalogProgramReceipt {
+    program_id: DeviceReusableExecutionProgramId,
+    program_fingerprint: String,
+    state: DeviceReusableExecutionProgramState,
+    node_count: u32,
+    eager_boundary_node_indices: Vec<u32>,
+    resident_segments: Vec<DeviceReusableExecutionSegment>,
+    per_wave_binding_node_indices: Vec<u32>,
+    gaps: Vec<DeviceReusableExecutionProgramGap>,
+}
+
+impl VNextReusableExecutionCatalogProgramReceipt {
+    fn from_program(program: &DeviceReusableExecutionProgram) -> Self {
+        Self {
+            program_id: program.program_id().clone(),
+            program_fingerprint: program.program_id().fingerprint(),
+            state: program.state(),
+            node_count: program.node_count(),
+            eager_boundary_node_indices: program.eager_boundary_node_indices().to_vec(),
+            resident_segments: program.segments().to_vec(),
+            per_wave_binding_node_indices: program.per_wave_binding_node_indices().to_vec(),
+            gaps: program.gaps().to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VNextReusableExecutionCaptureCaseReceipt {
+    descriptor: VNextReusableExecutionDescriptor,
+    observed_program_fingerprints: Vec<String>,
+    resident_program_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -699,8 +1040,14 @@ struct VNextReusableExecutionStartupReport {
     enabled: bool,
     supported: bool,
     eager_fallback_required: bool,
+    resolved_runtime_policy_fingerprint: String,
+    resolved_program_policy: Option<ReusableExecutionProgramPolicy>,
+    decode_width_resolution: Option<VNextReusableExecutionCaptureResolution>,
+    maximum_device_executables: usize,
     requested_descriptors: Vec<VNextReusableExecutionDescriptor>,
     prepared_descriptors: Vec<VNextReusableExecutionDescriptor>,
+    capture_case_receipts: Vec<VNextReusableExecutionCaptureCaseReceipt>,
+    catalog_programs: Vec<VNextReusableExecutionCatalogProgramReceipt>,
     requested_decode_widths: Vec<usize>,
     prepared_decode_widths: Vec<usize>,
     requested_prefill_token_counts: Vec<usize>,
@@ -740,6 +1087,16 @@ fn reusable_execution_program_catalog_is_usable(
     prepared_programs: usize,
 ) -> bool {
     preparation.resident_executables() == 0 || prepared_programs != 0
+}
+
+fn reusable_startup_case_budget_violation<'a, D: Ord, P: Ord>(
+    requested_cases: &BTreeSet<D>,
+    observed_programs: &'a BTreeMap<D, BTreeSet<P>>,
+) -> Option<(&'a D, usize)> {
+    observed_programs
+        .iter()
+        .find(|(case, programs)| !requested_cases.contains(*case) || programs.len() > 1)
+        .map(|(case, programs)| (case, programs.len()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -812,6 +1169,130 @@ struct VNextReusableExecutionCatalog {
     programs: BTreeMap<DeviceReusableExecutionProgramId, DeviceReusableExecutionProgram>,
 }
 
+const MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VNextReusableExecutionCatalogMissReason {
+    ProgramIdentityUnavailable,
+    CatalogEmpty,
+    ProgramAbsent,
+    ProgramNonResident,
+    EpochMismatch,
+}
+
+impl VNextReusableExecutionCatalogMissReason {
+    const fn is_epoch_mismatch(self) -> bool {
+        matches!(self, Self::EpochMismatch)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+struct VNextReusableExecutionCatalogMissKey {
+    immediate_sequences: u32,
+    immediate_tokens: u64,
+    immediate_pages: u64,
+    topology_fingerprint: DeviceReusableExecutionTopologyFingerprint,
+    reason: VNextReusableExecutionCatalogMissReason,
+}
+
+impl VNextReusableExecutionCatalogMissKey {
+    fn from_program_id(
+        program_id: &DeviceReusableExecutionProgramId,
+        reason: VNextReusableExecutionCatalogMissReason,
+    ) -> Self {
+        Self {
+            immediate_sequences: program_id.immediate_sequences(),
+            immediate_tokens: program_id.immediate_tokens(),
+            immediate_pages: program_id.immediate_pages(),
+            topology_fingerprint: program_id.topology_fingerprint(),
+            reason,
+        }
+    }
+
+    fn without_program_identity(
+        work_shape: &BatchWorkShape,
+        reason: VNextReusableExecutionCatalogMissReason,
+    ) -> Self {
+        Self {
+            immediate_sequences: work_shape.immediate_sequences(),
+            immediate_tokens: work_shape.immediate_tokens(),
+            immediate_pages: work_shape.immediate_pages(),
+            topology_fingerprint: DeviceReusableExecutionTopologyFingerprint::static_program(),
+            reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VNextReusableExecutionCatalogMissRow {
+    key: VNextReusableExecutionCatalogMissKey,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VNextReusableExecutionCatalogMissOverflowRow {
+    reason: VNextReusableExecutionCatalogMissReason,
+    count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VNextReusableExecutionCatalogMissSnapshot {
+    maximum_distinct_keys: usize,
+    distinct_keys: usize,
+    rows: Vec<VNextReusableExecutionCatalogMissRow>,
+    overflow: Vec<VNextReusableExecutionCatalogMissOverflowRow>,
+}
+
+#[derive(Default)]
+struct VNextReusableExecutionCatalogMissLedger {
+    counts: BTreeMap<VNextReusableExecutionCatalogMissKey, u64>,
+    overflow: BTreeMap<VNextReusableExecutionCatalogMissReason, u64>,
+}
+
+impl VNextReusableExecutionCatalogMissLedger {
+    fn record(&mut self, key: VNextReusableExecutionCatalogMissKey) {
+        if let Some(count) = self.counts.get_mut(&key) {
+            *count = count.saturating_add(1);
+        } else if self.counts.len() < MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS {
+            self.counts.insert(key, 1);
+        } else {
+            let count = self.overflow.entry(key.reason).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> VNextReusableExecutionCatalogMissSnapshot {
+        VNextReusableExecutionCatalogMissSnapshot {
+            maximum_distinct_keys: MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
+            distinct_keys: self.counts.len(),
+            rows: self
+                .counts
+                .iter()
+                .map(|(key, count)| VNextReusableExecutionCatalogMissRow {
+                    key: *key,
+                    count: *count,
+                })
+                .collect(),
+            overflow: self
+                .overflow
+                .iter()
+                .map(
+                    |(reason, count)| VNextReusableExecutionCatalogMissOverflowRow {
+                        reason: *reason,
+                        count: *count,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.counts.clear();
+        self.overflow.clear();
+    }
+}
+
 #[derive(Default)]
 struct VNextExecutorMetrics {
     prefill_operations: AtomicU64,
@@ -828,6 +1309,7 @@ struct VNextExecutorMetrics {
     direct_reusable_fallbacks: AtomicU64,
     reusable_catalog_misses: AtomicU64,
     reusable_catalog_epoch_misses: AtomicU64,
+    reusable_catalog_miss_ledger: Mutex<VNextReusableExecutionCatalogMissLedger>,
     identity_waves: AtomicU64,
     identity_logical_nodes: AtomicU64,
     identity_nodes_materialized_before_submit: AtomicU64,
@@ -1724,6 +2206,16 @@ impl VNextExecutorMetrics {
         *self.last_failure.lock() = Some(message.into());
     }
 
+    fn record_reusable_catalog_miss(&self, key: VNextReusableExecutionCatalogMissKey) {
+        if key.reason.is_epoch_mismatch() {
+            self.reusable_catalog_epoch_misses
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.reusable_catalog_misses.fetch_add(1, Ordering::Relaxed);
+        }
+        self.reusable_catalog_miss_ledger.lock().record(key);
+    }
+
     fn average_ms(total_us: u64, operations: u64) -> f64 {
         if operations == 0 {
             0.0
@@ -1775,6 +2267,7 @@ impl VNextExecutorMetrics {
         }
         self.wave_timing.reset();
         self.prepared_wave_topology.reset();
+        self.reusable_catalog_miss_ledger.lock().reset();
         self.prefill_wave_timing.reset();
         self.decode_wave_timing.reset();
         self.device_timing.reset();
@@ -3415,6 +3908,9 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     reusable_execution_supported: bool,
     reusable_execution_startup_plan: Option<VNextReusableExecutionStartupPlan>,
     reusable_execution_catalog: OnceLock<VNextReusableExecutionCatalog>,
+    startup_reusable_programs: Mutex<
+        BTreeMap<VNextReusableExecutionDescriptor, BTreeSet<DeviceReusableExecutionProgramId>>,
+    >,
     startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
@@ -3916,12 +4412,35 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
         let reusable_execution_startup_plan =
             if config.device_reusable_execution_enabled && reusable_execution_supported {
+                let reusable_memory = resolved_plan
+                    .execution_plan()
+                    .payload()
+                    .memory()
+                    .reusable_execution()
+                    .ok_or_else(|| {
+                        FerrumError::internal(
+                            "vNext reusable execution is enabled without a resolved memory plan",
+                        )
+                    })?;
+                let program_policy = reusable_memory.program_policy().ok_or_else(|| {
+                    FerrumError::internal(
+                        "vNext reusable execution is enabled without a resolved program policy",
+                    )
+                })?;
+                let capture_resolution = config
+                    .reusable_execution_capture_resolution
+                    .clone()
+                    .ok_or_else(|| {
+                        FerrumError::internal(
+                        "vNext reusable execution is enabled without capture resolution evidence",
+                    )
+                    })?;
                 Some(VNextReusableExecutionStartupPlan::resolve(
-                    config.runtime_policy.memory().maximum_active_sequences,
-                    config.runtime_policy.admission().maximum_scheduled_tokens,
+                    program_policy,
+                    capture_resolution,
                     config.maximum_model_tokens,
                     &config.reusable_execution_prefill_chunks,
-                    resolved_plan.execution_plan().payload().nodes().len(),
+                    reusable_memory.maximum_device_executables(),
                 )?)
             } else {
                 None
@@ -3963,6 +4482,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             reusable_execution_supported,
             reusable_execution_startup_plan,
             reusable_execution_catalog: OnceLock::new(),
+            startup_reusable_programs: Mutex::new(BTreeMap::new()),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
             event_sink: RwLock::new(None),
@@ -4086,7 +4606,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             chunk,
         )?;
         match self
-            .execute_plan_runtime_prefill_with_capacity(&input)
+            .execute_plan_runtime_prefill_with_capacity_policy(
+                &input,
+                VNextPrefillFrontierPolicy::ExactStartup,
+            )
             .await?
         {
             PlanRuntimePrefillOutcome::Completed(completion) => {
@@ -4238,8 +4761,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 supported: self.reusable_execution_supported,
                 eager_fallback_required: self.device_reusable_execution_enabled
                     && !self.reusable_execution_supported,
+                resolved_runtime_policy_fingerprint: self.policy.fingerprint_str().to_owned(),
+                resolved_program_policy: None,
+                decode_width_resolution: None,
+                maximum_device_executables: 0,
                 requested_descriptors: Vec::new(),
                 prepared_descriptors: Vec::new(),
+                capture_case_receipts: Vec::new(),
+                catalog_programs: Vec::new(),
                 requested_decode_widths: Vec::new(),
                 prepared_decode_widths: Vec::new(),
                 requested_prefill_token_counts: Vec::new(),
@@ -4260,7 +4789,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let requested_decode_widths = plan.decode_widths();
         let requested_prefill_chunks = plan.prefill_chunks();
         let requested_prefill_token_counts = plan.prefill_token_counts();
-        for _ in 0..REUSABLE_EXECUTION_WARMUP_PASSES {
+        for _ in 0..plan.warmup_passes {
             for chunk in requested_prefill_chunks.iter().copied() {
                 self.execute_startup_prefill_request(chunk, "eager prefill warmup")
                     .await?;
@@ -4273,6 +4802,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         let requested_sequences = requested_decode_widths.first().copied().ok_or_else(|| {
             FerrumError::internal("vNext reusable execution plan has no decode widths")
         })?;
+        if requested_sequences > MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH {
+            return Err(FerrumError::config(format!(
+                "vNext reusable startup requested {requested_sequences} synthetic sequences, exceeding the independent hard bound {MAXIMUM_REUSABLE_EXECUTION_STARTUP_CAPTURE_WIDTH}"
+            )));
+        }
         for _ in 0..requested_sequences {
             if !self
                 .admit_startup_sequence(
@@ -4285,14 +4819,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 break;
             }
         }
-        if resources.sequences.is_empty() {
+        if resources.sequences.len() != requested_sequences {
             return Err(FerrumError::resource_exhausted(
-                "vNext reusable execution startup could not admit one synthetic sequence",
+                format!(
+                    "vNext reusable execution startup admitted {} of {requested_sequences} synthetic sequences; refusing to shrink the fingerprinted exact matrix",
+                    resources.sequences.len()
+                ),
             ));
         }
-        let prepared_decode_widths = plan.widths_for_available_sequences(resources.sequences.len());
+        let prepared_decode_widths = requested_decode_widths.clone();
 
-        for _ in 0..REUSABLE_EXECUTION_WARMUP_PASSES {
+        for _ in 0..plan.warmup_passes {
             for width in prepared_decode_widths.iter().copied() {
                 self.execute_startup_decode_pass(
                     &mut resources,
@@ -4319,7 +4856,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             )));
         }
 
-        for _ in 0..REUSABLE_EXECUTION_CAPTURE_PASSES {
+        for _ in 0..plan.capture_passes {
             for width in prepared_decode_widths.iter().copied() {
                 self.execute_startup_decode_pass(&mut resources, input_token, width, "capture")
                     .await?;
@@ -4341,7 +4878,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext reusable execution capture receipt is incomplete: {captured:?}"
             )));
         }
-        for _ in 0..REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES {
+        for _ in 0..plan.replay_validation_passes {
             for width in prepared_decode_widths.iter().copied() {
                 self.execute_startup_decode_pass(
                     &mut resources,
@@ -4372,51 +4909,57 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         resources.complete()?;
 
         let mut captured = replayed;
-        for chunk in requested_prefill_chunks.iter().copied() {
-            self.execute_startup_prefill_request(chunk, "prefill capture")
-                .await?;
-            let prefill_captured =
-                self.lane
-                    .reusable_executable_preparation()
-                    .map_err(|error| {
-                        FerrumError::device(format!(
-                            "vNext {:?} prefill capture inspection failed: {error}",
-                            chunk.range()
-                        ))
-                    })?;
-            if prefill_captured.state() != DeviceReusableExecutionPreparationState::Preparing
-                || prefill_captured.captured_executables()
-                    != prefill_captured.uploaded_executables()
-                || prefill_captured.uploaded_executables()
-                    != prefill_captured.resident_executables()
-                || prefill_captured.captured_executables() < captured.captured_executables()
-            {
-                return Err(FerrumError::device(format!(
-                    "vNext {:?} prefill capture receipt is incomplete: before={captured:?}, after={prefill_captured:?}",
-                    chunk.range()
-                )));
+        for _ in 0..plan.capture_passes {
+            for chunk in requested_prefill_chunks.iter().copied() {
+                self.execute_startup_prefill_request(chunk, "prefill capture")
+                    .await?;
+                let prefill_captured =
+                    self.lane
+                        .reusable_executable_preparation()
+                        .map_err(|error| {
+                            FerrumError::device(format!(
+                                "vNext {:?} prefill capture inspection failed: {error}",
+                                chunk.range()
+                            ))
+                        })?;
+                if prefill_captured.state() != DeviceReusableExecutionPreparationState::Preparing
+                    || prefill_captured.captured_executables()
+                        != prefill_captured.uploaded_executables()
+                    || prefill_captured.uploaded_executables()
+                        != prefill_captured.resident_executables()
+                    || prefill_captured.captured_executables() < captured.captured_executables()
+                {
+                    return Err(FerrumError::device(format!(
+                        "vNext {:?} prefill capture receipt is incomplete: before={captured:?}, after={prefill_captured:?}",
+                        chunk.range()
+                    )));
+                }
+                captured = prefill_captured;
             }
+        }
 
-            self.execute_startup_prefill_request(chunk, "fresh-request prefill replay")
-                .await?;
-            let prefill_replayed =
-                self.lane
-                    .reusable_executable_preparation()
-                    .map_err(|error| {
-                        FerrumError::device(format!(
+        for _ in 0..plan.replay_validation_passes {
+            for chunk in requested_prefill_chunks.iter().copied() {
+                self.execute_startup_prefill_request(chunk, "fresh-request prefill replay")
+                    .await?;
+                let prefill_replayed =
+                    self.lane
+                        .reusable_executable_preparation()
+                        .map_err(|error| {
+                            FerrumError::device(format!(
                             "vNext {:?} fresh-request prefill replay inspection failed: {error}",
                             chunk.range()
                         ))
-                    })?;
-            if prefill_replayed.state() != DeviceReusableExecutionPreparationState::Preparing
-                || !reusable_executable_inventory_matches(prefill_captured, prefill_replayed)
-            {
-                return Err(FerrumError::device(format!(
-                    "vNext {:?} fresh-request prefill replay changed executable state: before={prefill_captured:?}, after={prefill_replayed:?}",
-                    chunk.range()
-                )));
+                        })?;
+                if prefill_replayed.state() != DeviceReusableExecutionPreparationState::Preparing
+                    || !reusable_executable_inventory_matches(captured, prefill_replayed)
+                {
+                    return Err(FerrumError::device(format!(
+                        "vNext {:?} fresh-request prefill replay changed executable state: before={captured:?}, after={prefill_replayed:?}",
+                        chunk.range()
+                    )));
+                }
             }
-            captured = prefill_replayed;
         }
 
         let device_preparation = self.lane.seal_reusable_executables().map_err(|error| {
@@ -4458,6 +5001,38 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 ));
             }
         }
+        if catalog_by_id.len() > plan.program_policy.programs().len() {
+            return Err(FerrumError::internal(format!(
+                "vNext reusable execution observed {} physical programs for {} budgeted startup capture cases",
+                catalog_by_id.len(),
+                plan.program_policy.programs().len()
+            )));
+        }
+        let startup_programs = self.startup_reusable_programs.lock().clone();
+        let requested_descriptor_set = requested_descriptors
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if let Some((descriptor, observed_program_count)) =
+            reusable_startup_case_budget_violation(&requested_descriptor_set, &startup_programs)
+        {
+            return Err(FerrumError::internal(format!(
+                "vNext reusable startup case {descriptor:?} observed {} physical variants; the resolved policy budgets exactly one",
+                observed_program_count
+            )));
+        }
+        let observed_program_ids = startup_programs
+            .values()
+            .flat_map(|programs| programs.iter())
+            .collect::<BTreeSet<_>>();
+        if catalog_by_id
+            .keys()
+            .any(|program_id| !observed_program_ids.contains(program_id))
+        {
+            return Err(FerrumError::internal(
+                "vNext reusable execution catalog contains a physical program not observed by a resolved startup capture case",
+            ));
+        }
         let prepared_programs = catalog_by_id
             .values()
             .filter(|program| program.has_resident_segments())
@@ -4468,6 +5043,81 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 device_preparation.resident_executables()
             )));
         }
+        let catalog_programs = catalog_by_id
+            .values()
+            .map(VNextReusableExecutionCatalogProgramReceipt::from_program)
+            .collect::<Vec<_>>();
+        let capture_case_receipts = requested_descriptors
+            .iter()
+            .copied()
+            .map(|descriptor| {
+                let observed = startup_programs.get(&descriptor);
+                let observed_program_fingerprints = observed
+                    .into_iter()
+                    .flat_map(|programs| programs.iter())
+                    .map(DeviceReusableExecutionProgramId::fingerprint)
+                    .collect::<Vec<_>>();
+                let resident_program_fingerprints = observed
+                    .into_iter()
+                    .flat_map(|programs| programs.iter())
+                    .filter(|program_id| {
+                        catalog_by_id
+                            .get(*program_id)
+                            .is_some_and(DeviceReusableExecutionProgram::has_resident_segments)
+                    })
+                    .map(DeviceReusableExecutionProgramId::fingerprint)
+                    .collect::<Vec<_>>();
+                VNextReusableExecutionCaptureCaseReceipt {
+                    descriptor,
+                    observed_program_fingerprints,
+                    resident_program_fingerprints,
+                }
+            })
+            .collect::<Vec<_>>();
+        let prepared_descriptors = capture_case_receipts
+            .iter()
+            .filter(|receipt| !receipt.resident_program_fingerprints.is_empty())
+            .map(|receipt| receipt.descriptor)
+            .collect::<Vec<_>>();
+        let prepared_descriptor_set = prepared_descriptors
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let resident_prepared_decode_widths = prepared_descriptors
+            .iter()
+            .filter_map(|descriptor| match descriptor {
+                VNextReusableExecutionDescriptor::UniformDecode {
+                    request_capacity, ..
+                } => Some(*request_capacity),
+                VNextReusableExecutionDescriptor::Prefill { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let prepared_prefill_chunks = requested_prefill_chunks
+            .iter()
+            .copied()
+            .filter(|chunk| {
+                let main = VNextReusableExecutionStartupPlan::descriptor_for_chunk(*chunk);
+                if !prepared_descriptor_set.contains(&main) {
+                    return false;
+                }
+                if chunk.tokens_processed() == 0 {
+                    return true;
+                }
+                prepared_descriptor_set.contains(&VNextReusableExecutionDescriptor::Prefill {
+                    tokens_processed: 0,
+                    token_capacity: chunk.tokens_processed(),
+                    total_prompt_tokens: chunk.total_prompt_tokens(),
+                    request_capacity: 1,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut prepared_prefill_token_counts = prepared_prefill_chunks
+            .iter()
+            .map(|chunk| chunk.tokens_to_process())
+            .collect::<Vec<_>>();
+        prepared_prefill_token_counts.sort_unstable_by(|left, right| right.cmp(left));
+        prepared_prefill_token_counts.dedup();
+        let incomplete_capture_cases = prepared_descriptors.len() != requested_descriptors.len();
         self.reusable_execution_catalog
             .set(VNextReusableExecutionCatalog {
                 lane_epoch: catalog_epoch,
@@ -4476,35 +5126,31 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .map_err(|_| {
                 FerrumError::internal("vNext reusable execution catalog was already installed")
             })?;
-        let prepared_descriptors = prepared_decode_widths
-            .iter()
-            .copied()
-            .map(VNextReusableExecutionDescriptor::uniform_decode)
-            .chain(
-                requested_prefill_chunks
-                    .iter()
-                    .copied()
-                    .map(VNextReusableExecutionDescriptor::prefill),
-            )
-            .collect::<Vec<_>>();
-        let prepared_wave_shapes = prepared_decode_widths.len() + plan.prefill_wave_shapes();
+        let requested_wave_shapes = prepared_decode_widths.len() + plan.prefill_wave_shapes();
         Ok(VNextReusableExecutionStartupReport {
             enabled: true,
             supported: true,
-            eager_fallback_required: reusable_execution_requires_eager_fallback(device_preparation),
+            eager_fallback_required: reusable_execution_requires_eager_fallback(device_preparation)
+                || plan.decode_catalog_omits_admitted_widths()
+                || incomplete_capture_cases,
+            resolved_runtime_policy_fingerprint: self.policy.fingerprint_str().to_owned(),
+            resolved_program_policy: Some(plan.program_policy.clone()),
+            decode_width_resolution: Some(plan.capture_resolution.clone()),
+            maximum_device_executables: plan.device_plan.maximum_executables(),
             requested_descriptors,
             prepared_descriptors,
+            capture_case_receipts,
+            catalog_programs,
             requested_decode_widths,
-            prepared_decode_widths: prepared_decode_widths.clone(),
+            prepared_decode_widths: resident_prepared_decode_widths,
             requested_prefill_token_counts: requested_prefill_token_counts.clone(),
-            prepared_prefill_token_counts: requested_prefill_token_counts,
+            prepared_prefill_token_counts,
             requested_prefill_chunks: requested_prefill_chunks.clone(),
-            prepared_prefill_chunks: requested_prefill_chunks,
+            prepared_prefill_chunks,
             synthetic_sequences,
-            eager_warmup_waves: prepared_wave_shapes * REUSABLE_EXECUTION_WARMUP_PASSES,
-            capture_waves: prepared_wave_shapes * REUSABLE_EXECUTION_CAPTURE_PASSES,
-            replay_inventory_check_waves: prepared_wave_shapes
-                * REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES,
+            eager_warmup_waves: requested_wave_shapes * plan.warmup_passes,
+            capture_waves: requested_wave_shapes * plan.capture_passes,
+            replay_inventory_check_waves: requested_wave_shapes * plan.replay_validation_passes,
             prepared_programs,
             device_preparation,
             elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -5780,6 +6426,50 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         )
     }
 
+    fn startup_reusable_descriptor(
+        participants: &[VNextExecutionParticipant<'_, R>],
+        kind: VNextExecutionWaveKind,
+    ) -> Option<VNextReusableExecutionDescriptor> {
+        match kind {
+            VNextExecutionWaveKind::Decode
+                if !participants.is_empty()
+                    && participants
+                        .iter()
+                        .all(|participant| participant.span.immediate_tokens() == 1) =>
+            {
+                Some(VNextReusableExecutionDescriptor::uniform_decode(
+                    participants.len(),
+                ))
+            }
+            VNextExecutionWaveKind::Prefill if participants.len() == 1 => {
+                let participant = &participants[0];
+                let range = participant.span.immediate_token_range();
+                Some(VNextReusableExecutionDescriptor::Prefill {
+                    tokens_processed: usize::try_from(range.start).ok()?,
+                    token_capacity: usize::try_from(range.end.checked_sub(range.start)?).ok()?,
+                    total_prompt_tokens: participant.tokens.len(),
+                    request_capacity: 1,
+                })
+            }
+            VNextExecutionWaveKind::Prefill | VNextExecutionWaveKind::Decode => None,
+        }
+    }
+
+    fn record_startup_reusable_program(
+        &self,
+        participants: &[VNextExecutionParticipant<'_, R>],
+        kind: VNextExecutionWaveKind,
+        program_id: &DeviceReusableExecutionProgramId,
+    ) {
+        if let Some(descriptor) = Self::startup_reusable_descriptor(participants, kind) {
+            self.startup_reusable_programs
+                .lock()
+                .entry(descriptor)
+                .or_default()
+                .insert(program_id.clone());
+        }
+    }
+
     fn product_token_mask(
         &self,
         participant: &VNextExecutionParticipant<'_, R>,
@@ -6035,11 +6725,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             };
             let device_timing_mode = self.device_timing_mode();
             let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
-            let mut reusable_catalog_miss = false;
-            let mut reusable_catalog_epoch_miss = false;
-            let reusable_program = if !device_timing_mode.direct_reusable_execution_allowed()
-                || reusable_direct_attempted
-            {
+            let mut reusable_catalog_miss = None;
+            let reusable_program = if !reusable_catalog_lookup_allowed(
+                self.reusable_execution_startup_plan.is_some(),
+                device_timing_mode.direct_reusable_execution_allowed(),
+                reusable_direct_attempted,
+            ) {
                 None
             } else {
                 let program_id = match OperationDispatch::reusable_execution_program_id_for_wave(
@@ -6053,23 +6744,65 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return DispatchOutcome::QuiescentFailure(error.to_string());
                     }
                 };
-                match (program_id, self.reusable_execution_catalog.get()) {
-                    (Some(_), Some(catalog))
-                        if !catalog.programs.is_empty()
-                            && catalog.lane_epoch != self.lane.reusable_execution_epoch() =>
-                    {
-                        reusable_catalog_epoch_miss = true;
+                let catalog = self.reusable_execution_catalog.get();
+                match program_id {
+                    Some(program_id) => {
+                        if catalog.is_none() {
+                            self.record_startup_reusable_program(participants, kind, &program_id);
+                        }
+                        match catalog {
+                            Some(catalog)
+                                if catalog.lane_epoch != self.lane.reusable_execution_epoch() =>
+                            {
+                                reusable_catalog_miss =
+                                    Some(VNextReusableExecutionCatalogMissKey::from_program_id(
+                                        &program_id,
+                                        VNextReusableExecutionCatalogMissReason::EpochMismatch,
+                                    ));
+                                None
+                            }
+                            Some(catalog) if catalog.programs.is_empty() => {
+                                reusable_catalog_miss =
+                                    Some(VNextReusableExecutionCatalogMissKey::from_program_id(
+                                        &program_id,
+                                        VNextReusableExecutionCatalogMissReason::CatalogEmpty,
+                                    ));
+                                None
+                            }
+                            Some(catalog) => match catalog.programs.get(&program_id) {
+                                Some(program) if program.has_resident_segments() => Some(program),
+                                Some(_) => {
+                                    reusable_catalog_miss = Some(
+                                        VNextReusableExecutionCatalogMissKey::from_program_id(
+                                            &program_id,
+                                            VNextReusableExecutionCatalogMissReason::ProgramNonResident,
+                                        ),
+                                    );
+                                    None
+                                }
+                                None => {
+                                    reusable_catalog_miss = Some(
+                                        VNextReusableExecutionCatalogMissKey::from_program_id(
+                                            &program_id,
+                                            VNextReusableExecutionCatalogMissReason::ProgramAbsent,
+                                        ),
+                                    );
+                                    None
+                                }
+                            },
+                            None => None,
+                        }
+                    }
+                    None if catalog.is_some() => {
+                        reusable_catalog_miss = Some(
+                            VNextReusableExecutionCatalogMissKey::without_program_identity(
+                                wave.claimed_backing().work_shape(),
+                                VNextReusableExecutionCatalogMissReason::ProgramIdentityUnavailable,
+                            ),
+                        );
                         None
                     }
-                    (Some(program_id), Some(catalog)) if !catalog.programs.is_empty() => {
-                        let program = catalog
-                            .programs
-                            .get(&program_id)
-                            .filter(|program| program.has_resident_segments());
-                        reusable_catalog_miss = program.is_none();
-                        program
-                    }
-                    _ => None,
+                    None => None,
                 }
             };
             reusable_direct_attempted |= reusable_program.is_some();
@@ -6189,14 +6922,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         self.metrics
                             .direct_reusable_binding_nodes
                             .fetch_add(binding_nodes, Ordering::Relaxed);
-                    } else if reusable_catalog_miss {
-                        self.metrics
-                            .reusable_catalog_misses
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else if reusable_catalog_epoch_miss {
-                        self.metrics
-                            .reusable_catalog_epoch_misses
-                            .fetch_add(1, Ordering::Relaxed);
+                    } else if let Some(miss) = reusable_catalog_miss {
+                        self.metrics.record_reusable_catalog_miss(miss);
                     }
                     return DispatchOutcome::Submitted {
                         completion,
@@ -7433,6 +8160,18 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         &self,
         input: &PlanRuntimePrefillInput,
     ) -> Result<PlanRuntimePrefillOutcome> {
+        self.execute_plan_runtime_prefill_with_capacity_policy(
+            input,
+            VNextPrefillFrontierPolicy::Adaptive,
+        )
+        .await
+    }
+
+    async fn execute_plan_runtime_prefill_with_capacity_policy(
+        &self,
+        input: &PlanRuntimePrefillInput,
+        frontier_policy: VNextPrefillFrontierPolicy,
+    ) -> Result<PlanRuntimePrefillOutcome> {
         let started = Instant::now();
         let request_id = input.request_id.clone();
         let tokens = input
@@ -7502,6 +8241,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     execution.restore_ready()?;
                     return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
                 };
+                if frontier_policy == VNextPrefillFrontierPolicy::ExactStartup {
+                    execution.restore_ready()?;
+                    return Err(FerrumError::resource_exhausted(format!(
+                        "vNext reusable startup prefill {:?} would narrow to {next_tokens} tokens before submission; refusing to capture a shape outside the resolved matrix",
+                        completed_chunk.range()
+                    )));
+                }
                 capacity_probe_count = capacity_probe_count.checked_add(1).ok_or_else(|| {
                     FerrumError::internal("vNext prefill capacity probe count overflow")
                 })?;
@@ -7541,6 +8287,13 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         execution.restore_ready()?;
                         return Ok(PlanRuntimePrefillOutcome::Deferred(deferred.into()));
                     };
+                    if frontier_policy == VNextPrefillFrontierPolicy::ExactStartup {
+                        execution.restore_ready()?;
+                        return Err(FerrumError::resource_exhausted(format!(
+                            "vNext reusable startup prefill {:?} would narrow to {next_tokens} tokens before submission; refusing to capture a shape outside the resolved matrix",
+                            completed_chunk.range()
+                        )));
+                    }
                     capacity_probe_count =
                         capacity_probe_count.checked_add(1).ok_or_else(|| {
                             FerrumError::internal("vNext prefill capacity probe count overflow")
@@ -8189,6 +8942,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     "direct_fallbacks": self.metrics.direct_reusable_fallbacks.load(Ordering::Relaxed),
                     "catalog_misses": self.metrics.reusable_catalog_misses.load(Ordering::Relaxed),
                     "catalog_epoch_misses": self.metrics.reusable_catalog_epoch_misses.load(Ordering::Relaxed),
+                    "catalog_miss_ledger": self.metrics.reusable_catalog_miss_ledger.lock().snapshot(),
                 },
                 "identity_materialization": {
                     "waves": self.metrics.identity_waves.load(Ordering::Relaxed),
@@ -8905,6 +9659,7 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::Duration;
 
     use super::{
@@ -8913,14 +9668,18 @@ mod tests {
         nonterminal_completion_message, normalized_product_token_mask,
         product_output_mode_for_policies, product_repetition_input, reported_allocated_bytes,
         resolve_reusable_execution_policy, resolve_runtime_attention_authority,
-        resolved_sequence_fit_policy, reusable_executable_inventory_matches,
-        reusable_execution_program_catalog_is_usable, reusable_execution_requires_eager_fallback,
+        resolved_sequence_fit_policy, reusable_catalog_lookup_allowed,
+        reusable_executable_inventory_matches, reusable_execution_program_catalog_is_usable,
+        reusable_execution_requires_eager_fallback, reusable_startup_case_budget_violation,
         submission_execution_policy_for_timing, validate_sequence_completion_accounting,
         AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
         VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
-        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextReusableExecutionDescriptor,
+        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
+        VNextReusableExecutionCatalogMissKey, VNextReusableExecutionCatalogMissLedger,
+        VNextReusableExecutionCatalogMissReason, VNextReusableExecutionDescriptor,
         VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
         VNextTeacherForcedDecision, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
     };
     use ferrum_interfaces::model_executor::{
         ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
@@ -8930,13 +9689,53 @@ mod tests {
         CompletionReadbackBatchObservation, DeviceComputePathRequirement, DeviceExecutionInterval,
         DeviceExecutionIntervalKind, DeviceExecutionSpanKind, DeviceReusableExecutionObservation,
         DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
-        DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink,
-        DeviceTimingMeasurement, DeviceTimingMode, StepResourceAdmissionProfilePhase,
-        DENSE_SWIGLU_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID,
-        LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID,
-        TOKEN_EMBEDDING_OPERATION_ID,
+        DeviceReusableExecutionTopologyFingerprint, DeviceSubmissionExecutionSpan,
+        DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink, DeviceTimingMeasurement,
+        DeviceTimingMode, StepResourceAdmissionProfilePhase, DENSE_SWIGLU_OPERATION_ID,
+        LAST_TOKEN_MASKED_ARGMAX_F32_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+        TOKEN_EMBEDDING_F32_MASTER_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
     };
-    use ferrum_types::{AttentionExecutionPolicy, RequestId, TokenId};
+    use ferrum_types::{
+        AttentionExecutionPolicy, RequestId, ReusableExecutionCaptureConfig, TokenId,
+    };
+
+    fn resolve_test_reusable_startup_plan(
+        maximum_active_sequences: u32,
+        maximum_scheduled_tokens: u64,
+        maximum_model_tokens: usize,
+        prefill_chunks: &[PrefillChunk],
+        execution_node_count: usize,
+        capture_config: &ReusableExecutionCaptureConfig,
+    ) -> ferrum_types::Result<VNextReusableExecutionStartupPlan> {
+        let resolution = resolve_reusable_execution_policy(
+            maximum_active_sequences,
+            maximum_scheduled_tokens,
+            maximum_model_tokens,
+            prefill_chunks,
+            capture_config,
+            true,
+        )?;
+        let program_policy = resolution
+            .policy
+            .program_policy()
+            .cloned()
+            .ok_or_else(|| FerrumError::internal("test capture policy is missing"))?;
+        let maximum_device_executables = u64::try_from(
+            execution_node_count
+                .checked_mul(program_policy.programs().len())
+                .ok_or_else(|| FerrumError::internal("test executable capacity overflowed"))?,
+        )
+        .map_err(|_| FerrumError::internal("test executable capacity exceeds u64"))?;
+        VNextReusableExecutionStartupPlan::resolve(
+            &program_policy,
+            resolution
+                .capture
+                .ok_or_else(|| FerrumError::internal("test capture resolution is missing"))?,
+            maximum_model_tokens,
+            prefill_chunks,
+            maximum_device_executables,
+        )
+    }
 
     #[test]
     fn language_io_resolution_accepts_legacy_and_fp32_master_contracts_only() {
@@ -9005,6 +9804,34 @@ mod tests {
     }
 
     #[test]
+    fn reusable_catalog_lookup_requires_a_startup_plan_and_one_direct_attempt() {
+        assert!(reusable_catalog_lookup_allowed(true, true, false));
+        assert!(!reusable_catalog_lookup_allowed(false, true, false));
+        assert!(!reusable_catalog_lookup_allowed(true, false, false));
+        assert!(!reusable_catalog_lookup_allowed(true, true, true));
+    }
+
+    #[test]
+    fn reusable_startup_case_budget_allows_observed_many_to_one_program_identity() {
+        let requested_cases = BTreeSet::from(["prefill-a", "prefill-b"]);
+        let shared_program = BTreeSet::from(["physical-program"]);
+        let observations = BTreeMap::from([
+            ("prefill-a", shared_program.clone()),
+            ("prefill-b", shared_program),
+        ]);
+        assert!(
+            reusable_startup_case_budget_violation(&requested_cases, &observations).is_none(),
+            "each logical case actually observed the same stable physical program"
+        );
+
+        let invalid = BTreeMap::from([(
+            "prefill-a",
+            BTreeSet::from(["physical-program-a", "physical-program-b"]),
+        )]);
+        assert!(reusable_startup_case_budget_violation(&requested_cases, &invalid).is_some());
+    }
+
+    #[test]
     fn nonterminal_completion_message_preserves_typed_failure_class() {
         assert_eq!(
             nonterminal_completion_message(
@@ -9055,6 +9882,44 @@ mod tests {
     }
 
     #[test]
+    fn reusable_catalog_miss_ledger_is_bounded_and_preserves_overflow_reason() {
+        let mut ledger = VNextReusableExecutionCatalogMissLedger::default();
+        for width in 1..=(MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS + 1) {
+            ledger.record(VNextReusableExecutionCatalogMissKey {
+                immediate_sequences: u32::try_from(width).unwrap(),
+                immediate_tokens: u64::try_from(width).unwrap(),
+                immediate_pages: 1,
+                topology_fingerprint: DeviceReusableExecutionTopologyFingerprint::static_program(),
+                reason: VNextReusableExecutionCatalogMissReason::ProgramAbsent,
+            });
+        }
+        ledger.record(VNextReusableExecutionCatalogMissKey {
+            immediate_sequences: 1,
+            immediate_tokens: 1,
+            immediate_pages: 1,
+            topology_fingerprint: DeviceReusableExecutionTopologyFingerprint::static_program(),
+            reason: VNextReusableExecutionCatalogMissReason::ProgramAbsent,
+        });
+
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.maximum_distinct_keys, 64);
+        assert_eq!(snapshot.distinct_keys, 64);
+        assert_eq!(snapshot.rows[0].count, 2);
+        assert_eq!(snapshot.overflow.len(), 1);
+        assert_eq!(
+            snapshot.overflow[0].reason,
+            VNextReusableExecutionCatalogMissReason::ProgramAbsent
+        );
+        assert_eq!(snapshot.overflow[0].count, 1);
+
+        ledger.reset();
+        let empty = ledger.snapshot();
+        assert_eq!(empty.distinct_keys, 0);
+        assert!(empty.rows.is_empty());
+        assert!(empty.overflow.is_empty());
+    }
+
+    #[test]
     fn wave_timing_sink_attributes_replay_to_aggregate_and_exact_phase() {
         let aggregate = VNextWaveTimingMetrics::default();
         let decode = VNextWaveTimingMetrics::default();
@@ -9101,28 +9966,38 @@ mod tests {
     #[test]
     fn reusable_execution_startup_plan_is_policy_derived_largest_first_and_bounded() {
         let chunk_64 = PrefillChunk::new(0, 64, 64).unwrap();
-        let plan =
-            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 128, &[chunk_64, chunk_64], 23)
-                .unwrap();
+        let plan = resolve_test_reusable_startup_plan(
+            32,
+            2_048,
+            128,
+            &[chunk_64, chunk_64],
+            23,
+            &ReusableExecutionCaptureConfig::default(),
+        )
+        .unwrap();
 
         assert_eq!(plan.decode_widths(), (1..=32).rev().collect::<Vec<_>>());
         assert_eq!(plan.prefill_token_counts(), [64]);
         assert_eq!(plan.prefill_chunks(), [chunk_64]);
         assert_eq!(plan.maximum_decode_sequence_tokens, 97);
         assert_eq!(plan.device_plan.maximum_executables(), 759);
+        assert!(!plan.decode_catalog_omits_admitted_widths());
         assert_eq!(
             plan.descriptors.last(),
             Some(&VNextReusableExecutionDescriptor::prefill(chunk_64))
         );
-        assert_eq!(
-            plan.widths_for_available_sequences(20),
-            (1..=20).rev().collect::<Vec<_>>()
-        );
 
         let chunk_7 = PrefillChunk::new(0, 7, 7).unwrap();
         let chunk_4 = PrefillChunk::new(0, 4, 4).unwrap();
-        let non_power_of_two =
-            VNextReusableExecutionStartupPlan::resolve(7, 7, 64, &[chunk_7, chunk_4], 2).unwrap();
+        let non_power_of_two = resolve_test_reusable_startup_plan(
+            7,
+            7,
+            64,
+            &[chunk_7, chunk_4],
+            2,
+            &ReusableExecutionCaptureConfig::default(),
+        )
+        .unwrap();
         assert_eq!(
             non_power_of_two.decode_widths(),
             (1..=7).rev().collect::<Vec<_>>()
@@ -9131,28 +10006,76 @@ mod tests {
         assert_eq!(non_power_of_two.maximum_decode_sequence_tokens, 22);
         assert_eq!(non_power_of_two.device_plan.maximum_executables(), 18);
 
-        let wide = VNextReusableExecutionStartupPlan::resolve(65, 2_048, 128, &[], 1).unwrap();
-        let mut expected_wide_widths = vec![65, 64];
-        expected_wide_widths.extend((1..=32).rev());
-        assert_eq!(wide.decode_widths(), expected_wide_widths);
-        assert_eq!(wide.maximum_decode_sequence_tokens, 103);
-        assert_eq!(wide.device_plan.maximum_executables(), 34);
-        let mut expected_available_widths = vec![40];
-        expected_available_widths.extend((1..=32).rev());
+        let wider_admission = resolve_test_reusable_startup_plan(
+            65,
+            2_048,
+            128,
+            &[],
+            1,
+            &ReusableExecutionCaptureConfig::default(),
+        )
+        .unwrap();
         assert_eq!(
-            wide.widths_for_available_sequences(40),
-            expected_available_widths
+            wider_admission.decode_widths(),
+            (1..=32).rev().collect::<Vec<_>>()
+        );
+        assert!(wider_admission.decode_catalog_omits_admitted_widths());
+        assert!(wider_admission
+            .capture_resolution
+            .reduction_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("bounded at width 32")));
+
+        let explicit_wide = ReusableExecutionCaptureConfig {
+            exact_decode_widths: Some(vec![1, 2, 4, 8, 16, 32, 64, 65]),
+            ..ReusableExecutionCaptureConfig::default()
+        };
+        assert!(
+            resolve_test_reusable_startup_plan(65, 2_048, 128, &[], 1, &explicit_wide).is_err()
         );
 
-        let short_model =
-            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 19, &[], 1).unwrap();
+        let unbounded_explicit = ReusableExecutionCaptureConfig {
+            exact_decode_widths: Some(vec![u32::MAX as usize]),
+            ..ReusableExecutionCaptureConfig::default()
+        };
+        assert!(resolve_reusable_execution_policy(
+            u32::MAX,
+            u64::MAX,
+            usize::MAX,
+            &[],
+            &unbounded_explicit,
+            true,
+        )
+        .is_err());
+
+        let short_model = resolve_test_reusable_startup_plan(
+            32,
+            2_048,
+            19,
+            &[],
+            1,
+            &ReusableExecutionCaptureConfig::default(),
+        )
+        .unwrap();
         assert_eq!(short_model.decode_widths(), [32, 16, 8, 4, 2, 1]);
         assert_eq!(short_model.maximum_decode_sequence_tokens, 19);
         assert_eq!(short_model.device_plan.maximum_executables(), 6);
-        assert!(VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[], 1).is_err());
-        assert!(
-            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[chunk_64], 23).is_err()
-        );
+        assert!(short_model.capture_resolution.reduction_reason.is_some());
+        assert!(short_model.decode_catalog_omits_admitted_widths());
+        assert!(resolve_test_reusable_startup_plan(
+            32,
+            2_048,
+            18,
+            &[],
+            1,
+            &ReusableExecutionCaptureConfig::default(),
+        )
+        .is_err());
+        let explicit_all = ReusableExecutionCaptureConfig {
+            exact_decode_widths: Some((1..=32).collect()),
+            ..ReusableExecutionCaptureConfig::default()
+        };
+        assert!(resolve_test_reusable_startup_plan(32, 2_048, 19, &[], 1, &explicit_all).is_err());
     }
 
     #[test]
@@ -9160,12 +10083,13 @@ mod tests {
         let chunk_single = PrefillChunk::new(0, 1, 1).unwrap();
         let chunk_multi = PrefillChunk::new(0, 4, 4).unwrap();
         let chunk_boundary = PrefillChunk::new(4, 4, 8).unwrap();
-        let plan = VNextReusableExecutionStartupPlan::resolve(
+        let plan = resolve_test_reusable_startup_plan(
             32,
             2_048,
             128,
             &[chunk_single, chunk_multi, chunk_boundary],
             23,
+            &ReusableExecutionCaptureConfig::default(),
         )
         .unwrap();
 
@@ -9221,7 +10145,16 @@ mod tests {
             PrefillChunk::new(0, 128, 128).unwrap(),
             PrefillChunk::new(0, 64, 64).unwrap(),
         ];
-        let policy = resolve_reusable_execution_policy(16, 2_048, 4_096, &chunks).unwrap();
+        let resolution = resolve_reusable_execution_policy(
+            16,
+            2_048,
+            4_096,
+            &chunks,
+            &ReusableExecutionCaptureConfig::default(),
+            true,
+        )
+        .unwrap();
+        let policy = resolution.policy;
         let decode_widths = policy
             .buckets()
             .iter()

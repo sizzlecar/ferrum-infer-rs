@@ -1173,6 +1173,21 @@ impl ResolvedRuntimePolicy {
                     "bucket capacity exceeds the scheduler policy ceiling",
                 ));
             }
+            if reusable_execution
+                .program_policy()
+                .is_some_and(|program_policy| {
+                    program_policy.programs().iter().any(|program| {
+                        let shape = program.shape();
+                        shape.request_capacity() > memory.maximum_active_sequences
+                            || shape.token_capacity() > admission.maximum_scheduled_tokens
+                    })
+                })
+            {
+                return Err(invalid_plan(
+                    "runtime_policy.reusable_execution",
+                    "program shape exceeds the scheduler policy ceiling",
+                ));
+            }
         }
         Ok(())
     }

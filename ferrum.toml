@@ -56,6 +56,10 @@ test_data_dir = "./test_data"
 # kv_max_blocks = 2048
 # paged_max_seqs = 32
 # max_batched_tokens = 2048
+# Startup capture has an independent hard width bound of 32; runtime admission
+# may be higher and uncovered widths use eager fallback.
+# reusable_execution_exact_decode_widths = [1, 2, 4, 8, 16, 24, 32]
+# reusable_execution_max_automatic_exact_decode_width = 32
 # prefix_cache = false
 # moe_graph = true
 # marlin_profile = true
