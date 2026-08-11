@@ -6,7 +6,8 @@ use crate::model_executor::{
 use crate::vnext::{
     BoundExecutionResourceMaintenance, CapacityAvailabilitySource, CopyRegion, DeferredAction,
     DefinitelyNotSubmitted, DeviceCapacityPressureScope, DeviceClass, DeviceCommandBatch,
-    DeviceErrorReport, DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand,
+    DeviceErrorReport, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
+    DeviceReusableExecutionTrim, DeviceTerminal, DeviceTerminalReceipt, DynamicResourceDemand,
     ExecutionResourceMaintenanceStage, FenceIndeterminate, FenceQuery, HostTransferLayout,
     ProgramValueId, ResolvedReusableExecutionBucket, ReusableExecutionBucketSpec,
     ReusableExecutionCapacity, ReusableExecutionClassId, ReusableExecutionMemoryPlan,
@@ -77,6 +78,8 @@ struct TestRuntime {
     allocation_rendezvous: Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>,
     close_returned_probe: Mutex<Option<Arc<AtomicBool>>>,
     observed_close_return_during_allocation: AtomicBool,
+    reusable_resident_executables: AtomicU64,
+    reusable_trim_calls: AtomicU64,
 }
 
 impl Drop for TestRuntime {
@@ -113,6 +116,8 @@ impl TestRuntime {
             allocation_rendezvous: Mutex::new(None),
             close_returned_probe: Mutex::new(None),
             observed_close_return_during_allocation: AtomicBool::new(false),
+            reusable_resident_executables: AtomicU64::new(0),
+            reusable_trim_calls: AtomicU64::new(0),
         }
     }
 
@@ -163,6 +168,15 @@ impl TestRuntime {
     fn observed_close_return_during_allocation(&self) -> bool {
         self.observed_close_return_during_allocation
             .load(Ordering::Acquire)
+    }
+
+    fn set_reusable_resident_executables(&self, resident_executables: u64) {
+        self.reusable_resident_executables
+            .store(resident_executables, Ordering::Release);
+    }
+
+    fn reusable_trim_calls(&self) -> u64 {
+        self.reusable_trim_calls.load(Ordering::Acquire)
     }
 }
 
@@ -296,6 +310,39 @@ impl DeviceRuntime for TestRuntime {
         } else {
             Ok(())
         }
+    }
+
+    fn reusable_executable_preparation(
+        &self,
+        _stream: &Self::Stream,
+    ) -> Result<DeviceReusableExecutionPreparation, Self::Error> {
+        let resident_executables = self.reusable_resident_executables.load(Ordering::Acquire);
+        if resident_executables == 0 {
+            return Ok(DeviceReusableExecutionPreparation::unsupported());
+        }
+        let resident_executables = usize::try_from(resident_executables).unwrap();
+        let plan = DeviceReusableExecutionPlan::new(resident_executables).unwrap();
+        Ok(DeviceReusableExecutionPreparation::ready(
+            plan,
+            resident_executables,
+            0,
+            resident_executables as u64,
+            resident_executables as u64,
+            0,
+        )
+        .unwrap())
+    }
+
+    fn trim_reusable_executables(
+        &self,
+        _stream: &mut Self::Stream,
+    ) -> Result<DeviceReusableExecutionTrim, Self::Error> {
+        self.reusable_trim_calls.fetch_add(1, Ordering::AcqRel);
+        let released_executables = self.reusable_resident_executables.swap(0, Ordering::AcqRel);
+        Ok(DeviceReusableExecutionTrim::new(
+            usize::try_from(released_executables).unwrap(),
+            0,
+        ))
     }
 
     fn readback(
@@ -1193,6 +1240,100 @@ fn reusable_step_memory_plan(
         ReusableExecutionMemoryPlan::new(1, 1, vec![resolved]).unwrap(),
         bucket,
     )
+}
+
+fn idle_reusable_step_slot_harness() -> (Harness, Arc<ExecutionLane<TestRuntime>>) {
+    let catalog = pool_catalog(
+        linear_profile(),
+        AllocationLifetime::Step,
+        'a',
+        1,
+        256,
+        TestDemand::Tokens,
+    );
+    let (memory_plan, bucket) = reusable_step_memory_plan(catalog.pool_id.clone());
+    let runtime = new_runtime(&catalog, 256);
+    let harness = harness_with_reusable(runtime, catalog, 256, memory_plan);
+    let lane = harness.root.create_execution_lane().unwrap();
+    harness
+        .root
+        .maintenance_controller
+        .grow_pool(&harness.pool_ids[0], 256)
+        .unwrap();
+    let binding = harness.root.trusted_runtime_binding().unwrap();
+    let (_, requests) = binding
+        .scoped_demand(
+            AllocationLifetime::Step,
+            None,
+            shape(1),
+            shape(1),
+            Some(&bucket),
+            AdmissionFitPolicy::ImmediateOnly,
+            AdmissionPressureAction::WaitForRelease,
+        )
+        .unwrap();
+    let LaneBackingPrepareDecision::Prepared(prepared) = harness
+        .root
+        .dynamic_pools
+        .prepare_lane_stable_claim(&lane, &requests)
+        .unwrap()
+    else {
+        panic!("resident reusable capacity bucket must prepare")
+    };
+    let (slices, slot) = prepared.commit().into_parts();
+    drop(slices);
+    drop(slot);
+    drop(binding);
+
+    let status = harness.root.maintenance_controller.status().unwrap();
+    let occupancy = status.pools()[0].live_occupancy();
+    assert_eq!(occupancy.lane_stable().total().claim_count(), 1);
+    assert_eq!(occupancy.lane_stable().total().physical_bytes(), 256);
+    (harness, lane)
+}
+
+#[test]
+fn idle_lane_slot_reclaim_preserves_sealed_resident_reusable_executables() {
+    let (harness, lane) = idle_reusable_step_slot_harness();
+    harness.runtime.set_reusable_resident_executables(1);
+    let epoch_before = lane.reusable_execution_epoch();
+    let status_before = harness.root.maintenance_controller.status().unwrap();
+
+    assert!(!harness
+        .root
+        .dynamic_pools
+        .try_reclaim_one_idle_lane_slot()
+        .unwrap());
+    assert_eq!(harness.runtime.reusable_trim_calls(), 0);
+    assert_eq!(lane.reusable_execution_epoch(), epoch_before);
+    assert_eq!(
+        harness.root.maintenance_controller.status().unwrap(),
+        status_before
+    );
+
+    drop(lane);
+    close_dynamic_test_root(harness.root);
+}
+
+#[test]
+fn idle_lane_slot_reclaim_keeps_empty_reusable_trim_path() {
+    let (harness, lane) = idle_reusable_step_slot_harness();
+    let epoch_before = lane.reusable_execution_epoch();
+
+    assert!(harness
+        .root
+        .dynamic_pools
+        .try_reclaim_one_idle_lane_slot()
+        .unwrap());
+    assert_eq!(harness.runtime.reusable_trim_calls(), 1);
+    assert_eq!(lane.reusable_execution_epoch(), epoch_before);
+    let status = harness.root.maintenance_controller.status().unwrap();
+    let occupancy = status.pools()[0].live_occupancy();
+    assert_eq!(occupancy.lane_stable().total().claim_count(), 0);
+    assert_eq!(occupancy.lane_stable().total().physical_bytes(), 0);
+
+    drop(lane);
+    close_dynamic_test_root(harness.root);
 }
 
 #[test]

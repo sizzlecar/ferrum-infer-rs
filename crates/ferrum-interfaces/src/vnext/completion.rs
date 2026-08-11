@@ -16,12 +16,13 @@ use super::{
     DeferredDeviceCleanupDomainId, DeferredDeviceCleanupTask, DefinitelyNotSubmittedRetryAuthority,
     DefinitelyNotSubmittedWaveRetryAuthority, DeviceCommandBatch, DeviceDescriptor,
     DeviceExecutionTiming, DeviceReusableExecutionPlan, DeviceReusableExecutionPreparation,
-    DeviceReusableExecutionProgram, DeviceRuntime, DeviceSubmissionExecutionTiming,
-    DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
-    DeviceTimingMode, DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId,
-    FenceQuery, HostTransferLayout, IdentifiedFailure, InvocationResourceLease,
-    LogicalBackingBufferView, NodeId, PreparedStepSubmissionWave,
-    RequestStateHazardTerminalDisposition, ResourceId, StreamState, VNextError,
+    DeviceReusableExecutionPreparationState, DeviceReusableExecutionProgram, DeviceRuntime,
+    DeviceSubmissionExecutionTiming, DeviceSubmissionTimingSink, DeviceTerminal,
+    DeviceTerminalReceipt, DeviceTimingMeasurement, DeviceTimingMode,
+    DeviceTimingUnavailableReason, ExecutionIdentityEnvelope, ExecutionLaneId, FenceQuery,
+    HostTransferLayout, IdentifiedFailure, InvocationResourceLease, LogicalBackingBufferView,
+    NodeId, PreparedStepSubmissionWave, RequestStateHazardTerminalDisposition, ResourceId,
+    StreamState, VNextError,
 };
 
 mod readback_collection;
@@ -311,10 +312,30 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
             ));
         }
         let trimmed = catch_unwind(AssertUnwindSafe(|| {
-            self.runtime.trim_reusable_executables(&mut state.stream)
+            let preparation = self
+                .runtime
+                .reusable_executable_preparation(&state.stream)?;
+            // A sealed resident catalog owns lane-stable backing that the
+            // immutable plan already budgets as reusable workspace. Releasing
+            // it to reclaim one idle slot invalidates the entire catalog; keep
+            // that inventory resident until the lane is torn down.
+            if preparation.state() == DeviceReusableExecutionPreparationState::Ready
+                && preparation.resident_executables() != 0
+            {
+                return Ok(None);
+            }
+            self.runtime
+                .trim_reusable_executables(&mut state.stream)
+                .map(Some)
         }));
         match trimmed {
-            Ok(Ok(trim))
+            Ok(Ok(None))
+                if self.current_descriptor_matches_snapshot()
+                    && self.runtime.stream_state(&state.stream) == StreamState::Ready =>
+            {
+                Ok(false)
+            }
+            Ok(Ok(Some(trim)))
                 if self.current_descriptor_matches_snapshot()
                     && self.runtime.stream_state(&state.stream) == StreamState::Ready =>
             {
@@ -343,7 +364,7 @@ impl<R: DeviceRuntime> ExecutionLane<R> {
                 state.fail_closed = true;
                 self.fail_closed.store(true, Ordering::Release);
                 Err(invalid_completion(format!(
-                    "device reusable executable trim failed: {error}"
+                    "device reusable executable inspection or trim failed: {error}"
                 )))
             }
             Err(_) => {
