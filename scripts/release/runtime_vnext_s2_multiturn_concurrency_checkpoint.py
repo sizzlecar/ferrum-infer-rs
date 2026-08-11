@@ -239,7 +239,7 @@ def validate_manifest(source: Path) -> dict[str, Any]:
     require(
         manifest.get("server")
         == {
-            "args": ["--backend", "cuda", "--max-num-seqs", "2"],
+            "args": ["--backend", "cuda", "--max-num-seqs", "1"],
             "mode": "start",
         },
         "manifest must align run and serve typed capacity",
@@ -395,7 +395,7 @@ def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[
     require(any(server_argv[i : i + 2] == ["--backend", "cuda"] for i in range(len(server_argv) - 1)), "server argv lacks typed CUDA backend")
     require(
         any(
-            server_argv[i : i + 2] == ["--max-num-seqs", "2"]
+            server_argv[i : i + 2] == ["--max-num-seqs", "1"]
             for i in range(len(server_argv) - 1)
         ),
         "server argv must align typed capacity with run",
@@ -439,8 +439,8 @@ def validate_identity(source: Path, expected_git_sha: str | None) -> tuple[dict[
     require(effective.get("backend") == "cuda" and effective.get("cuda_device_count") == 1, "effective CUDA config mismatch")
     require(effective.get("selected_gpu_devices") == [0], "effective CUDA device mismatch")
     require(
-        effective.get("selected_max_sequences") == 2
-        and effective.get("selected_admission_limit") == 2,
+        effective.get("selected_max_sequences") == 1
+        and effective.get("selected_admission_limit") == 1,
         "effective run/serve capacity alignment mismatch",
     )
     require(effective.get("model_capabilities", {}).get("architecture") == "qwen3_5", "effective architecture mismatch")
@@ -572,6 +572,11 @@ def validate_run(source: Path, recorded: Path, receipt: dict[str, Any], row: dic
         )
     effective = read_json(root / "effective_config.json")
     require(effective.get("backend") == "cuda", "run effective backend mismatch")
+    require(
+        effective.get("selected_max_sequences") == 1
+        and effective.get("selected_admission_limit") == 1,
+        "run effective capacity no longer matches the single-sequence product default",
+    )
     read_jsonl(root / "decision_trace.jsonl")
     return request_ids, {
         "assistant_turns": len(RUN_PROMPTS),
@@ -1239,7 +1244,7 @@ def create_fixture(root: Path) -> None:
     )
     (run_root / "stdout.jsonl").write_text("".join(json.dumps(event) + "\n" for event in events), encoding="utf-8")
     (run_root / "stderr.log").write_text("clean run\n", encoding="utf-8")
-    effective = {"schema_version": 1, "backend": "cuda", "cuda_device_count": 1, "selected_gpu_devices": [0], "selected_max_sequences": 2, "selected_admission_limit": 2, "model_capabilities": {"architecture": "qwen3_5"}, "hardware_capabilities": {"backend": "cuda", "compiled_features": {"cuda": True}}}
+    effective = {"schema_version": 1, "backend": "cuda", "cuda_device_count": 1, "selected_gpu_devices": [0], "selected_max_sequences": 1, "selected_admission_limit": 1, "model_capabilities": {"architecture": "qwen3_5"}, "hardware_capabilities": {"backend": "cuda", "compiled_features": {"cuda": True}}}
     write_json(run_root / "effective_config.json", effective)
     (run_root / "decision_trace.jsonl").write_text('{"event":"run_started"}\n', encoding="utf-8")
     run_obs = run_root / "observability"
@@ -1357,7 +1362,7 @@ def create_fixture(root: Path) -> None:
         "concurrency_quality_helper": {"path": str(inputs / "openai_concurrency_quality_regression.py"), "sha256": file_sha256(inputs / "openai_concurrency_quality_regression.py")},
     }
     evidence = {key: {"path": str(root / filename), "size": (root / filename).stat().st_size, "sha256": file_sha256(root / filename)} for key, filename in {"effective_config": "server.effective_config.json", "decision_trace": "server.decision_trace.jsonl", "server_log": "server.log", "health_before": "server.health.json", "health_after": "server.health.after.json"}.items()}
-    receipt = self_hash({"schema_version": 1, "mode": "start", "runner_argv": ["/usr/bin/python3", "/workspace/ferrum/scripts/release/run_scenarios.py", "--manifest", "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "--out", str(root)], "runner_path": "/workspace/ferrum/scripts/release/run_scenarios.py", "runner_sha256": file_sha256(inputs / "run_scenarios.py"), "manifest_path": "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "manifest_sha256": file_sha256(inputs / "scenario_manifest.json"), "cwd": "/workspace/ferrum", "git_sha": "a" * 40, "dirty_status": {"is_dirty": False, "status_short": []}, "input_artifacts": input_artifacts, "backend": "cuda", "model": MODEL, "selected_scenarios": [name for name, _ in SCENARIOS], "scenario_execution_phases": [{"phase": "run", "scenarios": [RUN_NAME], "started_at": "2026-08-02T00:00:00+00:00", "finished_at": "2026-08-02T00:00:10+00:00"}, {"phase": "serve", "scenarios": [SERVE_NAME, CONCURRENCY_NAME], "started_at": "2026-08-02T00:00:10+00:00", "finished_at": "2026-08-02T00:01:00+00:00"}], "scenario_count": 3, "failed": 0, "skipped": 0, "server_argv": [binary_path, "serve", "--host", "127.0.0.1", "--effective-config-json", str(root / "server.effective_config.json"), "--decision-trace-jsonl", str(root / "server.decision_trace.jsonl"), "--backend", "cuda", "--max-num-seqs", "2", MODEL], "binary_path": binary_path, "binary_sha256": binary_sha, "hardware": {"argv": ["nvidia-smi", "--query-gpu=index,name,uuid,memory.total,driver_version", "--format=csv,noheader,nounits"], "returncode": 0, "stdout": "0, NVIDIA GeForce RTX 4090, GPU-fixture, 24564, 570.00\n", "stderr": ""}, "removed_hidden_env_names": [], "child_env": {"HF_HOME": "/workspace/hf-cache", "NO_COLOR": "1"}, "server_started_at": "2026-08-02T00:00:11+00:00", "server_finished_at": "2026-08-02T00:01:00+00:00", "server_returncode": -15, "evidence_files": evidence})
+    receipt = self_hash({"schema_version": 1, "mode": "start", "runner_argv": ["/usr/bin/python3", "/workspace/ferrum/scripts/release/run_scenarios.py", "--manifest", "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "--out", str(root)], "runner_path": "/workspace/ferrum/scripts/release/run_scenarios.py", "runner_sha256": file_sha256(inputs / "run_scenarios.py"), "manifest_path": "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "manifest_sha256": file_sha256(inputs / "scenario_manifest.json"), "cwd": "/workspace/ferrum", "git_sha": "a" * 40, "dirty_status": {"is_dirty": False, "status_short": []}, "input_artifacts": input_artifacts, "backend": "cuda", "model": MODEL, "selected_scenarios": [name for name, _ in SCENARIOS], "scenario_execution_phases": [{"phase": "run", "scenarios": [RUN_NAME], "started_at": "2026-08-02T00:00:00+00:00", "finished_at": "2026-08-02T00:00:10+00:00"}, {"phase": "serve", "scenarios": [SERVE_NAME, CONCURRENCY_NAME], "started_at": "2026-08-02T00:00:10+00:00", "finished_at": "2026-08-02T00:01:00+00:00"}], "scenario_count": 3, "failed": 0, "skipped": 0, "server_argv": [binary_path, "serve", "--host", "127.0.0.1", "--effective-config-json", str(root / "server.effective_config.json"), "--decision-trace-jsonl", str(root / "server.decision_trace.jsonl"), "--backend", "cuda", "--max-num-seqs", "1", MODEL], "binary_path": binary_path, "binary_sha256": binary_sha, "hardware": {"argv": ["nvidia-smi", "--query-gpu=index,name,uuid,memory.total,driver_version", "--format=csv,noheader,nounits"], "returncode": 0, "stdout": "0, NVIDIA GeForce RTX 4090, GPU-fixture, 24564, 570.00\n", "stderr": ""}, "removed_hidden_env_names": [], "child_env": {"HF_HOME": "/workspace/hf-cache", "NO_COLOR": "1"}, "server_started_at": "2026-08-02T00:00:11+00:00", "server_finished_at": "2026-08-02T00:01:00+00:00", "server_returncode": -15, "evidence_files": evidence})
     write_json(root / "execution_receipt.json", receipt)
     summary = {"schema_version": 1, "status": "pass", "manifest": "/workspace/ferrum/scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json", "artifact_dir": str(root), "model": MODEL, "backend": "cuda", "base_url": "http://127.0.0.1:8000", "git_sha": "a" * 40, "dirty_status": {"is_dirty": False, "status_short": []}, "started_at": "2026-08-02T00:00:00+00:00", "finished_at": "2026-08-02T00:01:00+00:00", "scenario_count": 3, "manifest_scenario_count": 3, "requested_scenarios": [], "selected_scenarios": [name for name, _ in SCENARIOS], "failed": 0, "skipped": 0, "scenarios": scenario_rows, "response_format_matrix_contract": {"artifact": str(root / "response_format_matrix_contract.json"), "case_counts": {"json_schema": 0, "json_object": 0}, "unique_json_schema_count": 0}, "observability": observability, "execution_receipt": {"artifact": str(root / "execution_receipt.json"), "artifact_sha256": file_sha256(root / "execution_receipt.json"), "canonical_sha256": receipt["canonical_sha256"], "mode": "start", "runner_sha256": receipt["runner_sha256"], "manifest_sha256": receipt["manifest_sha256"], "binary_sha256": binary_sha}, "pass_line": f"BACKEND REGRESSION SMOKE PASS: {root}"}
     write_json(root / "summary.json", summary)
