@@ -29,6 +29,7 @@ DEPENDENCY_KEYS = ("source", "numerics", "s2")
 CONTROL_PLANE_PREFIXES = ("docs/",)
 SAME_HISTORY_COLLECTOR = "scripts/release/runtime_vnext_g08a_same_history_collector.py"
 R1_AGGREGATOR = "scripts/release/runtime_vnext_r1_product_correctness.py"
+S0A_CONTRACT_SPLIT = "scripts/release/runtime_vnext_s0a_contract_split.py"
 CONTROL_PLANE_FILES = frozenset(
     {
         "scripts/release/runtime_vnext_r0_core_closure.py",
@@ -44,6 +45,7 @@ S2_MULTITURN_SCENARIO = (
 DEPENDENCY_LOCAL_FILES = {
     "source": frozenset(
         {
+            S0A_CONTRACT_SPLIT,
             "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
             "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py",
             S2_MULTITURN_SCENARIO,
@@ -51,6 +53,7 @@ DEPENDENCY_LOCAL_FILES = {
     ),
     "numerics": frozenset(
         {
+            S0A_CONTRACT_SPLIT,
             "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
             "scripts/release/runtime_vnext_s2_multiturn_concurrency_checkpoint.py",
             S2_MULTITURN_SCENARIO,
@@ -556,6 +559,17 @@ def self_test() -> int:
     require(
         rejected == [S2_MULTITURN_SCENARIO],
         "R0 S2 closure accepted a changed product scenario",
+    )
+    for key in ("source", "numerics"):
+        allowed, rejected = control_plane_only([S0A_CONTRACT_SPLIT], key)
+        require(
+            allowed == [S0A_CONTRACT_SPLIT] and not rejected,
+            f"R0 {key} closure rejected the G01A control-plane validator",
+        )
+    _, rejected = control_plane_only([S0A_CONTRACT_SPLIT], "s2")
+    require(
+        rejected == [S0A_CONTRACT_SPLIT],
+        "R0 S2 closure accepted a changed G01A control-plane validator",
     )
     _, rejected = control_plane_only(["crates/ferrum-engine/src/lib.rs"], "numerics")
     require(rejected == ["crates/ferrum-engine/src/lib.rs"], "R0 product change was not rejected")
