@@ -76,6 +76,7 @@ const MAX_DEFINITELY_NOT_SUBMITTED_RETRIES: u32 = 1;
 const MAX_BACKING_MAINTENANCE_ATTEMPTS: u32 = 2;
 const MAX_EXTENSION_RECHECKS: u32 = 2;
 const MAX_PROFILED_REUSABLE_EXECUTABLES: usize = 256;
+const MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES: usize = 1_024;
 const REUSABLE_EXECUTION_WARMUP_PASSES: u32 = 1;
 const REUSABLE_EXECUTION_CAPTURE_PASSES: u32 = 1;
 const REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES: u32 = 1;
@@ -1145,6 +1146,7 @@ struct VNextIoBinding {
     input_ordinal: u32,
     token_mask_input_node_id: NodeId,
     token_mask_input_ordinal: u32,
+    token_mask_residency_eligible: bool,
     repetition_token_ids_input_node_id: NodeId,
     repetition_token_ids_input_ordinal: u32,
     repetition_offsets_input_node_id: NodeId,
@@ -1363,6 +1365,349 @@ impl VNextProductOutputMode {
     }
 }
 
+#[derive(Debug, Clone)]
+enum VNextProductTokenMaskContent {
+    AllValid {
+        vocabulary_size: usize,
+    },
+    Selection {
+        vocabulary_size: usize,
+        fingerprint: u64,
+        valid_token_mask: Arc<[i8]>,
+    },
+}
+
+impl VNextProductTokenMaskContent {
+    fn from_policy(
+        policy: Option<&LogitsReturnPolicy>,
+        output_mode: VNextProductOutputMode,
+        vocabulary_size: usize,
+    ) -> Self {
+        if output_mode == VNextProductOutputMode::GreedyToken {
+            if let Some(LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(token_mask),
+                ..
+            }) = policy
+            {
+                return Self::Selection {
+                    vocabulary_size,
+                    fingerprint: token_mask.fingerprint,
+                    valid_token_mask: Arc::clone(&token_mask.valid_token_mask),
+                };
+            }
+        }
+        Self::AllValid { vocabulary_size }
+    }
+
+    fn normalized(&self) -> Vec<u8> {
+        match self {
+            Self::AllValid { vocabulary_size } => vec![1_u8; *vocabulary_size],
+            Self::Selection {
+                vocabulary_size,
+                valid_token_mask,
+                ..
+            } => {
+                let mut output = vec![0_u8; *vocabulary_size];
+                for (destination, source) in output.iter_mut().zip(valid_token_mask.iter().copied())
+                {
+                    *destination = u8::from(source != 0);
+                }
+                output
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum VNextResidentProductTokenMaskContent {
+    AllValid {
+        vocabulary_size: usize,
+    },
+    Selection {
+        vocabulary_size: usize,
+        fingerprint: u64,
+        source_len: usize,
+        valid_token_mask: Weak<[i8]>,
+    },
+}
+
+impl VNextResidentProductTokenMaskContent {
+    fn from_requested(requested: &VNextProductTokenMaskContent) -> Self {
+        match requested {
+            VNextProductTokenMaskContent::AllValid { vocabulary_size } => Self::AllValid {
+                vocabulary_size: *vocabulary_size,
+            },
+            VNextProductTokenMaskContent::Selection {
+                vocabulary_size,
+                fingerprint,
+                valid_token_mask,
+            } => Self::Selection {
+                vocabulary_size: *vocabulary_size,
+                fingerprint: *fingerprint,
+                source_len: valid_token_mask.len(),
+                valid_token_mask: Arc::downgrade(valid_token_mask),
+            },
+        }
+    }
+
+    fn exactly_matches(&self, requested: &VNextProductTokenMaskContent) -> bool {
+        match (self, requested) {
+            (
+                Self::AllValid {
+                    vocabulary_size: resident_vocabulary_size,
+                },
+                VNextProductTokenMaskContent::AllValid {
+                    vocabulary_size: requested_vocabulary_size,
+                },
+            ) => resident_vocabulary_size == requested_vocabulary_size,
+            (
+                Self::Selection {
+                    vocabulary_size: resident_vocabulary_size,
+                    fingerprint: resident_fingerprint,
+                    source_len,
+                    valid_token_mask: resident_mask,
+                },
+                VNextProductTokenMaskContent::Selection {
+                    vocabulary_size: requested_vocabulary_size,
+                    fingerprint: requested_fingerprint,
+                    valid_token_mask: requested_mask,
+                },
+            ) => {
+                if resident_vocabulary_size != requested_vocabulary_size
+                    || resident_fingerprint != requested_fingerprint
+                    || *source_len != requested_mask.len()
+                {
+                    return false;
+                }
+                resident_mask.upgrade().is_some_and(|resident_mask| {
+                    Arc::ptr_eq(&resident_mask, requested_mask)
+                        || resident_mask.as_ref() == requested_mask.as_ref()
+                })
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VNextProductTokenMaskSlotIdentity {
+    LaneStable(Arc<LaneStableArenaSlotIdentity>),
+    #[cfg(test)]
+    Test(u64),
+}
+
+impl VNextProductTokenMaskSlotIdentity {
+    fn slot_id(&self) -> u64 {
+        match self {
+            Self::LaneStable(identity) => identity.slot_id(),
+            #[cfg(test)]
+            Self::Test(slot_id) => *slot_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VNextProductTokenMaskSlotTarget {
+    identity: VNextProductTokenMaskSlotIdentity,
+    participant_index: usize,
+}
+
+impl VNextProductTokenMaskSlotTarget {
+    fn cache_key(&self) -> (u64, usize) {
+        (self.identity.slot_id(), self.participant_index)
+    }
+}
+
+#[derive(Debug)]
+struct VNextResidentProductTokenMaskEntry {
+    identity: VNextProductTokenMaskSlotIdentity,
+    content: VNextResidentProductTokenMaskContent,
+}
+
+#[derive(Debug, Clone)]
+struct VNextProductTokenMaskSubmissionPlan {
+    target: Option<VNextProductTokenMaskSlotTarget>,
+    content: VNextProductTokenMaskContent,
+    upload_required: bool,
+}
+
+#[derive(Debug, Default)]
+struct VNextProductTokenMaskResidency {
+    entries: BTreeMap<(u64, usize), VNextResidentProductTokenMaskEntry>,
+}
+
+impl VNextProductTokenMaskResidency {
+    fn prepare(
+        &mut self,
+        target: Option<VNextProductTokenMaskSlotTarget>,
+        content: VNextProductTokenMaskContent,
+    ) -> VNextProductTokenMaskSubmissionPlan {
+        let upload_required = target.as_ref().is_none_or(|target| {
+            let key = target.cache_key();
+            let hit = self.entries.get(&key).is_some_and(|entry| {
+                entry.identity == target.identity && entry.content.exactly_matches(&content)
+            });
+            if !hit {
+                // An upload becomes resident only after terminal device success
+                // publishes it below while the Step slot is still leased.
+                self.entries.remove(&key);
+            }
+            !hit
+        });
+        VNextProductTokenMaskSubmissionPlan {
+            target,
+            content,
+            upload_required,
+        }
+    }
+
+    fn publish(&mut self, plans: &[VNextProductTokenMaskSubmissionPlan]) {
+        let cacheable = plans
+            .iter()
+            .filter(|plan| plan.upload_required && plan.target.is_some())
+            .count();
+        if cacheable == 0 {
+            return;
+        }
+        if cacheable > MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES {
+            self.entries.clear();
+            return;
+        }
+        let new_entries = plans
+            .iter()
+            .filter(|plan| plan.upload_required)
+            .filter_map(|plan| plan.target.as_ref())
+            .filter(|target| !self.entries.contains_key(&target.cache_key()))
+            .count();
+        if self.entries.len().saturating_add(new_entries)
+            > MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES
+        {
+            // Eviction can only turn future hits into uploads. Device contents
+            // remain authoritative and are never inferred from a missing entry.
+            self.entries.clear();
+        }
+        for plan in plans {
+            if plan.upload_required {
+                let Some(target) = &plan.target else {
+                    continue;
+                };
+                self.entries.insert(
+                    target.cache_key(),
+                    VNextResidentProductTokenMaskEntry {
+                        identity: target.identity.clone(),
+                        content: VNextResidentProductTokenMaskContent::from_requested(
+                            &plan.content,
+                        ),
+                    },
+                );
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+struct VNextProductTokenMaskResidencyTransaction<'a> {
+    residency: &'a Mutex<VNextProductTokenMaskResidency>,
+    plans: Vec<VNextProductTokenMaskSubmissionPlan>,
+    published: bool,
+    settled: bool,
+}
+
+impl<'a> VNextProductTokenMaskResidencyTransaction<'a> {
+    fn prepare(
+        residency: &'a Mutex<VNextProductTokenMaskResidency>,
+        slot_identity: Option<LaneStableArenaSlotIdentity>,
+        contents: impl IntoIterator<Item = VNextProductTokenMaskContent>,
+    ) -> Self {
+        let slot_identity = slot_identity
+            .map(Arc::new)
+            .map(VNextProductTokenMaskSlotIdentity::LaneStable);
+        Self::prepare_with_identity(residency, slot_identity, contents)
+    }
+
+    fn prepare_with_identity(
+        residency: &'a Mutex<VNextProductTokenMaskResidency>,
+        slot_identity: Option<VNextProductTokenMaskSlotIdentity>,
+        contents: impl IntoIterator<Item = VNextProductTokenMaskContent>,
+    ) -> Self {
+        let mut ledger = residency.lock();
+        let plans = contents
+            .into_iter()
+            .enumerate()
+            .map(|(participant_index, content)| {
+                let target =
+                    slot_identity
+                        .clone()
+                        .map(|identity| VNextProductTokenMaskSlotTarget {
+                            identity,
+                            participant_index,
+                        });
+                ledger.prepare(target, content)
+            })
+            .collect();
+        drop(ledger);
+        Self {
+            residency,
+            plans,
+            published: false,
+            settled: false,
+        }
+    }
+
+    #[cfg(test)]
+    fn prepare_for_test(
+        residency: &'a Mutex<VNextProductTokenMaskResidency>,
+        slot_id: Option<u64>,
+        contents: impl IntoIterator<Item = VNextProductTokenMaskContent>,
+    ) -> Self {
+        Self::prepare_with_identity(
+            residency,
+            slot_id.map(VNextProductTokenMaskSlotIdentity::Test),
+            contents,
+        )
+    }
+
+    fn plans(&self) -> &[VNextProductTokenMaskSubmissionPlan] {
+        &self.plans
+    }
+
+    fn publish(&mut self) {
+        debug_assert!(!self.published);
+        if self
+            .plans
+            .iter()
+            .any(|plan| plan.upload_required && plan.target.is_some())
+        {
+            self.residency.lock().publish(&self.plans);
+        }
+        self.published = true;
+    }
+
+    fn settle_success(&mut self) {
+        debug_assert!(self.published);
+        self.settled = true;
+    }
+
+    fn invalidate_before_slot_release(&mut self) {
+        debug_assert!(!self.published);
+        self.residency.lock().clear();
+        self.settled = true;
+    }
+}
+
+impl Drop for VNextProductTokenMaskResidencyTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            // Any unclassified submission or host-side terminal failure loses
+            // the proof, never the device allocation. The next wave uploads.
+            self.residency.lock().clear();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct VNextProductRepetitionInput<'a> {
     token_ids: &'a [u32],
@@ -1406,25 +1751,7 @@ fn normalized_product_token_mask(
     output_mode: VNextProductOutputMode,
     vocabulary_size: usize,
 ) -> Vec<u8> {
-    let mut output = vec![1_u8; vocabulary_size];
-    if output_mode != VNextProductOutputMode::GreedyToken {
-        return output;
-    }
-    let Some(LogitsReturnPolicy::GreedyArgmax {
-        token_mask: Some(token_mask),
-        ..
-    }) = policy
-    else {
-        return output;
-    };
-    output.fill(0);
-    for (destination, source) in output
-        .iter_mut()
-        .zip(token_mask.valid_token_mask.iter().copied())
-    {
-        *destination = u8::from(source != 0);
-    }
-    output
+    VNextProductTokenMaskContent::from_policy(policy, output_mode, vocabulary_size).normalized()
 }
 
 fn product_repetition_input(
@@ -3913,6 +4240,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     >,
     startup_preparation: Mutex<VNextStartupPreparationState>,
     sequences: Mutex<VNextSequenceRegistry<R>>,
+    product_token_mask_residency: Mutex<VNextProductTokenMaskResidency>,
     event_sink: RwLock<Option<Arc<dyn ExecutionEventSink>>>,
     device_timing_mode: AtomicU8,
     diagnostic_fault: Option<VNextDiagnosticFault>,
@@ -4485,6 +4813,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             startup_reusable_programs: Mutex::new(BTreeMap::new()),
             startup_preparation: Mutex::new(VNextStartupPreparationState::Pending),
             sequences: Mutex::new(VNextSequenceRegistry::default()),
+            product_token_mask_residency: Mutex::new(VNextProductTokenMaskResidency::default()),
             event_sink: RwLock::new(None),
             device_timing_mode: AtomicU8::new(DeviceTimingMode::Off as u8),
             diagnostic_fault: config.diagnostic_fault,
@@ -5168,6 +5497,9 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext startup cleanup left a completion task in flight",
             ));
         }
+        // Startup waves are synthetic evidence. Forget their residency proof so
+        // the first product wave establishes and accounts for its own upload.
+        self.product_token_mask_residency.lock().clear();
         self.metrics.reset_after_startup();
         Ok(())
     }
@@ -5186,6 +5518,47 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
 
     fn host_dispatch_timing_enabled(&self) -> bool {
         self.device_timing_mode() != DeviceTimingMode::Off
+    }
+
+    fn token_mask_residency_eligible(
+        executable: &impl ExecutablePlanView,
+        token_mask_input: &ResolvedValueBinding,
+    ) -> bool {
+        let [component] = token_mask_input.storage().components() else {
+            return false;
+        };
+        let memory = executable.execution_plan().payload().memory();
+        let Some(descriptor) = memory
+            .dynamic_descriptors()
+            .iter()
+            .find(|descriptor| descriptor.base_resource_id() == component.resource_id())
+        else {
+            return false;
+        };
+        if token_mask_input.usage() != BufferUsage::Activations
+            || descriptor.lifetime() != AllocationLifetime::Step
+            || descriptor.kind() != &AllocationKind::Value
+            || descriptor.usage() != BufferUsage::Activations
+            || descriptor.element_type() != ElementType::U8
+            || descriptor.initialization() != StateInitialization::None
+            || !matches!(
+                descriptor.demand(),
+                DynamicResourceDemand::ActualSequences { .. }
+            )
+        {
+            return false;
+        }
+        let mut matching_slots = memory
+            .dynamic_pools()
+            .iter()
+            .flat_map(DynamicBackingPoolSpec::step_resource_slots)
+            .filter(|slot| slot.resource_ids().contains(&component.resource_id()));
+        let Some(slot) = matching_slots.next() else {
+            return false;
+        };
+        matching_slots.next().is_none()
+            && slot.kind() == StepResourceSlotKind::Dedicated
+            && slot.resource_ids() == std::slice::from_ref(component.resource_id())
     }
 
     fn resolve_io(
@@ -5386,11 +5759,14 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
         let greedy_token_output_layout = HostTransferLayout::new(ElementType::U32, 1)
             .map_err(|error| FerrumError::model(error.to_string()))?;
+        let token_mask_residency_eligible =
+            Self::token_mask_residency_eligible(executable, token_mask_input);
         Ok(VNextIoBinding {
             input_node_id: (*input_node_id).clone(),
             input_ordinal: input.ordinal(),
             token_mask_input_node_id: (*token_mask_input_node_id).clone(),
             token_mask_input_ordinal: token_mask_input.ordinal(),
+            token_mask_residency_eligible,
             repetition_token_ids_input_node_id: (*repetition_token_ids_input_node_id).clone(),
             repetition_token_ids_input_ordinal: repetition_token_ids_input.ordinal(),
             repetition_offsets_input_node_id: (*repetition_offsets_input_node_id).clone(),
@@ -6470,27 +6846,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         }
     }
 
-    fn product_token_mask(
-        &self,
-        participant: &VNextExecutionParticipant<'_, R>,
-        output_mode: VNextProductOutputMode,
-    ) -> Vec<u8> {
-        normalized_product_token_mask(
-            participant.logits_policy,
-            output_mode,
-            self.io.output_elements,
-        )
-    }
-
     fn dispatch_participant_wave(
         &self,
         participants: &[VNextExecutionParticipant<'_, R>],
         wave: PreparedStepSubmissionWave<R>,
         kind: VNextExecutionWaveKind,
         output_mode: VNextProductOutputMode,
-        token_mask_upload_required: &[bool],
+        token_mask_plans: &[VNextProductTokenMaskSubmissionPlan],
     ) -> DispatchOutcome<R> {
-        if participants.is_empty() || participants.len() != token_mask_upload_required.len() {
+        if participants.is_empty() || participants.len() != token_mask_plans.len() {
             return DispatchOutcome::QuiescentFailure(
                 "vNext submission wave requires matching participants and token-mask decisions"
                     .to_owned(),
@@ -6582,10 +6946,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         };
         let token_mask_uploads = participants
             .iter()
-            .zip(token_mask_upload_required)
+            .zip(token_mask_plans)
             .enumerate()
-            .map(|(participant_index, (participant, upload_required))| {
-                if !*upload_required {
+            .map(|(participant_index, (_, plan))| {
+                if !plan.upload_required {
                     return Ok(None);
                 }
                 SubmissionWaveInputUpload::new(
@@ -6598,7 +6962,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     self.io.token_mask_input_ordinal,
                     0,
                     token_mask_layout,
-                    self.product_token_mask(participant, output_mode),
+                    plan.content.normalized(),
                 )
                 .map(Some)
                 .map_err(|error| FerrumError::backend(error.to_string()))
@@ -7234,22 +7598,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         } else {
             Self::product_output_mode(participants, kind)
         };
-        // Product inputs use lane-shared Step slices. Another wave may overwrite
-        // the same slice, so request-owned residency cannot prove the mask is
-        // still present. Refresh every participant before each submission.
-        let token_mask_uploads = vec![true; participants.len()];
         let readbacks =
             self.prepare_terminal_readbacks(participants, capture_claim, output_mode)?;
-        let dispatch = {
+        let (mut token_mask_residency, dispatch) = {
             let _timing = self.metrics.wave_timing.host_encode_submit.start();
             let _phase_timing = phase_timing.host_encode_submit.start();
-            self.dispatch_participant_wave(
+            // Product-fixed inputs live in the lane-stable Step arena. One Step
+            // slot lease is exclusive through terminal completion, while a
+            // released slot retains its physical backing for later waves. Bind
+            // residency to that exact slot and participant range; Invocation
+            // program-binding slots refer to different backing and are not used.
+            let token_mask_slot_identity = self
+                .io
+                .token_mask_residency_eligible
+                .then(|| {
+                    wave.step_resources()
+                        .claimed_backing()
+                        .lane_stable_slot_identity()
+                })
+                .flatten();
+            let token_mask_residency = VNextProductTokenMaskResidencyTransaction::prepare(
+                &self.product_token_mask_residency,
+                token_mask_slot_identity,
+                participants.iter().map(|participant| {
+                    VNextProductTokenMaskContent::from_policy(
+                        participant.logits_policy,
+                        output_mode,
+                        self.io.output_elements,
+                    )
+                }),
+            );
+            let dispatch = self.dispatch_participant_wave(
                 participants,
                 wave,
                 kind,
                 output_mode,
-                &token_mask_uploads,
-            )
+                token_mask_residency.plans(),
+            );
+            (token_mask_residency, dispatch)
         };
         let mut execution_event_error = None;
         let (completion, attribution) = match dispatch {
@@ -7258,7 +7644,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 attribution,
             } => (completion, attribution),
             DispatchOutcome::QuiescentFailure(message) => {
-                return Err(self.abort_step(step, message).await)
+                token_mask_residency.invalidate_before_slot_release();
+                return Err(self.abort_step(step, message).await);
             }
             DispatchOutcome::SubmissionIndeterminate { message, recovery } => {
                 let reaper = Arc::clone(&self.reaper);
@@ -7272,8 +7659,12 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .await
                     .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match recovered {
-                    Ok(_) => return Err(self.abort_step(step, message).await),
+                    Ok(_) => {
+                        token_mask_residency.invalidate_before_slot_release();
+                        return Err(self.abort_step(step, message).await);
+                    }
                     Err(error) => {
+                        token_mask_residency.invalidate_before_slot_release();
                         self.metrics
                             .record_failure(format!("{message}; recovery failed: {error}"));
                         return Err(FerrumError::backend(format!(
@@ -7298,9 +7689,11 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     .map_err(|error| FerrumError::backend(format!("{message}: {error}")))?;
                 match observed {
                     Ok(CompletionObservation::Terminal(_)) => {
-                        return Err(self.abort_step(step, message).await)
+                        token_mask_residency.invalidate_before_slot_release();
+                        return Err(self.abort_step(step, message).await);
                     }
                     Ok(other) => {
+                        token_mask_residency.invalidate_before_slot_release();
                         self.metrics.record_failure(format!(
                             "{message}; post-submit drain remained nonterminal: {other:?}"
                         ));
@@ -7309,6 +7702,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         )));
                     }
                     Err(error) => {
+                        token_mask_residency.invalidate_before_slot_release();
                         self.metrics
                             .record_failure(format!("{message}; drain failed: {error}"));
                         return Err(FerrumError::backend(format!(
@@ -7394,6 +7788,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             other => {
                 let message = nonterminal_completion_message(&other);
                 self.metrics.record_failure(message.clone());
+                token_mask_residency.invalidate_before_slot_release();
                 return Err(FerrumError::backend(message));
             }
         };
@@ -7445,9 +7840,15 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 "vNext device wave failed: {:?}",
                 receipt.completion().disposition()
             );
+            token_mask_residency.invalidate_before_slot_release();
             drop(receipt);
             return Err(self.abort_step(step, message).await);
         }
+        // A terminally successful command batch proves every encoded mask
+        // upload reached this still-owned Step slot. Host output processing and
+        // event attribution cannot mutate that input backing.
+        token_mask_residency.publish();
+        token_mask_residency.settle_success();
         if diagnostic_failure_requested {
             if diagnostic_failure_observed {
                 if let Err(error) = participants[0]
@@ -7637,10 +8038,16 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         self.metrics
             .readback_bytes
             .fetch_add(readback_bytes, Ordering::Relaxed);
-        for _ in token_mask_uploads {
-            self.metrics
-                .token_mask_upload_participants
-                .fetch_add(1, Ordering::Relaxed);
+        for plan in token_mask_residency.plans() {
+            if plan.upload_required {
+                self.metrics
+                    .token_mask_upload_participants
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics
+                    .token_mask_cache_hit_participants
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         let (sparse_repetition_participants, sparse_repetition_token_ids) = participants
             .iter()
@@ -8898,6 +9305,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             "full_logits_waves": self.metrics.full_logits_readback_waves.load(Ordering::Relaxed),
             "greedy_token_waves": self.metrics.greedy_token_readback_waves.load(Ordering::Relaxed),
             "greedy_policy_fallback_waves": self.metrics.greedy_policy_fallback_waves.load(Ordering::Relaxed),
+            "token_mask_residency_eligible": self.io.token_mask_residency_eligible,
             "token_mask_upload_participants": self.metrics.token_mask_upload_participants.load(Ordering::Relaxed),
             "token_mask_cache_hit_participants": self.metrics.token_mask_cache_hit_participants.load(Ordering::Relaxed),
             "sparse_repetition_waves": self.metrics.sparse_repetition_waves.load(Ordering::Relaxed),
@@ -9674,12 +10082,14 @@ mod tests {
         submission_execution_policy_for_timing, validate_sequence_completion_accounting,
         AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
         VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
-        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
+        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextProductTokenMaskContent,
+        VNextProductTokenMaskResidency, VNextProductTokenMaskResidencyTransaction,
+        VNextProductTokenMaskSlotIdentity, VNextProductTokenMaskSlotTarget,
         VNextReusableExecutionCatalogMissKey, VNextReusableExecutionCatalogMissLedger,
         VNextReusableExecutionCatalogMissReason, VNextReusableExecutionDescriptor,
         VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
         VNextTeacherForcedDecision, VNextWaveTimingMetrics, VNextWaveTimingSink,
-        MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
+        MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES, MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
     };
     use ferrum_interfaces::model_executor::{
         ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
@@ -10501,6 +10911,229 @@ mod tests {
         assert_eq!(
             normalized_product_token_mask(None, VNextProductOutputMode::GreedyToken, 3),
             [1, 1, 1]
+        );
+    }
+
+    fn test_token_mask_target(
+        slot_id: u64,
+        participant_index: usize,
+    ) -> VNextProductTokenMaskSlotTarget {
+        VNextProductTokenMaskSlotTarget {
+            identity: VNextProductTokenMaskSlotIdentity::Test(slot_id),
+            participant_index,
+        }
+    }
+
+    fn test_selection_content(mask: &TokenSelectionMask) -> VNextProductTokenMaskContent {
+        let policy = LogitsReturnPolicy::GreedyArgmax {
+            token_mask: Some(mask.clone()),
+            repetition_penalty: None,
+        };
+        VNextProductTokenMaskContent::from_policy(
+            Some(&policy),
+            VNextProductOutputMode::GreedyToken,
+            5,
+        )
+    }
+
+    #[test]
+    fn product_token_mask_residency_requires_exact_slot_participant_and_content() {
+        let first_mask = TokenSelectionMask::new(vec![1, 0, 1]);
+        let first_content = test_selection_content(&first_mask);
+        let target = test_token_mask_target(7, 0);
+        let mut residency = VNextProductTokenMaskResidency::default();
+
+        let first = residency.prepare(Some(target.clone()), first_content.clone());
+        assert!(first.upload_required);
+        residency.publish(std::slice::from_ref(&first));
+
+        assert!(
+            !residency
+                .prepare(Some(target.clone()), first_content.clone())
+                .upload_required
+        );
+        assert!(
+            residency
+                .prepare(Some(test_token_mask_target(7, 1)), first_content.clone())
+                .upload_required
+        );
+        assert!(
+            residency
+                .prepare(Some(test_token_mask_target(8, 0)), first_content.clone())
+                .upload_required
+        );
+
+        // Distinct Arcs with byte-identical masks may safely share residency.
+        let identical = TokenSelectionMask::new(vec![1, 0, 1]);
+        assert!(
+            !residency
+                .prepare(Some(target.clone()), test_selection_content(&identical))
+                .upload_required
+        );
+
+        // The public 64-bit fingerprint is a fast filter, not correctness
+        // authority: an exact byte mismatch must still upload.
+        let mut forged_collision = TokenSelectionMask::new(vec![0, 1, 0]);
+        forged_collision.fingerprint = first_mask.fingerprint;
+        assert!(
+            residency
+                .prepare(Some(target), test_selection_content(&forged_collision))
+                .upload_required
+        );
+    }
+
+    #[test]
+    fn product_token_mask_residency_overwrite_and_failed_transactions_are_fail_closed() {
+        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
+        let first = test_selection_content(&TokenSelectionMask::new(vec![1, 0, 1]));
+        let changed = test_selection_content(&TokenSelectionMask::new(vec![1, 1, 0]));
+
+        {
+            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(7),
+                [first.clone()],
+            );
+            assert!(transaction.plans()[0].upload_required);
+            transaction.publish();
+            transaction.settle_success();
+        }
+        {
+            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(7),
+                [changed.clone()],
+            );
+            assert!(transaction.plans()[0].upload_required);
+            // Definitely-not-submitted or any earlier failure cannot publish.
+            transaction.invalidate_before_slot_release();
+            assert!(residency.lock().entries.is_empty());
+            drop(transaction);
+        }
+        {
+            let transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(7),
+                [first.clone()],
+            );
+            assert!(transaction.plans()[0].upload_required);
+        }
+        {
+            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                Some(7),
+                [first.clone()],
+            );
+            transaction.publish();
+            // An interruption between publication and typed settlement must
+            // still fail closed. Production settles immediately after terminal
+            // device success.
+        }
+        let transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+            &residency,
+            Some(7),
+            [first],
+        );
+        assert!(transaction.plans()[0].upload_required);
+    }
+
+    #[test]
+    fn product_token_mask_residency_tracks_participant_reordering_by_physical_range() {
+        let mask_a = TokenSelectionMask::new(vec![1, 0, 1]);
+        let mask_b = TokenSelectionMask::new(vec![0, 1, 1]);
+        let content_a = test_selection_content(&mask_a);
+        let content_b = test_selection_content(&mask_b);
+        let target_zero = test_token_mask_target(7, 0);
+        let target_one = test_token_mask_target(7, 1);
+        let mut residency = VNextProductTokenMaskResidency::default();
+
+        let original = [
+            residency.prepare(Some(target_zero.clone()), content_a.clone()),
+            residency.prepare(Some(target_one.clone()), content_b.clone()),
+        ];
+        assert!(original.iter().all(|plan| plan.upload_required));
+        residency.publish(&original);
+
+        let reordered = [
+            residency.prepare(Some(target_zero.clone()), content_b.clone()),
+            residency.prepare(Some(target_one.clone()), content_a.clone()),
+        ];
+        assert!(reordered.iter().all(|plan| plan.upload_required));
+        residency.publish(&reordered);
+
+        assert!(
+            !residency
+                .prepare(Some(target_zero), content_b)
+                .upload_required
+        );
+        assert!(
+            !residency
+                .prepare(Some(target_one), content_a)
+                .upload_required
+        );
+    }
+
+    #[test]
+    fn product_token_mask_residency_rejects_copy_on_write_mutation() {
+        let mut mask = TokenSelectionMask::new(vec![1, 0, 1]);
+        let target = test_token_mask_target(7, 0);
+        let mut residency = VNextProductTokenMaskResidency::default();
+        let original = residency.prepare(Some(target.clone()), test_selection_content(&mask));
+        residency.publish(std::slice::from_ref(&original));
+
+        assert!(mask.set_tokens_validity(&[1], true));
+        assert!(
+            residency
+                .prepare(Some(target), test_selection_content(&mask))
+                .upload_required,
+            "copy-on-write mutation must not inherit the prior device residency proof"
+        );
+    }
+
+    #[test]
+    fn product_token_mask_residency_without_stable_slot_always_uploads() {
+        let residency = parking_lot::Mutex::new(VNextProductTokenMaskResidency::default());
+        let content = VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 };
+        for _ in 0..2 {
+            let mut transaction = VNextProductTokenMaskResidencyTransaction::prepare_for_test(
+                &residency,
+                None,
+                [content.clone()],
+            );
+            assert!(transaction.plans()[0].upload_required);
+            transaction.publish();
+            transaction.settle_success();
+        }
+        assert!(residency.lock().entries.is_empty());
+    }
+
+    #[test]
+    fn product_token_mask_residency_is_entry_bounded_and_does_not_retain_masks() {
+        let mut residency = VNextProductTokenMaskResidency::default();
+        for slot_id in 0..=MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES as u64 {
+            let plan = residency.prepare(
+                Some(test_token_mask_target(slot_id, 0)),
+                VNextProductTokenMaskContent::AllValid { vocabulary_size: 5 },
+            );
+            residency.publish(std::slice::from_ref(&plan));
+            assert!(residency.entries.len() <= MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES);
+        }
+
+        residency.clear();
+        let target = test_token_mask_target(17, 0);
+        {
+            let content = test_selection_content(&TokenSelectionMask::new(vec![1, 0, 1]));
+            let plan = residency.prepare(Some(target.clone()), content);
+            residency.publish(std::slice::from_ref(&plan));
+        }
+        assert!(
+            residency
+                .prepare(
+                    Some(target),
+                    test_selection_content(&TokenSelectionMask::new(vec![1, 0, 1])),
+                )
+                .upload_required,
+            "a dead request mask must not be retained solely by the residency ledger"
         );
     }
 
