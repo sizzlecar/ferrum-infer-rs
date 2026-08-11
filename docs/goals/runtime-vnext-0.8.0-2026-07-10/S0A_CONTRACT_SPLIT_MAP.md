@@ -16,8 +16,8 @@ migrated=14
 lost=0
 ambiguous=0
 inaccessible=0
-added=1157
-added_sha256=557dec231957692d7e9e727ad4da20d33441b00c788eaee76fdf2de398a0ef5a
+added=1242
+added_sha256=3891028803b2e6190cc93779193f4fb4ea4f8d54a5ea8520b6eebdfd801f8cb3
 unsupported=0
 ```
 
@@ -26,10 +26,10 @@ path and kind, public replacement targets, rationale, and introducing commit. An
 loss, redundant migration, inaccessible target, unsupported syntax, or added-item digest drift is
 a gate failure.
 
-The added-item ledger includes 46 request-state hazard contract items introduced by `5626fd2b`
-and 43 determinism, replay, and packed-coordinate contract items introduced afterward. This
-refresh changes no public paths or runtime semantics; it binds the gate to the public owner
-surface already present at `fd694d4a`.
+The added-item ledger includes the request-state hazard, determinism, replay, and packed-coordinate
+contract items recorded by earlier refreshes, plus 37 exact reusable device-program catalog items
+introduced by `c1faf845`. This refresh changes no public paths or runtime semantics; it binds the
+gate to the public owner surface already present through that commit.
 
 This document records the implemented ownership design. It is not a G01A PASS artifact. Canonical
 completion requires a clean-source `vnext-g01a` run and both exact PASS lines documented below.
