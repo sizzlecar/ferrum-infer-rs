@@ -205,6 +205,27 @@ def parse_timestamp(value: Any, label: str) -> str:
     return value
 
 
+def timestamp_nanos(value: Any, label: str) -> int:
+    raw = parse_timestamp(value, label)
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(
+        timezone.utc
+    )
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = parsed - epoch
+    return (
+        delta.days * 86_400 * 1_000_000_000
+        + delta.seconds * 1_000_000_000
+        + delta.microseconds * 1_000
+    )
+
+
+def timestamp_datetime(value: Any, label: str) -> datetime:
+    raw = parse_timestamp(value, label)
+    return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(
+        timezone.utc
+    )
+
+
 def normalize_source(value: Any, label: str) -> dict[str, Any]:
     require(isinstance(value, dict), f"{label} source identity is missing")
     source = {
@@ -1460,15 +1481,335 @@ def validate_request_sidecar(
     return measured
 
 
+def load_product_request_lifecycle(path: Path) -> dict[str, dict[str, int]]:
+    """Load the immutable product request boundaries from one scheduler trace."""
+
+    lifecycle: dict[str, dict[str, int]] = {}
+    accepted_phase = "vnext.request_accepted"
+    completed_phase = "vnext.request_completed"
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if accepted_phase not in line and completed_phase not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise R2Error(
+                    f"scheduler lifecycle JSON is invalid at line {line_number}"
+                ) from error
+            phase = event.get("phase")
+            if phase not in {accepted_phase, completed_phase}:
+                continue
+            request_id = event.get("request_id")
+            if not isinstance(request_id, str) or not request_id.startswith(
+                "request.product."
+            ):
+                continue
+            attributes = event.get("attributes")
+            require(
+                event.get("entrypoint") == "serve"
+                and event.get("status") == "ok"
+                and isinstance(attributes, dict)
+                and attributes.get("execution_request_origin") == "product",
+                f"scheduler lifecycle identity differs at line {line_number}",
+            )
+            timestamp = event.get("ts_unix_nanos")
+            require(
+                isinstance(timestamp, int)
+                and not isinstance(timestamp, bool)
+                and timestamp > 0,
+                f"scheduler lifecycle timestamp is invalid at line {line_number}",
+            )
+            kind = "accepted_ns" if phase == accepted_phase else "completed_ns"
+            slots = lifecycle.setdefault(request_id, {})
+            require(
+                kind not in slots,
+                f"scheduler lifecycle has duplicate {kind}: {request_id}",
+            )
+            slots[kind] = timestamp
+    require(lifecycle, "scheduler trace contains no product request lifecycle")
+    for request_id, slots in lifecycle.items():
+        require(
+            set(slots) == {"accepted_ns", "completed_ns"},
+            f"scheduler lifecycle pair is incomplete: {request_id}",
+        )
+        require(
+            slots["completed_ns"] >= slots["accepted_ns"],
+            f"scheduler lifecycle completion precedes acceptance: {request_id}",
+        )
+    return lifecycle
+
+
+def closed_loop_request_groups(
+    lifecycle: dict[str, dict[str, int]], record: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Split a bench cell into the strict warmup/measured barriers it executed."""
+
+    started_ns = timestamp_nanos(record.get("started_at"), "cell started_at")
+    finished_ns = timestamp_nanos(record.get("finished_at"), "cell finished_at")
+    counts = [record.get("warmup_requests"), record.get("num_prompts")] * int(
+        record.get("n_repeats", 0)
+    )
+    require(
+        finished_ns > started_ns
+        and counts
+        and all(isinstance(count, int) and count > 0 for count in counts),
+        "cell lifecycle window/counts are invalid",
+    )
+    selected = sorted(
+        (
+            (request_id, slots)
+            for request_id, slots in lifecycle.items()
+            if started_ns <= slots["accepted_ns"] <= finished_ns
+        ),
+        key=lambda item: (item[1]["accepted_ns"], item[0]),
+    )
+    require(
+        len(selected) == sum(counts)
+        and all(slots["completed_ns"] <= finished_ns for _, slots in selected),
+        "cell lifecycle request denominator/window differs",
+    )
+    groups: list[dict[str, Any]] = []
+    offset = 0
+    for count in counts:
+        chunk = selected[offset : offset + count]
+        offset += count
+        request_ids = [request_id for request_id, _ in chunk]
+        events: dict[int, int] = {}
+        for _, slots in chunk:
+            events[slots["accepted_ns"]] = events.get(slots["accepted_ns"], 0) + 1
+            events[slots["completed_ns"]] = events.get(slots["completed_ns"], 0) - 1
+        outstanding = 0
+        previous_ns: int | None = None
+        intervals: list[dict[str, int]] = []
+        for event_ns in sorted(events):
+            if previous_ns is not None and event_ns > previous_ns and outstanding > 0:
+                intervals.append(
+                    {
+                        "start_unix_nanos": previous_ns,
+                        "end_unix_nanos": event_ns,
+                        "outstanding_request_count": outstanding,
+                    }
+                )
+            outstanding += events[event_ns]
+            require(outstanding >= 0, "cell lifecycle completion precedes acceptance")
+            previous_ns = event_ns
+        require(outstanding == 0 and intervals, "cell lifecycle group is incomplete")
+        group = {
+            "started_unix_nanos": min(slots["accepted_ns"] for _, slots in chunk),
+            "finished_unix_nanos": max(slots["completed_ns"] for _, slots in chunk),
+            "request_ids": request_ids,
+            "outstanding_intervals": intervals,
+        }
+        if groups:
+            require(
+                groups[-1]["finished_unix_nanos"] <= group["started_unix_nanos"],
+                "cell warmup/measured phase barriers overlap",
+            )
+        groups.append(group)
+    return groups
+
+
+def replay_active_floor_duty(
+    *,
+    groups: list[dict[str, Any]],
+    active_rows: list[dict[str, Any]],
+    active_floor: int,
+) -> dict[str, Any]:
+    """Intersect measured outstanding>=floor time with conservative probes."""
+
+    measured_groups = groups[1::2]
+    require(measured_groups, "measured request groups are missing")
+    replay_rows: list[dict[str, Any]] = []
+    total_eligible_ns = 0
+    total_at_floor_ns = 0
+    for repeat, group in enumerate(measured_groups, start=1):
+        eligible_intervals = [
+            copy.deepcopy(interval)
+            for interval in group["outstanding_intervals"]
+            if interval["outstanding_request_count"] >= active_floor
+        ]
+        require(
+            eligible_intervals,
+            f"repeat {repeat} never has {active_floor} outstanding requests",
+        )
+        eligible_ns = 0
+        at_floor_ns = 0
+        observation_indexes: set[int] = set()
+        for interval in eligible_intervals:
+            start_ns = interval["start_unix_nanos"]
+            end_ns = interval["end_unix_nanos"]
+            expected_ns = end_ns - start_ns
+            covered_ns = 0
+            for row_index, row in enumerate(active_rows):
+                overlap_start = max(start_ns, row["started_unix_nanos"])
+                overlap_end = min(end_ns, row["finished_unix_nanos"])
+                if overlap_end <= overlap_start:
+                    continue
+                overlap_ns = overlap_end - overlap_start
+                require(
+                    row["eligible"],
+                    f"repeat {repeat} eligible lifecycle interval lacks a valid active probe",
+                )
+                covered_ns += overlap_ns
+                observation_indexes.add(row_index)
+                if row["active_requests_conservative"] >= active_floor:
+                    at_floor_ns += overlap_ns
+            require(
+                covered_ns == expected_ns,
+                f"repeat {repeat} active probes do not fully cover eligible lifecycle time",
+            )
+            eligible_ns += expected_ns
+        require(eligible_ns > 0, f"repeat {repeat} eligible duration is zero")
+        duty = at_floor_ns / eligible_ns
+        replay_rows.append(
+            {
+                "repeat": repeat,
+                "warmup_request_count": len(groups[(repeat - 1) * 2]["request_ids"]),
+                "measured_request_count": len(group["request_ids"]),
+                "warmup_request_id_set_sha256": canonical_json_sha256(
+                    sorted(groups[(repeat - 1) * 2]["request_ids"])
+                ),
+                "measured_request_id_set_sha256": canonical_json_sha256(
+                    sorted(group["request_ids"])
+                ),
+                "eligible_intervals": eligible_intervals,
+                "eligible_duration_ns": eligible_ns,
+                "active_at_or_above_floor_duration_ns": at_floor_ns,
+                "active_duty_cycle": duty,
+                "active_interval_count": len(observation_indexes),
+            }
+        )
+        total_eligible_ns += eligible_ns
+        total_at_floor_ns += at_floor_ns
+    return {
+        "schema_version": 1,
+        "algorithm": "measured-product-outstanding-intersect-conservative-active-v1",
+        "request_group_counts": [len(group["request_ids"]) for group in groups],
+        "repeats": replay_rows,
+        "eligible_duration_ns": total_eligible_ns,
+        "active_at_or_above_floor_duration_ns": total_at_floor_ns,
+        "active_duty_cycle": total_at_floor_ns / total_eligible_ns,
+    }
+
+
+def derive_active_interval_rows(
+    samples: list[dict[str, Any]], record: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Reproduce the collector sidecar directly from immutable probe samples."""
+
+    require(len(samples) >= 2, "resource observations contain fewer than two samples")
+    measurement_start = timestamp_datetime(record.get("started_at"), "cell started_at")
+    measurement_finish = timestamp_datetime(record.get("finished_at"), "cell finished_at")
+    require(measurement_finish > measurement_start, "cell measurement window is invalid")
+    rows: list[dict[str, Any]] = []
+    for sample_index, (left, right) in enumerate(
+        zip(samples, samples[1:]), start=1
+    ):
+        require(
+            isinstance(left, dict) and isinstance(right, dict),
+            f"resource sample pair {sample_index} is invalid",
+        )
+        left_at = timestamp_datetime(
+            left.get("sampled_at"), f"resource sample {sample_index} sampled_at"
+        )
+        right_at = timestamp_datetime(
+            right.get("sampled_at"),
+            f"resource sample {sample_index + 1} sampled_at",
+        )
+        clipped_start = max(left_at, measurement_start)
+        clipped_finish = min(right_at, measurement_finish)
+        duration_ms = (clipped_finish - clipped_start).total_seconds() * 1000.0
+        if duration_ms <= 0:
+            continue
+        left_errors = left.get("active_probe_errors", [])
+        right_errors = right.get("active_probe_errors", [])
+        require(
+            isinstance(left_errors, list) and isinstance(right_errors, list),
+            f"resource sample pair {sample_index} probe errors are invalid",
+        )
+        errors = [*left_errors, *right_errors]
+        eligible = (
+            left.get("process_alive") is True
+            and right.get("process_alive") is True
+            and not errors
+            and isinstance(left.get("active_requests"), int)
+            and isinstance(right.get("active_requests"), int)
+        )
+        rows.append(
+            {
+                "sequence": len(rows) + 1,
+                "started_at": clipped_start.isoformat().replace("+00:00", "Z"),
+                "finished_at": clipped_finish.isoformat().replace("+00:00", "Z"),
+                "duration_ms": duration_ms,
+                "eligible": eligible,
+                "active_requests_conservative": (
+                    min(left["active_requests"], right["active_requests"])
+                    if eligible
+                    else None
+                ),
+                "left_sample_sequence": left.get("sequence"),
+                "right_sample_sequence": right.get("sequence"),
+                "probe_errors": errors,
+            }
+        )
+    require(rows, "resource observations produce no active intervals")
+    return rows
+
+
+def load_raw_active_interval_rows(
+    observations_path: Path, record: dict[str, Any]
+) -> list[dict[str, Any]]:
+    samples: list[dict[str, Any]] = []
+    try:
+        with observations_path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                require(
+                    isinstance(row, dict),
+                    f"resource observation row {line_number} is invalid",
+                )
+                if row.get("record_type") == "sample":
+                    samples.append(row)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise R2Error(
+            f"cannot derive active intervals from resource observations: {error}"
+        ) from error
+    return derive_active_interval_rows(samples, record)
+
+
+def require_raw_derived_active_rows(
+    rows: Any, expected_rows: list[dict[str, Any]]
+) -> None:
+    require(rows == expected_rows, "active interval sidecar is not raw-derived")
+
+
+def require_repeat_active_floor_duty(evidence: dict[str, Any]) -> None:
+    require(
+        all(
+            row["active_duty_cycle"] >= 0.80 - 1e-12
+            for row in evidence["repeats"]
+        ),
+        "highest-concurrency active-floor duty is below 80%",
+    )
+
+
 def validate_active_intervals(
     root: Path,
     value: Any,
     *,
     observation_ref: dict[str, Any],
+    observations_path: Path,
     record: dict[str, Any],
     active_floor: int,
     require_floor: bool,
-) -> float:
+    product_lifecycle: dict[str, dict[str, int]] | None = None,
+    scheduler_trace_ref: dict[str, Any] | None = None,
+    report_ref: dict[str, Any] | None = None,
+    typed_active_cap: int | None = None,
+) -> tuple[float, dict[str, Any] | None]:
     path = validate_collector_ref(root, value, "active interval sidecar")
     document = read_json(path, "active interval sidecar")
     require(
@@ -1483,9 +1824,14 @@ def validate_active_intervals(
     )
     rows = document.get("intervals")
     require(isinstance(rows, list) and rows, "active interval timeline is empty")
+    require_raw_derived_active_rows(
+        rows, load_raw_active_interval_rows(observations_path, record)
+    )
     eligible = 0.0
     at_floor = 0.0
     total = 0.0
+    active_rows: list[dict[str, Any]] = []
+    previous_finish_ns: int | None = None
     for sequence, row in enumerate(rows, start=1):
         require(
             isinstance(row, dict)
@@ -1494,6 +1840,18 @@ def validate_active_intervals(
             "active interval identity differs",
         )
         duration = finite_positive(row.get("duration_ms"), "active interval duration")
+        started_ns = timestamp_nanos(
+            row.get("started_at"), f"active interval {sequence} started_at"
+        )
+        finished_ns = timestamp_nanos(
+            row.get("finished_at"), f"active interval {sequence} finished_at"
+        )
+        require(
+            finished_ns > started_ns
+            and (previous_finish_ns is None or started_ns >= previous_finish_ns),
+            "active interval timestamps overlap or are not increasing",
+        )
+        previous_finish_ns = finished_ns
         total += duration
         if row["eligible"]:
             active = row.get("active_requests_conservative")
@@ -1509,6 +1867,16 @@ def validate_active_intervals(
                 row.get("active_requests_conservative") is None,
                 "ineligible active interval has an active count",
             )
+        active_rows.append(
+            {
+                "started_unix_nanos": started_ns,
+                "finished_unix_nanos": finished_ns,
+                "eligible": row["eligible"],
+                "active_requests_conservative": row.get(
+                    "active_requests_conservative"
+                ),
+            }
+        )
     require(
         math.isclose(
             finite_positive(document.get("eligible_duration_ms"), "eligible interval duration"),
@@ -1523,9 +1891,58 @@ def validate_active_intervals(
         "active interval duration summary differs",
     )
     fraction = at_floor / eligible
-    if require_floor:
-        require(fraction >= 0.80 - 1e-12, "highest-concurrency active-floor duty is below 80%")
-    return fraction
+    if not require_floor:
+        return fraction, None
+    require(
+        product_lifecycle is not None
+        and isinstance(scheduler_trace_ref, dict)
+        and isinstance(report_ref, dict)
+        and isinstance(typed_active_cap, int)
+        and not isinstance(typed_active_cap, bool)
+        and typed_active_cap >= active_floor,
+        "highest-concurrency lifecycle replay inputs are missing",
+    )
+    groups = closed_loop_request_groups(product_lifecycle, record)
+    evidence = replay_active_floor_duty(
+        groups=groups,
+        active_rows=active_rows,
+        active_floor=active_floor,
+    )
+    require_repeat_active_floor_duty(evidence)
+    evidence.update(
+        {
+            "typed_active_cap": typed_active_cap,
+            "active_floor": active_floor,
+            "requested_concurrency": record.get("concurrency"),
+            "source_scheduler_trace": copy.deepcopy(scheduler_trace_ref),
+            "source_resource_observations": copy.deepcopy(observation_ref),
+            "source_active_intervals": copy.deepcopy(value),
+            "source_bench_report": copy.deepcopy(report_ref),
+            "validator": {
+                "path": SCRIPT_PATH.relative_to(REPO_ROOT).as_posix(),
+                "sha256": sha256(SCRIPT_PATH),
+                "size_bytes": SCRIPT_PATH.stat().st_size,
+            },
+            "lifecycle_integrity": {
+                "event_count": sum(
+                    len(group["request_ids"]) * 2 for group in groups
+                ),
+                "request_count": sum(len(group["request_ids"]) for group in groups),
+                "duplicate_count": 0,
+                "missing_count": 0,
+                "out_of_order_count": 0,
+                "foreign_count": 0,
+                "phase_barriers": "pass",
+            },
+            "observed_max_active": max(
+                row["active_requests_conservative"]
+                for row in active_rows
+                if row["eligible"]
+            ),
+            "legacy_full_command_window_duty_cycle": fraction,
+        }
+    )
+    return float(evidence["active_duty_cycle"]), evidence
 
 
 def load_ferrum_collector_lane(
@@ -1706,6 +2123,11 @@ def load_ferrum_collector_lane(
             f"Ferrum run sample {ordinal} is not the profile-off product path",
         )
     expected = expected_cells(expected_backend)
+    scheduler_trace_ref = session.get("scheduler_trace")
+    scheduler_trace_path = validate_collector_ref(
+        root, scheduler_trace_ref, "server scheduler trace"
+    )
+    product_lifecycle: dict[str, dict[str, int]] | None = None
     require(
         len(records) == len(expected)
         and manifest.get("formal_http_cell_count") == len(expected),
@@ -1803,13 +2225,20 @@ def load_ferrum_collector_lane(
             raise R2Error(f"resource evidence failed for {key}: {error}") from error
         require(recomputed_resource == resource_summary, f"resource summary is not raw-derived: {key}")
         highest = requires_active_floor(key[0], key[1], expected_backend)
-        duty = validate_active_intervals(
+        if highest and product_lifecycle is None:
+            product_lifecycle = load_product_request_lifecycle(scheduler_trace_path)
+        duty, duty_evidence = validate_active_intervals(
             root,
             resources.get("active_intervals"),
             observation_ref=observations_ref,
+            observations_path=observations_path,
             record=record,
             active_floor=ACTIVE_FLOORS[(expected_model, expected_backend)],
             require_floor=highest,
+            product_lifecycle=product_lifecycle if highest else None,
+            scheduler_trace_ref=scheduler_trace_ref if highest else None,
+            report_ref=report_ref if highest else None,
+            typed_active_cap=config.get("typed_active_cap") if highest else None,
         )
         require(
             finite_positive(resource_summary.get("peak_memory_bytes"), "peak memory")
@@ -1867,6 +2296,7 @@ def load_ferrum_collector_lane(
             "cv": cv,
             "observed_max_active": int(resource_summary["observed_max_active"]),
             "active_floor_duty_cycle": duty,
+            "active_floor_duty_evidence": duty_evidence,
             "raw_repeats": raw_metrics,
             "command_sha256": record["bench_argv_sha256"],
             "resource_observations_sha256": observations_ref["sha256"],
@@ -2060,6 +2490,12 @@ def validate_ferrum_performance_lane(
         "throughput_geometric_mean_ratio": geometric_mean,
         "max_cv": max(
             float(row["cv"]) for row in lane["summaries"].values()
+        ),
+        "highest_concurrency_active_floor_duty_cycle": high[
+            "active_floor_duty_cycle"
+        ],
+        "highest_concurrency_active_floor_duty_evidence": copy.deepcopy(
+            high["active_floor_duty_evidence"]
         ),
         "calibration": calibration,
     }
@@ -3505,6 +3941,125 @@ def self_test() -> None:
     require(
         "scripts/release/bounded_command.py" in R2_CONTROL_PLANE_FILES,
         "bounded command must remain an R2 evidence-control-plane file",
+    )
+    lifecycle_fixture: dict[str, dict[str, int]] = {}
+    active_fixture: list[dict[str, Any]] = []
+    cursor_ns = 10_000
+    group_counts = [2, 4, 2, 4, 2, 4]
+    for group_index, request_count in enumerate(group_counts):
+        duration_ns = 10_000 if group_index % 2 == 0 else 100_000
+        group_start = cursor_ns
+        group_finish = group_start + duration_ns
+        for request_index in range(request_count):
+            accepted_ns = group_start
+            completed_ns = group_finish
+            if group_index == 0:
+                midpoint_ns = group_start + duration_ns // 2
+                accepted_ns = group_start if request_index == 0 else midpoint_ns
+                completed_ns = midpoint_ns if request_index == 0 else group_finish
+            lifecycle_fixture[f"fixture-{group_index}-{request_index}"] = {
+                "accepted_ns": accepted_ns,
+                "completed_ns": completed_ns,
+            }
+        if group_index == 3:
+            active_fixture.extend(
+                [
+                    {
+                        "started_unix_nanos": group_start,
+                        "finished_unix_nanos": group_start + 70_000,
+                        "eligible": True,
+                        "active_requests_conservative": 4,
+                    },
+                    {
+                        "started_unix_nanos": group_start + 70_000,
+                        "finished_unix_nanos": group_finish,
+                        "eligible": True,
+                        "active_requests_conservative": 3,
+                    },
+                ]
+            )
+        else:
+            active_fixture.append(
+                {
+                    "started_unix_nanos": group_start,
+                    "finished_unix_nanos": group_finish,
+                    "eligible": True,
+                    # Warmup can reach the floor but must remain outside the denominator.
+                    "active_requests_conservative": 4,
+                }
+            )
+        cursor_ns = group_finish + 10_000
+    replay_record = {
+        "started_at": "1970-01-01T00:00:00Z",
+        "finished_at": "1970-01-01T00:00:00.001000Z",
+        "warmup_requests": 2,
+        "num_prompts": 4,
+        "n_repeats": 3,
+    }
+    replay_groups = closed_loop_request_groups(lifecycle_fixture, replay_record)
+    require(
+        [row["outstanding_request_count"] for row in replay_groups[0]["outstanding_intervals"]]
+        == [1, 1]
+        and replay_groups[0]["outstanding_intervals"][0]["end_unix_nanos"]
+        == replay_groups[0]["outstanding_intervals"][1]["start_unix_nanos"],
+        "same-timestamp completion/acceptance net delta differs",
+    )
+    replay = replay_active_floor_duty(
+        groups=replay_groups,
+        active_rows=active_fixture,
+        active_floor=4,
+    )
+    require(
+        replay["request_group_counts"] == group_counts
+        and replay["eligible_duration_ns"] == 300_000
+        and replay["active_at_or_above_floor_duration_ns"] == 270_000
+        and math.isclose(replay["active_duty_cycle"], 0.9, abs_tol=1e-12)
+        and math.isclose(
+            replay["repeats"][1]["active_duty_cycle"], 0.7, abs_tol=1e-12
+        ),
+        "measured outstanding active-duty replay differs",
+    )
+    expect_reject(
+        lambda: require_repeat_active_floor_duty(replay),
+        "per-repeat active-duty floor",
+    )
+    sample_fixture = [
+        {
+            "record_type": "sample",
+            "sequence": 1,
+            "sampled_at": "1970-01-01T00:00:00.000010Z",
+            "process_alive": True,
+            "active_requests": 4,
+            "active_probe_errors": [],
+        },
+        {
+            "record_type": "sample",
+            "sequence": 2,
+            "sampled_at": "1970-01-01T00:00:00.000020Z",
+            "process_alive": True,
+            "active_requests": 3,
+            "active_probe_errors": [],
+        },
+    ]
+    interval_fixture = derive_active_interval_rows(sample_fixture, replay_record)
+    for field, value in (
+        ("active_requests_conservative", 4),
+        ("eligible", False),
+        ("started_at", "1970-01-01T00:00:00.000011Z"),
+    ):
+        tampered = copy.deepcopy(interval_fixture)
+        tampered[0][field] = value
+        expect_reject(
+            lambda tampered=tampered: require_raw_derived_active_rows(
+                tampered, interval_fixture
+            ),
+            f"tampered active interval {field}",
+        )
+    truncated_lifecycle = copy.deepcopy(lifecycle_fixture)
+    truncated_lifecycle.pop("fixture-5-3")
+    expect_reject(
+        lambda: closed_loop_request_groups(truncated_lifecycle, replay_record),
+        "truncated closed-loop lifecycle",
     )
     require(
         requires_active_floor("random", 32, "cuda")
