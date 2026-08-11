@@ -20,6 +20,7 @@ import re
 import selectors
 import shlex
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -27,7 +28,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import runtime_vnext_performance_collector as collector_support
@@ -109,6 +110,43 @@ RESERVED_EXTRA_OPTIONS = {
 
 class R2CollectorError(RuntimeError):
     pass
+
+
+class CollectorInterrupted(BaseException):
+    def __init__(self, signum: int) -> None:
+        self.signum = signal.Signals(signum)
+        super().__init__(self.signum.name)
+
+
+def run_interruptibly(action: Callable[[], int], *, report: bool = True) -> int:
+    """Turn TERM/INT into an exception so nested process cleanup can unwind."""
+    prior_handlers: dict[signal.Signals, Any] = {}
+    interrupted = False
+
+    def handle_signal(signum: int, _frame: Any) -> None:
+        nonlocal interrupted
+        if interrupted:
+            return
+        interrupted = True
+        for managed_signal in prior_handlers:
+            signal.signal(managed_signal, signal.SIG_IGN)
+        raise CollectorInterrupted(signum)
+
+    try:
+        for managed_signal in (signal.SIGINT, signal.SIGTERM):
+            prior_handlers[managed_signal] = signal.getsignal(managed_signal)
+            signal.signal(managed_signal, handle_signal)
+        return action()
+    except CollectorInterrupted as exc:
+        if report:
+            print(
+                f"runtime vNext R2 Ferrum collector interrupted by {exc.signum.name}; child cleanup completed",
+                file=sys.stderr,
+            )
+        return 128 + int(exc.signum)
+    finally:
+        for managed_signal, previous in prior_handlers.items():
+            signal.signal(managed_signal, previous)
 
 
 def require(condition: bool, message: str) -> None:
@@ -3070,6 +3108,26 @@ def self_test() -> int:
         except R2CollectorError as exc:
             require("changed" in str(exc), "tamper self-test failed for the wrong reason")
 
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        cleanup_state = {"completed": False}
+
+        def interrupted_action(current_signal: signal.Signals = signum) -> int:
+            try:
+                signal.raise_signal(current_signal)
+                return 0
+            finally:
+                cleanup_state["completed"] = True
+
+        returncode = run_interruptibly(interrupted_action, report=False)
+        require(
+            returncode == 128 + int(signum),
+            f"{signum.name} interrupt returncode self-test failed",
+        )
+        require(
+            cleanup_state["completed"] is True,
+            f"{signum.name} did not unwind through child cleanup",
+        )
+
     print(SELFTEST_PASS_LINE)
     return 0
 
@@ -3135,13 +3193,16 @@ def main() -> int:
         write_config_template(args.write_config_template)
         return 0
     require(args.artifact_root is not None and args.config is not None, "--artifact-root and --config are required")
-    collect_lane(
-        args.artifact_root.expanduser().resolve(),
-        args.config.expanduser().resolve(),
-        resume=args.resume,
-        plan_only=args.plan_only,
-    )
-    return 0
+    def collect_action() -> int:
+        collect_lane(
+            args.artifact_root.expanduser().resolve(),
+            args.config.expanduser().resolve(),
+            resume=args.resume,
+            plan_only=args.plan_only,
+        )
+        return 0
+
+    return run_interruptibly(collect_action)
 
 
 if __name__ == "__main__":
