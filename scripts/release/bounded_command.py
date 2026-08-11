@@ -286,8 +286,10 @@ def _terminate_group(
     pgid: int,
     grace_seconds: float,
     termination: dict[str, Any],
+    *,
+    initial_signal: signal.Signals = signal.SIGTERM,
 ) -> None:
-    _record_signal(pgid, signal.SIGTERM, termination)
+    _record_signal(pgid, initial_signal, termination)
     grace_deadline = time.monotonic() + grace_seconds
     while _group_exists(pgid) and time.monotonic() < grace_deadline:
         process.poll()
@@ -422,6 +424,7 @@ def run_bounded_command(
     status = "internal_error"
     reason = "runner_internal_error"
     violation: dict[str, int] | None = None
+    interrupt_signal: signal.Signals | None = None
     prior_handlers: dict[int, Any] = {}
 
     def handle_signal(signum: int, _frame: Any) -> None:
@@ -530,9 +533,11 @@ def run_bounded_command(
                         time.sleep(min(limits.sample_interval_seconds, remaining))
     except RunnerInterrupted as error:
         status = "interrupted"
-        reason = f"runner_interrupted_{signal.Signals(error.signum).name}"
+        interrupt_signal = signal.Signals(error.signum)
+        reason = f"runner_interrupted_{interrupt_signal.name}"
     except KeyboardInterrupt:
         status = "interrupted"
+        interrupt_signal = signal.SIGINT
         reason = "runner_interrupted_SIGINT"
     except Exception as error:
         status = "internal_error"
@@ -554,7 +559,11 @@ def run_bounded_command(
                 try:
                     if pgid is not None and _group_exists(pgid):
                         _terminate_group(
-                            process, pgid, limits.term_grace_seconds, termination
+                            process,
+                            pgid,
+                            limits.term_grace_seconds,
+                            termination,
+                            initial_signal=interrupt_signal or signal.SIGTERM,
                         )
                     else:
                         process.wait(timeout=1.0)
@@ -770,6 +779,21 @@ def self_test() -> int:
         assert receipt["reason"] == "sampling_error_limit_exceeded"
         assert receipt["sampling_error_count"] == fast["max_sampling_errors"]
         assert len(receipt["sampling_errors"]) == fast["max_sampling_errors"]
+
+        def interrupt_sampling(_pgid: int) -> ProcessGroupSnapshot:
+            raise RunnerInterrupted(signal.SIGINT)
+
+        exit_code, receipt, _ = _self_test_case(
+            root,
+            "interrupt-forwarding",
+            "import time; time.sleep(5)",
+            Limits(2.0, 2, 4, 4, **fast),
+            sampler=interrupt_sampling,
+        )
+        assert exit_code == EXIT_REJECTED
+        assert receipt["status"] == "interrupted"
+        assert receipt["reason"] == "runner_interrupted_SIGINT"
+        assert receipt["termination"]["signals"][0]["signal"] == "SIGINT"
 
         exit_race_calls = 0
 
