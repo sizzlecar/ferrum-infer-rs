@@ -408,6 +408,10 @@ fn reusable_lane_same_shape_reuses_step_and_invocation_physical_generations() {
 
     let first_step = begin_step_with_bucket(&batch, &lane, Some(&bucket));
     let first_wave = prepare_wave(&plan, &first_step);
+    let first_step_slot_identity = first_step
+        .claimed_backing()
+        .lane_stable_slot_identity()
+        .expect("reusable Step backing must expose its stable physical slot identity");
     let first_step_identity = physical_slice_identities(first_step.backing_slices());
     let first_wave_identity =
         physical_slice_identities(first_wave.claimed_backing().backing_slices());
@@ -416,6 +420,14 @@ fn reusable_lane_same_shape_reuses_step_and_invocation_physical_generations() {
 
     let second_step = begin_step_with_bucket(&batch, &lane, Some(&bucket));
     let second_wave = prepare_wave(&plan, &second_step);
+    assert_eq!(
+        second_step
+            .claimed_backing()
+            .lane_stable_slot_identity()
+            .expect("reused Step backing must preserve its stable physical slot identity"),
+        first_step_slot_identity,
+        "sequential Steps with one reusable layout must expose the same physical slot identity"
+    );
     assert_eq!(
         physical_slice_identities(second_step.backing_slices()),
         first_step_identity
@@ -543,12 +555,24 @@ fn reusable_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots(
 
     let first_step = begin_step_with_bucket(&first_batch, &lane, Some(&bucket));
     let first_wave = prepare_wave(&plan, &first_step);
+    let first_step_slot_identity = first_step
+        .claimed_backing()
+        .lane_stable_slot_identity()
+        .expect("reusable Step backing must expose its stable physical slot identity");
     let first_step_identity = physical_slice_identities(first_step.backing_slices());
     let first_wave_identity =
         physical_slice_identities(first_wave.claimed_backing().backing_slices());
 
     let second_step = begin_step_with_bucket(&second_batch, &lane, Some(&bucket));
     let second_wave = prepare_wave(&plan, &second_step);
+    let second_step_slot_identity = second_step
+        .claimed_backing()
+        .lane_stable_slot_identity()
+        .expect("overlapping reusable Step backing must expose a stable slot identity");
+    assert_ne!(
+        second_step_slot_identity, first_step_slot_identity,
+        "simultaneously live Steps must never alias one lane-stable physical slot"
+    );
     let second_step_identity = physical_slice_identities(second_step.backing_slices());
     let second_wave_identity =
         physical_slice_identities(second_wave.claimed_backing().backing_slices());
@@ -559,6 +583,14 @@ fn reusable_lane_overlapping_steps_use_disjoint_slots_then_reuse_released_slots(
     first_step.try_retire_normal().unwrap();
     let third_step = begin_step_with_bucket(&first_batch, &lane, Some(&bucket));
     let third_wave = prepare_wave(&plan, &third_step);
+    assert_eq!(
+        third_step
+            .claimed_backing()
+            .lane_stable_slot_identity()
+            .expect("released reusable Step backing must expose its stable slot identity"),
+        first_step_slot_identity,
+        "a released Step slot may be reused only after its prior lease is terminal"
+    );
     assert_eq!(
         physical_slice_identities(third_step.backing_slices()),
         first_step_identity,
