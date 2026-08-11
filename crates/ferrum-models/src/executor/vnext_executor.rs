@@ -484,6 +484,10 @@ impl VNextExecutorConfig {
 const REUSABLE_EXECUTION_WARMUP_PASSES: usize = 1;
 const REUSABLE_EXECUTION_CAPTURE_PASSES: usize = 1;
 const REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES: usize = 1;
+// Program identity includes the exact immediate shape, so power-of-two workspace
+// buckets cannot substitute for uncaptured decode widths. Keep exact startup
+// capture independently bounded from configured concurrency.
+const REUSABLE_EXECUTION_EXACT_DECODE_WIDTH_LIMIT: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "topology", rename_all = "snake_case")]
@@ -547,16 +551,41 @@ impl VNextReusableExecutionStartupPlan {
             ));
         }
 
-        let mut decode_widths = Vec::new();
+        let mut anchor_decode_widths = Vec::new();
         let mut width = 1_usize;
         while width < maximum_width {
-            decode_widths.push(width);
+            anchor_decode_widths.push(width);
             width = width.checked_mul(2).unwrap_or(maximum_width);
         }
-        if decode_widths.last().copied() != Some(maximum_width) {
-            decode_widths.push(maximum_width);
+        if anchor_decode_widths.last().copied() != Some(maximum_width) {
+            anchor_decode_widths.push(maximum_width);
         }
-        decode_widths.sort_unstable_by(|left, right| right.cmp(left));
+        anchor_decode_widths.sort_unstable_by(|left, right| right.cmp(left));
+
+        let exact_width_limit = maximum_width.min(REUSABLE_EXECUTION_EXACT_DECODE_WIDTH_LIMIT);
+        let mut exact_decode_widths = (1..=exact_width_limit).collect::<Vec<_>>();
+        exact_decode_widths.extend(
+            anchor_decode_widths
+                .iter()
+                .copied()
+                .filter(|width| *width > exact_width_limit),
+        );
+        exact_decode_widths.sort_unstable_by(|left, right| right.cmp(left));
+        exact_decode_widths.dedup();
+
+        let passes_per_width = REUSABLE_EXECUTION_WARMUP_PASSES
+            + REUSABLE_EXECUTION_CAPTURE_PASSES
+            + REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES;
+        let exact_widths_fit_model_length = exact_decode_widths
+            .len()
+            .checked_mul(passes_per_width)
+            .and_then(|decode_tokens| decode_tokens.checked_add(1))
+            .is_some_and(|decode_tokens| decode_tokens <= maximum_model_tokens);
+        let decode_widths = if exact_widths_fit_model_length {
+            exact_decode_widths
+        } else {
+            anchor_decode_widths
+        };
 
         let mut prefill_chunks = prefill_chunks.iter().copied().collect::<Vec<_>>();
         if prefill_chunks.iter().any(|chunk| {
@@ -577,9 +606,6 @@ impl VNextReusableExecutionStartupPlan {
         });
         prefill_chunks.dedup();
 
-        let passes_per_width = REUSABLE_EXECUTION_WARMUP_PASSES
-            + REUSABLE_EXECUTION_CAPTURE_PASSES
-            + REUSABLE_EXECUTION_REPLAY_VALIDATION_PASSES;
         let maximum_decode_sequence_tokens = decode_widths
             .len()
             .checked_mul(passes_per_width)
@@ -9079,27 +9105,51 @@ mod tests {
             VNextReusableExecutionStartupPlan::resolve(32, 2_048, 128, &[chunk_64, chunk_64], 23)
                 .unwrap();
 
-        assert_eq!(plan.decode_widths(), [32, 16, 8, 4, 2, 1]);
+        assert_eq!(plan.decode_widths(), (1..=32).rev().collect::<Vec<_>>());
         assert_eq!(plan.prefill_token_counts(), [64]);
         assert_eq!(plan.prefill_chunks(), [chunk_64]);
-        assert_eq!(plan.maximum_decode_sequence_tokens, 19);
-        assert_eq!(plan.device_plan.maximum_executables(), 161);
+        assert_eq!(plan.maximum_decode_sequence_tokens, 97);
+        assert_eq!(plan.device_plan.maximum_executables(), 759);
         assert_eq!(
             plan.descriptors.last(),
             Some(&VNextReusableExecutionDescriptor::prefill(chunk_64))
         );
         assert_eq!(
             plan.widths_for_available_sequences(20),
-            [20, 16, 8, 4, 2, 1]
+            (1..=20).rev().collect::<Vec<_>>()
         );
 
         let chunk_7 = PrefillChunk::new(0, 7, 7).unwrap();
         let chunk_4 = PrefillChunk::new(0, 4, 4).unwrap();
         let non_power_of_two =
             VNextReusableExecutionStartupPlan::resolve(7, 7, 64, &[chunk_7, chunk_4], 2).unwrap();
-        assert_eq!(non_power_of_two.decode_widths(), [7, 4, 2, 1]);
+        assert_eq!(
+            non_power_of_two.decode_widths(),
+            (1..=7).rev().collect::<Vec<_>>()
+        );
         assert_eq!(non_power_of_two.prefill_token_counts(), [7, 4]);
-        assert_eq!(non_power_of_two.device_plan.maximum_executables(), 12);
+        assert_eq!(non_power_of_two.maximum_decode_sequence_tokens, 22);
+        assert_eq!(non_power_of_two.device_plan.maximum_executables(), 18);
+
+        let wide = VNextReusableExecutionStartupPlan::resolve(65, 2_048, 128, &[], 1).unwrap();
+        let mut expected_wide_widths = vec![65, 64];
+        expected_wide_widths.extend((1..=32).rev());
+        assert_eq!(wide.decode_widths(), expected_wide_widths);
+        assert_eq!(wide.maximum_decode_sequence_tokens, 103);
+        assert_eq!(wide.device_plan.maximum_executables(), 34);
+        let mut expected_available_widths = vec![40];
+        expected_available_widths.extend((1..=32).rev());
+        assert_eq!(
+            wide.widths_for_available_sequences(40),
+            expected_available_widths
+        );
+
+        let short_model =
+            VNextReusableExecutionStartupPlan::resolve(32, 2_048, 19, &[], 1).unwrap();
+        assert_eq!(short_model.decode_widths(), [32, 16, 8, 4, 2, 1]);
+        assert_eq!(short_model.maximum_decode_sequence_tokens, 19);
+        assert_eq!(short_model.device_plan.maximum_executables(), 6);
+        assert!(VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[], 1).is_err());
         assert!(
             VNextReusableExecutionStartupPlan::resolve(32, 2_048, 18, &[chunk_64], 23).is_err()
         );
@@ -9125,7 +9175,7 @@ mod tests {
         );
         assert_eq!(plan.prefill_token_counts(), [4, 1]);
         assert_eq!(plan.prefill_wave_shapes(), 4);
-        assert_eq!(plan.device_plan.maximum_executables(), 230);
+        assert_eq!(plan.device_plan.maximum_executables(), 828);
     }
 
     #[test]
