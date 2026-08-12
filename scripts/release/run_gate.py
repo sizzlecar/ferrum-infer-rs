@@ -1604,7 +1604,7 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             provenance_kind="vnext-r0",
         )
     if lane == "vnext-r1":
-        required = {
+        full_required = {
             "--r0": args.r0,
             "--m1-cuda": args.m1_cuda,
             "--m1-metal": args.m1_metal,
@@ -1615,9 +1615,26 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             "--llama-cuda": args.llama_cuda,
             "--llama-metal": args.llama_metal,
         }
-        missing = [flag for flag, value in required.items() if value is None]
-        if missing:
-            raise GateError("vnext-r1 requires " + ", ".join(missing))
+        cumulative_required = {
+            "--prior-r1": args.prior_r1,
+            "--impact-qualification": args.impact_qualification,
+        }
+        if any(value is not None for value in cumulative_required.values()):
+            missing = [
+                flag for flag, value in cumulative_required.items() if value is None
+            ]
+            mixed = [flag for flag, value in full_required.items() if value is not None]
+            if missing or mixed:
+                raise GateError(
+                    "vnext-r1 cumulative mode requires --prior-r1 and "
+                    "--impact-qualification, mutually exclusive with full inputs"
+                )
+            required = cumulative_required
+        else:
+            missing = [flag for flag, value in full_required.items() if value is None]
+            if missing:
+                raise GateError("vnext-r1 requires " + ", ".join(missing))
+            required = full_required
         cmd = [
             sys.executable,
             "scripts/release/runtime_vnext_r1_product_correctness.py",
@@ -9552,6 +9569,80 @@ def self_test() -> int:
             ),
             r1_manifest,
         )
+        cumulative_r1_inputs = {
+            "--prior-r1": root / "prior-r1/manifest.json",
+            "--impact-qualification": root / "impact-qualification/manifest.json",
+        }
+        cumulative_r1_out = root / "r1-cumulative-dry-run"
+        cumulative_r1_command = [sys.executable, str(this_script), "vnext-r1"]
+        for flag, value in cumulative_r1_inputs.items():
+            cumulative_r1_command.extend([flag, str(value)])
+        cumulative_r1_command.extend(
+            ["--out", str(cumulative_r1_out), "--dry-run"]
+        )
+        cumulative_r1_dry = run_selftest_command(cumulative_r1_command)
+        require_selftest(
+            cumulative_r1_dry.returncode == 0,
+            cumulative_r1_dry.stderr or cumulative_r1_dry.stdout,
+        )
+        cumulative_r1_manifest = json.loads(
+            (cumulative_r1_out / "gate.manifest.json").read_text()
+        )
+        expected_cumulative_r1_child = [
+            sys.executable,
+            "scripts/release/runtime_vnext_r1_product_correctness.py",
+        ]
+        for flag, value in cumulative_r1_inputs.items():
+            expected_cumulative_r1_child.extend([flag, str(value.resolve())])
+        expected_cumulative_r1_child.extend(
+            ["--out", str(cumulative_r1_out.resolve())]
+        )
+        require_selftest(
+            cumulative_r1_manifest["status"] == "dry-run"
+            and cumulative_r1_manifest["lane"] == "vnext-r1"
+            and cumulative_r1_manifest["delegated_command_line"]
+            == expected_cumulative_r1_child,
+            cumulative_r1_manifest,
+        )
+        incomplete_cumulative_r1 = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-r1",
+                "--prior-r1",
+                str(cumulative_r1_inputs["--prior-r1"]),
+                "--out",
+                str(root / "r1-cumulative-missing-input"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            incomplete_cumulative_r1.returncode != 0
+            and "requires --prior-r1 and --impact-qualification"
+            in incomplete_cumulative_r1.stderr,
+            incomplete_cumulative_r1.stderr or incomplete_cumulative_r1.stdout,
+        )
+        mixed_cumulative_r1 = run_selftest_command(
+            [
+                sys.executable,
+                str(this_script),
+                "vnext-r1",
+                "--prior-r1",
+                str(cumulative_r1_inputs["--prior-r1"]),
+                "--impact-qualification",
+                str(cumulative_r1_inputs["--impact-qualification"]),
+                "--r0",
+                str(r1_inputs["--r0"]),
+                "--out",
+                str(root / "r1-cumulative-mixed-input"),
+                "--dry-run",
+            ]
+        )
+        require_selftest(
+            mixed_cumulative_r1.returncode != 0
+            and "mutually exclusive with full inputs" in mixed_cumulative_r1.stderr,
+            mixed_cumulative_r1.stderr or mixed_cumulative_r1.stdout,
+        )
         r2_child_selftest = run_selftest_command(
             [
                 sys.executable,
@@ -11508,6 +11599,8 @@ def main() -> int:
     parser.add_argument("--g08a-metal-performance", type=Path)
     parser.add_argument("--r0", type=Path)
     parser.add_argument("--r1", type=Path)
+    parser.add_argument("--prior-r1", type=Path)
+    parser.add_argument("--impact-qualification", type=Path)
     parser.add_argument("--m1-cuda", type=Path)
     parser.add_argument("--m1-metal", type=Path)
     parser.add_argument("--m2-cuda", type=Path)

@@ -10,9 +10,11 @@
   的“exact case -> affected scenario -> architecture sentinel -> milestone full lane”顺序。
 - 本文件不修改 R0-R3 的验收分母、阈值或最终 PASS 条件。它只约束开发期间每个代码改动的
   回归范围，避免把“最终候选签字”错误地变成“每次改动后的全量回归”。
-- R1/R2/R3 的正式 artifact freshness 与开发期回归是两件事：产品代码变化会使旧正式 artifact
-  对最终聚合 stale，但这不授权立即重跑完整矩阵。先完成下述精确影响面验证，所有产品代码冻结后，
-  每个阶段只执行一次正式矩阵。
+- 首次阶段验收与后续修复分开：首次 R1 PASS 仍要求完整 R1 分母，且 R1 PASS 前不得进入 R2；一旦
+  取得 R1 PASS，后续阶段修复只暂停其 change-impact closure 覆盖的 case，未受影响历史 PASS 证据
+  累积有效。closure 通过即恢复阶段资格，不回 R0、不从零重跑完整 R1。
+- 最终 R3 仍对 exact staged bytes 执行 active amendments 规定的完整复验；累积证据规则不缩减最终
+  binary-level gate。
 
 ## 1. 每个改动必须先写出的影响集合
 
@@ -35,25 +37,27 @@
 
 每个改动只能逐层扩大，不能从源码改动直接跳到完整 R1/R2：
 
-1. **L0 静态边界**：`git diff --check`、format/compile 或脚本语法检查，只覆盖改动文件。
+1. **L0 静态边界与范围计算**：`git diff --check`、format/compile 或脚本语法检查，只覆盖改动文件；
+   validator 必须在任何回归命令启动前输出机器计算的 affected case closure。
 2. **L1 exact reproducer**：一个能在旧代码失败、新代码通过的精确用例；并发测试必须先通过
    `bounded_command.py`。
 3. **L2 affected unit/contract**：直接调用者、错误/清理分支和受影响 contract 的窄测试。
 4. **L3 affected product sentinel**：最小真实模型、真实入口、真实后端命令，必须实际穿过修改分支。
 5. **L4 affected group / architecture sentinel**：仅在 L3 通过后，并且调用链跨场景或跨架构时执行；
    只增加实际消费该分支的场景/架构。
-6. **L5 milestone lane**：只在 R0/R1/R2 阶段退出或新的源码冻结点执行一次正式 lane/aggregate。
+6. **L5 首次阶段验收 / 累积 aggregate**：阶段尚未首次 PASS 时执行目标规定的正式 lane；阶段已 PASS
+   后只将 closure 内的新 PASS 与未受影响历史 PASS 聚合，不因源码冻结再次执行完整 lane。
 7. **L6 release candidate**：只对 exact staged/published bytes 执行目标要求的最终完整复验。
 
 扩大范围必须满足至少一个条件：
 
 - 前一层发现同一 failure class 出现在更宽调用链；
 - 静态调用链证明修改点被另一入口、后端或架构实际消费；
-- 到达目标文档规定的阶段退出/源码冻结点；
+- 到达尚未首次 PASS 的目标阶段退出点；
 - 正式 validator 明确要求相同 source/binary 的最终签字。
 
-“改了 `crates/` 文件”“二进制 SHA 变化”只说明旧正式 artifact 最终不能签新二进制；它本身不是
-立即运行所有模型、后端和场景的扩大条件。
+“改了 `crates/` 文件”“二进制 SHA 变化”只说明旧 artifact 不能单独证明新 staged binary；它本身
+不是使历史 case PASS 整体失效、或立即运行所有模型、后端和场景的扩大条件。
 
 ## 3. 改动类型到最小回归范围
 
@@ -67,7 +71,7 @@
 | API/template/sampling/structured output | exact case；affected scenario group；模型协议不同时各一个必要架构 sentinel；共享响应路径变化时覆盖 `run`/`serve` | 资源、build、无关模型/backend 全矩阵 |
 | model-family loader/plan | 该 family 的 config/weight/plan test；该 family 一个 `run` 和一个 `serve` smoke；修改 shared op contract 时再按 provider 行扩展 | 其他 family 和无关后端 |
 | build/native provenance | 受影响的一个 build scenario、cache invalidation 正负例、binary/receipt identity | 模型 correctness/performance，除非产物语义或 feature graph变化 |
-| 默认产品语义或跨层公共 contract | exact case、affected unit、每个实际 consumer 类别的最小 product sentinel | 仍不直接运行完整阶段矩阵；到冻结点才执行 L5 |
+| 默认产品语义或跨层公共 contract | exact case、affected unit、每个实际 consumer 类别的最小 product sentinel | 阶段已首次 PASS 后仍不运行完整阶段矩阵；只重验 validator 计算出的 consumer closure |
 
 当一个 patch 同时属于多行时取集合并集，但必须先拆分能独立提交的无关改动；不得把“可能以后会改”
 计入当前影响集合。
@@ -107,16 +111,37 @@
 - 一个 focused case 通过只关闭该 failure class，不自动证明 full lane；一个 focused case失败也不使
   无关已通过 case 失效。
 
-## 6. 正式 artifact 与源码冻结
+## 6. 累积证据与阶段资格
 
-1. 开发期允许多个 focused KEEP/REJECT artifact，各自绑定其 source/binary。
-2. 修复已知 blocker 期间不运行 R1/R2 全量；先完成所有 L1-L4 影响面验证。
-3. 产品源码冻结后，只运行一次 current-source R1 正式矩阵并取得 exact PASS。
-4. R1 后禁止主动优化产品代码；只有 R2 暴露 release blocker 才解冻。解冻后仍先走 L1-L4，旧正式
-   artifact 标记 stale，但不边改边反复重跑。
-5. 再次冻结后才执行一次新的正式阶段矩阵。control-plane-only 且满足现有 source-closure allowlist 的
-   修改只重算 validator，不重跑产品 raw evidence。
-6. R3 staged binary 的完整复验仍按 active amendments 执行，不能由本计划缩减。
+1. 开发期允许多个 focused KEEP/REJECT artifact，各自如实绑定其 source/binary；聚合器不得改写这些
+   identity，也不得把旧 artifact 冒充为当前 source 的执行。
+2. 阶段首次 PASS 前，仍执行该阶段目标规定的完整分母。R1 未取得正式 PASS 前不得进入 R2。
+3. 阶段首次 PASS 后，后续阶段发现 blocker 并修改代码，只使 validator 计算出的 affected case
+   closure 暂停用于阶段资格；closure 外历史 PASS 保持有效，不能仅因产品源码或 binary SHA 改变而
+   整体标记 stale。
+4. 修复先走 L1-L4。closure 中规定的 case 全部 PASS 后，validator 重新聚合新 PASS 与未受影响历史
+   PASS，恢复原阶段资格，并从已经完成的下一阶段进度继续；不得退回 R0，也不得重跑完整 R1/R2。
+5. 只有静态调用链和 contract dependency 证明改动跨入口、后端、架构、模式或阶段边界时，closure
+   才扩大到对应相邻 consumer。跨到 R0 时只重验受影响 R0 gate；未跨到 R0 时不得要求 R0 重跑。
+6. control-plane/collector/validator 改动若不改变 raw evidence 语义，只运行对应 self-test、正反构造例
+   和 raw replay，再重算 aggregate；不能用人工 allowlist 代替机器影响计算。
+7. R3 staged binary 的完整复验仍按 active amendments 对 exact staged bytes 执行，不能由本计划缩减。
+
+### 6.1 Validator 的强制 contract
+
+validator 必须在测试前从 baseline artifact/source 与 current source 的实际 diff 计算范围，并保存
+machine-readable receipt，至少包含：
+
+- baseline/current source identity、完整 changed-path/diff identity 和 change-impact rule-set version；
+- 命中的通用 rule ID，以及受影响的 case ID、lane、入口、后端、架构、模式、证据域和传递因果边；
+- closure 外被复用 artifact 的原始 identity，以及其不在影响闭包内的机器可核验理由；
+- closure 内每个 required case 的新 PASS artifact，和恢复阶段资格的 aggregate PASS/REJECT 结果。
+
+规则必须按 contract/call-chain 语义可复用，禁止以 commit、SHA、blob、日期、一次性 bridge 或特定
+reviewed diff 作为通过条件。人工 impact note 只可解释或扩大范围，不能缩小 validator 计算结果，
+不能作为 waiver。未知或无法分类的 diff 必须 fail closed：先补通用规则和正反 self-test，再重新计算
+closure；不得把“未知”自动解释为“从零重跑全部 R0/R1”。若计算出的 closure 漏掉真实 consumer，
+validator 必须 REJECT。
 
 ## 7. 当前 `65c965ef` 改动的精确范围
 
@@ -154,7 +179,7 @@ L1 exact reproducer:
 L2 affected unit/contract:
 L3 product sentinel (if needed):
 Escalation signal and stop condition:
-Next milestone full gate (not run now):
+Next first-time stage gate or cumulative aggregate (do not default to a full rerun):
 Artifacts/receipts:
 ```
 

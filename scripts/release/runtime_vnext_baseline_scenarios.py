@@ -1382,13 +1382,20 @@ def runner_identity_at_git_sha(git_sha: str) -> dict[str, Any]:
     }
 
 
-def host_suspend_source_bridge() -> dict[str, Any]:
-    require(
-        not git_text(["status", "--short", "--untracked-files=all"]),
-        "host-suspend assembler requires a clean final worktree",
+def host_suspend_source_bridge_at_git_sha(final_sha: str) -> dict[str, Any]:
+    final_sha = require_git_sha(final_sha, "host-suspend final git SHA")
+    resolved_final_sha = require_git_sha(
+        git_text(["rev-parse", f"{final_sha}^{{commit}}"]),
+        "host-suspend resolved final commit",
     )
-    final_sha = require_git_sha(git_text(["rev-parse", "HEAD"]), "host-suspend final git SHA")
-    final_tree = require_git_sha(git_text(["rev-parse", "HEAD^{tree}"]), "host-suspend final tree SHA")
+    require(
+        resolved_final_sha == final_sha,
+        "host-suspend final Git object is not the recorded commit",
+    )
+    final_tree = require_git_sha(
+        git_text(["rev-parse", f"{final_sha}^{{tree}}"]),
+        "host-suspend final tree SHA",
+    )
     parents = git_text(["show", "-s", "--format=%P", final_sha]).split()
     require(parents == [HOST_SUSPEND_SOURCE_GIT_SHA], "host-suspend final source is not the unique direct child of a609cac8")
     raw_name_status = git_bytes(
@@ -1465,6 +1472,19 @@ def host_suspend_source_bridge() -> dict[str, Any]:
         "raw_diff_tree": raw_rows,
         "blobs": blobs,
     }
+
+
+def host_suspend_source_bridge() -> dict[str, Any]:
+    require(
+        not git_text(["status", "--short", "--untracked-files=all"]),
+        "host-suspend assembler requires a clean final worktree",
+    )
+    return host_suspend_source_bridge_at_git_sha(
+        require_git_sha(
+            git_text(["rev-parse", "HEAD"]),
+            "host-suspend final git SHA",
+        )
+    )
 
 
 def internal_fixture_runner_identity() -> dict[str, Any]:
@@ -5390,8 +5410,16 @@ def validate_host_suspend_report_assembly(
     provenance = require_object(provenance_parsed, "host-suspend provenance JSON")
     validate_host_suspend_original_inventory(inventory)
     require(host_suspend_original_inventory(root) == inventory, "host-suspend original artifacts changed after assembly")
-    assembler = canonical_runner_identity()
-    bridge = host_suspend_source_bridge()
+    recorded_bridge = require_object(
+        assembly.get("final_validation_source"),
+        "host-suspend report final validation source",
+    )
+    recorded_final_sha = require_git_sha(
+        recorded_bridge.get("final_git_sha"),
+        "host-suspend report final validation source.final_git_sha",
+    )
+    assembler = runner_identity_at_git_sha(recorded_final_sha)
+    bridge = host_suspend_source_bridge_at_git_sha(recorded_final_sha)
     require(assembly.get("assembler") == assembler, "host-suspend report assembler identity mismatch")
     require(assembly.get("final_validation_source") == bridge, "host-suspend report final validation source mismatch")
     expected_provenance = build_host_suspend_provenance(
@@ -6112,7 +6140,6 @@ def assemble_existing_host_suspend(
         require(after == before, "host-suspend original artifact inventory changed during assembly")
         validated = validate_host_suspend_assembly_manifest(
             output / "assembly-manifest.json",
-            verify_checkout=True,
         )
         return validated["manifest"]
     except Exception:
@@ -6128,10 +6155,7 @@ def assemble_existing_host_suspend(
 
 def validate_host_suspend_assembly_manifest(
     manifest_path: Path,
-    *,
-    verify_checkout: bool = True,
 ) -> dict[str, Any]:
-    require(verify_checkout is True, "host-suspend assembly validation may not disable checkout verification")
     manifest_path = manifest_path.resolve()
     require(manifest_path.name == "assembly-manifest.json", "host-suspend assembly manifest filename mismatch")
     output = manifest_path.parent
