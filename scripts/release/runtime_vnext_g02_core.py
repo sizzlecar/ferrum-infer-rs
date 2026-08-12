@@ -172,6 +172,7 @@ L0_TESTS = (
             {
                 "attention_provider_policy_is_sealed_into_runtime_fingerprint",
                 "execution_memory_is_core_owned_and_exact",
+                "legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable",
                 "maximum_active_sequence_ceiling_is_nonzero_and_o_graph",
                 "minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak",
                 "operation_resource_contract_requires_explicit_presence_and_alignment",
@@ -731,6 +732,30 @@ def validate_artifact(root: Path) -> dict[str, Any]:
 
 
 def self_test() -> int:
+    planning_resource_specs = [
+        spec for spec in L0_TESTS if spec.name == "planning-resource"
+    ]
+    require(
+        len(planning_resource_specs) == 1
+        and planning_resource_specs[0].expected_tests
+        == frozenset(
+            {
+                "attention_provider_policy_is_sealed_into_runtime_fingerprint",
+                "execution_memory_is_core_owned_and_exact",
+                "legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable",
+                "maximum_active_sequence_ceiling_is_nonzero_and_o_graph",
+                "minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak",
+                "operation_resource_contract_requires_explicit_presence_and_alignment",
+                "provider_formula_is_policy_invariant_and_core_binds_token_ceiling",
+                "provider_workspace_formulas_are_actual_shape_checked_and_wire_closed",
+                "reusable_execution_workspace_is_core_derived_plan_data",
+                "runtime_capacity_reserve_and_concurrency_are_typed_planning_inputs",
+                "state_capacity_demand_is_explicit_checked_and_wire_closed",
+                "theoretical_ceiling_over_u64_is_canonical_evidence_not_capacity_policy",
+            }
+        ),
+        "planning-resource exact test roster drifted",
+    )
     environment = child_environment()
     require(environment.get("CARGO_BUILD_JOBS") == str(CARGO_BUILD_JOBS),
             "Cargo build job bound is missing")

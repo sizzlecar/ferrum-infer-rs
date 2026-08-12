@@ -26,6 +26,21 @@ PASS_PREFIX = "FERRUM RUNTIME VNEXT R0 CORE CLOSURE PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT R0 CORE CLOSURE SELFTEST PASS"
 GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 DEPENDENCY_KEYS = ("source", "numerics", "s2")
+G02_ROSTER_BRIDGE_ID = "g02-roster-only-05a5d2f8-v1"
+G02_ROSTER_BRIDGE_BASE_GIT_SHA = "05a5d2f8611ed3a3fedb5c69ff3ba11e533bc4c7"
+G02_ROSTER_BRIDGE_PATH = "scripts/release/runtime_vnext_g02_core.py"
+G02_ROSTER_BRIDGE_OLD_BLOB = "38b832c95ecee833240a1477678fb5ce350f52fb"
+# Exact post-fix Git blob sealed into the one permitted bridge commit.
+G02_ROSTER_BRIDGE_NEW_BLOB = "fa369a3ee52535ead59aefb4b3f675844feb09b8"
+G02_ROSTER_BRIDGE_CHANGED_FILES = frozenset(
+    {
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
+        G02_ROSTER_BRIDGE_PATH,
+        "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
+        "scripts/release/runtime_vnext_r0_core_closure.py",
+        "scripts/release/runtime_vnext_r1_product_correctness.py",
+    }
+)
 CONTROL_PLANE_PREFIXES = ("docs/",)
 SAME_HISTORY_COLLECTOR = "scripts/release/runtime_vnext_g08a_same_history_collector.py"
 R1_AGGREGATOR = "scripts/release/runtime_vnext_r1_product_correctness.py"
@@ -184,6 +199,97 @@ def control_plane_only(paths: list[str], key: str) -> tuple[list[str], list[str]
     return allowed, rejected
 
 
+def _validate_g02_roster_bridge_facts(
+    *,
+    recorded_sha: str,
+    current_sha: str,
+    parent_shas: list[str],
+    changed_files: list[str],
+    old_blob: str,
+    new_blob: str,
+    expected_new_blob: str,
+) -> dict[str, Any]:
+    """Validate the immutable facts for the one-time G02 roster-only bridge."""
+    require(
+        GIT_SHA_RE.fullmatch(expected_new_blob) is not None
+        and expected_new_blob != "0" * 40,
+        "G02 roster bridge new blob is not sealed",
+    )
+    require(
+        GIT_SHA_RE.fullmatch(recorded_sha) is not None
+        and GIT_SHA_RE.fullmatch(current_sha) is not None
+        and all(GIT_SHA_RE.fullmatch(parent) is not None for parent in parent_shas)
+        and GIT_SHA_RE.fullmatch(old_blob) is not None
+        and GIT_SHA_RE.fullmatch(new_blob) is not None,
+        "G02 roster bridge Git identity is invalid",
+    )
+    require(
+        recorded_sha == G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+        "G02 roster bridge evidence is not the sealed 05a source",
+    )
+    require(current_sha != recorded_sha, "G02 roster bridge requires one new commit")
+    require(
+        parent_shas == [G02_ROSTER_BRIDGE_BASE_GIT_SHA],
+        "G02 roster bridge current source is not the unique direct child of 05a",
+    )
+    require(
+        len(changed_files) == len(G02_ROSTER_BRIDGE_CHANGED_FILES)
+        and set(changed_files) == set(G02_ROSTER_BRIDGE_CHANGED_FILES),
+        "G02 roster bridge changed-file set differs",
+    )
+    require(
+        old_blob == G02_ROSTER_BRIDGE_OLD_BLOB,
+        "G02 roster bridge old validator blob differs",
+    )
+    require(new_blob == expected_new_blob, "G02 roster bridge new validator blob differs")
+    return {
+        "bridge_id": G02_ROSTER_BRIDGE_ID,
+        "base_git_sha": G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+        "commit_git_sha": current_sha,
+        "parent_git_shas": copy.deepcopy(parent_shas),
+        "changed_files": sorted(changed_files),
+        "g02_validator": {
+            "path": G02_ROSTER_BRIDGE_PATH,
+            "old_blob": old_blob,
+            "new_blob": new_blob,
+        },
+    }
+
+
+def g02_roster_bridge(recorded: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """Resolve and validate the sealed bridge facts from Git, without heuristics."""
+    recorded_sha = str(recorded["git_sha"])
+    current_sha = str(current["git_sha"])
+    require(
+        git_text("rev-parse", f"{current_sha}^{{tree}}") == current["git_tree_sha"],
+        "G02 roster bridge current source tree differs from git",
+    )
+    commit_and_parents = git_text("rev-list", "--parents", "-n", "1", current_sha).split()
+    require(
+        commit_and_parents and commit_and_parents[0] == current_sha,
+        "G02 roster bridge commit topology is unavailable",
+    )
+    changed_files = [
+        line
+        for line in git_text(
+            "diff",
+            "--name-only",
+            "--diff-filter=ACDMRTUXB",
+            f"{recorded_sha}..{current_sha}",
+        ).splitlines()
+        if line
+    ]
+    return _validate_g02_roster_bridge_facts(
+        recorded_sha=recorded_sha,
+        current_sha=current_sha,
+        parent_shas=commit_and_parents[1:],
+        changed_files=changed_files,
+        old_blob=git_text("rev-parse", f"{recorded_sha}:{G02_ROSTER_BRIDGE_PATH}"),
+        new_blob=git_text("rev-parse", f"{current_sha}:{G02_ROSTER_BRIDGE_PATH}"),
+        expected_new_blob=G02_ROSTER_BRIDGE_NEW_BLOB,
+    )
+
+
 def source_closure(
     source: dict[str, Any], current: dict[str, Any], key: str, label: str
 ) -> dict[str, Any]:
@@ -192,34 +298,26 @@ def source_closure(
         git_text("rev-parse", f"{recorded_sha}^{{tree}}") == source["git_tree_sha"],
         f"{label} recorded source tree differs from git",
     )
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", recorded_sha, str(current["git_sha"])],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        check=False,
-    )
-    require(ancestor.returncode == 0, f"{label} source is not an ancestor of current HEAD")
-    changed = [
-        line
-        for line in git_text(
-            "diff",
-            "--name-only",
-            "--diff-filter=ACDMRTUXB",
-            f"{recorded_sha}..{current['git_sha']}",
-        ).splitlines()
-        if line
-    ]
-    allowed, rejected = control_plane_only(changed, key)
+    if source == current:
+        return {
+            "from_git_sha": recorded_sha,
+            "to_git_sha": current["git_sha"],
+            "changed_files": [],
+            "changed_file_count": 0,
+            "policy": "exact-source",
+        }
     require(
-        not rejected,
-        f"{label} evidence is stale after product or validator changes: {rejected[:8]}",
+        key in {"source", "numerics"},
+        f"{label} must use current-source evidence",
     )
+    bridge = g02_roster_bridge(source, current)
     return {
         "from_git_sha": recorded_sha,
         "to_git_sha": current["git_sha"],
-        "changed_files": allowed,
-        "changed_file_count": len(allowed),
-        "policy": "control-plane-only",
+        "changed_files": copy.deepcopy(bridge["changed_files"]),
+        "changed_file_count": len(bridge["changed_files"]),
+        "policy": "g02-roster-only-evidence-bridge",
+        "bridge": bridge,
     }
 
 
@@ -522,6 +620,46 @@ def fixture_dependencies() -> dict[str, Any]:
 
 
 def self_test() -> int:
+    bridge_facts = {
+        "recorded_sha": G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+        "current_sha": "c" * 40,
+        "parent_shas": [G02_ROSTER_BRIDGE_BASE_GIT_SHA],
+        "changed_files": sorted(G02_ROSTER_BRIDGE_CHANGED_FILES),
+        "old_blob": G02_ROSTER_BRIDGE_OLD_BLOB,
+        "new_blob": G02_ROSTER_BRIDGE_NEW_BLOB,
+        "expected_new_blob": G02_ROSTER_BRIDGE_NEW_BLOB,
+    }
+    sealed_bridge = _validate_g02_roster_bridge_facts(**bridge_facts)
+    require(
+        sealed_bridge["bridge_id"] == G02_ROSTER_BRIDGE_ID
+        and sealed_bridge["g02_validator"]["new_blob"]
+        == G02_ROSTER_BRIDGE_NEW_BLOB,
+        "R0 sealed G02 roster bridge fixture differs",
+    )
+    for field, value, marker in (
+        ("old_blob", "d" * 40, "wrong old G02 blob"),
+        ("new_blob", "e" * 40, "wrong new G02 blob"),
+        ("parent_shas", ["f" * 40], "second commit after 05a"),
+    ):
+        mutated = copy.deepcopy(bridge_facts)
+        mutated[field] = value
+        expect_reject(
+            lambda mutated=mutated: _validate_g02_roster_bridge_facts(**mutated),
+            marker,
+        )
+    for extra_path, marker in (
+        ("crates/ferrum-engine/src/lib.rs", "extra product change"),
+        (
+            "scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json",
+            "extra scenario change",
+        ),
+    ):
+        mutated = copy.deepcopy(bridge_facts)
+        mutated["changed_files"].append(extra_path)
+        expect_reject(
+            lambda mutated=mutated: _validate_g02_roster_bridge_facts(**mutated),
+            marker,
+        )
     allowed, rejected = control_plane_only(
         [
             "docs/goals/r0.md",

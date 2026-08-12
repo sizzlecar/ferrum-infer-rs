@@ -48,12 +48,25 @@ MODEL_REVISION_RE = re.compile(
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+BRIDGE_DEPENDENCY_GIT_SHA = "05a5d2f8611ed3a3fedb5c69ff3ba11e533bc4c7"
+G02_CORE_PATH = "scripts/release/runtime_vnext_g02_core.py"
+G02_CORE_OLD_GIT_BLOB = "38b832c95ecee833240a1477678fb5ce350f52fb"
+G02_CORE_NEW_GIT_BLOB = "fa369a3ee52535ead59aefb4b3f675844feb09b8"
+CORRECTNESS_AMENDMENT_PATH = (
+    "docs/goals/runtime-vnext-0.8.0-2026-07-10/"
+    "CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md"
+)
 DEPENDENCY_CLOSURE_FILES = frozenset(
     {
+        CORRECTNESS_AMENDMENT_PATH,
+        G02_CORE_PATH,
         "scripts/release/runtime_vnext_r0_core_closure.py",
+        "scripts/release/runtime_vnext_r1_product_correctness.py",
         "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
     }
 )
+BRIDGE_POLICY = "s2-g02-current-one-commit-bridge-v1"
+CHILD_SOURCE_POLICY = "g02-core-current-only-v1"
 
 
 @dataclass(frozen=True)
@@ -212,6 +225,24 @@ INPUT_SPECS: dict[str, InputSpec] = {
     ),
 }
 
+DEPENDENCY_SOURCE_KEYS = frozenset(
+    {
+        "g01",
+        "s1",
+        "s1_capacity",
+        "s1_decode_capacity",
+        "m1_determinism",
+        "response_format",
+        "api_modality",
+        "stream_disconnect",
+        "tool_schema",
+        "multiturn_concurrency",
+        "latency_first_failure",
+        "historical_resource_source",
+    }
+)
+CURRENT_SOURCE_KEYS = frozenset({"g02_core"})
+
 SCENARIO_KEYS = {
     "response_format",
     "api_modality",
@@ -223,7 +254,9 @@ PRODUCT_KEYS = {key for key, spec in INPUT_SPECS.items() if spec.product}
 ACCEPTANCE = {
     "all_required_children_present": True,
     "all_children_revalidated_from_raw_evidence": True,
-    "single_clean_source_identity": True,
+    "dependency_children_single_clean_source_identity": True,
+    "g02_core_exact_current_source_identity": True,
+    "one_commit_control_plane_bridge": True,
     "single_cuda_binary_identity": True,
     "qwen35_4b_revision_bound": True,
     "model_file_closure_bound": True,
@@ -373,10 +406,125 @@ def source_for_sha(git_sha: str) -> dict[str, Any]:
     }
 
 
+def child_source_policy() -> dict[str, Any]:
+    require(
+        not (DEPENDENCY_SOURCE_KEYS & CURRENT_SOURCE_KEYS),
+        "S2 child source roles overlap",
+    )
+    require(
+        DEPENDENCY_SOURCE_KEYS | CURRENT_SOURCE_KEYS == set(INPUT_SPECS),
+        "S2 child source roles do not exactly cover the input matrix",
+    )
+    require(
+        CURRENT_SOURCE_KEYS == {"g02_core"},
+        "S2 current-source child set must contain only g02_core",
+    )
+    require(
+        PRODUCT_KEYS <= DEPENDENCY_SOURCE_KEYS,
+        "S2 product evidence cannot use the current-source exception",
+    )
+    return {
+        "policy": CHILD_SOURCE_POLICY,
+        "dependency_source_keys": sorted(DEPENDENCY_SOURCE_KEYS),
+        "current_source_keys": sorted(CURRENT_SOURCE_KEYS),
+    }
+
+
+def source_role_for_key(key: str) -> str:
+    child_source_policy()
+    if key in DEPENDENCY_SOURCE_KEYS:
+        return "dependency"
+    if key in CURRENT_SOURCE_KEYS:
+        return "current"
+    raise AggregateError(f"S2 input has no source role: {key}")
+
+
+def expected_source_for_key(
+    key: str,
+    dependency_source: dict[str, Any],
+    current_source: dict[str, Any],
+) -> dict[str, Any]:
+    return dependency_source if source_role_for_key(key) == "dependency" else current_source
+
+
+def exact_source_closure(source: dict[str, Any]) -> dict[str, Any]:
+    source_sha = require_string(source.get("git_sha"), "S2 exact source git SHA")
+    return {
+        "from_git_sha": source_sha,
+        "to_git_sha": source_sha,
+        "changed_files": [],
+        "changed_file_count": 0,
+        "policy": "exact-current-source",
+    }
+
+
 def dependency_control_plane_only(paths: list[str]) -> tuple[list[str], list[str]]:
     allowed = [path for path in paths if path in DEPENDENCY_CLOSURE_FILES]
     rejected = [path for path in paths if path not in DEPENDENCY_CLOSURE_FILES]
     return allowed, rejected
+
+
+def validate_one_time_bridge_facts(
+    *,
+    dependency_git_sha: str,
+    current_git_sha: str,
+    current_commit_and_parents: list[str],
+    commit_distance: int,
+    changed_files: list[str],
+    g02_old_blob: str,
+    g02_new_blob: str,
+    expected_new_blob: str,
+) -> dict[str, Any]:
+    require(
+        dependency_git_sha == BRIDGE_DEPENDENCY_GIT_SHA,
+        "S2 dependency source is not the pinned 05a bridge source",
+    )
+    require(
+        current_git_sha != dependency_git_sha,
+        "S2 G02 bridge requires a distinct current source",
+    )
+    require(
+        current_commit_and_parents == [current_git_sha, dependency_git_sha],
+        "S2 current source is not the single-parent direct child of 05a",
+    )
+    require(commit_distance == 1, "S2 G02 bridge must span exactly one commit")
+    require(
+        len(changed_files) == len(set(changed_files)),
+        "S2 G02 bridge changed-file list contains duplicates",
+    )
+    actual_paths = set(changed_files)
+    require(
+        actual_paths == DEPENDENCY_CLOSURE_FILES,
+        "S2 G02 bridge changed-file set differs: "
+        f"missing={sorted(DEPENDENCY_CLOSURE_FILES - actual_paths)} "
+        f"extra={sorted(actual_paths - DEPENDENCY_CLOSURE_FILES)}",
+    )
+    require(
+        GIT_SHA_RE.fullmatch(g02_old_blob) is not None
+        and g02_old_blob == G02_CORE_OLD_GIT_BLOB,
+        "S2 G02 bridge old Git blob differs",
+    )
+    require(
+        GIT_SHA_RE.fullmatch(expected_new_blob) is not None,
+        "S2 G02 bridge final Git blob pin is not configured",
+    )
+    require(
+        GIT_SHA_RE.fullmatch(g02_new_blob) is not None
+        and g02_new_blob == expected_new_blob,
+        "S2 G02 bridge new Git blob differs",
+    )
+    return {
+        "from_git_sha": dependency_git_sha,
+        "to_git_sha": current_git_sha,
+        "changed_files": sorted(changed_files),
+        "changed_file_count": len(changed_files),
+        "commit_distance": 1,
+        "g02_core_git_blob_transition": {
+            "from": g02_old_blob,
+            "to": g02_new_blob,
+        },
+        "policy": BRIDGE_POLICY,
+    }
 
 
 def dependency_source_closure(
@@ -390,12 +538,19 @@ def dependency_source_closure(
         require_string(current_source.get("git_sha"), "S2 current git SHA")
     )
     require(current == current_source, "S2 current source differs from git")
-    git(
-        "merge-base",
-        "--is-ancestor",
-        recorded["git_sha"],
-        current["git_sha"],
-    )
+    current_commit_and_parents = git(
+        "rev-list", "--parents", "-n", "1", current["git_sha"]
+    ).split()
+    try:
+        commit_distance = int(
+            git(
+                "rev-list",
+                "--count",
+                f"{recorded['git_sha']}..{current['git_sha']}",
+            )
+        )
+    except ValueError as error:
+        raise AggregateError("S2 G02 bridge commit distance is invalid") from error
     changed = [
         line
         for line in git(
@@ -406,19 +561,22 @@ def dependency_source_closure(
         ).splitlines()
         if line
     ]
-    allowed, rejected = dependency_control_plane_only(changed)
-    require(
-        not rejected,
-        "S2 evidence is stale after product, scenario, or validator changes: "
-        f"{rejected[:8]}",
+    g02_old_blob = git(
+        "rev-parse", f"{recorded['git_sha']}:{G02_CORE_PATH}"
     )
-    return {
-        "from_git_sha": recorded["git_sha"],
-        "to_git_sha": current["git_sha"],
-        "changed_files": allowed,
-        "changed_file_count": len(allowed),
-        "policy": "s2-aggregate-control-plane-only",
-    }
+    g02_new_blob = git(
+        "rev-parse", f"{current['git_sha']}:{G02_CORE_PATH}"
+    )
+    return validate_one_time_bridge_facts(
+        dependency_git_sha=recorded["git_sha"],
+        current_git_sha=current["git_sha"],
+        current_commit_and_parents=current_commit_and_parents,
+        commit_distance=commit_distance,
+        changed_files=changed,
+        g02_old_blob=g02_old_blob,
+        g02_new_blob=g02_new_blob,
+        expected_new_blob=G02_CORE_NEW_GIT_BLOB,
+    )
 
 
 def safe_relative_path(root: Path, relative: str, label: str) -> Path:
@@ -799,7 +957,6 @@ def test_evidence_passed(value: Any, label: str) -> int:
 
 @contextlib.contextmanager
 def dependency_source_context(source: dict[str, Any]) -> Any:
-    original_git = g02.git
     baseline = determinism.baseline_scenarios
     original_baseline_git_text = baseline.git_text
     original_latency_git_output = latency_failure.git_output
@@ -807,13 +964,6 @@ def dependency_source_context(source: dict[str, Any]) -> Any:
     source_tree = require_string(
         source.get("git_tree_sha"), "dependency source git tree"
     )
-
-    def source_git(*args: str) -> str:
-        if args == ("rev-parse", "HEAD"):
-            return source_sha
-        if args == ("rev-parse", "HEAD^{tree}"):
-            return source_tree
-        return original_git(*args)
 
     def source_baseline_git_text(args: list[str]) -> str:
         if args == ["rev-parse", "HEAD"]:
@@ -829,13 +979,11 @@ def dependency_source_context(source: dict[str, Any]) -> Any:
             return source_tree
         return original_latency_git_output(*args)
 
-    g02.git = source_git
     baseline.git_text = source_baseline_git_text
     latency_failure.git_output = source_latency_git_output
     try:
         yield
     finally:
-        g02.git = original_git
         baseline.git_text = original_baseline_git_text
         latency_failure.git_output = original_latency_git_output
 
@@ -1066,6 +1214,10 @@ def deep_validate(
             }
         }, None
     if spec.validator == "g02_core":
+        require(
+            verify_checkout and source == clean_source(),
+            "G02 core must be revalidated on the exact current clean source",
+        )
         observed = g02.validate_artifact(child_path.parent)
         require(observed.get("source") == source, "G02 core source binding mismatch")
         validator_path = Path(g02.__file__).resolve()
@@ -1182,7 +1334,13 @@ def deep_validate(
     return binding, raw
 
 
-def load_input(path: Path, key: str, *, verify_checkout: bool) -> dict[str, Any]:
+def load_input(
+    path: Path,
+    key: str,
+    *,
+    expected_source: dict[str, Any] | None,
+    verify_checkout: bool,
+) -> dict[str, Any]:
     outer_path = path.expanduser().resolve()
     outer = read_json(outer_path, f"{key} outer manifest")
     recorded_outer_dir = require_string(outer.get("artifact_dir"), f"{key} outer artifact_dir")
@@ -1202,9 +1360,14 @@ def load_input(path: Path, key: str, *, verify_checkout: bool) -> dict[str, Any]
     child_digest = sha256(child_path)
     child = read_json(child_path, f"{key} child manifest")
     source = validate_outer_child_pair(key, outer, child, child_digest)
+    if expected_source is not None:
+        require(
+            source == expected_source,
+            f"{key} source identity differs from its {source_role_for_key(key)} source role",
+        )
     if verify_checkout:
         require(source == clean_source(), f"{key} is stale against current checkout")
-    with dependency_source_context(source):
+    if source_role_for_key(key) == "current":
         binding, raw = deep_validate(
             key,
             child,
@@ -1214,6 +1377,17 @@ def load_input(path: Path, key: str, *, verify_checkout: bool) -> dict[str, Any]
             source,
             verify_checkout=verify_checkout,
         )
+    else:
+        with dependency_source_context(source):
+            binding, raw = deep_validate(
+                key,
+                child,
+                child_path,
+                outer_path,
+                outer,
+                source,
+                verify_checkout=verify_checkout,
+            )
     return {
         "outer_path": outer_path,
         "outer": outer,
@@ -1227,9 +1401,21 @@ def load_input(path: Path, key: str, *, verify_checkout: bool) -> dict[str, Any]
     }
 
 
-def cross_bindings(inputs: dict[str, dict[str, Any]], source: dict[str, Any]) -> dict[str, Any]:
+def cross_bindings(
+    inputs: dict[str, dict[str, Any]],
+    dependency_source: dict[str, Any],
+    current_source: dict[str, Any],
+) -> dict[str, Any]:
+    require(set(inputs) == set(INPUT_SPECS), "S2 cross-binding input set differs")
+    policy = child_source_policy()
     for key in INPUT_SPECS:
-        require(inputs[key]["source"] == source, f"{key} source identity differs from S2 source")
+        expected_source = expected_source_for_key(
+            key, dependency_source, current_source
+        )
+        require(
+            inputs[key]["source"] == expected_source,
+            f"{key} source identity differs from its {source_role_for_key(key)} source role",
+        )
     products = {key: inputs[key]["binding"] for key in PRODUCT_KEYS}
     binaries = {binding.get("binary_sha256") for binding in products.values()}
     require(len(binaries) == 1 and None not in binaries, f"S2 product binary identity mismatch: {sorted(str(item) for item in binaries)}")
@@ -1260,6 +1446,17 @@ def cross_bindings(inputs: dict[str, dict[str, Any]], source: dict[str, Any]) ->
         for key in INPUT_SPECS
         if isinstance(inputs[key]["binding"], dict) and inputs[key]["binding"].get("validator")
     }
+    g02_validator = require_object(
+        validator_refs.get("g02_core"), "G02 current validator binding"
+    )
+    require(
+        g02_validator
+        == {
+            "path": G02_CORE_PATH,
+            "sha256": sha256(REPO_ROOT / G02_CORE_PATH),
+        },
+        "G02 validator binding differs from the current source",
+    )
     closure_refs = {
         key: binding["model_file_closure_sha256"]
         for key, binding in products.items()
@@ -1278,7 +1475,9 @@ def cross_bindings(inputs: dict[str, dict[str, Any]], source: dict[str, Any]) ->
         "S2 run/serve product execution identity failed",
     )
     return {
-        "source": source,
+        "product_source": dependency_source,
+        "g02_core_source": current_source,
+        "child_source_policy": policy,
         "binary_sha256": next(iter(binaries)),
         "model": {
             "id": MODEL_ID,
@@ -1320,6 +1519,7 @@ def input_reference(item: dict[str, Any], root: Path, key: str) -> dict[str, Any
     raw = item.get("raw_path")
     return {
         "lane": INPUT_SPECS[key].lane,
+        "source_role": source_role_for_key(key),
         "source": item["source"],
         "outer_manifest": {
             "path": outer_copy.relative_to(root).as_posix(),
@@ -1402,7 +1602,9 @@ def verify_checkpoint_manifest(
             "output_root",
             "source",
             "dependency_source",
+            "child_source_policy",
             "source_closure",
+            "g02_core_source_closure",
             "children",
             "bindings",
             "acceptance",
@@ -1439,14 +1641,26 @@ def verify_checkpoint_manifest(
         manifest.get("source_closure") == closure,
         "S2 dependency source closure mismatch",
     )
+    policy = child_source_policy()
+    require(
+        manifest.get("child_source_policy") == policy,
+        "S2 child source policy mismatch",
+    )
+    g02_closure = exact_source_closure(source)
+    require(
+        manifest.get("g02_core_source_closure") == g02_closure,
+        "S2 G02 current-source closure mismatch",
+    )
     children = require_object(manifest.get("children"), "S2 children")
     require(set(children) == set(INPUT_SPECS), "S2 child matrix mismatch")
     reconstructed_inputs: dict[str, dict[str, Any]] = {}
     for key, spec in INPUT_SPECS.items():
         ref = require_object(children.get(key), f"S2 child {key}")
+        expected_source = expected_source_for_key(key, dependency_source, source)
         require(
             ref.get("lane") == spec.lane
-            and ref.get("source") == dependency_source,
+            and ref.get("source_role") == source_role_for_key(key)
+            and ref.get("source") == expected_source,
             f"S2 child {key} identity mismatch",
         )
         outer_ref = require_object(ref.get("outer_manifest"), f"S2 child {key} outer")
@@ -1459,14 +1673,14 @@ def verify_checkpoint_manifest(
         child = read_json(child_path, f"S2 copied {key} child")
         observed_source = validate_outer_child_pair(key, outer, child, child_ref["sha256"])
         require(
-            observed_source == dependency_source,
+            observed_source == expected_source,
             f"S2 copied {key} source mismatch",
         )
         reconstructed_inputs[key] = {
-            "source": dependency_source,
+            "source": observed_source,
             "binding": ref.get("deep_validation"),
         }
-    bindings = cross_bindings(reconstructed_inputs, dependency_source)
+    bindings = cross_bindings(reconstructed_inputs, dependency_source, source)
     require(manifest.get("bindings") == bindings, "S2 aggregate cross-binding mismatch")
     require(manifest.get("acceptance") == ACCEPTANCE, "S2 acceptance mismatch")
     require(manifest.get("unlocks") == ["S3"], "S2 unlock set mismatch")
@@ -1488,7 +1702,9 @@ def verify_checkpoint_manifest(
             "dirty": source["dirty"],
         },
         "dependency_source": dependency_source,
+        "child_source_policy": policy,
         "source_closure": closure,
+        "g02_core_source_closure": g02_closure,
         "bindings": bindings,
     }
 
@@ -1504,13 +1720,30 @@ def build_checkpoint(input_paths: dict[str, Path], out: Path) -> str:
     started_at = iso_now()
     started = time.monotonic()
     try:
-        inputs = {
-            key: load_input(input_paths[key], key, verify_checkout=False)
-            for key in INPUT_SPECS
-        }
-        dependency_source = inputs["g01"]["source"]
+        g01_input = load_input(
+            input_paths["g01"],
+            "g01",
+            expected_source=None,
+            verify_checkout=False,
+        )
+        dependency_source = g01_input["source"]
         closure = dependency_source_closure(dependency_source, source)
-        bindings = cross_bindings(inputs, dependency_source)
+        inputs = {"g01": g01_input}
+        for key in INPUT_SPECS:
+            if key == "g01":
+                continue
+            role = source_role_for_key(key)
+            inputs[key] = load_input(
+                input_paths[key],
+                key,
+                expected_source=expected_source_for_key(
+                    key, dependency_source, source
+                ),
+                verify_checkout=role == "current",
+            )
+        policy = child_source_policy()
+        g02_closure = exact_source_closure(source)
+        bindings = cross_bindings(inputs, dependency_source, source)
         children = {key: input_reference(inputs[key], root, key) for key in INPUT_SPECS}
         rows = artifact_index(root)
         pass_line = f"{PASS_PREFIX}: {output}"
@@ -1525,7 +1758,9 @@ def build_checkpoint(input_paths: dict[str, Path], out: Path) -> str:
             "output_root": str(output),
             "source": source,
             "dependency_source": dependency_source,
+            "child_source_policy": policy,
             "source_closure": closure,
+            "g02_core_source_closure": g02_closure,
             "children": children,
             "bindings": bindings,
             "acceptance": ACCEPTANCE,
@@ -1571,26 +1806,101 @@ def expect_reject(action: Callable[[], Any], marker: str) -> None:
 def self_test() -> int:
     source_sha = "1" * 40
     source_tree = "2" * 40
-    source = {
+    dependency_source = {
         "git_sha": source_sha,
         "git_tree_sha": source_tree,
         "dirty": False,
         "status_short": [],
     }
-    allowed, rejected = dependency_control_plane_only(
-        [
-            "scripts/release/runtime_vnext_r0_core_closure.py",
-            "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
-        ]
+    current_source = {
+        "git_sha": "3" * 40,
+        "git_tree_sha": "4" * 40,
+        "dirty": False,
+        "status_short": [],
+    }
+    policy = child_source_policy()
+    require(
+        policy
+        == {
+            "policy": CHILD_SOURCE_POLICY,
+            "dependency_source_keys": sorted(DEPENDENCY_SOURCE_KEYS),
+            "current_source_keys": ["g02_core"],
+        },
+        "S2 child source policy differs",
     )
-    require(len(allowed) == 2 and not rejected, "S2 dependency closure rejected control-plane files")
+    allowed, rejected = dependency_control_plane_only(
+        sorted(DEPENDENCY_CLOSURE_FILES)
+    )
+    require(
+        set(allowed) == DEPENDENCY_CLOSURE_FILES and not rejected,
+        "S2 dependency closure rejected bridge files",
+    )
     _, rejected = dependency_control_plane_only(
         [
             "crates/ferrum-engine/src/lib.rs",
             "scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json",
+            "scripts/release/run_gate.py",
         ]
     )
-    require(len(rejected) == 2, "S2 dependency closure accepted product or scenario changes")
+    require(
+        len(rejected) == 3,
+        "S2 dependency closure accepted product, scenario, or adjacent gate changes",
+    )
+    bridge_facts = {
+        "dependency_git_sha": BRIDGE_DEPENDENCY_GIT_SHA,
+        "current_git_sha": current_source["git_sha"],
+        "current_commit_and_parents": [
+            current_source["git_sha"],
+            BRIDGE_DEPENDENCY_GIT_SHA,
+        ],
+        "commit_distance": 1,
+        "changed_files": sorted(DEPENDENCY_CLOSURE_FILES),
+        "g02_old_blob": G02_CORE_OLD_GIT_BLOB,
+        "g02_new_blob": G02_CORE_NEW_GIT_BLOB,
+        "expected_new_blob": G02_CORE_NEW_GIT_BLOB,
+    }
+    bridge = validate_one_time_bridge_facts(**bridge_facts)
+    require(
+        bridge["policy"] == BRIDGE_POLICY
+        and bridge["changed_file_count"] == len(DEPENDENCY_CLOSURE_FILES)
+        and bridge["commit_distance"] == 1,
+        "S2 one-time bridge fixture differs",
+    )
+    for key, value, marker in (
+        ("dependency_git_sha", "5" * 40, "pinned 05a"),
+        ("commit_distance", 2, "exactly one commit"),
+        ("g02_old_blob", "6" * 40, "old Git blob"),
+        ("g02_new_blob", "7" * 40, "new Git blob"),
+    ):
+        forged = copy.deepcopy(bridge_facts)
+        forged[key] = value
+        expect_reject(
+            lambda forged=forged: validate_one_time_bridge_facts(**forged),
+            marker,
+        )
+    forged = copy.deepcopy(bridge_facts)
+    forged["current_commit_and_parents"] = [current_source["git_sha"]]
+    expect_reject(
+        lambda: validate_one_time_bridge_facts(**forged), "single-parent direct child"
+    )
+    for changed in (
+        sorted(DEPENDENCY_CLOSURE_FILES - {G02_CORE_PATH}),
+        [*sorted(DEPENDENCY_CLOSURE_FILES), "scripts/release/run_gate.py"],
+    ):
+        forged = copy.deepcopy(bridge_facts)
+        forged["changed_files"] = changed
+        expect_reject(
+            lambda forged=forged: validate_one_time_bridge_facts(**forged),
+            "changed-file set",
+        )
+    forged = copy.deepcopy(bridge_facts)
+    forged["changed_files"] = [
+        *sorted(DEPENDENCY_CLOSURE_FILES),
+        sorted(DEPENDENCY_CLOSURE_FILES)[0],
+    ]
+    expect_reject(
+        lambda: validate_one_time_bridge_facts(**forged), "duplicates"
+    )
     require(
         test_evidence_passed({"summary": {"passed": 1}}, "fixture") == 1,
         "nested test evidence count drifted",
@@ -1643,8 +1953,11 @@ def self_test() -> int:
     original_g02_git = g02.git
     original_baseline_git_text = determinism.baseline_scenarios.git_text
     original_latency_git_output = latency_failure.git_output
-    with dependency_source_context(source):
-        require(g02.git("rev-parse", "HEAD") == source_sha, "G02 source context drifted")
+    with dependency_source_context(dependency_source):
+        require(
+            g02.git is original_g02_git,
+            "dependency context overrode the current G02 validator source",
+        )
         require(
             determinism.baseline_scenarios.git_text(["rev-parse", "HEAD"])
             == source_sha,
@@ -1750,9 +2063,13 @@ def self_test() -> int:
             },
         }
         original_source_for_sha = globals()["source_for_sha"]
-        globals()["source_for_sha"] = lambda _sha: source
+        globals()["source_for_sha"] = lambda _sha: dependency_source
         try:
-            require(validate_outer_child_pair(key, outer, child, "3" * 64) == source, f"{key} pair validation failed")
+            require(
+                validate_outer_child_pair(key, outer, child, "3" * 64)
+                == dependency_source,
+                f"{key} pair validation failed",
+            )
             dirty = copy.deepcopy(outer)
             dirty["dirty_status"] = {"is_dirty": True, "status_short": [" M source"]}
             expect_reject(lambda: validate_outer_child_pair(key, dirty, child, "3" * 64), "dirty")
@@ -1781,6 +2098,11 @@ def self_test() -> int:
     inputs: dict[str, dict[str, Any]] = {}
     for key in INPUT_SPECS:
         binding: dict[str, Any] = {"validator": {"path": f"{key}.py", "sha256": "9" * 64}}
+        if key == "g02_core":
+            binding["validator"] = {
+                "path": G02_CORE_PATH,
+                "sha256": sha256(REPO_ROOT / G02_CORE_PATH),
+            }
         if key in PRODUCT_KEYS:
             binding = copy.deepcopy(product)
             if key not in SCENARIO_KEYS:
@@ -1800,22 +2122,74 @@ def self_test() -> int:
                     "same_runtime_implementation": True,
                     "production_legacy_selection_count": 0,
                 }
-        inputs[key] = {"source": source, "binding": binding}
-    cross_bindings(inputs, source)
+        inputs[key] = {
+            "source": expected_source_for_key(
+                key, dependency_source, current_source
+            ),
+            "binding": binding,
+        }
+    cross_bindings(inputs, dependency_source, current_source)
+    forged = copy.deepcopy(inputs)
+    forged["g02_core"]["source"] = dependency_source
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "current source role",
+    )
+    forged = copy.deepcopy(inputs)
+    forged["s1"]["source"] = current_source
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "dependency source role",
+    )
+    forged = copy.deepcopy(inputs)
+    forged["s1"]["source"] = {
+        "git_sha": "8" * 40,
+        "git_tree_sha": "9" * 40,
+        "dirty": False,
+        "status_short": [],
+    }
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "dependency source role",
+    )
+    forged = copy.deepcopy(inputs)
+    forged.pop("historical_resource_source")
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "input set differs",
+    )
+    forged = copy.deepcopy(inputs)
+    forged["g02_core"]["binding"]["validator"]["sha256"] = "0" * 64
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "G02 validator binding",
+    )
     forged = copy.deepcopy(inputs)
     forged["s1_capacity"]["binding"]["binary_sha256"] = "d" * 64
-    expect_reject(lambda: cross_bindings(forged, source), "binary")
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "binary",
+    )
     forged = copy.deepcopy(inputs)
     forged["tool_schema"]["binding"]["hardware"]["uuid"] = "GPU-other"
-    expect_reject(lambda: cross_bindings(forged, source), "UUID")
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "UUID",
+    )
     forged = copy.deepcopy(inputs)
     forged["response_format"]["binding"]["model_revision"] = "e" * 40
-    expect_reject(lambda: cross_bindings(forged, source), "revision")
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "revision",
+    )
     forged = copy.deepcopy(inputs)
     forged["multiturn_concurrency"]["binding"]["product_execution_identity"][
         "production_legacy_selection_count"
     ] = 1
-    expect_reject(lambda: cross_bindings(forged, source), "product execution identity")
+    expect_reject(
+        lambda: cross_bindings(forged, dependency_source, current_source),
+        "product execution identity",
+    )
     print(SELFTEST_PASS)
     return 0
 

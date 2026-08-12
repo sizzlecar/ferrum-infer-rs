@@ -45,35 +45,6 @@ LLAMA_MODEL_MARKERS = {
     "cuda": "Meta-Llama-3.1-8B-Instruct-GPTQ-INT4",
     "metal": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
 }
-CONTROL_PLANE_FILES = frozenset(
-    {
-        "scripts/release/run_gate.py",
-        "scripts/release/runtime_vnext_r1_product_correctness.py",
-        "scripts/release/scenarios/runtime_vnext_r1_llama_dense_cuda.json",
-        "scripts/release/scenarios/runtime_vnext_r1_llama_dense_metal.json",
-    }
-)
-MATRIX_EVIDENCE_CLOSURE_FILES = frozenset(
-    {
-        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
-        "docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md",
-        "docs/goals/runtime-vnext-0.8.0-2026-07-10/RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md",
-        "scripts/release/runtime_vnext_baseline_scenarios.py",
-        "scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py",
-        "scripts/release/runtime_vnext_g08c_cuda_matrix_checkpoint.py",
-        "scripts/release/runtime_vnext_r1_product_correctness.py",
-    }
-)
-R1_CAUSALLY_ISOLATED_EVIDENCE_FILES = frozenset(
-    {
-        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
-        "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
-        "scripts/release/run_scenarios.py",
-        "scripts/release/runtime_vnext_g08a_same_history_collector.py",
-        "scripts/release/runtime_vnext_r0_core_closure.py",
-        "scripts/release/runtime_vnext_r1_product_correctness.py",
-    }
-)
 OUTER_GATE_FIELDS = {
     "artifact_dir",
     "binary",
@@ -305,57 +276,26 @@ def source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[st
         == recorded["git_tree_sha"],
         "R0 recorded source tree differs from git",
     )
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", recorded_sha, current["git_sha"]],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        check=False,
-    )
-    require(ancestor.returncode == 0, "R0 source is not an ancestor of R1 source")
-    changed = [
-        line
-        for line in git_text(
-            "diff",
-            "--name-only",
-            "--diff-filter=ACDMRTUXB",
-            f"{recorded_sha}..{current['git_sha']}",
-        ).splitlines()
-        if line
-    ]
-    rejected = [
-        path
-        for path in changed
-        if not path.startswith("docs/") and path not in CONTROL_PLANE_FILES
-    ]
     require(
-        not rejected,
-        f"R0 is stale after product or non-R1 validator changes: {rejected[:8]}",
+        recorded == current,
+        "R0 must be aggregated from the current R1 source",
     )
     return {
         "from_git_sha": recorded_sha,
         "to_git_sha": current["git_sha"],
-        "changed_files": changed,
-        "changed_file_count": len(changed),
-        "policy": "r1-control-plane-only",
+        "changed_files": [],
+        "changed_file_count": 0,
+        "policy": "exact-source",
     }
 
 
 def matrix_source_change_policy(changed: list[str], lane: MatrixLane) -> str:
-    allowed = R1_CAUSALLY_ISOLATED_EVIDENCE_FILES
-    policy = "r1-causally-isolated-control-plane-only"
-    if lane.model_key == "m1-qwen35-4b":
-        allowed = allowed | MATRIX_EVIDENCE_CLOSURE_FILES
-        policy = "m1-r1-matrix-control-plane-only"
-    rejected = [path for path in changed if path not in allowed]
     require(
-        not rejected,
-        f"{lane.key} matrix evidence is stale after non-control-plane changes: {rejected[:8]}",
+        len(changed) == len(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES)
+        and set(changed) == set(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES),
+        f"{lane.key} matrix evidence does not match the sealed G02 roster bridge",
     )
-    require(
-        changed,
-        f"{lane.key} source identity differs without an observable git diff",
-    )
-    return policy
+    return "g02-roster-only-evidence-bridge"
 
 
 def matrix_source_closure(
@@ -377,33 +317,18 @@ def matrix_source_closure(
             "changed_file_count": 0,
             "policy": "exact-source",
         }
-    ancestor = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", recorded_sha, current["git_sha"]],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        check=False,
-    )
-    require(
-        ancestor.returncode == 0,
-        f"{lane.key} recorded source is not an ancestor of current source",
-    )
-    changed = [
-        line
-        for line in git_text(
-            "diff",
-            "--name-only",
-            "--diff-filter=ACDMRTUXB",
-            f"{recorded_sha}..{current['git_sha']}",
-        ).splitlines()
-        if line
-    ]
-    policy = matrix_source_change_policy(changed, lane)
+    try:
+        bridge = r0_checkpoint.g02_roster_bridge(recorded, current)
+    except r0_checkpoint.R0Error as error:
+        raise R1Error(f"{lane.key} matrix bridge rejected: {error}") from error
+    policy = matrix_source_change_policy(bridge["changed_files"], lane)
     return {
         "from_git_sha": recorded_sha,
         "to_git_sha": current["git_sha"],
-        "changed_files": changed,
-        "changed_file_count": len(changed),
+        "changed_files": copy.deepcopy(bridge["changed_files"]),
+        "changed_file_count": len(bridge["changed_files"]),
         "policy": policy,
+        "bridge": bridge,
     }
 
 
@@ -1384,7 +1309,10 @@ def verify_manifest(
     llamas = dependencies["llama_dense"]
     require(isinstance(matrices, dict) and isinstance(llamas, dict), "R1 evidence maps are missing")
     for key, row in matrices.items():
-        require(isinstance(row, dict), f"R1 {key} evidence is invalid")
+        require(
+            key in MATRIX_LANES and isinstance(row, dict),
+            f"R1 {key} evidence is invalid",
+        )
         for ref_name in ("outer_manifest", "child_manifest", "validation", "scenario_report"):
             validate_ref(row[ref_name], f"R1 {key} {ref_name}")
         provider = row.get("provider_execution")
@@ -1393,6 +1321,24 @@ def verify_manifest(
         for ref_name in ("c18_raw", "c18_case", "c18_transcript"):
             validate_ref(provider[ref_name], f"R1 {key} {ref_name}")
         validate_ref(resources["c09_raw"], f"R1 {key} c09_raw")
+        closure = row.get("source_closure")
+        require(isinstance(closure, dict), f"R1 {key} source closure is missing")
+        recorded_sha = closure.get("from_git_sha")
+        require(
+            isinstance(recorded_sha, str)
+            and GIT_SHA_RE.fullmatch(recorded_sha) is not None,
+            f"R1 {key} recorded source SHA is invalid",
+        )
+        recorded_source = {
+            "git_sha": recorded_sha,
+            "git_tree_sha": git_text("rev-parse", f"{recorded_sha}^{{tree}}"),
+            "dirty": False,
+        }
+        require(
+            closure
+            == matrix_source_closure(recorded_source, source, MATRIX_LANES[key]),
+            f"R1 {key} source closure drifted",
+        )
     for backend, row in llamas.items():
         require(isinstance(row, dict), f"R1 Llama {backend} evidence is invalid")
         for ref_name in ("summary", "execution_receipt", "artifact_tree"):
@@ -1496,53 +1442,54 @@ def self_test() -> int:
         and exact_closure["changed_file_count"] == 0,
         "matrix exact-source closure differs",
     )
+    exact_r0_closure = source_closure(source, source)
     require(
-        matrix_source_change_policy(
-            [
-                "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
-                "scripts/release/run_scenarios.py",
-            ],
-            MATRIX_LANES["m2_metal"],
-        )
-        == "r1-causally-isolated-control-plane-only",
-        "R1 causal closure rejected isolated gate inputs",
+        exact_r0_closure["policy"] == "exact-source"
+        and exact_r0_closure["changed_file_count"] == 0,
+        "R1 accepted R0 closure is not exact-source",
     )
-    causal_patch_paths = [
-        "docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md",
-        "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
-        "scripts/release/run_scenarios.py",
-        "scripts/release/runtime_vnext_g08a_same_history_collector.py",
-        "scripts/release/runtime_vnext_r0_core_closure.py",
-        "scripts/release/runtime_vnext_r1_product_correctness.py",
-    ]
-    for key, expected_policy in (
-        ("m1_metal", "m1-r1-matrix-control-plane-only"),
-        ("m2_metal", "r1-causally-isolated-control-plane-only"),
-        ("m3_metal", "r1-causally-isolated-control-plane-only"),
-    ):
+    bridge_paths = sorted(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES)
+    for key in ("m1_metal", "m2_metal", "m3_metal"):
         require(
-            matrix_source_change_policy(causal_patch_paths, MATRIX_LANES[key])
-            == expected_policy,
-            f"{key} causal closure rejected the bounded numerics patch",
+            matrix_source_change_policy(bridge_paths, MATRIX_LANES[key])
+            == "g02-roster-only-evidence-bridge",
+            f"{key} rejected the sealed G02 roster bridge file set",
+        )
+    previous_sha = git_text("rev-parse", "HEAD^")
+    previous_source = {
+        "git_sha": previous_sha,
+        "git_tree_sha": git_text("rev-parse", f"{previous_sha}^{{tree}}"),
+        "dirty": False,
+    }
+    expect_reject(
+        lambda: source_closure(previous_source, source),
+        "non-current R0 source",
+    )
+    for path, marker in (
+        ("crates/ferrum-cli/src/commands/serve.rs", "extra product change"),
+        (
+            "scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json",
+            "extra scenario change",
+        ),
+    ):
+        changed = [*bridge_paths, path]
+        expect_reject(
+            lambda changed=changed: matrix_source_change_policy(
+                changed, MATRIX_LANES["m2_metal"]
+            ),
+            marker,
         )
     for path in (
-        "scripts/release/runtime_vnext_g08a_same_history.py",
-        "scripts/release/runtime_vnext_g08b_metal_matrix_checkpoint.py",
-        "crates/ferrum-cli/src/commands/serve.rs",
+        "scripts/release/runtime_vnext_g02_core.py",
+        "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
     ):
+        incomplete = [item for item in bridge_paths if item != path]
         expect_reject(
-            lambda path=path: matrix_source_change_policy(
-                [path], MATRIX_LANES["m2_metal"]
+            lambda incomplete=incomplete: matrix_source_change_policy(
+                incomplete, MATRIX_LANES["m2_metal"]
             ),
-            f"R1 causal closure non-isolated path {path}",
+            f"incomplete bridge set without {path}",
         )
-    expect_reject(
-        lambda: matrix_source_change_policy(
-            ["crates/ferrum-cli/src/commands/serve.rs"],
-            MATRIX_LANES["m2_metal"],
-        ),
-        "Llama runner closure product source",
-    )
     with tempfile.TemporaryDirectory(prefix="ferrum-r1-selftest-") as temporary:
         root = Path(temporary).resolve()
         binaries = {"cuda": "1" * 64, "metal": "2" * 64}
