@@ -848,6 +848,17 @@ impl SequenceState {
         }
     }
 
+    pub(super) fn record_decode_execution(&mut self, started_at: Instant, ended_at: Instant) {
+        if let Some(timing) = &mut self.token_timing {
+            timing.record_decode_stage_interval(
+                self.start_time,
+                EngineDecodeStage::DecodeExecution,
+                started_at,
+                ended_at,
+            );
+        }
+    }
+
     pub(super) fn record_generated_token_commit_with_decode_postprocess(
         &mut self,
         postprocess_started_at: Option<Instant>,

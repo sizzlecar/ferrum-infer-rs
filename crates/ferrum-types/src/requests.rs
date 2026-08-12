@@ -38,6 +38,9 @@ pub struct InferenceEvidenceRequest {
 pub enum EngineDecodeStage {
     /// Host scheduling work that selected this request for a decode wave.
     DecodeScheduling,
+    /// The model-executor call for one decode wave, including preparation,
+    /// device submission/completion, readback, and executor-side retirement.
+    DecodeExecution,
     /// Host-side validation, sampling, and state commit after device execution.
     DecodePostprocess,
 }

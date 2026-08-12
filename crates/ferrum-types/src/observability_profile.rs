@@ -472,6 +472,7 @@ impl FerrumProfileEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::requests::{EngineDecodeStage, EngineDecodeStageInterval};
 
     fn base_event() -> FerrumProfileEvent {
         FerrumProfileEvent {
@@ -563,7 +564,23 @@ mod tests {
             wall_anchor_max_error_nanos: 400,
             decode_ready_nanos_since_request_start: Some(2_000_000),
             token_commit_nanos_since_request_start: vec![1_000_000, 2_500_000, 5_000_000],
-            decode_stage_intervals: Vec::new(),
+            decode_stage_intervals: vec![
+                EngineDecodeStageInterval {
+                    stage: EngineDecodeStage::DecodeScheduling,
+                    start_nanos_since_request_start: 2_000_000,
+                    end_nanos_since_request_start: 2_100_000,
+                },
+                EngineDecodeStageInterval {
+                    stage: EngineDecodeStage::DecodeExecution,
+                    start_nanos_since_request_start: 2_100_000,
+                    end_nanos_since_request_start: 4_900_000,
+                },
+                EngineDecodeStageInterval {
+                    stage: EngineDecodeStage::DecodePostprocess,
+                    start_nanos_since_request_start: 4_900_000,
+                    end_nanos_since_request_start: 5_000_000,
+                },
+            ],
         };
         timing.validate(3).unwrap();
         assert!(timing.validate(2).is_err());
@@ -575,11 +592,27 @@ mod tests {
         );
         assert_eq!(
             attributes["engine_decode_stage_intervals"],
-            serde_json::json!([])
+            serde_json::json!([
+                {
+                    "stage": "decode_scheduling",
+                    "start_nanos_since_request_start": 2_000_000,
+                    "end_nanos_since_request_start": 2_100_000,
+                },
+                {
+                    "stage": "decode_execution",
+                    "start_nanos_since_request_start": 2_100_000,
+                    "end_nanos_since_request_start": 4_900_000,
+                },
+                {
+                    "stage": "decode_postprocess",
+                    "start_nanos_since_request_start": 4_900_000,
+                    "end_nanos_since_request_start": 5_000_000,
+                },
+            ])
         );
         assert_eq!(
             attributes["engine_decode_stage_interval_count"],
-            serde_json::json!(0)
+            serde_json::json!(3)
         );
         assert_eq!(attributes["ttft_us"], serde_json::json!(1_000));
         assert_eq!(attributes["itl_interval_count"], serde_json::json!(2));

@@ -4611,7 +4611,7 @@ async fn plan_runtime_adaptive_decode_failure_only_completes_its_exact_subcohort
 #[tokio::test]
 async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
     for (profile_detail, expected_stage_count) in [
-        (ObservabilityProfileDetail::Full, 2),
+        (ObservabilityProfileDetail::Full, 3),
         (ObservabilityProfileDetail::Off, 0),
     ] {
         let (engine, scheduler, executor, tokenizer) =
@@ -4646,16 +4646,22 @@ async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
         );
         if profile_detail == ObservabilityProfileDetail::Full {
             let scheduling = &timing.decode_stage_intervals[0];
-            let postprocess = &timing.decode_stage_intervals[1];
+            let execution = &timing.decode_stage_intervals[1];
+            let postprocess = &timing.decode_stage_intervals[2];
             assert_eq!(scheduling.stage, EngineDecodeStage::DecodeScheduling);
+            assert_eq!(execution.stage, EngineDecodeStage::DecodeExecution);
             assert_eq!(postprocess.stage, EngineDecodeStage::DecodePostprocess);
             assert_eq!(
                 scheduling.start_nanos_since_request_start,
                 timing.token_commit_nanos_since_request_start[0]
             );
-            assert!(
-                scheduling.end_nanos_since_request_start
-                    <= postprocess.start_nanos_since_request_start
+            assert_eq!(
+                scheduling.end_nanos_since_request_start,
+                execution.start_nanos_since_request_start
+            );
+            assert_eq!(
+                execution.end_nanos_since_request_start,
+                postprocess.start_nanos_since_request_start
             );
             assert_eq!(
                 postprocess.end_nanos_since_request_start,
@@ -7327,9 +7333,12 @@ fn sequence_engine_timing_is_opt_in_and_matches_committed_tokens() {
     enabled.record_decode_ready();
     enabled.generated_tokens.push(TokenId::new(3));
     enabled.record_generated_token_commit();
-    enabled.close_decode_scheduling(Instant::now());
+    let execution_started_at = Instant::now();
+    enabled.close_decode_scheduling(execution_started_at);
+    let execution_ended_at = Instant::now();
+    enabled.record_decode_execution(execution_started_at, execution_ended_at);
     enabled.generated_tokens.push(TokenId::new(4));
-    enabled.record_generated_token_commit_with_decode_postprocess(Some(Instant::now()));
+    enabled.record_generated_token_commit_with_decode_postprocess(Some(execution_ended_at));
 
     let evidence = enabled
         .take_execution_evidence()
@@ -7348,17 +7357,21 @@ fn sequence_engine_timing_is_opt_in_and_matches_committed_tokens() {
             >= timing.token_commit_nanos_since_request_start[0]
     );
     assert!(timing.decode_wall_nanos().is_some());
-    assert_eq!(timing.decode_stage_intervals.len(), 2);
+    assert_eq!(timing.decode_stage_intervals.len(), 3);
     assert_eq!(
         timing.decode_stage_intervals[0].stage,
         EngineDecodeStage::DecodeScheduling
     );
     assert_eq!(
         timing.decode_stage_intervals[1].stage,
+        EngineDecodeStage::DecodeExecution
+    );
+    assert_eq!(
+        timing.decode_stage_intervals[2].stage,
         EngineDecodeStage::DecodePostprocess
     );
     assert_eq!(
-        timing.decode_stage_intervals[1].end_nanos_since_request_start,
+        timing.decode_stage_intervals[2].end_nanos_since_request_start,
         timing.token_commit_nanos_since_request_start[1]
     );
 }
