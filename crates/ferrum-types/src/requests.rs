@@ -33,6 +33,25 @@ pub struct InferenceEvidenceRequest {
 /// this monotonic domain with profile events; durations and ITL must be
 /// computed from `token_commit_nanos_since_request_start`, never by
 /// subtracting wall-clock timestamps.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineDecodeStage {
+    /// Host scheduling work that selected this request for a decode wave.
+    DecodeScheduling,
+    /// Host-side validation, sampling, and state commit after device execution.
+    DecodePostprocess,
+}
+
+/// A measured request-local engine decode stage in the request's monotonic
+/// clock domain. These are explicit producer boundaries, not intervals inferred
+/// by filling gaps between other profile events.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineDecodeStageInterval {
+    pub stage: EngineDecodeStage,
+    pub start_nanos_since_request_start: u64,
+    pub end_nanos_since_request_start: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EngineTokenTimingEvidence {
     pub clock_source: String,
@@ -41,6 +60,9 @@ pub struct EngineTokenTimingEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_ready_nanos_since_request_start: Option<u64>,
     pub token_commit_nanos_since_request_start: Vec<u64>,
+    /// Opt-in decode-stage evidence captured only with engine token timing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_stage_intervals: Vec<EngineDecodeStageInterval>,
 }
 
 impl EngineTokenTimingEvidence {
@@ -63,6 +85,16 @@ impl EngineTokenTimingEvidence {
             .any(|window| window[1] < window[0])
         {
             return Err("engine token commit timestamps must be monotonic".to_string());
+        }
+        if self.decode_stage_intervals.iter().any(|interval| {
+            interval.end_nanos_since_request_start < interval.start_nanos_since_request_start
+        }) {
+            return Err("engine decode stage interval end precedes start".to_string());
+        }
+        if self.decode_stage_intervals.windows(2).any(|window| {
+            window[1].start_nanos_since_request_start < window[0].start_nanos_since_request_start
+        }) {
+            return Err("engine decode stage intervals must be ordered by start".to_string());
         }
         Ok(())
     }

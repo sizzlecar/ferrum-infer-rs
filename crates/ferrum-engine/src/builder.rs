@@ -1193,6 +1193,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn product_without_profile_does_not_attach_execution_event_sink() {
+        let saw_sink_during_startup = Arc::new(AtomicBool::new(false));
+        let executor: Arc<dyn ModelExecutor + Send + Sync> =
+            Arc::new(ProfileStartupProbeExecutor {
+                inner: ferrum_testkit::MockModelExecutor::instant(128),
+                event_sink: Mutex::new(None),
+                saw_sink_during_startup: Arc::clone(&saw_sink_during_startup),
+            });
+
+        let engine = EngineBuilder::new(EngineConfig::default())
+            .with_custom_executor(executor)
+            .build()
+            .await
+            .expect("profile-disabled engine builds");
+        assert!(!saw_sink_during_startup.load(Ordering::Acquire));
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn plan_runtime_without_resolved_plan_rejects_before_legacy_kv_factory() {
         let calls = Arc::new(AtomicUsize::new(0));
         let registry = Arc::new(ComponentRegistry::with_defaults());

@@ -2387,6 +2387,7 @@ mod tests {
                         wall_anchor_max_error_nanos: 500,
                         decode_ready_nanos_since_request_start: Some(1_000_000),
                         token_commit_nanos_since_request_start: vec![2_000_000, 4_000_000],
+                        decode_stage_intervals: Vec::new(),
                     }),
                 }),
                 memory: None,

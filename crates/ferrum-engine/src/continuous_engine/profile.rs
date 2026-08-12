@@ -469,6 +469,25 @@ impl VNextProfileEventContext {
                 serde_json::json!(origin.namespace()),
             );
         }
+        if let ExecutionEventDetail::MonotonicClockAnchor {
+            clock_source,
+            wall_anchor_unix_nanos,
+            max_error_nanos,
+        } = event.detail()
+        {
+            attributes.insert(
+                "vnext_monotonic_clock_source".to_string(),
+                serde_json::json!(clock_source),
+            );
+            attributes.insert(
+                "vnext_monotonic_wall_anchor_unix_nanos".to_string(),
+                serde_json::json!(wall_anchor_unix_nanos),
+            );
+            attributes.insert(
+                "vnext_clock_conversion_max_error_nanos".to_string(),
+                serde_json::json!(max_error_nanos),
+            );
+        }
         match event.detail() {
             ExecutionEventDetail::Failure(failure) => {
                 attributes.insert("first_failure_event".to_string(), serde_json::json!(true));

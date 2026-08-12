@@ -6,6 +6,8 @@ struct SequenceTokenTiming {
     wall_anchor_max_error_nanos: u64,
     decode_ready_nanos_since_request_start: Option<u64>,
     token_commit_nanos_since_request_start: Vec<u64>,
+    decode_stage_intervals: Vec<EngineDecodeStageInterval>,
+    pending_decode_scheduling_started_at: Option<Instant>,
 }
 
 impl SequenceTokenTiming {
@@ -24,25 +26,81 @@ impl SequenceTokenTiming {
                 wall_anchor_max_error_nanos: u64::try_from(span).unwrap_or(u64::MAX),
                 decode_ready_nanos_since_request_start: None,
                 token_commit_nanos_since_request_start: Vec::new(),
+                decode_stage_intervals: Vec::new(),
+                pending_decode_scheduling_started_at: None,
             },
         ))
     }
 
-    fn record_commit(&mut self, request_start: Instant) {
-        let elapsed = u64::try_from(request_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    fn nanos_since_request_start(request_start: Instant, at: Instant) -> Option<u64> {
+        at.checked_duration_since(request_start)
+            .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    fn record_commit(&mut self, request_start: Instant, committed_at: Instant) {
+        let elapsed =
+            Self::nanos_since_request_start(request_start, committed_at).unwrap_or_else(|| {
+                u64::try_from(request_start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+            });
         let monotonic = self
             .token_commit_nanos_since_request_start
             .last()
             .copied()
             .map_or(elapsed, |previous| previous.max(elapsed));
         self.token_commit_nanos_since_request_start.push(monotonic);
+        self.pending_decode_scheduling_started_at = Some(committed_at);
+    }
+
+    fn record_decode_stage_interval(
+        &mut self,
+        request_start: Instant,
+        stage: EngineDecodeStage,
+        started_at: Instant,
+        ended_at: Instant,
+    ) {
+        let Some(start_nanos_since_request_start) =
+            Self::nanos_since_request_start(request_start, started_at)
+        else {
+            return;
+        };
+        let Some(end_nanos_since_request_start) =
+            Self::nanos_since_request_start(request_start, ended_at)
+        else {
+            return;
+        };
+        if end_nanos_since_request_start < start_nanos_since_request_start {
+            return;
+        }
+        self.decode_stage_intervals.push(EngineDecodeStageInterval {
+            stage,
+            start_nanos_since_request_start,
+            end_nanos_since_request_start,
+        });
     }
 
     fn record_decode_ready(&mut self, request_start: Instant) {
-        self.decode_ready_nanos_since_request_start
-            .get_or_insert_with(|| {
+        if self.decode_ready_nanos_since_request_start.is_some() {
+            return;
+        }
+        let ready_at = Instant::now();
+        let ready_nanos =
+            Self::nanos_since_request_start(request_start, ready_at).unwrap_or_else(|| {
                 u64::try_from(request_start.elapsed().as_nanos()).unwrap_or(u64::MAX)
             });
+        self.decode_ready_nanos_since_request_start = Some(ready_nanos);
+        self.pending_decode_scheduling_started_at = Some(ready_at);
+    }
+
+    fn close_decode_scheduling(&mut self, request_start: Instant, ended_at: Instant) {
+        let Some(started_at) = self.pending_decode_scheduling_started_at.take() else {
+            return;
+        };
+        self.record_decode_stage_interval(
+            request_start,
+            EngineDecodeStage::DecodeScheduling,
+            started_at,
+            ended_at,
+        );
     }
 
     fn into_evidence(self, output_tokens: usize) -> Result<EngineTokenTimingEvidence> {
@@ -52,6 +110,7 @@ impl SequenceTokenTiming {
             wall_anchor_max_error_nanos: self.wall_anchor_max_error_nanos,
             decode_ready_nanos_since_request_start: self.decode_ready_nanos_since_request_start,
             token_commit_nanos_since_request_start: self.token_commit_nanos_since_request_start,
+            decode_stage_intervals: self.decode_stage_intervals,
         };
         evidence.validate(output_tokens).map_err(|error| {
             FerrumError::internal(format!("invalid engine token timing evidence: {error}"))
@@ -769,8 +828,43 @@ impl SequenceState {
 
     pub(super) fn record_generated_token_commit(&mut self) {
         if let Some(timing) = &mut self.token_timing {
-            timing.record_commit(self.start_time);
+            timing.record_commit(self.start_time, Instant::now());
         }
+    }
+
+    pub(super) fn closes_pending_decode_scheduling(&self) -> bool {
+        self.token_timing
+            .as_ref()
+            .is_some_and(|timing| timing.pending_decode_scheduling_started_at.is_some())
+    }
+
+    pub(super) fn captures_engine_token_timing(&self) -> bool {
+        self.token_timing.is_some()
+    }
+
+    pub(super) fn close_decode_scheduling(&mut self, ended_at: Instant) {
+        if let Some(timing) = &mut self.token_timing {
+            timing.close_decode_scheduling(self.start_time, ended_at);
+        }
+    }
+
+    pub(super) fn record_generated_token_commit_with_decode_postprocess(
+        &mut self,
+        postprocess_started_at: Option<Instant>,
+    ) {
+        let Some(timing) = &mut self.token_timing else {
+            return;
+        };
+        let committed_at = Instant::now();
+        if let Some(started_at) = postprocess_started_at {
+            timing.record_decode_stage_interval(
+                self.start_time,
+                EngineDecodeStage::DecodePostprocess,
+                started_at,
+                committed_at,
+            );
+        }
+        timing.record_commit(self.start_time, committed_at);
     }
 
     pub(super) fn record_decode_ready(&mut self) {

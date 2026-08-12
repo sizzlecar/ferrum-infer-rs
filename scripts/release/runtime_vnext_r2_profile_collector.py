@@ -48,6 +48,9 @@ MAX_CLOCK_CONVERSION_ERROR_FRACTION = 0.005
 VNEXT_CLOCK_SOURCE_ATTRIBUTE = "vnext_monotonic_clock_source"
 VNEXT_WALL_ANCHOR_ATTRIBUTE = "vnext_monotonic_wall_anchor_unix_nanos"
 VNEXT_CLOCK_ERROR_ATTRIBUTE = "vnext_clock_conversion_max_error_nanos"
+ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE = "engine_decode_stage_intervals"
+ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE = "engine_decode_stage_interval_count"
+ENGINE_DECODE_STAGE_KINDS = {"decode_scheduling", "decode_postprocess"}
 
 # These limits are fixed independently from model size, request count, GPU
 # capacity, or user concurrency.  They are applied before every child spawn.
@@ -806,6 +809,54 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
     require(type(decode_ready) is int and decode_ready >= 0, "full profile lacks decode-ready timing")
     decode_wall = commits[-1] - decode_ready
     require(decode_wall > 0, "decode wall interval is not positive")
+    raw_engine_intervals = terminal_attributes.get(ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE)
+    engine_interval_count = terminal_attributes.get(ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE)
+    require(
+        isinstance(raw_engine_intervals, list),
+        "full profile lacks typed engine decode stage intervals",
+    )
+    require(
+        type(engine_interval_count) is int
+        and engine_interval_count == len(raw_engine_intervals),
+        "engine decode stage interval count differs from typed rows",
+    )
+    require(engine_interval_count > 0, "full profile has no engine decode stage intervals")
+    engine_intervals_by_kind: dict[str, list[tuple[int, int]]] = {
+        kind: [] for kind in sorted(ENGINE_DECODE_STAGE_KINDS)
+    }
+    previous_engine_start: int | None = None
+    for index, row in enumerate(raw_engine_intervals):
+        require(
+            isinstance(row, dict)
+            and set(row)
+            == {
+                "stage",
+                "start_nanos_since_request_start",
+                "end_nanos_since_request_start",
+            },
+            f"engine decode stage interval {index} has invalid shape",
+        )
+        stage = row.get("stage")
+        start = row.get("start_nanos_since_request_start")
+        end = row.get("end_nanos_since_request_start")
+        require(
+            stage in ENGINE_DECODE_STAGE_KINDS,
+            f"engine decode stage interval {index} has unsupported stage",
+        )
+        require(
+            type(start) is int and start >= 0 and type(end) is int and end >= start,
+            f"engine decode stage interval {index} has invalid bounds",
+        )
+        require(
+            previous_engine_start is None or start >= previous_engine_start,
+            "engine decode stage intervals are not ordered by start",
+        )
+        previous_engine_start = start
+        engine_intervals_by_kind[str(stage)].append((start, end))
+    require(
+        all(engine_intervals_by_kind.values()),
+        "full profile does not measure every required engine decode stage",
+    )
     accepted = next(
         (
             event
@@ -956,13 +1007,22 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
 
     decode_start = engine_wall_anchor + decode_ready
     decode_end = engine_wall_anchor + commits[-1]
-    intervals = [
+    node_intervals = [
         (
             max(vnext_wall_anchor + start, decode_start),
             min(vnext_wall_anchor + end, decode_end),
         )
         for start, end in monotonic_intervals
     ]
+    engine_intervals = [
+        (
+            max(engine_wall_anchor + start, decode_start),
+            min(engine_wall_anchor + end, decode_end),
+        )
+        for rows in engine_intervals_by_kind.values()
+        for start, end in rows
+    ]
+    intervals = node_intervals + engine_intervals
     accounted = merge_interval_length(intervals)
     coverage = accounted / decode_wall
     require(coverage <= 1.0 + 1e-9, "stage coverage exceeds 100%")
@@ -974,6 +1034,9 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
         "unattributed_ns": decode_wall - accounted,
         "coverage": coverage,
         "node_interval_pairs": pair_count,
+        "engine_stage_interval_count": engine_interval_count,
+        "engine_stage_kinds": sorted(engine_intervals_by_kind),
+        "engine_stage_accounted_union_ns": merge_interval_length(engine_intervals),
         "clock_source": "unix_nanos_from_bounded_wall_anchors",
         "boundary_source": "engine_wall_anchor_plus_token_offsets",
         "legacy_mixed_clock_coverage_omitted": False,
@@ -2056,8 +2119,8 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
     replay.append(submission)
 
     full = topology("full")
-    full[2]["attributes"]["monotonic_nanos_since_run_start"] = 100
-    full[3]["attributes"]["monotonic_nanos_since_run_start"] = 1_000
+    full[2]["attributes"]["monotonic_nanos_since_run_start"] = 300
+    full[3]["attributes"]["monotonic_nanos_since_run_start"] = 800
     terminal = base("actual_run_generation", "full", 1_100)
     terminal["event_kind"] = "timed_span"
     terminal["duration_us"] = 1
@@ -2069,6 +2132,19 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
             "clock_conversion_max_error_nanos": 1,
             "engine_decode_ready_nanos_since_request_start": 5_100,
             "engine_token_commit_nanos_since_request_start": [6_000],
+            ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE: [
+                {
+                    "stage": "decode_scheduling",
+                    "start_nanos_since_request_start": 5_100,
+                    "end_nanos_since_request_start": 5_300,
+                },
+                {
+                    "stage": "decode_postprocess",
+                    "start_nanos_since_request_start": 5_800,
+                    "end_nanos_since_request_start": 6_000,
+                },
+            ],
+            ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE: 2,
         }
     )
     native = base("vnext.device_native_work", "full", 1_050)
@@ -2117,6 +2193,30 @@ def run_selftest() -> int:
         and baseline_stage["coverage"] == 1.0,
         "bounded wall-anchor fixture did not produce exact formal coverage",
     )
+    require(
+        baseline_stage["engine_stage_interval_count"] == 2
+        and baseline_stage["engine_stage_accounted_union_ns"] == 400,
+        "typed engine decode stages were not unioned into formal coverage",
+    )
+    missing_postprocess = json.loads(json.dumps(cuda[2]))
+    missing_postprocess[-1]["attributes"][ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE].pop()
+    missing_postprocess[-1]["attributes"][ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE] = 1
+    try:
+        calculate_stage_coverage(missing_postprocess)
+    except CollectorError:
+        missing_engine_stage_rejected = True
+    else:
+        missing_engine_stage_rejected = False
+    malformed_engine_stage = json.loads(json.dumps(cuda[2]))
+    malformed_engine_stage[-1]["attributes"][ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE][0][
+        "end_nanos_since_request_start"
+    ] = 5_099
+    try:
+        calculate_stage_coverage(malformed_engine_stage)
+    except CollectorError:
+        malformed_engine_stage_rejected = True
+    else:
+        malformed_engine_stage_rejected = False
     concurrent = json.loads(json.dumps(cuda[2]))
     foreign_request_id = "request.startup.concurrent"
     foreign_started = json.loads(json.dumps(concurrent[2]))
@@ -2222,6 +2322,10 @@ def run_selftest() -> int:
         and target_duplicate_rejected
         and missing_clock_rejected,
         "negative fixtures did not reject",
+    )
+    require(
+        missing_engine_stage_rejected and malformed_engine_stage_rejected,
+        "invalid engine decode stage unexpectedly passed",
     )
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-r2-profile-selftest-") as temporary:
         root = Path(temporary)

@@ -14,6 +14,39 @@ pub(in crate::continuous_engine) enum PlanRuntimeDecodeBatchOutcome {
 impl EngineInner {
     // ── batch decode ──────────────────────────────────────────────────
 
+    /// Close the request-local host-loop interval immediately before the
+    /// PlanRuntime executor call. Ordinary inference returns before locking
+    /// sequence state or reading another clock.
+    fn close_plan_runtime_decode_scheduling(&self, request_ids: &[RequestId]) -> bool {
+        if !self
+            .config
+            .runtime
+            .profile_detail
+            .captures_engine_token_timing()
+        {
+            return false;
+        }
+        let mut sequences = self.sequences.write();
+        let capture_timing = request_ids.iter().any(|request_id| {
+            sequences
+                .get(request_id)
+                .is_some_and(SequenceState::captures_engine_token_timing)
+        });
+        if !capture_timing {
+            return false;
+        }
+        let submitted_at = Instant::now();
+        for request_id in request_ids {
+            let Some(sequence) = sequences.get_mut(request_id) else {
+                continue;
+            };
+            if sequence.closes_pending_decode_scheduling() {
+                sequence.close_decode_scheduling(submitted_at);
+            }
+        }
+        true
+    }
+
     /// Executes one PlanRuntime decode cohort through the typed batch API.
     /// Output cardinality and cache identity are validated before any request
     /// publishes a sampled token or updated physical-resource handle.
@@ -54,12 +87,15 @@ impl EngineInner {
             .iter()
             .map(|input| input.logits_policy.clone())
             .collect::<Vec<_>>();
-        let outputs = match self
+        let capture_decode_stage_timing = self.close_plan_runtime_decode_scheduling(&rids);
+        let (outputs, postprocess_started_at) = match self
             .model_executor
             .plan_runtime_batch_decode_with_capacity(&inputs)
             .await
         {
-            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => outputs,
+            Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {
+                (outputs, capture_decode_stage_timing.then(Instant::now))
+            }
             Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
                 return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {
                     request_ids: rids,
@@ -108,7 +144,9 @@ impl EngineInner {
                             )?,
                     };
                     sequence.commit_decode_step_physical_resources(output.kv_cache.clone())?;
-                    sequence.record_generated_token_commit();
+                    sequence.record_generated_token_commit_with_decode_postprocess(
+                        postprocess_started_at,
+                    );
                     Ok::<TokenId, FerrumError>(token)
                 })
             };

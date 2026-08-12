@@ -66,33 +66,72 @@ impl From<UnvalidatedIdentifiedFailureWire> for UnvalidatedIdentifiedFailure {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionEventDetail {
     None,
-    Counters { input: u64, output: u64 },
+    MonotonicClockAnchor {
+        clock_source: String,
+        wall_anchor_unix_nanos: i64,
+        max_error_nanos: u64,
+    },
+    Counters {
+        input: u64,
+        output: u64,
+    },
     Failure(IdentifiedFailure),
-    FailureTerminal { first_failure_fingerprint: String },
+    FailureTerminal {
+        first_failure_fingerprint: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UnvalidatedExecutionEventDetail {
     None,
-    Counters { input: u64, output: u64 },
+    MonotonicClockAnchor {
+        clock_source: String,
+        wall_anchor_unix_nanos: i64,
+        max_error_nanos: u64,
+    },
+    Counters {
+        input: u64,
+        output: u64,
+    },
     Failure(UnvalidatedIdentifiedFailure),
-    FailureTerminal { first_failure_fingerprint: String },
+    FailureTerminal {
+        first_failure_fingerprint: String,
+    },
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum UnvalidatedExecutionEventDetailWire {
     None,
-    Counters { input: u64, output: u64 },
+    MonotonicClockAnchor {
+        clock_source: String,
+        wall_anchor_unix_nanos: i64,
+        max_error_nanos: u64,
+    },
+    Counters {
+        input: u64,
+        output: u64,
+    },
     Failure(UnvalidatedIdentifiedFailureWire),
-    FailureTerminal { first_failure_fingerprint: String },
+    FailureTerminal {
+        first_failure_fingerprint: String,
+    },
 }
 
 impl From<UnvalidatedExecutionEventDetailWire> for UnvalidatedExecutionEventDetail {
     fn from(wire: UnvalidatedExecutionEventDetailWire) -> Self {
         match wire {
             UnvalidatedExecutionEventDetailWire::None => Self::None,
+            UnvalidatedExecutionEventDetailWire::MonotonicClockAnchor {
+                clock_source,
+                wall_anchor_unix_nanos,
+                max_error_nanos,
+            } => Self::MonotonicClockAnchor {
+                clock_source,
+                wall_anchor_unix_nanos,
+                max_error_nanos,
+            },
             UnvalidatedExecutionEventDetailWire::Counters { input, output } => {
                 Self::Counters { input, output }
             }
@@ -478,6 +517,15 @@ impl UnvalidatedExecutionEvent {
         let identity = ExecutionIdentityEnvelope::new(self.identity.into())?;
         let detail = match self.detail {
             UnvalidatedExecutionEventDetail::None => ExecutionEventDetail::None,
+            UnvalidatedExecutionEventDetail::MonotonicClockAnchor {
+                clock_source,
+                wall_anchor_unix_nanos,
+                max_error_nanos,
+            } => ExecutionEventDetail::MonotonicClockAnchor {
+                clock_source,
+                wall_anchor_unix_nanos,
+                max_error_nanos,
+            },
             UnvalidatedExecutionEventDetail::Counters { input, output } => {
                 ExecutionEventDetail::Counters { input, output }
             }
@@ -659,6 +707,14 @@ fn validate_event_shape(
         )));
     }
     let detail_ok = match (kind, detail) {
+        (
+            ExecutionEventKind::RequestAccepted,
+            ExecutionEventDetail::MonotonicClockAnchor {
+                clock_source,
+                wall_anchor_unix_nanos,
+                ..
+            },
+        ) => !clock_source.trim().is_empty() && *wall_anchor_unix_nanos > 0,
         (ExecutionEventKind::RequestCompleted, ExecutionEventDetail::Counters { .. }) => true,
         (ExecutionEventKind::FailureObserved, ExecutionEventDetail::Failure(_)) => true,
         (
