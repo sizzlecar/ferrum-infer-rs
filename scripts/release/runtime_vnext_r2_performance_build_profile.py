@@ -105,6 +105,7 @@ R2_CONTROL_PLANE_FILES = frozenset(
     {
         "scripts/release/bounded_command.py",
         "scripts/release/runtime_vnext_r2_ferrum_collector.py",
+        "scripts/release/runtime_vnext_r2_ferrum_terminal_recovery.py",
         "scripts/release/runtime_vnext_r2_performance_build_profile.py",
         "scripts/release/runtime_vnext_r2_profile_collector.py",
         "scripts/release/runtime_vnext_g07a_build_iteration.py",
@@ -1404,6 +1405,301 @@ def ferrum_collector_root(manifest_path: Path, manifest: dict[str, Any]) -> Path
     return root.resolve()
 
 
+TERMINAL_CUDA_EXIT_RECOVERY_CONTRACT = (
+    "ferrum.runtime-vnext.r2.cuda-terminal-exit-recovery.v1"
+)
+TERMINAL_CUDA_EXIT_REJECTION = (
+    "R2CollectorError: CUDA bridge server PID left its process group"
+)
+
+
+def read_jsonl_objects(path: Path, label: str) -> list[dict[str, Any]]:
+    try:
+        rows = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise R2Error(f"invalid {label} JSONL {path}: {error}") from error
+    require(
+        rows and all(isinstance(row, dict) for row in rows),
+        f"{label} must contain JSON objects",
+    )
+    return rows
+
+
+def parsed_utc_timestamp(value: Any, label: str) -> datetime:
+    require(isinstance(value, str) and value, f"{label} is missing")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise R2Error(f"{label} is not ISO-8601: {value}") from error
+    require(parsed.tzinfo is not None, f"{label} lacks a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_terminal_cuda_exit_recovery(
+    root: Path,
+    bundle: dict[str, Any],
+    *,
+    fingerprint: str,
+    sample_ordinal: int,
+    recovery: dict[str, Any],
+) -> dict[str, Any]:
+    """Accept one immutable legacy audit race without weakening live-PID checks."""
+
+    try:
+        import runtime_vnext_r2_ferrum_collector as ferrum_collector
+        import runtime_vnext_resource_sampler as resource_sampler
+    except ModuleNotFoundError as error:
+        raise R2Error(f"Ferrum recovery validator import failed: {error}") from error
+
+    require(
+        bundle.get("schema_version") == 1
+        and bundle.get("config_fingerprint") == fingerprint,
+        "Ferrum recovered run bundle identity differs",
+    )
+    sample = bundle.get("sample")
+    require(
+        isinstance(sample, dict)
+        and sample.get("sample_ordinal") == sample_ordinal
+        and sample.get("independent_process") is True
+        and sample.get("returncode") == 0,
+        "Ferrum recovered run sample did not exit successfully",
+    )
+    stdout_path = validate_collector_ref(
+        root, sample.get("stdout"), "recovered run stdout"
+    )
+    arrival_path = validate_collector_ref(
+        root, sample.get("arrival_timeline"), "recovered run arrival timeline"
+    )
+    stderr_path = validate_collector_ref(
+        root, sample.get("stderr"), "recovered run stderr"
+    )
+    validate_collector_ref(
+        root, sample.get("product_effective_config"), "recovered run effective config"
+    )
+    process_receipt_ref = sample.get("process_receipt")
+    require(
+        isinstance(process_receipt_ref, dict)
+        and isinstance(process_receipt_ref.get("path"), str)
+        and isinstance(process_receipt_ref.get("sha256"), str),
+        "recovered run process receipt reference is invalid",
+    )
+    process_receipt_path = (root / process_receipt_ref["path"]).resolve()
+    try:
+        process_receipt_path.relative_to(root.resolve())
+    except ValueError as error:
+        raise R2Error("recovered run process receipt escaped artifact root") from error
+    require(
+        process_receipt_path.is_file()
+        and not process_receipt_path.is_symlink()
+        and sha256(process_receipt_path) == process_receipt_ref["sha256"],
+        "recovered run process receipt differs",
+    )
+    process_receipt = read_json(process_receipt_path, "recovered run process receipt")
+    require(
+        process_receipt.get("pid") == sample.get("pid")
+        and process_receipt.get("pgid") == sample.get("pgid")
+        and process_receipt.get("process_start_marker")
+        == sample.get("process_start_marker")
+        and process_receipt.get("argv") == sample.get("argv")
+        and process_receipt.get("environment") == sample.get("environment"),
+        "recovered run process receipt identity differs",
+    )
+
+    resources = sample.get("resources")
+    require(isinstance(resources, dict), "recovered run resources are missing")
+    observations_path = validate_collector_ref(
+        root, resources.get("observations"), "recovered run resource observations"
+    )
+    observation_rows = read_jsonl_objects(
+        observations_path, "recovered run resource observations"
+    )
+    header, footer = observation_rows[0], observation_rows[-1]
+    samples = observation_rows[1:-1]
+    require(
+        samples
+        and footer.get("record_type") == "footer"
+        and footer.get("exit_reason") == "process-exit",
+        "recovered run lacks a process-exit resource footer",
+    )
+    resource_summary = resources.get("summary")
+    require(isinstance(resource_summary, dict), "recovered run resource summary is missing")
+    recomputed_resource = resource_sampler.derive_summary(
+        observations_path,
+        session_id=sample["sample_id"],
+        cell_id="run:c1",
+        backend="cuda",
+        hardware_id=sample["hardware"]["id"],
+        pid=sample["pid"],
+        pgid=sample["pgid"],
+        process_start_marker=sample["process_start_marker"],
+        base_url=f"process://{sample['sample_id']}",
+        session_started_at=sample["started_at"],
+        session_finished_at=sample["finished_at"],
+        measurement_started_at=samples[0]["sampled_at"],
+        measurement_finished_at=samples[-1]["sampled_at"],
+        memory_budget_bytes=resource_summary["memory_budget_bytes"],
+        requested_concurrency=1,
+        typed_active_cap=1,
+        runtime_log_path=header["runtime_log_path"],
+        runtime_log_evidence_path=stderr_path,
+    )
+    require(
+        recomputed_resource == resource_summary
+        and resource_summary.get("oom_count") == 0
+        and resource_summary.get("admission_error_count") == 0,
+        "recovered run resources are not raw-derived or contain runtime errors",
+    )
+
+    bridge = resources.get("cuda_pid_namespace_bridge")
+    require(isinstance(bridge, dict), "recovered run CUDA bridge is missing")
+    original_audit_path = validate_collector_ref(
+        root, bridge.get("audit"), "recovered run original CUDA audit"
+    )
+    original_rows = read_jsonl_objects(
+        original_audit_path, "recovered run original CUDA audit"
+    )
+    terminal = original_rows[-1]
+    prefix_ref = recovery.get("accepted_prefix_audit")
+    prefix_path = validate_collector_ref(
+        root, prefix_ref, "recovered run accepted CUDA audit prefix"
+    )
+    prefix_rows = read_jsonl_objects(
+        prefix_path, "recovered run accepted CUDA audit prefix"
+    )
+    require(
+        prefix_rows == original_rows[:-1],
+        "recovered CUDA audit prefix is not the immutable original prefix",
+    )
+    prefix_resources = copy.deepcopy(resources)
+    prefix_resources["cuda_pid_namespace_bridge"]["audit"] = copy.deepcopy(prefix_ref)
+    ferrum_collector.validate_cuda_bridge_evidence(
+        root,
+        prefix_resources,
+        backend="cuda",
+        label=f"recovered run sample {sample_ordinal} prefix",
+    )
+
+    compute_options = set(ferrum_collector.CUDA_COMPUTE_QUERY)
+    prior_compute = [
+        row
+        for row in prefix_rows
+        if compute_options <= set(row.get("nvidia_smi_argv", []))
+        and row.get("status") == "pass"
+        and row.get("strategy")
+        in {
+            "native-process-group-pid",
+            "single-new-host-pid-mapped-to-container-server",
+        }
+    ]
+    require(len(prior_compute) >= 3, "recovered CUDA audit lacks prior mapped samples")
+    terminal_raw = ferrum_collector.parse_cuda_compute_rows(
+        str(terminal.get("raw_stdout", "")), "terminal CUDA compute query"
+    )
+    require(
+        terminal is original_rows[-1]
+        and compute_options <= set(terminal.get("nvidia_smi_argv", []))
+        and terminal.get("contract") == bridge.get("contract")
+        and terminal.get("collector_sha256") == bridge.get("bridge_source_sha256")
+        and terminal.get("server_pid") == sample.get("pid")
+        and terminal.get("server_pgid") == sample.get("pgid")
+        and terminal.get("status") == "reject"
+        and terminal.get("error") == TERMINAL_CUDA_EXIT_REJECTION
+        and terminal.get("real_returncode") == 0
+        and terminal.get("raw_stderr") == ""
+        and len(terminal_raw) == 1,
+        "recovered CUDA terminal rejection shape differs",
+    )
+    prior_raw_for_pid = [
+        app["used_gpu_memory_mib"]
+        for row in prior_compute
+        for app in row.get("raw_compute_apps", [])
+        if isinstance(app, dict) and app.get("pid") == terminal_raw[0]["pid"]
+    ]
+    require(
+        prior_raw_for_pid
+        and terminal_raw[0]["used_gpu_memory_mib"] > 0
+        and terminal_raw[0]["used_gpu_memory_mib"] < prior_raw_for_pid[-1],
+        "recovered CUDA terminal row is not a draining previously mapped PID",
+    )
+    last_sample_at = parsed_utc_timestamp(samples[-1]["sampled_at"], "last resource sample")
+    terminal_at = parsed_utc_timestamp(terminal.get("observed_at"), "terminal CUDA audit")
+    footer_at = parsed_utc_timestamp(footer.get("finished_at"), "resource footer")
+    sample_finished_at = parsed_utc_timestamp(sample.get("finished_at"), "run finish")
+    require(
+        last_sample_at <= terminal_at <= footer_at <= sample_finished_at
+        and (footer_at - terminal_at).total_seconds() <= 1.0,
+        "recovered CUDA rejection is not the terminal process-exit edge",
+    )
+
+    require(
+        recovery.get("schema_version") == 1
+        and recovery.get("contract") == TERMINAL_CUDA_EXIT_RECOVERY_CONTRACT
+        and recovery.get("artifact_type")
+        == "runtime_vnext_r2_cuda_terminal_exit_recovery"
+        and recovery.get("status") == "pass"
+        and recovery.get("sample_ordinal") == sample_ordinal
+        and isinstance(recovery.get("run_sample"), dict)
+        and recovery.get("raw_evidence_mutated") is False
+        and recovery.get("original_audit") == bridge.get("audit")
+        and recovery.get("terminal_rejection_sha256")
+        == canonical_json_sha256(terminal),
+        "Ferrum terminal-exit recovery receipt differs",
+    )
+    recovered_bundle_path = validate_collector_ref(
+        root, recovery.get("run_sample"), "recovered run sample bundle"
+    )
+    require(
+        read_json(recovered_bundle_path, "recovered run sample bundle") == bundle,
+        "Ferrum terminal-exit recovery references a different run bundle",
+    )
+    recovery_source = recovery.get("recovery_source")
+    classifier_source = recovery.get("classifier_source")
+    recovery_script = REPO_ROOT / "scripts/release/runtime_vnext_r2_ferrum_terminal_recovery.py"
+    require(
+        isinstance(recovery_source, dict)
+        and recovery_source.get("path")
+        == "scripts/release/runtime_vnext_r2_ferrum_terminal_recovery.py"
+        and recovery_source.get("sha256") == sha256(recovery_script)
+        and isinstance(classifier_source, dict)
+        and classifier_source.get("path")
+        == SCRIPT_PATH.relative_to(REPO_ROOT).as_posix()
+        and classifier_source.get("sha256") == sha256(SCRIPT_PATH),
+        "Ferrum terminal-exit recovery source identity differs",
+    )
+    postflight_path = validate_collector_ref(
+        root, recovery.get("cuda_idle_postflight"), "recovered CUDA idle postflight"
+    )
+    postflight = read_json(postflight_path, "recovered CUDA idle postflight")
+    require(
+        postflight.get("returncode") == 0
+        and postflight.get("compute_apps") == []
+        and postflight.get("gpu_uuids")
+        == read_json(
+            validate_collector_ref(root, bridge.get("preflight"), "recovered CUDA preflight"),
+            "recovered CUDA preflight",
+        ).get("gpu_uuids"),
+        "recovered CUDA idle postflight did not prove context cleanup",
+    )
+
+    events = read_jsonl_objects(stdout_path, "recovered run stdout")
+    arrivals = read_jsonl_objects(arrival_path, "recovered run arrival timeline")
+    metrics = ferrum_collector.validate_run_events(
+        events, arrivals, f"run sample {sample_ordinal}"
+    )
+    require(metrics == sample.get("metrics"), "recovered run metrics differ")
+    return {
+        "sample_ordinal": sample_ordinal,
+        "terminal_used_gpu_memory_mib": terminal_raw[0]["used_gpu_memory_mib"],
+        "prior_used_gpu_memory_mib": prior_raw_for_pid[-1],
+        "terminal_rejection_sha256": canonical_json_sha256(terminal),
+        "resource_exit_reason": resource_summary["exit_reason"],
+    }
+
+
 def default_collector_verifier(
     root: Path,
     manifest: dict[str, Any],
@@ -1417,8 +1713,35 @@ def default_collector_verifier(
         fingerprint = str(manifest.get("config_fingerprint", ""))
         ferrum_collector.validate_final_manifest(root, manifest, fingerprint)
         ferrum_collector.validate_server_bundle(root, server, fingerprint, config)
+        recovery_ref = manifest.get("terminal_exit_recovery")
+        recovery = None
+        recovery_ordinal = None
+        if recovery_ref is not None:
+            recovery_path = validate_collector_ref(
+                root, recovery_ref, "Ferrum terminal-exit recovery"
+            )
+            recovery = read_json(recovery_path, "Ferrum terminal-exit recovery")
+            recovery_ordinal = recovery.get("sample_ordinal")
+            require(
+                isinstance(recovery_ordinal, int)
+                and not isinstance(recovery_ordinal, bool)
+                and 1 <= recovery_ordinal <= len(runs),
+                "Ferrum terminal-exit recovery sample ordinal is invalid",
+            )
         for ordinal, bundle in enumerate(runs, start=1):
-            ferrum_collector.validate_run_bundle(root, bundle, fingerprint, ordinal)
+            if ordinal == recovery_ordinal:
+                require(recovery is not None, "Ferrum terminal-exit recovery is missing")
+                validate_terminal_cuda_exit_recovery(
+                    root,
+                    bundle,
+                    fingerprint=fingerprint,
+                    sample_ordinal=ordinal,
+                    recovery=recovery,
+                )
+            else:
+                ferrum_collector.validate_run_bundle(
+                    root, bundle, fingerprint, ordinal
+                )
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise R2Error(f"Ferrum collector provenance failed: {error}") from error
 
