@@ -162,6 +162,9 @@ MIN_DISPATCH_TIMING_COVERAGE = 0.80
 MIN_DEVICE_ATTRIBUTION_COVERAGE = 0.80
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
 DOES_NOT_PROVE = [
     "R2 profile stage coverage, performance, or build-time acceptance",
     "R3 exact staged-binary acceptance",
@@ -1070,6 +1073,8 @@ def validate_bounded_execution_receipt(
     stdout_ref: Any,
     stderr_ref: Any,
     label: str,
+    *,
+    require_sanitized_environment: bool = True,
 ) -> dict[str, Any]:
     receipt_path = validate_ref(receipt_ref, f"{label} bounded receipt")
     receipt = read_json(receipt_path, f"{label} bounded receipt")
@@ -1104,10 +1109,21 @@ def validate_bounded_execution_receipt(
     started = parse_utc(receipt.get("started_at"), f"{label} start")
     ended = parse_utc(receipt.get("ended_at"), f"{label} end")
     require(started <= ended, f"{label} bounded time range is invalid")
+    command = receipt.get("command")
+    if require_sanitized_environment:
+        validated_command = unwrap_sanitized_command(command, label)
+    else:
+        require(
+            isinstance(command, list)
+            and command
+            and all(isinstance(item, str) and item for item in command),
+            f"{label} command is invalid",
+        )
+        validated_command = copy.deepcopy(command)
     return {
         "receipt": file_ref(receipt_path),
         "receipt_body": receipt,
-        "command": unwrap_sanitized_command(receipt.get("command"), label),
+        "command": validated_command,
         "stdout": stdout_path,
         "stderr": stderr_path,
         "started_at": started,
@@ -2104,6 +2120,10 @@ def _validate_raw_execution_v2(
     ready = stdout["ready"]
     product_request_id = stdout["request_id"]
     require(
+        UUID_RE.fullmatch(product_request_id) is not None,
+        f"{check_id} product request id is not the public run UUID",
+    )
+    require(
         ready.get("requested_model") == model_argument
         and ready.get("resolved_model") == model_contract["repo"]
         and ready.get("model") == model_contract["repo"]
@@ -2243,6 +2263,7 @@ def _validate_raw_execution_v2(
         raw.get("hardware_stdout"),
         raw.get("hardware_stderr"),
         f"{check_id} hardware",
+        require_sanitized_environment=False,
     )
     require(
         hardware_run["command"]
@@ -2321,50 +2342,154 @@ def _validate_raw_execution_v2(
     reusable_fingerprints: set[str] = set()
     reusable_spans = 0
     observed_devices: set[str] = set()
+    startup_request_ids: set[str] = set()
+    accepted_request_counts: dict[str, int] = {}
+    sequence_completed_counts: dict[str, int] = {}
+    request_completed_counts: dict[str, int] = {}
+    lifecycle_counts: dict[str, int] = {}
+    engine_product_request_id = f"request.product.{product_request_id}"
+    product_lifecycle_phases = {
+        "actual_run_process_start",
+        "actual_run_backend_initialized",
+        "actual_run_model_loaded",
+        "actual_run_profile_run_done",
+        "actual_run_cache_allocated",
+        "request_open",
+        "request_slot_reserve",
+        "request_slot_commit",
+        "actual_run_generation",
+        "request_slot_release",
+        "request_close",
+        "actual_run_shutdown",
+    }
     for event in profile_events:
         attributes = event.get("attributes")
         attributes = attributes if isinstance(attributes, dict) else {}
+        backend_detail = event.get("backend_detail")
+        backend_detail = backend_detail if isinstance(backend_detail, dict) else {}
+        phase = event.get("phase")
+        event_request_id = event.get("request_id")
+        is_vnext_event = isinstance(phase, str) and phase.startswith("vnext.")
         require(
             event.get("entrypoint") == "run"
-            and event.get("model") == model_contract["repo"]
-            and attributes.get("profile_detail") == "full",
-            f"{check_id} profile contains a foreign entrypoint/model/mode",
+            and isinstance(event_request_id, str)
+            and bool(event_request_id),
+            f"{check_id} profile contains a foreign entrypoint/request",
+        )
+        if is_vnext_event:
+            require(
+                event.get("model") == model_contract["repo"]
+                and (
+                    attributes.get("profile_detail") == "full"
+                    or (
+                        phase == "vnext.execution_backing_maintenance"
+                        and attributes.get("profile_detail") is None
+                    )
+                ),
+                f"{check_id} vNext profile model/mode differs",
+            )
+            is_product_event = event_request_id == engine_product_request_id
+            is_startup_event = event_request_id.startswith("request.startup.")
+            require(
+                is_product_event != is_startup_event,
+                f"{check_id} vNext profile request closure differs",
+            )
+            execution_request_id = attributes.get("execution_request_id")
+            require(
+                execution_request_id is None
+                or execution_request_id == event_request_id,
+                f"{check_id} vNext execution request identity differs",
+            )
+            execution_identity = attributes.get("execution_identity")
+            if execution_identity is not None:
+                require(
+                    isinstance(execution_identity, dict)
+                    and execution_identity.get("request_id") == event_request_id
+                    and execution_identity.get("device_id")
+                    in {None, f"device.cuda.{gpu_index}"},
+                    f"{check_id} nested execution identity differs",
+                )
+            participant_request_ids = attributes.get("participant_request_ids")
+            if participant_request_ids is not None:
+                require(
+                    isinstance(participant_request_ids, list)
+                    and participant_request_ids
+                    and set(participant_request_ids) == {event_request_id},
+                    f"{check_id} participant request identity differs",
+                )
+            if is_startup_event:
+                startup_request_ids.add(event_request_id)
+                require(
+                    UUID_RE.fullmatch(event_request_id.removeprefix("request.startup."))
+                    is not None,
+                    f"{check_id} startup request id is invalid",
+                )
+            attribute_device = attributes.get("backend_device")
+            detail_device = backend_detail.get("backend_device")
+            require(
+                attribute_device == f"CUDA({gpu_index})"
+                or detail_device == f"CUDA({gpu_index})",
+                f"{check_id} vNext backend device differs",
+            )
+            if attribute_device is not None and detail_device is not None:
+                require(
+                    attribute_device == detail_device,
+                    f"{check_id} vNext backend device identities disagree",
+                )
+        else:
+            require(
+                phase in product_lifecycle_phases
+                and event.get("model") == model_argument
+                and attributes.get("profile_detail") == "full"
+                and event_request_id == product_request_id,
+                f"{check_id} product lifecycle model/mode/request differs",
+            )
+            is_product_event = True
+            is_startup_event = False
+            lifecycle_counts[phase] = lifecycle_counts.get(phase, 0) + 1
+            execution_request_id = attributes.get("execution_request_id")
+            require(
+                execution_request_id is None
+                or execution_request_id == engine_product_request_id,
+                f"{check_id} product lifecycle execution identity differs",
+            )
+        require(
+            event.get("backend") == "actual",
+            f"{check_id} profile contains a foreign backend",
         )
         timestamp = parse_utc(event.get("timestamp"), f"{check_id} profile event")
         require(
             product_run["started_at"] <= timestamp <= product_run["ended_at"],
             f"{check_id} profile event lies outside the bounded product execution",
         )
-        backend_device = attributes.get("backend_device")
+        backend_device = attributes.get("backend_device") or backend_detail.get(
+            "backend_device"
+        )
         if backend_device is not None:
             require(isinstance(backend_device, str), f"{check_id} backend_device is invalid")
             observed_devices.add(backend_device)
-        joined_ids = {
-            value
-            for value in (
-                event.get("request_id"),
-                event.get("correlation_id"),
-                attributes.get("execution_request_id"),
-            )
-            if isinstance(value, str) and value
-        }
-        is_product_event = product_request_id in joined_ids
         if is_product_event:
             product_events.append(event)
-        else:
-            require(
-                joined_ids
-                and all(value.startswith("request.startup.") for value in joined_ids),
-                f"{check_id} profile contains an unrelated request closure",
+        if is_vnext_event and phase == "vnext.request_accepted":
+            accepted_request_counts[event_request_id] = (
+                accepted_request_counts.get(event_request_id, 0) + 1
+            )
+        elif is_vnext_event and phase == "vnext.sequence_completed":
+            sequence_completed_counts[event_request_id] = (
+                sequence_completed_counts.get(event_request_id, 0) + 1
+            )
+        elif is_vnext_event and phase == "vnext.request_completed":
+            request_completed_counts[event_request_id] = (
+                request_completed_counts.get(event_request_id, 0) + 1
             )
         if attributes.get("device_timing_status") == "measured":
             require(
-                is_product_event,
-                f"{check_id} measured timing row is unrelated to the product request",
+                is_product_event or is_startup_event,
+                f"{check_id} measured timing row is outside the bounded request closure",
             )
         if (
             event.get("phase") == "vnext.device_execution_span"
-            and any(value.startswith("request.startup.") for value in joined_ids)
+            and is_startup_event
             and attributes.get("device_timing_span_kind") == "reusable_executable"
             and attributes.get("execution_path") == "replayed"
         ):
@@ -2378,6 +2503,16 @@ def _validate_raw_execution_v2(
             reusable_fingerprints.add(fingerprint)
     require(
         observed_devices == {f"CUDA({gpu_index})"}
+        and len(startup_request_ids) == 1
+        and set(accepted_request_counts)
+        == startup_request_ids | {engine_product_request_id}
+        and all(count == 1 for count in accepted_request_counts.values())
+        and sequence_completed_counts
+        == {request_id: 1 for request_id in accepted_request_counts}
+        and request_completed_counts
+        == {request_id: 1 for request_id in accepted_request_counts}
+        and lifecycle_counts
+        == {phase: 1 for phase in product_lifecycle_phases}
         and reusable_spans > 0
         and reusable_fingerprints,
         f"{check_id} hardware/reusable profile closure differs",
@@ -2396,7 +2531,7 @@ def _validate_raw_execution_v2(
         len(terminal_rows) == 1
         and len(accepted_rows) == 1
         and terminal_rows[0].get("attributes", {}).get("execution_request_id")
-        == product_request_id,
+        == engine_product_request_id,
         f"{check_id} product request/profile terminal join differs",
     )
     plan_ids = {
@@ -4162,24 +4297,129 @@ def self_test() -> int:
         execution_root = temp_root / "execution-closure-v2"
         execution_root.mkdir()
         model_contract = m1_cuda_model_contract(build_source)
-        product_request_id = "request.product.fixture"
+        product_request_id = "12345678-1234-5678-9abc-def012345678"
+        engine_product_request_id = f"request.product.{product_request_id}"
         profile_path = execution_root / "profile.jsonl"
         profile_events = copy.deepcopy(cuda_profile_fixture)
         for event in profile_events:
-            event["timestamp"] = "2026-08-13T00:00:05+00:00"
-            event["model"] = model_contract["repo"]
-            event["entrypoint"] = "run"
+            is_vnext_fixture = str(event.get("phase", "")).startswith("vnext.")
+            expected_fixture_request_id = (
+                engine_product_request_id if is_vnext_fixture else product_request_id
+            )
+            if event.get("request_id") == "request.product.fixture":
+                event["request_id"] = expected_fixture_request_id
+            if event.get("correlation_id") == "request.product.fixture":
+                event["correlation_id"] = expected_fixture_request_id
             attributes = event.setdefault("attributes", {})
+            if attributes.get("execution_request_id") == "request.product.fixture":
+                attributes["execution_request_id"] = engine_product_request_id
+            if attributes.get("participant_request_ids") == ["request.product.fixture"]:
+                attributes["participant_request_ids"] = [engine_product_request_id]
+            execution_identity = attributes.get("execution_identity")
+            if (
+                isinstance(execution_identity, dict)
+                and execution_identity.get("request_id") == "request.product.fixture"
+            ):
+                execution_identity["request_id"] = engine_product_request_id
+            event["timestamp"] = "2026-08-13T00:00:05+00:00"
+            event["model"] = (
+                model_contract["repo"]
+                if is_vnext_fixture
+                else "/models/m1"
+            )
+            event["entrypoint"] = "run"
+            event["backend"] = "actual"
             attributes["profile_detail"] = "full"
             attributes["backend_device"] = "CUDA(0)"
+        product_terminal_attributes = {
+            "profile_detail": "full",
+            "backend_device": "CUDA(0)",
+            "execution_request_id": engine_product_request_id,
+        }
+        for suffix, phase in (
+            ("sequence", "vnext.sequence_completed"),
+            ("request", "vnext.request_completed"),
+        ):
+            profile_events.append(
+                {
+                    "schema_version": 1,
+                    "event_id": f"product-{suffix}-completed-selftest",
+                    "timestamp": "2026-08-13T00:00:05+00:00",
+                    "request_id": engine_product_request_id,
+                    "correlation_id": engine_product_request_id,
+                    "entrypoint": "run",
+                    "backend": "actual",
+                    "model": model_contract["repo"],
+                    "phase": phase,
+                    "status": "ok",
+                    "attributes": copy.deepcopy(product_terminal_attributes),
+                }
+            )
+        startup_request_id = "request.startup.87654321-4321-6789-abcd-ef0123456789"
+        for suffix, phase in (
+            ("accepted", "vnext.request_accepted"),
+            ("sequence", "vnext.sequence_completed"),
+            ("request", "vnext.request_completed"),
+        ):
+            profile_events.append(
+                {
+                    "schema_version": 1,
+                    "event_id": f"startup-{suffix}-selftest",
+                    "timestamp": "2026-08-13T00:00:05+00:00",
+                    "request_id": startup_request_id,
+                    "correlation_id": startup_request_id,
+                    "entrypoint": "run",
+                    "backend": "actual",
+                    "model": model_contract["repo"],
+                    "phase": phase,
+                    "status": "ok",
+                    "attributes": {
+                        "backend_device": "CUDA(0)",
+                        "profile_detail": "full",
+                        "execution_request_id": startup_request_id,
+                    },
+                }
+            )
+        for phase in (
+            "actual_run_process_start",
+            "actual_run_backend_initialized",
+            "actual_run_model_loaded",
+            "actual_run_profile_run_done",
+            "actual_run_cache_allocated",
+            "request_open",
+            "request_slot_reserve",
+            "request_slot_commit",
+            "request_slot_release",
+            "request_close",
+            "actual_run_shutdown",
+        ):
+            profile_events.append(
+                {
+                    "schema_version": 1,
+                    "event_id": f"{phase}-selftest",
+                    "timestamp": "2026-08-13T00:00:05+00:00",
+                    "request_id": product_request_id,
+                    "correlation_id": "corr-product-run",
+                    "entrypoint": "run",
+                    "backend": "actual",
+                    "model": "/models/m1",
+                    "phase": phase,
+                    "status": "ok",
+                    "attributes": {
+                        "profile_detail": "full",
+                        "execution_request_id": engine_product_request_id,
+                    },
+                }
+            )
         profile_events.append(
             {
                 "schema_version": 1,
                 "event_id": "startup-reusable-selftest",
                 "timestamp": "2026-08-13T00:00:05+00:00",
-                "request_id": "request.startup.self-test",
-                "correlation_id": "request.startup.self-test",
+                "request_id": startup_request_id,
+                "correlation_id": startup_request_id,
                 "entrypoint": "run",
+                "backend": "actual",
                 "model": model_contract["repo"],
                 "phase": "vnext.device_execution_span",
                 "status": "diagnostic_only",
@@ -4378,7 +4618,14 @@ def self_test() -> int:
             stderr_path: Path,
             started_at: str,
             ended_at: str,
+            *,
+            sanitized_environment: bool = True,
         ) -> None:
+            recorded_command = (
+                ["/usr/bin/env", "-i", "PATH=/usr/bin", *command]
+                if sanitized_environment
+                else command
+            )
             write_json(
                 receipt_path,
                 {
@@ -4386,7 +4633,7 @@ def self_test() -> int:
                     "status": "pass",
                     "reason": "command_completed",
                     "rc": 0,
-                    "command": ["/usr/bin/env", "-i", "PATH=/usr/bin", *command],
+                    "command": recorded_command,
                     "limits": {
                         "wall_timeout_seconds": 600,
                         "max_processes": 8,
@@ -4435,6 +4682,7 @@ def self_test() -> int:
             hardware_stderr,
             "2026-08-12T23:59:00+00:00",
             "2026-08-12T23:59:01+00:00",
+            sanitized_environment=False,
         )
         vast_instance_path = execution_root / "vast-instance.json"
         write_json(
@@ -4589,6 +4837,7 @@ def self_test() -> int:
                 variant_stderr,
                 "2026-08-12T23:59:00+00:00",
                 "2026-08-12T23:59:01+00:00",
+                sanitized_environment=False,
             )
             write_json(
                 variant_instance,
