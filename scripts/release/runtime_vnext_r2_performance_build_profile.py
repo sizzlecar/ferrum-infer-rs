@@ -69,6 +69,10 @@ ABSOLUTE_RUN_FLOORS = {
     ("m3-qwen3-30b-a3b", "metal"): 5.0,
 }
 HIGHEST_CONCURRENCY_SCALE = {"cuda": 1.25, "metal": 1.10}
+PHYSICAL_HEADROOM_FLOOR_BYTES = {
+    "cuda": 512 * 1024**2,
+    "metal": 2 * 1024**3,
+}
 FLOOR_METRICS = (
     "throughput",
     "ttft_p95",
@@ -408,6 +412,15 @@ def requests_per_repeat(dataset: str) -> int:
 
 
 def validate_metal_resource_contract(summary: dict[str, Any], label: str) -> None:
+    physical_headroom = finite_nonnegative(
+        summary.get("physical_headroom_bytes"), f"{label} Metal physical headroom"
+    )
+    physical_headroom_floor = PHYSICAL_HEADROOM_FLOOR_BYTES["metal"]
+    require(
+        physical_headroom >= physical_headroom_floor,
+        f"{label} Metal physical headroom is below the "
+        f"{physical_headroom_floor}-byte floor",
+    )
     swap_start = finite_nonnegative(
         summary.get("swap_start_bytes"), f"{label} Metal swap start"
     )
@@ -2252,12 +2265,13 @@ def load_ferrum_collector_lane(
                 finite_nonnegative(
                     resource_summary.get("physical_headroom_bytes"), "CUDA headroom"
                 )
-                >= 512 * 1024 * 1024,
+                >= PHYSICAL_HEADROOM_FLOOR_BYTES["cuda"],
                 f"CUDA headroom is below 512 MiB: {key}",
             )
         else:
             validate_metal_resource_contract(
-                resource_summary, f"Ferrum collector cell {key}"
+                resource_summary,
+                f"Ferrum collector cell {key}",
             )
         throughputs = [finite_positive(row.get("output_throughput_tps"), "repeat throughput") for row in repeats]
         cv = statistics.pstdev(throughputs) / statistics.mean(throughputs)
@@ -2289,6 +2303,9 @@ def load_ferrum_collector_lane(
             "peak_accelerator_or_unified_memory": raw_metrics[
                 "peak_accelerator_or_unified_memory"
             ][0],
+            "physical_headroom_bytes": resource_summary[
+                "physical_headroom_bytes"
+            ],
             "steady_decode": statistics.median(
                 1000.0 / finite_positive(row.get("tpot_ms", {}).get("p50"), "repeat TPOT p50")
                 for row in repeats
@@ -2351,6 +2368,12 @@ def load_ferrum_collector_lane(
         "typed_config_sha256": sha256(config_path),
         "correctness_manifest_sha256": inputs["correctness_manifest"]["sha256"],
         "summaries": summaries,
+        "minimum_cell_physical_headroom_bytes": min(
+            summary["physical_headroom_bytes"] for summary in summaries.values()
+        ),
+        "physical_headroom_floor_bytes": PHYSICAL_HEADROOM_FLOOR_BYTES[
+            expected_backend
+        ],
         "measured_request_count": measured_requests,
         "run": {
             "sample_count": 3,
@@ -2487,6 +2510,12 @@ def validate_ferrum_performance_lane(
         "repeat_count": len(lane["summaries"]) * 3,
         "measured_request_count": lane["measured_request_count"],
         "run_sample_count": lane["run"]["sample_count"],
+        "minimum_cell_physical_headroom_bytes": lane[
+            "minimum_cell_physical_headroom_bytes"
+        ],
+        "physical_headroom_floor_bytes": lane[
+            "physical_headroom_floor_bytes"
+        ],
         "throughput_geometric_mean_ratio": geometric_mean,
         "max_cv": max(
             float(row["cv"]) for row in lane["summaries"].values()
@@ -4070,6 +4099,7 @@ def self_test() -> None:
     )
     validate_metal_resource_contract(
         {
+            "physical_headroom_bytes": 2 * 1024**3,
             "swap_start_bytes": 10,
             "swap_end_bytes": 9,
             "thermal_throttling_count": 0,
@@ -4078,6 +4108,7 @@ def self_test() -> None:
     )
     validate_metal_resource_contract(
         {
+            "physical_headroom_bytes": 2 * 1024**3,
             "swap_start_bytes": 10,
             "swap_end_bytes": 10,
             "thermal_throttling_count": 0,
@@ -4087,6 +4118,19 @@ def self_test() -> None:
     expect_reject(
         lambda: validate_metal_resource_contract(
             {
+                "physical_headroom_bytes": 2 * 1024**3 - 1,
+                "swap_start_bytes": 10,
+                "swap_end_bytes": 10,
+                "thermal_throttling_count": 0,
+            },
+            "below-floor headroom fixture",
+        ),
+        "Metal physical headroom below 2 GiB",
+    )
+    expect_reject(
+        lambda: validate_metal_resource_contract(
+            {
+                "physical_headroom_bytes": 2 * 1024**3,
                 "swap_start_bytes": 10,
                 "swap_end_bytes": 11,
                 "thermal_throttling_count": 0,
@@ -4098,6 +4142,7 @@ def self_test() -> None:
     expect_reject(
         lambda: validate_metal_resource_contract(
             {
+                "physical_headroom_bytes": 2 * 1024**3,
                 "swap_start_bytes": 10,
                 "swap_end_bytes": 10,
                 "thermal_throttling_count": 1,
