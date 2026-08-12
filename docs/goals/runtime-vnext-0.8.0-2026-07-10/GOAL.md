@@ -15,6 +15,12 @@ legacy physical zero 和平台完备性转入 v0.8.1/0.9 hardening。v0.8.0 正�
 `R0-R3 1/4 PASS`；下文各时期的 `G00-G10 0/11` 是原 exhaustive roadmap 的历史状态，不再作为
 release freeze 前置条件。
 
+2026-08-12 起，开发期每个代码改动的回归范围按
+[`CHANGE_IMPACT_REGRESSION_PLAN_2026-08-12.md`](CHANGE_IMPACT_REGRESSION_PLAN_2026-08-12.md)
+执行：只允许 `exact reproducer -> affected contract -> affected product/architecture sentinel` 逐层扩大，
+阶段完整矩阵只在源码冻结/阶段退出时执行一次。该执行计划不修改本目标或 active amendments 的最终
+验收分母与阈值。
+
 ### 当前 release-blocking 状态（2026-08-07）
 
 - 正式分母：R0 `PASS`，R1-R3 `OPEN`，合计 `R0-R3 1/4 PASS`。本段是当前状态源；下方按日期
