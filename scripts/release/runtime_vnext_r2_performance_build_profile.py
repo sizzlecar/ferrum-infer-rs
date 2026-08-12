@@ -73,11 +73,6 @@ PHYSICAL_HEADROOM_FLOOR_BYTES = {
     "cuda": 512 * 1024**2,
     "metal": 2 * 1024**3,
 }
-METAL_SWAP_NOISE_MAX_LANE_GROWTH_STEP_COUNT = 1
-METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES = 1024**2
-METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES = 4 * 1024**3
-METAL_SWAP_NOISE_MIN_STABLE_SAMPLE_COUNT = 30
-METAL_SWAP_NOISE_MIN_STABLE_SECONDS = 10.0
 FLOOR_METRICS = (
     "throughput",
     "ttft_p95",
@@ -106,6 +101,19 @@ PROFILE_IDENTITY_FIELDS = {
     "provider",
     "kernel",
 }
+POST_CELL_OCCUPANCY_COUNTER_FIELDS = (
+    "claim_count",
+    "segment_count",
+    "physical_bytes",
+)
+POST_CELL_OCCUPANCY_SCOPE_FIELDS = (
+    "plan",
+    "request",
+    "sequence",
+    "step",
+    "invocation",
+    "initial_sequence_bundle",
+)
 R2_CONTROL_PLANE_FILES = frozenset(
     {
         "docs/goals/runtime-vnext-0.8.0-2026-07-10/METAL_HOST_GLOBAL_SWAP_NOISE_AMENDMENT_2026-08-13.md",
@@ -496,42 +504,66 @@ def derive_metal_swap_scope_evidence(
     )
     deltas = [right - left for left, right in zip(swap_values, swap_values[1:])]
     changed = [delta for delta in deltas if delta != 0]
-    growth = [(index + 1, delta) for index, delta in enumerate(deltas) if delta > 0]
+    positive_steps = [
+        {
+            "before_sample_index": index,
+            "after_sample_index": index + 1,
+            "before_sample_at": samples[index]["sampled_at"],
+            "after_sample_at": samples[index + 1]["sampled_at"],
+            "before_bytes": swap_values[index],
+            "after_bytes": swap_values[index + 1],
+            "delta_bytes": delta,
+        }
+        for index, delta in enumerate(deltas)
+        if delta > 0
+    ]
     decreases = [delta for delta in deltas if delta < 0]
-    last_growth_index = growth[-1][0] if growth else None
-    stable_sample_count = (
-        len(samples) - last_growth_index - 1
-        if last_growth_index is not None
-        else len(samples) - 1
+    headroom_values = [
+        int(
+            finite_nonnegative(
+                row.get("physical_headroom_bytes"), f"{label} raw physical headroom"
+            )
+        )
+        for row in samples
+    ]
+    require(
+        min(headroom_values) == summary.get("physical_headroom_bytes"),
+        f"{label} raw physical headroom differs from the collector summary",
     )
-    stable_seconds = (
-        (parsed[-1] - parsed[last_growth_index]).total_seconds()
-        if last_growth_index is not None
-        else (parsed[-1] - parsed[0]).total_seconds()
+    thermal_states = [row.get("thermal_state") for row in samples]
+    require(
+        all(value in {"nominal", "throttled"} for value in thermal_states),
+        f"{label} raw thermal state is invalid",
     )
-    raw_total_positive_growth_bytes = sum(delta for _, delta in growth)
-    raw_max_positive_step_bytes = max((delta for _, delta in growth), default=0)
-    safety_clean = (
-        finite_nonnegative(summary.get("physical_headroom_bytes"), f"{label} headroom")
-        >= METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES
-        and summary.get("thermal_throttling_count") == 0
-        and summary.get("oom_count") == 0
-        and summary.get("admission_error_count") == 0
-        and summary.get("active_probe_retry_error_count") == 0
+    raw_thermal_throttling_count = sum(
+        value != "nominal" for value in thermal_states
     )
-    if not growth:
-        classification = "exact_zero"
-    elif (
-        len(growth) == 1
-        and raw_total_positive_growth_bytes
-        <= METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES
-        and safety_clean
-    ):
-        classification = "host_global_swap_noise_candidate"
-    else:
-        classification = "swap_pressure"
+    require(
+        raw_thermal_throttling_count == summary.get("thermal_throttling_count"),
+        f"{label} raw thermal state differs from the collector summary",
+    )
+    power_modes = [row.get("power_mode") for row in samples]
+    require(
+        all(value in {"normal", "low-power"} for value in power_modes),
+        f"{label} raw power mode is invalid",
+    )
+    low_power_sample_count = sum(value != "normal" for value in power_modes)
+    raw_total_positive_growth_bytes = sum(
+        row["delta_bytes"] for row in positive_steps
+    )
+    raw_max_positive_step_bytes = max(
+        (row["delta_bytes"] for row in positive_steps), default=0
+    )
+    classification = (
+        "exact_zero" if not positive_steps else "host_global_swap_observed"
+    )
     return {
         "classification": classification,
+        "classification_reason": (
+            "no-positive-vm.swapusage-step-observed"
+            if classification == "exact_zero"
+            else "host-global-vm.swapusage-positive-step-observed-not-process-attributable"
+        ),
         "raw_collector_sha256": require_sha(
             header.get("collector_sha256"), f"{label} raw collector SHA256"
         ),
@@ -540,7 +572,7 @@ def derive_metal_swap_scope_evidence(
         ),
         "raw_sample_count": len(samples),
         "raw_step_count": len(changed),
-        "raw_positive_step_count": len(growth),
+        "raw_positive_step_count": len(positive_steps),
         "raw_negative_step_count": len(decreases),
         "raw_max_absolute_step_bytes": max(
             (abs(delta) for delta in changed), default=0
@@ -548,106 +580,63 @@ def derive_metal_swap_scope_evidence(
         "raw_max_positive_step_bytes": raw_max_positive_step_bytes,
         "raw_total_positive_growth_bytes": raw_total_positive_growth_bytes,
         "raw_net_growth_bytes": swap_values[-1] - swap_values[0],
+        "swap_start_bytes": swap_values[0],
+        "swap_end_bytes": swap_values[-1],
+        "positive_steps": positive_steps,
         "physical_headroom_bytes": int(summary["physical_headroom_bytes"]),
         "thermal_throttling_count": summary.get("thermal_throttling_count"),
+        "low_power_sample_count": low_power_sample_count,
         "oom_count": summary.get("oom_count"),
         "admission_error_count": summary.get("admission_error_count"),
         "active_probe_retry_error_count": summary.get(
             "active_probe_retry_error_count"
         ),
-        "stable_sample_count_after_last_growth": stable_sample_count,
-        "stable_seconds_after_last_growth": stable_seconds,
         "first_sample_at": samples[0]["sampled_at"],
         "last_sample_at": samples[-1]["sampled_at"],
-        "last_growth_at": (
-            samples[last_growth_index]["sampled_at"]
-            if last_growth_index is not None
-            else None
-        ),
     }
 
 
 def aggregate_metal_swap_evidence(
     scopes: list[dict[str, Any]], label: str
 ) -> dict[str, Any]:
-    """Apply the one-step allowance once to the complete 5-cell/3-run lane."""
+    """Aggregate non-attributable host-global swap telemetry without gating it."""
 
     require(len(scopes) == 8, f"{label} must cover five cells and three run samples")
     require(
         all(
-            row[field] == 0
-            for row in scopes
-            for field in (
-                "thermal_throttling_count",
-                "oom_count",
-                "admission_error_count",
-                "active_probe_retry_error_count",
+            row.get("classification")
+            == (
+                "exact_zero"
+                if row.get("raw_positive_step_count") == 0
+                else "host_global_swap_observed"
             )
+            for row in scopes
         ),
-        f"{label} contains a Metal thermal/OOM/admission/probe error",
+        f"{label} scope swap classification is not raw-derived",
     )
     positive_step_count = sum(row["raw_positive_step_count"] for row in scopes)
     total_positive_growth = sum(
         row["raw_total_positive_growth_bytes"] for row in scopes
     )
     max_positive_step = max(row["raw_max_positive_step_bytes"] for row in scopes)
-    growth_scopes = [row for row in scopes if row["raw_positive_step_count"] > 0]
-    if len(growth_scopes) == 1:
-        growth_scope = growth_scopes[0]
-        last_growth = timestamp_datetime(
-            growth_scope["last_growth_at"], f"{label} last swap growth"
-        )
-        stable_sample_count = growth_scope[
-            "stable_sample_count_after_last_growth"
-        ] + sum(
-            row["raw_sample_count"]
-            for row in scopes
-            if timestamp_datetime(row["first_sample_at"], f"{label} scope start")
-            > last_growth
-            and row is not growth_scope
-        )
-        stable_seconds = max(
-            0.0,
-            max(
-                timestamp_datetime(row["last_sample_at"], f"{label} scope end")
-                for row in scopes
-            ).timestamp()
-            - last_growth.timestamp(),
-        )
-    else:
-        stable_sample_count = 0
-        stable_seconds = 0.0
-    exact_zero = positive_step_count == 0
-    noise = (
-        positive_step_count <= METAL_SWAP_NOISE_MAX_LANE_GROWTH_STEP_COUNT
-        and total_positive_growth <= METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES
-        and all(
-            row["classification"]
-            in {"exact_zero", "host_global_swap_noise_candidate"}
-            for row in scopes
-        )
-        and stable_sample_count >= METAL_SWAP_NOISE_MIN_STABLE_SAMPLE_COUNT
-        and stable_seconds >= METAL_SWAP_NOISE_MIN_STABLE_SECONDS
-        and min(row["physical_headroom_bytes"] for row in scopes)
-        >= METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES
-    )
     classification = (
         "exact_zero"
-        if exact_zero
-        else "host_global_swap_noise"
-        if noise
-        else "swap_pressure"
+        if positive_step_count == 0
+        else "host_global_swap_observed"
     )
-    result = {
+    return {
         "classification": classification,
+        "classification_reason": (
+            "no-positive-vm.swapusage-step-observed-across-lane"
+            if classification == "exact_zero"
+            else "host-global-vm.swapusage-positive-step-observed-not-process-attributable"
+        ),
         "contract_scope": "five-formal-http-cells-plus-three-run-samples",
         "policy": {
-            "max_lane_positive_step_count": METAL_SWAP_NOISE_MAX_LANE_GROWTH_STEP_COUNT,
-            "max_lane_total_positive_growth_bytes": METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES,
-            "minimum_physical_headroom_bytes": METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES,
-            "minimum_stable_sample_count_after_last_growth": METAL_SWAP_NOISE_MIN_STABLE_SAMPLE_COUNT,
-            "minimum_stable_seconds_after_last_growth": METAL_SWAP_NOISE_MIN_STABLE_SECONDS,
-            "required_thermal_oom_admission_probe_error_count": 0,
+            "signal": "macos-vm.swapusage",
+            "attribution": "host-global-non-attributable",
+            "resource_gate": False,
+            "classification_basis": "positive-step-count-only",
         },
         "scope_count": len(scopes),
         "raw_step_count": sum(row["raw_step_count"] for row in scopes),
@@ -661,8 +650,6 @@ def aggregate_metal_swap_evidence(
         "raw_max_positive_step_bytes": max_positive_step,
         "raw_total_positive_growth_bytes": total_positive_growth,
         "raw_net_growth_bytes": sum(row["raw_net_growth_bytes"] for row in scopes),
-        "stable_sample_count_after_last_growth": stable_sample_count,
-        "stable_seconds_after_last_growth": stable_seconds,
         "minimum_physical_headroom_bytes": min(
             row["physical_headroom_bytes"] for row in scopes
         ),
@@ -671,18 +658,30 @@ def aggregate_metal_swap_evidence(
         ),
         "scopes": copy.deepcopy(scopes),
     }
-    require(
-        classification in {"exact_zero", "host_global_swap_noise"},
-        f"{label} sustained or unbounded Metal swap pressure detected",
-    )
-    return result
 
 
 def validate_metal_resource_contract(
     summary: dict[str, Any],
     label: str,
-    swap_evidence: dict[str, Any] | None = None,
+    *,
+    typed_memory_budget_bytes: Any,
+    resource_evidence: dict[str, Any],
 ) -> None:
+    typed_budget = finite_positive(
+        typed_memory_budget_bytes, f"{label} typed Metal memory budget"
+    )
+    summary_budget = finite_positive(
+        summary.get("memory_budget_bytes"), f"{label} Metal summary memory budget"
+    )
+    require(
+        summary_budget == typed_budget,
+        f"{label} Metal summary memory budget differs from typed config",
+    )
+    require(
+        finite_positive(summary.get("peak_memory_bytes"), f"{label} Metal peak RSS")
+        <= typed_budget,
+        f"{label} Metal peak process-group RSS exceeds the typed memory budget",
+    )
     physical_headroom = finite_nonnegative(
         summary.get("physical_headroom_bytes"), f"{label} Metal physical headroom"
     )
@@ -692,21 +691,40 @@ def validate_metal_resource_contract(
         f"{label} Metal physical headroom is below the "
         f"{physical_headroom_floor}-byte floor",
     )
-    swap_start = finite_nonnegative(
-        summary.get("swap_start_bytes"), f"{label} Metal swap start"
+    require(
+        resource_evidence.get("classification")
+        in {"exact_zero", "host_global_swap_observed"},
+        f"{label} Metal host-global swap telemetry classification is invalid",
     )
-    swap_end = finite_nonnegative(
-        summary.get("swap_end_bytes"), f"{label} Metal swap end"
+    require(
+        resource_evidence.get("physical_headroom_bytes")
+        == summary.get("physical_headroom_bytes")
+        and resource_evidence.get("thermal_throttling_count")
+        == summary.get("thermal_throttling_count")
+        and resource_evidence.get("oom_count") == summary.get("oom_count")
+        and resource_evidence.get("admission_error_count")
+        == summary.get("admission_error_count")
+        and resource_evidence.get("active_probe_retry_error_count")
+        == summary.get("active_probe_retry_error_count"),
+        f"{label} Metal raw resource evidence differs from the collector summary",
     )
     require(
         summary.get("thermal_throttling_count") == 0
-        and (
-            swap_end <= swap_start
-            if swap_evidence is None
-            else swap_evidence.get("classification")
-            in {"exact_zero", "host_global_swap_noise_candidate"}
-        ),
-        f"{label} Metal swap growth/thermal contract failed",
+        and summary.get("thermal_start") == "nominal"
+        and summary.get("thermal_end") == "nominal",
+        f"{label} Metal thermal state is not nominal",
+    )
+    require(
+        summary.get("power_mode_start") == "normal"
+        and summary.get("power_mode_end") == "normal"
+        and resource_evidence.get("low_power_sample_count") == 0,
+        f"{label} Metal power mode is not normal",
+    )
+    require(
+        summary.get("oom_count") == 0
+        and summary.get("admission_error_count") == 0
+        and summary.get("active_probe_retry_error_count") == 0,
+        f"{label} Metal OOM/admission/probe error contract failed",
     )
 
 
@@ -1814,6 +1832,453 @@ def validate_collector_ref(root: Path, value: Any, label: str) -> Path:
     return path
 
 
+def post_cell_nonnegative_int(value: Any, label: str) -> int:
+    require(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0,
+        f"{label} must be a nonnegative integer",
+    )
+    return value
+
+
+def validate_post_cell_occupancy_counter(
+    value: Any, label: str
+) -> dict[str, int]:
+    require(isinstance(value, dict), f"{label} occupancy counter is missing")
+    return {
+        field: post_cell_nonnegative_int(value.get(field), f"{label}.{field}")
+        for field in POST_CELL_OCCUPANCY_COUNTER_FIELDS
+    }
+
+
+def validate_post_cell_residency_occupancy(
+    value: Any, label: str
+) -> dict[str, dict[str, int]]:
+    require(isinstance(value, dict), f"{label} residency occupancy is missing")
+    normalized = {
+        field: validate_post_cell_occupancy_counter(
+            value.get(field), f"{label}.{field}"
+        )
+        for field in ("total", *POST_CELL_OCCUPANCY_SCOPE_FIELDS)
+    }
+    for metric in POST_CELL_OCCUPANCY_COUNTER_FIELDS:
+        require(
+            normalized["total"][metric]
+            == sum(
+                normalized[scope][metric]
+                for scope in POST_CELL_OCCUPANCY_SCOPE_FIELDS
+            ),
+            f"{label} scope occupancy does not sum to total {metric}",
+        )
+    return normalized
+
+
+def validate_post_cell_typed_ledger(
+    body: Any,
+    *,
+    typed_active_cap: int,
+    memory_budget_bytes: int,
+    label: str,
+) -> dict[str, Any]:
+    """Validate one quiescent product health body and its typed pool ledger."""
+
+    require(isinstance(body, dict), f"{label} health body is invalid")
+    post_cell_nonnegative_int(typed_active_cap, f"{label} typed active cap")
+    post_cell_nonnegative_int(memory_budget_bytes, f"{label} memory budget")
+    require(typed_active_cap > 0, f"{label} typed active cap must be positive")
+    require(memory_budget_bytes > 0, f"{label} memory budget must be positive")
+
+    engine = body.get("engine")
+    admission = body.get("admission")
+    require(
+        isinstance(engine, dict) and isinstance(admission, dict),
+        f"{label} engine/admission health is missing",
+    )
+    for field in ("active_requests", "queued_requests"):
+        require(
+            post_cell_nonnegative_int(engine.get(field), f"{label} engine.{field}")
+            == 0,
+            f"{label} engine is not quiescent: {field}",
+        )
+    require(
+        admission.get("runtime_snapshot_available") is True
+        and admission.get("runtime_contract_error") is None
+        and admission.get("resource_authority") == "plan_runtime",
+        f"{label} admission runtime authority is invalid",
+    )
+    for field in (
+        "queue_depth",
+        "active_sequences",
+        "active_prefill",
+        "active_decode",
+        "rejected_requests_total",
+        "failed_requests_total",
+    ):
+        require(
+            post_cell_nonnegative_int(
+                admission.get(field), f"{label} admission.{field}"
+            )
+            == 0,
+            f"{label} admission is not quiescent: {field}",
+        )
+    current_batch_size = admission.get("current_batch_size")
+    require(
+        current_batch_size is None
+        or (
+            isinstance(current_batch_size, int)
+            and not isinstance(current_batch_size, bool)
+            and current_batch_size == 0
+        ),
+        f"{label} admission current batch is active",
+    )
+    for field in (
+        "effective_max_concurrent",
+        "maximum_active_sequences",
+        "preflight_effective_max_concurrent",
+    ):
+        require(
+            post_cell_nonnegative_int(
+                admission.get(field), f"{label} admission.{field}"
+            )
+            == typed_active_cap,
+            f"{label} admission active ceiling differs: {field}",
+        )
+
+    cache = body.get("cache")
+    executor = cache.get("prefix_cache") if isinstance(cache, dict) else None
+    require(
+        isinstance(executor, dict)
+        and executor.get("schema") == "ferrum.runtime-vnext.executor-trace.v1",
+        f"{label} vNext executor health is missing",
+    )
+    for field in (
+        "pending_sequences",
+        "active_sequences",
+        "staged_prefill_requests",
+        "staged_prefill_sequences",
+        "pending_prefill_maintenance",
+        "executing_prefills",
+    ):
+        require(
+            post_cell_nonnegative_int(
+                executor.get(field), f"{label} executor.{field}"
+            )
+            == 0,
+            f"{label} executor is not quiescent: {field}",
+        )
+    deferred_cleanup = executor.get("deferred_cleanup")
+    require(
+        isinstance(deferred_cleanup, dict),
+        f"{label} deferred cleanup status is missing",
+    )
+    for field in (
+        "queued",
+        "in_progress",
+        "retryable",
+        "quarantined",
+        "panicked",
+        "panicked_total",
+    ):
+        require(
+            post_cell_nonnegative_int(
+                deferred_cleanup.get(field), f"{label} deferred_cleanup.{field}"
+            )
+            == 0,
+            f"{label} deferred cleanup is not quiescent: {field}",
+        )
+
+    static_bytes = post_cell_nonnegative_int(
+        executor.get("static_bytes"), f"{label} static bytes"
+    )
+    require(static_bytes > 0, f"{label} static bytes must be positive")
+    runtime_memory = executor.get("runtime_memory_policy")
+    pools_status = executor.get("dynamic_pools")
+    require(
+        isinstance(runtime_memory, dict) and isinstance(pools_status, dict),
+        f"{label} runtime memory/pool status is missing",
+    )
+    runtime_capacity = post_cell_nonnegative_int(
+        runtime_memory.get("capacity_bytes"), f"{label} runtime capacity"
+    )
+    runtime_reserve = post_cell_nonnegative_int(
+        runtime_memory.get("reserve_bytes"), f"{label} runtime reserve"
+    )
+    require(
+        post_cell_nonnegative_int(
+            runtime_memory.get("maximum_active_sequences"),
+            f"{label} runtime maximum active sequences",
+        )
+        == typed_active_cap,
+        f"{label} runtime active ceiling differs",
+    )
+    require(
+        post_cell_nonnegative_int(
+            pools_status.get("maximum_active_sequences"),
+            f"{label} pool maximum active sequences",
+        )
+        == typed_active_cap,
+        f"{label} pool active ceiling differs",
+    )
+
+    device_capacity = post_cell_nonnegative_int(
+        pools_status.get("device_capacity_bytes"), f"{label} device capacity"
+    )
+    effective_ceiling = post_cell_nonnegative_int(
+        pools_status.get("effective_device_usable_ceiling_bytes"),
+        f"{label} effective device ceiling",
+    )
+    budget_ceiling = post_cell_nonnegative_int(
+        pools_status.get("budget_device_wide_usable_ceiling_bytes"),
+        f"{label} budget device ceiling",
+    )
+    process_claimed = post_cell_nonnegative_int(
+        pools_status.get("process_claimed_bytes"), f"{label} process claim"
+    )
+    budget_claimed = post_cell_nonnegative_int(
+        pools_status.get("budget_claimed_bytes"), f"{label} budget claim"
+    )
+    require(
+        runtime_capacity == device_capacity
+        and runtime_reserve <= runtime_capacity
+        and runtime_capacity - runtime_reserve == budget_ceiling
+        and effective_ceiling == budget_ceiling == memory_budget_bytes
+        and budget_claimed == process_claimed <= effective_ceiling,
+        f"{label} effective ceiling/process/budget claims differ",
+    )
+
+    pools = pools_status.get("pools")
+    require(isinstance(pools, list) and pools, f"{label} dynamic pool list is empty")
+    seen_pool_ids: set[str] = set()
+    resident_total = 0
+    used_total = 0
+    live_physical_total = 0
+    for index, pool in enumerate(pools, start=1):
+        pool_label = f"{label} pool {index}"
+        require(isinstance(pool, dict), f"{pool_label} status is invalid")
+        pool_id = pool.get("pool_id")
+        require(
+            isinstance(pool_id, str)
+            and bool(pool_id)
+            and pool_id not in seen_pool_ids,
+            f"{pool_label} identity is invalid",
+        )
+        seen_pool_ids.add(pool_id)
+        require(
+            post_cell_nonnegative_int(pool.get("domain_id"), f"{pool_label} domain")
+            > 0,
+            f"{pool_label} domain is invalid",
+        )
+        resident = post_cell_nonnegative_int(
+            pool.get("resident_bytes"), f"{pool_label} resident bytes"
+        )
+        free = post_cell_nonnegative_int(
+            pool.get("free_bytes"), f"{pool_label} free bytes"
+        )
+        resident_chunks = post_cell_nonnegative_int(
+            pool.get("resident_chunks"), f"{pool_label} resident chunks"
+        )
+        live_segments = post_cell_nonnegative_int(
+            pool.get("live_segments"), f"{pool_label} live segments"
+        )
+        largest_contiguous = post_cell_nonnegative_int(
+            pool.get("largest_contiguous_bytes"),
+            f"{pool_label} largest contiguous bytes",
+        )
+        require(
+            free <= resident
+            and largest_contiguous <= free
+            and (resident == 0) == (resident_chunks == 0),
+            f"{pool_label} resident/free/chunk accounting differs",
+        )
+        for field in (
+            "pending_growth_bytes",
+            "quarantined_bytes",
+            "quarantined_chunks",
+            "descriptor_mismatch_chunks",
+            "publication_rejected_chunks",
+        ):
+            require(
+                post_cell_nonnegative_int(pool.get(field), f"{pool_label}.{field}")
+                == 0,
+                f"{pool_label} contains pending/quarantined/rejected backing: {field}",
+            )
+        require(pool.get("poisoned") is False, f"{pool_label} is poisoned")
+
+        live = pool.get("live_occupancy")
+        require(isinstance(live, dict), f"{pool_label} live occupancy is missing")
+        live_total = validate_post_cell_occupancy_counter(
+            live.get("total"), f"{pool_label}.live.total"
+        )
+        transient = validate_post_cell_residency_occupancy(
+            live.get("transient"), f"{pool_label}.live.transient"
+        )
+        lane_stable = validate_post_cell_residency_occupancy(
+            live.get("lane_stable"), f"{pool_label}.live.lane_stable"
+        )
+        for metric in POST_CELL_OCCUPANCY_COUNTER_FIELDS:
+            require(
+                live_total[metric]
+                == transient["total"][metric] + lane_stable["total"][metric],
+                f"{pool_label} residency occupancy does not sum to live {metric}",
+            )
+            require(
+                transient["total"][metric] == 0,
+                f"{pool_label} transient {metric} remains after the cell",
+            )
+        used = resident - free
+        require(
+            live_total["physical_bytes"] == used
+            and live_total["segment_count"] == live_segments,
+            f"{pool_label} live ledger differs from allocator occupancy",
+        )
+        resident_total += resident
+        used_total += used
+        live_physical_total += live_total["physical_bytes"]
+
+    require(
+        budget_claimed == static_bytes + resident_total
+        and used_total == live_physical_total,
+        f"{label} aggregate pool/budget accounting differs",
+    )
+    return {
+        "pool_count": len(pools),
+        "resident_bytes": resident_total,
+        "used_bytes": used_total,
+        "budget_claimed_bytes": budget_claimed,
+        "process_claimed_bytes": process_claimed,
+        "effective_device_usable_ceiling_bytes": effective_ceiling,
+        "typed_active_cap": typed_active_cap,
+    }
+
+
+def validate_legacy_post_cell_path(
+    root: Path, relative: Any, digest: Any, label: str
+) -> Path:
+    raw = Path(str(relative or ""))
+    require(
+        str(raw) and not raw.is_absolute() and ".." not in raw.parts,
+        f"{label} path is invalid",
+    )
+    path = (root / raw).resolve()
+    try:
+        path.relative_to(root.resolve())
+    except ValueError as error:
+        raise R2Error(f"{label} escaped the collector root") from error
+    require(path.is_file() and not path.is_symlink(), f"{label} is missing: {path}")
+    require(
+        require_sha(digest, f"{label}.sha256") == sha256(path),
+        f"{label} SHA256 differs",
+    )
+    return path
+
+
+def validate_post_cell_probe_receipt(
+    body_path: Path, receipt_path: Path, label: str
+) -> dict[str, Any]:
+    receipt = read_json(receipt_path, f"{label} receipt")
+    require(
+        receipt.get("returncode") == 0
+        and receipt.get("http_status") == 200
+        and receipt.get("body_sha256") == sha256(body_path)
+        and receipt.get("body_size_bytes") == body_path.stat().st_size,
+        f"{label} receipt/body binding differs",
+    )
+    return read_json(body_path, f"{label} health body")
+
+
+def load_post_cell_health_bodies(
+    root: Path,
+    server: dict[str, Any],
+    records: list[dict[str, Any]],
+    *,
+    legacy_single_epoch: bool,
+) -> list[dict[str, Any]]:
+    """Load current checkpoint refs or the frozen legacy quiescence refs."""
+
+    checkpoint_refs = server.get("completed_cell_checkpoints")
+    if checkpoint_refs is not None:
+        require(
+            isinstance(checkpoint_refs, list)
+            and len(checkpoint_refs) == len(records),
+            "Ferrum completed-cell checkpoint denominator differs",
+        )
+        bodies: list[dict[str, Any]] = []
+        for record, checkpoint_ref in zip(records, checkpoint_refs, strict=True):
+            label = f"Ferrum post-cell {record.get('cell_id')}"
+            checkpoint_path = validate_collector_ref(
+                root, checkpoint_ref, f"{label} checkpoint"
+            )
+            checkpoint = read_json(checkpoint_path, f"{label} checkpoint")
+            require(
+                checkpoint.get("contract")
+                == "ferrum.runtime-vnext.r2.completed-cell-checkpoint.v1"
+                and checkpoint.get("sequence") == record.get("sequence")
+                and checkpoint.get("cell_id") == record.get("cell_id"),
+                f"{label} checkpoint/record binding differs",
+            )
+            post = checkpoint.get("post_cell_idle")
+            require(
+                isinstance(post, dict) and post.get("status") == "quiescent",
+                f"{label} checkpoint is not quiescent",
+            )
+            body_path = validate_collector_ref(
+                root, post.get("body"), f"{label} body"
+            )
+            receipt_path = validate_collector_ref(
+                root, post.get("receipt"), f"{label} receipt"
+            )
+            bodies.append(
+                validate_post_cell_probe_receipt(body_path, receipt_path, label)
+            )
+        return bodies
+
+    require(legacy_single_epoch, "Ferrum post-cell checkpoints are missing")
+    session = server.get("session")
+    quiescence = session.get("cell_quiescence") if isinstance(session, dict) else None
+    require(
+        isinstance(quiescence, list) and len(quiescence) == len(records),
+        "legacy Ferrum cell-quiescence denominator differs",
+    )
+    bodies = []
+    for record, row in zip(records, quiescence, strict=True):
+        label = f"legacy Ferrum post-cell {record.get('cell_id')}"
+        require(
+            isinstance(row, dict)
+            and row.get("status") == "quiescent"
+            and row.get("active_requests") == 0
+            and row.get("queued_requests") == 0
+            and row.get("admission_queue_depth") == 0,
+            f"{label} quiescence receipt differs",
+        )
+        probe = row.get("probe")
+        require(isinstance(probe, dict), f"{label} probe is missing")
+        expected_prefix = (
+            f"post-{record.get('sequence'):02d}-{record.get('dataset')}"
+            f"-c{record.get('concurrency')}-"
+        )
+        body_relative = probe.get("body")
+        receipt_relative = probe.get("receipt")
+        require(
+            isinstance(body_relative, str)
+            and isinstance(receipt_relative, str)
+            and Path(body_relative).name.startswith(expected_prefix)
+            and Path(body_relative).name.endswith(".body.json")
+            and Path(receipt_relative).name.startswith(expected_prefix)
+            and Path(receipt_relative).name.endswith(".receipt.json"),
+            f"{label} probe/record path binding differs",
+        )
+        body_path = validate_legacy_post_cell_path(
+            root, body_relative, probe.get("body_sha256"), f"{label} body"
+        )
+        receipt_path = validate_legacy_post_cell_path(
+            root,
+            receipt_relative,
+            probe.get("receipt_sha256"),
+            f"{label} receipt",
+        )
+        bodies.append(validate_post_cell_probe_receipt(body_path, receipt_path, label))
+    return bodies
+
+
 def ferrum_collector_root(manifest_path: Path, manifest: dict[str, Any]) -> Path:
     plan = manifest.get("plan")
     require(isinstance(plan, dict), "Ferrum collector plan reference is missing")
@@ -2864,6 +3329,7 @@ def load_ferrum_collector_lane(
         and isinstance(records, list),
         "Ferrum collector server session is incomplete",
     )
+    all_server_records = [*records, server.get("run_serve_parity_report")]
     if legacy_single_epoch:
         session_epochs = [
             {
@@ -2871,7 +3337,7 @@ def load_ferrum_collector_lane(
                 "session_id": session.get("session_id"),
                 "completed_cell_sequences": [
                     row.get("sequence")
-                    for row in [*records, server.get("run_serve_parity_report")]
+                    for row in all_server_records
                     if isinstance(row, dict)
                 ],
             }
@@ -2968,7 +3434,7 @@ def load_ferrum_collector_lane(
     observed_epoch_sequences: dict[str, list[int]] = {
         epoch_id: [] for epoch_id in epoch_authority
     }
-    for record in [*server.get("formal_reports", []), server.get("run_serve_parity_report")]:
+    for record in all_server_records:
         require(isinstance(record, dict), "Ferrum server record is invalid")
         epoch_id = record.get("session_id")
         require(epoch_id in observed_epoch_sequences, "Ferrum server record uses an unknown epoch")
@@ -2982,6 +3448,19 @@ def load_ferrum_collector_lane(
         session.get("server_process_ordinal") == len(epoch_authority),
         "Ferrum collector server epoch/process denominator differs",
     )
+    post_cell_bodies = load_post_cell_health_bodies(
+        root,
+        server,
+        all_server_records,
+        legacy_single_epoch=legacy_single_epoch,
+    )
+    for record, body in zip(all_server_records, post_cell_bodies, strict=True):
+        validate_post_cell_typed_ledger(
+            body,
+            typed_active_cap=config.get("typed_active_cap"),
+            memory_budget_bytes=config.get("memory_budget_bytes"),
+            label=f"Ferrum post-cell {record.get('cell_id')}",
+        )
     try:
         baseline_scenarios.validate_sanitized_environment(
             session.get("environment"), "Ferrum serve environment"
@@ -3012,7 +3491,8 @@ def load_ferrum_collector_lane(
             and sample.get("sample_ordinal") == ordinal
             and sample.get("candidate_binary_sha256") == binary
             and sample.get("source_git_sha") == source["git_sha"]
-            and sample.get("profile_detail") == "off",
+            and sample.get("profile_detail") == "off"
+            and sample.get("returncode") == 0,
             f"Ferrum run sample {ordinal} identity differs",
         )
         pid = sample.get("pid")
@@ -3050,23 +3530,21 @@ def load_ferrum_collector_lane(
             == "off",
             f"Ferrum run sample {ordinal} is not the profile-off product path",
         )
+        resources = sample.get("resources")
+        require(
+            isinstance(resources, dict)
+            and isinstance(resources.get("summary"), dict)
+            and resources["summary"].get("exit_reason") == "process-exit",
+            f"Ferrum run sample {ordinal} lacks a clean process-exit resource footer",
+        )
         if expected_backend == "metal":
-            resources = sample.get("resources")
-            require(
-                isinstance(resources, dict),
-                f"Ferrum run sample {ordinal} resource evidence is missing",
-            )
             observations_ref = resources.get("observations")
             observations_path = validate_collector_ref(
                 root,
                 observations_ref,
                 f"Ferrum run sample {ordinal} resource observations",
             )
-            resource_summary = resources.get("summary")
-            require(
-                isinstance(resource_summary, dict),
-                f"Ferrum run sample {ordinal} resource summary is missing",
-            )
+            resource_summary = resources["summary"]
             observation_rows = read_jsonl_objects(
                 observations_path,
                 f"Ferrum run sample {ordinal} resource observations",
@@ -3089,7 +3567,7 @@ def load_ferrum_collector_lane(
                     session_finished_at=sample["finished_at"],
                     measurement_started_at=observation_samples[0]["sampled_at"],
                     measurement_finished_at=observation_samples[-1]["sampled_at"],
-                    memory_budget_bytes=resource_summary["memory_budget_bytes"],
+                    memory_budget_bytes=config["memory_budget_bytes"],
                     requested_concurrency=1,
                     typed_active_cap=1,
                     runtime_log_path=observation_rows[0]["runtime_log_path"],
@@ -3111,7 +3589,8 @@ def load_ferrum_collector_lane(
             validate_metal_resource_contract(
                 resource_summary,
                 f"Ferrum run sample {ordinal}",
-                swap_evidence,
+                typed_memory_budget_bytes=config["memory_budget_bytes"],
+                resource_evidence=swap_evidence,
             )
             metal_swap_scopes.append(
                 {"scope": f"run:c1:sample-{ordinal}", **swap_evidence}
@@ -3244,15 +3723,15 @@ def load_ferrum_collector_lane(
             report_ref=report_ref if highest else None,
             typed_active_cap=config.get("typed_active_cap") if highest else None,
         )
-        require(
-            finite_positive(resource_summary.get("peak_memory_bytes"), "peak memory")
-            <= finite_positive(resource_summary.get("memory_budget_bytes"), "memory budget")
-            and resource_summary.get("oom_count") == 0
-            and resource_summary.get("admission_error_count") == 0,
-            f"resource budget/error contract failed: {key}",
-        )
         swap_evidence: dict[str, Any] | None = None
         if expected_backend == "cuda":
+            require(
+                finite_positive(resource_summary.get("peak_memory_bytes"), "peak memory")
+                <= finite_positive(resource_summary.get("memory_budget_bytes"), "memory budget")
+                and resource_summary.get("oom_count") == 0
+                and resource_summary.get("admission_error_count") == 0,
+                f"resource budget/error contract failed: {key}",
+            )
             require(
                 finite_nonnegative(
                     resource_summary.get("physical_headroom_bytes"), "CUDA headroom"
@@ -3272,7 +3751,8 @@ def load_ferrum_collector_lane(
             validate_metal_resource_contract(
                 resource_summary,
                 f"Ferrum collector cell {key}",
-                swap_evidence,
+                typed_memory_budget_bytes=config["memory_budget_bytes"],
+                resource_evidence=swap_evidence,
             )
             metal_swap_scopes.append(
                 {"scope": f"{key[0]}:c{key[1]}", **swap_evidence}
@@ -3352,6 +3832,80 @@ def load_ferrum_collector_lane(
     require(measured_requests == sum(requests_per_repeat(dataset) * 3 for dataset, _ in expected), "Ferrum collector measured request denominator differs")
     parity = server.get("run_serve_parity_report")
     require(isinstance(parity, dict), "run/serve parity evidence is missing")
+    if expected_backend == "metal":
+        parity_session_id = parity.get("session_id")
+        require(
+            isinstance(parity_session_id, str)
+            and parity_session_id in epoch_authority,
+            "run/serve parity resource epoch is unknown",
+        )
+        parity_session = epoch_authority[parity_session_id]
+        parity_resources = parity.get("resources")
+        require(
+            isinstance(parity_resources, dict),
+            "run/serve parity resource evidence is missing",
+        )
+        parity_observations_ref = parity_resources.get("observations")
+        parity_observations_path = validate_collector_ref(
+            root,
+            parity_observations_ref,
+            "run/serve parity resource observations",
+        )
+        parity_resource_summary = parity_resources.get("summary")
+        require(
+            isinstance(parity_resource_summary, dict),
+            "run/serve parity resource summary is missing",
+        )
+        parity_runtime_log_path = validate_collector_ref(
+            root,
+            parity_session.get("runtime_log"),
+            "run/serve parity epoch runtime log",
+        )
+        try:
+            import runtime_vnext_resource_sampler as resource_sampler
+
+            recomputed_parity_resource = resource_sampler.derive_summary(
+                parity_observations_path,
+                session_id=parity_session["session_id"],
+                cell_id=parity["cell_id"],
+                backend="metal",
+                hardware_id=hardware["id"],
+                pid=parity_session["pid"],
+                pgid=parity_session["pgid"],
+                process_start_marker=parity_session["process_start_marker"],
+                base_url=parity_session["base_url"],
+                session_started_at=parity_session["started_at"],
+                session_finished_at=parity_session["finished_at"],
+                measurement_started_at=parity["started_at"],
+                measurement_finished_at=parity["finished_at"],
+                memory_budget_bytes=config["memory_budget_bytes"],
+                requested_concurrency=parity["concurrency"],
+                typed_active_cap=config["typed_active_cap"],
+                runtime_log_path=parity_session["runtime_log_origin_path"],
+                runtime_log_evidence_path=parity_runtime_log_path,
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            raise R2Error(
+                f"run/serve parity resource evidence failed: {error}"
+            ) from error
+        require(
+            recomputed_parity_resource == parity_resource_summary,
+            "run/serve parity resource summary is not raw-derived",
+        )
+        parity_resource_evidence = derive_metal_swap_scope_evidence(
+            parity_observations_path,
+            parity_observations_ref["sha256"],
+            parity_resource_summary,
+            label="run/serve parity resource",
+            measurement_started_at=parity["started_at"],
+            measurement_finished_at=parity["finished_at"],
+        )
+        validate_metal_resource_contract(
+            parity_resource_summary,
+            "run/serve parity resource",
+            typed_memory_budget_bytes=config["memory_budget_bytes"],
+            resource_evidence=parity_resource_evidence,
+        )
     try:
         import runtime_vnext_r2_ferrum_collector as ferrum_collector
 
@@ -5044,25 +5598,245 @@ def self_test() -> None:
         "scripts/release/bounded_command.py" in R2_CONTROL_PLANE_FILES,
         "bounded command must remain an R2 evidence-control-plane file",
     )
-    metal_resource = {
-        "physical_headroom_bytes": 8 * 1024**3,
-        "swap_start_bytes": 100,
-        "swap_end_bytes": 101,
-        "thermal_throttling_count": 0,
+
+    def occupancy_counter(
+        claim_count: int, segment_count: int, physical_bytes: int
+    ) -> dict[str, int]:
+        return {
+            "claim_count": claim_count,
+            "segment_count": segment_count,
+            "physical_bytes": physical_bytes,
+        }
+
+    def residency_occupancy(
+        claim_count: int = 0,
+        segment_count: int = 0,
+        physical_bytes: int = 0,
+    ) -> dict[str, dict[str, int]]:
+        zero = occupancy_counter(0, 0, 0)
+        return {
+            "total": occupancy_counter(
+                claim_count, segment_count, physical_bytes
+            ),
+            **{
+                scope: (
+                    occupancy_counter(claim_count, segment_count, physical_bytes)
+                    if scope == "step"
+                    else copy.deepcopy(zero)
+                )
+                for scope in POST_CELL_OCCUPANCY_SCOPE_FIELDS
+            },
+        }
+
+    post_cell_fixture = {
+        "engine": {"active_requests": 0, "queued_requests": 0},
+        "admission": {
+            "runtime_snapshot_available": True,
+            "runtime_contract_error": None,
+            "resource_authority": "plan_runtime",
+            "queue_depth": 0,
+            "active_sequences": 0,
+            "active_prefill": 0,
+            "active_decode": 0,
+            "current_batch_size": None,
+            "rejected_requests_total": 0,
+            "failed_requests_total": 0,
+            "effective_max_concurrent": 4,
+            "maximum_active_sequences": 4,
+            "preflight_effective_max_concurrent": 4,
+        },
+        "cache": {
+            "prefix_cache": {
+                "schema": "ferrum.runtime-vnext.executor-trace.v1",
+                "pending_sequences": 0,
+                "active_sequences": 0,
+                "staged_prefill_requests": 0,
+                "staged_prefill_sequences": 0,
+                "pending_prefill_maintenance": 0,
+                "executing_prefills": 0,
+                "deferred_cleanup": {
+                    "queued": 0,
+                    "in_progress": 0,
+                    "retryable": 0,
+                    "quarantined": 0,
+                    "panicked": 0,
+                    "panicked_total": 0,
+                },
+                "static_bytes": 100,
+                "runtime_memory_policy": {
+                    "capacity_bytes": 1000,
+                    "reserve_bytes": 400,
+                    "maximum_active_sequences": 4,
+                },
+                "dynamic_pools": {
+                    "maximum_active_sequences": 4,
+                    "device_capacity_bytes": 1000,
+                    "effective_device_usable_ceiling_bytes": 600,
+                    "process_claimed_bytes": 164,
+                    "budget_device_wide_usable_ceiling_bytes": 600,
+                    "budget_claimed_bytes": 164,
+                    "pools": [
+                        {
+                            "pool_id": "pool-a",
+                            "domain_id": 1,
+                            "resident_bytes": 64,
+                            "pending_growth_bytes": 0,
+                            "free_bytes": 16,
+                            "largest_contiguous_bytes": 16,
+                            "resident_chunks": 1,
+                            "live_segments": 2,
+                            "live_occupancy": {
+                                "total": occupancy_counter(1, 2, 48),
+                                "transient": residency_occupancy(),
+                                "lane_stable": residency_occupancy(1, 2, 48),
+                            },
+                            "quarantined_chunks": 0,
+                            "quarantined_bytes": 0,
+                            "descriptor_mismatch_chunks": 0,
+                            "publication_rejected_chunks": 0,
+                            "poisoned": False,
+                        }
+                    ],
+                },
+            }
+        },
     }
-    try:
-        validate_metal_resource_contract(metal_resource, "selftest legacy swap")
-        raise R2Error("legacy Metal swap growth unexpectedly passed without derived evidence")
-    except R2Error as error:
-        require(
-            "swap growth/thermal" in str(error),
-            "legacy Metal swap fallback rejected for the wrong reason",
-        )
-    validate_metal_resource_contract(
-        metal_resource,
-        "selftest derived swap",
-        {"classification": "host_global_swap_noise_candidate"},
+    post_cell_summary = validate_post_cell_typed_ledger(
+        post_cell_fixture,
+        typed_active_cap=4,
+        memory_budget_bytes=600,
+        label="post-cell fixture",
     )
+    require(
+        post_cell_summary["pool_count"] == 1
+        and post_cell_summary["resident_bytes"] == 64
+        and post_cell_summary["used_bytes"] == 48,
+        "post-cell typed ledger summary differs",
+    )
+    active_post_cell = copy.deepcopy(post_cell_fixture)
+    active_post_cell["engine"]["active_requests"] = 1
+    expect_reject(
+        lambda: validate_post_cell_typed_ledger(
+            active_post_cell,
+            typed_active_cap=4,
+            memory_budget_bytes=600,
+            label="active post-cell fixture",
+        ),
+        "active post-cell health",
+    )
+    transient_post_cell = copy.deepcopy(post_cell_fixture)
+    transient_live = transient_post_cell["cache"]["prefix_cache"]["dynamic_pools"][
+        "pools"
+    ][0]["live_occupancy"]
+    transient_live["transient"] = residency_occupancy(1, 2, 48)
+    transient_live["lane_stable"] = residency_occupancy()
+    expect_reject(
+        lambda: validate_post_cell_typed_ledger(
+            transient_post_cell,
+            typed_active_cap=4,
+            memory_budget_bytes=600,
+            label="transient post-cell fixture",
+        ),
+        "transient post-cell occupancy",
+    )
+    mismatched_budget = copy.deepcopy(post_cell_fixture)
+    mismatched_budget["cache"]["prefix_cache"]["dynamic_pools"][
+        "budget_claimed_bytes"
+    ] += 1
+    expect_reject(
+        lambda: validate_post_cell_typed_ledger(
+            mismatched_budget,
+            typed_active_cap=4,
+            memory_budget_bytes=600,
+            label="mismatched post-cell budget fixture",
+        ),
+        "mismatched post-cell budget",
+    )
+
+    with tempfile.TemporaryDirectory(prefix="ferrum-post-cell-selftest-") as raw_temp:
+        fixture_root = Path(raw_temp)
+        fixture_dir = fixture_root / "lane" / "attempts"
+        body_path = fixture_dir / "post-01-random-c1-001.body.json"
+        receipt_path = fixture_dir / "post-01-random-c1-001.receipt.json"
+        checkpoint_path = fixture_root / "lane" / "cell-01.json"
+        write_json(body_path, post_cell_fixture)
+        write_json(
+            receipt_path,
+            {
+                "returncode": 0,
+                "http_status": 200,
+                "body_sha256": sha256(body_path),
+                "body_size_bytes": body_path.stat().st_size,
+            },
+        )
+
+        def collector_ref(path: Path, kind: str) -> dict[str, Any]:
+            return {
+                "kind": kind,
+                "path": path.relative_to(fixture_root).as_posix(),
+                "sha256": sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
+
+        record_fixture = {
+            "sequence": 1,
+            "cell_id": "random:c1",
+            "dataset": "random",
+            "concurrency": 1,
+        }
+        write_json(
+            checkpoint_path,
+            {
+                "contract": "ferrum.runtime-vnext.r2.completed-cell-checkpoint.v1",
+                "sequence": 1,
+                "cell_id": "random:c1",
+                "completion_provenance": "legacy-active-envelope",
+                "post_cell_idle": {
+                    "status": "quiescent",
+                    "body": collector_ref(body_path, "post-cell-idle-body"),
+                    "receipt": collector_ref(
+                        receipt_path, "post-cell-idle-receipt"
+                    ),
+                },
+            },
+        )
+        current_bodies = load_post_cell_health_bodies(
+            fixture_root,
+            {"completed_cell_checkpoints": [collector_ref(checkpoint_path, "checkpoint")]},
+            [record_fixture],
+            legacy_single_epoch=False,
+        )
+        legacy_bodies = load_post_cell_health_bodies(
+            fixture_root,
+            {
+                "session": {
+                    "cell_quiescence": [
+                        {
+                            "status": "quiescent",
+                            "active_requests": 0,
+                            "queued_requests": 0,
+                            "admission_queue_depth": 0,
+                            "probe": {
+                                "body": body_path.relative_to(fixture_root).as_posix(),
+                                "body_sha256": sha256(body_path),
+                                "receipt": receipt_path.relative_to(
+                                    fixture_root
+                                ).as_posix(),
+                                "receipt_sha256": sha256(receipt_path),
+                                "body_origin_path": "/stale/remote/body.json",
+                            },
+                        }
+                    ]
+                }
+            },
+            [record_fixture],
+            legacy_single_epoch=True,
+        )
+        require(
+            current_bodies == legacy_bodies == [post_cell_fixture],
+            "current/legacy post-cell health adapters differ",
+        )
+
     lifecycle_fixture: dict[str, dict[str, int]] = {}
     active_fixture: list[dict[str, Any]] = []
     cursor_ns = 10_000
@@ -5189,40 +5963,22 @@ def self_test() -> None:
         and not requires_active_floor("real-chat", 16, "metal"),
         "active-floor cell selection differs",
     )
+    typed_metal_budget = 20 * 1024**3
     stable_summary = {
+        "peak_memory_bytes": 1024**3,
+        "memory_budget_bytes": typed_metal_budget,
         "physical_headroom_bytes": 4 * 1024**3,
         "swap_start_bytes": 10,
         "swap_end_bytes": 10,
+        "thermal_start": "nominal",
+        "thermal_end": "nominal",
+        "power_mode_start": "normal",
+        "power_mode_end": "normal",
         "thermal_throttling_count": 0,
         "oom_count": 0,
         "admission_error_count": 0,
         "active_probe_retry_error_count": 0,
     }
-    validate_metal_resource_contract(stable_summary, "stable-swap fixture")
-    expect_reject(
-        lambda: validate_metal_resource_contract(
-            {
-                "physical_headroom_bytes": 2 * 1024**3 - 1,
-                "swap_start_bytes": 10,
-                "swap_end_bytes": 10,
-                "thermal_throttling_count": 0,
-            },
-            "below-floor headroom fixture",
-        ),
-        "Metal physical headroom below 2 GiB",
-    )
-    expect_reject(
-        lambda: validate_metal_resource_contract(
-            {
-                "physical_headroom_bytes": 2 * 1024**3,
-                "swap_start_bytes": 10,
-                "swap_end_bytes": 10,
-                "thermal_throttling_count": 1,
-            },
-            "thermal-throttling fixture",
-        ),
-        "Metal thermal throttling",
-    )
     with tempfile.TemporaryDirectory(prefix="ferrum-metal-swap-selftest-") as swap_temp:
         swap_root = Path(swap_temp)
 
@@ -5231,8 +5987,17 @@ def self_test() -> None:
             values: list[int],
             *,
             summary_overrides: dict[str, Any] | None = None,
+            power_modes: list[str] | None = None,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
             path = swap_root / f"{name}.jsonl"
+            summary = {
+                **stable_summary,
+                "swap_start_bytes": values[0],
+                "swap_end_bytes": values[-1],
+                **(summary_overrides or {}),
+            }
+            modes = power_modes or ["normal"] * len(values)
+            require(len(modes) == len(values), f"{name} power-mode fixture differs")
             rows: list[dict[str, Any]] = [
                 {
                     "record_type": "header",
@@ -5247,6 +6012,11 @@ def self_test() -> None:
                         + timedelta(seconds=index)
                     ).isoformat(),
                     "swap_used_bytes": value,
+                    "physical_headroom_bytes": summary[
+                        "physical_headroom_bytes"
+                    ],
+                    "thermal_state": "nominal",
+                    "power_mode": modes[index],
                 }
                 for index, value in enumerate(values)
             )
@@ -5255,12 +6025,6 @@ def self_test() -> None:
                 "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
                 encoding="utf-8",
             )
-            summary = {
-                **stable_summary,
-                "swap_start_bytes": values[0],
-                "swap_end_bytes": values[-1],
-                **(summary_overrides or {}),
-            }
             evidence = derive_metal_swap_scope_evidence(
                 path,
                 sha256(path),
@@ -5269,105 +6033,155 @@ def self_test() -> None:
             )
             return summary, {"scope": name, **evidence}
 
-        _, exact_swap = swap_fixture("exact-zero", [100] * 42)
+        exact_summary, exact_swap = swap_fixture("exact-zero", [100] * 42)
         require(
             exact_swap["classification"] == "exact_zero"
             and exact_swap["raw_step_count"] == 0
             and exact_swap["raw_net_growth_bytes"] == 0,
             "exact-zero Metal swap evidence differs",
         )
-        noise_summary, noise_swap = swap_fixture(
-            "bounded-noise",
-            [100] * 10 + [100 + 768 * 1024] * 32,
+        validate_metal_resource_contract(
+            exact_summary,
+            "exact-zero fixture",
+            typed_memory_budget_bytes=typed_metal_budget,
+            resource_evidence=exact_swap,
+        )
+
+        actual_step_sizes = [199_230, 587_202, 398_459, 450_888]
+        actual_values = [1_754_854_850] * 3
+        for step in actual_step_sizes:
+            actual_values.extend([actual_values[-1] + step] * 3)
+        actual_summary, actual_swap = swap_fixture(
+            "actual-four-step-observation", actual_values
         )
         require(
-            noise_swap["classification"] == "host_global_swap_noise_candidate"
-            and noise_swap["raw_step_count"] == 1
-            and noise_swap["raw_max_positive_step_bytes"] == 768 * 1024
-            and noise_swap["raw_net_growth_bytes"] == 768 * 1024,
-            "bounded Metal host-global swap-noise evidence differs",
+            actual_swap["classification"] == "host_global_swap_observed"
+            and actual_swap["raw_positive_step_count"] == 4
+            and actual_swap["raw_max_positive_step_bytes"] == 587_202
+            and actual_swap["raw_total_positive_growth_bytes"] == 1_635_779
+            and len(actual_swap["positive_steps"]) == 4,
+            "actual four-step Metal host-global observation differs",
         )
         validate_metal_resource_contract(
-            noise_summary, "bounded-noise fixture", noise_swap
+            actual_summary,
+            "actual-four-step fixture",
+            typed_memory_budget_bytes=typed_metal_budget,
+            resource_evidence=actual_swap,
         )
-        lane_noise = aggregate_metal_swap_evidence(
-            [noise_swap, *({**exact_swap, "scope": f"exact-{index}"} for index in range(7))],
-            "bounded-noise lane fixture",
-        )
-        require(
-            lane_noise["classification"] == "host_global_swap_noise"
-            and lane_noise["scope_count"] == 8
-            and lane_noise["raw_positive_step_count"] == 1
-            and lane_noise["raw_total_positive_growth_bytes"] == 768 * 1024,
-            "lane-global Metal host swap-noise classification differs",
-        )
-        _, sustained_swap = swap_fixture(
-            "sustained-pressure",
-            [100] * 8
-            + [100 + 512 * 1024] * 2
-            + [100 + 768 * 1024] * 32,
+        observed_lane = aggregate_metal_swap_evidence(
+            [
+                actual_swap,
+                *(
+                    {**exact_swap, "scope": f"actual-exact-{index}"}
+                    for index in range(7)
+                ),
+            ],
+            "actual-observation lane fixture",
         )
         require(
-            sustained_swap["classification"] == "swap_pressure",
-            "sustained Metal swap pressure was not classified",
+            observed_lane["classification"] == "host_global_swap_observed"
+            and observed_lane["scope_count"] == 8
+            and observed_lane["raw_positive_step_count"] == 4
+            and observed_lane["raw_total_positive_growth_bytes"] == 1_635_779,
+            "lane-global Metal host swap observation classification differs",
         )
-        expect_reject(
-            lambda: aggregate_metal_swap_evidence(
-                [
-                    sustained_swap,
-                    *(
-                        {**exact_swap, "scope": f"sustained-exact-{index}"}
-                        for index in range(7)
-                    ),
-                ],
-                "sustained-pressure lane fixture",
-            ),
-            "sustained Metal swap pressure",
-        )
-        _, m2_pressure = swap_fixture(
-            "m2-646mib-pressure",
+
+        low_headroom = int(1.607 * 1024**3)
+        m2_summary, m2_swap = swap_fixture(
+            "m2-646mib-observation",
             [100] * 10 + [100 + 646 * 1024**2] * 32,
+            summary_overrides={"physical_headroom_bytes": low_headroom},
         )
         require(
-            m2_pressure["classification"] == "swap_pressure",
-            "646 MiB Metal swap growth must remain rejected",
+            m2_swap["classification"] == "host_global_swap_observed"
+            and m2_swap["raw_total_positive_growth_bytes"] == 646 * 1024**2,
+            "646 MiB Metal host-global observation was not preserved",
+        )
+        aggregate_metal_swap_evidence(
+            [
+                m2_swap,
+                *(
+                    {**exact_swap, "scope": f"m2-exact-{index}"}
+                    for index in range(7)
+                ),
+            ],
+            "m2-observation lane fixture",
         )
         expect_reject(
-            lambda: aggregate_metal_swap_evidence(
-                [
-                    noise_swap,
-                    {**noise_swap, "scope": "second-noise-step"},
-                    *(
-                        {**exact_swap, "scope": f"double-exact-{index}"}
-                        for index in range(6)
-                    ),
-                ],
-                "two-noise-step lane fixture",
+            lambda: validate_metal_resource_contract(
+                m2_summary,
+                "m2-low-headroom fixture",
+                typed_memory_budget_bytes=typed_metal_budget,
+                resource_evidence=m2_swap,
             ),
-            "second Metal host-global swap step",
+            "646 MiB observation with 1.607 GiB physical headroom",
         )
-        _, unstable_noise = swap_fixture(
-            "unstable-noise",
-            [100] * 41 + [100 + 512 * 1024],
+
+        _, low_power_swap = swap_fixture(
+            "low-power-observation",
+            [100] * 5,
+            power_modes=["normal", "normal", "low-power", "normal", "normal"],
         )
         require(
-            unstable_noise["classification"]
-            == "host_global_swap_noise_candidate",
-            "single terminal swap step should remain a candidate until lane aggregation",
+            low_power_swap["low_power_sample_count"] == 1,
+            "low-power raw evidence count differs",
         )
-        expect_reject(
-            lambda: aggregate_metal_swap_evidence(
-                [
-                    unstable_noise,
-                    *(
-                        {**exact_swap, "scope": f"unstable-exact-{index}"}
-                        for index in range(7)
-                    ),
-                ],
-                "unstable-noise lane fixture",
+        hard_gate_rejects = (
+            (
+                {**exact_summary, "memory_budget_bytes": typed_metal_budget + 1},
+                exact_swap,
+                "typed budget mismatch",
             ),
-            "Metal host-global swap step without stable follow-up",
+            (
+                {**exact_summary, "peak_memory_bytes": typed_metal_budget + 1},
+                exact_swap,
+                "peak RSS above typed budget",
+            ),
+            (
+                {**exact_summary, "physical_headroom_bytes": 2 * 1024**3 - 1},
+                {
+                    **exact_swap,
+                    "physical_headroom_bytes": 2 * 1024**3 - 1,
+                },
+                "physical headroom below 2 GiB",
+            ),
+            (
+                {
+                    **exact_summary,
+                    "thermal_start": "throttled",
+                    "thermal_end": "throttled",
+                    "thermal_throttling_count": 1,
+                },
+                {**exact_swap, "thermal_throttling_count": 1},
+                "thermal throttling",
+            ),
+            (exact_summary, low_power_swap, "low-power mode"),
+            (
+                {**exact_summary, "oom_count": 1},
+                {**exact_swap, "oom_count": 1},
+                "OOM event",
+            ),
+            (
+                {**exact_summary, "admission_error_count": 1},
+                {**exact_swap, "admission_error_count": 1},
+                "admission error",
+            ),
+            (
+                {**exact_summary, "active_probe_retry_error_count": 1},
+                {**exact_swap, "active_probe_retry_error_count": 1},
+                "resource probe error",
+            ),
         )
+        for rejected_summary, rejected_evidence, rejected_label in hard_gate_rejects:
+            expect_reject(
+                lambda rejected_summary=rejected_summary, rejected_evidence=rejected_evidence: validate_metal_resource_contract(
+                    rejected_summary,
+                    f"{rejected_label} fixture",
+                    typed_memory_budget_bytes=typed_metal_budget,
+                    resource_evidence=rejected_evidence,
+                ),
+                f"Metal hard resource gate: {rejected_label}",
+            )
     source = {
         "git_sha": "a" * 40,
         "git_tree_sha": "b" * 40,
