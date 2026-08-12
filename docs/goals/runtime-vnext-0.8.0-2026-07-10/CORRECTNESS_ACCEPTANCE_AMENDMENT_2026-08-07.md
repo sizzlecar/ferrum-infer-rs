@@ -118,3 +118,29 @@ G08A numerics，不参与 S2 或 R1 模型矩阵执行。R0 可跨该文件的�
 child 仍严格同 SHA 的 S2 聚合证据，但不得因此复用旧 numerics；R1 模型矩阵可跨该 exact 文件及
 R0/R1 aggregator 的因果隔离变化。该例外不扩展为目录或相邻文件白名单，Llama 三用例仍必须在
 最终 source SHA 上重跑。
+
+### 2026-08-12 一次性 G02 roster bridge
+
+从 clean source `05a5d2f8611ed3a3fedb5c69ff3ba11e533bc4c7` 到其紧接的 G02 roster
+修复 checkpoint，只允许以下五个文件出现在 source diff 中：
+
+- `scripts/release/runtime_vnext_g02_core.py`
+- `scripts/release/runtime_vnext_s2_cuda_product_contract.py`
+- `scripts/release/runtime_vnext_r0_core_closure.py`
+- `scripts/release/runtime_vnext_r1_product_correctness.py`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md`
+
+其中 G02 文件必须是 Git blob
+`38b832c95ecee833240a1477678fb5ce350f52fb` 到
+`fa369a3ee52535ead59aefb4b3f675844feb09b8` 的精确转换：只补登记已经由
+`c1faf845f821d60c8aab01542eaa58f6bf9d5900` 加入的
+`legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable` 测试，并增加该 12-test
+精确 roster 的 self-test。其余三个 Python 文件只可实现和验证这次两域 source closure；本段文档
+只记录该闭包。任一额外路径、不同 G02 blob、`crates/`、Cargo、model lock、runtime config、
+产品场景 manifest、matrix runner 或生产实现变化都必须使 bridge fail closed，不得按文件名前缀或
+相邻目录扩展白名单。
+
+该 bridge 允许重新执行当前 source 的 G02 L0/L1，并让新的 S2、R0、R1 aggregate 对仍绑定
+`05a5d2f8` 的未变产品 raw evidence 和已完成 matrix evidence 做深度重验；它不把旧 G02 failure
+提升为 PASS，也不免除 G02、S2 和 R0 在当前 source 重新打印正式 PASS。Llama CUDA/Metal
+`run`、`serve`、stream 三用例仍必须严格在最终 current source SHA 上重新执行，不能消费该 bridge。
