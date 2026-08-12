@@ -104,6 +104,21 @@ const fn reusable_catalog_lookup_allowed(
         && !direct_reusable_execution_already_attempted
 }
 
+const fn reusable_program_identity_required(
+    has_startup_plan: bool,
+    catalog_installed: bool,
+    direct_reusable_execution_allowed: bool,
+    direct_reusable_execution_already_attempted: bool,
+) -> bool {
+    has_startup_plan
+        && (!catalog_installed
+            || reusable_catalog_lookup_allowed(
+                true,
+                direct_reusable_execution_allowed,
+                direct_reusable_execution_already_attempted,
+            ))
+}
+
 const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {
     match policy {
         SequenceFitPolicy::FullInputMustFit => AdmissionFitPolicy::FullInputMustFit,
@@ -7090,8 +7105,10 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             let device_timing_mode = self.device_timing_mode();
             let execution_policy = submission_execution_policy_for_timing(device_timing_mode);
             let mut reusable_catalog_miss = None;
-            let reusable_program = if !reusable_catalog_lookup_allowed(
+            let catalog = self.reusable_execution_catalog.get();
+            let reusable_program = if !reusable_program_identity_required(
                 self.reusable_execution_startup_plan.is_some(),
+                catalog.is_some(),
                 device_timing_mode.direct_reusable_execution_allowed(),
                 reusable_direct_attempted,
             ) {
@@ -7108,7 +7125,6 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                         return DispatchOutcome::QuiescentFailure(error.to_string());
                     }
                 };
-                let catalog = self.reusable_execution_catalog.get();
                 match program_id {
                     Some(program_id) => {
                         if catalog.is_none() {
@@ -10078,18 +10094,19 @@ mod tests {
         resolve_reusable_execution_policy, resolve_runtime_attention_authority,
         resolved_sequence_fit_policy, reusable_catalog_lookup_allowed,
         reusable_executable_inventory_matches, reusable_execution_program_catalog_is_usable,
-        reusable_execution_requires_eager_fallback, reusable_startup_case_budget_violation,
-        submission_execution_policy_for_timing, validate_sequence_completion_accounting,
-        AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
-        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
-        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextProductTokenMaskContent,
-        VNextProductTokenMaskResidency, VNextProductTokenMaskResidencyTransaction,
-        VNextProductTokenMaskSlotIdentity, VNextProductTokenMaskSlotTarget,
-        VNextReusableExecutionCatalogMissKey, VNextReusableExecutionCatalogMissLedger,
-        VNextReusableExecutionCatalogMissReason, VNextReusableExecutionDescriptor,
-        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
-        VNextTeacherForcedDecision, VNextWaveTimingMetrics, VNextWaveTimingSink,
-        MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES, MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
+        reusable_execution_requires_eager_fallback, reusable_program_identity_required,
+        reusable_startup_case_budget_violation, submission_execution_policy_for_timing,
+        validate_sequence_completion_accounting, AdmissionFitPolicy, DecodeFailureDisposition,
+        FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
+        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
+        VNextProductTokenMaskContent, VNextProductTokenMaskResidency,
+        VNextProductTokenMaskResidencyTransaction, VNextProductTokenMaskSlotIdentity,
+        VNextProductTokenMaskSlotTarget, VNextReusableExecutionCatalogMissKey,
+        VNextReusableExecutionCatalogMissLedger, VNextReusableExecutionCatalogMissReason,
+        VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
+        VNextReusableExecutionStartupPlan, VNextTeacherForcedDecision, VNextWaveTimingMetrics,
+        VNextWaveTimingSink, MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES,
+        MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
     };
     use ferrum_interfaces::model_executor::{
         ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
@@ -10219,6 +10236,31 @@ mod tests {
         assert!(!reusable_catalog_lookup_allowed(false, true, false));
         assert!(!reusable_catalog_lookup_allowed(true, false, false));
         assert!(!reusable_catalog_lookup_allowed(true, true, true));
+    }
+
+    #[test]
+    fn reusable_program_identity_is_recorded_before_catalog_installation() {
+        for timing_mode in [DeviceTimingMode::Kernel, DeviceTimingMode::Verification] {
+            assert!(reusable_program_identity_required(
+                true,
+                false,
+                timing_mode.direct_reusable_execution_allowed(),
+                false,
+            ));
+            assert!(!reusable_program_identity_required(
+                true,
+                true,
+                timing_mode.direct_reusable_execution_allowed(),
+                false,
+            ));
+        }
+        assert!(reusable_program_identity_required(true, false, false, true));
+        assert!(!reusable_program_identity_required(
+            false, false, true, false
+        ));
+
+        assert!(reusable_program_identity_required(true, true, true, false));
+        assert!(!reusable_program_identity_required(true, true, true, true));
     }
 
     #[test]
