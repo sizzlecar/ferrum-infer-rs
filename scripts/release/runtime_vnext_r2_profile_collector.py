@@ -43,6 +43,11 @@ MAX_PROFILE_OVERHEAD = 0.07
 HARDENING_PROFILE_OVERHEAD = 0.02
 MIN_CUDA_STAGE_COVERAGE = 0.90
 MIN_CUDA_DEVICE_ATTRIBUTION_COVERAGE = 0.80
+MAX_CLOCK_CONVERSION_ERROR_FRACTION = 0.005
+
+VNEXT_CLOCK_SOURCE_ATTRIBUTE = "vnext_monotonic_clock_source"
+VNEXT_WALL_ANCHOR_ATTRIBUTE = "vnext_monotonic_wall_anchor_unix_nanos"
+VNEXT_CLOCK_ERROR_ATTRIBUTE = "vnext_clock_conversion_max_error_nanos"
 
 # These limits are fixed independently from model size, request count, GPU
 # capacity, or user concurrency.  They are applied before every child spawn.
@@ -756,6 +761,31 @@ def merge_interval_length(intervals: Iterable[tuple[int, int]]) -> int:
     return sum(end - start for start, end in merged)
 
 
+def unavailable_stage_timing(
+    *,
+    reason: str,
+    decode_wall: int,
+    pair_count: int,
+    missing_fields: Sequence[str] = (),
+    clock_conversion: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "status": "diagnostic_only",
+        "formal_coverage_eligible": False,
+        "unavailable_reason": reason,
+        "missing_fields": list(missing_fields),
+        "decode_wall_ns": decode_wall,
+        "stage_accounted_union_ns": None,
+        "unattributed_ns": None,
+        "coverage": None,
+        "node_interval_pairs": pair_count,
+        "clock_source": "unjoined",
+        "boundary_source": "engine_wall_anchor_plus_token_offsets",
+        "legacy_mixed_clock_coverage_omitted": True,
+        "clock_conversion": clock_conversion,
+    }
+
+
 def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
     terminal = next(
         (event for event in events if event.get("phase") == "actual_run_generation"),
@@ -774,6 +804,8 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
         "full profile lacks typed engine token commits",
     )
     require(type(decode_ready) is int and decode_ready >= 0, "full profile lacks decode-ready timing")
+    decode_wall = commits[-1] - decode_ready
+    require(decode_wall > 0, "decode wall interval is not positive")
     accepted = next(
         (
             event
@@ -784,14 +816,12 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
         None,
     )
     require(isinstance(accepted, dict), "full profile cannot join request acceptance")
-    request_origin = event_attributes(accepted).get("monotonic_nanos_since_run_start")
+    accepted_attributes = event_attributes(accepted)
+    request_origin = accepted_attributes.get("monotonic_nanos_since_run_start")
     require(type(request_origin) is int and request_origin >= 0, "request lacks monotonic origin")
-    decode_start = request_origin + decode_ready
-    decode_end = request_origin + commits[-1]
-    require(decode_end > decode_start, "decode wall interval is not positive")
 
     starts: dict[tuple[Any, Any, Any, Any], tuple[int, str]] = {}
-    intervals: list[tuple[int, int]] = []
+    monotonic_intervals: list[tuple[int, int]] = []
     pair_count = 0
     for event in events:
         if event.get("phase") not in {"vnext.node_started", "vnext.node_retired"}:
@@ -840,20 +870,114 @@ def calculate_stage_coverage(events: Sequence[dict[str, Any]]) -> dict[str, Any]
         )
         require(timestamp >= start, f"node interval is reversed: {key}")
         pair_count += 1
-        intervals.append((max(start, decode_start), min(timestamp, decode_end)))
+        monotonic_intervals.append((start, timestamp))
     require(not starts, "full profile has unterminated node spans")
+
+    engine_clock_source = terminal_attributes.get("engine_token_clock_source")
+    engine_wall_anchor = terminal_attributes.get("engine_token_wall_anchor_unix_nanos")
+    engine_max_error = terminal_attributes.get("clock_conversion_max_error_nanos")
+    vnext_clock_source = accepted_attributes.get(VNEXT_CLOCK_SOURCE_ATTRIBUTE)
+    vnext_wall_anchor = accepted_attributes.get(VNEXT_WALL_ANCHOR_ATTRIBUTE)
+    vnext_max_error = accepted_attributes.get(VNEXT_CLOCK_ERROR_ATTRIBUTE)
+    required_clock_fields = (
+        ("actual_run_generation.attributes.engine_token_clock_source", engine_clock_source),
+        (
+            "actual_run_generation.attributes.engine_token_wall_anchor_unix_nanos",
+            engine_wall_anchor,
+        ),
+        (
+            "actual_run_generation.attributes.clock_conversion_max_error_nanos",
+            engine_max_error,
+        ),
+        (
+            f"vnext.request_accepted.attributes.{VNEXT_CLOCK_SOURCE_ATTRIBUTE}",
+            vnext_clock_source,
+        ),
+        (
+            f"vnext.request_accepted.attributes.{VNEXT_WALL_ANCHOR_ATTRIBUTE}",
+            vnext_wall_anchor,
+        ),
+        (
+            f"vnext.request_accepted.attributes.{VNEXT_CLOCK_ERROR_ATTRIBUTE}",
+            vnext_max_error,
+        ),
+    )
+    missing_clock_fields = [name for name, value in required_clock_fields if value is None]
+    if missing_clock_fields:
+        return unavailable_stage_timing(
+            reason="missing_bounded_clock_domain_conversion",
+            decode_wall=decode_wall,
+            pair_count=pair_count,
+            missing_fields=missing_clock_fields,
+            clock_conversion={
+                "engine_clock_source": engine_clock_source,
+                "vnext_clock_source": vnext_clock_source,
+            },
+        )
+
+    require(engine_clock_source == "rust_std_instant", "engine token clock source is unsupported")
+    require(vnext_clock_source == "rust_std_instant", "vNext event clock source is unsupported")
+    require(
+        type(engine_wall_anchor) is int and engine_wall_anchor > 0,
+        "engine token wall anchor is invalid",
+    )
+    require(
+        type(vnext_wall_anchor) is int and vnext_wall_anchor > 0,
+        "vNext monotonic wall anchor is invalid",
+    )
+    require(
+        type(engine_max_error) is int and engine_max_error >= 0,
+        "engine clock conversion error is invalid",
+    )
+    require(
+        type(vnext_max_error) is int and vnext_max_error >= 0,
+        "vNext clock conversion error is invalid",
+    )
+    relative_max_error = engine_max_error + vnext_max_error
+    conversion = {
+        "event_source": "vnext.monotonic_nanos_since_run_start",
+        "common_domain": "unix_nanos",
+        "engine_clock_source": engine_clock_source,
+        "engine_wall_anchor_unix_nanos": engine_wall_anchor,
+        "engine_max_error_nanos": engine_max_error,
+        "vnext_clock_source": vnext_clock_source,
+        "vnext_wall_anchor_unix_nanos": vnext_wall_anchor,
+        "vnext_max_error_nanos": vnext_max_error,
+        "relative_max_error_nanos": relative_max_error,
+        "relative_error_ppm": relative_max_error * 1_000_000 // decode_wall,
+    }
+    if relative_max_error > decode_wall * MAX_CLOCK_CONVERSION_ERROR_FRACTION:
+        return unavailable_stage_timing(
+            reason="clock_conversion_error_exceeds_formal_limit",
+            decode_wall=decode_wall,
+            pair_count=pair_count,
+            clock_conversion=conversion,
+        )
+
+    decode_start = engine_wall_anchor + decode_ready
+    decode_end = engine_wall_anchor + commits[-1]
+    intervals = [
+        (
+            max(vnext_wall_anchor + start, decode_start),
+            min(vnext_wall_anchor + end, decode_end),
+        )
+        for start, end in monotonic_intervals
+    ]
     accounted = merge_interval_length(intervals)
-    decode_wall = decode_end - decode_start
     coverage = accounted / decode_wall
     require(coverage <= 1.0 + 1e-9, "stage coverage exceeds 100%")
     return {
+        "status": "measured",
+        "formal_coverage_eligible": True,
         "decode_wall_ns": decode_wall,
         "stage_accounted_union_ns": accounted,
         "unattributed_ns": decode_wall - accounted,
         "coverage": coverage,
         "node_interval_pairs": pair_count,
-        "clock_source": "monotonic_nanos_since_run_start",
-        "boundary_source": "engine_decode_ready_and_token_commits",
+        "clock_source": "unix_nanos_from_bounded_wall_anchors",
+        "boundary_source": "engine_wall_anchor_plus_token_offsets",
+        "legacy_mixed_clock_coverage_omitted": False,
+        "clock_conversion": conversion,
     }
 
 
@@ -1000,6 +1124,12 @@ def validate_identity_and_device_contract(
         )
 
     stage = calculate_stage_coverage(full_events)
+    require(
+        stage.get("formal_coverage_eligible") is True,
+        "stage_clock_domain_unavailable: "
+        f"{stage.get('unavailable_reason', 'unknown')} "
+        f"missing={stage.get('missing_fields', [])}",
+    )
     if backend == "metal":
         unavailable = 0
         for event in native_rows:
@@ -1372,6 +1502,10 @@ def validate_backend_manifest(path: Path, expected_backend: str | None = None) -
     contract = manifest.get("profile_contract")
     require(isinstance(contract, dict) and contract.get("status") == "pass", f"{path}: profile contract did not pass")
     if backend == "cuda":
+        require(
+            contract.get("stage_timing", {}).get("formal_coverage_eligible") is True,
+            f"{path}: CUDA stage coverage lacks bounded clock conversion",
+        )
         require(
             contract.get("stage_timing", {}).get("coverage", 0) >= MIN_CUDA_STAGE_COVERAGE,
             f"{path}: CUDA stage coverage is below threshold",
@@ -1846,6 +1980,8 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
     plan_id = "plan/sha256/" + "a" * 64
     run_id = "run.fixture"
     request_id = "request.product.fixture"
+    engine_wall_anchor = 1_700_000_000_000_000_000
+    vnext_wall_anchor = engine_wall_anchor + 5_000
 
     def base(phase: str, mode: str, timestamp: int) -> dict[str, Any]:
         return {
@@ -1873,7 +2009,13 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
     def topology(mode: str) -> list[dict[str, Any]]:
         accepted = base("vnext.request_accepted", mode, 0)
         accepted["attributes"].update(
-            {"monotonic_nanos_since_run_start": 0, "run_id": run_id}
+            {
+                "monotonic_nanos_since_run_start": 0,
+                "run_id": run_id,
+                VNEXT_CLOCK_SOURCE_ATTRIBUTE: "rust_std_instant",
+                VNEXT_WALL_ANCHOR_ATTRIBUTE: vnext_wall_anchor,
+                VNEXT_CLOCK_ERROR_ATTRIBUTE: 1,
+            }
         )
         plan = base("vnext.plan_built", mode, 1)
         started = base("vnext.node_started", mode, 100)
@@ -1922,8 +2064,11 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
     terminal["attributes"].update(
         {
             "execution_request_id": request_id,
-            "engine_decode_ready_nanos_since_request_start": 100,
-            "engine_token_commit_nanos_since_request_start": [1_000],
+            "engine_token_clock_source": "rust_std_instant",
+            "engine_token_wall_anchor_unix_nanos": engine_wall_anchor,
+            "clock_conversion_max_error_nanos": 1,
+            "engine_decode_ready_nanos_since_request_start": 5_100,
+            "engine_token_commit_nanos_since_request_start": [6_000],
         }
     )
     native = base("vnext.device_native_work", "full", 1_050)
@@ -1967,6 +2112,11 @@ def run_selftest() -> int:
     )
     require(cuda_result["status"] == "pass", "positive CUDA fixture did not pass")
     baseline_stage = calculate_stage_coverage(cuda[2])
+    require(
+        baseline_stage["formal_coverage_eligible"] is True
+        and baseline_stage["coverage"] == 1.0,
+        "bounded wall-anchor fixture did not produce exact formal coverage",
+    )
     concurrent = json.loads(json.dumps(cuda[2]))
     foreign_request_id = "request.startup.concurrent"
     foreign_started = json.loads(json.dumps(concurrent[2]))
@@ -1992,6 +2142,34 @@ def run_selftest() -> int:
         target_duplicate_rejected = True
     else:
         raise CollectorError("target-request duplicate node start unexpectedly passed")
+    missing_anchor = json.loads(json.dumps(cuda[2]))
+    missing_anchor[0]["attributes"].pop(VNEXT_WALL_ANCHOR_ATTRIBUTE)
+    unavailable_stage = calculate_stage_coverage(missing_anchor)
+    require(
+        unavailable_stage["formal_coverage_eligible"] is False
+        and unavailable_stage["coverage"] is None
+        and unavailable_stage["legacy_mixed_clock_coverage_omitted"] is True,
+        "missing vNext wall anchor produced overstated formal coverage",
+    )
+    try:
+        validate_identity_and_device_contract(
+            backend="cuda",
+            basic_events=cuda[0],
+            replay_events=cuda[1],
+            full_events=missing_anchor,
+        )
+    except CollectorError as error:
+        missing_clock_rejected = str(error).startswith("stage_clock_domain_unavailable:")
+    else:
+        missing_clock_rejected = False
+    excessive_error = json.loads(json.dumps(cuda[2]))
+    excessive_error[0]["attributes"][VNEXT_CLOCK_ERROR_ATTRIBUTE] = 10
+    excessive_error_stage = calculate_stage_coverage(excessive_error)
+    require(
+        excessive_error_stage["formal_coverage_eligible"] is False
+        and excessive_error_stage["coverage"] is None,
+        "excessive clock conversion error produced formal coverage",
+    )
     metal = fixture_profile_events("metal")
     metal_result = validate_identity_and_device_contract(
         backend="metal", basic_events=metal[0], replay_events=metal[1], full_events=metal[2]
@@ -2041,7 +2219,8 @@ def run_selftest() -> int:
     require(
         negative_identity_rejected
         and negative_overhead_rejected
-        and target_duplicate_rejected,
+        and target_duplicate_rejected
+        and missing_clock_rejected,
         "negative fixtures did not reject",
     )
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-r2-profile-selftest-") as temporary:
