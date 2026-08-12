@@ -761,6 +761,9 @@ def validate_raw_execution(
     )
     reusable_spans = 0
     reusable_fingerprints: set[str] = set()
+    verification_sequence_completed: set[str] = set()
+    verification_request_completed: set[str] = set()
+    verification_eager_participants: set[str] = set()
     profile_startup_error_count = 0
     try:
         with profile_path.open("r", encoding="utf-8") as profile_handle:
@@ -775,6 +778,60 @@ def validate_raw_execution(
                 )
                 attributes = event.get("attributes")
                 request_id = event.get("request_id")
+                if (
+                    profile_detail == "verify"
+                    and event.get("entrypoint") == entrypoint
+                    and isinstance(request_id, str)
+                    and request_id.startswith("request.startup.")
+                    and isinstance(attributes, dict)
+                    and attributes.get("profile_detail") == "verify"
+                    and isinstance(attributes.get("backend_device"), str)
+                    and attributes["backend_device"].startswith("CUDA(")
+                ):
+                    phase = event.get("phase")
+                    if phase in {
+                        "vnext.sequence_completed",
+                        "vnext.request_completed",
+                    }:
+                        expected_kind = phase.removeprefix("vnext.")
+                        require(
+                            event.get("status") == "ok"
+                            and attributes.get("execution_event_kind")
+                            == expected_kind
+                            and attributes.get("execution_request_origin")
+                            == "startup"
+                            and attributes.get("execution_request_id") == request_id
+                            and isinstance(
+                                attributes.get("completed_sequence_fingerprint"), str
+                            )
+                            and SHA256_RE.fullmatch(
+                                attributes["completed_sequence_fingerprint"]
+                            )
+                            is not None,
+                            f"{check_id} startup verification terminal event is invalid",
+                        )
+                        if phase == "vnext.sequence_completed":
+                            verification_sequence_completed.add(request_id)
+                        else:
+                            verification_request_completed.add(request_id)
+                    elif phase == "vnext.device_native_work":
+                        participants = attributes.get("participant_request_ids")
+                        require(
+                            event.get("status") == "diagnostic_only"
+                            and attributes.get("execution_path") == "eager"
+                            and attributes.get("device_timing_span_kind")
+                            == "eager_command"
+                            and isinstance(participants, list)
+                            and participants
+                            and all(isinstance(item, str) for item in participants)
+                            and request_id in participants,
+                            f"{check_id} startup verification native work is invalid",
+                        )
+                        verification_eager_participants.update(
+                            item
+                            for item in participants
+                            if item.startswith("request.startup.")
+                        )
                 if not (
                     event.get("phase") == "vnext.device_execution_span"
                     and event.get("entrypoint") == entrypoint
@@ -801,10 +858,18 @@ def validate_raw_execution(
         raise QualificationError(
             f"invalid {check_id} profile JSONL {profile_path}: {error}"
         ) from error
-    require(
-        reusable_spans > 0 and reusable_fingerprints,
-        f"{check_id} did not reach startup reusable executable capture/replay",
-    )
+    if profile_detail == "full":
+        require(
+            reusable_spans > 0 and reusable_fingerprints,
+            f"{check_id} did not reach startup reusable executable capture/replay",
+        )
+    else:
+        require(
+            verification_request_completed
+            and verification_request_completed == verification_sequence_completed
+            and verification_request_completed == verification_eager_participants,
+            f"{check_id} did not complete CUDA startup verification work",
+        )
 
     command = raw.get("command")
     require(
@@ -994,6 +1059,15 @@ def validate_raw_execution(
         "startup_catalog_error_count": startup_error_count,
         "startup_reusable_execution_span_count": reusable_spans,
         "startup_reusable_program_fingerprint_count": len(reusable_fingerprints),
+        "startup_verification_sequence_completed_count": len(
+            verification_sequence_completed
+        ),
+        "startup_verification_request_completed_count": len(
+            verification_request_completed
+        ),
+        "startup_verification_eager_participant_count": len(
+            verification_eager_participants
+        ),
     }
     return {
         "raw_execution": file_ref(path),
@@ -1076,8 +1150,26 @@ def validate_witness(
     require(
         witness.get("target_signal") == derived["target_signal"]
         and derived["target_signal"]["startup_catalog_error_count"] == 0
-        and derived["target_signal"]["startup_reusable_execution_span_count"] > 0
-        and derived["target_signal"]["startup_reusable_program_fingerprint_count"] > 0,
+        and (
+            (
+                profile_detail == "full"
+                and derived["target_signal"][
+                    "startup_reusable_execution_span_count"
+                ]
+                > 0
+                and derived["target_signal"][
+                    "startup_reusable_program_fingerprint_count"
+                ]
+                > 0
+            )
+            or (
+                profile_detail == "verify"
+                and derived["target_signal"][
+                    "startup_verification_request_completed_count"
+                ]
+                > 0
+            )
+        ),
         f"{check_id} startup target signal differs from raw evidence",
     )
     require(
@@ -1687,9 +1779,8 @@ def self_test() -> int:
             is_run = entrypoint == "run"
             profile_detail = "full" if is_run else "verify"
             profile_path = case_root / "profile.jsonl"
-            profile_path.write_text(
-                json.dumps(
-                    {
+            profile_events = [
+                {
                     "schema_version": 1,
                     "request_id": "request.startup.self-test",
                     "entrypoint": entrypoint,
@@ -1701,10 +1792,62 @@ def self_test() -> int:
                         "profile_detail": profile_detail,
                         "reusable_executable_fingerprint": "2" * 64,
                     },
+                }
+            ]
+            if not is_run:
+                profile_events = [
+                    {
+                        "schema_version": 1,
+                        "request_id": "request.startup.self-test",
+                        "entrypoint": "serve",
+                        "phase": "vnext.device_native_work",
+                        "status": "diagnostic_only",
+                        "attributes": {
+                            "backend_device": "CUDA(0)",
+                            "device_timing_span_kind": "eager_command",
+                            "execution_path": "eager",
+                            "participant_request_ids": [
+                                "request.startup.self-test"
+                            ],
+                            "profile_detail": "verify",
+                        },
                     },
-                    sort_keys=True,
-                )
-                + "\n",
+                    {
+                        "schema_version": 1,
+                        "request_id": "request.startup.self-test",
+                        "entrypoint": "serve",
+                        "phase": "vnext.sequence_completed",
+                        "status": "ok",
+                        "attributes": {
+                            "backend_device": "CUDA(0)",
+                            "completed_sequence_fingerprint": "3" * 64,
+                            "execution_event_kind": "sequence_completed",
+                            "execution_request_id": "request.startup.self-test",
+                            "execution_request_origin": "startup",
+                            "profile_detail": "verify",
+                        },
+                    },
+                    {
+                        "schema_version": 1,
+                        "request_id": "request.startup.self-test",
+                        "entrypoint": "serve",
+                        "phase": "vnext.request_completed",
+                        "status": "ok",
+                        "attributes": {
+                            "backend_device": "CUDA(0)",
+                            "completed_sequence_fingerprint": "3" * 64,
+                            "execution_event_kind": "request_completed",
+                            "execution_request_id": "request.startup.self-test",
+                            "execution_request_origin": "startup",
+                            "profile_detail": "verify",
+                        },
+                    },
+                ]
+            profile_path.write_text(
+                "".join(
+                    json.dumps(event, sort_keys=True) + "\n"
+                    for event in profile_events
+                ),
                 encoding="utf-8",
             )
             raw: dict[str, Any] = {
@@ -1798,8 +1941,19 @@ def self_test() -> int:
                 "product": product,
                 "target_signal": {
                     "startup_catalog_error_count": 0,
-                    "startup_reusable_execution_span_count": 1,
-                    "startup_reusable_program_fingerprint_count": 1,
+                    "startup_reusable_execution_span_count": 1 if is_run else 0,
+                    "startup_reusable_program_fingerprint_count": (
+                        1 if is_run else 0
+                    ),
+                    "startup_verification_sequence_completed_count": (
+                        0 if is_run else 1
+                    ),
+                    "startup_verification_request_completed_count": (
+                        0 if is_run else 1
+                    ),
+                    "startup_verification_eager_participant_count": (
+                        0 if is_run else 1
+                    ),
                 },
                 "harness": harness_summary,
                 "evidence": {"raw_execution": file_ref(raw_path)},
@@ -1834,6 +1988,9 @@ def self_test() -> int:
                 "startup_catalog_error_count": 0,
                 "startup_reusable_execution_span_count": 1,
                 "startup_reusable_program_fingerprint_count": 1,
+                "startup_verification_sequence_completed_count": 0,
+                "startup_verification_request_completed_count": 0,
+                "startup_verification_eager_participant_count": 0,
             },
             "self-test did not derive run raw evidence",
         )
@@ -1918,6 +2075,63 @@ def self_test() -> int:
                 "failure_class": "non_target_configuration",
             },
             "self-test did not derive serve raw evidence",
+        )
+
+        def drop_verify_sequence(raw: dict[str, Any], _: Path) -> None:
+            profile_path = validate_ref(raw["profile_jsonl"], "self-test profile")
+            events = [
+                json.loads(line)
+                for line in profile_path.read_text(encoding="utf-8").splitlines()
+            ]
+            profile_path.write_text(
+                "".join(
+                    json.dumps(event, sort_keys=True) + "\n"
+                    for event in events
+                    if event.get("phase") != "vnext.sequence_completed"
+                ),
+                encoding="utf-8",
+            )
+            raw["profile_jsonl"] = file_ref(profile_path)
+
+        expect_reject(
+            lambda: validate_case(
+                make_witness_case(
+                    "serve-missing-sequence",
+                    "serve",
+                    raw_mutator=drop_verify_sequence,
+                ),
+                "serve",
+            ),
+            "verify evidence missing sequence completion",
+        )
+
+        def make_verify_work_replayed(raw: dict[str, Any], _: Path) -> None:
+            profile_path = validate_ref(raw["profile_jsonl"], "self-test profile")
+            events = [
+                json.loads(line)
+                for line in profile_path.read_text(encoding="utf-8").splitlines()
+            ]
+            for event in events:
+                if event.get("phase") == "vnext.device_native_work":
+                    event["attributes"]["execution_path"] = "replayed"
+            profile_path.write_text(
+                "".join(
+                    json.dumps(event, sort_keys=True) + "\n" for event in events
+                ),
+                encoding="utf-8",
+            )
+            raw["profile_jsonl"] = file_ref(profile_path)
+
+        expect_reject(
+            lambda: validate_case(
+                make_witness_case(
+                    "serve-replayed-native-work",
+                    "serve",
+                    raw_mutator=make_verify_work_replayed,
+                ),
+                "serve",
+            ),
+            "verify evidence used replayed native work",
         )
 
         def forge_completion_summary(witness: dict[str, Any]) -> None:
