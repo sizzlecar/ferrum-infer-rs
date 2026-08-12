@@ -511,6 +511,86 @@ def default_r1_verifier(path: Path) -> dict[str, Any]:
         raise R2Error(f"R1 child provenance failed: {error}") from error
 
 
+def validate_cumulative_profile_off_evidence(
+    child_path: Path,
+    child_manifest: dict[str, Any],
+    summary: dict[str, Any],
+    r1_module: Any,
+) -> dict[str, Any] | None:
+    dependencies = child_manifest.get("dependencies")
+    require(isinstance(dependencies, dict), "R1 child dependencies are missing")
+    dependency_keys = set(dependencies)
+    require(
+        dependency_keys == r1_module.FULL_DEPENDENCY_KEYS
+        or dependency_keys == r1_module.CUMULATIVE_DEPENDENCY_KEYS,
+        "R1 child dependency shape differs",
+    )
+    acceptance = summary["acceptance"]
+    if dependency_keys == r1_module.FULL_DEPENDENCY_KEYS:
+        require(
+            "evidence_backend_binary_sha256" not in acceptance,
+            "full R1 cannot expose cumulative performance evidence",
+        )
+        return None
+
+    # The cumulative exception is available only after the canonical R1 verifier
+    # has recursively revalidated the qualification and its prior full R1.
+    try:
+        deep_summary = r1_module.verify_manifest(
+            child_path,
+            verify_checkout=False,
+            expected_source=summary["source"],
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise R2Error(f"cumulative R1 deep provenance failed: {error}") from error
+    require(deep_summary == summary, "cumulative R1 deep summary differs")
+
+    prior_path = validate_ref(dependencies.get("prior_r1"), "prior full R1")
+    prior_manifest = read_json(prior_path, "prior full R1")
+    try:
+        r1_module.require_full_prior_manifest_shape(prior_manifest)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+        raise R2Error(f"prior R1 is not a deeply verified full aggregate: {error}") from error
+    prior_source = normalize_source(prior_manifest.get("source"), "prior full R1")
+    prior_acceptance = prior_manifest.get("acceptance")
+    require(isinstance(prior_acceptance, dict), "prior full R1 acceptance is missing")
+    prior_binaries = prior_acceptance.get("backend_binary_sha256")
+    evidence_binaries = acceptance.get("evidence_backend_binary_sha256")
+    prior_hardware = prior_acceptance.get("backend_hardware_id")
+    require(
+        isinstance(prior_binaries, dict)
+        and set(prior_binaries) == set(BACKENDS)
+        and all(SHA256_RE.fullmatch(str(value)) for value in prior_binaries.values())
+        and evidence_binaries == prior_binaries,
+        "cumulative R1 evidence binary authority differs from prior full R1",
+    )
+    require(
+        isinstance(prior_hardware, dict)
+        and set(prior_hardware) == set(BACKENDS)
+        and acceptance.get("backend_hardware_id") == prior_hardware,
+        "cumulative R1 hardware authority differs from prior full R1",
+    )
+    qualification_path = validate_ref(
+        dependencies.get("impact_qualification"),
+        "cumulative R1 impact qualification",
+    )
+    prior_ref = file_ref(prior_path)
+    qualification_ref = file_ref(qualification_path)
+    require(
+        prior_ref == dependencies["prior_r1"]
+        and qualification_ref == dependencies["impact_qualification"],
+        "cumulative R1 dependency reference drifted",
+    )
+    return {
+        "mode": "cumulative-r1-prior-full-profile-off",
+        "source": prior_source,
+        "r1_child_manifest": prior_ref,
+        "impact_qualification": qualification_ref,
+        "backend_binary_sha256": copy.deepcopy(evidence_binaries),
+        "backend_hardware_id": copy.deepcopy(prior_hardware),
+    }
+
+
 def validate_r1_outer(
     path: Path,
     source: dict[str, Any],
@@ -568,6 +648,7 @@ def validate_r1_outer(
         and isinstance(summary.get("acceptance"), dict),
         "R1 verifier returned an invalid summary",
     )
+    child_manifest = read_json(child_path, "R1 child")
     recorded_source = normalize_source(summary.get("source"), "R1")
     require(
         outer.get("git_sha") == recorded_source["git_sha"],
@@ -599,7 +680,13 @@ def validate_r1_outer(
         and all(isinstance(value, str) and value for value in hardware.values()),
         "R1 backend hardware authority is invalid",
     )
-    return {
+    cumulative_profile_off_evidence = validate_cumulative_profile_off_evidence(
+        child_path,
+        child_manifest,
+        summary,
+        r1,
+    )
+    result = {
         "outer_manifest": file_ref(outer_path),
         "child_manifest": file_ref(child_path),
         "source": recorded_source,
@@ -608,6 +695,11 @@ def validate_r1_outer(
         "backend_hardware_id": copy.deepcopy(hardware),
         "acceptance": copy.deepcopy(acceptance),
     }
+    if cumulative_profile_off_evidence is not None:
+        result["cumulative_profile_off_evidence"] = (
+            cumulative_profile_off_evidence
+        )
+    return result
 
 
 def catalog_key(
@@ -2683,6 +2775,7 @@ def load_ferrum_collector_lane(
         "manifest_sha256": sha256(manifest_path),
         "artifact_root": root,
         "source": source,
+        "profile_detail": "off",
         "created_at": session["formal_measurement_finished_at"],
         "binary_sha256": binary,
         "hardware_id": hardware["id"],
@@ -2708,6 +2801,64 @@ def load_ferrum_collector_lane(
     }
 
 
+def performance_lane_r1_source_closure(
+    lane: dict[str, Any],
+    source: dict[str, Any],
+    r1: dict[str, Any],
+    expected_backend: str,
+) -> dict[str, Any]:
+    require(
+        lane.get("profile_detail") == "off",
+        "cumulative R1 evidence is restricted to profile-off performance lanes",
+    )
+    if (
+        lane.get("binary_sha256")
+        == r1["backend_binary_sha256"][expected_backend]
+        and lane.get("correctness_manifest_sha256")
+        == r1["child_manifest"]["sha256"]
+    ):
+        return source_closure(lane["source"], source)
+
+    evidence = r1.get("cumulative_profile_off_evidence")
+    require(
+        isinstance(evidence, dict)
+        and set(evidence)
+        == {
+            "mode",
+            "source",
+            "r1_child_manifest",
+            "impact_qualification",
+            "backend_binary_sha256",
+            "backend_hardware_id",
+        }
+        and evidence.get("mode") == "cumulative-r1-prior-full-profile-off",
+        "Ferrum collector binary/correctness authority differs from R1",
+    )
+    prior_source = normalize_source(
+        evidence.get("source"), "cumulative prior full R1"
+    )
+    evidence_binaries = evidence.get("backend_binary_sha256")
+    prior_child = evidence.get("r1_child_manifest")
+    require(
+        lane.get("source") == prior_source
+        and isinstance(evidence_binaries, dict)
+        and set(evidence_binaries) == set(BACKENDS)
+        and lane.get("binary_sha256") == evidence_binaries.get(expected_backend)
+        and isinstance(prior_child, dict)
+        and lane.get("correctness_manifest_sha256") == prior_child.get("sha256"),
+        "Ferrum collector is not bound to cumulative R1 prior profile-off evidence",
+    )
+    return {
+        "from_git_sha": prior_source["git_sha"],
+        "to_git_sha": source["git_sha"],
+        "policy": "cumulative-r1-prior-full-profile-off",
+        "prior_r1_child_manifest": copy.deepcopy(prior_child),
+        "impact_qualification": copy.deepcopy(evidence["impact_qualification"]),
+        "current_r1_child_manifest": copy.deepcopy(r1["child_manifest"]),
+        "current_r1_source_closure": copy.deepcopy(r1["source_closure"]),
+    }
+
+
 def validate_ferrum_performance_lane(
     path: Path,
     *,
@@ -2723,12 +2874,11 @@ def validate_ferrum_performance_lane(
         expected_backend=expected_backend,
         expected_source=None,
     )
-    closure = source_closure(lane["source"], source)
-    require(
-        lane["binary_sha256"] == r1["backend_binary_sha256"][expected_backend]
-        and lane["correctness_manifest_sha256"]
-        == r1["child_manifest"]["sha256"],
-        "Ferrum collector binary/correctness authority differs from R1",
+    closure = performance_lane_r1_source_closure(
+        lane,
+        source,
+        r1,
+        expected_backend,
     )
     throughput_ratios: list[float] = []
     calibration = False
@@ -4482,6 +4632,113 @@ def self_test() -> None:
     binaries = {"cuda": "1" * 64, "metal": "2" * 64}
     hardware = {"cuda": "selftest-rtx4090", "metal": "selftest-mac"}
     timestamp = "2026-08-09T00:00:00+00:00"
+    current_child_ref = {
+        "path": "/fixture/current-r1.json",
+        "sha256": "3" * 64,
+        "size_bytes": 1,
+    }
+    current_r1_fixture = {
+        "source": source,
+        "source_closure": source_closure(source, source),
+        "child_manifest": current_child_ref,
+        "backend_binary_sha256": binaries,
+        "backend_hardware_id": hardware,
+    }
+    exact_lane_fixture = {
+        "profile_detail": "off",
+        "source": source,
+        "binary_sha256": binaries["cuda"],
+        "correctness_manifest_sha256": current_child_ref["sha256"],
+    }
+    require(
+        performance_lane_r1_source_closure(
+            exact_lane_fixture, source, current_r1_fixture, "cuda"
+        )["policy"]
+        == "exact-source",
+        "current R1 performance authority closure differs",
+    )
+    prior_source = {
+        "git_sha": "c" * 40,
+        "git_tree_sha": "d" * 40,
+        "dirty": False,
+    }
+    prior_child_ref = {
+        "path": "/fixture/prior-full-r1.json",
+        "sha256": "4" * 64,
+        "size_bytes": 1,
+    }
+    qualification_ref = {
+        "path": "/fixture/impact-qualification.json",
+        "sha256": "5" * 64,
+        "size_bytes": 1,
+    }
+    evidence_binaries = {"cuda": "6" * 64, "metal": "7" * 64}
+    cumulative_r1_fixture = copy.deepcopy(current_r1_fixture)
+    cumulative_r1_fixture["cumulative_profile_off_evidence"] = {
+        "mode": "cumulative-r1-prior-full-profile-off",
+        "source": prior_source,
+        "r1_child_manifest": prior_child_ref,
+        "impact_qualification": qualification_ref,
+        "backend_binary_sha256": evidence_binaries,
+        "backend_hardware_id": hardware,
+    }
+    cumulative_lane_fixture = {
+        "profile_detail": "off",
+        "source": prior_source,
+        "binary_sha256": evidence_binaries["cuda"],
+        "correctness_manifest_sha256": prior_child_ref["sha256"],
+    }
+    cumulative_closure = performance_lane_r1_source_closure(
+        cumulative_lane_fixture,
+        source,
+        cumulative_r1_fixture,
+        "cuda",
+    )
+    require(
+        cumulative_closure["policy"]
+        == "cumulative-r1-prior-full-profile-off"
+        and cumulative_closure["prior_r1_child_manifest"] == prior_child_ref
+        and cumulative_closure["impact_qualification"] == qualification_ref,
+        "cumulative R1 profile-off performance closure differs",
+    )
+    for marker, mutation in (
+        ("profile mode", {"profile_detail": "basic"}),
+        ("evidence binary", {"binary_sha256": "8" * 64}),
+        (
+            "prior correctness child",
+            {"correctness_manifest_sha256": current_child_ref["sha256"]},
+        ),
+        (
+            "prior source",
+            {
+                "source": {
+                    "git_sha": "e" * 40,
+                    "git_tree_sha": "f" * 40,
+                    "dirty": False,
+                }
+            },
+        ),
+    ):
+        invalid_lane = copy.deepcopy(cumulative_lane_fixture)
+        invalid_lane.update(mutation)
+        expect_reject(
+            lambda invalid_lane=invalid_lane: performance_lane_r1_source_closure(
+                invalid_lane,
+                source,
+                cumulative_r1_fixture,
+                "cuda",
+            ),
+            f"cumulative profile-off {marker}",
+        )
+    expect_reject(
+        lambda: performance_lane_r1_source_closure(
+            cumulative_lane_fixture,
+            source,
+            current_r1_fixture,
+            "cuda",
+        ),
+        "profile-off evidence without cumulative R1",
+    )
 
     with tempfile.TemporaryDirectory(prefix="ferrum-r2-selftest-") as raw_temp:
         temp = Path(raw_temp).resolve()
@@ -4497,7 +4754,16 @@ def self_test() -> None:
         r1_root = temp / "r1"
         r1_root.mkdir()
         child_path = r1_root / "manifest.json"
-        write_json(child_path, {"fixture": "r1-child"}, exclusive=True)
+        write_json(
+            child_path,
+            {
+                "dependencies": {
+                    key: {}
+                    for key in ("r0", "matrices", "llama_dense", "acceptance")
+                }
+            },
+            exclusive=True,
+        )
         r1_acceptance = {
             "backend_binary_sha256": binaries,
             "backend_hardware_id": hardware,
