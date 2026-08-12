@@ -17,14 +17,14 @@ impl EngineInner {
     /// Close the request-local host-loop interval immediately before the
     /// PlanRuntime executor call. Ordinary inference returns before locking
     /// sequence state or reading another clock.
-    fn close_plan_runtime_decode_scheduling(&self, request_ids: &[RequestId]) -> bool {
+    fn close_plan_runtime_decode_scheduling(&self, request_ids: &[RequestId]) -> Option<Instant> {
         if !self
             .config
             .runtime
             .profile_detail
             .captures_engine_token_timing()
         {
-            return false;
+            return None;
         }
         let mut sequences = self.sequences.write();
         let capture_timing = request_ids.iter().any(|request_id| {
@@ -33,7 +33,7 @@ impl EngineInner {
                 .is_some_and(SequenceState::captures_engine_token_timing)
         });
         if !capture_timing {
-            return false;
+            return None;
         }
         let submitted_at = Instant::now();
         for request_id in request_ids {
@@ -44,7 +44,22 @@ impl EngineInner {
                 sequence.close_decode_scheduling(submitted_at);
             }
         }
-        true
+        Some(submitted_at)
+    }
+
+    fn record_plan_runtime_decode_execution(
+        &self,
+        request_ids: &[RequestId],
+        started_at: Instant,
+        ended_at: Instant,
+    ) {
+        let mut sequences = self.sequences.write();
+        for request_id in request_ids {
+            let Some(sequence) = sequences.get_mut(request_id) else {
+                continue;
+            };
+            sequence.record_decode_execution(started_at, ended_at);
+        }
     }
 
     /// Executes one PlanRuntime decode cohort through the typed batch API.
@@ -87,14 +102,20 @@ impl EngineInner {
             .iter()
             .map(|input| input.logits_policy.clone())
             .collect::<Vec<_>>();
-        let capture_decode_stage_timing = self.close_plan_runtime_decode_scheduling(&rids);
+        let decode_execution_started_at = self.close_plan_runtime_decode_scheduling(&rids);
         let (outputs, postprocess_started_at) = match self
             .model_executor
             .plan_runtime_batch_decode_with_capacity(&inputs)
             .await
         {
             Ok(PlanRuntimeBatchDecodeOutcome::Completed(outputs)) => {
-                (outputs, capture_decode_stage_timing.then(Instant::now))
+                let completed_at = decode_execution_started_at.map(|_| Instant::now());
+                if let (Some(started_at), Some(ended_at)) =
+                    (decode_execution_started_at, completed_at)
+                {
+                    self.record_plan_runtime_decode_execution(&rids, started_at, ended_at);
+                }
+                (outputs, completed_at)
             }
             Ok(PlanRuntimeBatchDecodeOutcome::Deferred(deferral)) => {
                 return Ok(PlanRuntimeDecodeBatchOutcome::Deferred {

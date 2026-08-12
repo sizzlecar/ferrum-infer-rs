@@ -50,7 +50,11 @@ VNEXT_WALL_ANCHOR_ATTRIBUTE = "vnext_monotonic_wall_anchor_unix_nanos"
 VNEXT_CLOCK_ERROR_ATTRIBUTE = "vnext_clock_conversion_max_error_nanos"
 ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE = "engine_decode_stage_intervals"
 ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE = "engine_decode_stage_interval_count"
-ENGINE_DECODE_STAGE_KINDS = {"decode_scheduling", "decode_postprocess"}
+ENGINE_DECODE_STAGE_KINDS = {
+    "decode_scheduling",
+    "decode_execution",
+    "decode_postprocess",
+}
 
 # These limits are fixed independently from model size, request count, GPU
 # capacity, or user concurrency.  They are applied before every child spawn.
@@ -2139,12 +2143,17 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
                     "end_nanos_since_request_start": 5_300,
                 },
                 {
+                    "stage": "decode_execution",
+                    "start_nanos_since_request_start": 5_300,
+                    "end_nanos_since_request_start": 5_800,
+                },
+                {
                     "stage": "decode_postprocess",
                     "start_nanos_since_request_start": 5_800,
                     "end_nanos_since_request_start": 6_000,
                 },
             ],
-            ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE: 2,
+            ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE: 3,
         }
     )
     native = base("vnext.device_native_work", "full", 1_050)
@@ -2194,19 +2203,28 @@ def run_selftest() -> int:
         "bounded wall-anchor fixture did not produce exact formal coverage",
     )
     require(
-        baseline_stage["engine_stage_interval_count"] == 2
-        and baseline_stage["engine_stage_accounted_union_ns"] == 400,
+        baseline_stage["engine_stage_interval_count"] == 3
+        and baseline_stage["engine_stage_accounted_union_ns"] == 900,
         "typed engine decode stages were not unioned into formal coverage",
     )
+    missing_execution = json.loads(json.dumps(cuda[2]))
+    missing_execution[-1]["attributes"][ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE].pop(1)
+    missing_execution[-1]["attributes"][ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE] = 2
+    try:
+        calculate_stage_coverage(missing_execution)
+    except CollectorError:
+        missing_execution_stage_rejected = True
+    else:
+        missing_execution_stage_rejected = False
     missing_postprocess = json.loads(json.dumps(cuda[2]))
     missing_postprocess[-1]["attributes"][ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE].pop()
-    missing_postprocess[-1]["attributes"][ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE] = 1
+    missing_postprocess[-1]["attributes"][ENGINE_DECODE_STAGE_COUNT_ATTRIBUTE] = 2
     try:
         calculate_stage_coverage(missing_postprocess)
     except CollectorError:
-        missing_engine_stage_rejected = True
+        missing_postprocess_stage_rejected = True
     else:
-        missing_engine_stage_rejected = False
+        missing_postprocess_stage_rejected = False
     malformed_engine_stage = json.loads(json.dumps(cuda[2]))
     malformed_engine_stage[-1]["attributes"][ENGINE_DECODE_STAGE_INTERVALS_ATTRIBUTE][0][
         "end_nanos_since_request_start"
@@ -2324,7 +2342,9 @@ def run_selftest() -> int:
         "negative fixtures did not reject",
     )
     require(
-        missing_engine_stage_rejected and malformed_engine_stage_rejected,
+        missing_execution_stage_rejected
+        and missing_postprocess_stage_rejected
+        and malformed_engine_stage_rejected,
         "invalid engine decode stage unexpectedly passed",
     )
     with tempfile.TemporaryDirectory(prefix="runtime-vnext-r2-profile-selftest-") as temporary:
