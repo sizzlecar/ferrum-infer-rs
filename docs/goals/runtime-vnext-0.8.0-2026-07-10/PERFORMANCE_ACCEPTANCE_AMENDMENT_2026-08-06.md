@@ -14,6 +14,9 @@
 - vLLM 和 llama.cpp 仍可作为非阻断诊断工具，但不再是 v0.8.0 performance PASS 的 comparator，
   不要求下载、启动、同机 ABBA、ratio 或 CI。
 - 外部竞争性性能门转入 v0.8.1/0.9，不得误报为 v0.8.0 已证明与 vLLM/llama.cpp 持平。
+- 2026-08-13 起，Metal 的 host-global swap 资源判定和 completed-cell 累计续跑进一步以
+  [`METAL_HOST_GLOBAL_SWAP_NOISE_AMENDMENT_2026-08-13.md`](METAL_HOST_GLOBAL_SWAP_NOISE_AMENDMENT_2026-08-13.md)
+  为准；该文件只在与本修订的 exact-zero swap 或单 server epoch wording 冲突时优先。
 
 ## 目标
 
@@ -115,8 +118,8 @@ typed config、artifact 路径、三个 raw repeats 和冻结时间。
 - measured 和 warmup completion `100%`；request error、bad output、malformed SSE、missing/duplicate
   `[DONE]`、zero output、panic、OOM、admission failure、resource leak 均为 `0`。
 - output token source 为 usage 的请求比例 `100%`；输入长度必须来自实际 tokenizer count。
-- Metal measured interval swap growth `0`，thermal throttling `0`；CUDA 保留至少 `512 MiB`
-  physical VRAM headroom。
+- Metal measured interval swap 按 2026-08-13 host-global swap 修订执行 lane-global 机械分类，
+  thermal throttling `0`；CUDA 保留至少 `512 MiB` physical VRAM headroom。
 - TTFT、TPOT、throughput、active timeline、memory 和 raw request 字段完整率 `100%`。
 
 ### Profile 与编译
