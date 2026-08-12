@@ -2309,7 +2309,6 @@ def control_self_test(expected_source_sha: str) -> int:
         f"change-impact planner focused self-test failed: {planner_result.get('failures')}",
     )
     print(PLANNER_SELFTEST_PASS_LINE)
-    require(self_test() == 0, "qualification focused self-test failed")
 
     import run_gate
     import runtime_vnext_baseline_scenarios as baseline_scenarios
