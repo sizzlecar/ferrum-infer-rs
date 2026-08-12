@@ -21,7 +21,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -73,6 +73,11 @@ PHYSICAL_HEADROOM_FLOOR_BYTES = {
     "cuda": 512 * 1024**2,
     "metal": 2 * 1024**3,
 }
+METAL_SWAP_NOISE_MAX_LANE_GROWTH_STEP_COUNT = 1
+METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES = 1024**2
+METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES = 4 * 1024**3
+METAL_SWAP_NOISE_MIN_STABLE_SAMPLE_COUNT = 30
+METAL_SWAP_NOISE_MIN_STABLE_SECONDS = 10.0
 FLOOR_METRICS = (
     "throughput",
     "ttft_p95",
@@ -103,6 +108,8 @@ PROFILE_IDENTITY_FIELDS = {
 }
 R2_CONTROL_PLANE_FILES = frozenset(
     {
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/METAL_HOST_GLOBAL_SWAP_NOISE_AMENDMENT_2026-08-13.md",
+        "docs/goals/runtime-vnext-0.8.0-2026-07-10/PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md",
         "scripts/release/bounded_command.py",
         "scripts/release/runtime_vnext_r2_ferrum_collector.py",
         "scripts/release/runtime_vnext_r2_ferrum_terminal_recovery.py",
@@ -264,6 +271,24 @@ def git_text(*args: str) -> str:
     return process.stdout.strip()
 
 
+def require_recorded_source_in_history(path: str, digest: Any, label: str) -> None:
+    recorded = require_sha(digest, label)
+    commits = git_text("log", "--format=%H", "--", path).splitlines()
+    require(commits, f"{label} path has no Git history")
+    matches = False
+    for commit in commits:
+        process = subprocess.run(
+            ["git", "show", f"{commit}:{path}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+        if process.returncode == 0 and hashlib.sha256(process.stdout).hexdigest() == recorded:
+            matches = True
+            break
+    require(matches, f"{label} is not a reviewed Git-history source")
+
+
 def current_source() -> dict[str, Any]:
     status = [line for line in git_text("status", "--short").splitlines() if line]
     require(not status, f"R2 source must be clean: {status[:8]}")
@@ -412,7 +437,252 @@ def requests_per_repeat(dataset: str) -> int:
     return 100 if dataset == "random" else 30
 
 
-def validate_metal_resource_contract(summary: dict[str, Any], label: str) -> None:
+def derive_metal_swap_scope_evidence(
+    observations_path: Path,
+    observations_sha256: str,
+    summary: dict[str, Any],
+    *,
+    label: str,
+    measurement_started_at: str | None = None,
+    measurement_finished_at: str | None = None,
+) -> dict[str, Any]:
+    """Derive transparent host-global swap movement from immutable raw rows."""
+
+    rows = read_jsonl_objects(observations_path, f"{label} raw resource observations")
+    require(
+        rows[0].get("record_type") == "header"
+        and rows[-1].get("record_type") == "footer",
+        f"{label} raw resource observations lack header/footer",
+    )
+    header = rows[0]
+    samples = [row for row in rows[1:-1] if row.get("record_type") == "sample"]
+    require(len(samples) >= 2, f"{label} raw swap evidence has fewer than two samples")
+    parsed = [
+        timestamp_datetime(row.get("sampled_at"), f"{label} sample timestamp")
+        for row in samples
+    ]
+    require(
+        all(right > left for left, right in zip(parsed, parsed[1:])),
+        f"{label} raw swap timestamps are not strictly increasing",
+    )
+    if measurement_started_at is not None or measurement_finished_at is not None:
+        require(
+            measurement_started_at is not None
+            and measurement_finished_at is not None,
+            f"{label} swap measurement window is incomplete",
+        )
+        started = timestamp_datetime(
+            measurement_started_at, f"{label} measurement start"
+        )
+        finished = timestamp_datetime(
+            measurement_finished_at, f"{label} measurement finish"
+        )
+        before = [index for index, value in enumerate(parsed) if value <= started]
+        after = [index for index, value in enumerate(parsed) if value >= finished]
+        require(before and after, f"{label} raw swap evidence does not bracket measurement")
+        start_index = before[-1]
+        finish_index = after[0]
+        samples = samples[start_index : finish_index + 1]
+        parsed = parsed[start_index : finish_index + 1]
+
+    swap_values = [
+        int(finite_nonnegative(row.get("swap_used_bytes"), f"{label} raw swap"))
+        for row in samples
+    ]
+    require(
+        swap_values[0] == summary.get("swap_start_bytes")
+        and swap_values[-1] == summary.get("swap_end_bytes"),
+        f"{label} raw swap endpoints differ from the collector summary",
+    )
+    deltas = [right - left for left, right in zip(swap_values, swap_values[1:])]
+    changed = [delta for delta in deltas if delta != 0]
+    growth = [(index + 1, delta) for index, delta in enumerate(deltas) if delta > 0]
+    decreases = [delta for delta in deltas if delta < 0]
+    last_growth_index = growth[-1][0] if growth else None
+    stable_sample_count = (
+        len(samples) - last_growth_index - 1
+        if last_growth_index is not None
+        else len(samples) - 1
+    )
+    stable_seconds = (
+        (parsed[-1] - parsed[last_growth_index]).total_seconds()
+        if last_growth_index is not None
+        else (parsed[-1] - parsed[0]).total_seconds()
+    )
+    raw_total_positive_growth_bytes = sum(delta for _, delta in growth)
+    raw_max_positive_step_bytes = max((delta for _, delta in growth), default=0)
+    safety_clean = (
+        finite_nonnegative(summary.get("physical_headroom_bytes"), f"{label} headroom")
+        >= METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES
+        and summary.get("thermal_throttling_count") == 0
+        and summary.get("oom_count") == 0
+        and summary.get("admission_error_count") == 0
+        and summary.get("active_probe_retry_error_count") == 0
+    )
+    if not growth:
+        classification = "exact_zero"
+    elif (
+        len(growth) == 1
+        and raw_total_positive_growth_bytes
+        <= METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES
+        and safety_clean
+    ):
+        classification = "host_global_swap_noise_candidate"
+    else:
+        classification = "swap_pressure"
+    return {
+        "classification": classification,
+        "raw_collector_sha256": require_sha(
+            header.get("collector_sha256"), f"{label} raw collector SHA256"
+        ),
+        "resource_observations_sha256": require_sha(
+            observations_sha256, f"{label} resource observations SHA256"
+        ),
+        "raw_sample_count": len(samples),
+        "raw_step_count": len(changed),
+        "raw_positive_step_count": len(growth),
+        "raw_negative_step_count": len(decreases),
+        "raw_max_absolute_step_bytes": max(
+            (abs(delta) for delta in changed), default=0
+        ),
+        "raw_max_positive_step_bytes": raw_max_positive_step_bytes,
+        "raw_total_positive_growth_bytes": raw_total_positive_growth_bytes,
+        "raw_net_growth_bytes": swap_values[-1] - swap_values[0],
+        "physical_headroom_bytes": int(summary["physical_headroom_bytes"]),
+        "thermal_throttling_count": summary.get("thermal_throttling_count"),
+        "oom_count": summary.get("oom_count"),
+        "admission_error_count": summary.get("admission_error_count"),
+        "active_probe_retry_error_count": summary.get(
+            "active_probe_retry_error_count"
+        ),
+        "stable_sample_count_after_last_growth": stable_sample_count,
+        "stable_seconds_after_last_growth": stable_seconds,
+        "first_sample_at": samples[0]["sampled_at"],
+        "last_sample_at": samples[-1]["sampled_at"],
+        "last_growth_at": (
+            samples[last_growth_index]["sampled_at"]
+            if last_growth_index is not None
+            else None
+        ),
+    }
+
+
+def aggregate_metal_swap_evidence(
+    scopes: list[dict[str, Any]], label: str
+) -> dict[str, Any]:
+    """Apply the one-step allowance once to the complete 5-cell/3-run lane."""
+
+    require(len(scopes) == 8, f"{label} must cover five cells and three run samples")
+    require(
+        all(
+            row[field] == 0
+            for row in scopes
+            for field in (
+                "thermal_throttling_count",
+                "oom_count",
+                "admission_error_count",
+                "active_probe_retry_error_count",
+            )
+        ),
+        f"{label} contains a Metal thermal/OOM/admission/probe error",
+    )
+    positive_step_count = sum(row["raw_positive_step_count"] for row in scopes)
+    total_positive_growth = sum(
+        row["raw_total_positive_growth_bytes"] for row in scopes
+    )
+    max_positive_step = max(row["raw_max_positive_step_bytes"] for row in scopes)
+    growth_scopes = [row for row in scopes if row["raw_positive_step_count"] > 0]
+    if len(growth_scopes) == 1:
+        growth_scope = growth_scopes[0]
+        last_growth = timestamp_datetime(
+            growth_scope["last_growth_at"], f"{label} last swap growth"
+        )
+        stable_sample_count = growth_scope[
+            "stable_sample_count_after_last_growth"
+        ] + sum(
+            row["raw_sample_count"]
+            for row in scopes
+            if timestamp_datetime(row["first_sample_at"], f"{label} scope start")
+            > last_growth
+            and row is not growth_scope
+        )
+        stable_seconds = max(
+            0.0,
+            max(
+                timestamp_datetime(row["last_sample_at"], f"{label} scope end")
+                for row in scopes
+            ).timestamp()
+            - last_growth.timestamp(),
+        )
+    else:
+        stable_sample_count = 0
+        stable_seconds = 0.0
+    exact_zero = positive_step_count == 0
+    noise = (
+        positive_step_count <= METAL_SWAP_NOISE_MAX_LANE_GROWTH_STEP_COUNT
+        and total_positive_growth <= METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES
+        and all(
+            row["classification"]
+            in {"exact_zero", "host_global_swap_noise_candidate"}
+            for row in scopes
+        )
+        and stable_sample_count >= METAL_SWAP_NOISE_MIN_STABLE_SAMPLE_COUNT
+        and stable_seconds >= METAL_SWAP_NOISE_MIN_STABLE_SECONDS
+        and min(row["physical_headroom_bytes"] for row in scopes)
+        >= METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES
+    )
+    classification = (
+        "exact_zero"
+        if exact_zero
+        else "host_global_swap_noise"
+        if noise
+        else "swap_pressure"
+    )
+    result = {
+        "classification": classification,
+        "contract_scope": "five-formal-http-cells-plus-three-run-samples",
+        "policy": {
+            "max_lane_positive_step_count": METAL_SWAP_NOISE_MAX_LANE_GROWTH_STEP_COUNT,
+            "max_lane_total_positive_growth_bytes": METAL_SWAP_NOISE_MAX_LANE_GROWTH_BYTES,
+            "minimum_physical_headroom_bytes": METAL_SWAP_NOISE_MIN_PHYSICAL_HEADROOM_BYTES,
+            "minimum_stable_sample_count_after_last_growth": METAL_SWAP_NOISE_MIN_STABLE_SAMPLE_COUNT,
+            "minimum_stable_seconds_after_last_growth": METAL_SWAP_NOISE_MIN_STABLE_SECONDS,
+            "required_thermal_oom_admission_probe_error_count": 0,
+        },
+        "scope_count": len(scopes),
+        "raw_step_count": sum(row["raw_step_count"] for row in scopes),
+        "raw_positive_step_count": positive_step_count,
+        "raw_negative_step_count": sum(
+            row["raw_negative_step_count"] for row in scopes
+        ),
+        "raw_max_absolute_step_bytes": max(
+            row["raw_max_absolute_step_bytes"] for row in scopes
+        ),
+        "raw_max_positive_step_bytes": max_positive_step,
+        "raw_total_positive_growth_bytes": total_positive_growth,
+        "raw_net_growth_bytes": sum(row["raw_net_growth_bytes"] for row in scopes),
+        "stable_sample_count_after_last_growth": stable_sample_count,
+        "stable_seconds_after_last_growth": stable_seconds,
+        "minimum_physical_headroom_bytes": min(
+            row["physical_headroom_bytes"] for row in scopes
+        ),
+        "raw_collector_sha256": sorted(
+            {row["raw_collector_sha256"] for row in scopes}
+        ),
+        "scopes": copy.deepcopy(scopes),
+    }
+    require(
+        classification in {"exact_zero", "host_global_swap_noise"},
+        f"{label} sustained or unbounded Metal swap pressure detected",
+    )
+    return result
+
+
+def validate_metal_resource_contract(
+    summary: dict[str, Any],
+    label: str,
+    swap_evidence: dict[str, Any] | None = None,
+) -> None:
     physical_headroom = finite_nonnegative(
         summary.get("physical_headroom_bytes"), f"{label} Metal physical headroom"
     )
@@ -429,8 +699,13 @@ def validate_metal_resource_contract(summary: dict[str, Any], label: str) -> Non
         summary.get("swap_end_bytes"), f"{label} Metal swap end"
     )
     require(
-        swap_end <= swap_start
-        and summary.get("thermal_throttling_count") == 0,
+        summary.get("thermal_throttling_count") == 0
+        and (
+            swap_end <= swap_start
+            if swap_evidence is None
+            else swap_evidence.get("classification")
+            in {"exact_zero", "host_global_swap_noise_candidate"}
+        ),
         f"{label} Metal swap growth/thermal contract failed",
     )
 
@@ -1602,6 +1877,7 @@ def validate_terminal_cuda_exit_recovery(
     fingerprint: str,
     sample_ordinal: int,
     recovery: dict[str, Any],
+    expected_collector_sha256: str,
 ) -> dict[str, Any]:
     """Accept one immutable legacy audit race without weakening live-PID checks."""
 
@@ -1737,6 +2013,7 @@ def validate_terminal_cuda_exit_recovery(
         prefix_resources,
         backend="cuda",
         label=f"recovered run sample {sample_ordinal} prefix",
+        expected_collector_sha256=expected_collector_sha256,
     )
 
     compute_options = set(ferrum_collector.CUDA_COMPUTE_QUERY)
@@ -1822,9 +2099,13 @@ def validate_terminal_cuda_exit_recovery(
         and recovery_source.get("sha256") == sha256(recovery_script)
         and isinstance(classifier_source, dict)
         and classifier_source.get("path")
-        == SCRIPT_PATH.relative_to(REPO_ROOT).as_posix()
-        and classifier_source.get("sha256") == sha256(SCRIPT_PATH),
+        == SCRIPT_PATH.relative_to(REPO_ROOT).as_posix(),
         "Ferrum terminal-exit recovery source identity differs",
+    )
+    require_recorded_source_in_history(
+        classifier_source["path"],
+        classifier_source.get("sha256"),
+        "Ferrum terminal-exit recovery classifier source",
     )
     postflight_path = validate_collector_ref(
         root, recovery.get("cuda_idle_postflight"), "recovered CUDA idle postflight"
@@ -1868,7 +2149,28 @@ def default_collector_verifier(
 
         fingerprint = str(manifest.get("config_fingerprint", ""))
         ferrum_collector.validate_final_manifest(root, manifest, fingerprint)
-        ferrum_collector.validate_server_bundle(root, server, fingerprint, config)
+        inputs = {
+            "binary_path": validate_collector_ref(
+                root, manifest.get("inputs", {}).get("binary"), "collector input binary"
+            ),
+            "binary": copy.deepcopy(manifest.get("inputs", {}).get("binary")),
+            "tokenizer_path": validate_collector_ref(
+                root, manifest.get("inputs", {}).get("tokenizer"), "collector input tokenizer"
+            ),
+            "realistic_dataset_path": validate_collector_ref(
+                root,
+                manifest.get("inputs", {}).get("realistic_dataset"),
+                "collector input realistic dataset",
+            ),
+            "run_parity_dataset_path": validate_collector_ref(
+                root,
+                manifest.get("inputs", {}).get("run_parity_dataset"),
+                "collector input run parity dataset",
+            ),
+        }
+        ferrum_collector.validate_server_bundle(
+            root, server, fingerprint, config, inputs
+        )
         recovery_ref = manifest.get("terminal_exit_recovery")
         recovery = None
         recovery_ordinal = None
@@ -1884,6 +2186,11 @@ def default_collector_verifier(
                 and 1 <= recovery_ordinal <= len(runs),
                 "Ferrum terminal-exit recovery sample ordinal is invalid",
             )
+        legacy_epoch = ferrum_collector.frozen_collection_epoch(
+            ferrum_collector.read_json(
+                ferrum_collector.lane_dir(root, config) / "plan.json"
+            )
+        )
         for ordinal, bundle in enumerate(runs, start=1):
             if ordinal == recovery_ordinal:
                 require(recovery is not None, "Ferrum terminal-exit recovery is missing")
@@ -1893,10 +2200,15 @@ def default_collector_verifier(
                     fingerprint=fingerprint,
                     sample_ordinal=ordinal,
                     recovery=recovery,
+                    expected_collector_sha256=legacy_epoch["collector_sha256"],
                 )
             else:
                 ferrum_collector.validate_run_bundle(
-                    root, bundle, fingerprint, ordinal
+                    root,
+                    bundle,
+                    fingerprint,
+                    ordinal,
+                    legacy_collection_epoch=legacy_epoch,
                 )
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
         raise R2Error(f"Ferrum collector provenance failed: {error}") from error
@@ -2539,13 +2851,136 @@ def load_ferrum_collector_lane(
     runs = [read_json(run_path, "run sample bundle") for run_path in run_paths]
     collector_verifier(root, manifest, config, server, runs)
     session = server.get("session")
+    session_epochs = server.get("session_epochs")
     records = server.get("formal_reports")
+    legacy_single_epoch = session_epochs is None
     require(
         isinstance(session, dict)
-        and session.get("server_process_ordinal") == 1
+        and (
+            (isinstance(session_epochs, list) and bool(session_epochs))
+            or (legacy_single_epoch and session.get("server_process_ordinal") == 1)
+        )
         and session.get("shutdown_clean") is True
         and isinstance(records, list),
         "Ferrum collector server session is incomplete",
+    )
+    if legacy_single_epoch:
+        session_epochs = [
+            {
+                "kind": "legacy-single-session",
+                "session_id": session.get("session_id"),
+                "completed_cell_sequences": [
+                    row.get("sequence")
+                    for row in [*records, server.get("run_serve_parity_report")]
+                    if isinstance(row, dict)
+                ],
+            }
+        ]
+    epoch_authority: dict[str, dict[str, Any]] = {}
+    for ordinal, epoch_row in enumerate(session_epochs, start=1):
+        require(isinstance(epoch_row, dict), f"Ferrum server epoch {ordinal} is invalid")
+        epoch_session_id = epoch_row.get("session_id")
+        require(
+            isinstance(epoch_session_id, str)
+            and bool(epoch_session_id)
+            and epoch_session_id not in epoch_authority,
+            f"Ferrum server epoch {ordinal} identity is invalid",
+        )
+        if epoch_row.get("kind") == "recovered-completed-cell":
+            checkpoint_refs = epoch_row.get("checkpoints")
+            completed_sequences = epoch_row.get("completed_cell_sequences")
+            require(
+                isinstance(checkpoint_refs, list)
+                and isinstance(completed_sequences, list)
+                and len(checkpoint_refs) == len(completed_sequences)
+                and bool(checkpoint_refs),
+                f"Ferrum recovered epoch {ordinal} checkpoint set is invalid",
+            )
+            checkpoint_documents = [
+                read_json(
+                    validate_collector_ref(
+                        root, ref, f"Ferrum recovered epoch {ordinal} checkpoint {index}"
+                    ),
+                    f"Ferrum recovered epoch {ordinal} checkpoint {index}",
+                )
+                for index, ref in enumerate(checkpoint_refs, start=1)
+            ]
+            checkpoint = checkpoint_documents[0]
+            require(
+                [row.get("sequence") for row in checkpoint_documents] == completed_sequences
+                and all(
+                    row.get("contract") == "ferrum.runtime-vnext.r2.completed-cell-checkpoint.v1"
+                    and row.get("config_fingerprint") == manifest.get("config_fingerprint")
+                    and row.get("collection_epoch") == epoch_row.get("collection_epoch")
+                    and row.get("epoch", {}).get("session_id") == epoch_session_id
+                    and row.get("epoch") == checkpoint.get("epoch")
+                    and row.get("attempt_cleanup") == checkpoint.get("attempt_cleanup")
+                    for row in checkpoint_documents
+                ),
+                f"Ferrum recovered epoch {ordinal} checkpoint binding differs",
+            )
+            authority = copy.deepcopy(checkpoint["epoch"])
+            authority["runtime_log"] = checkpoint["epoch"]["runtime_log_evidence"]
+            authority["scheduler_trace"] = checkpoint["epoch"]["scheduler_trace"]
+            authority["product_effective_config"] = checkpoint["epoch"]["product_effective_config"]
+            failure_path = validate_collector_ref(
+                root,
+                checkpoint.get("attempt_cleanup"),
+                f"Ferrum recovered epoch {ordinal} cleanup",
+            )
+            failure = read_json(failure_path, f"Ferrum recovered epoch {ordinal} cleanup")
+            require(
+                failure.get("cleanup_process_group_gone") is True
+                and failure.get("cleanup_error") is None,
+                f"Ferrum recovered epoch {ordinal} cleanup differs",
+            )
+            authority["finished_at"] = failure["failed_at"]
+            authority["completed_cell_sequences"] = completed_sequences
+        elif epoch_row.get("kind") == "legacy-single-session":
+            require(
+                epoch_session_id == session.get("session_id"),
+                f"Ferrum legacy epoch {ordinal} identity differs",
+            )
+            authority = {
+                **session,
+                "completed_cell_sequences": epoch_row["completed_cell_sequences"],
+            }
+        else:
+            require(
+                epoch_row.get("kind") == "current-server-session"
+                and epoch_session_id == session.get("session_id"),
+                f"Ferrum server epoch {ordinal} kind differs",
+            )
+            authority = session
+            completed_sequences = epoch_row.get("completed_cell_sequences")
+            require(
+                isinstance(completed_sequences, list)
+                and completed_sequences
+                and all(isinstance(value, int) for value in completed_sequences),
+                f"Ferrum current epoch {ordinal} completed-cell set is invalid",
+            )
+            authority = {**authority, "completed_cell_sequences": completed_sequences}
+        for ref_name in ("runtime_log", "scheduler_trace", "product_effective_config"):
+            validate_collector_ref(
+                root, authority.get(ref_name), f"Ferrum server epoch {ordinal} {ref_name}"
+            )
+        epoch_authority[epoch_session_id] = authority
+    observed_epoch_sequences: dict[str, list[int]] = {
+        epoch_id: [] for epoch_id in epoch_authority
+    }
+    for record in [*server.get("formal_reports", []), server.get("run_serve_parity_report")]:
+        require(isinstance(record, dict), "Ferrum server record is invalid")
+        epoch_id = record.get("session_id")
+        require(epoch_id in observed_epoch_sequences, "Ferrum server record uses an unknown epoch")
+        observed_epoch_sequences[epoch_id].append(record.get("sequence"))
+    for epoch_id, authority in epoch_authority.items():
+        require(
+            observed_epoch_sequences[epoch_id] == authority["completed_cell_sequences"],
+            f"Ferrum server epoch {epoch_id} completed-cell binding differs",
+        )
+    require(
+        session.get("server_process_ordinal") == len(epoch_authority),
+        "Ferrum collector server epoch/process denominator differs",
     )
     try:
         baseline_scenarios.validate_sanitized_environment(
@@ -2569,6 +3004,7 @@ def load_ferrum_collector_lane(
         "Ferrum serve product argv/hash differs",
     )
     run_pids: set[int] = set()
+    metal_swap_scopes: list[dict[str, Any]] = []
     for ordinal, bundle in enumerate(runs, start=1):
         sample = bundle.get("sample")
         require(
@@ -2614,12 +3050,74 @@ def load_ferrum_collector_lane(
             == "off",
             f"Ferrum run sample {ordinal} is not the profile-off product path",
         )
+        if expected_backend == "metal":
+            resources = sample.get("resources")
+            require(
+                isinstance(resources, dict),
+                f"Ferrum run sample {ordinal} resource evidence is missing",
+            )
+            observations_ref = resources.get("observations")
+            observations_path = validate_collector_ref(
+                root,
+                observations_ref,
+                f"Ferrum run sample {ordinal} resource observations",
+            )
+            resource_summary = resources.get("summary")
+            require(
+                isinstance(resource_summary, dict),
+                f"Ferrum run sample {ordinal} resource summary is missing",
+            )
+            observation_rows = read_jsonl_objects(
+                observations_path,
+                f"Ferrum run sample {ordinal} resource observations",
+            )
+            observation_samples = observation_rows[1:-1]
+            try:
+                import runtime_vnext_resource_sampler as resource_sampler
+
+                recomputed_resource = resource_sampler.derive_summary(
+                    observations_path,
+                    session_id=sample["sample_id"],
+                    cell_id="run:c1",
+                    backend="metal",
+                    hardware_id=hardware["id"],
+                    pid=sample["pid"],
+                    pgid=sample["pgid"],
+                    process_start_marker=sample["process_start_marker"],
+                    base_url=f"process://{sample['sample_id']}",
+                    session_started_at=sample["started_at"],
+                    session_finished_at=sample["finished_at"],
+                    measurement_started_at=observation_samples[0]["sampled_at"],
+                    measurement_finished_at=observation_samples[-1]["sampled_at"],
+                    memory_budget_bytes=resource_summary["memory_budget_bytes"],
+                    requested_concurrency=1,
+                    typed_active_cap=1,
+                    runtime_log_path=observation_rows[0]["runtime_log_path"],
+                )
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+                raise R2Error(
+                    f"Ferrum run sample {ordinal} resource evidence failed: {error}"
+                ) from error
+            require(
+                recomputed_resource == resource_summary,
+                f"Ferrum run sample {ordinal} resource summary is not raw-derived",
+            )
+            swap_evidence = derive_metal_swap_scope_evidence(
+                observations_path,
+                observations_ref["sha256"],
+                resource_summary,
+                label=f"Ferrum run sample {ordinal}",
+            )
+            validate_metal_resource_contract(
+                resource_summary,
+                f"Ferrum run sample {ordinal}",
+                swap_evidence,
+            )
+            metal_swap_scopes.append(
+                {"scope": f"run:c1:sample-{ordinal}", **swap_evidence}
+            )
     expected = expected_cells(expected_backend)
-    scheduler_trace_ref = session.get("scheduler_trace")
-    scheduler_trace_path = validate_collector_ref(
-        root, scheduler_trace_ref, "server scheduler trace"
-    )
-    product_lifecycle: dict[str, dict[str, int]] | None = None
+    product_lifecycle_by_epoch: dict[str, dict[str, dict[str, int]]] = {}
     require(
         len(records) == len(expected)
         and manifest.get("formal_http_cell_count") == len(expected),
@@ -2629,6 +3127,12 @@ def load_ferrum_collector_lane(
     measured_requests = 0
     for record, cell in zip(records, plan.get("server_cell_order", []), strict=True):
         key = (str(cell.get("dataset")), int(cell.get("concurrency", -1)))
+        record_session_id = record.get("session_id")
+        require(
+            isinstance(record_session_id, str) and record_session_id in epoch_authority,
+            f"Ferrum collector cell epoch is unknown: {key}",
+        )
+        record_session = epoch_authority[record_session_id]
         require(
             key in expected
             and key not in summaries
@@ -2688,37 +3192,43 @@ def load_ferrum_collector_lane(
         resource_summary = resources.get("summary")
         require(isinstance(resource_summary, dict), f"resource summary is missing: {key}")
         runtime_log_path = validate_collector_ref(
-            root, session.get("runtime_log"), "server runtime log"
+            root, record_session.get("runtime_log"), f"server epoch runtime log {key}"
         )
         try:
             import runtime_vnext_resource_sampler as resource_sampler
 
             recomputed_resource = resource_sampler.derive_summary(
                 observations_path,
-                session_id=session["session_id"],
+                session_id=record_session["session_id"],
                 cell_id=record["cell_id"],
                 backend=expected_backend,
                 hardware_id=hardware["id"],
-                pid=session["pid"],
-                pgid=session["pgid"],
-                process_start_marker=session["process_start_marker"],
-                base_url=session["base_url"],
-                session_started_at=session["started_at"],
-                session_finished_at=session["finished_at"],
+                pid=record_session["pid"],
+                pgid=record_session["pgid"],
+                process_start_marker=record_session["process_start_marker"],
+                base_url=record_session["base_url"],
+                session_started_at=record_session["started_at"],
+                session_finished_at=record_session["finished_at"],
                 measurement_started_at=record["started_at"],
                 measurement_finished_at=record["finished_at"],
                 memory_budget_bytes=config["memory_budget_bytes"],
                 requested_concurrency=record["concurrency"],
                 typed_active_cap=config["typed_active_cap"],
-                runtime_log_path=session["runtime_log_origin_path"],
+                runtime_log_path=record_session["runtime_log_origin_path"],
                 runtime_log_evidence_path=runtime_log_path,
             )
         except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
             raise R2Error(f"resource evidence failed for {key}: {error}") from error
         require(recomputed_resource == resource_summary, f"resource summary is not raw-derived: {key}")
         highest = requires_active_floor(key[0], key[1], expected_backend)
-        if highest and product_lifecycle is None:
-            product_lifecycle = load_product_request_lifecycle(scheduler_trace_path)
+        scheduler_trace_ref = record_session.get("scheduler_trace")
+        if highest and record_session_id not in product_lifecycle_by_epoch:
+            scheduler_trace_path = validate_collector_ref(
+                root, scheduler_trace_ref, f"server epoch scheduler trace {key}"
+            )
+            product_lifecycle_by_epoch[record_session_id] = load_product_request_lifecycle(
+                scheduler_trace_path
+            )
         duty, duty_evidence = validate_active_intervals(
             root,
             resources.get("active_intervals"),
@@ -2727,7 +3237,9 @@ def load_ferrum_collector_lane(
             record=record,
             active_floor=ACTIVE_FLOORS[(expected_model, expected_backend)],
             require_floor=highest,
-            product_lifecycle=product_lifecycle if highest else None,
+            product_lifecycle=(
+                product_lifecycle_by_epoch[record_session_id] if highest else None
+            ),
             scheduler_trace_ref=scheduler_trace_ref if highest else None,
             report_ref=report_ref if highest else None,
             typed_active_cap=config.get("typed_active_cap") if highest else None,
@@ -2739,6 +3251,7 @@ def load_ferrum_collector_lane(
             and resource_summary.get("admission_error_count") == 0,
             f"resource budget/error contract failed: {key}",
         )
+        swap_evidence: dict[str, Any] | None = None
         if expected_backend == "cuda":
             require(
                 finite_nonnegative(
@@ -2748,9 +3261,21 @@ def load_ferrum_collector_lane(
                 f"CUDA headroom is below 512 MiB: {key}",
             )
         else:
+            swap_evidence = derive_metal_swap_scope_evidence(
+                observations_path,
+                observations_ref["sha256"],
+                resource_summary,
+                label=f"Ferrum collector cell {key}",
+                measurement_started_at=record["started_at"],
+                measurement_finished_at=record["finished_at"],
+            )
             validate_metal_resource_contract(
                 resource_summary,
                 f"Ferrum collector cell {key}",
+                swap_evidence,
+            )
+            metal_swap_scopes.append(
+                {"scope": f"{key[0]}:c{key[1]}", **swap_evidence}
             )
         throughputs = [finite_positive(row.get("output_throughput_tps"), "repeat throughput") for row in repeats]
         cv = statistics.pstdev(throughputs) / statistics.mean(throughputs)
@@ -2785,6 +3310,7 @@ def load_ferrum_collector_lane(
             "physical_headroom_bytes": resource_summary[
                 "physical_headroom_bytes"
             ],
+            "metal_swap_evidence": copy.deepcopy(swap_evidence),
             "steady_decode": statistics.median(
                 1000.0 / finite_positive(row.get("tpot_ms", {}).get("p50"), "repeat TPOT p50")
                 for row in repeats
@@ -2815,6 +3341,14 @@ def load_ferrum_collector_lane(
             "report": copy.deepcopy(report_ref),
         }
     require(set(summaries) == expected, "Ferrum collector cell tuple set differs")
+    metal_swap_evidence = (
+        aggregate_metal_swap_evidence(
+            metal_swap_scopes,
+            f"Ferrum collector {expected_model}/{expected_backend}",
+        )
+        if expected_backend == "metal"
+        else None
+    )
     require(measured_requests == sum(requests_per_repeat(dataset) * 3 for dataset, _ in expected), "Ferrum collector measured request denominator differs")
     parity = server.get("run_serve_parity_report")
     require(isinstance(parity, dict), "run/serve parity evidence is missing")
@@ -2854,6 +3388,7 @@ def load_ferrum_collector_lane(
         "physical_headroom_floor_bytes": PHYSICAL_HEADROOM_FLOOR_BYTES[
             expected_backend
         ],
+        "metal_swap_evidence": metal_swap_evidence,
         "measured_request_count": measured_requests,
         "run": {
             "sample_count": 3,
@@ -3053,6 +3588,7 @@ def validate_ferrum_performance_lane(
         "physical_headroom_floor_bytes": lane[
             "physical_headroom_floor_bytes"
         ],
+        "metal_swap_evidence": copy.deepcopy(lane["metal_swap_evidence"]),
         "throughput_geometric_mean_ratio": geometric_mean,
         "max_cv": max(
             float(row["cv"]) for row in lane["summaries"].values()
@@ -4508,6 +5044,25 @@ def self_test() -> None:
         "scripts/release/bounded_command.py" in R2_CONTROL_PLANE_FILES,
         "bounded command must remain an R2 evidence-control-plane file",
     )
+    metal_resource = {
+        "physical_headroom_bytes": 8 * 1024**3,
+        "swap_start_bytes": 100,
+        "swap_end_bytes": 101,
+        "thermal_throttling_count": 0,
+    }
+    try:
+        validate_metal_resource_contract(metal_resource, "selftest legacy swap")
+        raise R2Error("legacy Metal swap growth unexpectedly passed without derived evidence")
+    except R2Error as error:
+        require(
+            "swap growth/thermal" in str(error),
+            "legacy Metal swap fallback rejected for the wrong reason",
+        )
+    validate_metal_resource_contract(
+        metal_resource,
+        "selftest derived swap",
+        {"classification": "host_global_swap_noise_candidate"},
+    )
     lifecycle_fixture: dict[str, dict[str, int]] = {}
     active_fixture: list[dict[str, Any]] = []
     cursor_ns = 10_000
@@ -4634,24 +5189,16 @@ def self_test() -> None:
         and not requires_active_floor("real-chat", 16, "metal"),
         "active-floor cell selection differs",
     )
-    validate_metal_resource_contract(
-        {
-            "physical_headroom_bytes": 2 * 1024**3,
-            "swap_start_bytes": 10,
-            "swap_end_bytes": 9,
-            "thermal_throttling_count": 0,
-        },
-        "decreasing-swap fixture",
-    )
-    validate_metal_resource_contract(
-        {
-            "physical_headroom_bytes": 2 * 1024**3,
-            "swap_start_bytes": 10,
-            "swap_end_bytes": 10,
-            "thermal_throttling_count": 0,
-        },
-        "stable-swap fixture",
-    )
+    stable_summary = {
+        "physical_headroom_bytes": 4 * 1024**3,
+        "swap_start_bytes": 10,
+        "swap_end_bytes": 10,
+        "thermal_throttling_count": 0,
+        "oom_count": 0,
+        "admission_error_count": 0,
+        "active_probe_retry_error_count": 0,
+    }
+    validate_metal_resource_contract(stable_summary, "stable-swap fixture")
     expect_reject(
         lambda: validate_metal_resource_contract(
             {
@@ -4669,18 +5216,6 @@ def self_test() -> None:
             {
                 "physical_headroom_bytes": 2 * 1024**3,
                 "swap_start_bytes": 10,
-                "swap_end_bytes": 11,
-                "thermal_throttling_count": 0,
-            },
-            "growing-swap fixture",
-        ),
-        "Metal swap growth",
-    )
-    expect_reject(
-        lambda: validate_metal_resource_contract(
-            {
-                "physical_headroom_bytes": 2 * 1024**3,
-                "swap_start_bytes": 10,
                 "swap_end_bytes": 10,
                 "thermal_throttling_count": 1,
             },
@@ -4688,6 +5223,151 @@ def self_test() -> None:
         ),
         "Metal thermal throttling",
     )
+    with tempfile.TemporaryDirectory(prefix="ferrum-metal-swap-selftest-") as swap_temp:
+        swap_root = Path(swap_temp)
+
+        def swap_fixture(
+            name: str,
+            values: list[int],
+            *,
+            summary_overrides: dict[str, Any] | None = None,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            path = swap_root / f"{name}.jsonl"
+            rows: list[dict[str, Any]] = [
+                {
+                    "record_type": "header",
+                    "collector_sha256": "a" * 64,
+                }
+            ]
+            rows.extend(
+                {
+                    "record_type": "sample",
+                    "sampled_at": (
+                        datetime(2026, 8, 13, tzinfo=timezone.utc)
+                        + timedelta(seconds=index)
+                    ).isoformat(),
+                    "swap_used_bytes": value,
+                }
+                for index, value in enumerate(values)
+            )
+            rows.append({"record_type": "footer"})
+            path.write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            summary = {
+                **stable_summary,
+                "swap_start_bytes": values[0],
+                "swap_end_bytes": values[-1],
+                **(summary_overrides or {}),
+            }
+            evidence = derive_metal_swap_scope_evidence(
+                path,
+                sha256(path),
+                summary,
+                label=f"{name} fixture",
+            )
+            return summary, {"scope": name, **evidence}
+
+        _, exact_swap = swap_fixture("exact-zero", [100] * 42)
+        require(
+            exact_swap["classification"] == "exact_zero"
+            and exact_swap["raw_step_count"] == 0
+            and exact_swap["raw_net_growth_bytes"] == 0,
+            "exact-zero Metal swap evidence differs",
+        )
+        noise_summary, noise_swap = swap_fixture(
+            "bounded-noise",
+            [100] * 10 + [100 + 768 * 1024] * 32,
+        )
+        require(
+            noise_swap["classification"] == "host_global_swap_noise_candidate"
+            and noise_swap["raw_step_count"] == 1
+            and noise_swap["raw_max_positive_step_bytes"] == 768 * 1024
+            and noise_swap["raw_net_growth_bytes"] == 768 * 1024,
+            "bounded Metal host-global swap-noise evidence differs",
+        )
+        validate_metal_resource_contract(
+            noise_summary, "bounded-noise fixture", noise_swap
+        )
+        lane_noise = aggregate_metal_swap_evidence(
+            [noise_swap, *({**exact_swap, "scope": f"exact-{index}"} for index in range(7))],
+            "bounded-noise lane fixture",
+        )
+        require(
+            lane_noise["classification"] == "host_global_swap_noise"
+            and lane_noise["scope_count"] == 8
+            and lane_noise["raw_positive_step_count"] == 1
+            and lane_noise["raw_total_positive_growth_bytes"] == 768 * 1024,
+            "lane-global Metal host swap-noise classification differs",
+        )
+        _, sustained_swap = swap_fixture(
+            "sustained-pressure",
+            [100] * 8
+            + [100 + 512 * 1024] * 2
+            + [100 + 768 * 1024] * 32,
+        )
+        require(
+            sustained_swap["classification"] == "swap_pressure",
+            "sustained Metal swap pressure was not classified",
+        )
+        expect_reject(
+            lambda: aggregate_metal_swap_evidence(
+                [
+                    sustained_swap,
+                    *(
+                        {**exact_swap, "scope": f"sustained-exact-{index}"}
+                        for index in range(7)
+                    ),
+                ],
+                "sustained-pressure lane fixture",
+            ),
+            "sustained Metal swap pressure",
+        )
+        _, m2_pressure = swap_fixture(
+            "m2-646mib-pressure",
+            [100] * 10 + [100 + 646 * 1024**2] * 32,
+        )
+        require(
+            m2_pressure["classification"] == "swap_pressure",
+            "646 MiB Metal swap growth must remain rejected",
+        )
+        expect_reject(
+            lambda: aggregate_metal_swap_evidence(
+                [
+                    noise_swap,
+                    {**noise_swap, "scope": "second-noise-step"},
+                    *(
+                        {**exact_swap, "scope": f"double-exact-{index}"}
+                        for index in range(6)
+                    ),
+                ],
+                "two-noise-step lane fixture",
+            ),
+            "second Metal host-global swap step",
+        )
+        _, unstable_noise = swap_fixture(
+            "unstable-noise",
+            [100] * 41 + [100 + 512 * 1024],
+        )
+        require(
+            unstable_noise["classification"]
+            == "host_global_swap_noise_candidate",
+            "single terminal swap step should remain a candidate until lane aggregation",
+        )
+        expect_reject(
+            lambda: aggregate_metal_swap_evidence(
+                [
+                    unstable_noise,
+                    *(
+                        {**exact_swap, "scope": f"unstable-exact-{index}"}
+                        for index in range(7)
+                    ),
+                ],
+                "unstable-noise lane fixture",
+            ),
+            "Metal host-global swap step without stable follow-up",
+        )
     source = {
         "git_sha": "a" * 40,
         "git_tree_sha": "b" * 40,

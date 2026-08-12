@@ -2,8 +2,10 @@
 """Collect one formal R2 Ferrum-only model/backend performance lane.
 
 The collector intentionally has no external-engine, legacy-binary, or ABBA
-execution path.  One Ferrum server process executes the complete backend cell
-matrix in order, followed by three independent ``ferrum run`` processes.
+execution path.  One Ferrum server process per epoch executes the remaining
+backend cell suffix in order; a validated completed-cell prefix may be resumed
+in an explicitly recorded later epoch.  Three independent ``ferrum run``
+processes follow the server matrix.
 Collection PASS means the immutable raw lane evidence is complete; the R2
 aggregate validator remains responsible for baseline and threshold decisions.
 """
@@ -43,6 +45,7 @@ SUPPORT_PATH = Path(collector_support.__file__).resolve()
 RESOURCE_SAMPLER_PATH = Path(collector_support.RESOURCE_SAMPLER_PATH).resolve()
 SCHEMA_VERSION = 1
 CONTRACT = "ferrum.runtime-vnext.r2.ferrum-collector.v1"
+CELL_CHECKPOINT_CONTRACT = "ferrum.runtime-vnext.r2.completed-cell-checkpoint.v1"
 R1_CORRECTNESS_ARTIFACT_TYPE = (
     "runtime_vnext_r1_product_correctness_manifest"
 )
@@ -585,16 +588,22 @@ def validate_cuda_bridge_evidence(
     *,
     backend: str,
     label: str,
+    expected_collector_sha256: str | None = None,
 ) -> None:
     evidence = resources.get("cuda_pid_namespace_bridge")
     if backend != "cuda":
         require(evidence is None, f"{label} unexpectedly contains a CUDA PID bridge")
         return
     require(isinstance(evidence, dict), f"{label} CUDA PID bridge evidence is missing")
+    collector_sha = expected_collector_sha256 or file_sha256(COLLECTOR_PATH)
+    require(
+        isinstance(collector_sha, str) and SHA256_RE.fullmatch(collector_sha) is not None,
+        f"{label} expected CUDA PID bridge collector identity is invalid",
+    )
     require(
         evidence.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
         and evidence.get("bridge_source_path") == COLLECTOR_RELATIVE_PATH
-        and evidence.get("bridge_source_sha256") == file_sha256(COLLECTOR_PATH)
+        and evidence.get("bridge_source_sha256") == collector_sha
         and evidence.get("product_environment_unchanged") is True
         and isinstance(evidence.get("sampler_environment_sha256"), str)
         and SHA256_RE.fullmatch(evidence["sampler_environment_sha256"]) is not None,
@@ -608,7 +617,7 @@ def validate_cuda_bridge_evidence(
     preflight = read_json(preflight_path)
     require(
         preflight.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
-        and preflight.get("collector_sha256") == file_sha256(COLLECTOR_PATH)
+        and preflight.get("collector_sha256") == collector_sha
         and preflight.get("compute_apps") == []
         and preflight.get("gpu_count") == 1
         and preflight.get("real_nvidia_smi_path") == evidence.get("real_nvidia_smi_path")
@@ -625,7 +634,7 @@ def validate_cuda_bridge_evidence(
         all(
             isinstance(row, dict)
             and row.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
-            and row.get("collector_sha256") == file_sha256(COLLECTOR_PATH)
+            and row.get("collector_sha256") == collector_sha
             and row.get("server_pid") == evidence.get("server_pid")
             and row.get("server_pgid") == evidence.get("server_pgid")
             and row.get("status") == "pass"
@@ -1013,12 +1022,19 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
     return config, context
 
 
-def collection_fingerprint(config: dict[str, Any], context: dict[str, Any]) -> str:
+def collection_fingerprint(
+    config: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    collector_sha256: str | None = None,
+    support_sha256: str | None = None,
+    resource_sampler_sha256: str | None = None,
+) -> str:
     material = {
         "contract": CONTRACT,
-        "collector_sha256": file_sha256(COLLECTOR_PATH),
-        "support_sha256": file_sha256(SUPPORT_PATH),
-        "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+        "collector_sha256": collector_sha256 or file_sha256(COLLECTOR_PATH),
+        "support_sha256": support_sha256 or file_sha256(SUPPORT_PATH),
+        "resource_sampler_sha256": resource_sampler_sha256 or file_sha256(RESOURCE_SAMPLER_PATH),
         "models_lock_sha256": file_sha256(context["models_lock_path"]),
         "correctness_manifest_sha256": file_sha256(context["correctness_path"]),
         "candidate_binary_sha256": file_sha256(context["binary_path"]),
@@ -1065,7 +1081,8 @@ def prepare_plan(root: Path, config: dict[str, Any], context: dict[str, Any], *,
         "backend": config["backend"],
         "hardware": copy.deepcopy(config["hardware"]),
         "profile_detail": "off",
-        "server_process_count": 1,
+        "server_process_count_per_epoch": 1,
+        "server_epoch_policy": "one fresh server process resumes after the validated completed-cell prefix",
         "server_cell_order": [copy.deepcopy(cell) for cell in expected_cells(config["backend"])],
         "run_serve_parity_probe": copy.deepcopy(run_parity_cell(config["backend"])),
         "run_process_count": RUN_SAMPLE_COUNT,
@@ -1086,7 +1103,41 @@ def prepare_plan(root: Path, config: dict[str, Any], context: dict[str, Any], *,
     }
     if plan_path.exists():
         require(resume, f"collection plan already exists; pass --resume: {plan_path}")
-        require(read_json(plan_path) == plan, "resume plan differs from frozen plan")
+        frozen_plan = read_json(plan_path)
+        frozen_collector = frozen_plan.get("collector")
+        require(isinstance(frozen_collector, dict), "frozen plan collector binding is missing")
+        frozen_collector_sha = frozen_collector.get("sha256")
+        frozen_support_sha = frozen_collector.get("support_sha256")
+        frozen_sampler_sha = frozen_collector.get("resource_sampler_sha256")
+        require(
+            isinstance(frozen_collector_sha, str)
+            and SHA256_RE.fullmatch(frozen_collector_sha) is not None,
+            "frozen plan collector SHA256 is invalid",
+        )
+        require(
+            isinstance(frozen_support_sha, str)
+            and SHA256_RE.fullmatch(frozen_support_sha) is not None
+            and isinstance(frozen_sampler_sha, str)
+            and SHA256_RE.fullmatch(frozen_sampler_sha) is not None,
+            "frozen plan support/sampler SHA256 is invalid",
+        )
+        frozen_fingerprint = collection_fingerprint(
+            config,
+            context,
+            collector_sha256=frozen_collector_sha,
+            support_sha256=frozen_support_sha,
+            resource_sampler_sha256=frozen_sampler_sha,
+        )
+        frozen_expected = copy.deepcopy(plan)
+        frozen_expected["collector"] = copy.deepcopy(frozen_collector)
+        frozen_expected["config_fingerprint"] = frozen_fingerprint
+        if "server_process_count" in frozen_plan and "server_process_count_per_epoch" not in frozen_plan:
+            require(frozen_plan.get("server_process_count") == 1, "legacy frozen plan server process count is invalid")
+            frozen_expected.pop("server_process_count_per_epoch")
+            frozen_expected.pop("server_epoch_policy")
+            frozen_expected["server_process_count"] = 1
+        require(frozen_plan == frozen_expected, "resume plan differs from frozen plan")
+        fingerprint = frozen_fingerprint
     else:
         atomic_write_json(plan_path, plan)
     return lane, fingerprint
@@ -1285,36 +1336,18 @@ def run_argv(binary: Path, effective: Path, config: dict[str, Any]) -> list[str]
     ]
 
 
-def start_cell_sampler(
-    root: Path,
+def cell_sampler_argv(
     attempt_dir: Path,
     session: dict[str, Any],
     config: dict[str, Any],
     cell: dict[str, Any],
-    cuda_preflight: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Start the shared sampler with a cell deadline longer than the benchmark."""
+) -> list[str]:
     identifier = cell_id(cell)
     stem = identifier.replace(":", "-")
     observations = attempt_dir / f"{stem}.resource-observations.jsonl"
     stop_file = attempt_dir / f"{stem}.resource-stop"
-    stdout_path = attempt_dir / f"{stem}.resource-sampler.stdout.log"
-    stderr_path = attempt_dir / f"{stem}.resource-sampler.stderr.log"
-    require(not observations.exists(), f"resource observation already exists: {observations}")
-    bridge = None
-    sampler_environment = collector_support.sanitized_environment()
-    if config["backend"] == "cuda":
-        require(cuda_preflight is not None, "CUDA sampler requires an idle process preflight")
-        bridge = prepare_cuda_bridge(
-            attempt_dir,
-            stem,
-            pid=session["pid"],
-            pgid=session["pgid"],
-            preflight=cuda_preflight,
-        )
-        sampler_environment = bridge["environment"]
     max_duration = int(math.ceil(float(config["server"]["command_timeout_sec"]))) + 120
-    argv = [
+    return [
         sys.executable,
         str(RESOURCE_SAMPLER_PATH),
         "--out",
@@ -1354,6 +1387,37 @@ def start_cell_sampler(
         "--active-path",
         ACTIVE_PROBE["path"],
     ]
+
+
+def start_cell_sampler(
+    root: Path,
+    attempt_dir: Path,
+    session: dict[str, Any],
+    config: dict[str, Any],
+    cell: dict[str, Any],
+    cuda_preflight: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Start the shared sampler with a cell deadline longer than the benchmark."""
+    identifier = cell_id(cell)
+    stem = identifier.replace(":", "-")
+    observations = attempt_dir / f"{stem}.resource-observations.jsonl"
+    stop_file = attempt_dir / f"{stem}.resource-stop"
+    stdout_path = attempt_dir / f"{stem}.resource-sampler.stdout.log"
+    stderr_path = attempt_dir / f"{stem}.resource-sampler.stderr.log"
+    require(not observations.exists(), f"resource observation already exists: {observations}")
+    bridge = None
+    sampler_environment = collector_support.sanitized_environment()
+    if config["backend"] == "cuda":
+        require(cuda_preflight is not None, "CUDA sampler requires an idle process preflight")
+        bridge = prepare_cuda_bridge(
+            attempt_dir,
+            stem,
+            pid=session["pid"],
+            pgid=session["pgid"],
+            preflight=cuda_preflight,
+        )
+        sampler_environment = bridge["environment"]
+    argv = cell_sampler_argv(attempt_dir, session, config, cell)
     stdout_handle = stdout_path.open("x", encoding="utf-8")
     stderr_handle = stderr_path.open("x", encoding="utf-8")
     process: subprocess.Popen[Any] | None = None
@@ -1779,7 +1843,9 @@ def cell_resource_evidence(
         requested_concurrency=record["concurrency"],
         typed_active_cap=config["typed_active_cap"],
         runtime_log_path=session["runtime_log_origin_path"],
-        runtime_log_evidence_path=Path(session["runtime_log_origin_path"]),
+        runtime_log_evidence_path=Path(
+            session.get("runtime_log_evidence_path", session["runtime_log_origin_path"])
+        ),
     )
     interval_path = observations.with_name(
         observations.name.replace(".resource-observations.jsonl", ".active-intervals.json")
@@ -1911,24 +1977,898 @@ def wait_for_quiescence(
     raise R2CollectorError(f"server failed to become quiescent after {name}")
 
 
+def checkpoint_path(lane: Path, sequence: int) -> Path:
+    return lane / "cell-checkpoints" / f"cell-{sequence:02d}.json"
+
+
+def require_chronological_prefix(sequences: list[int], label: str) -> None:
+    require(sequences == list(range(1, len(sequences) + 1)), f"{label} is not a chronological prefix")
+
+
+def frozen_collection_epoch(plan: dict[str, Any]) -> dict[str, str]:
+    collector = plan.get("collector")
+    require(isinstance(collector, dict), "frozen collector identity is missing")
+    epoch = {
+        "collector_sha256": collector.get("sha256"),
+        "support_sha256": collector.get("support_sha256"),
+        "resource_sampler_sha256": collector.get("resource_sampler_sha256"),
+    }
+    require(
+        all(isinstance(value, str) and SHA256_RE.fullmatch(value) is not None for value in epoch.values()),
+        "frozen collector epoch identity is invalid",
+    )
+    return epoch
+
+
+def require_legacy_finalized_server_shape(
+    session: Any, reports: Any, parity: Any, backend: str
+) -> None:
+    require(
+        isinstance(session, dict)
+        and session.get("server_process_ordinal") == 1
+        and session.get("shutdown_clean") is True,
+        "legacy server bundle is not a clean single-process final bundle",
+    )
+    require(
+        isinstance(reports, list)
+        and len(reports) == len(expected_cells(backend))
+        and [record.get("sequence") for record in reports]
+        == list(range(1, len(expected_cells(backend)) + 1))
+        and isinstance(parity, dict)
+        and parity.get("sequence") == len(expected_cells(backend)) + 1,
+        "legacy server bundle is incomplete",
+    )
+
+
+def portable_artifact_argv(argv: Any, label: str) -> list[str]:
+    require(isinstance(argv, list) and all(isinstance(value, str) for value in argv), f"{label} argv is invalid")
+    marker = f"{os.sep}r2-ferrum{os.sep}"
+    return [f"<artifact-root>{marker}{value.split(marker, 1)[1]}" if marker in value else value for value in argv]
+
+
+def observation_active_envelope(
+    observations: Path,
+    *,
+    session_id: str,
+    identifier: str,
+    resource_sampler_sha256: str | None = None,
+) -> tuple[str, str]:
+    """Validate a legacy sampler stream and return its conservative active envelope."""
+    try:
+        rows = [json.loads(line) for line in observations.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise R2CollectorError(f"cannot read checkpoint observations {observations}: {exc}") from exc
+    require(len(rows) >= 4, f"{identifier} checkpoint observations are incomplete")
+    header = rows[0]
+    footer = rows[-1]
+    require(header.get("record_type") == "header", f"{identifier} checkpoint header is missing")
+    require(footer.get("record_type") == "footer", f"{identifier} checkpoint footer is missing")
+    require(
+        sum(row.get("record_type") == "header" for row in rows) == 1
+        and sum(row.get("record_type") == "footer" for row in rows) == 1,
+        f"{identifier} checkpoint header/footer is not unique",
+    )
+    require(
+        header.get("session_id") == session_id and header.get("cell_id") == identifier,
+        f"{identifier} checkpoint observation identity mismatch",
+    )
+    if resource_sampler_sha256 is not None:
+        require(
+            header.get("collector_sha256") == resource_sampler_sha256,
+            f"{identifier} checkpoint sampler identity mismatch",
+        )
+    samples = [row for row in rows[1:-1] if row.get("record_type") == "sample"]
+    require(len(samples) == len(rows) - 2, f"{identifier} checkpoint has records after/between its footer")
+    require(footer.get("exit_reason") == "stop-file", f"{identifier} checkpoint sampler did not stop cleanly")
+    require(footer.get("sample_count") == len(samples), f"{identifier} checkpoint footer sample count mismatch")
+    require(
+        [row.get("sequence") for row in samples] == list(range(len(samples))),
+        f"{identifier} checkpoint sample sequence is not contiguous",
+    )
+    active_indexes = [
+        index
+        for index, row in enumerate(samples)
+        if isinstance(row.get("active_requests"), int) and row["active_requests"] > 0
+    ]
+    require(active_indexes, f"{identifier} checkpoint has no observed active measurement envelope")
+    first_active = active_indexes[0]
+    last_active = active_indexes[-1]
+    require(
+        first_active > 0 and last_active + 1 < len(samples),
+        f"{identifier} checkpoint active envelope lacks idle brackets",
+    )
+    before = samples[first_active - 1]
+    after = samples[last_active + 1]
+    require(
+        before.get("active_requests") == 0 and after.get("active_requests") == 0,
+        f"{identifier} checkpoint active envelope is not bracketed by idle samples",
+    )
+    active = [samples[index] for index in active_indexes]
+    require(
+        all(row.get("process_alive") is True and not row.get("active_probe_errors") for row in active),
+        f"{identifier} checkpoint active envelope is not healthy",
+    )
+    started_at = before.get("sampled_at")
+    finished_at = after.get("sampled_at")
+    require(
+        isinstance(started_at, str)
+        and isinstance(finished_at, str)
+        and duration_seconds(started_at, finished_at) > 0,
+        f"{identifier} checkpoint active envelope timestamps are invalid",
+    )
+    return started_at, finished_at
+
+
+def checkpoint_probe_refs(root: Path, probe: dict[str, Any], label: str) -> dict[str, Any]:
+    receipt_origin = probe.get("receipt_origin_path")
+    body_origin = probe.get("body_origin_path")
+    require(isinstance(receipt_origin, str) and isinstance(body_origin, str), f"{label} probe origins are missing")
+    receipt_path = Path(receipt_origin).resolve()
+    body_path = Path(body_origin).resolve()
+    receipt = read_json(receipt_path)
+    body = read_json(body_path)
+    require(receipt.get("returncode") == 0 and receipt.get("http_status") == 200, f"{label} probe failed")
+    require(
+        receipt.get("body_sha256") == file_sha256(body_path)
+        and receipt.get("body_size_bytes") == body_path.stat().st_size,
+        f"{label} probe body binding mismatch",
+    )
+    engine = body.get("engine")
+    admission = body.get("admission")
+    require(isinstance(engine, dict), f"{label} probe engine state is missing")
+    require(
+        engine.get("active_requests") == 0
+        and engine.get("queued_requests", 0) == 0
+        and (admission.get("queue_depth", 0) if isinstance(admission, dict) else 0) == 0,
+        f"{label} post-cell probe is active",
+    )
+    return {
+        "status": "quiescent",
+        "receipt": artifact_ref(root, receipt_path, kind="post-cell-idle-receipt"),
+        "body": artifact_ref(root, body_path, kind="post-cell-idle-body"),
+    }
+
+
+def require_completed_attempt_cleanup(attempt_dir: Path, label: str) -> dict[str, Any]:
+    failure_path = attempt_dir / "failure.json"
+    require(failure_path.is_file(), f"{label} attempt has no finalized cleanup receipt")
+    failure = read_json(failure_path)
+    require(failure.get("cleanup_process_group_gone") is True, f"{label} attempt process group survived cleanup")
+    require(failure.get("cleanup_error") is None, f"{label} attempt cleanup reported an error")
+    require(
+        failure.get("cleanup_returncode") == 0,
+        f"{label} attempt cleanup returncode is not zero",
+    )
+    return failure
+
+
+def checkpoint_cuda_bridge(root: Path, bridge: dict[str, Any] | None) -> dict[str, Any] | None:
+    if bridge is None:
+        return None
+    real_binary = Path(bridge["real_binary"]).resolve()
+    return {
+        "wrapper": artifact_ref(root, Path(bridge["wrapper"]), kind="cuda-pid-namespace-wrapper"),
+        "preflight": artifact_ref(root, Path(bridge["preflight"]), kind="cuda-pid-namespace-preflight"),
+        "audit": artifact_ref(root, Path(bridge["audit"]), kind="cuda-pid-namespace-audit"),
+        "real_nvidia_smi_path": str(real_binary),
+        "real_nvidia_smi_sha256": file_sha256(real_binary),
+        "server_pid": bridge["server_pid"],
+        "server_pgid": bridge["server_pgid"],
+    }
+
+
+def restore_checkpoint_cuda_bridge(root: Path, raw: Any, label: str) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    require(isinstance(raw, dict), f"{label} CUDA bridge checkpoint is invalid")
+    wrapper = validate_artifact_ref(root, raw.get("wrapper"), f"{label}.cuda_bridge.wrapper")
+    preflight = validate_artifact_ref(root, raw.get("preflight"), f"{label}.cuda_bridge.preflight")
+    audit = validate_artifact_ref(root, raw.get("audit"), f"{label}.cuda_bridge.audit")
+    real_binary_raw = raw.get("real_nvidia_smi_path")
+    require(isinstance(real_binary_raw, str) and real_binary_raw, f"{label} CUDA bridge binary path is invalid")
+    real_binary = Path(real_binary_raw).resolve()
+    require(
+        real_binary.is_file() and file_sha256(real_binary) == raw.get("real_nvidia_smi_sha256"),
+        f"{label} CUDA bridge binary changed",
+    )
+    return {
+        "wrapper": wrapper,
+        "preflight": preflight,
+        "audit": audit,
+        "real_binary": real_binary,
+        "server_pid": raw.get("server_pid"),
+        "server_pgid": raw.get("server_pgid"),
+    }
+
+
+def make_completed_cell_checkpoint(
+    root: Path,
+    lane: Path,
+    fingerprint: str,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    attempt_dir: Path,
+    session: dict[str, Any],
+    record: dict[str, Any],
+    sampler: dict[str, Any],
+    quiescence: dict[str, Any],
+    *,
+    provenance: str,
+    collection_epoch: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    sequence = record["sequence"]
+    path = checkpoint_path(lane, sequence)
+    probe = checkpoint_probe_refs(root, quiescence["probe"], f"cell {sequence}")
+    identities = collection_epoch or {
+        "collector_sha256": file_sha256(COLLECTOR_PATH),
+        "support_sha256": file_sha256(SUPPORT_PATH),
+        "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+    }
+    require(
+        set(identities) == {"collector_sha256", "support_sha256", "resource_sampler_sha256"}
+        and all(isinstance(value, str) and SHA256_RE.fullmatch(value) is not None for value in identities.values()),
+        "completed cell collection epoch identity is invalid",
+    )
+    epoch = {
+        key: copy.deepcopy(session[key])
+        for key in (
+            "session_id",
+            "pid",
+            "pgid",
+            "process_start_marker",
+            "process_start_source",
+            "base_url",
+            "started_at",
+            "runtime_log_origin_path",
+        )
+    }
+    if provenance == "legacy-active-envelope":
+        epoch["runtime_log_evidence"] = artifact_ref(
+            root,
+            Path(session.get("runtime_log_evidence_path", session["runtime_log_origin_path"])),
+            kind="server-runtime-log",
+        )
+        epoch["scheduler_trace"] = artifact_ref(
+            root, attempt_dir / "server-scheduler-trace.jsonl", kind="scheduler-trace"
+        )
+        epoch["product_effective_config"] = artifact_ref(
+            root, attempt_dir / "server-effective-config.json", kind="product-effective-config"
+        )
+    document = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": CELL_CHECKPOINT_CONTRACT,
+        "artifact_type": "runtime_vnext_r2_completed_cell_checkpoint",
+        "config_fingerprint": fingerprint,
+        "normalized_config_sha256": file_sha256(lane / "config.normalized.json"),
+        "source_git_sha": config["candidate"]["source_git_sha"],
+        "source_tree_sha": config["candidate"]["source_tree_sha"],
+        "candidate_binary_sha256": inputs["binary"]["sha256"],
+        "collection_epoch": copy.deepcopy(identities),
+        "sequence": sequence,
+        "cell_id": record["cell_id"],
+        "completion_provenance": provenance,
+        "attempt_dir": artifact_relative(root, attempt_dir),
+        "epoch": epoch,
+        "process_receipt": artifact_ref(root, attempt_dir / "server-process-receipt.json", kind="server-process-receipt"),
+        "attempt_cleanup": (
+            artifact_ref(root, attempt_dir / "failure.json", kind="attempt-cleanup-receipt")
+            if (attempt_dir / "failure.json").is_file()
+            else None
+        ),
+        "record": copy.deepcopy(record),
+        "sampler": {
+            "argv": copy.deepcopy(sampler["argv"]),
+            "observations": artifact_ref(root, sampler["observations"], kind="resource-observations"),
+            "stdout": artifact_ref(root, sampler["stdout_path"], kind="resource-sampler-stdout"),
+            "stderr": artifact_ref(root, sampler["stderr_path"], kind="resource-sampler-stderr"),
+            "cuda_pid_namespace_bridge": checkpoint_cuda_bridge(
+                root, sampler.get("cuda_pid_namespace_bridge")
+            ),
+        },
+        "post_cell_idle": probe,
+    }
+    if path.exists():
+        require(read_json(path) == document, f"completed cell checkpoint changed: {path}")
+    else:
+        atomic_write_json(path, document)
+    return document
+
+
+def finalize_attempt_cell_checkpoints(root: Path, lane: Path, attempt_dir: Path) -> None:
+    """Bind mutable epoch logs only after the epoch process is gone."""
+    for path in sorted((lane / "cell-checkpoints").glob("cell-*.json")):
+        checkpoint = read_json(path)
+        if checkpoint.get("attempt_dir") != artifact_relative(root, attempt_dir):
+            continue
+        epoch = checkpoint.get("epoch")
+        require(isinstance(epoch, dict), f"checkpoint epoch is missing: {path}")
+        if "runtime_log_evidence" in epoch:
+            continue
+        epoch["runtime_log_evidence"] = artifact_ref(
+            root, attempt_dir / "server-runtime.log", kind="server-runtime-log"
+        )
+        epoch["scheduler_trace"] = artifact_ref(
+            root, attempt_dir / "server-scheduler-trace.jsonl", kind="scheduler-trace"
+        )
+        epoch["product_effective_config"] = artifact_ref(
+            root, attempt_dir / "server-effective-config.json", kind="product-effective-config"
+        )
+        failure_path = attempt_dir / "failure.json"
+        checkpoint["attempt_cleanup"] = (
+            artifact_ref(root, failure_path, kind="attempt-cleanup-receipt")
+            if failure_path.is_file()
+            else None
+        )
+        atomic_write_json(path, checkpoint)
+
+
+def legacy_probe(attempt_dir: Path, cell: dict[str, Any]) -> dict[str, Any] | None:
+    prefix = f"post-{cell['sequence']:02d}-{cell['dataset']}-c{cell['concurrency']}-"
+    receipts = sorted(attempt_dir.glob(f"{prefix}*.receipt.json"))
+    if len(receipts) != 1:
+        return None
+    receipt = read_json(receipts[0])
+    body = receipts[0].with_name(receipts[0].name.replace(".receipt.json", ".body.json"))
+    if not body.is_file():
+        return None
+    return {"receipt_origin_path": str(receipts[0]), "body_origin_path": str(body), "receipt": receipt}
+
+
+def legacy_cell_has_completion_envelope(attempt_dir: Path, cell: dict[str, Any]) -> bool:
+    stem = cell_id(cell).replace(":", "-")
+    required = [
+        attempt_dir / f"{stem}.bench-report.json",
+        attempt_dir / f"{stem}.bench-request-evidence.json",
+        attempt_dir / f"{stem}.bench.stdout.log",
+        attempt_dir / f"{stem}.bench.stderr.log",
+        attempt_dir / f"{stem}.resource-observations.jsonl",
+        attempt_dir / f"{stem}.resource-sampler.stdout.log",
+        attempt_dir / f"{stem}.resource-sampler.stderr.log",
+    ]
+    if not all(path.is_file() and path.stat().st_size > 0 for path in required):
+        return False
+    try:
+        last = json.loads(required[4].read_text(encoding="utf-8").splitlines()[-1])
+    except (OSError, IndexError, json.JSONDecodeError):
+        return False
+    return last.get("record_type") == "footer" and legacy_probe(attempt_dir, cell) is not None
+
+
+def recover_legacy_cell_checkpoint(
+    root: Path,
+    lane: Path,
+    fingerprint: str,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    attempt_dir: Path,
+    cell: dict[str, Any],
+) -> dict[str, Any] | None:
+    require(
+        config["backend"] == "metal",
+        "legacy completed-cell import is only defined for the audited Metal active-envelope artifact",
+    )
+    identifier = cell_id(cell)
+    stem = identifier.replace(":", "-")
+    paths = {
+        "report": attempt_dir / f"{stem}.bench-report.json",
+        "request": attempt_dir / f"{stem}.bench-request-evidence.json",
+        "stdout": attempt_dir / f"{stem}.bench.stdout.log",
+        "stderr": attempt_dir / f"{stem}.bench.stderr.log",
+        "observations": attempt_dir / f"{stem}.resource-observations.jsonl",
+        "sampler_stdout": attempt_dir / f"{stem}.resource-sampler.stdout.log",
+        "sampler_stderr": attempt_dir / f"{stem}.resource-sampler.stderr.log",
+    }
+    probe = legacy_probe(attempt_dir, cell)
+    if not all(path.is_file() and path.stat().st_size > 0 for path in paths.values()) or probe is None:
+        return None
+    failure = require_completed_attempt_cleanup(attempt_dir, identifier)
+    receipt = read_json(attempt_dir / "server-process-receipt.json")
+    observation_header = json.loads(paths["observations"].read_text(encoding="utf-8").splitlines()[0])
+    session_id = observation_header.get("session_id")
+    require(isinstance(session_id, str) and session_id, f"{identifier} legacy session id is missing")
+    frozen_collector = read_json(lane / "plan.json").get("collector")
+    require(isinstance(frozen_collector, dict), f"{identifier} frozen collector identity is missing")
+    legacy_epoch = {
+        "collector_sha256": frozen_collector.get("sha256"),
+        "support_sha256": frozen_collector.get("support_sha256"),
+        "resource_sampler_sha256": frozen_collector.get("resource_sampler_sha256"),
+    }
+    started_at, finished_at = observation_active_envelope(
+        paths["observations"],
+        session_id=session_id,
+        identifier=identifier,
+        resource_sampler_sha256=legacy_epoch["resource_sampler_sha256"],
+    )
+    report = read_json(paths["report"])
+    validate_bench_report(report, config, cell)
+    request = read_json(paths["request"])
+    require(request.get("cell") == cell, f"{identifier} request sidecar cell mismatch")
+    validate_artifact_ref(root, request.get("source_report"), f"{identifier} request sidecar source")
+    session = {
+        "session_id": session_id,
+        "pid": receipt.get("pid"),
+        "pgid": receipt.get("pgid"),
+        "process_start_marker": receipt.get("process_start_marker"),
+        "process_start_source": receipt.get("process_start_source"),
+        "base_url": f"http://{config['server']['host']}:{config['server']['port']}",
+        "started_at": receipt.get("captured_at"),
+        "finished_at": failure.get("failed_at"),
+        "runtime_log_origin_path": observation_header.get("runtime_log_path"),
+        "runtime_log_evidence_path": str(attempt_dir / "server-runtime.log"),
+    }
+    require(
+        isinstance(session["pid"], int)
+        and isinstance(session["pgid"], int)
+        and session["pid"] == session["pgid"],
+        f"{identifier} legacy process receipt is invalid",
+    )
+    bench = bench_argv(inputs["binary_path"], paths["report"], config, inputs, cell)
+    record = {
+        "sequence": cell["sequence"],
+        "cell_id": identifier,
+        "dataset": cell["dataset"],
+        "concurrency": cell["concurrency"],
+        "num_prompts": cell["num_prompts"],
+        "n_repeats": 3,
+        "warmup_requests": WARMUP_REQUESTS,
+        "formal_matrix_cell": cell.get("formal_matrix_cell", True),
+        "session_id": session_id,
+        "server_pid": session["pid"],
+        "candidate_binary_sha256": inputs["binary"]["sha256"],
+        "bench_argv": bench,
+        "bench_argv_sha256": canonical_json_sha256(bench),
+        "environment": copy.deepcopy(config["candidate"]["env"]),
+        "environment_sha256": canonical_json_sha256(config["candidate"]["env"]),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_sec": duration_seconds(started_at, finished_at),
+        "returncode": 0,
+        "measurement_window_source": "legacy-active-envelope",
+        "measurement_window_method": "last idle sample before first active through first idle sample after last active",
+        "stdout": artifact_ref(root, paths["stdout"], kind="bench-stdout"),
+        "stderr": artifact_ref(root, paths["stderr"], kind="bench-stderr"),
+        "raw_report": artifact_ref(root, paths["report"], kind="raw-bench-report"),
+        "raw_request_evidence": artifact_ref(root, paths["request"], kind="bench-request-evidence-sidecar"),
+    }
+    sampler = {
+        "argv": cell_sampler_argv(attempt_dir, session, config, cell),
+        "observations": paths["observations"],
+        "stdout_path": paths["sampler_stdout"],
+        "stderr_path": paths["sampler_stderr"],
+        "cuda_pid_namespace_bridge": None,
+    }
+    quiescence = {"probe": probe}
+    was_present = checkpoint_path(lane, cell["sequence"]).exists()
+    checkpoint = make_completed_cell_checkpoint(
+        root,
+        lane,
+        fingerprint,
+        config,
+        inputs,
+        attempt_dir,
+        session,
+        record,
+        sampler,
+        quiescence,
+        provenance="legacy-active-envelope",
+        collection_epoch=legacy_epoch,
+    )
+    if not was_present:
+        checkpoint_file = checkpoint_path(lane, cell["sequence"])
+        collector_support.append_jsonl(
+            lane / "command-log.jsonl",
+            {
+                "event": "legacy-completed-cell-import",
+                "imported_at": now_iso(),
+                "cell_id": identifier,
+                "sequence": cell["sequence"],
+                "completion_provenance": "legacy-active-envelope",
+                "checkpoint": artifact_relative(root, checkpoint_file),
+                "checkpoint_sha256": file_sha256(checkpoint_file),
+                "source_attempt": artifact_relative(root, attempt_dir),
+                "collection_epoch": legacy_epoch,
+            },
+        )
+    return checkpoint
+
+
+def validate_completed_cell_checkpoint(
+    root: Path,
+    lane: Path,
+    fingerprint: str,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    checkpoint: dict[str, Any],
+    cell: dict[str, Any],
+    *,
+    finalized_session: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    identifier = cell_id(cell)
+    require(checkpoint.get("contract") == CELL_CHECKPOINT_CONTRACT, f"{identifier} checkpoint contract mismatch")
+    require(checkpoint.get("config_fingerprint") == fingerprint, f"{identifier} checkpoint fingerprint mismatch")
+    require(
+        checkpoint.get("normalized_config_sha256") == file_sha256(lane / "config.normalized.json")
+        and checkpoint.get("source_git_sha") == config["candidate"]["source_git_sha"]
+        and checkpoint.get("source_tree_sha") == config["candidate"]["source_tree_sha"]
+        and checkpoint.get("candidate_binary_sha256") == inputs["binary"]["sha256"],
+        f"{identifier} checkpoint source/config/binary binding mismatch",
+    )
+    require(
+        checkpoint.get("sequence") == cell["sequence"] and checkpoint.get("cell_id") == identifier,
+        f"{identifier} checkpoint order mismatch",
+    )
+    collection_epoch = checkpoint.get("collection_epoch")
+    require(
+        isinstance(collection_epoch, dict)
+        and set(collection_epoch) == {"collector_sha256", "support_sha256", "resource_sampler_sha256"}
+        and all(isinstance(value, str) and SHA256_RE.fullmatch(value) is not None for value in collection_epoch.values()),
+        f"{identifier} checkpoint collection epoch identity is invalid",
+    )
+    provenance = checkpoint.get("completion_provenance")
+    if provenance == "legacy-active-envelope":
+        frozen_collector = read_json(lane / "plan.json").get("collector")
+        expected_epoch = {
+            "collector_sha256": frozen_collector.get("sha256") if isinstance(frozen_collector, dict) else None,
+            "support_sha256": frozen_collector.get("support_sha256") if isinstance(frozen_collector, dict) else None,
+            "resource_sampler_sha256": (
+                frozen_collector.get("resource_sampler_sha256") if isinstance(frozen_collector, dict) else None
+            ),
+        }
+    else:
+        require(provenance == "native-completed-cell", f"{identifier} checkpoint provenance is invalid")
+        expected_epoch = {
+            "collector_sha256": file_sha256(COLLECTOR_PATH),
+            "support_sha256": file_sha256(SUPPORT_PATH),
+            "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+        }
+    require(collection_epoch == expected_epoch, f"{identifier} checkpoint collection epoch binding mismatch")
+    attempt_relative = checkpoint.get("attempt_dir")
+    require(isinstance(attempt_relative, str) and not Path(attempt_relative).is_absolute(), f"{identifier} checkpoint attempt path is invalid")
+    attempt_dir = (root / attempt_relative).resolve()
+    cleanup_ref = checkpoint.get("attempt_cleanup")
+    if cleanup_ref is not None:
+        cleanup_path = validate_artifact_ref(root, cleanup_ref, f"{identifier}.attempt_cleanup")
+        require(cleanup_path == attempt_dir / "failure.json", f"{identifier} cleanup receipt path mismatch")
+        failure = require_completed_attempt_cleanup(attempt_dir, identifier)
+    else:
+        require(not (attempt_dir / "failure.json").exists(), f"{identifier} cleanup receipt is unbound")
+        failure = None
+    process_receipt_path = validate_artifact_ref(
+        root, checkpoint.get("process_receipt"), f"{identifier}.process_receipt"
+    )
+    process_receipt = read_json(process_receipt_path)
+    record = checkpoint.get("record")
+    epoch = checkpoint.get("epoch")
+    sampler_document = checkpoint.get("sampler")
+    require(isinstance(record, dict) and isinstance(epoch, dict) and isinstance(sampler_document, dict), f"{identifier} checkpoint payload is incomplete")
+    expected_server_argv, _, _ = server_argv(inputs["binary_path"], attempt_dir, config)
+    received_server_argv = process_receipt.get("argv")
+    require(
+        portable_artifact_argv(received_server_argv, f"{identifier} server")
+        == portable_artifact_argv(expected_server_argv, f"{identifier} expected server")
+        and process_receipt.get("argv_sha256") == canonical_json_sha256(received_server_argv)
+        and process_receipt.get("environment") == config["candidate"]["env"]
+        and process_receipt.get("environment_sha256") == canonical_json_sha256(config["candidate"]["env"]),
+        f"{identifier} checkpoint server process binding mismatch",
+    )
+    require(
+        epoch.get("pid") == process_receipt.get("pid")
+        and epoch.get("pgid") == process_receipt.get("pgid")
+        and epoch.get("process_start_marker") == process_receipt.get("process_start_marker")
+        and epoch.get("pid") == epoch.get("pgid"),
+        f"{identifier} checkpoint epoch/process receipt mismatch",
+    )
+    require(record.get("sequence") == cell["sequence"] and record.get("cell_id") == identifier, f"{identifier} checkpoint record mismatch")
+    report_path = validate_artifact_ref(root, record.get("raw_report"), f"{identifier}.raw_report")
+    validate_bench_report(read_json(report_path), config, cell)
+    expected_bench = bench_argv(inputs["binary_path"], report_path, config, inputs, cell)
+    received_bench = record.get("bench_argv")
+    require(
+        portable_artifact_argv(received_bench, f"{identifier} benchmark")
+        == portable_artifact_argv(expected_bench, f"{identifier} expected benchmark")
+        and record.get("bench_argv_sha256") == canonical_json_sha256(received_bench)
+        and record.get("candidate_binary_sha256") == inputs["binary"]["sha256"],
+        f"{identifier} checkpoint benchmark binding mismatch",
+    )
+    for key in ("stdout", "stderr"):
+        validate_artifact_ref(root, record.get(key), f"{identifier}.{key}")
+    request_path = validate_artifact_ref(
+        root, record.get("raw_request_evidence"), f"{identifier}.raw_request_evidence"
+    )
+    request = read_json(request_path)
+    require(request.get("cell") == cell, f"{identifier} checkpoint request evidence cell mismatch")
+    require(
+        validate_artifact_ref(root, request.get("source_report"), f"{identifier}.request.source_report")
+        == report_path,
+        f"{identifier} checkpoint request evidence report mismatch",
+    )
+    observations = validate_artifact_ref(root, sampler_document.get("observations"), f"{identifier}.observations")
+    require(
+        portable_artifact_argv(sampler_document.get("argv"), f"{identifier} sampler")
+        == portable_artifact_argv(
+            cell_sampler_argv(attempt_dir, epoch, config, cell),
+            f"{identifier} expected sampler",
+        ),
+        f"{identifier} checkpoint sampler argv mismatch",
+    )
+    for key in ("stdout", "stderr"):
+        validate_artifact_ref(root, sampler_document.get(key), f"{identifier}.sampler.{key}")
+    observation_active_envelope(
+        observations,
+        session_id=epoch.get("session_id"),
+        identifier=identifier,
+        resource_sampler_sha256=collection_epoch["resource_sampler_sha256"],
+    )
+    post = checkpoint.get("post_cell_idle")
+    require(isinstance(post, dict) and post.get("status") == "quiescent", f"{identifier} checkpoint post-cell idle proof is missing")
+    receipt_path = validate_artifact_ref(root, post.get("receipt"), f"{identifier}.post_idle.receipt")
+    body_path = validate_artifact_ref(root, post.get("body"), f"{identifier}.post_idle.body")
+    checkpoint_probe_refs(
+        root,
+        {"receipt_origin_path": str(receipt_path), "body_origin_path": str(body_path)},
+        identifier,
+    )
+    epoch_session = copy.deepcopy(epoch)
+    epoch_session["runtime_log_evidence_path"] = str(
+        validate_artifact_ref(
+            root,
+            epoch.get("runtime_log_evidence"),
+            f"{identifier}.epoch.runtime_log_evidence",
+        )
+    )
+    validate_artifact_ref(root, epoch.get("scheduler_trace"), f"{identifier}.epoch.scheduler_trace")
+    product_path = validate_artifact_ref(
+        root, epoch.get("product_effective_config"), f"{identifier}.epoch.product_effective_config"
+    )
+    product = read_json(product_path)
+    require(
+        isinstance(product.get("admission"), dict)
+        and product["admission"].get("effective_max_concurrent") == config["typed_active_cap"],
+        f"{identifier} checkpoint effective active cap mismatch",
+    )
+    if failure is not None:
+        epoch_session["finished_at"] = failure["failed_at"]
+    else:
+        require(
+            isinstance(finalized_session, dict)
+            and finalized_session.get("session_id") == epoch.get("session_id")
+            and finalized_session.get("shutdown_clean") is True
+            and isinstance(finalized_session.get("returncode"), int),
+            f"{identifier} checkpoint has neither failed-attempt cleanup nor a clean finalized epoch",
+        )
+        epoch_session["finished_at"] = finalized_session["finished_at"]
+    sampler = {
+        "argv": copy.deepcopy(sampler_document.get("argv")),
+        "observations": observations,
+        "cuda_pid_namespace_bridge": restore_checkpoint_cuda_bridge(
+            root, sampler_document.get("cuda_pid_namespace_bridge"), identifier
+        ),
+    }
+    record = copy.deepcopy(record)
+    record["resources"] = cell_resource_evidence(root, epoch_session, record, sampler, config)
+    return record, checkpoint, epoch_session
+
+
+def load_completed_cell_prefix(
+    root: Path,
+    lane: Path,
+    fingerprint: str,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    *,
+    resume: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
+    checkpoint_dir = lane / "cell-checkpoints"
+    existing_paths = sorted(checkpoint_dir.glob("cell-*.json")) if checkpoint_dir.is_dir() else []
+    existing_sequences = []
+    for path in existing_paths:
+        match = re.fullmatch(r"cell-(\d+)\.json", path.name)
+        require(match is not None, f"invalid completed-cell checkpoint name: {path}")
+        existing_sequences.append(int(match.group(1)))
+    require_chronological_prefix(existing_sequences, "completed-cell resume state")
+    if resume and not existing_paths:
+        legacy_completed: list[tuple[Path, dict[str, Any]]] = []
+        for attempt_dir in sorted((lane / "attempts").glob("server-*")) if (lane / "attempts").is_dir() else []:
+            for cell in cells:
+                if legacy_cell_has_completion_envelope(attempt_dir, cell):
+                    legacy_completed.append((attempt_dir, cell))
+        sequences = sorted({cell["sequence"] for _, cell in legacy_completed})
+        require_chronological_prefix(sequences, "legacy completed-cell state")
+        for expected_sequence in sequences:
+            matches = [(attempt, cell) for attempt, cell in legacy_completed if cell["sequence"] == expected_sequence]
+            require(len(matches) == 1, f"legacy cell {expected_sequence} has ambiguous completed attempts")
+            attempt, cell = matches[0]
+            checkpoint = recover_legacy_cell_checkpoint(root, lane, fingerprint, config, inputs, attempt, cell)
+            require(checkpoint is not None, f"legacy cell {expected_sequence} is not safely recoverable")
+        existing_paths = [checkpoint_path(lane, sequence) for sequence in sequences]
+    require(not existing_paths or resume, "completed cell checkpoints require --resume")
+    records: list[dict[str, Any]] = []
+    checkpoints: list[dict[str, Any]] = []
+    epochs: list[dict[str, Any]] = []
+    for path, cell in zip(existing_paths, cells):
+        record, checkpoint, epoch = validate_completed_cell_checkpoint(
+            root, lane, fingerprint, config, inputs, read_json(path), cell
+        )
+        records.append(record)
+        checkpoints.append(checkpoint)
+        epochs.append(epoch)
+    return records, checkpoints, epochs
+
+
+def recovered_session_epoch_rows(
+    root: Path,
+    lane: Path,
+    checkpoints: list[dict[str, Any]],
+    epochs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    for checkpoint, epoch in zip(checkpoints, epochs):
+        session_id = epoch["session_id"]
+        row = grouped.setdefault(
+            session_id,
+            {
+                "kind": "recovered-completed-cell",
+                "session_id": session_id,
+                "collection_epoch": copy.deepcopy(checkpoint["collection_epoch"]),
+                "completed_cell_sequences": [],
+                "checkpoints": [],
+            },
+        )
+        require(
+            row["collection_epoch"] == checkpoint["collection_epoch"],
+            f"recovered session {session_id} changes collection identity",
+        )
+        row["completed_cell_sequences"].append(checkpoint["sequence"])
+        row["checkpoints"].append(
+            artifact_ref(
+                root,
+                checkpoint_path(lane, checkpoint["sequence"]),
+                kind="completed-cell-checkpoint",
+            )
+        )
+    return list(grouped.values())
+
+
+def finalize_recovered_only_server_bundle(
+    root: Path,
+    lane: Path,
+    fingerprint: str,
+    config: dict[str, Any],
+    inputs: dict[str, Any],
+    records: list[dict[str, Any]],
+    checkpoints: list[dict[str, Any]],
+    epochs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    grouped_epochs = recovered_session_epoch_rows(root, lane, checkpoints, epochs)
+    require(grouped_epochs, "recovered-only server bundle has no epochs")
+    last_epoch = epochs[-1]
+    last_checkpoint = checkpoints[-1]
+    attempt_dir = (root / last_checkpoint["attempt_dir"]).resolve()
+    cleanup = require_completed_attempt_cleanup(attempt_dir, "recovered-only server epoch")
+    receipt = read_json(
+        validate_artifact_ref(
+            root, last_checkpoint["process_receipt"], "recovered-only server process receipt"
+        )
+    )
+    session = {
+        **copy.deepcopy(last_epoch),
+        "server_process_ordinal": len(grouped_epochs),
+        "hardware": copy.deepcopy(config["hardware"]),
+        "candidate_binary_sha256": inputs["binary"]["sha256"],
+        "source_git_sha": config["candidate"]["source_git_sha"],
+        "source_tree_sha": config["candidate"]["source_tree_sha"],
+        "dirty_status": copy.deepcopy(config["candidate"]["dirty_status"]),
+        "profile_detail": "off",
+        "environment": copy.deepcopy(receipt["environment"]),
+        "environment_sha256": receipt["environment_sha256"],
+        "server_argv": copy.deepcopy(receipt["argv"]),
+        "server_argv_sha256": receipt["argv_sha256"],
+        "runtime_log": copy.deepcopy(last_epoch["runtime_log_evidence"]),
+        "scheduler_trace": copy.deepcopy(last_epoch["scheduler_trace"]),
+        "product_effective_config": copy.deepcopy(last_epoch["product_effective_config"]),
+        "finished_at": cleanup["failed_at"],
+        "duration_sec": duration_seconds(last_epoch["started_at"], cleanup["failed_at"]),
+        "formal_measurement_started_at": records[0]["started_at"],
+        "formal_measurement_finished_at": records[len(expected_cells(config["backend"])) - 1]["finished_at"],
+        "parity_measurement_started_at": records[-1]["started_at"],
+        "parity_measurement_finished_at": records[-1]["finished_at"],
+        "returncode": cleanup["cleanup_returncode"],
+        "shutdown_clean": True,
+        "shutdown_provenance": "interrupted-after-all-cells-with-process-group-gone",
+        "cell_quiescence": [
+            {"status": "checkpointed-quiescent", "cell_id": record["cell_id"]}
+            for record in records
+        ],
+    }
+    bundle = {
+        "schema_version": SCHEMA_VERSION,
+        "contract": CONTRACT,
+        "config_fingerprint": fingerprint,
+        "session": session,
+        "session_epochs": grouped_epochs,
+        "completed_cell_checkpoints": [
+            artifact_ref(
+                root,
+                checkpoint_path(lane, checkpoint["sequence"]),
+                kind="completed-cell-checkpoint",
+            )
+            for checkpoint in checkpoints
+        ],
+        "formal_reports": records[: len(expected_cells(config["backend"]))],
+        "run_serve_parity_report": records[len(expected_cells(config["backend"]))],
+    }
+    path = lane / "server-session.json"
+    atomic_write_json(path, bundle)
+    validate_server_bundle(root, bundle, fingerprint, config, inputs)
+    return bundle
+
+
 def validate_server_bundle(
     root: Path,
     bundle: dict[str, Any],
     fingerprint: str,
     config: dict[str, Any],
+    inputs: dict[str, Any],
 ) -> None:
     require(bundle.get("schema_version") == SCHEMA_VERSION, "server bundle schema mismatch")
     require(bundle.get("config_fingerprint") == fingerprint, "server bundle fingerprint mismatch")
     session = bundle.get("session")
+    epochs = bundle.get("session_epochs")
+    checkpoints = bundle.get("completed_cell_checkpoints")
     reports = bundle.get("formal_reports")
     parity = bundle.get("run_serve_parity_report")
     require(isinstance(session, dict), "server bundle session is missing")
-    require(session.get("server_process_ordinal") == 1, "server bundle must use one server process")
+    legacy_single_epoch = epochs is None and checkpoints is None
+    legacy_epoch = frozen_collection_epoch(read_json(lane_dir(root, config) / "plan.json")) if legacy_single_epoch else None
+    if legacy_single_epoch:
+        require_legacy_finalized_server_shape(session, reports, parity, config["backend"])
+        epochs = [{"session_id": session.get("session_id")}]
+        checkpoints = []
+    else:
+        require(isinstance(epochs, list) and epochs, "server bundle session epochs are missing")
+        require(
+            isinstance(checkpoints, list) and len(checkpoints) == len(expected_cells(config["backend"])) + 1,
+            "server bundle completed-cell checkpoint set is incomplete",
+        )
+    checkpoint_documents: list[dict[str, Any]] = []
+    for index, ref in enumerate(checkpoints, start=1):
+        checkpoint_file = validate_artifact_ref(root, ref, f"completed_cell_checkpoints[{index}]")
+        checkpoint_document = read_json(checkpoint_file)
+        require(checkpoint_document.get("sequence") == index, "server bundle checkpoint order mismatch")
+        checkpoint_documents.append(checkpoint_document)
+    epoch_session_ids = [epoch.get("session_id") for epoch in epochs if isinstance(epoch, dict)]
+    require(
+        len(epoch_session_ids) == len(epochs)
+        and all(isinstance(value, str) and value for value in epoch_session_ids),
+        "server bundle epoch session identity is invalid",
+    )
+    actual_process_count = len(set(epoch_session_ids))
+    require(
+        session.get("server_process_ordinal") == actual_process_count,
+        "server bundle process ordinal does not match explicit epoch count",
+    )
     require(isinstance(reports, list) and len(reports) == len(expected_cells(config["backend"])), "server bundle formal cell count mismatch")
     require(isinstance(parity, dict), "server bundle lacks run/serve parity probe")
+    if not legacy_single_epoch:
+        all_records = [*reports, parity]
+        all_cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
+        for checkpoint_document, cell, expected_record in zip(checkpoint_documents, all_cells, all_records):
+            checkpoint_record, _, _ = validate_completed_cell_checkpoint(
+                root,
+                lane_dir(root, config),
+                fingerprint,
+                config,
+                inputs,
+                checkpoint_document,
+                cell,
+                finalized_session=session,
+            )
+            require(checkpoint_record == expected_record, f"{cell_id(cell)} finalized checkpoint record mismatch")
     expected = list(expected_cells(config["backend"]))
     for index, (record, cell) in enumerate(zip(reports, expected), start=1):
         require(record.get("sequence") == index and record.get("cell_id") == cell_id(cell), "server bundle cell order mismatch")
+        require(record.get("session_id") in epoch_session_ids, "server bundle formal report has an unknown epoch")
         report_path = validate_artifact_ref(root, record.get("raw_report"), f"formal_reports[{index}].raw_report")
         validate_bench_report(read_json(report_path), config, cell)
         for key in ("stdout", "stderr"):
@@ -1943,8 +2883,10 @@ def validate_server_bundle(
             resources,
             backend=config["backend"],
             label=f"formal_reports[{index}].resources",
+            expected_collector_sha256=(legacy_epoch or {}).get("collector_sha256"),
         )
     parity_path = validate_artifact_ref(root, parity.get("raw_report"), "run_serve_parity_report.raw_report")
+    require(parity.get("session_id") in epoch_session_ids, "run/serve parity report has an unknown epoch")
     validate_bench_report(read_json(parity_path), config, run_parity_cell(config["backend"]))
     for key in ("stdout", "stderr"):
         validate_artifact_ref(root, parity.get(key), f"run_serve_parity_report.{key}")
@@ -1956,6 +2898,7 @@ def validate_server_bundle(
         parity.get("resources", {}),
         backend=config["backend"],
         label="run_serve_parity_report.resources",
+        expected_collector_sha256=(legacy_epoch or {}).get("collector_sha256"),
     )
     for key in ("runtime_log", "scheduler_trace", "product_effective_config"):
         validate_artifact_ref(root, session.get(key), f"session.{key}")
@@ -1975,8 +2918,29 @@ def collect_server_session(
     if bundle_path.exists():
         require(resume, f"server session already exists; pass --resume: {bundle_path}")
         bundle = read_json(bundle_path)
-        validate_server_bundle(root, bundle, fingerprint, config)
+        validate_server_bundle(root, bundle, fingerprint, config, inputs)
         return bundle
+
+    recovered_records, recovered_checkpoints, recovered_epochs = load_completed_cell_prefix(
+        root,
+        lane,
+        fingerprint,
+        config,
+        inputs,
+        resume=resume,
+    )
+    all_cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
+    if len(recovered_records) == len(all_cells):
+        return finalize_recovered_only_server_bundle(
+            root,
+            lane,
+            fingerprint,
+            config,
+            inputs,
+            recovered_records,
+            recovered_checkpoints,
+            recovered_epochs,
+        )
 
     attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     attempt_dir = lane / "attempts" / f"server-{attempt_id}"
@@ -1992,6 +2956,8 @@ def collect_server_session(
     process: subprocess.Popen[Any] | None = None
     failure: BaseException | None = None
     cuda_preflight: dict[str, Any] | None = None
+    completed_cleanup_returncode: int | None = None
+    completed_cleanup_gone = False
     try:
         if config["backend"] == "cuda":
             cuda_preflight = capture_cuda_bridge_preflight(attempt_dir)
@@ -2019,7 +2985,7 @@ def collect_server_session(
         )
         session: dict[str, Any] = {
             "session_id": f"r2-{config['model_key']}-{config['backend']}-{attempt_id}",
-            "server_process_ordinal": 1,
+            "server_process_ordinal": len({epoch["session_id"] for epoch in recovered_epochs}) + 1,
             "hardware": copy.deepcopy(config["hardware"]),
             "candidate_binary_sha256": inputs["binary"]["sha256"],
             "source_git_sha": config["candidate"]["source_git_sha"],
@@ -2051,11 +3017,15 @@ def collect_server_session(
             root, attempt_dir, "pre-measurement", base_url, environment
         )
 
-        records: list[dict[str, Any]] = []
+        records: list[dict[str, Any]] = list(recovered_records)
         samplers: list[dict[str, Any]] = []
-        quiescence: list[dict[str, Any]] = []
-        all_cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
-        for cell in all_cells:
+        new_records: list[dict[str, Any]] = []
+        quiescence: list[dict[str, Any]] = [
+            {"status": "checkpointed-quiescent", "cell_id": record["cell_id"]}
+            for record in recovered_records
+        ]
+        checkpoints: list[dict[str, Any]] = list(recovered_checkpoints)
+        for cell in all_cells[len(recovered_records) :]:
             record, sampler = run_bench_cell(
                 root,
                 attempt_dir,
@@ -2067,14 +3037,29 @@ def collect_server_session(
                 cuda_preflight,
             )
             records.append(record)
+            new_records.append(record)
             samplers.append(sampler)
-            quiescence.append(
-                wait_for_quiescence(
+            post_idle = wait_for_quiescence(
+                root,
+                attempt_dir,
+                f"post-{cell['sequence']:02d}-{cell['dataset']}-c{cell['concurrency']}",
+                base_url,
+                environment,
+            )
+            quiescence.append(post_idle)
+            checkpoints.append(
+                make_completed_cell_checkpoint(
                     root,
+                    lane,
+                    fingerprint,
+                    config,
+                    inputs,
                     attempt_dir,
-                    f"post-{cell['sequence']:02d}-{cell['dataset']}-c{cell['concurrency']}",
-                    base_url,
-                    environment,
+                    session,
+                    record,
+                    sampler,
+                    post_idle,
+                    provenance="native-completed-cell",
                 )
             )
         session["formal_measurement_started_at"] = records[0]["started_at"]
@@ -2086,6 +3071,8 @@ def collect_server_session(
         returncode, group_gone = collector_support.terminate_process_group(
             process, config["server"]["shutdown_timeout_sec"]
         )
+        completed_cleanup_returncode = returncode
+        completed_cleanup_gone = group_gone
         session["finished_at"] = now_iso()
         session["duration_sec"] = duration_seconds(started_at, session["finished_at"])
         session["returncode"] = returncode
@@ -2108,7 +3095,9 @@ def collect_server_session(
         session["runtime_log"] = artifact_ref(root, runtime_log, kind="server-runtime-log")
         session["scheduler_trace"] = artifact_ref(root, scheduler_trace, kind="scheduler-trace")
         session["product_effective_config"] = artifact_ref(root, product_config, kind="product-effective-config")
-        for record, sampler in zip(records, samplers):
+        finalize_attempt_cell_checkpoints(root, lane, attempt_dir)
+        checkpoints = [read_json(checkpoint_path(lane, row["sequence"])) for row in records]
+        for record, sampler in zip(new_records, samplers):
             record["resources"] = cell_resource_evidence(root, session, record, sampler, config)
         formal_count = len(expected_cells(config["backend"]))
         bundle = {
@@ -2116,6 +3105,29 @@ def collect_server_session(
             "contract": CONTRACT,
             "config_fingerprint": fingerprint,
             "session": session,
+            "session_epochs": recovered_session_epoch_rows(
+                root, lane, recovered_checkpoints, recovered_epochs
+            )
+            + [
+                {
+                    "kind": "current-server-session",
+                    "session_id": session["session_id"],
+                    "collection_epoch": {
+                        "collector_sha256": file_sha256(COLLECTOR_PATH),
+                        "support_sha256": file_sha256(SUPPORT_PATH),
+                        "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+                    },
+                    "completed_cell_sequences": [record["sequence"] for record in new_records],
+                }
+            ],
+            "completed_cell_checkpoints": [
+                artifact_ref(
+                    root,
+                    checkpoint_path(lane, checkpoint["sequence"]),
+                    kind="completed-cell-checkpoint",
+                )
+                for checkpoint in checkpoints
+            ],
             "formal_reports": records[:formal_count],
             "run_serve_parity_report": records[formal_count],
         }
@@ -2131,7 +3143,7 @@ def collect_server_session(
                 "bundle_sha256": file_sha256(bundle_path),
             },
         )
-        validate_server_bundle(root, bundle, fingerprint, config)
+        validate_server_bundle(root, bundle, fingerprint, config, inputs)
         return bundle
     except BaseException as exc:
         failure = exc
@@ -2140,7 +3152,9 @@ def collect_server_session(
         if process is not None:
             cleanup_returncode, cleanup_gone, cleanup_error = collector_support.cleanup_process_group_noexcept(process, 10.0)
         else:
-            cleanup_returncode, cleanup_gone, cleanup_error = None, True, None
+            cleanup_returncode = completed_cleanup_returncode
+            cleanup_gone = completed_cleanup_gone or failure is None
+            cleanup_error = None
         if runtime_handle is not None:
             try:
                 runtime_handle.flush()
@@ -2159,9 +3173,10 @@ def collect_server_session(
                     "cleanup_returncode": cleanup_returncode,
                     "cleanup_process_group_gone": cleanup_gone,
                     "cleanup_error": cleanup_error,
-                    "resume_policy": "preserve attempt and restart all server cells in one new process",
+                    "resume_policy": "recover only the validated chronological completed-cell prefix; discard the partial suffix",
                 },
             )
+            finalize_attempt_cell_checkpoints(root, lane, attempt_dir)
 
 
 def exec_barrier_launcher_argv(release_file: Path, product_argv: list[str]) -> list[str]:
@@ -2333,9 +3348,21 @@ def validate_run_bundle(
     bundle: dict[str, Any],
     fingerprint: str,
     sample_ordinal: int,
+    *,
+    legacy_collection_epoch: dict[str, str] | None = None,
 ) -> None:
     require(bundle.get("schema_version") == SCHEMA_VERSION, "run bundle schema mismatch")
     require(bundle.get("config_fingerprint") == fingerprint, "run bundle fingerprint mismatch")
+    collection_epoch = bundle.get("collection_epoch")
+    require(
+        (collection_epoch is None and legacy_collection_epoch is not None)
+        or (
+            isinstance(collection_epoch, dict)
+            and set(collection_epoch) == {"collector_sha256", "support_sha256", "resource_sampler_sha256"}
+            and all(isinstance(value, str) and SHA256_RE.fullmatch(value) is not None for value in collection_epoch.values())
+        ),
+        "run bundle collection epoch differs",
+    )
     sample = bundle.get("sample")
     require(isinstance(sample, dict) and sample.get("sample_ordinal") == sample_ordinal, "run sample ordinal mismatch")
     stdout = validate_artifact_ref(root, sample.get("stdout"), f"run sample {sample_ordinal}.stdout")
@@ -2343,7 +3370,16 @@ def validate_run_bundle(
     for key in ("stderr", "product_effective_config"):
         validate_artifact_ref(root, sample.get(key), f"run sample {sample_ordinal}.{key}")
     resources = sample.get("resources", {})
-    validate_artifact_ref(root, resources.get("observations"), f"run sample {sample_ordinal}.resources.observations")
+    observations = validate_artifact_ref(
+        root, resources.get("observations"), f"run sample {sample_ordinal}.resources.observations"
+    )
+    header = json.loads(observations.read_text(encoding="utf-8").splitlines()[0])
+    effective_epoch = collection_epoch or legacy_collection_epoch
+    require(
+        isinstance(effective_epoch, dict)
+        and header.get("collector_sha256") == effective_epoch["resource_sampler_sha256"],
+        f"run sample {sample_ordinal} sampler epoch differs",
+    )
     argv = sample.get("argv")
     require(isinstance(argv, list) and "--backend" in argv, f"run sample {sample_ordinal} lacks backend argv")
     backend_index = argv.index("--backend")
@@ -2353,6 +3389,9 @@ def validate_run_bundle(
         resources,
         backend=argv[backend_index + 1],
         label=f"run sample {sample_ordinal}.resources",
+        expected_collector_sha256=(
+            legacy_collection_epoch or collection_epoch or {}
+        ).get("collector_sha256"),
     )
     events = [json.loads(line) for line in stdout.read_text(encoding="utf-8").splitlines() if line.strip()]
     arrivals = [json.loads(line) for line in arrival.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -2374,7 +3413,13 @@ def collect_run_sample(
     if bundle_path.exists():
         require(resume, f"run sample already exists; pass --resume: {bundle_path}")
         bundle = read_json(bundle_path)
-        validate_run_bundle(root, bundle, fingerprint, sample_ordinal)
+        validate_run_bundle(
+            root,
+            bundle,
+            fingerprint,
+            sample_ordinal,
+            legacy_collection_epoch=frozen_collection_epoch(read_json(lane / "plan.json")),
+        )
         return bundle
     attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     sample_id = f"r2-{config['model_key']}-{config['backend']}-run-{sample_ordinal}"
@@ -2528,6 +3573,11 @@ def collect_run_sample(
                 "schema_version": SCHEMA_VERSION,
                 "contract": CONTRACT,
                 "config_fingerprint": fingerprint,
+                "collection_epoch": {
+                    "collector_sha256": file_sha256(COLLECTOR_PATH),
+                    "support_sha256": file_sha256(SUPPORT_PATH),
+                    "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+                },
                 "sample": sample,
             }
             bundle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2641,6 +3691,11 @@ def write_artifact_index(
     refs: dict[str, dict[str, Any]] = {}
     collect_artifact_refs(root, inputs, refs)
     collect_artifact_refs(root, server_bundle, refs)
+    for index, checkpoint_ref in enumerate(server_bundle.get("completed_cell_checkpoints", []), start=1):
+        checkpoint_file = validate_artifact_ref(
+            root, checkpoint_ref, f"raw index completed_cell_checkpoints[{index}]"
+        )
+        collect_artifact_refs(root, read_json(checkpoint_file), refs)
     collect_artifact_refs(root, run_bundles, refs)
     for path, kind in [
         (plan_path, "collection-plan"),
@@ -2656,7 +3711,8 @@ def write_artifact_index(
         "contract": CONTRACT,
         "artifact_type": "runtime_vnext_r2_ferrum_raw_artifact_index",
         "selected_evidence_only": True,
-        "failed_attempts_excluded": True,
+        "completed_cell_dependencies_included": True,
+        "incomplete_failed_suffix_excluded": True,
         "artifact_count": len(refs),
         "artifacts": [refs[key] for key in sorted(refs)],
     }
@@ -2673,6 +3729,18 @@ def validate_final_manifest(root: Path, manifest: dict[str, Any], fingerprint: s
     require(manifest.get("contract") == CONTRACT, "final manifest contract mismatch")
     require(manifest.get("status") == "pass", "final manifest status is not pass")
     require(manifest.get("config_fingerprint") == fingerprint, "final manifest fingerprint mismatch")
+    epochs = manifest.get("collection_epochs")
+    require(epochs is None or (isinstance(epochs, list) and epochs), "final manifest collection epochs are invalid")
+    for index, epoch in enumerate(epochs or [], start=1):
+        require(
+            isinstance(epoch, dict)
+            and isinstance(epoch.get("collection_epoch"), dict)
+            and all(
+                isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
+                for value in epoch["collection_epoch"].values()
+            ),
+            f"final manifest collection epoch {index} is invalid",
+        )
     for key in ("plan", "server_session", "raw_artifact_index"):
         validate_artifact_ref(root, manifest.get(key), f"manifest.{key}")
     runs = manifest.get("run_samples")
@@ -2697,6 +3765,20 @@ def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool
         raise R2CollectorError("artifact root must stay outside the Git worktree")
     raw = read_json(config_path)
     config, context = normalize_config(raw)
+    frozen_config_path = lane_dir(root, config) / "config.normalized.json"
+    if resume and frozen_config_path.is_file():
+        frozen_config = read_json(frozen_config_path)
+        current_without_env = copy.deepcopy(config)
+        frozen_without_env = copy.deepcopy(frozen_config)
+        current_without_env.get("candidate", {}).pop("env", None)
+        frozen_without_env.get("candidate", {}).pop("env", None)
+        require(
+            current_without_env == frozen_without_env,
+            "resume config differs from frozen normalized config",
+        )
+        # Sanitized inherited shell variables (for example TERM) are ambient.
+        # Resume executes with the exact frozen environment, not today's shell.
+        config = frozen_config
     lane, fingerprint = prepare_plan(root, config, context, resume=resume)
     plan_path = lane / "plan.json"
     if plan_only:
@@ -2755,6 +3837,15 @@ def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool
         "run_samples": [artifact_ref(root, path, kind="run-sample-bundle") for path in run_bundle_paths],
         "run_performance": summary,
         "raw_artifact_index": artifact_ref(root, index_path, kind="raw-artifact-index"),
+        "collection_epochs": copy.deepcopy(server_bundle["session_epochs"])
+        + [
+            {
+                "kind": "current-run-process",
+                "sample_id": bundle["sample"]["sample_id"],
+                "collection_epoch": copy.deepcopy(bundle["collection_epoch"]),
+            }
+            for bundle in run_bundles
+        ],
         "pass_line": f"{PASS_PREFIX}: {config['model_key']}/{config['backend']}: {manifest_path}",
     }
     if manifest_path.exists():
@@ -2762,7 +3853,7 @@ def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool
         require(read_json(manifest_path) == manifest, "final manifest changed during resume")
     else:
         atomic_write_json(manifest_path, manifest)
-    validate_server_bundle(root, server_bundle, fingerprint, config)
+    validate_server_bundle(root, server_bundle, fingerprint, config, inputs)
     for ordinal, bundle in enumerate(run_bundles, start=1):
         validate_run_bundle(root, bundle, fingerprint, ordinal)
     validate_final_manifest(root, manifest, fingerprint)
@@ -3107,6 +4198,162 @@ def self_test() -> int:
             raise R2CollectorError("tampered artifact unexpectedly passed")
         except R2CollectorError as exc:
             require("changed" in str(exc), "tamper self-test failed for the wrong reason")
+
+        resume_dir = root / "resume"
+        resume_dir.mkdir()
+        observations = resume_dir / "cell.resource-observations.jsonl"
+        observation_rows = [
+            {
+                "record_type": "header",
+                "session_id": "resume-session",
+                "cell_id": "random:c1",
+                "collector_sha256": "7" * 64,
+            },
+            {
+                "record_type": "sample",
+                "sequence": 0,
+                "sampled_at": "2026-01-01T00:00:00Z",
+                "active_requests": 0,
+                "process_alive": True,
+                "active_probe_errors": [],
+            },
+            {
+                "record_type": "sample",
+                "sequence": 1,
+                "sampled_at": "2026-01-01T00:00:01Z",
+                "active_requests": 1,
+                "process_alive": True,
+                "active_probe_errors": [],
+            },
+            {
+                "record_type": "sample",
+                "sequence": 2,
+                "sampled_at": "2026-01-01T00:00:02Z",
+                "active_requests": 0,
+                "process_alive": True,
+                "active_probe_errors": [],
+            },
+            {
+                "record_type": "sample",
+                "sequence": 3,
+                "sampled_at": "2026-01-01T00:00:03Z",
+                "active_requests": 1,
+                "process_alive": True,
+                "active_probe_errors": [],
+            },
+            {
+                "record_type": "sample",
+                "sequence": 4,
+                "sampled_at": "2026-01-01T00:00:04Z",
+                "active_requests": 0,
+                "process_alive": True,
+                "active_probe_errors": [],
+            },
+            {
+                "record_type": "footer",
+                "exit_reason": "stop-file",
+                "sample_count": 5,
+            },
+        ]
+        atomic_write_text(
+            observations,
+            "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in observation_rows),
+        )
+        require(
+            observation_active_envelope(
+                observations,
+                session_id="resume-session",
+                identifier="random:c1",
+                resource_sampler_sha256="7" * 64,
+            )
+            == ("2026-01-01T00:00:00Z", "2026-01-01T00:00:04Z"),
+            "completed-cell active-envelope positive self-test failed",
+        )
+        bad_footer = resume_dir / "bad-footer.jsonl"
+        bad_rows = copy.deepcopy(observation_rows)
+        bad_rows[-1]["sample_count"] = 4
+        atomic_write_text(
+            bad_footer,
+            "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in bad_rows),
+        )
+        try:
+            observation_active_envelope(
+                bad_footer,
+                session_id="resume-session",
+                identifier="random:c1",
+                resource_sampler_sha256="7" * 64,
+            )
+            raise R2CollectorError("bad checkpoint footer unexpectedly passed")
+        except R2CollectorError as exc:
+            require("footer sample count" in str(exc), "checkpoint footer self-test failed for the wrong reason")
+
+        idle_body = resume_dir / "post.body.json"
+        idle_receipt = resume_dir / "post.receipt.json"
+        atomic_write_json(idle_body, {"engine": {"active_requests": 0, "queued_requests": 0}})
+        atomic_write_json(
+            idle_receipt,
+            {
+                "returncode": 0,
+                "http_status": 200,
+                "body_sha256": file_sha256(idle_body),
+                "body_size_bytes": idle_body.stat().st_size,
+            },
+        )
+        checkpoint_probe_refs(
+            root,
+            {"receipt_origin_path": str(idle_receipt), "body_origin_path": str(idle_body)},
+            "selftest idle",
+        )
+        atomic_write_json(idle_body, {"engine": {"active_requests": 1, "queued_requests": 0}})
+        atomic_write_json(
+            idle_receipt,
+            {
+                "returncode": 0,
+                "http_status": 200,
+                "body_sha256": file_sha256(idle_body),
+                "body_size_bytes": idle_body.stat().st_size,
+            },
+        )
+        try:
+            checkpoint_probe_refs(
+                root,
+                {"receipt_origin_path": str(idle_receipt), "body_origin_path": str(idle_body)},
+                "selftest post-active",
+            )
+            raise R2CollectorError("post-active checkpoint unexpectedly passed")
+        except R2CollectorError as exc:
+            require("post-cell probe is active" in str(exc), "post-active self-test failed for the wrong reason")
+
+        try:
+            require_chronological_prefix([1, 3], "selftest completed-cell state")
+            raise R2CollectorError("noncontiguous checkpoints unexpectedly passed")
+        except R2CollectorError as exc:
+            require("chronological prefix" in str(exc), "noncontiguous checkpoint self-test failed for the wrong reason")
+
+        cleanup_attempt = resume_dir / "attempt"
+        cleanup_attempt.mkdir()
+        atomic_write_json(
+            cleanup_attempt / "failure.json",
+            {
+                "cleanup_process_group_gone": True,
+                "cleanup_error": None,
+                "cleanup_returncode": 0,
+            },
+        )
+        require_completed_attempt_cleanup(cleanup_attempt, "selftest cleanup")
+        atomic_write_json(
+            cleanup_attempt / "failure.json",
+            {
+                "cleanup_process_group_gone": False,
+                "cleanup_error": None,
+                "cleanup_returncode": 0,
+            },
+        )
+        try:
+            require_completed_attempt_cleanup(cleanup_attempt, "selftest cleanup")
+            raise R2CollectorError("unclean checkpoint attempt unexpectedly passed")
+        except R2CollectorError as exc:
+            require("survived cleanup" in str(exc), "cleanup checkpoint self-test failed for the wrong reason")
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         cleanup_state = {"completed": False}
