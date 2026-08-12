@@ -116,6 +116,69 @@ C09_DIAGNOSTIC_REJECT_PREFIX = "FERRUM RUNTIME VNEXT C09 DIAGNOSTIC REJECT"
 FOCUSED_DIAGNOSTIC_KEEP_PREFIX = "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC KEEP"
 FOCUSED_DIAGNOSTIC_REJECT_PREFIX = "FERRUM RUNTIME VNEXT FOCUSED DIAGNOSTIC REJECT"
 SCHEMA_VERSION = 1
+HOST_SUSPEND_ASSEMBLY_KIND = "runtime-vnext-host-suspend-c19-006-assembly-v1"
+HOST_SUSPEND_INVENTORY_KIND = "runtime-vnext-original-artifact-inventory-v1"
+HOST_SUSPEND_PROVENANCE_KIND = "runtime-vnext-host-suspend-c19-006-provenance-v1"
+HOST_SUSPEND_MANIFEST_KIND = "runtime-vnext-host-suspend-c19-006-manifest-v1"
+HOST_SUSPEND_PASS_PREFIX = "FERRUM RUNTIME VNEXT HOST SUSPEND ASSEMBLY PASS"
+HOST_SUSPEND_SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT HOST SUSPEND ASSEMBLER SELFTEST PASS"
+HOST_SUSPEND_DERIVED_REL = Path("derived/host-suspend-c19-006")
+HOST_SUSPEND_EVIDENCE_REL = Path("control/diagnostic-only-host-sleep-c19-006")
+HOST_SUSPEND_CASE_REL = Path(
+    "correctness/m1-qwen35-4b/metal/scenarios/C19/cases/c19-006"
+)
+HOST_SUSPEND_SOURCE_GIT_SHA = "a609cac8099e0190004a7f6523166f281c6b9ad2"
+HOST_SUSPEND_SOURCE_TREE_SHA = "d2fa2ffd22d322cf4a7188562f121a3a8babc0c7"
+HOST_SUSPEND_RUNNER_SHA256 = "c1fe55826770b34426eec21eff0554cf2849e52abfa8715488e9e1eb95d72e00"
+HOST_SUSPEND_HARDWARE_ID = "metal-m1max-32gb-24core"
+HOST_SUSPEND_MODEL_REVISION = "e87f176479d0855a907a41277aca2f8ee7a09523"
+HOST_SUSPEND_MODEL_FILES = {
+    "Qwen3.5-4B-Q4_K_M.gguf": "00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+}
+HOST_SUSPEND_BINARY_SHA256 = "0c80d38bd53909178d048ef2b72ace5e367ed23ad0dbde931c319ac9fbbf4d04"
+HOST_SUSPEND_MODELS_LOCK_SHA256 = "107805513950ed9dd9d0dc064f85252ba8999bffdb2daf216d3477d8eb824039"
+HOST_SUSPEND_MANIFEST_SHA256 = "9378a7dce1225cd3b3c6716ae5ee656d365b2148692fbfea468da3d107149d8d"
+HOST_SUSPEND_EXPECTATIONS_SHA256 = "13707b0be6e3645700f7572a5735371206ac6debdab1c7523bf8c40dbc3833d7"
+HOST_SUSPEND_ORIGINAL_INVENTORY_SHA256 = "f297460de16f9a9ea83681a618b40d722d805c5652f77146f2924ad622972c4a"
+HOST_SUSPEND_ORIGINAL_FILE_COUNT = 5772
+HOST_SUSPEND_ORIGINAL_SIZE_BYTES = 1_739_606_140
+HOST_SUSPEND_PMSET_SLEEP_LINE_SHA256 = "96ecb23ed53e19546eacb093200cbc53e5cf21383dad2c81b9d31e595299be78"
+HOST_SUSPEND_PMSET_DARKWAKE_LINE_SHA256 = "1c0e9abe6cf5cbb5344f361c54d6094cb49de9888fdb12b922b201971f16fe13"
+HOST_SUSPEND_BRIDGE_PATHS = (
+    ("A", "docs/goals/runtime-vnext-0.8.0-2026-07-10/HOST_SUSPEND_EVIDENCE_AMENDMENT_2026-08-12.md"),
+    ("M", RUNNER_REPO_PATH),
+    ("M", "scripts/release/runtime_vnext_r0_core_closure.py"),
+    ("M", "scripts/release/runtime_vnext_r1_product_correctness.py"),
+)
+HOST_SUSPEND_BASE_BLOBS = {
+    RUNNER_REPO_PATH: "e667cef1b2bad37d439be472abd09d2203bd42c1",
+    "scripts/release/runtime_vnext_r0_core_closure.py": "d86d3cb9719b5d669802bbf22b81cafc9d060360",
+    "scripts/release/runtime_vnext_r1_product_correctness.py": "e23b242414afee16b0435099900bf78a4e832d12",
+}
+HOST_SUSPEND_FINAL_MODES = {
+    HOST_SUSPEND_BRIDGE_PATHS[0][1]: "100644",
+    RUNNER_REPO_PATH: "100644",
+    "scripts/release/runtime_vnext_r0_core_closure.py": "100644",
+    "scripts/release/runtime_vnext_r1_product_correctness.py": "100755",
+}
+HOST_SUSPEND_EVIDENCE_FILES = {
+    "full-702.receipt.json": ("523e5645c50c1701a261d21847b05863e9f8ace127366b90ecc50961418b0884", 1986),
+    "full-702.stderr.log": ("29c0855c7536dd5bae1280ad1a2ae80082ba235ffa054a1c472095a05ae0ea4a", 212),
+    "hashes.receipt.json": ("1fcb30b6aeb3f1bd7f7a5c10b3bec367427b4a0938621a56413e6f506b6438bc", 1847),
+    "hashes.stderr.log": ("fb25e3c091eb2fab45e9a6dc5f67012148222e5492b840d4851050ec55dd541a", 273),
+    "hashes.stdout.log": ("7bef53ad1d49926050d6520142e739d174cd171f4c210492a9bb1b9a49e5f047", 644),
+    "original-case/case.json": ("2fde53ce63f360610b4d6bf6f2d9d386393a9cbe4cebc0c5c24645653337d2b8", 4213),
+    "original-case/checker.log": ("440747fd851a55d5227a928da567e54d55ab3f7629f8593c58e668075c301090", 95),
+    "original-case/command-spec.json": ("eb4f389e67d7cb44b901408fbfc7276bc4600f10bb8dfd8218ec03b245fdd2ad", 1102),
+    "original-case/execution-envelope.json": ("66925d45f5dd7d5038b32104ce55d0e9a5a2d32e0a544e58f09dd7dcdaa918cb", 7776),
+    "original-case/http-transcript.json": ("d0034d2e33bf044a2a1288f06ad45eb831710bd7f8c739a93fa4dbab3f72514f", 19736),
+    "original-case/input.json": ("ed932f66a93bf4467a06a4342d499fecf0e904f4c2e2a6127e6c3ee04487bee8", 670),
+    "original-case/stderr.log": ("23d9cd0107f60ee5398c48ec0f37e24e5045012b0d39d33e096b84418fd9bc30", 65),
+    "original-case/stdout.log": ("8004936d04da855fbac10c18dcf0c3fef1ba91d647b0f4eeff51b4ba86aad683", 6455),
+    "pmset.receipt.json": ("8528143e86326404aa22a03b5b6b2e31441ec381be2441f13dda6786648e3966", 1527),
+    "pmset.stderr.log": ("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0),
+    "pmset.stdout.log": ("2b88f8475fc97b6f507f095139cfdc6a6246bd54b34efc72c7cddec714fff371", 9401806),
+}
 LEGACY_EXECUTION_CONTRACT = "g00-legacy-baseline-v1"
 G08_EXECUTION_CONTRACT = "g08-model-matrix-v1"
 EXECUTION_CONTRACTS = {LEGACY_EXECUTION_CONTRACT, G08_EXECUTION_CONTRACT}
@@ -390,6 +453,478 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def host_suspend_original_inventory(root: Path) -> dict[str, Any]:
+    """Hash every immutable input while excluding all derived outputs."""
+    require(root.is_absolute() and root.is_dir(), "host-suspend artifact root is invalid")
+    require(not root.is_symlink(), "host-suspend artifact root must not be a symlink")
+    rows: list[dict[str, Any]] = []
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        relative_current = current_path.relative_to(root)
+        kept_directories = []
+        for name in sorted(directory_names):
+            path = current_path / name
+            relative = path.relative_to(root)
+            if relative == HOST_SUSPEND_DERIVED_REL:
+                require(not path.is_symlink() and path.is_dir(), "host-suspend derived output path is invalid")
+                continue
+            require(not path.is_symlink(), f"host-suspend original artifact contains symlink: {relative}")
+            require(path.is_dir(), f"host-suspend original artifact contains non-directory: {relative}")
+            kept_directories.append(name)
+        directory_names[:] = kept_directories
+        for name in sorted(file_names):
+            path = current_path / name
+            relative = (relative_current / name).as_posix()
+            require(not path.is_symlink(), f"host-suspend original artifact contains symlink: {relative}")
+            require(path.is_file(), f"host-suspend original artifact contains non-regular file: {relative}")
+            rows.append(
+                {
+                    "path": relative,
+                    "sha256": file_sha256(path),
+                    "size_bytes": path.stat().st_size,
+                }
+            )
+    rows.sort(key=lambda row: row["path"])
+    inventory_sha256 = canonical_json_sha256(rows)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_kind": HOST_SUSPEND_INVENTORY_KIND,
+        "status": "pass",
+        "scope": {
+            "root": str(root),
+            "excluded_prefixes": [f"{HOST_SUSPEND_DERIVED_REL.as_posix()}/"],
+        },
+        "file_count": len(rows),
+        "size_bytes": sum(row["size_bytes"] for row in rows),
+        "inventory_sha256": inventory_sha256,
+        "files": rows,
+    }
+
+
+def validate_host_suspend_original_inventory(inventory: dict[str, Any]) -> None:
+    require(inventory.get("schema_version") == SCHEMA_VERSION, "host-suspend inventory schema mismatch")
+    require(inventory.get("artifact_kind") == HOST_SUSPEND_INVENTORY_KIND, "host-suspend inventory kind mismatch")
+    require(inventory.get("status") == "pass", "host-suspend inventory status must be pass")
+    rows = require_list(inventory.get("files"), "host-suspend inventory files")
+    require(
+        inventory.get("file_count") == len(rows) == HOST_SUSPEND_ORIGINAL_FILE_COUNT,
+        "host-suspend original file count mismatch",
+    )
+    require(
+        inventory.get("size_bytes") == sum(require_count(row.get("size_bytes"), "host-suspend inventory size") for row in rows)
+        == HOST_SUSPEND_ORIGINAL_SIZE_BYTES,
+        "host-suspend original byte count mismatch",
+    )
+    require(
+        canonical_json_sha256(rows) == inventory.get("inventory_sha256") == HOST_SUSPEND_ORIGINAL_INVENTORY_SHA256,
+        "host-suspend original inventory SHA256 mismatch",
+    )
+
+
+def validate_host_suspend_evidence_files(root: Path, evidence: Path) -> None:
+    require(evidence == root / HOST_SUSPEND_EVIDENCE_REL, "host-suspend evidence path is not the sealed diagnostic directory")
+    require(evidence.is_dir() and not evidence.is_symlink(), "host-suspend evidence directory is invalid")
+    observed: set[str] = set()
+    observed_directories: set[str] = set()
+    for current, directory_names, file_names in os.walk(evidence, followlinks=False):
+        current_path = Path(current)
+        for name in directory_names:
+            path = current_path / name
+            require(not path.is_symlink(), f"host-suspend evidence contains symlink: {path}")
+            observed_directories.add(path.relative_to(evidence).as_posix())
+        for name in file_names:
+            path = current_path / name
+            relative = path.relative_to(evidence).as_posix()
+            require(not path.is_symlink() and path.is_file(), f"host-suspend evidence is not a regular file: {relative}")
+            observed.add(relative)
+    require(observed_directories == {"original-case"}, "host-suspend diagnostic directory set mismatch")
+    require(observed == set(HOST_SUSPEND_EVIDENCE_FILES), "host-suspend diagnostic file set mismatch")
+    for relative, (digest, size) in HOST_SUSPEND_EVIDENCE_FILES.items():
+        path = evidence / relative
+        require(path.stat().st_size == size, f"host-suspend evidence size mismatch: {relative}")
+        require(file_sha256(path) == digest, f"host-suspend evidence SHA256 mismatch: {relative}")
+
+
+def host_suspend_duration_window(
+    *,
+    kind: str,
+    pid: Any,
+    pgid: Any,
+    started_at: Any,
+    finished_at: Any,
+    duration_sec: Any,
+    started_monotonic_ns: Any,
+    finished_monotonic_ns: Any,
+    sleep_duration_sec: float,
+    sleep_at: datetime,
+    darkwake_at: datetime,
+) -> dict[str, Any]:
+    started = parse_timestamp(started_at, f"host-suspend {kind}.started_at")
+    finished = parse_timestamp(finished_at, f"host-suspend {kind}.finished_at")
+    start_ns = require_count(started_monotonic_ns, f"host-suspend {kind}.started_monotonic_ns", minimum=1)
+    finish_ns = require_count(finished_monotonic_ns, f"host-suspend {kind}.finished_monotonic_ns", minimum=1)
+    require(finished > started and finish_ns > start_ns, f"host-suspend {kind} window is invalid")
+    typed_pid = require_count(pid, f"host-suspend {kind}.pid", minimum=1)
+    typed_pgid = require_count(pgid, f"host-suspend {kind}.pgid", minimum=1)
+    require(typed_pid == typed_pgid == 58900, f"host-suspend {kind} PID/PGID mismatch")
+    require(isinstance(duration_sec, (int, float)) and not isinstance(duration_sec, bool), f"host-suspend {kind} duration is invalid")
+    wall = (finished - started).total_seconds()
+    monotonic = (finish_ns - start_ns) / 1e9
+    require(abs(float(duration_sec) - monotonic) <= max(0.05, monotonic * 0.05), f"host-suspend {kind} monotonic duration mismatch")
+    discontinuity = wall - monotonic
+    residual = sleep_duration_sec - discontinuity
+    require(0.0 <= residual <= 2.0, f"host-suspend {kind} clock discontinuity does not match pmset sleep")
+    sleep_within = started <= sleep_at <= finished
+    darkwake_within = started <= darkwake_at <= finished
+    require(sleep_within and darkwake_within, f"host-suspend pmset pair is outside {kind}")
+    return {
+        "kind": kind,
+        "pid": typed_pid,
+        "pgid": typed_pgid,
+        "wall_started_at": str(started_at),
+        "wall_finished_at": str(finished_at),
+        "monotonic_started_ns": start_ns,
+        "monotonic_finished_ns": finish_ns,
+        "recorded_duration_sec": float(duration_sec),
+        "wall_duration_sec": wall,
+        "monotonic_duration_sec": monotonic,
+        "clock_discontinuity_sec": discontinuity,
+        "pmset_sleep_duration_sec": sleep_duration_sec,
+        "sleep_residual_sec": residual,
+        "sleep_event_within_window": sleep_within,
+        "darkwake_event_within_window": darkwake_within,
+    }
+
+
+def host_suspend_pmset_pair(path: Path, case_started: datetime, case_finished: datetime) -> dict[str, Any]:
+    require(path.is_file() and not path.is_symlink(), "host-suspend pmset log is invalid")
+    lines = path.read_bytes().splitlines(keepends=True)
+
+    def event_time(line: bytes, label: str) -> datetime:
+        try:
+            return datetime.strptime(line[:25].decode("ascii"), "%Y-%m-%d %H:%M:%S %z").astimezone(timezone.utc)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ScenarioError(f"host-suspend {label} timestamp is invalid") from exc
+
+    qualifying: list[tuple[int, int, bytes, datetime]] = []
+    offset = 0
+    for index, line in enumerate(lines):
+        if b"Entering Sleep state due to 'Clamshell Sleep'" in line:
+            timestamp = event_time(line, "Sleep")
+            if case_started <= timestamp <= case_finished:
+                qualifying.append((index, offset, line, timestamp))
+        offset += len(line)
+    require(len(qualifying) == 1, "host-suspend c19-006 window must contain exactly one Clamshell Sleep")
+    sleep_index, sleep_offset, sleep_line, sleep_at = qualifying[0]
+    wake: tuple[int, int, bytes, datetime] | None = None
+    offset = sum(len(line) for line in lines[: sleep_index + 1])
+    for index in range(sleep_index + 1, len(lines)):
+        line = lines[index]
+        if re.search(rb"\sDarkWake\s", line):
+            wake = (index, offset, line, event_time(line, "DarkWake"))
+            break
+        offset += len(line)
+    require(wake is not None, "host-suspend Sleep has no following DarkWake")
+    wake_index, wake_offset, wake_line, darkwake_at = wake
+    require(len(sleep_line) == 148, "host-suspend Sleep line byte count mismatch")
+    require(len(wake_line) == 162, "host-suspend DarkWake line byte count mismatch")
+    require(hashlib.sha256(sleep_line).hexdigest() == HOST_SUSPEND_PMSET_SLEEP_LINE_SHA256, "host-suspend Sleep line SHA256 mismatch")
+    require(hashlib.sha256(wake_line).hexdigest() == HOST_SUSPEND_PMSET_DARKWAKE_LINE_SHA256, "host-suspend first DarkWake line SHA256 mismatch")
+    require(sleep_line.endswith(b"\n") and wake_line.endswith(b"\n"), "host-suspend pmset lines must be LF terminated")
+    require(b"DarkWake from Deep Idle [CDNP]" in wake_line, "host-suspend DarkWake text mismatch")
+    duration_match = re.search(rb"\b(\d+) secs\s+\n$", sleep_line)
+    require(duration_match is not None, "host-suspend Sleep line duration is missing")
+    sleep_duration = require_count(int(duration_match.group(1)), "host-suspend Sleep duration", minimum=1)
+    require(sleep_duration == 83, "host-suspend Sleep duration must equal 83 seconds")
+    require((darkwake_at - sleep_at).total_seconds() == 83.0, "host-suspend Sleep/DarkWake timestamp delta mismatch")
+    require(case_started <= sleep_at < darkwake_at <= case_finished, "host-suspend pmset pair is outside c19-006")
+    return {
+        "sleep": {
+            "line_number": sleep_index + 1,
+            "byte_offset": sleep_offset,
+            "size_bytes": len(sleep_line),
+            "sha256": hashlib.sha256(sleep_line).hexdigest(),
+            "timestamp": sleep_at.isoformat().replace("+00:00", "Z"),
+            "event": "Sleep",
+            "reason": "Clamshell Sleep",
+            "advertised_duration_sec": sleep_duration,
+        },
+        "darkwake": {
+            "line_number": wake_index + 1,
+            "byte_offset": wake_offset,
+            "size_bytes": len(wake_line),
+            "sha256": hashlib.sha256(wake_line).hexdigest(),
+            "timestamp": darkwake_at.isoformat().replace("+00:00", "Z"),
+            "event": "DarkWake",
+            "detail": "DarkWake from Deep Idle [CDNP]",
+        },
+        "timestamp_delta_sec": 83.0,
+    }
+
+
+def portable_file_identity(root: Path, path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    require(not path.is_symlink() and resolved.is_file(), f"artifact identity path is invalid: {path}")
+    try:
+        relative = resolved.relative_to(root.resolve()).as_posix()
+    except ValueError as exc:
+        raise ScenarioError(f"artifact identity path escapes artifact root: {path}") from exc
+    return {"path": relative, "sha256": file_sha256(resolved), "size_bytes": resolved.stat().st_size}
+
+
+def staged_file_identity(root: Path, staged_path: Path, final_path: Path) -> dict[str, Any]:
+    require(staged_path.is_file() and not staged_path.is_symlink(), f"staged artifact is invalid: {staged_path}")
+    try:
+        relative = final_path.resolve(strict=False).relative_to(root.resolve()).as_posix()
+    except ValueError as exc:
+        raise ScenarioError(f"final staged artifact path escapes artifact root: {final_path}") from exc
+    return {"path": relative, "sha256": file_sha256(staged_path), "size_bytes": staged_path.stat().st_size}
+
+
+def staged_artifact_ref(root: Path, staged_path: Path, final_path: Path, kind: str) -> dict[str, Any]:
+    identity = staged_file_identity(root, staged_path, final_path)
+    return {"kind": kind, "path": identity["path"], "sha256": identity["sha256"]}
+
+
+def validate_host_suspend_source_artifact(manifest: dict[str, Any], root: Path) -> None:
+    require(file_sha256(root / "execution-manifest.json") == HOST_SUSPEND_MANIFEST_SHA256, "host-suspend execution manifest SHA mismatch")
+    expected = {
+        "source_git_sha": HOST_SUSPEND_SOURCE_GIT_SHA,
+        "source_tree_sha": HOST_SUSPEND_SOURCE_TREE_SHA,
+        "execution_contract": G08_EXECUTION_CONTRACT,
+        "model_key": "m1-qwen35-4b",
+        "backend": "metal",
+        "hardware_id": HOST_SUSPEND_HARDWARE_ID,
+        "model_revision": HOST_SUSPEND_MODEL_REVISION,
+        "model_files": HOST_SUSPEND_MODEL_FILES,
+        "binary_sha256": HOST_SUSPEND_BINARY_SHA256,
+        "models_lock_sha256": HOST_SUSPEND_MODELS_LOCK_SHA256,
+    }
+    for key, value in expected.items():
+        require(manifest.get(key) == value, f"host-suspend execution manifest {key} mismatch")
+    require(manifest.get("dirty_status") == {"is_dirty": False, "status_short": []}, "host-suspend execution manifest is dirty")
+
+
+def host_suspend_timing_scan(root: Path) -> dict[str, Any]:
+    lane = root / "correctness/m1-qwen35-4b/metal/scenarios"
+    case_paths = sorted(lane.glob("C[0-9][0-9]/cases/c[0-9][0-9]-[0-9][0-9][0-9]/case.json"))
+    require(len(case_paths) == 702, "host-suspend source must contain exactly 702 canonical case.json files")
+    mismatches: list[str] = []
+    envelope_count = 0
+    for case_path in case_paths:
+        case = read_json(case_path)
+        case_id = require_string(case.get("case_id"), f"host-suspend timing {case_path}.case_id")
+        execution = require_object(case.get("execution"), f"host-suspend timing {case_id}.execution")
+        started = parse_timestamp(execution.get("started_at"), f"host-suspend timing {case_id}.started_at")
+        finished = parse_timestamp(execution.get("finished_at"), f"host-suspend timing {case_id}.finished_at")
+        duration = execution.get("duration_sec")
+        require(isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0, f"host-suspend timing {case_id} duration invalid")
+        wall = (finished - started).total_seconds()
+        case_mismatch = abs(float(duration) - wall) > max(0.05, wall * 0.05)
+        envelope_ref = require_object(case.get("execution_envelope"), f"host-suspend timing {case_id}.execution_envelope")
+        envelope_path = artifact_path(root, envelope_ref.get("path"), f"host-suspend timing {case_id}.execution_envelope.path")
+        require(envelope_path == case_path.parent / "execution-envelope.json", f"host-suspend timing {case_id} envelope path mismatch")
+        require(file_sha256(envelope_path) == envelope_ref.get("sha256"), f"host-suspend timing {case_id} envelope SHA mismatch")
+        envelope = read_json(envelope_path)
+        spawn = require_object(envelope.get("spawn"), f"host-suspend timing {case_id}.spawn")
+        for key in ("started_at", "finished_at", "duration_sec"):
+            require(spawn.get(key) == execution.get(key), f"host-suspend timing {case_id} spawn binding mismatch")
+        monotonic = (
+            require_count(spawn.get("finished_monotonic_ns"), f"host-suspend timing {case_id}.finished_monotonic_ns", minimum=1)
+            - require_count(spawn.get("started_monotonic_ns"), f"host-suspend timing {case_id}.started_monotonic_ns", minimum=1)
+        ) / 1e9
+        require(monotonic > 0, f"host-suspend timing {case_id} monotonic window invalid")
+        require(abs(float(duration) - monotonic) <= max(0.05, monotonic * 0.05), f"host-suspend timing {case_id} monotonic duration mismatch")
+        envelope_wall = (
+            parse_timestamp(spawn.get("finished_at"), f"host-suspend timing {case_id}.spawn.finished_at")
+            - parse_timestamp(spawn.get("started_at"), f"host-suspend timing {case_id}.spawn.started_at")
+        ).total_seconds()
+        envelope_mismatch = abs(float(spawn["duration_sec"]) - envelope_wall) > max(0.05, envelope_wall * 0.05)
+        require(case_mismatch == envelope_mismatch, f"host-suspend timing {case_id} case/envelope mismatch classification differs")
+        if case_mismatch:
+            mismatches.append(case_id)
+        envelope_count += 1
+    require(mismatches == ["c19-006"], "host-suspend timing corpus must contain only the c19-006 wall-clock mismatch")
+    return {
+        "case_count": len(case_paths),
+        "execution_envelope_count": envelope_count,
+        "ordinary_timing_mismatch_count": len(mismatches),
+        "ordinary_timing_mismatch_case_ids": mismatches,
+        "ordinary_tolerance": {"absolute_sec": 0.05, "relative": 0.05},
+    }
+
+
+def build_host_suspend_provenance(
+    root: Path,
+    evidence: Path,
+    manifest: dict[str, Any],
+    inventory: dict[str, Any],
+    assembler: dict[str, Any],
+    bridge: dict[str, Any],
+    inventory_path: Path,
+    final_inventory_path: Path,
+) -> dict[str, Any]:
+    validate_host_suspend_source_artifact(manifest, root)
+    validate_host_suspend_evidence_files(root, evidence)
+    canonical_case = root / HOST_SUSPEND_CASE_REL
+    copied_case = evidence / "original-case"
+    canonical_names = sorted(path.name for path in canonical_case.iterdir() if path.is_file())
+    copied_names = sorted(path.name for path in copied_case.iterdir() if path.is_file())
+    require(canonical_names == copied_names, "host-suspend copied original-case file set mismatch")
+    for name in canonical_names:
+        require((canonical_case / name).read_bytes() == (copied_case / name).read_bytes(), f"host-suspend copied original-case byte mismatch: {name}")
+    for name in ("full-702.receipt.json", "full-702.stderr.log"):
+        require((evidence / name).read_bytes() == (root / "control" / name).read_bytes(), f"host-suspend copied control byte mismatch: {name}")
+
+    hashes_receipt = read_json(evidence / "hashes.receipt.json")
+    expected_hash_command = [
+        "shasum", "-a", "256", "full-702.receipt.json", "full-702.stderr.log",
+        "original-case/case.json", "original-case/execution-envelope.json",
+        "original-case/http-transcript.json", "original-case/checker.log", "pmset.stdout.log",
+    ]
+    require(hashes_receipt.get("command") == expected_hash_command, "host-suspend hashes command mismatch")
+    require(hashes_receipt.get("status") == "pass" and hashes_receipt.get("rc") == 0, "host-suspend hashes receipt failed")
+    expected_hash_lines = [
+        f"{HOST_SUSPEND_EVIDENCE_FILES[name][0]}  {name}"
+        for name in expected_hash_command[3:]
+    ]
+    require((evidence / "hashes.stdout.log").read_text(encoding="utf-8").splitlines() == expected_hash_lines, "host-suspend hashes stdout mismatch")
+
+    pmset_receipt = read_json(evidence / "pmset.receipt.json")
+    require(pmset_receipt.get("command") == ["pmset", "-g", "log"], "host-suspend pmset command mismatch")
+    require(pmset_receipt.get("status") == "pass" and pmset_receipt.get("rc") == 0, "host-suspend pmset receipt failed")
+    require(pmset_receipt.get("cleanup") == {"process_group_gone": True}, "host-suspend pmset cleanup mismatch")
+    for name in ("stdout", "stderr"):
+        identity = require_object(pmset_receipt.get(name), f"host-suspend pmset {name}")
+        expected_path = evidence / f"pmset.{name}.log"
+        require(Path(require_string(identity.get("path"), f"host-suspend pmset {name}.path")).resolve() == expected_path, f"host-suspend pmset {name} path mismatch")
+        require(identity.get("sha256") == file_sha256(expected_path) and identity.get("size_bytes") == expected_path.stat().st_size, f"host-suspend pmset {name} identity mismatch")
+
+    case = read_json(canonical_case / "case.json")
+    envelope = read_json(canonical_case / "execution-envelope.json")
+    execution = require_object(case.get("execution"), "host-suspend c19-006 execution")
+    spawn = require_object(envelope.get("spawn"), "host-suspend c19-006 spawn")
+    require(case.get("case_id") == envelope.get("case_id") == "c19-006", "host-suspend case identity mismatch")
+    for key in ("id", "argv", "started_at", "finished_at", "duration_sec", "returncode"):
+        require(execution.get(key) == spawn.get(key), f"host-suspend c19-006 execution/spawn {key} mismatch")
+    product = require_object(envelope.get("product_process"), "host-suspend c19-006 product process")
+    require(product.get("pid") == 84281 and product.get("pgid") == 58900, "host-suspend server PID/PGID mismatch")
+    case_started = parse_timestamp(execution.get("started_at"), "host-suspend c19-006 started_at")
+    case_finished = parse_timestamp(execution.get("finished_at"), "host-suspend c19-006 finished_at")
+    pmset_pair = host_suspend_pmset_pair(evidence / "pmset.stdout.log", case_started, case_finished)
+    sleep_at = parse_timestamp(pmset_pair["sleep"]["timestamp"], "host-suspend pmset Sleep")
+    darkwake_at = parse_timestamp(pmset_pair["darkwake"]["timestamp"], "host-suspend pmset DarkWake")
+
+    invocation_path = root / "correctness/m1-qwen35-4b/metal/commands/scenario-executor-invocation.json"
+    invocation = read_json(invocation_path)
+    require(invocation.get("runner_sha256") == HOST_SUSPEND_RUNNER_SHA256, "host-suspend invocation runner SHA mismatch")
+    require(invocation.get("mode") == "canonical", "host-suspend invocation mode mismatch")
+    process_windows = {
+        "c19-006-spawn": host_suspend_duration_window(
+            kind="c19-006-spawn", pid=spawn.get("pid"), pgid=spawn.get("pgid"),
+            started_at=spawn.get("started_at"), finished_at=spawn.get("finished_at"),
+            duration_sec=spawn.get("duration_sec"), started_monotonic_ns=spawn.get("started_monotonic_ns"),
+            finished_monotonic_ns=spawn.get("finished_monotonic_ns"), sleep_duration_sec=83.0,
+            sleep_at=sleep_at, darkwake_at=darkwake_at,
+        ),
+        "scenario-executor-invocation": host_suspend_duration_window(
+            kind="scenario-executor-invocation", pid=invocation.get("pid"), pgid=invocation.get("pgid"),
+            started_at=invocation.get("started_at"), finished_at=invocation.get("finished_at"),
+            duration_sec=invocation.get("duration_sec"), started_monotonic_ns=invocation.get("started_monotonic_ns"),
+            finished_monotonic_ns=invocation.get("finished_monotonic_ns"), sleep_duration_sec=83.0,
+            sleep_at=sleep_at, darkwake_at=darkwake_at,
+        ),
+    }
+    bounded = read_json(evidence / "full-702.receipt.json")
+    require(bounded.get("pid") == bounded.get("pgid") == 58900, "host-suspend bounded PID/PGID mismatch")
+    require(bounded.get("status") == "failed" and bounded.get("rc") == 1 and bounded.get("reason") == "command_exit_nonzero", "host-suspend bounded outcome mismatch")
+    require(bounded.get("cleanup") == {"process_group_gone": True}, "host-suspend bounded cleanup mismatch")
+    limits = require_object(bounded.get("limits"), "host-suspend bounded limits")
+    require(
+        {key: limits.get(key) for key in ("max_processes", "max_group_threads", "max_per_process_threads", "wall_timeout_seconds")}
+        == {"max_processes": 8, "max_group_threads": 128, "max_per_process_threads": 64, "wall_timeout_seconds": 7200.0},
+        "host-suspend bounded limits mismatch",
+    )
+    peaks = require_object(bounded.get("peaks"), "host-suspend bounded peaks")
+    require(
+        {key: peaks.get(key) for key in ("processes", "group_threads", "per_process_threads")}
+        == {"processes": 3, "group_threads": 35, "per_process_threads": 18},
+        "host-suspend bounded peaks mismatch",
+    )
+    expected_failure = f"{CANDIDATE_PASS_PREFIX.replace(' PASS', ' FAIL')}: {root / 'full-702-report.json'}: case c19-006 duration does not match timestamps\n"
+    require((evidence / "full-702.stderr.log").read_text(encoding="utf-8") == expected_failure, "host-suspend bounded failure text mismatch")
+    bounded_stdout = require_object(bounded.get("stdout"), "host-suspend bounded stdout")
+    empty_stdout = root / "control/full-702.stdout.log"
+    require(Path(require_string(bounded_stdout.get("path"), "host-suspend bounded stdout path")).resolve() == empty_stdout, "host-suspend bounded stdout path mismatch")
+    require(empty_stdout.is_file() and empty_stdout.stat().st_size == 0 and file_sha256(empty_stdout) == hashlib.sha256(b"").hexdigest(), "host-suspend bounded stdout is not the sealed empty file")
+    bounded_started = parse_timestamp(bounded.get("started_at"), "host-suspend bounded started_at")
+    bounded_finished = parse_timestamp(bounded.get("ended_at"), "host-suspend bounded ended_at")
+    bounded_duration = bounded.get("duration_seconds")
+    require(isinstance(bounded_duration, (int, float)) and not isinstance(bounded_duration, bool), "host-suspend bounded duration invalid")
+    bounded_wall = (bounded_finished - bounded_started).total_seconds()
+    bounded_discontinuity = bounded_wall - float(bounded_duration)
+    bounded_residual = 83.0 - bounded_discontinuity
+    require(0.0 <= bounded_residual <= 2.0, "host-suspend bounded discontinuity does not match pmset sleep")
+    bounded_sleep_within = bounded_started <= sleep_at <= bounded_finished
+    bounded_wake_within = bounded_started <= darkwake_at <= bounded_finished
+    require(bounded_sleep_within and bounded_wake_within, "host-suspend pmset pair is outside bounded window")
+    process_windows["bounded-full-702"] = {
+        "kind": "bounded-full-702", "pid": 58900, "pgid": 58900,
+        "wall_started_at": bounded.get("started_at"), "wall_finished_at": bounded.get("ended_at"),
+        "recorded_duration_sec": float(bounded_duration), "duration_source": "bounded-command-receipt",
+        "wall_duration_sec": bounded_wall, "clock_discontinuity_sec": bounded_discontinuity,
+        "pmset_sleep_duration_sec": 83.0, "sleep_residual_sec": bounded_residual,
+        "sleep_event_within_window": bounded_sleep_within, "darkwake_event_within_window": bounded_wake_within,
+    }
+    timing_scan = host_suspend_timing_scan(root)
+    command_window_derivation = {
+        command["id"]: {
+            "window_semantics": command["window_semantics"],
+            "started_at": command["started_at"],
+            "started_at_evidence": copy.deepcopy(command["started_at_evidence"]),
+            "finished_at": command["finished_at"],
+            "finished_at_evidence": copy.deepcopy(command["finished_at_evidence"]),
+            "duration_sec": command["duration_sec"],
+            "terminal_evidence": copy.deepcopy(command["terminal_evidence"]),
+        }
+        for command in reconstruct_host_suspend_commands(root, manifest)
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_kind": HOST_SUSPEND_PROVENANCE_KIND,
+        "status": "pass",
+        "original_source": {
+            "source_git_sha": HOST_SUSPEND_SOURCE_GIT_SHA,
+            "source_tree_sha": HOST_SUSPEND_SOURCE_TREE_SHA,
+            "execution_manifest": portable_file_identity(root, root / "execution-manifest.json"),
+        },
+        "final_validation_source": bridge,
+        "assembler": assembler,
+        "original_artifact_inventory": {
+            **staged_file_identity(root, inventory_path, final_inventory_path),
+            "rows_sha256": inventory["inventory_sha256"],
+            "file_count": inventory["file_count"],
+            "size_bytes_indexed": inventory["size_bytes"],
+        },
+        "sealed_evidence": {
+            name: portable_file_identity(root, evidence / name)
+            for name in sorted(HOST_SUSPEND_EVIDENCE_FILES)
+        },
+        "pmset_pair": pmset_pair,
+        "process_windows": process_windows,
+        "timing_scan": timing_scan,
+        "command_window_derivation": command_window_derivation,
+        "bindings": {
+            "canonical_case": portable_file_identity(root, canonical_case / "case.json"),
+            "canonical_execution_envelope": portable_file_identity(root, canonical_case / "execution-envelope.json"),
+            "scenario_executor_invocation": portable_file_identity(root, invocation_path),
+            "bounded_full_702_receipt": portable_file_identity(root, root / "control/full-702.receipt.json"),
+        },
+        "product_processes_started": 0,
+        "model_processes_started": 0,
+    }
 
 
 def native_operator_set_lock_identity(path: Path) -> dict[str, Any]:
@@ -813,6 +1348,125 @@ def canonical_runner_identity() -> dict[str, Any]:
     }
 
 
+def runner_identity_at_git_sha(git_sha: str) -> dict[str, Any]:
+    git_sha = require_git_sha(git_sha, "historic runner git_sha")
+    tree_sha = require_git_sha(
+        git_text(["rev-parse", f"{git_sha}^{{tree}}"]),
+        "historic runner source_tree_sha",
+    )
+    runner_bytes = git_bytes(["show", f"{git_sha}:{RUNNER_REPO_PATH}"])
+    dependencies = []
+    for index, (_, repo_path) in enumerate(RUNNER_DEPENDENCIES):
+        dependency_bytes = git_bytes(["show", f"{git_sha}:{repo_path}"])
+        dependencies.append(
+            {
+                "path": repo_path,
+                "git_blob_sha": require_git_sha(
+                    git_text(["rev-parse", f"{git_sha}:{repo_path}"]),
+                    f"historic runner dependency {index} blob",
+                ),
+                "sha256": hashlib.sha256(dependency_bytes).hexdigest(),
+            }
+        )
+    return {
+        "path": RUNNER_REPO_PATH,
+        "git_sha": git_sha,
+        "source_tree_sha": tree_sha,
+        "git_blob_sha": require_git_sha(
+            git_text(["rev-parse", f"{git_sha}:{RUNNER_REPO_PATH}"]),
+            "historic runner git_blob_sha",
+        ),
+        "sha256": hashlib.sha256(runner_bytes).hexdigest(),
+        "dependencies": dependencies,
+        "dirty_status": {"is_dirty": False, "status_short": []},
+    }
+
+
+def host_suspend_source_bridge() -> dict[str, Any]:
+    require(
+        not git_text(["status", "--short", "--untracked-files=all"]),
+        "host-suspend assembler requires a clean final worktree",
+    )
+    final_sha = require_git_sha(git_text(["rev-parse", "HEAD"]), "host-suspend final git SHA")
+    final_tree = require_git_sha(git_text(["rev-parse", "HEAD^{tree}"]), "host-suspend final tree SHA")
+    parents = git_text(["show", "-s", "--format=%P", final_sha]).split()
+    require(parents == [HOST_SUSPEND_SOURCE_GIT_SHA], "host-suspend final source is not the unique direct child of a609cac8")
+    raw_name_status = git_bytes(
+        ["diff-tree", "--no-commit-id", "--name-status", "-r", HOST_SUSPEND_SOURCE_GIT_SHA, final_sha]
+    )
+    raw_diff_tree = git_bytes(
+        ["diff-tree", "--no-commit-id", "--raw", "--no-abbrev", "-r", HOST_SUSPEND_SOURCE_GIT_SHA, final_sha]
+    )
+    name_status = []
+    for line in raw_name_status.decode("utf-8").splitlines():
+        status, path = line.split("\t", 1)
+        name_status.append((status, path))
+    require(tuple(name_status) == HOST_SUSPEND_BRIDGE_PATHS, "host-suspend direct-child name-status set mismatch")
+    raw_rows = []
+    for line in raw_diff_tree.decode("utf-8").splitlines():
+        metadata, path = line.split("\t", 1)
+        old_mode, new_mode, old_blob, new_blob, status = metadata.split()
+        raw_rows.append(
+            {
+                "status": status,
+                "path": path,
+                "old_mode": old_mode.removeprefix(":"),
+                "new_mode": new_mode,
+                "old_blob": old_blob,
+                "new_blob": new_blob,
+            }
+        )
+    require(
+        [(row["status"], row["path"]) for row in raw_rows] == list(HOST_SUSPEND_BRIDGE_PATHS),
+        "host-suspend raw diff path set mismatch",
+    )
+    amendment_path = HOST_SUSPEND_BRIDGE_PATHS[0][1]
+    missing = subprocess.run(
+        ["git", "cat-file", "-e", f"{HOST_SUSPEND_SOURCE_GIT_SHA}:{amendment_path}"],
+        cwd=REPO_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    require(missing.returncode != 0, "host-suspend amendment unexpectedly exists at a609cac8")
+    blobs: dict[str, Any] = {}
+    for status, path in HOST_SUSPEND_BRIDGE_PATHS:
+        base_blob = None
+        if status == "M":
+            base_blob = require_git_sha(
+                git_text(["rev-parse", f"{HOST_SUSPEND_SOURCE_GIT_SHA}:{path}"]),
+                f"host-suspend base blob {path}",
+            )
+            require(base_blob == HOST_SUSPEND_BASE_BLOBS[path], f"host-suspend base blob drift: {path}")
+        final_blob = require_git_sha(
+            git_text(["rev-parse", f"{final_sha}:{path}"]),
+            f"host-suspend final blob {path}",
+        )
+        raw_row = next(row for row in raw_rows if row["path"] == path)
+        expected_mode = HOST_SUSPEND_FINAL_MODES[path]
+        require(raw_row["new_mode"] == expected_mode and raw_row["new_blob"] == final_blob, f"host-suspend final raw blob/mode mismatch: {path}")
+        if status == "A":
+            require(raw_row["old_mode"] == "000000" and raw_row["old_blob"] == "0" * 40, "host-suspend amendment raw add identity mismatch")
+        else:
+            require(raw_row["old_mode"] == expected_mode and raw_row["old_blob"] == base_blob, f"host-suspend base raw blob/mode mismatch: {path}")
+        blobs[path] = {"status": status, "base_git_blob_sha": base_blob, "final_git_blob_sha": final_blob}
+    return {
+        "kind": "runtime-vnext-host-suspend-direct-child-bridge-v1",
+        "base_git_sha": HOST_SUSPEND_SOURCE_GIT_SHA,
+        "base_tree_sha": HOST_SUSPEND_SOURCE_TREE_SHA,
+        "final_git_sha": final_sha,
+        "final_tree_sha": final_tree,
+        "parents": parents,
+        "name_status": [
+            {"status": status, "path": path} for status, path in HOST_SUSPEND_BRIDGE_PATHS
+        ],
+        "raw_name_status_sha256": hashlib.sha256(raw_name_status).hexdigest(),
+        "raw_diff_tree_sha256": hashlib.sha256(raw_diff_tree).hexdigest(),
+        "raw_diff_tree": raw_rows,
+        "blobs": blobs,
+    }
+
+
 def internal_fixture_runner_identity() -> dict[str, Any]:
     return {
         "path": RUNNER_REPO_PATH,
@@ -895,6 +1549,7 @@ def validate_source_identity(
     label: str,
     *,
     allow_internal_fixture: bool = False,
+    allow_host_suspend_source: bool = False,
 ) -> str:
     contract = execution_contract(data, label)
     source_git_sha = require_git_sha(data.get("source_git_sha"), f"{label}.source_git_sha")
@@ -908,13 +1563,16 @@ def validate_source_identity(
             f"{label}.source_tree_sha",
         )
         require(source_tree_sha == expected_tree, f"{label}.source_tree_sha mismatch")
-        if not allow_internal_fixture:
+        if not allow_internal_fixture and not allow_host_suspend_source:
             current_sha = require_git_sha(git_text(["rev-parse", "HEAD"]), f"{label}.current_git_sha")
             require(source_git_sha == current_sha, f"{label}.source_git_sha is not the current candidate SHA")
             require(
                 not git_text(["status", "--short", "--untracked-files=all"]),
                 f"{label} candidate worktree must be clean",
             )
+        if allow_host_suspend_source:
+            require(source_git_sha == HOST_SUSPEND_SOURCE_GIT_SHA, f"{label}.source_git_sha is not the sealed host-suspend source")
+            require(source_tree_sha == HOST_SUSPEND_SOURCE_TREE_SHA, f"{label}.source_tree_sha is not the sealed host-suspend tree")
     dirty = require_object(data.get("dirty_status"), f"{label}.dirty_status")
     require(dirty.get("is_dirty") is False, f"{label} dirty source is forbidden")
     require(dirty.get("status_short") == [], f"{label}.dirty_status.status_short must be empty")
@@ -1528,6 +2186,7 @@ def validate_candidate_build_receipt(
     *,
     expected: dict[str, Any],
     allow_internal_fixture: bool,
+    allow_host_suspend_source: bool = False,
 ) -> tuple[dict[str, Any], Path, str, Path]:
     receipt_path, _, parsed = validate_artifact_ref(
         root,
@@ -1544,6 +2203,7 @@ def validate_candidate_build_receipt(
             receipt,
             "candidate binary build receipt",
             allow_internal_fixture=allow_internal_fixture,
+            allow_host_suspend_source=allow_host_suspend_source,
         )
         == G08_EXECUTION_CONTRACT,
         "candidate build receipt execution contract mismatch",
@@ -1846,7 +2506,12 @@ def validate_candidate_build_receipt(
     return receipt, receipt_path, file_sha256(receipt_path), binary_path
 
 
-def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[str, Any]:
+def validate_runner_identity(
+    raw: Any,
+    *,
+    allow_internal_fixture: bool,
+    allow_host_suspend_source: bool = False,
+) -> dict[str, Any]:
     runner = require_object(raw, "scenario_report.runner")
     require(runner.get("path") == RUNNER_REPO_PATH, f"scenario_report.runner.path must be {RUNNER_REPO_PATH}")
     require_sha256(runner.get("sha256"), "scenario_report.runner.sha256")
@@ -1867,7 +2532,11 @@ def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[
     checked_in = git_bytes(["show", f"{runner_git_sha}:{RUNNER_REPO_PATH}"])
     expected_sha256 = hashlib.sha256(checked_in).hexdigest()
     require(runner.get("sha256") == expected_sha256, "scenario_report runner SHA256 mismatch")
-    require(file_sha256(RUNNER_PATH) == expected_sha256, "scenario_report runner does not match the current gate contract")
+    if allow_host_suspend_source:
+        require(runner_git_sha == HOST_SUSPEND_SOURCE_GIT_SHA, "scenario_report runner is not the sealed host-suspend runner")
+        require(expected_sha256 == HOST_SUSPEND_RUNNER_SHA256, "scenario_report sealed host-suspend runner SHA mismatch")
+    else:
+        require(file_sha256(RUNNER_PATH) == expected_sha256, "scenario_report runner does not match the current gate contract")
     dependencies = require_list(runner.get("dependencies"), "scenario_report.runner.dependencies")
     expected_dependencies = tuple(
         (repo_path, local_path)
@@ -1902,10 +2571,11 @@ def validate_runner_identity(raw: Any, *, allow_internal_fixture: bool) -> dict[
             dependency.get("sha256") == dependency_sha256,
             f"scenario_report runner dependency {index} SHA256 mismatch",
         )
-        require(
-            file_sha256(local_path) == dependency_sha256,
-            f"scenario_report runner dependency {index} does not match current gate contract",
-        )
+        if not allow_host_suspend_source:
+            require(
+                file_sha256(local_path) == dependency_sha256,
+                f"scenario_report runner dependency {index} does not match current gate contract",
+            )
     return runner
 
 
@@ -1922,6 +2592,7 @@ def validate_effective_config(
         config,
         "effective_config",
         allow_internal_fixture=bool(expected.get("allow_internal_fixture")),
+        allow_host_suspend_source=bool(expected.get("allow_host_suspend_source")),
     )
     require(
         config_contract == expected.get("execution_contract", LEGACY_EXECUTION_CONTRACT),
@@ -1961,6 +2632,40 @@ def validate_command(
     require(argv[1] == entrypoint, f"{label}.argv must have exact ferrum {entrypoint} command shape")
     execution_mode = command.get("execution_mode")
     resident_mode = entrypoint == "run" and execution_mode == "resident-jsonl"
+    observed_live_window = expected.get("allow_host_suspend_source") is True
+    if observed_live_window:
+        require(command.get("window_semantics") == "observed-live-window", f"{label} host-suspend window semantics mismatch")
+        started_evidence = require_object(command.get("started_at_evidence"), f"{label}.started_at_evidence")
+        require(started_evidence.get("kind") == "product-process-started-at", f"{label} host-suspend started-at evidence kind mismatch")
+        _, _, envelope_parsed = validate_artifact_ref(
+            root,
+            started_evidence.get("execution_envelope"),
+            f"{label}.started_at_evidence.execution_envelope",
+            allowed_kinds={"raw-json"},
+        )
+        start_envelope = require_object(envelope_parsed, f"{label}.started_at_evidence.execution_envelope JSON")
+        require(start_envelope.get("case_id") == started_evidence.get("case_id"), f"{label} host-suspend started-at case binding mismatch")
+        require(start_envelope.get("command_id") == command_id, f"{label} host-suspend started-at command binding mismatch")
+        require(require_object(start_envelope.get("product_process"), f"{label} start product process").get("started_at") == command.get("started_at"), f"{label} host-suspend started-at is not derived from product evidence")
+        finished_evidence = require_object(command.get("finished_at_evidence"), f"{label}.finished_at_evidence")
+        require(finished_evidence.get("kind") == "last-case-finished-at", f"{label} host-suspend finished-at evidence kind mismatch")
+        case_path, _, case_parsed = validate_artifact_ref(
+            root,
+            finished_evidence.get("case_json"),
+            f"{label}.finished_at_evidence.case_json",
+            allowed_kinds={"raw-json"},
+        )
+        last_case = require_object(case_parsed, f"{label}.finished_at_evidence.case_json JSON")
+        require(last_case.get("case_id") == finished_evidence.get("case_id"), f"{label} host-suspend finished-at case binding mismatch")
+        require(last_case.get("command_id") == command_id, f"{label} host-suspend finished-at command binding mismatch")
+        require(require_object(last_case.get("execution"), f"{label} last case execution").get("finished_at") == command.get("finished_at"), f"{label} host-suspend finished-at is not derived from its bound case")
+        require(case_path.parent.name == last_case["case_id"], f"{label} host-suspend finished-at case path mismatch")
+        terminal = require_object(command.get("terminal_evidence"), f"{label}.terminal_evidence")
+    else:
+        require(
+            not ({"window_semantics", "started_at_evidence", "finished_at_evidence", "terminal_evidence"} & set(command)),
+            f"{label} ordinary command contains derived live-window fields",
+        )
     if expected.get("execution_contract") == G08_EXECUTION_CONTRACT and entrypoint == "run":
         require(resident_mode, f"{label} G08 run command must use resident-jsonl")
     if resident_mode:
@@ -1980,17 +2685,37 @@ def validate_command(
             and all(value in {"<none>", "P_DETERMINISTIC", "P_NO_THINKING", "P_THINKING", "P_OFFICIAL_DEFAULT"} for value in preset_aliases),
             f"{label}.preset_aliases invalid",
         )
-        validate_artifact_ref(
+        _, _, wire_parsed = validate_artifact_ref(
             root,
             command.get("wire_receipt"),
             f"{label}.wire_receipt",
             allowed_kinds={"raw-json"},
         )
+        if observed_live_window:
+            wire = require_object(wire_parsed, f"{label}.wire_receipt JSON")
+            require(terminal.get("kind") == "resident-jsonl-exit-event-monotonic", f"{label} host-suspend run terminal evidence kind mismatch")
+            require(terminal.get("wire_receipt") == command.get("wire_receipt"), f"{label} host-suspend terminal wire binding mismatch")
+            exit_event = require_object(wire.get("exit_event"), f"{label} host-suspend exit event")
+            require(
+                terminal.get("exit_received_monotonic_ns") == exit_event.get("received_monotonic_ns")
+                and terminal.get("controlled_stop") is True
+                and wire.get("controlled_stop") is True,
+                f"{label} host-suspend terminal event mismatch",
+            )
     else:
         require(
             not ({"group_key", "case_count", "case_ids", "preset_aliases", "wire_receipt"} & set(command)),
             f"{label} non-resident command contains resident metadata",
         )
+        if observed_live_window:
+            require(
+                terminal
+                == {
+                    "kind": "wall-terminal-not-persisted",
+                    "last_observed_case_id": finished_evidence.get("case_id"),
+                },
+                f"{label} host-suspend serve terminal evidence mismatch",
+            )
     if "binary_path" in expected:
         require(Path(argv[0]).resolve() == expected["binary_path"], f"{label}.argv binary is not the bound binary artifact")
         require(argv[2] == expected.get("model_path"), f"{label}.argv model path is not the bound execution model")
@@ -3497,7 +4222,16 @@ def validate_case_evidence(
     duration = execution.get("duration_sec")
     actual_duration = (finished - started).total_seconds()
     require(isinstance(duration, (int, float)) and not isinstance(duration, bool) and duration > 0, f"case {case_id} duration invalid")
-    require(abs(float(duration) - actual_duration) <= max(0.05, actual_duration * 0.05), f"case {case_id} duration does not match timestamps")
+    wall_duration_matches = abs(float(duration) - actual_duration) <= max(0.05, actual_duration * 0.05)
+    require(
+        wall_duration_matches
+        or (
+            case_id == "c19-006"
+            and expected.get("allow_host_suspend_source") is True
+            and host_suspend_timing_exception(expected["report"], "c19-006-spawn", execution)
+        ),
+        f"case {case_id} duration does not match timestamps",
+    )
     if "invocation_started_at" in expected:
         require(expected["invocation_started_at"] <= started < finished <= expected["invocation_finished_at"], f"case {case_id} wall window is outside executor invocation")
     expectation_rule = resolve_expectation(
@@ -3743,7 +4477,12 @@ def validate_case_evidence(
         )
         checker = require_object(envelope_document.get("checker"), f"case {case_id}.checker")
         require(checker.get("mode") == "in-process" and checker.get("function") == "classify_execution_outcome", f"case {case_id} checker identity mismatch")
-        require(checker.get("runner_sha256") == file_sha256(RUNNER_PATH), f"case {case_id} checker runner SHA mismatch")
+        expected_checker_runner_sha = (
+            HOST_SUSPEND_RUNNER_SHA256
+            if expected.get("allow_host_suspend_source") is True
+            else file_sha256(RUNNER_PATH)
+        )
+        require(checker.get("runner_sha256") == expected_checker_runner_sha, f"case {case_id} checker runner SHA mismatch")
         checker_inputs = require_object(checker.get("input_artifact_sha256"), f"case {case_id}.checker.input_artifact_sha256")
         expected_checker_inputs = {"stdout": file_sha256(resolved["stdout"][0]), "stderr": file_sha256(resolved["stderr"][0])}
         if entrypoint == "serve":
@@ -4569,6 +5308,163 @@ def validate_resident_run_commands(
     require(len(pids) == 5, "G08 resident commands did not use five distinct product processes")
 
 
+def host_suspend_timing_exception(report: dict[str, Any], window_name: str, record: dict[str, Any]) -> bool:
+    assembly = require_object(report.get("assembly"), "host-suspend report assembly")
+    root_text = require_string(
+        require_object(assembly.get("artifact_root"), "host-suspend assembly artifact_root").get("path"),
+        "host-suspend assembly artifact_root.path",
+    )
+    root = Path(root_text).resolve()
+    _, _, parsed = validate_artifact_ref(
+        root,
+        assembly.get("host_suspend_provenance"),
+        "host-suspend report provenance",
+        allowed_kinds={"raw-json"},
+    )
+    provenance = require_object(parsed, "host-suspend report provenance JSON")
+    windows = require_object(provenance.get("process_windows"), "host-suspend process windows")
+    require(
+        set(windows) == {"c19-006-spawn", "scenario-executor-invocation", "bounded-full-702"},
+        "host-suspend process window denominator mismatch",
+    )
+    window = require_object(windows.get(window_name), f"host-suspend process window {window_name}")
+    if window_name == "c19-006-spawn":
+        required = {
+            "started_at": window.get("wall_started_at"),
+            "finished_at": window.get("wall_finished_at"),
+            "duration_sec": window.get("recorded_duration_sec"),
+        }
+    elif window_name == "scenario-executor-invocation":
+        required = {
+            "pid": window.get("pid"),
+            "pgid": window.get("pgid"),
+            "started_at": window.get("wall_started_at"),
+            "finished_at": window.get("wall_finished_at"),
+            "started_monotonic_ns": window.get("monotonic_started_ns"),
+            "finished_monotonic_ns": window.get("monotonic_finished_ns"),
+            "duration_sec": window.get("recorded_duration_sec"),
+        }
+    else:
+        raise ScenarioError(f"host-suspend timing exception is forbidden for {window_name}")
+    return all(record.get(key) == value for key, value in required.items())
+
+
+def validate_host_suspend_report_assembly(
+    report: dict[str, Any],
+    root: Path,
+    *,
+    report_path: Path | None,
+) -> dict[str, Any]:
+    root = root.resolve()
+    expected_report = root / HOST_SUSPEND_DERIVED_REL / "scenario-report.json"
+    if report_path is not None:
+        require(report_path.resolve() == expected_report, "host-suspend scenario report path mismatch")
+    assembly = require_object(report.get("assembly"), "host-suspend report assembly")
+    require(
+        set(assembly)
+        == {
+            "kind", "mode", "eligible_case_id", "artifact_root", "original_source",
+            "final_validation_source", "assembler", "original_artifact_inventory",
+            "host_suspend_provenance", "product_processes_started", "model_processes_started",
+        },
+        "host-suspend report assembly fields mismatch",
+    )
+    require(assembly.get("kind") == HOST_SUSPEND_ASSEMBLY_KIND, "host-suspend report assembly kind mismatch")
+    require(assembly.get("mode") == "artifact-only" and assembly.get("eligible_case_id") == "c19-006", "host-suspend report assembly scope mismatch")
+    require(assembly.get("artifact_root") == {"path": str(root)}, "host-suspend report artifact root mismatch")
+    require(
+        assembly.get("original_source")
+        == {"source_git_sha": HOST_SUSPEND_SOURCE_GIT_SHA, "source_tree_sha": HOST_SUSPEND_SOURCE_TREE_SHA},
+        "host-suspend report original source mismatch",
+    )
+    require(assembly.get("product_processes_started") == assembly.get("model_processes_started") == 0, "host-suspend assembly started a product/model process")
+    inventory_path, _, inventory_parsed = validate_artifact_ref(
+        root, assembly.get("original_artifact_inventory"), "host-suspend report inventory", allowed_kinds={"raw-json"}
+    )
+    provenance_path, _, provenance_parsed = validate_artifact_ref(
+        root, assembly.get("host_suspend_provenance"), "host-suspend report provenance", allowed_kinds={"raw-json"}
+    )
+    require(inventory_path == root / HOST_SUSPEND_DERIVED_REL / "original-artifact-inventory.json", "host-suspend inventory path mismatch")
+    require(provenance_path == root / HOST_SUSPEND_DERIVED_REL / "host-suspend-provenance.json", "host-suspend provenance path mismatch")
+    inventory = require_object(inventory_parsed, "host-suspend inventory JSON")
+    provenance = require_object(provenance_parsed, "host-suspend provenance JSON")
+    validate_host_suspend_original_inventory(inventory)
+    require(host_suspend_original_inventory(root) == inventory, "host-suspend original artifacts changed after assembly")
+    assembler = canonical_runner_identity()
+    bridge = host_suspend_source_bridge()
+    require(assembly.get("assembler") == assembler, "host-suspend report assembler identity mismatch")
+    require(assembly.get("final_validation_source") == bridge, "host-suspend report final validation source mismatch")
+    expected_provenance = build_host_suspend_provenance(
+        root,
+        root / HOST_SUSPEND_EVIDENCE_REL,
+        read_json(root / "execution-manifest.json"),
+        inventory,
+        assembler,
+        bridge,
+        inventory_path,
+        inventory_path,
+    )
+    require(provenance == expected_provenance, "host-suspend provenance is not mechanically derived from sealed bytes")
+    return {"inventory": inventory, "provenance": provenance, "assembler": assembler, "bridge": bridge}
+
+
+def validate_host_suspend_command_windows(
+    root: Path,
+    commands: dict[str, dict[str, Any]],
+    case_rows_by_scenario: dict[str, list[dict[str, Any]]],
+) -> None:
+    all_cases = [case for rows in case_rows_by_scenario.values() for case in rows]
+    for command_id, command_record in commands.items():
+        command = require_object(command_record.get("raw"), f"host-suspend command {command_id}")
+        cases = [case for case in all_cases if case.get("command_id") == command_id]
+        require(cases, f"host-suspend command {command_id} has no validated cases")
+        first_started = min(case["started_at"] for case in cases)
+        last_finished = max(case["finished_at"] for case in cases)
+        product_identities: set[tuple[str, int, int, tuple[str, ...]]] = set()
+        for case in cases:
+            case_path = root / (
+                f"correctness/m1-qwen35-4b/metal/scenarios/{case['scenario_id']}"
+                f"/cases/{case['case_id']}/case.json"
+            )
+            case_document = read_json(case_path)
+            envelope_ref = require_object(
+                case_document.get("execution_envelope"),
+                f"host-suspend command {command_id} case {case['case_id']} envelope",
+            )
+            _, _, envelope_parsed = validate_artifact_ref(
+                root,
+                envelope_ref,
+                f"host-suspend command {command_id} case {case['case_id']} envelope",
+                allowed_kinds={"raw-json"},
+            )
+            envelope = require_object(envelope_parsed, f"host-suspend command {command_id} case envelope JSON")
+            require(envelope.get("command_id") == command_id, f"host-suspend command {command_id} envelope binding mismatch")
+            product = require_object(envelope.get("product_process"), f"host-suspend command {command_id} product process")
+            product_identities.add(
+                (
+                    require_string(product.get("started_at"), f"host-suspend command {command_id} product started_at"),
+                    require_count(product.get("pid"), f"host-suspend command {command_id} product pid", minimum=1),
+                    require_count(product.get("pgid"), f"host-suspend command {command_id} product pgid", minimum=1),
+                    tuple(require_list(product.get("argv"), f"host-suspend command {command_id} product argv")),
+                )
+            )
+        require(len(product_identities) == 1, f"host-suspend command {command_id} cases do not share one product process")
+        product_started_at, _, _, product_argv = next(iter(product_identities))
+        require(product_started_at == command.get("started_at"), f"host-suspend command {command_id} start is not the shared product start")
+        require(list(product_argv) == command.get("argv"), f"host-suspend command {command_id} argv differs from shared product")
+        require(
+            parse_timestamp(command.get("started_at"), f"host-suspend command {command_id}.started_at") <= first_started,
+            f"host-suspend command {command_id} observed-live window starts after its first case",
+        )
+        require(
+            parse_timestamp(command.get("finished_at"), f"host-suspend command {command_id}.finished_at") == last_finished,
+            f"host-suspend command {command_id} observed-live endpoint is not the last validated case",
+        )
+        evidence = require_object(command.get("finished_at_evidence"), f"host-suspend command {command_id}.finished_at_evidence")
+        last_ids = sorted(case["case_id"] for case in cases if case["finished_at"] == last_finished)
+        require(evidence.get("case_id") == last_ids[0], f"host-suspend command {command_id} last-case evidence is not deterministic")
+
+
 def validate_report_document(
     report: dict[str, Any],
     root: Path,
@@ -4580,10 +5476,14 @@ def validate_report_document(
     require(report.get("schema_version") == SCHEMA_VERSION, "scenario_report.schema_version mismatch")
     require(report.get("status") == "pass", "scenario_report.status must be pass")
     reject_forbidden_markers(report, "scenario_report", allow_internal_fixture=allow_internal_fixture)
+    host_suspend = report.get("assembly") is not None
+    if host_suspend:
+        validate_host_suspend_report_assembly(report, root, report_path=report_path)
     contract = validate_source_identity(
         report,
         "scenario_report",
         allow_internal_fixture=allow_internal_fixture,
+        allow_host_suspend_source=host_suspend,
     )
     model_key = require_string(report.get("model_key"), "scenario_report.model_key")
     require(model_key in {"m1-qwen35-4b", "m2-qwen35-35b-a3b", "m3-qwen3-30b-a3b"}, "scenario_report.model_key is not primary")
@@ -4617,6 +5517,8 @@ def validate_report_document(
     }
     expected["execution_contract"] = contract
     expected["allow_internal_fixture"] = allow_internal_fixture
+    expected["allow_host_suspend_source"] = host_suspend
+    expected["report"] = report
     if "model_path" in report:
         expected["model_path"] = report["model_path"]
     _, effective_config_sha256 = validate_effective_config(root, report.get("effective_config"), expected=expected)
@@ -4655,6 +5557,7 @@ def validate_report_document(
                 "binary_path": binary_path,
             },
             allow_internal_fixture=allow_internal_fixture,
+            allow_host_suspend_source=host_suspend,
         )
     else:
         require(
@@ -4663,12 +5566,13 @@ def validate_report_document(
         )
     models_lock_path, _, _ = validate_artifact_ref(root, report.get("models_lock"), "scenario_report.models_lock", allowed_kinds={"raw-json"})
     require(file_sha256(models_lock_path) == report["models_lock_sha256"], "scenario_report models.lock binding mismatch")
-    runner_identity = validate_runner_identity(report.get("runner"), allow_internal_fixture=allow_internal_fixture)
+    runner_identity = validate_runner_identity(
+        report.get("runner"),
+        allow_internal_fixture=allow_internal_fixture,
+        allow_host_suspend_source=host_suspend,
+    )
     if contract == G08_EXECUTION_CONTRACT and not allow_internal_fixture:
-        require(
-            runner_identity["git_sha"] == report["source_git_sha"],
-            "G08 candidate source SHA differs from its runner SHA",
-        )
+        require(runner_identity["git_sha"] == report["source_git_sha"], "G08 candidate source SHA differs from its runner SHA")
     invocation_ref = report.get("executor_invocation")
     if not allow_internal_fixture or invocation_ref is not None:
         _, _, invocation_parsed = validate_artifact_ref(root, invocation_ref, "scenario_report.executor_invocation", allowed_kinds={"raw-json"})
@@ -4690,7 +5594,12 @@ def validate_report_document(
         require(isinstance(invocation_duration, (int, float)) and not isinstance(invocation_duration, bool) and invocation_duration > 0, "executor invocation duration invalid")
         wall_duration = (invocation_finished_at - invocation_started_at).total_seconds()
         mono_duration = (finish_ns - start_ns) / 1e9
-        require(abs(float(invocation_duration) - wall_duration) <= max(0.05, wall_duration * 0.05), "executor invocation wall duration mismatch")
+        invocation_wall_matches = abs(float(invocation_duration) - wall_duration) <= max(0.05, wall_duration * 0.05)
+        require(
+            invocation_wall_matches
+            or host_suspend_timing_exception(report, "scenario-executor-invocation", invocation),
+            "executor invocation wall duration mismatch",
+        )
         require(abs(float(invocation_duration) - mono_duration) <= max(0.05, mono_duration * 0.05), "executor invocation monotonic duration mismatch")
         require_count(invocation.get("pid"), "executor invocation pid", minimum=1)
         require_count(invocation.get("pgid"), "executor invocation pgid", minimum=1)
@@ -4717,6 +5626,7 @@ def validate_report_document(
             snapshot_document,
             root,
             allow_internal_fixture=allow_internal_fixture,
+            allow_host_suspend_source=host_suspend,
         )
         require(snapshot["execution_contract"] == contract, "executor invocation manifest execution contract differs from report")
         for key in ("source_git_sha", "source_tree_sha", "models_lock_sha256", "binary_sha256", "model_key", "backend", "model_revision", "model_files", "hardware_id"):
@@ -4772,6 +5682,8 @@ def validate_report_document(
             used_case_artifacts=used_case_artifacts,
             used_argv=used_argv,
         )
+    if host_suspend:
+        validate_host_suspend_command_windows(root, commands, case_rows_by_scenario)
     if invocation_ref is not None:
         expected_run_ids = (
             {f"actual-run-{index:02d}" for index in range(1, 6)}
@@ -4870,6 +5782,445 @@ def collect_manifest(
         require_current_output_path=True,
     )
     return report
+
+
+def reconstruct_host_suspend_commands(root: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    lane = root / "correctness/m1-qwen35-4b/metal"
+    case_documents = [read_json(path) for path in sorted(lane.glob("scenarios/C??/cases/c??-???/case.json"))]
+    require(len(case_documents) == 702, "host-suspend command reconstruction requires 702 cases")
+    effective_sha = file_sha256(lane / "effective-config.json")
+    commands: list[dict[str, Any]] = []
+    command_specs = [
+        *(f"actual-run-{index:02d}" for index in range(1, 6)),
+        "actual-serve-01",
+        "actual-serve-02",
+    ]
+    for command_id in command_specs:
+        command_cases = [case for case in case_documents if case.get("command_id") == command_id]
+        require(command_cases, f"host-suspend command {command_id} has no cases")
+        command_cases.sort(key=lambda case: (case["scenario_id"], case["ordinal"]))
+        first_case_path = artifact_path(
+            root,
+            command_cases[0]["execution_envelope"]["path"],
+            f"host-suspend {command_id} first case envelope",
+        )
+        first_envelope = read_json(first_case_path)
+        product = require_object(first_envelope.get("product_process"), f"host-suspend {command_id} product process")
+        process_ref = require_object(first_envelope.get("product_process_receipt"), f"host-suspend {command_id} process receipt")
+        _, _, receipt_parsed = validate_artifact_ref(root, process_ref, f"host-suspend {command_id} process receipt", allowed_kinds={"raw-json"})
+        receipt = require_object(receipt_parsed, f"host-suspend {command_id} process receipt JSON")
+        argv = require_list(receipt.get("argv"), f"host-suspend {command_id} argv")
+        environment = validate_sanitized_environment(receipt.get("environment"), f"host-suspend {command_id} environment")
+        started_at = require_string(product.get("started_at"), f"host-suspend {command_id} started_at")
+        last_case = max(
+            command_cases,
+            key=lambda case: parse_timestamp(
+                case["execution"]["finished_at"],
+                f"host-suspend {command_id} case finished_at",
+            ),
+        )
+        finished_at = require_string(
+            require_object(last_case.get("execution"), f"host-suspend {command_id} last case execution").get("finished_at"),
+            f"host-suspend {command_id} last observed finished_at",
+        )
+        last_case_path = lane / f"scenarios/{last_case['scenario_id']}/cases/{last_case['case_id']}/case.json"
+        duration = (
+            parse_timestamp(finished_at, f"host-suspend {command_id} finished_at")
+            - parse_timestamp(started_at, f"host-suspend {command_id} started_at")
+        ).total_seconds()
+        stem = command_id.removeprefix("actual-")
+        command = {
+            "id": command_id,
+            "entrypoint": "run" if command_id.startswith("actual-run-") else "serve",
+            "argv": argv,
+            "source_git_sha": manifest["source_git_sha"],
+            "source_tree_sha": manifest["source_tree_sha"],
+            "models_lock_sha256": manifest["models_lock_sha256"],
+            "binary_sha256": manifest["binary_sha256"],
+            "effective_config_sha256": effective_sha,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "duration_sec": duration,
+            "window_semantics": "observed-live-window",
+            "started_at_evidence": {
+                "kind": "product-process-started-at",
+                "case_id": command_cases[0]["case_id"],
+                "execution_envelope": existing_artifact_ref(root, first_case_path, "raw-json"),
+            },
+            "finished_at_evidence": {
+                "kind": "last-case-finished-at",
+                "case_id": last_case["case_id"],
+                "case_json": existing_artifact_ref(root, last_case_path, "raw-json"),
+            },
+            "env": environment,
+            "env_sha256": canonical_json_sha256(environment),
+            "process_receipt": process_ref,
+            "returncode": 0,
+            "stdout": existing_artifact_ref(root, lane / f"commands/{stem}.stdout.log", "stdout-log"),
+            "stderr": existing_artifact_ref(root, lane / f"commands/{stem}.stderr.log", "stderr-log"),
+        }
+        if command["entrypoint"] == "run":
+            wire_path = lane / f"commands/{stem}.wire-receipt.json"
+            wire = read_json(wire_path)
+            require(wire.get("command_id") == command_id, f"host-suspend {command_id} wire binding mismatch")
+            command.update(
+                {
+                    "execution_mode": "resident-jsonl",
+                    "group_key": wire.get("group_key"),
+                    "case_count": wire.get("case_count"),
+                    "case_ids": wire.get("case_ids"),
+                    "preset_aliases": wire.get("preset_aliases"),
+                    "wire_receipt": existing_artifact_ref(root, wire_path, "raw-json"),
+                    "terminal_evidence": {
+                        "kind": "resident-jsonl-exit-event-monotonic",
+                        "wire_receipt": existing_artifact_ref(root, wire_path, "raw-json"),
+                        "exit_received_monotonic_ns": require_object(
+                            wire.get("exit_event"), f"host-suspend {command_id} exit event"
+                        ).get("received_monotonic_ns"),
+                        "controlled_stop": wire.get("controlled_stop"),
+                    },
+                }
+            )
+        else:
+            command["terminal_evidence"] = {
+                "kind": "wall-terminal-not-persisted",
+                "last_observed_case_id": last_case["case_id"],
+            }
+        commands.append(command)
+    require(sum(command["case_count"] for command in commands if command["entrypoint"] == "run") == 97, "host-suspend resident run denominator mismatch")
+    return commands
+
+
+def reconstruct_host_suspend_scenarios(root: Path) -> list[dict[str, Any]]:
+    lane = root / "correctness/m1-qwen35-4b/metal/scenarios"
+    scenarios = []
+    for scenario_id in SCENARIO_IDS:
+        raw_path = lane / scenario_id / "raw.json"
+        checker_path = lane / scenario_id / "checker.log"
+        raw = read_json(raw_path)
+        require(raw.get("scenario_id") == scenario_id, f"host-suspend raw scenario identity mismatch: {scenario_id}")
+        scenario = {
+            "id": scenario_id,
+            **{
+                key: copy.deepcopy(raw[key])
+                for key in (
+                    "status", "case_count", "passed_count", "known_failed_count", "blocked_count",
+                    "failed_count", "error_count", "unexpected_count", "presets", "unpreset_count",
+                    "entrypoints", "command_ids", "variants", "dimensions", "assertions",
+                )
+            },
+            "artifacts": [
+                existing_artifact_ref(root, raw_path, "raw-json"),
+                existing_artifact_ref(root, checker_path, "checker-log"),
+            ],
+        }
+        if scenario_id == "C18":
+            scenario["concurrency_cells"] = copy.deepcopy(raw["concurrency_cells"])
+        scenarios.append(scenario)
+    require(sum(scenario["case_count"] for scenario in scenarios) == 702, "host-suspend scenario denominator mismatch")
+    return scenarios
+
+
+def host_suspend_report_summary(report: dict[str, Any]) -> dict[str, Any]:
+    scenarios = require_list(report.get("scenarios"), "host-suspend report scenarios")
+    require(len(scenarios) == 21, "host-suspend report scenario denominator mismatch")
+    case_count = sum(require_count(scenario.get("case_count"), "host-suspend scenario case_count") for scenario in scenarios)
+    passed = sum(require_count(scenario.get("passed_count"), "host-suspend scenario passed_count") for scenario in scenarios)
+    c18 = require_object(scenarios[17], "host-suspend C18")
+    top_cell = require_object(require_list(c18.get("concurrency_cells"), "host-suspend C18 cells")[-1], "host-suspend C18 top cell")
+    timeline = require_object(top_cell.get("active_timeline"), "host-suspend C18 active timeline")
+    return {
+        "scenario_count": len(scenarios),
+        "case_count": case_count,
+        "passed_case_count": passed,
+        "known_failed_count": sum(int(scenario.get("known_failed_count", 0)) for scenario in scenarios),
+        "blocked_count": sum(int(scenario.get("blocked_count", 0)) for scenario in scenarios),
+        "error_count": sum(int(scenario.get("error_count", 0)) for scenario in scenarios),
+        "unexpected_count": sum(int(scenario.get("unexpected_count", 0)) for scenario in scenarios),
+        "entrypoints": sorted({entrypoint for scenario in scenarios for entrypoint in scenario.get("entrypoints", [])}),
+        "c18": {
+            "requested_concurrency": top_cell.get("requested_concurrency"),
+            "typed_admission_cap": top_cell.get("typed_admission_cap"),
+            "active_floor": top_cell.get("active_floor"),
+            "observed_max_active": top_cell.get("observed_max_active"),
+            "active_duty_cycle": timeline.get("active_duty_cycle"),
+            "resource_balance": copy.deepcopy(top_cell.get("resource_balance")),
+        },
+    }
+
+
+def reconstruct_host_suspend_report(
+    root: Path,
+    manifest: dict[str, Any],
+    report_path: Path,
+    inventory_path: Path,
+    provenance_path: Path,
+    assembler: dict[str, Any],
+    bridge: dict[str, Any],
+) -> dict[str, Any]:
+    lane = root / "correctness/m1-qwen35-4b/metal"
+    report = {
+        **{
+            key: copy.deepcopy(manifest[key])
+            for key in (
+                "source_git_sha", "source_tree_sha", "dirty_status", "models_lock_sha256",
+                "binary_sha256", "model_key", "backend", "model_revision", "model_files",
+                "hardware_id", "binary_artifact", "models_lock", "effective_config",
+            )
+        },
+        "schema_version": SCHEMA_VERSION,
+        "execution_contract": G08_EXECUTION_CONTRACT,
+        "status": "pass",
+        "model_path": manifest["execution"]["model_arg"],
+        "runner": runner_identity_at_git_sha(HOST_SUSPEND_SOURCE_GIT_SHA),
+        "expectations_catalog_sha256": HOST_SUSPEND_EXPECTATIONS_SHA256,
+        "expectations_catalog": existing_artifact_ref(root, root / "g08-model-matrix-expectations.json", "raw-json"),
+        "executor_invocation": existing_artifact_ref(root, lane / "commands/scenario-executor-invocation.json", "raw-json"),
+        "binary_build_receipt": manifest["binary_build_receipt"],
+        "commands": reconstruct_host_suspend_commands(root, manifest),
+        "scenarios": reconstruct_host_suspend_scenarios(root),
+        "pair_registry": existing_artifact_ref(root, lane / "pair-registry.json", "raw-json"),
+        "artifact_path": str(report_path),
+        "pass_line": f"{CANDIDATE_PASS_PREFIX}: {report_path}",
+        "assembly": {
+            "kind": HOST_SUSPEND_ASSEMBLY_KIND,
+            "mode": "artifact-only",
+            "eligible_case_id": "c19-006",
+            "artifact_root": {"path": str(root)},
+            "original_source": {
+                "source_git_sha": HOST_SUSPEND_SOURCE_GIT_SHA,
+                "source_tree_sha": HOST_SUSPEND_SOURCE_TREE_SHA,
+            },
+            "final_validation_source": bridge,
+            "assembler": assembler,
+            "original_artifact_inventory": staged_artifact_ref(
+                root, inventory_path, root / HOST_SUSPEND_DERIVED_REL / "original-artifact-inventory.json"
+                , "raw-json"
+            ),
+            "host_suspend_provenance": staged_artifact_ref(
+                root, provenance_path, root / HOST_SUSPEND_DERIVED_REL / "host-suspend-provenance.json"
+                , "raw-json"
+            ),
+            "product_processes_started": 0,
+            "model_processes_started": 0,
+        },
+    }
+    return report
+
+
+def assemble_existing_host_suspend(
+    manifest_path: Path,
+    root: Path,
+    evidence: Path,
+) -> dict[str, Any]:
+    root = root.resolve()
+    require(root.name == "m1-metal" and root.parent.name == "runtime-vnext-r1-metal-a609cac8-20260812-r1", "host-suspend artifact root name mismatch")
+    require(root.is_dir() and not root.is_symlink(), "host-suspend artifact root is invalid")
+    require(manifest_path.absolute() == root / "execution-manifest.json", "host-suspend manifest path must be the root execution-manifest.json")
+    require(manifest_path.is_file() and not manifest_path.is_symlink(), "host-suspend execution manifest is invalid")
+    require(evidence.absolute() == root / HOST_SUSPEND_EVIDENCE_REL, "host-suspend evidence argument is not the sealed directory")
+    require(evidence.is_dir() and not evidence.is_symlink(), "host-suspend evidence argument is invalid")
+    output = root / HOST_SUSPEND_DERIVED_REL
+    require(not os.path.lexists(output), "host-suspend derived output already exists; overwrite is forbidden")
+    derived_parent = output.parent
+    derived_parent_created = False
+    if os.path.lexists(derived_parent):
+        require(derived_parent.is_dir() and not derived_parent.is_symlink(), "host-suspend derived parent is invalid")
+        require(not any(derived_parent.iterdir()), "host-suspend derived parent must be empty at assembly start")
+    else:
+        derived_parent.mkdir(parents=False)
+        derived_parent_created = True
+    manifest = read_json(manifest_path)
+    validate_host_suspend_source_artifact(manifest, root)
+    validate_host_suspend_evidence_files(root, evidence)
+    before = host_suspend_original_inventory(root)
+    validate_host_suspend_original_inventory(before)
+    assembler = canonical_runner_identity()
+    bridge = host_suspend_source_bridge()
+    stage = Path(tempfile.mkdtemp(prefix=".host-suspend-c19-006.staging-", dir=derived_parent))
+    published = False
+    try:
+        inventory_stage = stage / "original-artifact-inventory.json"
+        provenance_stage = stage / "host-suspend-provenance.json"
+        report_stage = stage / "scenario-report.json"
+        assembly_manifest_stage = stage / "assembly-manifest.json"
+        write_json(inventory_stage, before)
+        provenance = build_host_suspend_provenance(
+            root,
+            evidence,
+            manifest,
+            before,
+            assembler,
+            bridge,
+            inventory_stage,
+            output / inventory_stage.name,
+        )
+        write_json(provenance_stage, provenance)
+        report = reconstruct_host_suspend_report(
+            root,
+            manifest,
+            output / report_stage.name,
+            inventory_stage,
+            provenance_stage,
+            assembler,
+            bridge,
+        )
+        write_json(report_stage, report)
+        summary = host_suspend_report_summary(report)
+        require(
+            summary["case_count"] == summary["passed_case_count"] == 702
+            and all(summary[field] == 0 for field in ("known_failed_count", "blocked_count", "error_count", "unexpected_count"))
+            and summary["entrypoints"] == ["run", "serve"],
+            "host-suspend reconstructed report summary is incomplete",
+        )
+        outputs = {
+            "original_artifact_inventory": staged_file_identity(root, inventory_stage, output / inventory_stage.name),
+            "host_suspend_provenance": staged_file_identity(root, provenance_stage, output / provenance_stage.name),
+            "scenario_report": staged_file_identity(root, report_stage, output / report_stage.name),
+        }
+        pass_line = f"{HOST_SUSPEND_PASS_PREFIX}: {output}"
+        assembly_manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "artifact_kind": HOST_SUSPEND_MANIFEST_KIND,
+            "status": "pass",
+            "original_source": {
+                "source_git_sha": HOST_SUSPEND_SOURCE_GIT_SHA,
+                "source_tree_sha": HOST_SUSPEND_SOURCE_TREE_SHA,
+            },
+            "final_validation_source": bridge,
+            "assembler": assembler,
+            "outputs": outputs,
+            "summary": summary,
+            "product_processes_started": 0,
+            "model_processes_started": 0,
+            "artifact_path": str(output),
+            "pass_line": pass_line,
+        }
+        write_json(assembly_manifest_stage, assembly_manifest)
+        require(
+            {path.name for path in stage.iterdir()} == {
+                "original-artifact-inventory.json", "host-suspend-provenance.json",
+                "scenario-report.json", "assembly-manifest.json",
+            }
+            and all(path.is_file() and not path.is_symlink() for path in stage.iterdir()),
+            "host-suspend staged output set mismatch",
+        )
+        require(not os.path.lexists(output), "host-suspend derived output appeared during assembly")
+        os.rename(stage, output)
+        published = True
+        after = host_suspend_original_inventory(root)
+        require(after == before, "host-suspend original artifact inventory changed during assembly")
+        validated = validate_host_suspend_assembly_manifest(
+            output / "assembly-manifest.json",
+            verify_checkout=True,
+        )
+        return validated["manifest"]
+    except Exception:
+        if published and output.is_dir() and not output.is_symlink():
+            shutil.rmtree(output)
+        raise
+    finally:
+        if not published and stage.is_dir():
+            shutil.rmtree(stage)
+        if derived_parent_created and derived_parent.is_dir() and not any(derived_parent.iterdir()):
+            derived_parent.rmdir()
+
+
+def validate_host_suspend_assembly_manifest(
+    manifest_path: Path,
+    *,
+    verify_checkout: bool = True,
+) -> dict[str, Any]:
+    require(verify_checkout is True, "host-suspend assembly validation may not disable checkout verification")
+    manifest_path = manifest_path.resolve()
+    require(manifest_path.name == "assembly-manifest.json", "host-suspend assembly manifest filename mismatch")
+    output = manifest_path.parent
+    require(output.name == "host-suspend-c19-006" and output.parent.name == "derived", "host-suspend assembly output directory mismatch")
+    root = output.parents[1]
+    require(output == root / HOST_SUSPEND_DERIVED_REL, "host-suspend assembly output path mismatch")
+    require(root.name == "m1-metal" and root.parent.name == "runtime-vnext-r1-metal-a609cac8-20260812-r1", "host-suspend assembly artifact root mismatch")
+    require(output.is_dir() and not output.is_symlink(), "host-suspend assembly output is invalid")
+    require(
+        list(output.parent.iterdir()) == [output],
+        "host-suspend derived parent contains an unauthorized sibling output",
+    )
+    entries = list(output.iterdir())
+    require(
+        {path.name for path in entries}
+        == {"original-artifact-inventory.json", "host-suspend-provenance.json", "scenario-report.json", "assembly-manifest.json"}
+        and all(path.is_file() and not path.is_symlink() for path in entries),
+        "host-suspend assembly must contain exactly four regular files",
+    )
+    manifest = read_json(manifest_path)
+    require(
+        set(manifest)
+        == {
+            "schema_version",
+            "artifact_kind",
+            "status",
+            "original_source",
+            "final_validation_source",
+            "assembler",
+            "outputs",
+            "summary",
+            "product_processes_started",
+            "model_processes_started",
+            "artifact_path",
+            "pass_line",
+        },
+        "host-suspend assembly manifest fields mismatch",
+    )
+    require(manifest.get("schema_version") == SCHEMA_VERSION, "host-suspend assembly manifest schema mismatch")
+    require(manifest.get("artifact_kind") == HOST_SUSPEND_MANIFEST_KIND, "host-suspend assembly manifest kind mismatch")
+    require(manifest.get("status") == "pass", "host-suspend assembly manifest status must be pass")
+    require(
+        manifest.get("original_source")
+        == {"source_git_sha": HOST_SUSPEND_SOURCE_GIT_SHA, "source_tree_sha": HOST_SUSPEND_SOURCE_TREE_SHA},
+        "host-suspend assembly manifest original source mismatch",
+    )
+    require(manifest.get("product_processes_started") == manifest.get("model_processes_started") == 0, "host-suspend assembly manifest records product/model execution")
+    require(manifest.get("artifact_path") == str(output), "host-suspend assembly manifest artifact path mismatch")
+    require(manifest.get("pass_line") == f"{HOST_SUSPEND_PASS_PREFIX}: {output}", "host-suspend assembly manifest PASS line mismatch")
+    outputs = require_object(manifest.get("outputs"), "host-suspend assembly outputs")
+    require(set(outputs) == {"original_artifact_inventory", "host_suspend_provenance", "scenario_report"}, "host-suspend assembly output bindings mismatch")
+    bound_paths: dict[str, Path] = {}
+    for key, filename in (
+        ("original_artifact_inventory", "original-artifact-inventory.json"),
+        ("host_suspend_provenance", "host-suspend-provenance.json"),
+        ("scenario_report", "scenario-report.json"),
+    ):
+        path = validate_plain_artifact_ref(root, outputs[key], f"host-suspend assembly {key}")
+        require(path == output / filename, f"host-suspend assembly {key} path mismatch")
+        bound_paths[key] = path
+    report = read_json(bound_paths["scenario_report"])
+    validate_report_document(
+        report,
+        root,
+        report_path=bound_paths["scenario_report"],
+        allow_internal_fixture=False,
+        require_current_output_path=True,
+    )
+    inventory = read_json(bound_paths["original_artifact_inventory"])
+    provenance = read_json(bound_paths["host_suspend_provenance"])
+    assembly = require_object(report.get("assembly"), "host-suspend validated report assembly")
+    require(assembly.get("assembler") == manifest.get("assembler"), "host-suspend manifest/report assembler mismatch")
+    require(assembly.get("final_validation_source") == manifest.get("final_validation_source"), "host-suspend manifest/report final source mismatch")
+    require(assembly.get("original_source") == manifest.get("original_source"), "host-suspend manifest/report original source mismatch")
+    summary = host_suspend_report_summary(report)
+    require(manifest.get("summary") == summary, "host-suspend assembly manifest summary mismatch")
+    require(
+        summary["scenario_count"] == 21
+        and summary["case_count"] == summary["passed_case_count"] == 702
+        and all(summary[field] == 0 for field in ("known_failed_count", "blocked_count", "error_count", "unexpected_count")),
+        "host-suspend assembly summary is incomplete",
+    )
+    return {
+        "manifest": manifest,
+        "report": report,
+        "inventory": inventory,
+        "provenance": provenance,
+        "summary": summary,
+    }
 
 
 def artifact_ref(root: Path, rel: str, kind: str, text: str) -> dict[str, str]:
@@ -8675,12 +10026,14 @@ def validate_execution_manifest(
     root: Path,
     *,
     allow_internal_fixture: bool = False,
+    allow_host_suspend_source: bool = False,
 ) -> dict[str, Any]:
     require(not ({"runner", "commands", "scenarios", "pass_line", "status", "artifact_path"} & set(manifest)), "execution manifest must not contain prebuilt report fields")
     contract = validate_source_identity(
         manifest,
         "execution_manifest",
         allow_internal_fixture=allow_internal_fixture,
+        allow_host_suspend_source=allow_host_suspend_source,
     )
     for key in ("model_key", "backend", "model_revision", "hardware_id"):
         require_string(manifest.get(key), f"execution_manifest.{key}")
@@ -8713,6 +10066,7 @@ def validate_execution_manifest(
                 "binary_path": binary_path,
             },
             allow_internal_fixture=allow_internal_fixture,
+            allow_host_suspend_source=allow_host_suspend_source,
         )
     else:
         require(
@@ -8725,6 +10079,7 @@ def validate_execution_manifest(
         effective_document,
         "execution_manifest effective config",
         allow_internal_fixture=allow_internal_fixture,
+        allow_host_suspend_source=allow_host_suspend_source,
     )
     require(effective_contract == contract, "execution manifest effective config contract mismatch")
     execution = require_object(manifest.get("execution"), "execution_manifest.execution")
@@ -12040,6 +13395,78 @@ def self_test_c18_trace_scope() -> int:
     return 0
 
 
+def self_test_host_suspend_assembler() -> int:
+    sleep_line = (
+        b"2026-08-12 10:11:42 +0800 Sleep               \tEntering Sleep state due to "
+        b"'Clamshell Sleep':TCPKeepAlive=active Using Batt (Charge:85%) 83 secs   \n"
+    )
+    wake_line = (
+        b"2026-08-12 10:13:05 +0800 DarkWake            \tDarkWake from Deep Idle [CDNP] : "
+        b"due to SMC.OutboxNotEmpty smc.70070000 wifibt/ Using BATT (Charge:85%) 25 secs   \n"
+    )
+    require(len(sleep_line) == 148 and hashlib.sha256(sleep_line).hexdigest() == HOST_SUSPEND_PMSET_SLEEP_LINE_SHA256, "host-suspend self-test Sleep fixture drift")
+    require(len(wake_line) == 162 and hashlib.sha256(wake_line).hexdigest() == HOST_SUSPEND_PMSET_DARKWAKE_LINE_SHA256, "host-suspend self-test DarkWake fixture drift")
+    with tempfile.TemporaryDirectory(prefix="ferrum-host-suspend-self-test-") as temporary:
+        fixture = Path(temporary)
+        pmset_path = fixture / "pmset.stdout.log"
+        pmset_path.write_bytes(b"unrelated line\n" + sleep_line + b"unrelated event\n" + wake_line)
+        started = parse_timestamp("2026-08-12T02:11:35.159184Z", "host-suspend self-test start")
+        finished = parse_timestamp("2026-08-12T02:14:32.144726Z", "host-suspend self-test finish")
+        pair = host_suspend_pmset_pair(pmset_path, started, finished)
+        require(pair["timestamp_delta_sec"] == 83.0, "host-suspend self-test pmset delta drift")
+        window = host_suspend_duration_window(
+            kind="c19-006-spawn", pid=58900, pgid=58900,
+            started_at="2026-08-12T02:11:35.159184Z", finished_at="2026-08-12T02:14:32.144726Z",
+            duration_sec=95.650772416, started_monotonic_ns=2597678276620375,
+            finished_monotonic_ns=2597773927392791, sleep_duration_sec=83.0,
+            sleep_at=parse_timestamp(pair["sleep"]["timestamp"], "host-suspend self-test Sleep"),
+            darkwake_at=parse_timestamp(pair["darkwake"]["timestamp"], "host-suspend self-test DarkWake"),
+        )
+        require(0.0 <= window["sleep_residual_sec"] <= 2.0, "host-suspend self-test residual drift")
+
+        pmset_path.write_bytes(sleep_line + sleep_line + wake_line)
+        try:
+            host_suspend_pmset_pair(pmset_path, started, finished)
+        except ScenarioError as exc:
+            require("exactly one Clamshell Sleep" in str(exc), "host-suspend self-test ambiguous-pair rejection drift")
+        else:
+            raise ScenarioError("host-suspend self-test accepted an ambiguous Sleep pair")
+        pmset_path.write_bytes(sleep_line.replace(b"83 secs", b"82 secs") + wake_line)
+        try:
+            host_suspend_pmset_pair(pmset_path, started, finished)
+        except ScenarioError as exc:
+            require("Sleep line SHA256 mismatch" in str(exc), "host-suspend self-test tamper rejection drift")
+        else:
+            raise ScenarioError("host-suspend self-test accepted a tampered Sleep line")
+
+        inventory_root = fixture / "inventory-root"
+        inventory_root.mkdir()
+        (inventory_root / "original.bin").write_bytes(b"original")
+        fixed_output = inventory_root / HOST_SUSPEND_DERIVED_REL
+        fixed_output.mkdir(parents=True)
+        (fixed_output / "ignored.bin").write_bytes(b"derived")
+        sibling = inventory_root / "derived/sibling"
+        sibling.mkdir()
+        (sibling / "included.bin").write_bytes(b"sibling")
+        inventory = host_suspend_original_inventory(inventory_root.resolve())
+        paths = [row["path"] for row in inventory["files"]]
+        require(paths == ["derived/sibling/included.bin", "original.bin"], "host-suspend self-test fixed exclusion scope drift")
+        symlink = inventory_root / "original-link"
+        try:
+            symlink.symlink_to(inventory_root / "original.bin")
+        except OSError:
+            pass
+        else:
+            try:
+                host_suspend_original_inventory(inventory_root.resolve())
+            except ScenarioError as exc:
+                require("contains symlink" in str(exc), "host-suspend self-test symlink rejection drift")
+            else:
+                raise ScenarioError("host-suspend self-test accepted an original-artifact symlink")
+    print(HOST_SUSPEND_SELFTEST_PASS_LINE)
+    return 0
+
+
 def self_test_stream_pair_contracts() -> None:
     def usage(prompt_tokens: int, completion_tokens: int) -> dict[str, int]:
         return {
@@ -14949,6 +16376,8 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--artifact-root", type=Path)
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--host-suspend-evidence", type=Path)
+    parser.add_argument("--assemble-existing", action="store_true")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--discover", action="store_true")
     parser.add_argument("--discover-scenario", choices=("C03",))
@@ -14957,11 +16386,42 @@ def main() -> int:
     parser.add_argument("--focus-scenario", action="append", choices=SCENARIO_IDS, default=[])
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--self-test-c18-trace-scope", action="store_true")
+    parser.add_argument("--self-test-host-suspend-assembler", action="store_true")
     args = parser.parse_args()
+    if args.assemble_existing and (
+        args.self_test
+        or args.self_test_c18_trace_scope
+        or args.self_test_host_suspend_assembler
+    ):
+        parser.error("--assemble-existing is mutually exclusive with self-test modes")
+    if args.self_test_host_suspend_assembler:
+        return self_test_host_suspend_assembler()
     if args.self_test_c18_trace_scope:
         return self_test_c18_trace_scope()
     if args.self_test:
         return self_test()
+    if args.assemble_existing:
+        if args.manifest is None or args.artifact_root is None or args.host_suspend_evidence is None:
+            parser.error("--assemble-existing requires --manifest, --artifact-root, and --host-suspend-evidence")
+        if args.out is not None:
+            parser.error("--assemble-existing forbids --out; output is fixed")
+        if any((args.execute, args.discover, args.diagnose_c09, args.discover_scenario, args.focus_case, args.focus_scenario)):
+            parser.error("--assemble-existing is artifact-only and forbids execution, discovery, diagnostics, and focus modes")
+        if args.artifact_root.is_symlink() or args.manifest.is_symlink() or args.host_suspend_evidence.is_symlink():
+            parser.error("--assemble-existing rejects symlinked input paths")
+        try:
+            assembly_manifest = assemble_existing_host_suspend(
+                args.manifest.absolute(),
+                args.artifact_root.absolute(),
+                args.host_suspend_evidence.absolute(),
+            )
+        except (ScenarioError, ValueError, OSError) as exc:
+            print(f"FERRUM RUNTIME VNEXT HOST SUSPEND ASSEMBLY FAIL: {exc}", file=sys.stderr)
+            return 1
+        print(assembly_manifest["pass_line"])
+        return 0
+    if args.host_suspend_evidence is not None:
+        parser.error("--host-suspend-evidence requires --assemble-existing")
     if args.discover_scenario is not None and not args.discover:
         parser.error("--discover-scenario requires --discover")
     if (args.focus_case or args.focus_scenario) and not args.execute:

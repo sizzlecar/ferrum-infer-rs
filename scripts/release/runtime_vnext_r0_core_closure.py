@@ -28,6 +28,8 @@ GIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
 DEPENDENCY_KEYS = ("source", "numerics", "s2")
 G02_ROSTER_BRIDGE_ID = "g02-roster-only-05a5d2f8-v1"
 G02_ROSTER_BRIDGE_BASE_GIT_SHA = "05a5d2f8611ed3a3fedb5c69ff3ba11e533bc4c7"
+G02_ROSTER_BRIDGE_COMMIT_GIT_SHA = "a609cac8099e0190004a7f6523166f281c6b9ad2"
+G02_ROSTER_BRIDGE_COMMIT_TREE_SHA = "d2fa2ffd22d322cf4a7188562f121a3a8babc0c7"
 G02_ROSTER_BRIDGE_PATH = "scripts/release/runtime_vnext_g02_core.py"
 G02_ROSTER_BRIDGE_OLD_BLOB = "38b832c95ecee833240a1477678fb5ce350f52fb"
 # Exact post-fix Git blob sealed into the one permitted bridge commit.
@@ -41,6 +43,36 @@ G02_ROSTER_BRIDGE_CHANGED_FILES = frozenset(
         "scripts/release/runtime_vnext_r1_product_correctness.py",
     }
 )
+ARTIFACT_EVIDENCE_BRIDGE_ID = "artifact-evidence-only-a609cac8-v1"
+ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA = G02_ROSTER_BRIDGE_COMMIT_GIT_SHA
+ARTIFACT_EVIDENCE_BRIDGE_BASE_TREE_SHA = G02_ROSTER_BRIDGE_COMMIT_TREE_SHA
+ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH = (
+    "docs/goals/runtime-vnext-0.8.0-2026-07-10/"
+    "HOST_SUSPEND_EVIDENCE_AMENDMENT_2026-08-12.md"
+)
+ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH = (
+    "scripts/release/runtime_vnext_baseline_scenarios.py"
+)
+ARTIFACT_EVIDENCE_BRIDGE_R0_PATH = "scripts/release/runtime_vnext_r0_core_closure.py"
+ARTIFACT_EVIDENCE_BRIDGE_R1_PATH = (
+    "scripts/release/runtime_vnext_r1_product_correctness.py"
+)
+ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES = (
+    ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH,
+    ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH,
+    ARTIFACT_EVIDENCE_BRIDGE_R0_PATH,
+    ARTIFACT_EVIDENCE_BRIDGE_R1_PATH,
+)
+ARTIFACT_EVIDENCE_BRIDGE_OLD_BLOBS = {
+    ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH: "0" * 40,
+    ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH: "e667cef1b2bad37d439be472abd09d2203bd42c1",
+    ARTIFACT_EVIDENCE_BRIDGE_R0_PATH: "d86d3cb9719b5d669802bbf22b81cafc9d060360",
+    ARTIFACT_EVIDENCE_BRIDGE_R1_PATH: "e23b242414afee16b0435099900bf78a4e832d12",
+}
+# These two blobs depend on sibling integration. They intentionally fail closed until
+# the final amendment and baseline assembler bytes stop moving and are sealed here.
+ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_NEW_BLOB = "bdf2082acae76dc2475329baefd434abce5ec35b"
+ARTIFACT_EVIDENCE_BRIDGE_BASELINE_NEW_BLOB = "8907606f0fdbf58720e84fcf8fdc2d18d4d8da76"
 CONTROL_PLANE_PREFIXES = ("docs/",)
 SAME_HISTORY_COLLECTOR = "scripts/release/runtime_vnext_g08a_same_history_collector.py"
 R1_AGGREGATOR = "scripts/release/runtime_vnext_r1_product_correctness.py"
@@ -227,15 +259,18 @@ def _validate_g02_roster_bridge_facts(
         recorded_sha == G02_ROSTER_BRIDGE_BASE_GIT_SHA,
         "G02 roster bridge evidence is not the sealed 05a source",
     )
-    require(current_sha != recorded_sha, "G02 roster bridge requires one new commit")
+    require(
+        current_sha == G02_ROSTER_BRIDGE_COMMIT_GIT_SHA,
+        "G02 roster bridge is not the sealed a609 checkpoint",
+    )
     require(
         parent_shas == [G02_ROSTER_BRIDGE_BASE_GIT_SHA],
         "G02 roster bridge current source is not the unique direct child of 05a",
     )
     require(
         len(changed_files) == len(G02_ROSTER_BRIDGE_CHANGED_FILES)
-        and set(changed_files) == set(G02_ROSTER_BRIDGE_CHANGED_FILES),
-        "G02 roster bridge changed-file set differs",
+        and changed_files == sorted(G02_ROSTER_BRIDGE_CHANGED_FILES),
+        "G02 roster bridge changed-file order or set differs",
     )
     require(
         old_blob == G02_ROSTER_BRIDGE_OLD_BLOB,
@@ -254,6 +289,149 @@ def _validate_g02_roster_bridge_facts(
             "new_blob": new_blob,
         },
     }
+
+
+def _validate_artifact_evidence_bridge_facts(
+    *,
+    base_sha: str,
+    base_tree_sha: str,
+    current_sha: str,
+    current_tree_sha: str,
+    parent_shas: list[str],
+    changes: list[dict[str, str]],
+    current_blobs: dict[str, str],
+    expected_final_blobs: dict[str, str],
+) -> dict[str, Any]:
+    """Validate the immutable facts for the one-time a609 evidence-only hop."""
+    require(
+        set(expected_final_blobs)
+        == {
+            ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH,
+            ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH,
+        }
+        and all(
+            GIT_SHA_RE.fullmatch(blob) is not None and blob != "0" * 40
+            for blob in expected_final_blobs.values()
+        ),
+        "artifact-evidence bridge final blobs are not sealed",
+    )
+    require(
+        tuple(current_blobs) == ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES
+        and all(GIT_SHA_RE.fullmatch(blob) is not None for blob in current_blobs.values()),
+        "artifact-evidence bridge current blob closure differs",
+    )
+    require(
+        GIT_SHA_RE.fullmatch(base_sha) is not None
+        and GIT_SHA_RE.fullmatch(base_tree_sha) is not None
+        and GIT_SHA_RE.fullmatch(current_sha) is not None
+        and GIT_SHA_RE.fullmatch(current_tree_sha) is not None
+        and all(GIT_SHA_RE.fullmatch(parent) is not None for parent in parent_shas),
+        "artifact-evidence bridge Git identity is invalid",
+    )
+    require(
+        base_sha == ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA,
+        "artifact-evidence bridge does not start at the sealed a609 checkpoint",
+    )
+    require(
+        base_tree_sha == ARTIFACT_EVIDENCE_BRIDGE_BASE_TREE_SHA,
+        "artifact-evidence bridge a609 tree is not sealed",
+    )
+    require(current_sha != base_sha, "artifact-evidence bridge requires one new commit")
+    require(
+        parent_shas == [ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA],
+        "artifact-evidence bridge current source is not the unique direct child of a609",
+    )
+    require(
+        isinstance(changes, list)
+        and len(changes) == len(ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES),
+        "artifact-evidence bridge changed-file count differs",
+    )
+    expected_modes = {
+        ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH: ("000000", "100644", "A"),
+        ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH: ("100644", "100644", "M"),
+        ARTIFACT_EVIDENCE_BRIDGE_R0_PATH: ("100644", "100644", "M"),
+        ARTIFACT_EVIDENCE_BRIDGE_R1_PATH: ("100755", "100755", "M"),
+    }
+    normalized_changes: list[dict[str, str]] = []
+    for index, path in enumerate(ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES):
+        change = changes[index]
+        require(
+            isinstance(change, dict)
+            and set(change)
+            == {"path", "status", "old_mode", "new_mode", "old_blob", "new_blob"},
+            f"artifact-evidence bridge change row {index} fields differ",
+        )
+        require(
+            change.get("path") == path,
+            "artifact-evidence bridge changed-file order or set differs",
+        )
+        old_mode, new_mode, status = expected_modes[path]
+        require(
+            (change.get("old_mode"), change.get("new_mode"), change.get("status"))
+            == (old_mode, new_mode, status),
+            f"artifact-evidence bridge mode/status differs for {path}",
+        )
+        old_blob = str(change.get("old_blob"))
+        new_blob = str(change.get("new_blob"))
+        require(
+            old_blob == ARTIFACT_EVIDENCE_BRIDGE_OLD_BLOBS[path],
+            f"artifact-evidence bridge a609 blob differs for {path}",
+        )
+        require(
+            GIT_SHA_RE.fullmatch(new_blob) is not None
+            and new_blob != "0" * 40
+            and new_blob != old_blob,
+            f"artifact-evidence bridge final blob is invalid for {path}",
+        )
+        require(
+            new_blob == current_blobs[path],
+            f"artifact-evidence bridge final tree blob differs for {path}",
+        )
+        if path in expected_final_blobs:
+            require(
+                new_blob == expected_final_blobs[path],
+                f"artifact-evidence bridge sealed final blob differs for {path}",
+            )
+        normalized_changes.append(copy.deepcopy(change))
+    return {
+        "bridge_id": ARTIFACT_EVIDENCE_BRIDGE_ID,
+        "base_git_sha": ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA,
+        "base_git_tree_sha": ARTIFACT_EVIDENCE_BRIDGE_BASE_TREE_SHA,
+        "commit_git_sha": current_sha,
+        "commit_git_tree_sha": current_tree_sha,
+        "parent_git_shas": copy.deepcopy(parent_shas),
+        "changed_files": list(ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES),
+        "changes": normalized_changes,
+        "final_blobs": copy.deepcopy(current_blobs),
+        "sealed_final_blobs": copy.deepcopy(expected_final_blobs),
+    }
+
+
+def _parse_raw_git_changes(raw: str) -> list[dict[str, str]]:
+    changes: list[dict[str, str]] = []
+    for index, line in enumerate(raw.splitlines()):
+        try:
+            metadata, path = line.split("\t", 1)
+        except ValueError as error:
+            raise R0Error(
+                f"artifact-evidence bridge raw diff row {index} is malformed"
+            ) from error
+        fields = metadata.split()
+        require(
+            len(fields) == 5 and fields[0].startswith(":"),
+            f"artifact-evidence bridge raw diff row {index} metadata differs",
+        )
+        changes.append(
+            {
+                "path": path,
+                "status": fields[4],
+                "old_mode": fields[0][1:],
+                "new_mode": fields[1],
+                "old_blob": fields[2],
+                "new_blob": fields[3],
+            }
+        )
+    return changes
 
 
 def g02_roster_bridge(recorded: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
@@ -290,6 +468,159 @@ def g02_roster_bridge(recorded: dict[str, Any], current: dict[str, Any]) -> dict
     )
 
 
+def artifact_evidence_bridge(
+    recorded: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    """Resolve the exact a609 -> direct-child evidence-only hop from Git."""
+    recorded_sha = str(recorded["git_sha"])
+    current_sha = str(current["git_sha"])
+    require(
+        recorded
+        == {
+            "git_sha": ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA,
+            "git_tree_sha": ARTIFACT_EVIDENCE_BRIDGE_BASE_TREE_SHA,
+            "dirty": False,
+        },
+        "artifact-evidence bridge recorded source is not the sealed a609 tree",
+    )
+    require(
+        git_text("rev-parse", f"{recorded_sha}^{{tree}}")
+        == ARTIFACT_EVIDENCE_BRIDGE_BASE_TREE_SHA,
+        "artifact-evidence bridge a609 tree differs from git",
+    )
+    require(
+        git_text("rev-parse", f"{current_sha}^{{tree}}") == current["git_tree_sha"],
+        "artifact-evidence bridge current source tree differs from git",
+    )
+    commit_and_parents = git_text("rev-list", "--parents", "-n", "1", current_sha).split()
+    require(
+        commit_and_parents and commit_and_parents[0] == current_sha,
+        "artifact-evidence bridge commit topology is unavailable",
+    )
+    changes = _parse_raw_git_changes(
+        git_text(
+            "diff",
+            "--raw",
+            "--no-renames",
+            "--abbrev=40",
+            f"{recorded_sha}..{current_sha}",
+        )
+    )
+    return _validate_artifact_evidence_bridge_facts(
+        base_sha=recorded_sha,
+        base_tree_sha=str(recorded["git_tree_sha"]),
+        current_sha=current_sha,
+        current_tree_sha=str(current["git_tree_sha"]),
+        parent_shas=commit_and_parents[1:],
+        changes=changes,
+        current_blobs={
+            path: git_text("rev-parse", f"{current_sha}:{path}")
+            for path in ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES
+        },
+        expected_final_blobs={
+            ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH: (
+                ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_NEW_BLOB
+            ),
+            ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH: (
+                ARTIFACT_EVIDENCE_BRIDGE_BASELINE_NEW_BLOB
+            ),
+        },
+    )
+
+
+def _single_artifact_evidence_closure(
+    recorded_sha: str, current_sha: str, bridge: dict[str, Any]
+) -> dict[str, Any]:
+    require(
+        recorded_sha == ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA
+        and bridge.get("bridge_id") == ARTIFACT_EVIDENCE_BRIDGE_ID
+        and bridge.get("base_git_sha") == recorded_sha
+        and bridge.get("commit_git_sha") == current_sha,
+        "artifact-evidence bridge hop identity/order differs",
+    )
+    changed_files = bridge.get("changed_files")
+    require(
+        changed_files == list(ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES),
+        "artifact-evidence bridge hop file order differs",
+    )
+    return {
+        "from_git_sha": recorded_sha,
+        "to_git_sha": current_sha,
+        "changed_files_by_hop": [copy.deepcopy(changed_files)],
+        "changed_file_count": len(changed_files),
+        "hop_count": 1,
+        "policy": "artifact-evidence-only-a609-direct-child-bridge",
+        "bridge_hops": [copy.deepcopy(bridge)],
+    }
+
+
+def _ordered_g02_artifact_evidence_closure(
+    recorded_sha: str,
+    current_sha: str,
+    g02_bridge: dict[str, Any],
+    artifact_bridge: dict[str, Any],
+) -> dict[str, Any]:
+    require(
+        recorded_sha == G02_ROSTER_BRIDGE_BASE_GIT_SHA
+        and g02_bridge.get("bridge_id") == G02_ROSTER_BRIDGE_ID
+        and g02_bridge.get("base_git_sha") == recorded_sha
+        and g02_bridge.get("commit_git_sha") == G02_ROSTER_BRIDGE_COMMIT_GIT_SHA,
+        "ordered evidence bridge first hop is not sealed 05a -> a609 G02",
+    )
+    require(
+        artifact_bridge.get("bridge_id") == ARTIFACT_EVIDENCE_BRIDGE_ID
+        and artifact_bridge.get("base_git_sha") == G02_ROSTER_BRIDGE_COMMIT_GIT_SHA
+        and artifact_bridge.get("commit_git_sha") == current_sha,
+        "ordered evidence bridge second hop is not sealed a609 -> final",
+    )
+    first_files = g02_bridge.get("changed_files")
+    second_files = artifact_bridge.get("changed_files")
+    require(
+        first_files == sorted(G02_ROSTER_BRIDGE_CHANGED_FILES)
+        and second_files == list(ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES),
+        "ordered evidence bridge hop file order differs",
+    )
+    return {
+        "from_git_sha": recorded_sha,
+        "to_git_sha": current_sha,
+        "changed_files_by_hop": [
+            copy.deepcopy(first_files),
+            copy.deepcopy(second_files),
+        ],
+        "changed_file_count": len(first_files) + len(second_files),
+        "hop_count": 2,
+        "policy": "ordered-g02-roster-then-artifact-evidence-bridge",
+        "bridge_hops": [copy.deepcopy(g02_bridge), copy.deepcopy(artifact_bridge)],
+    }
+
+
+def artifact_evidence_source_closure(
+    recorded: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    bridge = artifact_evidence_bridge(recorded, current)
+    return _single_artifact_evidence_closure(
+        str(recorded["git_sha"]), str(current["git_sha"]), bridge
+    )
+
+
+def g02_then_artifact_evidence_source_closure(
+    recorded: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    a609_source = {
+        "git_sha": G02_ROSTER_BRIDGE_COMMIT_GIT_SHA,
+        "git_tree_sha": G02_ROSTER_BRIDGE_COMMIT_TREE_SHA,
+        "dirty": False,
+    }
+    first_hop = g02_roster_bridge(recorded, a609_source)
+    second_hop = artifact_evidence_bridge(a609_source, current)
+    return _ordered_g02_artifact_evidence_closure(
+        str(recorded["git_sha"]),
+        str(current["git_sha"]),
+        first_hop,
+        second_hop,
+    )
+
+
 def source_closure(
     source: dict[str, Any], current: dict[str, Any], key: str, label: str
 ) -> dict[str, Any]:
@@ -310,15 +641,26 @@ def source_closure(
         key in {"source", "numerics"},
         f"{label} must use current-source evidence",
     )
-    bridge = g02_roster_bridge(source, current)
-    return {
-        "from_git_sha": recorded_sha,
-        "to_git_sha": current["git_sha"],
-        "changed_files": copy.deepcopy(bridge["changed_files"]),
-        "changed_file_count": len(bridge["changed_files"]),
-        "policy": "g02-roster-only-evidence-bridge",
-        "bridge": bridge,
-    }
+    if (
+        recorded_sha == G02_ROSTER_BRIDGE_BASE_GIT_SHA
+        and current["git_sha"] == G02_ROSTER_BRIDGE_COMMIT_GIT_SHA
+    ):
+        bridge = g02_roster_bridge(source, current)
+        return {
+            "from_git_sha": recorded_sha,
+            "to_git_sha": current["git_sha"],
+            "changed_files": copy.deepcopy(bridge["changed_files"]),
+            "changed_file_count": len(bridge["changed_files"]),
+            "policy": "g02-roster-only-evidence-bridge",
+            "bridge": bridge,
+        }
+    if recorded_sha == ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA:
+        return artifact_evidence_source_closure(source, current)
+    require(
+        recorded_sha == G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+        f"{label} evidence does not start at sealed 05a or a609",
+    )
+    return g02_then_artifact_evidence_source_closure(source, current)
 
 
 def validate_dependencies(
@@ -619,10 +961,46 @@ def fixture_dependencies() -> dict[str, Any]:
     }
 
 
+def fixture_artifact_evidence_changes(
+) -> tuple[list[dict[str, str]], dict[str, str], dict[str, str]]:
+    new_blobs = {
+        ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH: "1" * 40,
+        ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH: "2" * 40,
+        ARTIFACT_EVIDENCE_BRIDGE_R0_PATH: "3" * 40,
+        ARTIFACT_EVIDENCE_BRIDGE_R1_PATH: "4" * 40,
+    }
+    modes = {
+        ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH: ("000000", "100644", "A"),
+        ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH: ("100644", "100644", "M"),
+        ARTIFACT_EVIDENCE_BRIDGE_R0_PATH: ("100644", "100644", "M"),
+        ARTIFACT_EVIDENCE_BRIDGE_R1_PATH: ("100755", "100755", "M"),
+    }
+    changes = []
+    for path in ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES:
+        old_mode, new_mode, status = modes[path]
+        changes.append(
+            {
+                "path": path,
+                "status": status,
+                "old_mode": old_mode,
+                "new_mode": new_mode,
+                "old_blob": ARTIFACT_EVIDENCE_BRIDGE_OLD_BLOBS[path],
+                "new_blob": new_blobs[path],
+            }
+        )
+    return changes, new_blobs, {
+        path: new_blobs[path]
+        for path in (
+            ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH,
+            ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH,
+        )
+    }
+
+
 def self_test() -> int:
     bridge_facts = {
         "recorded_sha": G02_ROSTER_BRIDGE_BASE_GIT_SHA,
-        "current_sha": "c" * 40,
+        "current_sha": G02_ROSTER_BRIDGE_COMMIT_GIT_SHA,
         "parent_shas": [G02_ROSTER_BRIDGE_BASE_GIT_SHA],
         "changed_files": sorted(G02_ROSTER_BRIDGE_CHANGED_FILES),
         "old_blob": G02_ROSTER_BRIDGE_OLD_BLOB,
@@ -640,6 +1018,12 @@ def self_test() -> int:
         ("old_blob", "d" * 40, "wrong old G02 blob"),
         ("new_blob", "e" * 40, "wrong new G02 blob"),
         ("parent_shas", ["f" * 40], "second commit after 05a"),
+        ("current_sha", "c" * 40, "unsealed direct child of 05a"),
+        (
+            "changed_files",
+            list(reversed(sorted(G02_ROSTER_BRIDGE_CHANGED_FILES))),
+            "wrong G02 file order",
+        ),
     ):
         mutated = copy.deepcopy(bridge_facts)
         mutated[field] = value
@@ -647,6 +1031,195 @@ def self_test() -> int:
             lambda mutated=mutated: _validate_g02_roster_bridge_facts(**mutated),
             marker,
         )
+    artifact_changes, current_blobs, expected_final_blobs = (
+        fixture_artifact_evidence_changes()
+    )
+    artifact_facts = {
+        "base_sha": ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA,
+        "base_tree_sha": ARTIFACT_EVIDENCE_BRIDGE_BASE_TREE_SHA,
+        "current_sha": "c" * 40,
+        "current_tree_sha": "d" * 40,
+        "parent_shas": [ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA],
+        "changes": artifact_changes,
+        "current_blobs": current_blobs,
+        "expected_final_blobs": expected_final_blobs,
+    }
+    sealed_artifact_bridge = _validate_artifact_evidence_bridge_facts(
+        **artifact_facts
+    )
+    require(
+        sealed_artifact_bridge["bridge_id"] == ARTIFACT_EVIDENCE_BRIDGE_ID
+        and sealed_artifact_bridge["changed_files"]
+        == list(ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES),
+        "R0 sealed artifact-evidence bridge fixture differs",
+    )
+    raw_fixture = "\n".join(
+        (
+            f":{row['old_mode']} {row['new_mode']} {row['old_blob']} "
+            f"{row['new_blob']} {row['status']}\t{row['path']}"
+        )
+        for row in artifact_changes
+    )
+    require(
+        _parse_raw_git_changes(raw_fixture) == artifact_changes,
+        "R0 artifact-evidence raw diff parser fixture differs",
+    )
+    for field, value, marker in (
+        ("base_sha", G02_ROSTER_BRIDGE_BASE_GIT_SHA, "flattened 05a to final hop"),
+        ("base_tree_sha", "e" * 40, "wrong a609 tree"),
+        ("current_tree_sha", "unsealed", "invalid final tree"),
+        ("parent_shas", ["f" * 40], "wrong a609 parent"),
+        (
+            "parent_shas",
+            [ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA, "f" * 40],
+            "merge child of a609",
+        ),
+        ("expected_final_blobs", {}, "unsealed final blobs"),
+        ("current_blobs", {}, "missing current blob closure"),
+    ):
+        mutated = copy.deepcopy(artifact_facts)
+        mutated[field] = value
+        expect_reject(
+            lambda mutated=mutated: _validate_artifact_evidence_bridge_facts(
+                **mutated
+            ),
+            marker,
+        )
+    mutated = copy.deepcopy(artifact_facts)
+    mutated["changes"][0], mutated["changes"][1] = (
+        mutated["changes"][1],
+        mutated["changes"][0],
+    )
+    expect_reject(
+        lambda: _validate_artifact_evidence_bridge_facts(**mutated),
+        "wrong artifact-evidence changed-file order",
+    )
+    mutated = copy.deepcopy(artifact_facts)
+    mutated["changes"].pop()
+    expect_reject(
+        lambda: _validate_artifact_evidence_bridge_facts(**mutated),
+        "missing artifact-evidence changed file",
+    )
+    for field, value, marker in (
+        ("status", "A", "wrong baseline status"),
+        ("old_mode", "100755", "wrong baseline old mode"),
+    ):
+        mutated = copy.deepcopy(artifact_facts)
+        mutated["changes"][1][field] = value
+        expect_reject(
+            lambda mutated=mutated: _validate_artifact_evidence_bridge_facts(
+                **mutated
+            ),
+            marker,
+        )
+    mutated = copy.deepcopy(artifact_facts)
+    mutated["expected_final_blobs"] = {
+        ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_PATH: (
+            ARTIFACT_EVIDENCE_BRIDGE_AMENDMENT_NEW_BLOB
+        ),
+        ARTIFACT_EVIDENCE_BRIDGE_BASELINE_PATH: (
+            ARTIFACT_EVIDENCE_BRIDGE_BASELINE_NEW_BLOB
+        ),
+    }
+    expect_reject(
+        lambda: _validate_artifact_evidence_bridge_facts(**mutated),
+        "integration-dependent final blobs remain unsealed",
+    )
+    for path, marker in (
+        ("crates/ferrum-engine/src/lib.rs", "crate change"),
+        ("Cargo.toml", "Cargo change"),
+        (
+            "scripts/release/configs/runtime_vnext_g08a_m1_cuda.models.lock.json",
+            "model lock change",
+        ),
+        (
+            "scripts/release/configs/runtime_vnext_g08a_source_contract.json",
+            "release config change",
+        ),
+        ("ferrum.toml", "runtime config change"),
+        (
+            "scripts/release/scenarios/runtime_vnext_r1_llama_dense_cuda.json",
+            "product scenario change",
+        ),
+    ):
+        mutated = copy.deepcopy(artifact_facts)
+        extra = copy.deepcopy(mutated["changes"][-1])
+        extra["path"] = path
+        mutated["changes"].append(extra)
+        expect_reject(
+            lambda mutated=mutated: _validate_artifact_evidence_bridge_facts(
+                **mutated
+            ),
+            marker,
+        )
+    for index, change in enumerate(artifact_changes):
+        mutated = copy.deepcopy(artifact_facts)
+        mutated["changes"][index]["old_blob"] = "e" * 40
+        expect_reject(
+            lambda mutated=mutated: _validate_artifact_evidence_bridge_facts(
+                **mutated
+            ),
+            f"wrong a609 blob for {change['path']}",
+        )
+        mutated = copy.deepcopy(artifact_facts)
+        mutated["changes"][index]["new_blob"] = "f" * 40
+        expect_reject(
+            lambda mutated=mutated: _validate_artifact_evidence_bridge_facts(
+                **mutated
+            ),
+            f"wrong final tree blob for {change['path']}",
+        )
+    for path in expected_final_blobs:
+        index = ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES.index(path)
+        mutated = copy.deepcopy(artifact_facts)
+        mutated["changes"][index]["new_blob"] = "f" * 40
+        expect_reject(
+            lambda mutated=mutated: _validate_artifact_evidence_bridge_facts(
+                **mutated
+            ),
+            f"wrong sealed final blob for {path}",
+        )
+    g02_hop = _validate_g02_roster_bridge_facts(**bridge_facts)
+    ordered = _ordered_g02_artifact_evidence_closure(
+        G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+        artifact_facts["current_sha"],
+        g02_hop,
+        sealed_artifact_bridge,
+    )
+    require(
+        ordered["hop_count"] == 2
+        and [hop["bridge_id"] for hop in ordered["bridge_hops"]]
+        == [G02_ROSTER_BRIDGE_ID, ARTIFACT_EVIDENCE_BRIDGE_ID],
+        "R0 ordered 05a -> a609 -> final bridge differs",
+    )
+    expect_reject(
+        lambda: _ordered_g02_artifact_evidence_closure(
+            G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+            artifact_facts["current_sha"],
+            sealed_artifact_bridge,
+            g02_hop,
+        ),
+        "reversed evidence bridge hops",
+    )
+    single = _single_artifact_evidence_closure(
+        ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA,
+        artifact_facts["current_sha"],
+        sealed_artifact_bridge,
+    )
+    require(
+        single["hop_count"] == 1
+        and single["bridge_hops"][0]["bridge_id"]
+        == ARTIFACT_EVIDENCE_BRIDGE_ID,
+        "R0 a609 -> final evidence bridge differs",
+    )
+    expect_reject(
+        lambda: _single_artifact_evidence_closure(
+            G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+            artifact_facts["current_sha"],
+            sealed_artifact_bridge,
+        ),
+        "flattened single-hop 05a evidence",
+    )
     for extra_path, marker in (
         ("crates/ferrum-engine/src/lib.rs", "extra product change"),
         (

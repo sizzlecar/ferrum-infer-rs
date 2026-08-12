@@ -24,6 +24,7 @@ import runtime_vnext_r0_core_closure as r0_checkpoint
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+matrix = matrix_checkpoint.matrix
 SCHEMA_VERSION = 1
 PASS_PREFIX = "FERRUM RUNTIME VNEXT R1 PRODUCT CORRECTNESS PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT R1 PRODUCT CORRECTNESS SELFTEST PASS"
@@ -269,17 +270,9 @@ def normalize_source(value: Any, label: str) -> dict[str, Any]:
     return source
 
 
-def source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+def exact_source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     recorded_sha = recorded["git_sha"]
-    require(
-        git_text("rev-parse", f"{recorded_sha}^{{tree}}")
-        == recorded["git_tree_sha"],
-        "R0 recorded source tree differs from git",
-    )
-    require(
-        recorded == current,
-        "R0 must be aggregated from the current R1 source",
-    )
+    require(recorded == current, "exact source closure differs")
     return {
         "from_git_sha": recorded_sha,
         "to_git_sha": current["git_sha"],
@@ -289,13 +282,93 @@ def source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[st
     }
 
 
-def matrix_source_change_policy(changed: list[str], lane: MatrixLane) -> str:
+def source_closure(recorded: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    recorded_sha = recorded["git_sha"]
     require(
-        len(changed) == len(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES)
-        and set(changed) == set(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES),
-        f"{lane.key} matrix evidence does not match the sealed G02 roster bridge",
+        git_text("rev-parse", f"{recorded_sha}^{{tree}}")
+        == recorded["git_tree_sha"],
+        "R0 recorded source tree differs from git",
     )
-    return "g02-roster-only-evidence-bridge"
+    if recorded == current:
+        return exact_source_closure(recorded, current)
+    try:
+        return r0_checkpoint.artifact_evidence_source_closure(recorded, current)
+    except r0_checkpoint.R0Error as error:
+        raise R1Error(f"R0 artifact-evidence bridge rejected: {error}") from error
+
+
+def llama_source_closure(
+    recorded: dict[str, Any], current: dict[str, Any], backend: str
+) -> dict[str, Any]:
+    recorded_sha = recorded["git_sha"]
+    require(
+        git_text("rev-parse", f"{recorded_sha}^{{tree}}")
+        == recorded["git_tree_sha"],
+        f"Llama {backend} recorded source tree differs from git",
+    )
+    if recorded == current:
+        return exact_source_closure(recorded, current)
+    try:
+        return r0_checkpoint.artifact_evidence_source_closure(recorded, current)
+    except r0_checkpoint.R0Error as error:
+        raise R1Error(
+            f"Llama {backend} artifact-evidence bridge rejected: {error}"
+        ) from error
+
+
+def matrix_source_change_policy(closure: dict[str, Any], lane: MatrixLane) -> str:
+    hops = closure.get("bridge_hops")
+    if closure.get("policy") == "artifact-evidence-only-a609-direct-child-bridge":
+        require(
+            closure.get("hop_count") == 1
+            and isinstance(hops, list)
+            and len(hops) == 1
+            and closure.get("from_git_sha")
+            == r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA
+            and closure.get("to_git_sha") == hops[0].get("commit_git_sha")
+            and hops[0].get("bridge_id")
+            == r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_ID
+            and hops[0].get("base_git_sha")
+            == r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA
+            and hops[0].get("parent_git_shas")
+            == [r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA]
+            and closure.get("changed_files_by_hop")
+            == [list(r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES)],
+            f"{lane.key} a609 matrix evidence bridge closure differs",
+        )
+        return str(closure["policy"])
+    require(
+        closure.get("policy")
+        == "ordered-g02-roster-then-artifact-evidence-bridge"
+        and closure.get("hop_count") == 2
+        and isinstance(hops, list)
+        and len(hops) == 2
+        and closure.get("from_git_sha")
+        == r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA
+        and closure.get("to_git_sha") == hops[1].get("commit_git_sha")
+        and [hop.get("bridge_id") for hop in hops if isinstance(hop, dict)]
+        == [
+            r0_checkpoint.G02_ROSTER_BRIDGE_ID,
+            r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_ID,
+        ]
+        and hops[0].get("base_git_sha")
+        == r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA
+        and hops[0].get("commit_git_sha")
+        == r0_checkpoint.G02_ROSTER_BRIDGE_COMMIT_GIT_SHA
+        and hops[0].get("parent_git_shas")
+        == [r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA]
+        and hops[1].get("base_git_sha")
+        == r0_checkpoint.G02_ROSTER_BRIDGE_COMMIT_GIT_SHA
+        and hops[1].get("parent_git_shas")
+        == [r0_checkpoint.G02_ROSTER_BRIDGE_COMMIT_GIT_SHA]
+        and closure.get("changed_files_by_hop")
+        == [
+            sorted(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES),
+            list(r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_CHANGED_FILES),
+        ],
+        f"{lane.key} matrix evidence bridge order/closure differs",
+    )
+    return str(closure["policy"])
 
 
 def matrix_source_closure(
@@ -310,26 +383,22 @@ def matrix_source_closure(
         f"{lane.key} recorded source tree differs from git",
     )
     if recorded == current:
-        return {
-            "from_git_sha": recorded_sha,
-            "to_git_sha": current["git_sha"],
-            "changed_files": [],
-            "changed_file_count": 0,
-            "policy": "exact-source",
-        }
+        return exact_source_closure(recorded, current)
     try:
-        bridge = r0_checkpoint.g02_roster_bridge(recorded, current)
+        if recorded_sha == r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA:
+            closure = r0_checkpoint.g02_then_artifact_evidence_source_closure(
+                recorded, current
+            )
+        elif recorded_sha == r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA:
+            closure = r0_checkpoint.artifact_evidence_source_closure(recorded, current)
+        else:
+            raise R1Error(
+                f"{lane.key} matrix evidence does not start at sealed 05a or a609"
+            )
     except r0_checkpoint.R0Error as error:
         raise R1Error(f"{lane.key} matrix bridge rejected: {error}") from error
-    policy = matrix_source_change_policy(bridge["changed_files"], lane)
-    return {
-        "from_git_sha": recorded_sha,
-        "to_git_sha": current["git_sha"],
-        "changed_files": copy.deepcopy(bridge["changed_files"]),
-        "changed_file_count": len(bridge["changed_files"]),
-        "policy": policy,
-        "bridge": bridge,
-    }
+    matrix_source_change_policy(closure, lane)
+    return closure
 
 
 def resolve_member(root: Path, recorded_root: Path, raw: Any, label: str) -> Path:
@@ -708,7 +777,138 @@ def validate_resource_contract(
     }
 
 
+def validate_host_suspend_matrix(
+    path: Path, lane: MatrixLane, source: dict[str, Any]
+) -> dict[str, Any]:
+    """Consume only the sealed one-time M1 Metal assembly, never a new model run."""
+    require(lane.key == "m1_metal", "host-suspend assembly is restricted to M1 Metal")
+    manifest_path = path.expanduser().resolve()
+    require(
+        manifest_path.name == "assembly-manifest.json"
+        and manifest_path.parent.name == "host-suspend-c19-006"
+        and manifest_path.parent.parent.name == "derived",
+        "M1 Metal host-suspend assembly manifest path differs",
+    )
+    artifact_root = manifest_path.parents[2]
+    expected_output = artifact_root / matrix.HOST_SUSPEND_DERIVED_REL
+    require(
+        manifest_path.parent == expected_output,
+        "M1 Metal host-suspend assembly escaped its fixed output directory",
+    )
+    try:
+        bundle = matrix.validate_host_suspend_assembly_manifest(
+            manifest_path,
+            verify_checkout=True,
+        )
+    except matrix.ScenarioError as error:
+        raise R1Error(f"M1 Metal host-suspend assembly rejected: {error}") from error
+    require(
+        set(bundle) == {"manifest", "report", "inventory", "provenance", "summary"},
+        "M1 Metal host-suspend assembly validation result differs",
+    )
+    assembly_manifest = bundle["manifest"]
+    report = bundle["report"]
+    summary = bundle["summary"]
+    require(
+        isinstance(assembly_manifest, dict)
+        and isinstance(report, dict)
+        and isinstance(summary, dict),
+        "M1 Metal host-suspend assembly documents are invalid",
+    )
+    recorded_source = {
+        "git_sha": report.get("source_git_sha"),
+        "git_tree_sha": report.get("source_tree_sha"),
+        "dirty": report.get("dirty_status", {}).get("is_dirty")
+        if isinstance(report.get("dirty_status"), dict)
+        else None,
+    }
+    require(
+        recorded_source
+        == {
+            "git_sha": matrix.HOST_SUSPEND_SOURCE_GIT_SHA,
+            "git_tree_sha": matrix.HOST_SUSPEND_SOURCE_TREE_SHA,
+            "dirty": False,
+        },
+        "M1 Metal host-suspend report execution source differs",
+    )
+    closure = matrix_source_closure(recorded_source, source, lane)
+    require(
+        closure.get("policy")
+        == "artifact-evidence-only-a609-direct-child-bridge"
+        and closure.get("hop_count") == 1,
+        "M1 Metal host-suspend source closure is not the sealed one-hop bridge",
+    )
+    assembly = report.get("assembly")
+    require(
+        isinstance(assembly, dict)
+        and assembly.get("kind") == matrix.HOST_SUSPEND_ASSEMBLY_KIND,
+        "M1 Metal scenario report lacks the exact host-suspend assembly identity",
+    )
+    final_validation_source = assembly_manifest.get("final_validation_source")
+    require(
+        isinstance(final_validation_source, dict)
+        and final_validation_source.get("base_git_sha")
+        == recorded_source["git_sha"]
+        and final_validation_source.get("base_tree_sha")
+        == recorded_source["git_tree_sha"]
+        and final_validation_source.get("final_git_sha") == source["git_sha"]
+        and final_validation_source.get("final_tree_sha")
+        == source["git_tree_sha"],
+        "M1 Metal host-suspend final validation source differs",
+    )
+    requirement = expected_matrix_summary(lane.spec)
+    require(
+        summary.get("scenario_count") == 21
+        and summary.get("case_count") == requirement["case_count"]
+        and summary.get("passed_case_count") == requirement["case_count"]
+        and summary.get("entrypoints") == ["run", "serve"],
+        "M1 Metal host-suspend matrix denominator or entrypoints differ",
+    )
+    for field in (
+        "known_failed_count",
+        "blocked_count",
+        "error_count",
+        "unexpected_count",
+    ):
+        require(summary.get(field) == 0, f"M1 Metal host-suspend {field} must be zero")
+    require(
+        summary == matrix_checkpoint.summarize_matrix(report, lane.spec),
+        "M1 Metal host-suspend summary is not derived from the assembled report",
+    )
+    require(
+        report.get("models_lock_sha256") == sha256(lane.spec.model_lock_path),
+        "M1 Metal host-suspend model lock differs from current source",
+    )
+    startup = validate_startup_identity(report, artifact_root, lane)
+    providers = validate_provider_execution(report, artifact_root, lane)
+    resources = validate_resource_contract(report, artifact_root, lane)
+    inventory_path = expected_output / "original-artifact-inventory.json"
+    provenance_path = expected_output / "host-suspend-provenance.json"
+    report_path = expected_output / "scenario-report.json"
+    return {
+        "evidence_kind": matrix.HOST_SUSPEND_ASSEMBLY_KIND,
+        "lane": lane.lane,
+        "model_key": lane.model_key,
+        "backend": lane.backend,
+        "assembly_manifest": file_ref(manifest_path),
+        "original_artifact_inventory": file_ref(inventory_path),
+        "host_suspend_provenance": file_ref(provenance_path),
+        "scenario_report": file_ref(report_path),
+        "binary_sha256": require_sha(
+            report.get("binary_sha256"), "M1 Metal host-suspend binary SHA"
+        ),
+        "hardware_id": report.get("hardware_id"),
+        "summary": copy.deepcopy(summary),
+        "product_execution_identity": startup,
+        "provider_execution": providers,
+        "resource_contract": resources,
+        "source_closure": closure,
+    }
+
+
 def validate_matrix(path: Path, lane: MatrixLane, source: dict[str, Any]) -> dict[str, Any]:
+    if lane.key == "m1_metal":
+        return validate_host_suspend_matrix(path, lane, source)
     outer_path = path.expanduser().resolve()
     outer = read_json(outer_path, f"{lane.key} outer manifest")
     require(set(outer) == OUTER_GATE_FIELDS, f"{lane.key} outer field set mismatch")
@@ -948,13 +1148,25 @@ def validate_llama(path: Path, backend: str, source: dict[str, Any]) -> dict[str
     summary = read_json(summary_path, f"Llama {backend} summary")
     recorded = Path(str(summary.get("artifact_dir", "")))
     require(recorded.is_absolute(), f"Llama {backend} recorded root is invalid")
+    recorded_sha = summary.get("git_sha")
+    require(
+        isinstance(recorded_sha, str)
+        and GIT_SHA_RE.fullmatch(recorded_sha) is not None,
+        f"Llama {backend} recorded source SHA is invalid",
+    )
+    recorded_source = {
+        "git_sha": recorded_sha,
+        "git_tree_sha": git_text("rev-parse", f"{recorded_sha}^{{tree}}"),
+        "dirty": False,
+    }
+    closure = llama_source_closure(recorded_source, source, backend)
     validate_llama_manifest(backend)
     require(
         summary.get("schema_version") == 1
         and summary.get("status") == "pass"
         and summary.get("backend") == backend
         and LLAMA_MODEL_MARKERS[backend] in str(summary.get("model"))
-        and summary.get("git_sha") == source["git_sha"]
+        and summary.get("git_sha") == recorded_source["git_sha"]
         and summary.get("dirty_status") == {"is_dirty": False, "status_short": []}
         and summary.get("scenario_count") == 3
         and summary.get("manifest_scenario_count") == 3
@@ -1005,7 +1217,7 @@ def validate_llama(path: Path, backend: str, source: dict[str, Any]) -> dict[str
         and receipt.get("mode") == "start"
         and receipt.get("backend") == backend
         and receipt.get("model") == summary.get("model")
-        and receipt.get("git_sha") == source["git_sha"]
+        and receipt.get("git_sha") == recorded_source["git_sha"]
         and receipt.get("dirty_status") == summary["dirty_status"]
         and receipt.get("selected_scenarios") == summary["selected_scenarios"]
         and receipt.get("scenario_count") == 3
@@ -1086,6 +1298,8 @@ def validate_llama(path: Path, backend: str, source: dict[str, Any]) -> dict[str
         "entrypoints": ["run", "serve"],
         "stream_done_count": 1,
         "stream_usage_count": 1,
+        "source": recorded_source,
+        "source_closure": closure,
     }
 
 
@@ -1313,8 +1527,33 @@ def verify_manifest(
             key in MATRIX_LANES and isinstance(row, dict),
             f"R1 {key} evidence is invalid",
         )
-        for ref_name in ("outer_manifest", "child_manifest", "validation", "scenario_report"):
+        expected_refs = (
+            (
+                "assembly_manifest",
+                "original_artifact_inventory",
+                "host_suspend_provenance",
+                "scenario_report",
+            )
+            if key == "m1_metal"
+            else ("outer_manifest", "child_manifest", "validation", "scenario_report")
+        )
+        require(
+            (row.get("evidence_kind") == matrix.HOST_SUSPEND_ASSEMBLY_KIND)
+            == (key == "m1_metal"),
+            f"R1 {key} host-suspend evidence identity differs",
+        )
+        for ref_name in expected_refs:
             validate_ref(row[ref_name], f"R1 {key} {ref_name}")
+        if key == "m1_metal":
+            expected_row = validate_host_suspend_matrix(
+                Path(str(row["assembly_manifest"]["path"])),
+                MATRIX_LANES[key],
+                source,
+            )
+            require(
+                row == expected_row,
+                "R1 M1 Metal host-suspend evidence row drifted",
+            )
         provider = row.get("provider_execution")
         resources = row.get("resource_contract")
         require(isinstance(provider, dict) and isinstance(resources, dict), f"R1 {key} detailed evidence is missing")
@@ -1343,12 +1582,21 @@ def verify_manifest(
         require(isinstance(row, dict), f"R1 Llama {backend} evidence is invalid")
         for ref_name in ("summary", "execution_receipt", "artifact_tree"):
             validate_ref(row[ref_name], f"R1 Llama {backend} {ref_name}")
+        recorded_source = normalize_source(
+            row.get("source"), f"R1 Llama {backend}"
+        )
+        require(
+            row.get("source_closure")
+            == llama_source_closure(recorded_source, source, backend),
+            f"R1 Llama {backend} source closure drifted",
+        )
     r0 = dependencies["r0"]
     require(isinstance(r0, dict), "R1 R0 dependency is missing")
     validate_ref(r0["outer_manifest"], "R1 R0 outer manifest")
     validate_ref(r0["child_manifest"], "R1 R0 child manifest")
+    r0_source = normalize_source(r0.get("source"), "R1 R0")
     require(
-        r0["source_closure"] == source_closure(r0["source"], source),
+        r0["source_closure"] == source_closure(r0_source, source),
         "R1 R0 source closure drifted",
     )
     accepted = acceptance(matrices, llamas)
@@ -1421,7 +1669,7 @@ def fixture_matrix(key: str, binary: str, hardware: str, root: Path) -> dict[str
 def expect_reject(action: Any, marker: str) -> None:
     try:
         action()
-    except R1Error:
+    except (R1Error, r0_checkpoint.R0Error):
         return
     raise R1Error(f"self-test mutation was accepted: {marker}")
 
@@ -1448,48 +1696,112 @@ def self_test() -> int:
         and exact_r0_closure["changed_file_count"] == 0,
         "R1 accepted R0 closure is not exact-source",
     )
-    bridge_paths = sorted(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES)
+    g02_changes = [
+        {
+            "path": path,
+            "status": "M",
+            "old_mode": "100644",
+            "new_mode": "100644",
+            "old_blob": "1" * 40,
+            "new_blob": "2" * 40,
+        }
+        for path in sorted(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES)
+    ]
+    g02_hop = {
+        "bridge_id": r0_checkpoint.G02_ROSTER_BRIDGE_ID,
+        "base_git_sha": r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+        "commit_git_sha": r0_checkpoint.G02_ROSTER_BRIDGE_COMMIT_GIT_SHA,
+        "parent_git_shas": [r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA],
+        "changed_files": sorted(r0_checkpoint.G02_ROSTER_BRIDGE_CHANGED_FILES),
+        "changes": g02_changes,
+    }
+    artifact_changes, artifact_current_blobs, artifact_final_blobs = (
+        r0_checkpoint.fixture_artifact_evidence_changes()
+    )
+    artifact_hop = r0_checkpoint._validate_artifact_evidence_bridge_facts(
+        base_sha=r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA,
+        base_tree_sha=r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_BASE_TREE_SHA,
+        current_sha="c" * 40,
+        current_tree_sha="d" * 40,
+        parent_shas=[r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_BASE_GIT_SHA],
+        changes=artifact_changes,
+        current_blobs=artifact_current_blobs,
+        expected_final_blobs=artifact_final_blobs,
+    )
+    ordered_closure = r0_checkpoint._ordered_g02_artifact_evidence_closure(
+        r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+        "c" * 40,
+        g02_hop,
+        artifact_hop,
+    )
     for key in ("m1_metal", "m2_metal", "m3_metal"):
         require(
-            matrix_source_change_policy(bridge_paths, MATRIX_LANES[key])
-            == "g02-roster-only-evidence-bridge",
-            f"{key} rejected the sealed G02 roster bridge file set",
+            matrix_source_change_policy(ordered_closure, MATRIX_LANES[key])
+            == "ordered-g02-roster-then-artifact-evidence-bridge",
+            f"{key} rejected the ordered two-hop evidence bridge",
         )
-    previous_sha = git_text("rev-parse", "HEAD^")
+    previous_sha = r0_checkpoint.G02_ROSTER_BRIDGE_COMMIT_GIT_SHA
     previous_source = {
         "git_sha": previous_sha,
         "git_tree_sha": git_text("rev-parse", f"{previous_sha}^{{tree}}"),
         "dirty": False,
     }
-    expect_reject(
-        lambda: source_closure(previous_source, source),
-        "non-current R0 source",
+    single_closure = r0_checkpoint._single_artifact_evidence_closure(
+        previous_sha, "c" * 40, artifact_hop
     )
-    for path, marker in (
-        ("crates/ferrum-cli/src/commands/serve.rs", "extra product change"),
+    require(
+        single_closure["hop_count"] == 1
+        and single_closure["bridge_hops"][0]["bridge_id"]
+        == r0_checkpoint.ARTIFACT_EVIDENCE_BRIDGE_ID,
+        "R1 a609 R0/Llama single-hop closure differs",
+    )
+    require(
+        matrix_source_change_policy(single_closure, MATRIX_LANES["m1_metal"])
+        == "artifact-evidence-only-a609-direct-child-bridge",
+        "R1 a609 matrix single-hop closure differs",
+    )
+    for mutation, marker in (
         (
-            "scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json",
-            "extra scenario change",
+            lambda value: value["bridge_hops"].reverse(),
+            "reversed bridge order",
+        ),
+        (
+            lambda value: value["bridge_hops"].pop(0),
+            "flattened bridge hops",
+        ),
+        (
+            lambda value: value["changed_files_by_hop"][1].append(
+                "crates/ferrum-cli/src/commands/serve.rs"
+            ),
+            "extra product path",
         ),
     ):
-        changed = [*bridge_paths, path]
+        forged = copy.deepcopy(ordered_closure)
+        mutation(forged)
         expect_reject(
-            lambda changed=changed: matrix_source_change_policy(
-                changed, MATRIX_LANES["m2_metal"]
+            lambda forged=forged: matrix_source_change_policy(
+                forged, MATRIX_LANES["m2_metal"]
             ),
             marker,
         )
-    for path in (
-        "scripts/release/runtime_vnext_g02_core.py",
-        "scripts/release/runtime_vnext_s2_cuda_product_contract.py",
-    ):
-        incomplete = [item for item in bridge_paths if item != path]
-        expect_reject(
-            lambda incomplete=incomplete: matrix_source_change_policy(
-                incomplete, MATRIX_LANES["m2_metal"]
-            ),
-            f"incomplete bridge set without {path}",
-        )
+    forged_single = copy.deepcopy(single_closure)
+    forged_single["from_git_sha"] = r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA
+    expect_reject(
+        lambda: r0_checkpoint._single_artifact_evidence_closure(
+            forged_single["from_git_sha"],
+            forged_single["to_git_sha"],
+            artifact_hop,
+        ),
+        "matrix flattened 05a evidence to the a609-only hop",
+    )
+    expect_reject(
+        lambda: r0_checkpoint._single_artifact_evidence_closure(
+            r0_checkpoint.G02_ROSTER_BRIDGE_BASE_GIT_SHA,
+            "c" * 40,
+            artifact_hop,
+        ),
+        "Llama flattened 05a to final",
+    )
     with tempfile.TemporaryDirectory(prefix="ferrum-r1-selftest-") as temporary:
         root = Path(temporary).resolve()
         binaries = {"cuda": "1" * 64, "metal": "2" * 64}
