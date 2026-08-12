@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,13 @@ import runtime_vnext_g08a_matrix_specs as g08a_specs
 import runtime_vnext_g08b_cuda_matrix_checkpoint as matrix_checkpoint
 import runtime_vnext_g08c_cuda_matrix_checkpoint as g08c_specs
 import runtime_vnext_r0_core_closure as r0_checkpoint
+
+
+# The unified gate launches this file as a script while the change-impact
+# validator imports it by its canonical module name. Keep both references on
+# the same module object so their typed verification context is not duplicated.
+if __name__ == "__main__":
+    sys.modules.setdefault("runtime_vnext_r1_product_correctness", sys.modules[__name__])
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
