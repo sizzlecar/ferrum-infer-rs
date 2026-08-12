@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import copy
+import difflib
 import fnmatch
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import tokenize
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -155,11 +160,12 @@ def load_rule_config(path: Path) -> dict[str, Any]:
             raise PlannerError(f"{path}: qualification profile ids must be non-empty strings")
         if not isinstance(profile, dict):
             raise PlannerError(f"{path}: qualification_profiles.{profile_id} must be an object")
-        for key in ("domains", "qualified_scopes", "required_checks"):
+        for key in ("domains", "qualified_scopes", "required_checks", "required_gates"):
             values = profile.get(key)
-            if not isinstance(values, list) or not values:
+            if not isinstance(values, list) or (key != "required_gates" and not values):
                 raise PlannerError(
-                    f"{path}: qualification_profiles.{profile_id}.{key} must be a non-empty list"
+                    f"{path}: qualification_profiles.{profile_id}.{key} must be a list"
+                    + ("" if key == "required_gates" else " with at least one item")
                 )
         if not all(isinstance(item, str) and item for item in profile["domains"]):
             raise PlannerError(
@@ -168,6 +174,10 @@ def load_rule_config(path: Path) -> dict[str, Any]:
         if not all(isinstance(item, str) and item for item in profile["required_checks"]):
             raise PlannerError(
                 f"{path}: qualification_profiles.{profile_id}.required_checks must contain non-empty strings"
+            )
+        if not all(isinstance(item, str) and item for item in profile["required_gates"]):
+            raise PlannerError(
+                f"{path}: qualification_profiles.{profile_id}.required_gates must contain non-empty strings"
             )
         for scope_index, scope in enumerate(profile["qualified_scopes"]):
             if not isinstance(scope, dict):
@@ -182,11 +192,15 @@ def load_rule_config(path: Path) -> dict[str, Any]:
                         f"[{scope_index}].{key} must be a non-empty string"
                     )
         selector = profile.get("selector")
-        if not isinstance(selector, dict) or selector.get("kind") != "structured_rewrites":
+        selector_kind = selector.get("kind") if isinstance(selector, dict) else None
+        if selector_kind not in {"structured_rewrites", "symbol_contracts"}:
             raise PlannerError(
-                f"{path}: qualification_profiles.{profile_id}.selector.kind must be structured_rewrites"
+                f"{path}: qualification_profiles.{profile_id}.selector.kind must be "
+                "structured_rewrites or symbol_contracts"
             )
-        if not isinstance(selector.get("allow_test_changes", False), bool):
+        if selector_kind == "structured_rewrites" and not isinstance(
+            selector.get("allow_test_changes", False), bool
+        ):
             raise PlannerError(
                 f"{path}: qualification_profiles.{profile_id}.selector.allow_test_changes "
                 "must be boolean"
@@ -203,12 +217,189 @@ def load_rule_config(path: Path) -> dict[str, Any]:
                     "must be an object"
                 )
             selected_path = file_selector.get("path")
-            rewrites = file_selector.get("rewrites")
             if not isinstance(selected_path, str) or not selected_path:
                 raise PlannerError(
                     f"{path}: qualification_profiles.{profile_id}.selector.files"
                     f"[{file_index}].path must be a non-empty string"
                 )
+            if selector_kind == "symbol_contracts":
+                language = file_selector.get("language")
+                if language not in {"json", "python", "rust"}:
+                    raise PlannerError(
+                        f"{path}: qualification_profiles.{profile_id}.selector.files"
+                        f"[{file_index}].language must be json, python, or rust"
+                    )
+                for key in ("allow_test_changes", "test_only"):
+                    if not isinstance(file_selector.get(key, False), bool):
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].{key} must be boolean"
+                        )
+                contracts = file_selector.get("contracts", [])
+                test_only = bool(file_selector.get("test_only", False))
+                if not isinstance(contracts, list) or (not test_only and not contracts):
+                    raise PlannerError(
+                        f"{path}: qualification_profiles.{profile_id}.selector.files"
+                        f"[{file_index}].contracts must be a non-empty list unless test_only"
+                    )
+                contract_ids: set[str] = set()
+                rust_kinds = {
+                    "rust_enum_variant",
+                    "rust_const",
+                    "rust_function",
+                    "rust_impl_method",
+                    "rust_struct_field",
+                    "rust_type",
+                    "rust_use",
+                }
+                python_kinds = {"python_import", "python_symbol"}
+                json_kinds = {"json_value"}
+                semantic_policy = file_selector.get("semantic_policy")
+                behavioral_kinds = {
+                    "python_symbol",
+                    "rust_const",
+                    "rust_enum_variant",
+                    "rust_function",
+                    "rust_impl_method",
+                    "rust_struct_field",
+                    "rust_type",
+                }
+                if not test_only and any(
+                    isinstance(contract, dict) and contract.get("kind") in behavioral_kinds
+                    for contract in contracts
+                ):
+                    if not isinstance(semantic_policy, dict) or semantic_policy.get("kind") != "timing_observability":
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].semantic_policy.kind must be timing_observability"
+                        )
+                    for key in (
+                        "allowed_identifiers",
+                        "allowed_identifier_patterns",
+                        "required_identifiers",
+                        "required_identifier_patterns",
+                        "allowed_literals",
+                        "allowed_literal_patterns",
+                        "allowed_operators",
+                    ):
+                        values = semantic_policy.get(key, [])
+                        if not isinstance(values, list) or not all(
+                            isinstance(value, str) and value for value in values
+                        ):
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].semantic_policy.{key} must be a string list"
+                            )
+                    for key in (
+                        "allowed_identifier_patterns",
+                        "required_identifier_patterns",
+                        "allowed_literal_patterns",
+                    ):
+                        try:
+                            for value in semantic_policy.get(key, []):
+                                re.compile(value)
+                        except re.error as error:
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].semantic_policy.{key} contains invalid regex"
+                            ) from error
+                for contract_index, contract in enumerate(contracts):
+                    if not isinstance(contract, dict):
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].contracts[{contract_index}] must be an object"
+                        )
+                    contract_id = contract.get("id")
+                    contract_kind = contract.get("kind")
+                    symbol = contract.get("symbol")
+                    if not all(isinstance(value, str) and value for value in (contract_id, contract_kind, symbol)):
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].contracts[{contract_index}] requires non-empty id, kind, symbol"
+                        )
+                    if contract_id in contract_ids:
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].contracts contains duplicate id {contract_id!r}"
+                        )
+                    contract_ids.add(contract_id)
+                    supported = (
+                        rust_kinds
+                        if language == "rust"
+                        else python_kinds
+                        if language == "python"
+                        else json_kinds
+                    )
+                    if contract_kind not in supported:
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].contracts[{contract_index}].kind is unsupported for {language}"
+                        )
+                    if contract_kind == "rust_use":
+                        for key in ("allowed_added", "allowed_removed"):
+                            values = contract.get(key, [])
+                            if not isinstance(values, list) or not all(
+                                isinstance(value, str) and value for value in values
+                            ):
+                                raise PlannerError(
+                                    f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                    f"[{file_index}].contracts[{contract_index}].{key} must be a string list"
+                                )
+                    for key in ("allowed_identifiers", "allowed_numeric_literals"):
+                        values = contract.get(key, [])
+                        if not isinstance(values, list) or not all(
+                            isinstance(value, str) and value for value in values
+                        ):
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].contracts[{contract_index}].{key} "
+                                "must be a string list"
+                            )
+                    semantic_rewrites = contract.get("semantic_rewrites", [])
+                    if not isinstance(semantic_rewrites, list):
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].contracts[{contract_index}].semantic_rewrites "
+                            "must be a list"
+                        )
+                    rewrite_ids: set[str] = set()
+                    for rewrite_index, rewrite in enumerate(semantic_rewrites):
+                        if not isinstance(rewrite, dict):
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].contracts[{contract_index}].semantic_rewrites"
+                                f"[{rewrite_index}] must be an object"
+                            )
+                        rewrite_id = rewrite.get("id")
+                        before_rewrite = rewrite.get("before")
+                        after_rewrite = rewrite.get("after")
+                        if not isinstance(rewrite_id, str) or not rewrite_id:
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].contracts[{contract_index}].semantic_rewrites"
+                                f"[{rewrite_index}].id must be a non-empty string"
+                            )
+                        if rewrite_id in rewrite_ids:
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].contracts[{contract_index}].semantic_rewrites "
+                                f"contains duplicate id {rewrite_id!r}"
+                            )
+                        rewrite_ids.add(rewrite_id)
+                        if not isinstance(before_rewrite, str) or not isinstance(after_rewrite, str):
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].contracts[{contract_index}].semantic_rewrites"
+                                f"[{rewrite_index}] requires string before and after values"
+                            )
+                        if before_rewrite == after_rewrite:
+                            raise PlannerError(
+                                f"{path}: qualification_profiles.{profile_id}.selector.files"
+                                f"[{file_index}].contracts[{contract_index}].semantic_rewrites"
+                                f"[{rewrite_index}] must change the semantic source"
+                            )
+                continue
+            rewrites = file_selector.get("rewrites")
             if not isinstance(rewrites, list) or not rewrites:
                 raise PlannerError(
                     f"{path}: qualification_profiles.{profile_id}.selector.files"
@@ -263,6 +454,8 @@ def load_rule_config(path: Path) -> dict[str, Any]:
             )
         if not isinstance(rule["exceptions"], list):
             raise PlannerError(f"{path}: rules[{idx}].exceptions must be a list")
+        if not isinstance(rule.get("exclusive", False), bool):
+            raise PlannerError(f"{path}: rules[{idx}].exclusive must be boolean")
         profile_refs = rule.get("qualification_profiles", [])
         if not isinstance(profile_refs, list) or not all(
             isinstance(item, str) and item for item in profile_refs
@@ -432,6 +625,1038 @@ def structured_rewrites_match(
     return True, applied, None
 
 
+def normalized_rust_source(text: str) -> str:
+    """Ignore Rust layout/comments while preserving literal bytes and punctuation."""
+
+    tokens: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            depth = 1
+            cursor = index + 2
+            while cursor < len(text) and depth:
+                if text.startswith("/*", cursor):
+                    depth += 1
+                    cursor += 2
+                elif text.startswith("*/", cursor):
+                    depth -= 1
+                    cursor += 2
+                else:
+                    cursor += 1
+            if depth:
+                return "invalid-rust:block-comment:" + text
+            index = cursor
+            continue
+        raw_match = re.match(r"(?:br|rb|r)(?P<hashes>#{0,255})\"", text[index:])
+        if raw_match:
+            terminator = '"' + raw_match.group("hashes")
+            end = text.find(terminator, index + raw_match.end())
+            if end < 0:
+                return "invalid-rust:raw-string:" + text
+            end += len(terminator)
+            tokens.append(text[index:end])
+            index = end
+            continue
+        if text[index] == '"':
+            cursor = index + 1
+            while cursor < len(text):
+                if text[cursor] == "\\":
+                    cursor += 2
+                elif text[cursor] == '"':
+                    cursor += 1
+                    break
+                else:
+                    cursor += 1
+            if cursor > len(text) or text[cursor - 1 : cursor] != '"':
+                return "invalid-rust:string:" + text
+            tokens.append(text[index:cursor])
+            index = cursor
+            continue
+        if text[index] == "'":
+            char_match = re.match(r"'(?:\\.|[^\\'\n])'", text[index:])
+            if char_match:
+                tokens.append(char_match.group(0))
+                index += len(char_match.group(0))
+                continue
+        if text[index] == ",":
+            cursor = index + 1
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor < len(text) and text[cursor] == "}":
+                index += 1
+                continue
+        tokens.append(text[index])
+        index += 1
+    return "".join(tokens)
+
+
+def normalized_contract_source(text: str, *, language: str) -> str:
+    if language == "rust":
+        return normalized_rust_source(text)
+    try:
+        return ast.dump(ast.parse(text), include_attributes=False)
+    except SyntaxError:
+        return "invalid-python:" + text
+
+
+SEMANTIC_NEUTRAL_IDENTIFIERS = {
+    "as",
+    "async",
+    "await",
+    "bool",
+    "break",
+    "class",
+    "const",
+    "continue",
+    "def",
+    "dict",
+    "else",
+    "enum",
+    "Err",
+    "False",
+    "false",
+    "fn",
+    "for",
+    "from",
+    "if",
+    "impl",
+    "in",
+    "int",
+    "is",
+    "let",
+    "list",
+    "match",
+    "mut",
+    "None",
+    "not",
+    "Ok",
+    "Option",
+    "or",
+    "pass",
+    "pub",
+    "ref",
+    "return",
+    "Self",
+    "self",
+    "set",
+    "Some",
+    "str",
+    "struct",
+    "super",
+    "True",
+    "true",
+    "tuple",
+    "u128",
+    "u64",
+    "usize",
+    "use",
+    "Vec",
+    "where",
+    "while",
+}
+SEMANTIC_NEUTRAL_OPERATORS = {
+    "!",
+    "#",
+    "&",
+    "(",
+    ")",
+    "*",
+    ",",
+    ".",
+    ":",
+    "::",
+    ";",
+    "=",
+    "=>",
+    "?",
+    "@",
+    "[",
+    "]",
+    "_",
+    "{",
+    "}",
+}
+SEMANTIC_OBSERVABILITY_IDENTIFIERS = {
+    "Any",
+    "Clone",
+    "Copy",
+    "Debug",
+    "Deserialize",
+    "Eq",
+    "ExecutionEventDetail",
+    "ExecutionEventKind",
+    "ExecutionEventSinkError",
+    "Instant",
+    "PartialEq",
+    "Path",
+    "RequestAccepted",
+    "RequestId",
+    "Result",
+    "Sequence",
+    "Serialize",
+    "String",
+    "SystemTime",
+    "UNIX_EPOCH",
+    "UnvalidatedExecutionEventDetail",
+    "UnvalidatedExecutionEventDetailWire",
+    "all",
+    "any",
+    "as_nanos",
+    "as_ref",
+    "checked_duration_since",
+    "derive",
+    "duration_since",
+    "dumps",
+    "enumerate",
+    "format",
+    "get",
+    "is_empty",
+    "is_some",
+    "is_some_and",
+    "isinstance",
+    "iter",
+    "json",
+    "len",
+    "loads",
+    "map",
+    "map_err",
+    "map_or",
+    "map_or_else",
+    "matches",
+    "max",
+    "min",
+    "new",
+    "now",
+    "require",
+    "saturating_add",
+    "saturating_sub",
+    "serde",
+    "serde_json",
+    "sorted",
+    "startswith",
+    "then",
+    "to_string",
+    "transpose",
+    "trim",
+    "try_from",
+    "type",
+    "unwrap_or",
+    "unwrap_or_else",
+    "values",
+    "windows",
+}
+TIMING_OBSERVABILITY_IDENTIFIER = re.compile(
+    r"(?i).*(?:anchor|clock|coverage|duration|elapsed|instant|interval|monotonic|nanos|profile|stage|timing|wall).*"
+)
+TIMING_OBSERVABILITY_LITERAL = re.compile(
+    r'''(?is)[rubf]*(?:"|').*(?:anchor|clock|coverage|decode|instant|interval|monotonic|nanos|profile|stage|timing|unix|wall).*(?:"|')'''
+)
+PROTECTED_PRODUCT_IDENTIFIER = re.compile(
+    r"(?i)(?:(?:^|_)(?:admission|capacity|kv(?:_cache)?|logits?|max_tokens|min_tokens|"
+    r"penalty|sampl(?:e|er|ing)|temperature|threshold|token_ids?|top_k|top_p)(?:$|_)|"
+    r"(?:^|_)tokens?$)"
+)
+
+
+def rust_semantic_tokens(text: str) -> list[tuple[str, str]]:
+    """Tokenize Rust enough to police changed operations, excluding layout/comments."""
+
+    tokens: list[tuple[str, str]] = []
+    index = 0
+    multi_operators = (
+        "<<=",
+        ">>=",
+        "..=",
+        "::",
+        "->",
+        "=>",
+        "==",
+        "!=",
+        "<=",
+        ">=",
+        "&&",
+        "||",
+        "+=",
+        "-=",
+        "*=",
+        "/=",
+        "%=",
+        "&=",
+        "|=",
+        "^=",
+        "<<",
+        ">>",
+        "..",
+    )
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            depth = 1
+            cursor = index + 2
+            while cursor < len(text) and depth:
+                if text.startswith("/*", cursor):
+                    depth += 1
+                    cursor += 2
+                elif text.startswith("*/", cursor):
+                    depth -= 1
+                    cursor += 2
+                else:
+                    cursor += 1
+            if depth:
+                raise PlannerError("invalid Rust block comment in semantic contract")
+            index = cursor
+            continue
+        raw_match = re.match(r'(?:br|rb|r)(?P<hashes>#{0,255})"', text[index:])
+        if raw_match:
+            terminator = '"' + raw_match.group("hashes")
+            end = text.find(terminator, index + raw_match.end())
+            if end < 0:
+                raise PlannerError("invalid Rust raw string in semantic contract")
+            end += len(terminator)
+            tokens.append(("literal", text[index:end]))
+            index = end
+            continue
+        if text[index] == '"':
+            cursor = index + 1
+            while cursor < len(text):
+                if text[cursor] == "\\":
+                    cursor += 2
+                elif text[cursor] == '"':
+                    cursor += 1
+                    break
+                else:
+                    cursor += 1
+            if cursor > len(text) or text[cursor - 1 : cursor] != '"':
+                raise PlannerError("invalid Rust string in semantic contract")
+            tokens.append(("literal", text[index:cursor]))
+            index = cursor
+            continue
+        char_match = re.match(r"'(?:\\.|[^\\'\n])'", text[index:])
+        if char_match:
+            tokens.append(("literal", char_match.group(0)))
+            index += len(char_match.group(0))
+            continue
+        identifier = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text[index:])
+        if identifier:
+            tokens.append(("identifier", identifier.group(0)))
+            index += len(identifier.group(0))
+            continue
+        number = re.match(
+            r"(?:0[xX][0-9A-Fa-f_]+|0[bB][01_]+|0[oO][0-7_]+|"
+            r"[0-9][0-9_]*(?:\.[0-9_]+)?(?:[eE][+-]?[0-9_]+)?)(?:[A-Za-z][A-Za-z0-9_]*)?",
+            text[index:],
+        )
+        if number:
+            tokens.append(("literal", number.group(0)))
+            index += len(number.group(0))
+            continue
+        operator = next((item for item in multi_operators if text.startswith(item, index)), None)
+        if operator is None:
+            operator = text[index]
+        tokens.append(("operator", operator))
+        index += len(operator)
+    return tokens
+
+
+def python_semantic_tokens(text: str) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    try:
+        stream = tokenize.generate_tokens(io.StringIO(text).readline)
+        for token in stream:
+            if token.type == tokenize.NAME:
+                tokens.append(("identifier", token.string))
+            elif token.type in {tokenize.NUMBER, tokenize.STRING}:
+                tokens.append(("literal", token.string))
+            elif token.type == tokenize.OP:
+                tokens.append(("operator", token.string))
+    except (IndentationError, tokenize.TokenError) as error:
+        raise PlannerError("invalid Python source in semantic contract") from error
+    return tokens
+
+
+def semantic_tokens(text: str, *, language: str) -> list[tuple[str, str]]:
+    if language == "rust":
+        return rust_semantic_tokens(text)
+    if language == "python":
+        return python_semantic_tokens(text)
+    raise PlannerError(f"semantic change policy does not support {language}")
+
+
+def semantic_change_tokens(
+    before: str, after: str, *, language: str
+) -> list[tuple[str, str]]:
+    before_tokens = semantic_tokens(before, language=language)
+    after_tokens = semantic_tokens(after, language=language)
+    changed: list[tuple[str, str]] = []
+    matcher = difflib.SequenceMatcher(a=before_tokens, b=after_tokens, autojunk=False)
+    for operation, before_start, before_end, after_start, after_end in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        changed.extend(before_tokens[before_start:before_end])
+        changed.extend(after_tokens[after_start:after_end])
+    return changed
+
+
+def semantic_rewrites_match(
+    *,
+    before_source: str,
+    after_source: str,
+    language: str,
+    contract_id: str,
+    rewrites: list[dict[str, Any]],
+) -> tuple[bool, str | None]:
+    """Project the base contract through exact semantic-token rewrites.
+
+    Unlike an identifier allowlist, this proves that every semantic token in the
+    resulting contract is accounted for by a reviewed rewrite. Layout and
+    comments may change, but an otherwise innocuous statement made only from
+    allowlisted identifiers cannot hitchhike on an observability edit.
+    """
+
+    expected = semantic_tokens(before_source, language=language)
+    for rewrite in rewrites:
+        rewrite_id = str(rewrite["id"])
+        before_tokens = semantic_tokens(str(rewrite["before"]), language=language)
+        after_tokens = semantic_tokens(str(rewrite["after"]), language=language)
+        if not before_tokens:
+            if expected or len(rewrites) != 1:
+                return (
+                    False,
+                    f"contract_{contract_id}_semantic_rewrite_{rewrite_id}_empty_before_ambiguous",
+                )
+            expected = after_tokens
+            continue
+        occurrences = [
+            index
+            for index in range(len(expected) - len(before_tokens) + 1)
+            if expected[index : index + len(before_tokens)] == before_tokens
+        ]
+        if len(occurrences) != 1:
+            return (
+                False,
+                f"contract_{contract_id}_semantic_rewrite_{rewrite_id}_before_occurrences_"
+                f"{len(occurrences)}",
+            )
+        start = occurrences[0]
+        expected[start : start + len(before_tokens)] = after_tokens
+    if expected != semantic_tokens(after_source, language=language):
+        return False, f"contract_{contract_id}_semantic_diff_exceeds_rewrites"
+    return True, None
+
+
+def semantic_policy_match(
+    *,
+    before_source: str,
+    after_source: str,
+    language: str,
+    contract_id: str,
+    policy: dict[str, Any],
+    contract_allowed_identifiers: set[str],
+    allowed_numeric_literals: set[str],
+) -> tuple[bool, str | None]:
+    if before_source and not after_source:
+        return False, f"contract_{contract_id}_removal_not_allowed"
+    changed = semantic_change_tokens(before_source, after_source, language=language)
+    allowed_identifiers = set(policy.get("allowed_identifiers", [])) | contract_allowed_identifiers
+    identifier_patterns = [re.compile(pattern) for pattern in policy.get("allowed_identifier_patterns", [])]
+    required_identifiers = set(policy.get("required_identifiers", []))
+    required_patterns = [re.compile(pattern) for pattern in policy.get("required_identifier_patterns", [])]
+    allowed_literals = set(policy.get("allowed_literals", []))
+    literal_patterns = [re.compile(pattern) for pattern in policy.get("allowed_literal_patterns", [])]
+    allowed_operators = set(policy.get("allowed_operators", [])) | SEMANTIC_NEUTRAL_OPERATORS
+    changed_identifiers = {value for kind, value in changed if kind == "identifier"}
+    protected = sorted(
+        identifier for identifier in changed_identifiers if PROTECTED_PRODUCT_IDENTIFIER.search(identifier)
+    )
+    if protected:
+        return False, f"contract_{contract_id}_protected_product_identifier_changed"
+    unexpected_identifiers = sorted(
+        identifier
+        for identifier in changed_identifiers
+        if identifier not in SEMANTIC_NEUTRAL_IDENTIFIERS
+        and identifier not in SEMANTIC_OBSERVABILITY_IDENTIFIERS
+        and not TIMING_OBSERVABILITY_IDENTIFIER.fullmatch(identifier)
+        and identifier not in allowed_identifiers
+        and not any(pattern.fullmatch(identifier) for pattern in identifier_patterns)
+    )
+    if unexpected_identifiers:
+        return False, f"contract_{contract_id}_identifier_delta_exceeded"
+    changed_literals = {value for kind, value in changed if kind == "literal"}
+    unexpected_literals = sorted(
+        literal
+        for literal in changed_literals
+        if (
+            re.fullmatch(r"[0-9].*", literal) is not None
+            and literal not in allowed_numeric_literals
+        )
+        or (
+            re.fullmatch(r"[0-9].*", literal) is None
+            and literal not in allowed_literals
+            and not TIMING_OBSERVABILITY_LITERAL.fullmatch(literal)
+            and not any(pattern.fullmatch(literal) for pattern in literal_patterns)
+        )
+    )
+    if unexpected_literals:
+        return False, f"contract_{contract_id}_literal_delta_exceeded"
+    changed_operators = {value for kind, value in changed if kind == "operator"}
+    if changed_operators - allowed_operators:
+        return False, f"contract_{contract_id}_operator_delta_exceeded"
+    has_required_marker = (
+        any(TIMING_OBSERVABILITY_IDENTIFIER.fullmatch(identifier) for identifier in changed_identifiers)
+        or bool(changed_identifiers & required_identifiers)
+        or any(
+        pattern.fullmatch(identifier)
+        for pattern in required_patterns
+        for identifier in changed_identifiers
+        )
+    )
+    if not has_required_marker:
+        return False, f"contract_{contract_id}_lacks_required_semantic_marker"
+    return True, None
+
+
+def declaration_start(text: str, start: int) -> int:
+    """Include contiguous Rust attributes and doc comments owned by an item."""
+
+    start = text.rfind("\n", 0, start) + 1
+    cursor = start
+    while cursor > 0:
+        previous_end = cursor - 1
+        previous_start = text.rfind("\n", 0, previous_end) + 1
+        line = text[previous_start:previous_end].strip()
+        if line.startswith("#[") or line.startswith("///") or line.startswith("//!"):
+            start = previous_start
+            cursor = previous_start
+            continue
+        break
+    return start
+
+
+def rust_braced_span(text: str, match: re.Match[str]) -> tuple[int, int] | None:
+    opening = text.find("{", match.end())
+    semicolon = text.find(";", match.end())
+    if opening < 0 or (semicolon >= 0 and semicolon < opening):
+        return None
+    end = rust_block_end(text, opening)
+    if end is None:
+        return None
+    return declaration_start(text, match.start()), end
+
+
+def rust_top_level_item_span(
+    text: str, *, symbol: str, kinds: str
+) -> tuple[int, int] | None:
+    pattern = re.compile(
+        rf"(?m)^(?:pub(?:\([^\n)]*\))?\s+)?(?:unsafe\s+)?(?:async\s+)?"
+        rf"(?:const\s+)?(?:{kinds})\s+{re.escape(symbol)}\b"
+    )
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
+        return None
+    return rust_braced_span(text, matches[0])
+
+
+def rust_impl_blocks(text: str, wanted: str) -> list[tuple[int, int, int]]:
+    canonical_wanted = re.sub(r"\s+", "", wanted)
+    blocks: list[tuple[int, int, int]] = []
+    for match in re.finditer(r"(?m)^impl\b", text):
+        opening = text.find("{", match.end())
+        if opening < 0:
+            continue
+        header = re.sub(r"\s+", "", text[match.start() + len("impl") : opening])
+        if header != canonical_wanted:
+            continue
+        end = rust_block_end(text, opening)
+        if end is not None:
+            blocks.append((match.start(), opening, end))
+    return blocks
+
+
+def rust_impl_method_span(
+    text: str, *, impl_name: str, method: str
+) -> tuple[int, int] | None:
+    candidates: list[tuple[int, int]] = []
+    pattern = re.compile(
+        rf"(?m)^    (?:pub(?:\([^\n)]*\))?\s+)?(?:unsafe\s+)?(?:async\s+)?"
+        rf"(?:const\s+)?fn\s+{re.escape(method)}\b"
+    )
+    for _, opening, impl_end in rust_impl_blocks(text, impl_name):
+        for match in pattern.finditer(text, opening + 1, impl_end - 1):
+            span = rust_braced_span(text, match)
+            if span is not None and span[1] <= impl_end:
+                candidates.append(span)
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def rust_struct_field_span(
+    text: str, *, struct_name: str, field: str
+) -> tuple[int, int] | None:
+    struct_span = rust_top_level_item_span(text, symbol=struct_name, kinds="struct")
+    if struct_span is None:
+        return None
+    pattern = re.compile(
+        rf"(?m)^    (?:pub(?:\([^\n)]*\))?\s+)?{re.escape(field)}\s*:"
+    )
+    matches = list(pattern.finditer(text, struct_span[0], struct_span[1]))
+    if len(matches) != 1:
+        return None
+    end = text.find(",", matches[0].end(), struct_span[1])
+    if end < 0:
+        return None
+    return declaration_start(text, matches[0].start()), end + 1
+
+
+def rust_enum_variant_span(
+    text: str, *, enum_name: str, variant: str
+) -> tuple[int, int] | None:
+    enum_span = rust_top_level_item_span(text, symbol=enum_name, kinds="enum")
+    if enum_span is None:
+        return None
+    pattern = re.compile(rf"(?m)^    {re.escape(variant)}\b")
+    matches = list(pattern.finditer(text, enum_span[0], enum_span[1]))
+    if len(matches) != 1:
+        return None
+    opening = text.find("{", matches[0].end(), enum_span[1])
+    comma = text.find(",", matches[0].end(), enum_span[1])
+    if opening >= 0 and (comma < 0 or opening < comma):
+        end = rust_block_end(text, opening)
+        if end is None:
+            return None
+        if end < len(text) and text[end] == ",":
+            end += 1
+    elif comma >= 0:
+        end = comma + 1
+    else:
+        return None
+    return declaration_start(text, matches[0].start()), end
+
+
+def rust_use_span(text: str, root: str) -> tuple[tuple[int, int], set[str]] | None:
+    pattern = re.compile(rf"(?m)^use\s+{re.escape(root)}(?=::|\s*;)")
+    matches = list(pattern.finditer(text))
+    if len(matches) != 1:
+        return None
+    end = text.find(";", matches[0].end())
+    if end < 0:
+        return None
+    source = text[matches[0].start() : end + 1]
+    suffix = source[len("use ") + len(root) :].strip().rstrip(";")
+    suffix = suffix.removeprefix("::").strip().strip("{}")
+    names = {
+        part.strip().split(" as ", 1)[0].strip().rsplit("::", 1)[-1]
+        for part in suffix.split(",")
+        if part.strip()
+    }
+    return (matches[0].start(), end + 1), names
+
+
+def rust_contract_span(
+    text: str, contract: dict[str, Any]
+) -> tuple[tuple[int, int], set[str] | None] | None:
+    kind = str(contract["kind"])
+    symbol = str(contract["symbol"])
+    if kind == "rust_const":
+        pattern = re.compile(
+            rf"(?m)^(?:pub(?:\([^\n)]*\))?\s+)?const\s+{re.escape(symbol)}\b"
+        )
+        matches = list(pattern.finditer(text))
+        if len(matches) != 1:
+            return None
+        end = text.find(";", matches[0].end())
+        span = (
+            declaration_start(text, matches[0].start()),
+            end + 1,
+        ) if end >= 0 else None
+    elif kind == "rust_type":
+        span = rust_top_level_item_span(text, symbol=symbol, kinds="struct|enum")
+    elif kind == "rust_function":
+        span = rust_top_level_item_span(text, symbol=symbol, kinds="fn")
+    elif kind == "rust_impl_method":
+        if "::" not in symbol:
+            return None
+        impl_name, method = symbol.rsplit("::", 1)
+        span = rust_impl_method_span(text, impl_name=impl_name, method=method)
+    elif kind == "rust_struct_field":
+        if "::" not in symbol:
+            return None
+        struct_name, field = symbol.rsplit("::", 1)
+        span = rust_struct_field_span(text, struct_name=struct_name, field=field)
+    elif kind == "rust_enum_variant":
+        if "::" not in symbol:
+            return None
+        enum_name, variant = symbol.rsplit("::", 1)
+        span = rust_enum_variant_span(text, enum_name=enum_name, variant=variant)
+    elif kind == "rust_use":
+        return rust_use_span(text, symbol)
+    else:
+        return None
+    return (span, None) if span is not None else None
+
+
+def remove_contract_spans(text: str, spans: list[tuple[int, int]]) -> str | None:
+    ordered = sorted(spans)
+    if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
+        return None
+    projected = text
+    for start, end in reversed(ordered):
+        projected = projected[:start] + projected[end:]
+    return projected
+
+
+def rust_symbol_contracts_match(
+    *, before: str, after: str, file_selector: dict[str, Any]
+) -> tuple[bool, list[str], str | None]:
+    allow_tests = bool(file_selector.get("allow_test_changes", False))
+    before_product, before_error = production_text(before, allow_tests)
+    after_product, after_error = production_text(after, allow_tests)
+    if before_product is None:
+        return False, [], f"base_{before_error}"
+    if after_product is None:
+        return False, [], f"head_{after_error}"
+    before_spans: list[tuple[int, int]] = []
+    after_spans: list[tuple[int, int]] = []
+    changed: list[str] = []
+    for contract in file_selector.get("contracts", []):
+        contract_id = str(contract["id"])
+        before_match = rust_contract_span(before_product, contract)
+        after_match = rust_contract_span(after_product, contract)
+        if before_match is None and after_match is None:
+            continue
+        before_span, before_names = before_match or (None, None)
+        after_span, after_names = after_match or (None, None)
+        if contract["kind"] == "rust_use":
+            old_names = before_names or set()
+            new_names = after_names or set()
+            unexpected_added = new_names - old_names - set(contract.get("allowed_added", []))
+            unexpected_removed = old_names - new_names - set(contract.get("allowed_removed", []))
+            if unexpected_added or unexpected_removed:
+                return False, changed, f"contract_{contract_id}_import_delta_exceeded"
+        before_source = "" if before_span is None else before_product[slice(*before_span)]
+        after_source = "" if after_span is None else after_product[slice(*after_span)]
+        if normalized_contract_source(before_source, language="rust") != normalized_contract_source(
+            after_source, language="rust"
+        ):
+            if contract["kind"] != "rust_use":
+                semantic_rewrites = contract.get("semantic_rewrites", [])
+                if semantic_rewrites:
+                    rewrites_ok, rewrites_error = semantic_rewrites_match(
+                        before_source=before_source,
+                        after_source=after_source,
+                        language="rust",
+                        contract_id=contract_id,
+                        rewrites=semantic_rewrites,
+                    )
+                    if not rewrites_ok:
+                        return False, changed, rewrites_error
+                policy_ok, policy_error = semantic_policy_match(
+                    before_source=before_source,
+                    after_source=after_source,
+                    language="rust",
+                    contract_id=contract_id,
+                    policy=file_selector["semantic_policy"],
+                    contract_allowed_identifiers=set(contract.get("allowed_identifiers", [])),
+                    allowed_numeric_literals=set(contract.get("allowed_numeric_literals", [])),
+                )
+                if not policy_ok:
+                    return False, changed, policy_error
+            changed.append(contract_id)
+        if before_span is not None:
+            before_spans.append(before_span)
+        if after_span is not None:
+            after_spans.append(after_span)
+    before_projection = remove_contract_spans(before_product, before_spans)
+    after_projection = remove_contract_spans(after_product, after_spans)
+    if before_projection is None or after_projection is None:
+        return False, changed, "overlapping_symbol_contracts"
+    if normalized_contract_source(before_projection, language="rust") != normalized_contract_source(
+        after_projection, language="rust"
+    ):
+        return False, changed, "production_diff_exceeds_symbol_contracts"
+    if allow_tests and before != after and before_product == after_product:
+        changed.append("test_only")
+    if not changed:
+        return False, [], "no_symbol_contract_changed"
+    return True, sorted(set(changed)), None
+
+
+def python_symbol_spans(text: str) -> dict[str, tuple[int, int]]:
+    tree = ast.parse(text)
+    offsets = [0]
+    for line in text.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    spans: dict[str, tuple[int, int]] = {}
+    for node in tree.body:
+        name: str | None = None
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+            first_line = min(
+                [node.lineno, *(decorator.lineno for decorator in node.decorator_list)]
+            )
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = [target.id for target in targets if isinstance(target, ast.Name)]
+            if len(names) != 1:
+                continue
+            name = names[0]
+            first_line = node.lineno
+        else:
+            continue
+        if name in spans or node.end_lineno is None:
+            raise PlannerError(f"Python qualification symbol is ambiguous: {name}")
+        spans[name] = (offsets[first_line - 1], offsets[node.end_lineno])
+    return spans
+
+
+def python_import_spans(text: str) -> dict[str, tuple[int, int]]:
+    tree = ast.parse(text)
+    offsets = [0]
+    for line in text.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    spans: dict[str, tuple[int, int]] = {}
+    for node in tree.body:
+        modules: list[str] = []
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            modules = [node.module]
+        for module in modules:
+            if module in spans or node.end_lineno is None:
+                raise PlannerError(f"Python qualification import is ambiguous: {module}")
+            spans[module] = (offsets[node.lineno - 1], offsets[node.end_lineno])
+    return spans
+
+
+def python_symbol_contracts_match(
+    *, before: str, after: str, file_selector: dict[str, Any]
+) -> tuple[bool, list[str], str | None]:
+    try:
+        before_symbols = python_symbol_spans(before)
+        after_symbols = python_symbol_spans(after)
+        before_imports = python_import_spans(before)
+        after_imports = python_import_spans(after)
+    except (SyntaxError, PlannerError):
+        return False, [], "python_symbol_parse_failed"
+    before_spans: list[tuple[int, int]] = []
+    after_spans: list[tuple[int, int]] = []
+    changed: list[str] = []
+    for contract in file_selector.get("contracts", []):
+        contract_id = str(contract["id"])
+        symbol = str(contract["symbol"])
+        if contract["kind"] == "python_import":
+            before_span = before_imports.get(symbol)
+            after_span = after_imports.get(symbol)
+        else:
+            before_span = before_symbols.get(symbol)
+            after_span = after_symbols.get(symbol)
+        if before_span is None and after_span is None:
+            continue
+        before_source = "" if before_span is None else before[slice(*before_span)]
+        after_source = "" if after_span is None else after[slice(*after_span)]
+        if normalized_contract_source(before_source, language="python") != normalized_contract_source(
+            after_source, language="python"
+        ):
+            semantic_rewrites = contract.get("semantic_rewrites", [])
+            if semantic_rewrites:
+                rewrites_ok, rewrites_error = semantic_rewrites_match(
+                    before_source=before_source,
+                    after_source=after_source,
+                    language="python",
+                    contract_id=contract_id,
+                    rewrites=semantic_rewrites,
+                )
+                if not rewrites_ok:
+                    return False, changed, rewrites_error
+            else:
+                policy_ok, policy_error = semantic_policy_match(
+                    before_source=before_source,
+                    after_source=after_source,
+                    language="python",
+                    contract_id=contract_id,
+                    policy=file_selector["semantic_policy"],
+                    contract_allowed_identifiers=set(contract.get("allowed_identifiers", [])),
+                    allowed_numeric_literals=set(contract.get("allowed_numeric_literals", [])),
+                )
+                if not policy_ok:
+                    return False, changed, policy_error
+            changed.append(contract_id)
+        if before_span is not None:
+            before_spans.append(before_span)
+        if after_span is not None:
+            after_spans.append(after_span)
+    before_projection = remove_contract_spans(before, before_spans)
+    after_projection = remove_contract_spans(after, after_spans)
+    if before_projection is None or after_projection is None:
+        return False, changed, "overlapping_symbol_contracts"
+    if normalized_contract_source(before_projection, language="python") != normalized_contract_source(
+        after_projection, language="python"
+    ):
+        return False, changed, "production_diff_exceeds_symbol_contracts"
+    if not changed:
+        return False, [], "no_symbol_contract_changed"
+    return True, sorted(set(changed)), None
+
+
+def json_path_parts(path: str) -> list[tuple[str, tuple[str, str] | None]] | None:
+    parts: list[tuple[str, tuple[str, str] | None]] = []
+    for raw in path.split("."):
+        match = re.fullmatch(
+            r"(?P<key>[A-Za-z0-9_-]+)(?:\[(?P<select_key>[A-Za-z0-9_-]+)=(?P<select_value>[^\]]+)\])?",
+            raw,
+        )
+        if match is None:
+            return None
+        selector = None
+        if match.group("select_key") is not None:
+            selector = (match.group("select_key"), match.group("select_value"))
+        parts.append((match.group("key"), selector))
+    return parts
+
+
+def json_contract_value(document: Any, path: str) -> tuple[bool, Any]:
+    parts = json_path_parts(path)
+    if parts is None:
+        return False, None
+    current = document
+    for key, selector in parts:
+        if not isinstance(current, dict) or key not in current:
+            return False, None
+        current = current[key]
+        if selector is not None:
+            selector_key, selector_value = selector
+            if not isinstance(current, list):
+                return False, None
+            matches = [
+                item
+                for item in current
+                if isinstance(item, dict)
+                and str(item.get(selector_key)) == selector_value
+            ]
+            if len(matches) != 1:
+                return False, None
+            current = matches[0]
+    return True, current
+
+
+def remove_json_contract(document: Any, path: str) -> bool:
+    parts = json_path_parts(path)
+    if not parts:
+        return False
+    current = document
+    for key, selector in parts[:-1]:
+        if not isinstance(current, dict) or key not in current:
+            return False
+        current = current[key]
+        if selector is not None:
+            selector_key, selector_value = selector
+            if not isinstance(current, list):
+                return False
+            matches = [
+                item
+                for item in current
+                if isinstance(item, dict)
+                and str(item.get(selector_key)) == selector_value
+            ]
+            if len(matches) != 1:
+                return False
+            current = matches[0]
+    key, selector = parts[-1]
+    if not isinstance(current, dict) or key not in current:
+        return False
+    if selector is None:
+        del current[key]
+        return True
+    value = current[key]
+    selector_key, selector_value = selector
+    if not isinstance(value, list):
+        return False
+    matches = [
+        index
+        for index, item in enumerate(value)
+        if isinstance(item, dict) and str(item.get(selector_key)) == selector_value
+    ]
+    if len(matches) != 1:
+        return False
+    del value[matches[0]]
+    return True
+
+
+def json_symbol_contracts_match(
+    *, before: str, after: str, file_selector: dict[str, Any]
+) -> tuple[bool, list[str], str | None]:
+    try:
+        before_document = json.loads(before)
+        after_document = json.loads(after)
+    except json.JSONDecodeError:
+        return False, [], "json_symbol_parse_failed"
+    before_projection = copy.deepcopy(before_document)
+    after_projection = copy.deepcopy(after_document)
+    changed: list[str] = []
+    for contract in file_selector.get("contracts", []):
+        contract_id = str(contract["id"])
+        symbol = str(contract["symbol"])
+        before_found, before_value = json_contract_value(before_document, symbol)
+        after_found, after_value = json_contract_value(after_document, symbol)
+        if not before_found and not after_found:
+            continue
+        if before_found != after_found or before_value != after_value:
+            changed.append(contract_id)
+        if before_found and not remove_json_contract(before_projection, symbol):
+            return False, changed, f"contract_{contract_id}_base_projection_failed"
+        if after_found and not remove_json_contract(after_projection, symbol):
+            return False, changed, f"contract_{contract_id}_head_projection_failed"
+    if before_projection != after_projection:
+        return False, changed, "production_diff_exceeds_json_contracts"
+    if not changed:
+        return False, [], "no_json_contract_changed"
+    return True, sorted(set(changed)), None
+
+
+def symbol_contracts_match(
+    *, before: str, after: str, file_selector: dict[str, Any]
+) -> tuple[bool, list[str], str | None]:
+    if file_selector.get("test_only") is True:
+        if before == after:
+            return False, [], "test_only_file_did_not_change"
+        if file_selector.get("language") == "rust" and file_selector.get(
+            "allow_test_changes"
+        ):
+            before_product, before_error = production_text(before, True)
+            after_product, after_error = production_text(after, True)
+            if before_product is None:
+                return False, [], f"base_{before_error}"
+            if after_product is None:
+                return False, [], f"head_{after_error}"
+            if normalized_contract_source(
+                before_product, language="rust"
+            ) != normalized_contract_source(after_product, language="rust"):
+                return False, [], "test_only_file_changed_production"
+        return True, ["test_only"], None
+    if file_selector.get("language") == "rust":
+        return rust_symbol_contracts_match(
+            before=before, after=after, file_selector=file_selector
+        )
+    if file_selector.get("language") == "python":
+        return python_symbol_contracts_match(
+            before=before, after=after, file_selector=file_selector
+        )
+    return json_symbol_contracts_match(
+        before=before, after=after, file_selector=file_selector
+    )
+
+
 def qualification_for_path(
     path: str,
     profile_id: str,
@@ -446,18 +1671,26 @@ def qualification_for_path(
     versions = file_versions.get(path)
     if file_selector is None or versions is None:
         return None
-    matched, applied_rewrites, mismatch_reason = structured_rewrites_match(
-        before=str(versions.get("before", "")),
-        after=str(versions.get("after", "")),
-        file_selector=file_selector,
-        allow_test_changes=bool(selector.get("allow_test_changes", False)),
-    )
+    selector_kind = str(selector["kind"])
+    if selector_kind == "structured_rewrites":
+        matched, applied_rewrites, mismatch_reason = structured_rewrites_match(
+            before=str(versions.get("before", "")),
+            after=str(versions.get("after", "")),
+            file_selector=file_selector,
+            allow_test_changes=bool(selector.get("allow_test_changes", False)),
+        )
+    else:
+        matched, applied_rewrites, mismatch_reason = symbol_contracts_match(
+            before=str(versions.get("before", "")),
+            after=str(versions.get("after", "")),
+            file_selector=file_selector,
+        )
     if not matched:
         return None
     return {
         "profile_id": profile_id,
         "path": path,
-        "selector_kind": "structured_rewrites",
+        "selector_kind": selector_kind,
         "applied_rewrites": applied_rewrites,
         "changed_regions": applied_rewrites,
         "qualified_scopes": profile["qualified_scopes"],
@@ -611,9 +1844,11 @@ def plan_from_files(
     for changed in changed_files:
         matched = False
         path_qualification_matches: dict[str, dict[str, Any]] = {}
-        for rule in rules:
-            if not matches_any(changed, rule["path_globs"]):
-                continue
+        path_rules = [rule for rule in rules if matches_any(changed, rule["path_globs"])]
+        exclusive_rules = [rule for rule in path_rules if rule.get("exclusive") is True]
+        if exclusive_rules:
+            path_rules = exclusive_rules
+        for rule in path_rules:
             for profile_id in rule.get("qualification_profiles", []):
                 if profile_id in path_qualification_matches:
                     continue
@@ -625,9 +1860,7 @@ def plan_from_files(
                 )
                 if match is not None:
                     path_qualification_matches[profile_id] = match
-        for rule in rules:
-            if not matches_any(changed, rule["path_globs"]):
-                continue
+        for rule in path_rules:
             matched = True
             matched_profile_ids = sorted(
                 set(rule.get("qualification_profiles", [])) & set(path_qualification_matches)
@@ -639,7 +1872,7 @@ def plan_from_files(
                         "rule_id": rule["id"],
                         "qualification_profiles": matched_profile_ids,
                         "broad_rule_replaced": True,
-                        "reason": "production diff exactly matched the profile's structured rewrites",
+                        "reason": "production diff matched the profile selector and semantic-operation policy",
                     }
                 )
                 continue
@@ -669,6 +1902,7 @@ def plan_from_files(
         for profile_id, match in sorted(path_qualification_matches.items()):
             profile = qualification_profiles[profile_id]
             impact_domains.update(str(domain) for domain in profile["domains"])
+            required_gates.update(str(gate) for gate in profile.get("required_gates", []))
             required_checks.update(str(check) for check in profile["required_checks"])
             for scope in profile["qualified_scopes"]:
                 scope_key = json.dumps(scope, sort_keys=True, separators=(",", ":"))
@@ -681,6 +1915,7 @@ def plan_from_files(
                     "qualification_profile": profile_id,
                     "domains": profile["domains"],
                     "required_checks_added": profile["required_checks"],
+                    "required_gates_added": profile.get("required_gates", []),
                     "qualified_scopes": profile["qualified_scopes"],
                     "applied_rewrites": match["applied_rewrites"],
                     "reason": profile.get("reason"),
@@ -984,6 +2219,10 @@ def run_selftest(
         fixture_failures += assert_not_contains(
             "impact_domains", plan["impact_domains"], list(fixture.get("forbid_domains") or [])
         )
+        if "expect_domains_exact" in fixture and plan["impact_domains"] != fixture["expect_domains_exact"]:
+            fixture_failures.append(
+                f"impact_domains {plan['impact_domains']!r} != {fixture['expect_domains_exact']!r}"
+            )
         fixture_failures += assert_contains(
             "required_gates", plan["required_gates"], list(fixture.get("expect_required_gates") or [])
         )
@@ -995,12 +2234,20 @@ def run_selftest(
         fixture_failures += assert_not_contains(
             "required_gates", plan["required_gates"], list(fixture.get("forbid_required_gates") or [])
         )
+        if "expect_required_gates_exact" in fixture and plan["required_gates"] != fixture["expect_required_gates_exact"]:
+            fixture_failures.append(
+                f"required_gates {plan['required_gates']!r} != {fixture['expect_required_gates_exact']!r}"
+            )
         fixture_failures += assert_contains(
             "required_checks", plan["required_checks"], list(fixture.get("expect_required_checks") or [])
         )
         fixture_failures += assert_not_contains(
             "required_checks", plan["required_checks"], list(fixture.get("forbid_required_checks") or [])
         )
+        if "expect_required_checks_exact" in fixture and plan["required_checks"] != fixture["expect_required_checks_exact"]:
+            fixture_failures.append(
+                f"required_checks {plan['required_checks']!r} != {fixture['expect_required_checks_exact']!r}"
+            )
         actual_profile_ids = sorted(
             str(match.get("profile_id")) for match in plan["qualification_matches"]
         )
