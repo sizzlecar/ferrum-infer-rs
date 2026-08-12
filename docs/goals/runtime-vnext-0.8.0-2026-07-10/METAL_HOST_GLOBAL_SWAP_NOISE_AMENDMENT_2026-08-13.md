@@ -1,4 +1,4 @@
-# Runtime vNext v0.8.0 Metal host-global swap noise amendment (2026-08-13)
+# Runtime vNext v0.8.0 Metal host-global swap observation amendment (2026-08-13)
 
 ## Status and precedence
 
@@ -17,9 +17,20 @@
 
 ## Measurement fact and scope
 
-On macOS, `vm.swapusage` is a host-global counter. It is not attributable to the Ferrum process.
-The validator must therefore distinguish one bounded host-global counter step from sustained or
-repeated swap pressure without changing any raw observation.
+On macOS, `vm.swapusage` is a host-global counter. It is not attributable to the Ferrum process or
+its process group, so neither a positive delta nor a sequence of positive deltas proves that Ferrum
+allocated, retained, or swapped those bytes. The validator must preserve this signal transparently
+as host-level diagnostic context without using its value, delta count, or growth shape to decide
+PASS or REJECT.
+
+This is a mechanism correction based on two bounded observations of the same M1 Metal lane, not a
+loosening of a numeric limit. The first observation contained one `786,432`-byte positive step
+while measured physical headroom remained above `14 GB`. A later clean-server epoch contained four
+positive steps totaling `1,635,779` bytes, with a maximum individual step of `587,202` bytes and a
+minimum measured physical headroom of `9,190,129,664` bytes. Both observations had zero thermal,
+OOM, admission, and resource-probe failures. Because the counter covers unrelated host activity,
+choosing a larger byte, step-count, headroom, or post-step-stability allowance after either
+observation would remain a post-hoc threshold rather than process-attributable evidence.
 
 One `(model, metal)` performance lane contains exactly these eight formal measurement scopes:
 
@@ -32,8 +43,9 @@ One `(model, metal)` performance lane contains exactly these eight formal measur
 7. `ferrum run` sample 2;
 8. `ferrum run` sample 3.
 
-Missing, duplicate, unbound, or additional scopes make the lane REJECT. The allowance below is
-lane-global across all eight scopes; it is not one allowance per scope or per cell.
+Missing, duplicate, unbound, or additional scopes make the lane REJECT as an evidence-completeness
+failure. The host-global observation is aggregated across all eight scopes; it is not interpreted
+independently as a resource verdict for any scope or cell.
 
 For each scope, the validator reads the immutable, hash-bound raw resource observations inside the
 formal measurement window, orders them by their recorded monotonic timestamp, and computes every
@@ -48,45 +60,33 @@ only observed adjacent samples inside that scope form steps.
 
 ## Mechanical acceptance rule
 
-The normal no-growth path remains unchanged. If all eight scopes contain zero positive swap
-steps, the lane uses the pre-existing Metal resource contract, including the `2 GiB`
-(`2,147,483,648` bytes) measured physical-headroom floor. This path does not inherit the stricter
-`4 GiB` noise-qualification floor.
-
-The host-global-noise path is available only when all of the following are true across the exact
-eight-scope set:
-
-1. `positive_step_count == 1`;
-2. `max_positive_step_bytes <= 1,048,576`;
-3. `total_positive_growth_bytes <= 1,048,576`;
-4. the minimum recorded physical headroom across every scope is at least
-   `4 GiB` (`4,294,967,296` bytes);
-5. thermal throttling, OOM, admission failure, and resource-probe error counts are all `0` in every
-   scope;
-6. the positive step's containing scope has at least `30` later samples, at least `10.0` seconds
-   from that step to the last later sample, and no later positive step.
-
-The unchanged broader Metal lane contracts still require zero thermal throttling, OOM, admission
-failure, resource-probe error, and resource leak on the normal no-growth path. The list above is
-the additional complete safety envelope required to classify a positive step as host-global noise;
-it must not be imposed as a new `4 GiB` floor on an `exact_zero` M1/M2/M3 lane.
-
-The lane classification is machine-derived:
+`vm.swapusage` is recorded and machine-classified, but there is no Metal resource-gate branch whose
+outcome depends on its absolute value, positive-step count, maximum step, cumulative growth, net
+change, or later decrease. The diagnostic classification is:
 
 - `exact_zero`: all eight scopes contain zero positive swap steps. Here `exact_zero` means exact
-  zero positive growth; the host's absolute swap-used value need not be zero.
-- `host_global_swap_noise`: exactly one positive step exists across the lane and every condition
-  above passes. The containing scope may expose the intermediate classification
-  `host_global_swap_noise_candidate`.
-- `swap_pressure`: any other result, including a second positive step, repeated or sustained
-  growth, a step or cumulative positive growth above `1 MiB`, insufficient post-step stability,
-  noise-path headroom below `4 GiB`, thermal throttling, OOM, admission failure, probe error, or
-  incomplete evidence.
+  zero observed positive growth; the host's absolute swap-used value need not be zero.
+- `host_global_swap_observed`: one or more positive steps exist across the lane. The aggregate must
+  retain every step and all computed totals, without interpreting them as Ferrum memory pressure.
 
-`exact_zero` and `host_global_swap_noise` satisfy only the swap portion of the Metal resource gate;
-all other performance and correctness assertions must still pass. `swap_pressure` always rejects
-the lane. A later decrease, a high final headroom value, or a passing throughput result cannot
-convert `swap_pressure` to PASS.
+Malformed, missing, unhashed, or unbound raw observations still reject the lane as an evidence-
+integrity failure. A host-global swap observation by itself does not. Conversely, `exact_zero`
+does not satisfy, weaken, or substitute for a process-attributable resource gate.
+
+The unchanged hard Metal resource gates are evaluated independently and remain fail-closed:
+
+1. peak Ferrum process-group RSS must not exceed the lane's typed memory budget;
+2. measured physical headroom must remain at least `2 GiB` (`2,147,483,648` bytes);
+3. the thermal state must remain nominal and the power state normal;
+4. OOM, admission-failure, and resource-probe-error counts must each remain `0`;
+5. every HTTP cell must provide post-cell quiescence evidence, preserve the typed dynamic-pool
+   ledger, and prove all transient resources returned to zero;
+6. every `ferrum run` sample's process group must exit and leave no product child behind.
+
+Every ordinary correctness, workload, performance, provenance, cleanup, and artifact-integrity
+assertion also remains unchanged. Host-global swap can never mask or override failure of any hard
+gate above, and passing any hard gate cannot erase or rewrite the recorded host-global observation.
+The same mechanism and separation of diagnostic and hard signals applies to R3.
 
 ## Completed-cell cumulative resume
 
@@ -150,29 +150,30 @@ not a waiver.
 
 ## Provenance and raw-evidence integrity
 
-The validator must recompute the classification from raw observations and save, for every scope:
+The validator must recompute the diagnostic classification from raw observations and save, for
+every scope:
 
 - raw artifact path, byte size, SHA256, sampler/collector identity, and measurement-window
   derivation;
 - first/last sample timestamp and swap-used value, sample count, positive-step count, maximum step,
   cumulative positive growth, and net change;
 - every positive step's sample indexes, timestamps, before/after values, and delta;
-- minimum physical headroom, post-step sample count and duration, and all thermal/OOM/admission/probe
-  error counters;
-- the threshold constants, scope classification, and explicit classification reason.
+- minimum physical headroom and all thermal/OOM/admission/probe error counters;
+- the scope classification and explicit classification reason that identifies `vm.swapusage` as a
+  host-global, non-attributable diagnostic.
 
 The lane aggregate must bind the ordered eight scope artifacts and their hashes, recompute the
-lane-wide counts and maxima, and record the final classification. A summary without the raw
-hash-bound observations is not evidence.
+lane-wide counts and maxima, and record the final diagnostic classification separately from the
+hard resource-gate verdict. A summary without the raw hash-bound observations is not evidence.
 
 The collector and validator may derive a new classification artifact beside an otherwise eligible
 existing raw artifact, but they must not edit, truncate, renumber, smooth, subtract from, or replace
 any raw sample or old summary. There is no manual allowlist, command-line waiver, model-specific
-exception, or post-hoc threshold. Accepting `host_global_swap_noise` is application of this common
-machine rule, not a waiver.
+exception, or post-hoc threshold. Treating `host_global_swap_observed` as diagnostic-only is the
+common machine rule for a non-attributable host counter, not an evidence waiver.
 
 This amendment does not authorize reuse across an invalid source, binary, model, hardware, config,
-workload, sampler, or unbound collector/support identity. It only prevents a single tiny
-host-global counter quantization step, proven under the complete safety envelope above, from being
-misclassified as Ferrum memory pressure, and prevents already completed cells from being repeated
-after a fully evidenced clean epoch boundary.
+workload, sampler, or unbound collector/support identity. It prevents an unowned host-global
+counter from being misclassified as Ferrum memory pressure while preserving the process-
+attributable hard gates, and prevents already completed cells from being repeated after a fully
+evidenced clean epoch boundary.
