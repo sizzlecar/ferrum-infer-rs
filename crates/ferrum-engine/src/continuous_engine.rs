@@ -55,13 +55,14 @@ use ferrum_scheduler::vnext::{
     AdmissionDeferral, AdmissionProbeOutcome, AdmissionWakeEpochs, AdmissionWakeSnapshot,
 };
 use ferrum_types::{
-    DataType, Device, EngineConfig, EngineStatus, EngineTokenTimingEvidence, FerrumError,
-    FerrumProfileEvent, FinishReason, InferenceExecutionEvidence, InferenceRequest,
-    InferenceResponse, ObservabilityProfileDetail, Priority, ProfileEntrypoint, ProfileError,
-    ProfileEventKind, ProfileStatus, RequestId, ResourceAction, ResourceTraceEvent,
-    ResponseCompletionBoundary, Result, SamplingParams, StreamChunk, TokenId, TokenUsage,
-    DEFAULT_MAX_TOKENS_METADATA_KEY, ENGINE_RUNTIME_TRACE_PRESET_HASH,
-    OBSERVABILITY_PROFILE_SCHEMA_VERSION, PROMPT_TOKENS_METADATA_KEY,
+    DataType, Device, EngineConfig, EngineDecodeStage, EngineDecodeStageInterval, EngineStatus,
+    EngineTokenTimingEvidence, FerrumError, FerrumProfileEvent, FinishReason,
+    InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ObservabilityProfileDetail,
+    Priority, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, RequestId,
+    ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary, Result, SamplingParams,
+    StreamChunk, TokenId, TokenUsage, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    ENGINE_RUNTIME_TRACE_PRESET_HASH, OBSERVABILITY_PROFILE_SCHEMA_VERSION,
+    PROMPT_TOKENS_METADATA_KEY,
 };
 use futures::{stream::Stream, FutureExt};
 use metrics::{counter, gauge, histogram};

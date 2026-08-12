@@ -48,6 +48,14 @@ pub fn engine_token_timing_profile_attributes(
             serde_json::json!(timing.token_commit_nanos_since_request_start.len()),
         ),
         (
+            "engine_decode_stage_intervals".to_string(),
+            serde_json::json!(timing.decode_stage_intervals),
+        ),
+        (
+            "engine_decode_stage_interval_count".to_string(),
+            serde_json::json!(timing.decode_stage_intervals.len()),
+        ),
+        (
             "itl_source".to_string(),
             serde_json::json!("engine_token_commit"),
         ),
@@ -555,6 +563,7 @@ mod tests {
             wall_anchor_max_error_nanos: 400,
             decode_ready_nanos_since_request_start: Some(2_000_000),
             token_commit_nanos_since_request_start: vec![1_000_000, 2_500_000, 5_000_000],
+            decode_stage_intervals: Vec::new(),
         };
         timing.validate(3).unwrap();
         assert!(timing.validate(2).is_err());
@@ -563,6 +572,14 @@ mod tests {
         assert_eq!(
             attributes["engine_token_commit_count"],
             serde_json::json!(3)
+        );
+        assert_eq!(
+            attributes["engine_decode_stage_intervals"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            attributes["engine_decode_stage_interval_count"],
+            serde_json::json!(0)
         );
         assert_eq!(attributes["ttft_us"], serde_json::json!(1_000));
         assert_eq!(attributes["itl_interval_count"], serde_json::json!(2));

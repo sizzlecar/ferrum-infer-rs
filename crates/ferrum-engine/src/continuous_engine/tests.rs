@@ -3528,6 +3528,24 @@ fn plan_runtime_batch_decode_test_engine(
     plan_runtime_batch_decode_test_engine_with_trace(behavior, None)
 }
 
+fn plan_runtime_batch_decode_profile_test_engine(
+    profile_detail: ObservabilityProfileDetail,
+) -> (
+    ContinuousBatchEngine,
+    Arc<ContinuousBatchScheduler>,
+    Arc<PlanRuntimeBatchDecodeTestExecutor>,
+    Arc<dyn Tokenizer + Send + Sync>,
+) {
+    let (mut engine, scheduler, executor, tokenizer) =
+        plan_runtime_batch_decode_test_engine(PlanRuntimeBatchDecodeBehavior::Exact);
+    Arc::get_mut(&mut engine.inner)
+        .expect("new test engine must have one inner owner")
+        .config
+        .runtime
+        .profile_detail = profile_detail;
+    (engine, scheduler, executor, tokenizer)
+}
+
 fn plan_runtime_batch_decode_test_engine_with_stage(
     behavior: PlanRuntimeBatchDecodeBehavior,
     capacity_stage: ExecutorExecutionCapacityStage,
@@ -3702,6 +3720,52 @@ async fn install_plan_runtime_decode_frontiers(
         cache_ids.push(cache_id);
     }
     (request_ids, initial_tokens, cache_ids)
+}
+
+async fn install_profiled_plan_runtime_decode_frontier(
+    engine: &ContinuousBatchEngine,
+    scheduler: &ContinuousBatchScheduler,
+    tokenizer: Arc<dyn Tokenizer + Send + Sync>,
+) -> RequestId {
+    let mut request = policy_request();
+    request.prompt = "test".to_string();
+    request.sampling_params.max_tokens = 4;
+    request.evidence_request.capture_engine_token_timing = true;
+    request
+        .metadata
+        .insert(PROMPT_TOKENS_METADATA_KEY.to_string(), serde_json::json!(1));
+    let request_id = request.id.clone();
+    scheduler.submit(request.clone()).await.unwrap();
+    let initial_batch = scheduler
+        .next_batch(ferrum_interfaces::BatchHint::simple(1))
+        .await
+        .expect("profiled decode request must first schedule as prefill");
+    assert_eq!(initial_batch.requests.len(), 1);
+    scheduler.mark_prefill_complete(&request_id, 1);
+
+    let token = TokenId::new(5);
+    let kv_cache = engine
+        .inner
+        .make_model_kv_handle_with_seq("profiled-plan-runtime-cache".to_string(), 1);
+    let mut sequence = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![token],
+        Some(tokenizer),
+        Some(64),
+    );
+    sequence.prefill_complete = true;
+    sequence.prefill_tokens_processed = 1;
+    sequence.install_runtime_managed_model_kv(kv_cache);
+    sequence.phase = RequestPhase::Decoding;
+    sequence.record_decode_ready();
+    sequence.generated_tokens.push(token);
+    sequence.record_generated_token_commit();
+    engine
+        .inner
+        .sequences
+        .write()
+        .insert(request_id.clone(), sequence);
+    request_id
 }
 
 #[tokio::test]
@@ -4542,6 +4606,63 @@ async fn plan_runtime_adaptive_decode_failure_only_completes_its_exact_subcohort
         !sequences.contains_key(&request_ids[1]),
         "only the failed exact subcohort may be completed"
     );
+}
+
+#[tokio::test]
+async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
+    for (profile_detail, expected_stage_count) in [
+        (ObservabilityProfileDetail::Full, 2),
+        (ObservabilityProfileDetail::Off, 0),
+    ] {
+        let (engine, scheduler, executor, tokenizer) =
+            plan_runtime_batch_decode_profile_test_engine(profile_detail);
+        let request_id =
+            install_profiled_plan_runtime_decode_frontier(&engine, &scheduler, tokenizer).await;
+
+        engine
+            .inner
+            .run_plan_runtime_batch_decode(std::slice::from_ref(&request_id))
+            .await
+            .unwrap();
+
+        assert_eq!(executor.batch_decode_calls.load(Ordering::Relaxed), 1);
+        let timing = engine
+            .inner
+            .sequences
+            .write()
+            .get_mut(&request_id)
+            .unwrap()
+            .take_execution_evidence()
+            .unwrap()
+            .unwrap()
+            .engine_token_timing
+            .unwrap();
+        assert_eq!(timing.token_commit_nanos_since_request_start.len(), 2);
+        assert_eq!(
+            timing.decode_stage_intervals.len(),
+            expected_stage_count,
+            "profile detail {} stage capture",
+            profile_detail.as_str()
+        );
+        if profile_detail == ObservabilityProfileDetail::Full {
+            let scheduling = &timing.decode_stage_intervals[0];
+            let postprocess = &timing.decode_stage_intervals[1];
+            assert_eq!(scheduling.stage, EngineDecodeStage::DecodeScheduling);
+            assert_eq!(postprocess.stage, EngineDecodeStage::DecodePostprocess);
+            assert_eq!(
+                scheduling.start_nanos_since_request_start,
+                timing.token_commit_nanos_since_request_start[0]
+            );
+            assert!(
+                scheduling.end_nanos_since_request_start
+                    <= postprocess.start_nanos_since_request_start
+            );
+            assert_eq!(
+                postprocess.end_nanos_since_request_start,
+                timing.token_commit_nanos_since_request_start[1]
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -6689,7 +6810,11 @@ fn vnext_profile_test_event_for_request(
             async_links: Vec::new(),
         })
         .unwrap(),
-        ExecutionEventDetail::None,
+        ExecutionEventDetail::MonotonicClockAnchor {
+            clock_source: "rust_std_instant".to_string(),
+            wall_anchor_unix_nanos: 1_700_000_000_000_000_000,
+            max_error_nanos: 400,
+        },
     )
     .unwrap();
     (run_id, request_id, event)
@@ -7081,6 +7206,22 @@ fn vnext_execution_events_use_the_canonical_scheduler_trace_schema() {
         profile.attributes.get("execution_capture_policy"),
         Some(&serde_json::json!("first_frame_per_request"))
     );
+    assert_eq!(
+        profile.attributes.get("vnext_monotonic_clock_source"),
+        Some(&serde_json::json!("rust_std_instant"))
+    );
+    assert_eq!(
+        profile
+            .attributes
+            .get("vnext_monotonic_wall_anchor_unix_nanos"),
+        Some(&serde_json::json!(1_700_000_000_000_000_000_i64))
+    );
+    assert_eq!(
+        profile
+            .attributes
+            .get("vnext_clock_conversion_max_error_nanos"),
+        Some(&serde_json::json!(400))
+    );
 
     let _ = std::fs::remove_file(trace_path);
 }
@@ -7186,8 +7327,9 @@ fn sequence_engine_timing_is_opt_in_and_matches_committed_tokens() {
     enabled.record_decode_ready();
     enabled.generated_tokens.push(TokenId::new(3));
     enabled.record_generated_token_commit();
+    enabled.close_decode_scheduling(Instant::now());
     enabled.generated_tokens.push(TokenId::new(4));
-    enabled.record_generated_token_commit();
+    enabled.record_generated_token_commit_with_decode_postprocess(Some(Instant::now()));
 
     let evidence = enabled
         .take_execution_evidence()
@@ -7206,6 +7348,19 @@ fn sequence_engine_timing_is_opt_in_and_matches_committed_tokens() {
             >= timing.token_commit_nanos_since_request_start[0]
     );
     assert!(timing.decode_wall_nanos().is_some());
+    assert_eq!(timing.decode_stage_intervals.len(), 2);
+    assert_eq!(
+        timing.decode_stage_intervals[0].stage,
+        EngineDecodeStage::DecodeScheduling
+    );
+    assert_eq!(
+        timing.decode_stage_intervals[1].stage,
+        EngineDecodeStage::DecodePostprocess
+    );
+    assert_eq!(
+        timing.decode_stage_intervals[1].end_nanos_since_request_start,
+        timing.token_commit_nanos_since_request_start[1]
+    );
 }
 
 #[test]

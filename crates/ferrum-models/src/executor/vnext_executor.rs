@@ -11,7 +11,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ferrum_interfaces::kv_cache::{BlockTable, CacheHandleStats};
 use ferrum_interfaces::model_executor::{
@@ -2633,6 +2633,39 @@ enum JournaledSubmission {
     },
 }
 
+const VNEXT_MONOTONIC_CLOCK_SOURCE: &str = "rust_std_instant";
+
+const fn journal_clock_anchor_required(timing_mode: DeviceTimingMode) -> bool {
+    matches!(timing_mode, DeviceTimingMode::Kernel)
+}
+
+fn system_time_unix_nanos(time: SystemTime) -> std::result::Result<i64, ExecutionEventSinkError> {
+    let duration = time.duration_since(UNIX_EPOCH).map_err(|error| {
+        ExecutionEventSinkError::new(format!("system clock predates Unix epoch: {error}"))
+    })?;
+    i64::try_from(duration.as_nanos())
+        .map_err(|_| ExecutionEventSinkError::new("system clock Unix nanos exceed i64"))
+}
+
+fn bounded_wall_anchor(wall_before: i64, wall_after: i64) -> (i64, u64) {
+    let lower = wall_before.min(wall_after);
+    let upper = wall_before.max(wall_after);
+    let span = upper.saturating_sub(lower);
+    (
+        lower.saturating_add(span / 2),
+        u64::try_from(span).unwrap_or(u64::MAX),
+    )
+}
+
+fn capture_monotonic_wall_anchor(
+) -> std::result::Result<(Instant, i64, u64), ExecutionEventSinkError> {
+    let wall_before = system_time_unix_nanos(SystemTime::now())?;
+    let started = Instant::now();
+    let wall_after = system_time_unix_nanos(SystemTime::now())?;
+    let (wall_anchor_unix_nanos, max_error_nanos) = bounded_wall_anchor(wall_before, wall_after);
+    Ok((started, wall_anchor_unix_nanos, max_error_nanos))
+}
+
 struct VNextExecutionJournal {
     emitter: ExecutionEventEmitter<'static>,
     topology: TrustedExecutionTopology,
@@ -2657,6 +2690,12 @@ impl VNextExecutionJournal {
         active: Arc<TrustedActiveSequenceBinding>,
         request_origin: ExecutorRequestOrigin,
     ) -> std::result::Result<Self, ExecutionEventSinkError> {
+        let clock_anchor = journal_clock_anchor_required(sink.device_timing_mode())
+            .then(capture_monotonic_wall_anchor)
+            .transpose()?;
+        let started = clock_anchor
+            .as_ref()
+            .map_or_else(Instant::now, |(started, _, _)| *started);
         let topology = TrustedExecutionTopology::from_plan(plan).map_err(Self::error)?;
         let root_span =
             SpanId::new(format!("vnext/request/{}", active.fingerprint())).map_err(Self::error)?;
@@ -2672,17 +2711,27 @@ impl VNextExecutionJournal {
             active,
             capture_policy,
             completed_frames: 0,
-            started: Instant::now(),
+            started,
             last_timestamp_nanos: 0,
             root_span,
             pending_submission: None,
             first_failure: None,
         };
+        let accepted_detail = clock_anchor.map_or(
+            ExecutionEventDetail::None,
+            |(_, wall_anchor_unix_nanos, max_error_nanos)| {
+                ExecutionEventDetail::MonotonicClockAnchor {
+                    clock_source: VNEXT_MONOTONIC_CLOCK_SOURCE.to_string(),
+                    wall_anchor_unix_nanos,
+                    max_error_nanos,
+                }
+            },
+        );
         let accepted = journal.event(
             ExecutionPhase::Resolution,
             ExecutionEventKind::RequestAccepted,
             journal.base_parts(1, journal.root_span.clone(), None),
-            ExecutionEventDetail::None,
+            accepted_detail,
         )?;
         let plan_span = SpanId::new(format!("{}/plan", journal.root_span)).map_err(Self::error)?;
         let planned_parts =
@@ -10087,8 +10136,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        apply_teacher_forced_decision, decode_output_width, decode_selected_token,
-        is_language_masked_argmax_operation, is_language_token_embedding_operation,
+        apply_teacher_forced_decision, bounded_wall_anchor, decode_output_width,
+        decode_selected_token, is_language_masked_argmax_operation,
+        is_language_token_embedding_operation, journal_clock_anchor_required,
         nonterminal_completion_message, normalized_product_token_mask,
         product_output_mode_for_policies, product_repetition_input, reported_allocated_bytes,
         resolve_reusable_execution_policy, resolve_runtime_attention_authority,
@@ -10844,6 +10894,26 @@ mod tests {
     fn allocated_memory_does_not_count_static_claim_twice() {
         assert_eq!(reported_allocated_bytes(Some(64), 64), 64);
         assert_eq!(reported_allocated_bytes(None, 64), 64);
+    }
+
+    #[test]
+    fn monotonic_wall_anchor_uses_sample_midpoint_and_bounds_full_capture_span() {
+        assert_eq!(bounded_wall_anchor(1_000, 1_100), (1_050, 100));
+        assert_eq!(bounded_wall_anchor(1_101, 1_000), (1_050, 101));
+        assert_eq!(bounded_wall_anchor(7, 7), (7, 0));
+    }
+
+    #[test]
+    fn journal_clock_anchor_is_kernel_profile_only() {
+        assert!(journal_clock_anchor_required(DeviceTimingMode::Kernel));
+        for timing_mode in [
+            DeviceTimingMode::Off,
+            DeviceTimingMode::Completion,
+            DeviceTimingMode::Replay,
+            DeviceTimingMode::Verification,
+        ] {
+            assert!(!journal_clock_anchor_required(timing_mode));
+        }
     }
 
     #[test]

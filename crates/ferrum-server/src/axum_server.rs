@@ -5865,6 +5865,7 @@ mod tests {
                     token_commit_nanos_since_request_start: (1..=output_token_count)
                         .map(|ordinal| ordinal as u64 * 1_000_000)
                         .collect(),
+                    decode_stage_intervals: Vec::new(),
                 }
             }),
         })

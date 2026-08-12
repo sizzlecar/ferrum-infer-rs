@@ -4,6 +4,50 @@ use ferrum_interfaces::model_executor::PlanRuntimeResourceSnapshot;
 use vnext_event_contract::*;
 
 #[test]
+fn request_accepted_clock_anchor_is_typed_and_legacy_none_remains_valid() {
+    let run_id = RunId::new("run.clock-anchor-contract").unwrap();
+    let request_id = RequestIdentity::new("request.clock-anchor-contract").unwrap();
+    assert_eq!(
+        accepted_event(&run_id, &request_id).detail(),
+        &ExecutionEventDetail::None
+    );
+
+    let event = |clock_source: &str, wall_anchor_unix_nanos: i64, max_error_nanos: u64| {
+        ExecutionEvent::new(
+            MonotonicTimestamp {
+                nanos_since_run_start: 1,
+            },
+            ExecutionPhase::Resolution,
+            ExecutionEventKind::RequestAccepted,
+            ExecutionIdentityEnvelope::new(base_parts(
+                &run_id,
+                &request_id,
+                1,
+                "span.clock-anchor-contract",
+                None,
+            ))
+            .unwrap(),
+            ExecutionEventDetail::MonotonicClockAnchor {
+                clock_source: clock_source.to_string(),
+                wall_anchor_unix_nanos,
+                max_error_nanos,
+            },
+        )
+    };
+
+    let valid = event("rust_std_instant", 1_700_000_000_000_000_000, 400).unwrap();
+    let mut invalid_error_wire = serde_json::to_value(valid).unwrap();
+    invalid_error_wire["detail"]["monotonic_clock_anchor"]["max_error_nanos"] =
+        serde_json::json!(-1);
+    assert!(
+        ExecutionEvent::decode_untrusted(&serde_json::to_vec(&invalid_error_wire).unwrap())
+            .is_err()
+    );
+    assert!(event("", 1_700_000_000_000_000_000, 400).is_err());
+    assert!(event("rust_std_instant", 0, 400).is_err());
+}
+
+#[test]
 fn trusted_event_topology_binds_provider_execution_semantics() {
     let runtime_catalog = catalog();
     let operation_registry = make_operation_registry(&runtime_catalog);
