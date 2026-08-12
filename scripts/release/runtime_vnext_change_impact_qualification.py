@@ -1171,17 +1171,74 @@ def m1_cuda_model_contract(source: dict[str, Any]) -> dict[str, Any]:
         and GIT_SHA_RE.fullmatch(lane["revision"]) is not None
         and isinstance(lane.get("files"), list)
         and isinstance(lane.get("semantic_source"), dict)
+        and lane["semantic_source"].get("repo") == lane.get("repo")
+        and lane["semantic_source"].get("revision") == lane.get("revision")
         and isinstance(lane["semantic_source"].get("files"), list),
         "M1 CUDA model lock lane differs",
     )
+    unique_files: dict[str, dict[str, Any]] = {}
+    ordered_files: list[dict[str, Any]] = []
+    for row in [*lane["files"], *lane["semantic_source"]["files"]]:
+        require(
+            isinstance(row, dict)
+            and set(row) == {"path", "sha256", "size_bytes"}
+            and isinstance(row.get("path"), str)
+            and bool(row["path"])
+            and SHA256_RE.fullmatch(str(row.get("sha256"))) is not None
+            and isinstance(row.get("size_bytes"), int)
+            and not isinstance(row.get("size_bytes"), bool)
+            and row["size_bytes"] >= 0,
+            "M1 CUDA model lock file identity differs",
+        )
+        existing = unique_files.get(row["path"])
+        require(
+            existing is None or existing == row,
+            f"M1 CUDA model lock conflicts for {row['path']}",
+        )
+        if existing is None:
+            unique_files[row["path"]] = copy.deepcopy(row)
+            ordered_files.append(copy.deepcopy(row))
     return {
         "repo": lane["repo"],
         "revision": lane["revision"],
         "model_files": copy.deepcopy(lane["files"]),
         "semantic_files": copy.deepcopy(lane["semantic_source"]["files"]),
+        "unique_files": ordered_files,
         "hardware_policy": lane["hardware_policy"],
         "lock": git_blob_ref(source, lock_path),
     }
+
+
+def validate_model_lock_validation(
+    value: Any,
+    *,
+    model_argument: str,
+    model_contract: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    path = validate_ref(value, f"{label} model lock validation")
+    validation = read_json(path, f"{label} model lock validation")
+    require(
+        validation.get("status") == "pass"
+        and validation.get("snapshot_path") == model_argument
+        and validation.get("repo") == model_contract["repo"]
+        and validation.get("revision") == model_contract["revision"]
+        and validation.get("files") == model_contract["unique_files"],
+        f"{label} model snapshot validation differs from the source lock",
+    )
+    return file_ref(path)
+
+
+def producer_shell_quote(value: str) -> str:
+    require(isinstance(value, str), "replay argv contains a non-string value")
+    if value and all(character.isalnum() or character in "-_./:" for character in value):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def producer_command(argv: list[str]) -> str:
+    require(argv and all(isinstance(item, str) for item in argv), "replay argv is invalid")
+    return " ".join(producer_shell_quote(item) for item in argv)
 
 
 def parse_product_stdout(path: Path, label: str) -> dict[str, Any]:
@@ -1913,6 +1970,7 @@ def _validate_raw_execution_v2(
             "hardware_stderr",
             "execution_outputs",
             "model_identity",
+            "model_lock_validation",
         },
         f"{check_id} raw execution-closure field set differs",
     )
@@ -2031,9 +2089,15 @@ def _validate_raw_execution_v2(
         "lock": model_contract["lock"],
     }
     require(
-        tokenizer_argument == semantic_argument
+        model_argument == semantic_argument == tokenizer_argument
         and raw.get("model_identity") == expected_model_identity,
         f"{check_id} source-bound M1 CUDA model identity differs",
+    )
+    model_lock_validation = validate_model_lock_validation(
+        raw.get("model_lock_validation"),
+        model_argument=model_argument,
+        model_contract=model_contract,
+        label=check_id,
     )
 
     stdout = parse_product_stdout(product_run["stdout"], check_id)
@@ -2071,30 +2135,100 @@ def _validate_raw_execution_v2(
         bundle_root / "replay.command.json", f"{check_id} request replay command"
     )
     replay_argv = replay_command.get("argv")
+    replay_sample_rate = (
+        exact_flag_value(replay_argv, "--profile-sample-rate", check_id)
+        if isinstance(replay_argv, list)
+        else ""
+    )
+    expected_bundle_dir = str(
+        Path(str(dump_output["executed_path"])) / product_request_id
+    )
+    expected_replay_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        "run",
+        "synthetic/no-weight",
+        "--profile-detail",
+        "full",
+        "--profile-sample-rate",
+        replay_sample_rate,
+    ]
+    for flag, field in (
+        ("--profile-jsonl", "profile_jsonl"),
+        ("--memory-profile-jsonl", "memory_profile_jsonl"),
+        ("--scheduler-trace-jsonl", "scheduler_trace_jsonl"),
+        ("--request-dump-dir", "request_dump_dir"),
+    ):
+        value = runtime_config.get(field)
+        if value is not None:
+            require(
+                isinstance(value, str) and value,
+                f"{check_id} request runtime {field} is invalid",
+            )
+            expected_replay_argv.extend([flag, value])
+    engine_replay = replay_command.get("engine_replay")
+    expected_engine_argv = [
+        "cargo",
+        "run",
+        "-p",
+        "ferrum-cli",
+        "--",
+        "replay-bundle",
+        expected_bundle_dir,
+        "--out",
+        str(Path(expected_bundle_dir) / "engine_replay"),
+        "--json",
+    ]
     require(
         bundles[0].get("request_id") == product_request_id
         and request.get("request_id") == product_request_id
+        and request.get("schema_version") == 1
         and request.get("entrypoint") == "run"
         and request.get("backend") == "actual"
         and request.get("actual_model_smoke") is True
         and request.get("sanitized") is True
-        and request.get("model") == model_contract["repo"]
+        and request.get("l0_only") is False
+        and request.get("profile_detail") == "full"
+        and request.get("profile_sample_rate") == 1.0
+        and request.get("model") == model_argument
         and runtime_config.get("request_id") == product_request_id
+        and runtime_config.get("schema_version") == 1
+        and runtime_config.get("entrypoint") == "run"
+        and runtime_config.get("profile_detail") == "full"
+        and runtime_config.get("profile_sample_rate") == 1.0
+        and runtime_config.get("profile_jsonl") == profile_output["executed_path"]
+        and runtime_config.get("request_dump_dir") == dump_output["executed_path"]
+        and runtime_config.get("sanitized") is True
         and backend_selection.get("request_id") == product_request_id
+        and backend_selection.get("schema_version") == 1
         and backend_selection.get("backend") == "actual"
-        and backend_selection.get("model") == model_contract["repo"]
+        and backend_selection.get("actual_model_smoke") is True
+        and backend_selection.get("model") == model_argument
         and sampling.get("request_id") == product_request_id
-        and isinstance(replay_argv, list)
-        and len(replay_argv) >= 3
-        and Path(str(replay_argv[0])).name == "ferrum"
-        and replay_argv[1] == "run"
-        and replay_argv[2] == model_contract["repo"],
+        and replay_argv == expected_replay_argv
+        and replay_sample_rate in {"1", "1.0"}
+        and replay_command.get("schema_version") == 1
+        and replay_command.get("request_id") == product_request_id
+        and replay_command.get("entrypoint") == "run"
+        and replay_command.get("sanitized") is True
+        and replay_command.get("bundle_dir") == expected_bundle_dir
+        and replay_command.get("command") == producer_command(expected_replay_argv)
+        and request.get("replay_command") == replay_command.get("command")
+        and isinstance(engine_replay, dict)
+        and engine_replay.get("mode") == "bundle_offline"
+        and engine_replay.get("requires_http_server") is False
+        and engine_replay.get("argv") == expected_engine_argv
+        and engine_replay.get("command") == producer_command(expected_engine_argv),
         f"{check_id} request/model/backend closure differs",
     )
     if "--prompt" in argv:
         require(
-            request.get("prompt") == exact_flag_value(argv, "--prompt", check_id),
-            f"{check_id} request prompt differs from product command",
+            stdout["user"].get("content")
+            == exact_flag_value(argv, "--prompt", check_id),
+            f"{check_id} product prompt differs from stdout user event",
         )
     sampling_params = sampling.get("sampling_params")
     if isinstance(sampling_params, dict) and "max_tokens" in sampling_params:
@@ -2295,6 +2429,7 @@ def _validate_raw_execution_v2(
         "stdout": file_ref(product_run["stdout"]),
         "stderr": file_ref(product_run["stderr"]),
         "effective_config": file_ref(config_path),
+        "model_lock_validation": model_lock_validation,
         "hardware_receipt": hardware_run["receipt"],
         "hardware_stdout": file_ref(hardware_run["stdout"]),
         "hardware_stderr": file_ref(hardware_run["stderr"]),
@@ -4067,7 +4202,9 @@ def self_test() -> int:
         import request_replay_bundle_gate as replay_gate
 
         replay_gate.make_bundle(dump_root)
-        bundle_root = dump_root / "req-fixture"
+        fixture_bundle = dump_root / "req-fixture"
+        bundle_root = dump_root / product_request_id
+        fixture_bundle.rename(bundle_root)
         for json_path in bundle_root.glob("*.json"):
             body = read_json(json_path, f"self-test {json_path.name}")
             if "request_id" in body:
@@ -4079,18 +4216,69 @@ def self_test() -> int:
                         "backend": "actual",
                         "actual_model_smoke": True,
                         "sanitized": True,
-                        "model": model_contract["repo"],
-                        "prompt": "public fixture",
+                        "model": "/models/m1",
+                        "profile_detail": "full",
+                        "profile_sample_rate": 1.0,
+                        "l0_only": False,
                     }
                 )
             elif json_path.name == "backend_selection.json":
-                body.update({"backend": "actual", "model": model_contract["repo"]})
+                body.update(
+                    {
+                        "backend": "actual",
+                        "model": "/models/m1",
+                        "actual_model_smoke": True,
+                    }
+                )
             elif json_path.name == "sampling_params.json":
                 body["sampling_params"] = {"max_tokens": 4, "temperature": 0.0}
+            elif json_path.name == "runtime_effective_config.json":
+                body.update(
+                    {
+                        "entrypoint": "run",
+                        "profile_detail": "full",
+                        "profile_sample_rate": 1.0,
+                        "profile_jsonl": str(profile_path.resolve()),
+                        "memory_profile_jsonl": None,
+                        "scheduler_trace_jsonl": None,
+                        "request_dump_dir": str(dump_root.resolve()),
+                        "sanitized": True,
+                    }
+                )
             elif json_path.name == "replay.command.json":
-                body["argv"] = ["ferrum", "run", model_contract["repo"]]
-                body["command"] = f"ferrum run {model_contract['repo']}"
+                replay_argv = [
+                    "cargo", "run", "-p", "ferrum-cli", "--", "run",
+                    "synthetic/no-weight", "--profile-detail", "full",
+                    "--profile-sample-rate", "1", "--profile-jsonl",
+                    str(profile_path.resolve()), "--request-dump-dir",
+                    str(dump_root.resolve()),
+                ]
+                engine_argv = [
+                    "cargo", "run", "-p", "ferrum-cli", "--",
+                    "replay-bundle", str(bundle_root.resolve()), "--out",
+                    str((bundle_root / "engine_replay").resolve()), "--json",
+                ]
+                body.update(
+                    {
+                        "entrypoint": "run",
+                        "argv": replay_argv,
+                        "command": producer_command(replay_argv),
+                        "bundle_dir": str(bundle_root.resolve()),
+                        "sanitized": True,
+                        "engine_replay": {
+                            "mode": "bundle_offline",
+                            "requires_http_server": False,
+                            "argv": engine_argv,
+                            "command": producer_command(engine_argv),
+                        },
+                    }
+                )
             write_json(json_path, body)
+        request_body = read_json(bundle_root / "request.json", "self-test request")
+        request_body["replay_command"] = read_json(
+            bundle_root / "replay.command.json", "self-test replay"
+        )["command"]
+        write_json(bundle_root / "request.json", request_body)
 
         def directory_closure(root: Path) -> dict[str, Any]:
             rows = [
@@ -4133,6 +4321,7 @@ def self_test() -> int:
                         "event": "user",
                         "session_id": "session-selftest",
                         "request_id": product_request_id,
+                        "content": "public fixture",
                     },
                     {
                         "event": "assistant",
@@ -4167,9 +4356,9 @@ def self_test() -> int:
             "--output-format",
             "jsonl",
             "--semantic-source",
-            "/models/m1-semantic",
+            "/models/m1",
             "--tokenizer-source",
-            "/models/m1-semantic",
+            "/models/m1",
             "--profile-detail",
             "full",
             "--effective-config-json",
@@ -4298,7 +4487,7 @@ def self_test() -> int:
             },
             "model_identity": {
                 "model_argument": "/models/m1",
-                "semantic_argument": "/models/m1-semantic",
+                "semantic_argument": "/models/m1",
                 "repo": model_contract["repo"],
                 "revision": model_contract["revision"],
                 "model_files": model_contract["model_files"],
@@ -4306,6 +4495,18 @@ def self_test() -> int:
                 "lock": model_contract["lock"],
             },
         }
+        model_lock_validation = execution_root / "model-lock-validation.json"
+        write_json(
+            model_lock_validation,
+            {
+                "status": "pass",
+                "snapshot_path": "/models/m1",
+                "repo": model_contract["repo"],
+                "revision": model_contract["revision"],
+                "files": model_contract["unique_files"],
+            },
+        )
+        raw_v2["model_lock_validation"] = file_ref(model_lock_validation)
         raw_v2_path = execution_root / "raw-v2.json"
         write_json(raw_v2_path, raw_v2)
         derived_v2 = validate_raw_execution(
