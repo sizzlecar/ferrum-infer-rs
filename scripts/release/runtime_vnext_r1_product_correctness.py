@@ -102,6 +102,64 @@ class R1Error(RuntimeError):
     pass
 
 
+MAX_CUMULATIVE_R1_DEPTH = 128
+
+
+@dataclass
+class _VerificationContext:
+    r1_memo: dict[tuple[str, str, int, str], dict[str, Any]]
+    qualification_memo: dict[tuple[str, str, int, str], dict[str, Any]]
+    r1_meta: dict[tuple[str, str, int, str], dict[str, Any]]
+    reachability_memo: dict[tuple[str, str, int, str], dict[str, Any]]
+    active: set[tuple[str, str, int, str]]
+
+    def __init__(self) -> None:
+        self.r1_memo = {}
+        self.qualification_memo = {}
+        self.r1_meta = {}
+        self.reachability_memo = {}
+        self.active = set()
+
+
+def _coerce_verification_context(
+    value: Any | None,
+) -> _VerificationContext:
+    if value is None:
+        return _VerificationContext()
+    require(
+        isinstance(value, _VerificationContext),
+        "verification context type differs",
+    )
+    return value
+
+
+def _artifact_key(kind: str, path: Path) -> tuple[str, str, int, str]:
+    resolved = path.expanduser().resolve()
+    require(
+        resolved.is_file() and not resolved.is_symlink(),
+        f"{kind} artifact is missing: {resolved}",
+    )
+    return kind, str(resolved), resolved.stat().st_size, sha256(resolved)
+
+
+def _next_cumulative_meta(prior_meta: Any) -> dict[str, Any]:
+    require(isinstance(prior_meta, dict), "prior R1 verification metadata is missing")
+    depth_to_full = prior_meta.get("depth_to_full")
+    require(
+        isinstance(depth_to_full, int)
+        and not isinstance(depth_to_full, bool)
+        and 0 <= depth_to_full < MAX_CUMULATIVE_R1_DEPTH
+        and isinstance(prior_meta.get("full_anchor_key"), tuple)
+        and isinstance(prior_meta.get("full_anchor_path"), str),
+        "prior R1 cumulative depth/anchor is invalid",
+    )
+    return {
+        "depth_to_full": depth_to_full + 1,
+        "full_anchor_key": prior_meta["full_anchor_key"],
+        "full_anchor_path": prior_meta["full_anchor_path"],
+    }
+
+
 @dataclass(frozen=True)
 class MatrixLane:
     key: str
@@ -1411,14 +1469,33 @@ def require_full_prior_manifest_shape(manifest: dict[str, Any]) -> None:
     )
 
 
+def require_supported_prior_manifest_shape(manifest: dict[str, Any]) -> str:
+    dependencies = manifest.get("dependencies")
+    require(isinstance(dependencies, dict), "prior R1 dependencies are missing")
+    keys = set(dependencies)
+    require(
+        keys == FULL_DEPENDENCY_KEYS or keys == CUMULATIVE_DEPENDENCY_KEYS,
+        "prior R1 dependency shape is unsupported",
+    )
+    return "full" if keys == FULL_DEPENDENCY_KEYS else "cumulative"
+
+
 def cumulative_acceptance(
     prior: dict[str, Any], authority: dict[str, Any]
 ) -> dict[str, Any]:
     previous_binaries = prior.get("backend_binary_sha256")
+    evidence_binaries = prior.get(
+        "evidence_backend_binary_sha256", previous_binaries
+    )
     require(
         isinstance(previous_binaries, dict)
         and set(previous_binaries) == {"cuda", "metal"},
         "prior R1 backend binary authority is missing",
+    )
+    require(
+        isinstance(evidence_binaries, dict)
+        and set(evidence_binaries) == {"cuda", "metal"},
+        "prior R1 evidence binary authority is missing",
     )
     require(
         set(authority) == {"cuda", "metal"},
@@ -1426,13 +1503,10 @@ def cumulative_acceptance(
     )
     for backend in ("cuda", "metal"):
         require_sha(previous_binaries.get(backend), f"prior R1 {backend} binary")
+        require_sha(evidence_binaries.get(backend), f"R1 evidence {backend} binary")
         require_sha(authority.get(backend), f"qualified {backend} binary")
     accepted = copy.deepcopy(prior)
-    require(
-        "evidence_backend_binary_sha256" not in accepted,
-        "prior R1 is already cumulative",
-    )
-    accepted["evidence_backend_binary_sha256"] = copy.deepcopy(previous_binaries)
+    accepted["evidence_backend_binary_sha256"] = copy.deepcopy(evidence_binaries)
     accepted["backend_binary_sha256"] = copy.deepcopy(authority)
     return accepted
 
@@ -1492,49 +1566,58 @@ def validate_qualification_closure(
         isinstance(previous, dict) and set(previous) == {"cuda", "metal"},
         "prior R1 backend binary authority is missing",
     )
+    for backend in ("cuda", "metal"):
+        require_sha(previous.get(backend), f"prior R1 {backend} authority")
+        require_sha(authority.get(backend), f"qualified R1 {backend} authority")
+    profile_id = qualification.get("profile_id")
+    scopes = qualification.get("qualified_scopes")
     require(
-        authority.get("metal") == previous.get("metal"),
-        "unaffected Metal binary authority changed",
+        isinstance(profile_id, str)
+        and profile_id
+        and isinstance(scopes, list)
+        and scopes,
+        "change-impact qualification scope is missing",
     )
+    normalized_scopes: list[dict[str, str]] = []
+    for index, scope in enumerate(scopes):
+        require(
+            isinstance(scope, dict)
+            and set(scope) == {"backend", "entrypoint", "profile_detail"}
+            and scope.get("backend") in {"cuda", "metal"}
+            and scope.get("entrypoint") in {"run", "serve"}
+            and isinstance(scope.get("profile_detail"), str)
+            and scope.get("profile_detail") not in {"", "off"},
+            f"change-impact qualification scope[{index}] is invalid",
+        )
+        normalized_scopes.append(copy.deepcopy(scope))
     require(
-        qualification.get("profile_id")
-        == "vnext-reusable-startup-diagnostic-observability"
-        and qualification.get("qualified_scopes")
-        == [
-            {"backend": "cuda", "entrypoint": "run", "profile_detail": "full"},
-            {
-                "backend": "cuda",
-                "entrypoint": "serve",
-                "profile_detail": "verify",
-            },
-        ],
-        "change-impact qualification scope differs",
+        len({json_sha256(scope) for scope in normalized_scopes})
+        == len(normalized_scopes),
+        "change-impact qualification scope is duplicated",
     )
     expected_reused = expected_cumulative_reused_cells(prior)
     require(
         qualification.get("reused_cells") == expected_reused,
         "change-impact qualification did not preserve the complete R1 denominator",
     )
-    expected_revalidated = [
-        {
-            "cell_id": "cuda.run.profile_full",
-            "backend": "cuda",
-            "entrypoint": "run",
-            "profile_detail": "full",
-            "evidence": "diagnostic_observability",
-            "check_id": "cuda_run_profile_full",
-            "binary_sha256": authority.get("cuda"),
-        },
-        {
-            "cell_id": "cuda.serve.profile_verify",
-            "backend": "cuda",
-            "entrypoint": "serve",
-            "profile_detail": "verify",
-            "evidence": "diagnostic_observability",
-            "check_id": "cuda_serve_profile_verify",
-            "binary_sha256": authority.get("cuda"),
-        },
-    ]
+    expected_revalidated = []
+    affected_backends: set[str] = set()
+    for scope in normalized_scopes:
+        backend = scope["backend"]
+        entrypoint = scope["entrypoint"]
+        profile_detail = scope["profile_detail"]
+        affected_backends.add(backend)
+        expected_revalidated.append(
+            {
+                "cell_id": f"{backend}.{entrypoint}.profile_{profile_detail}",
+                "backend": backend,
+                "entrypoint": entrypoint,
+                "profile_detail": profile_detail,
+                "evidence": "diagnostic_observability",
+                "check_id": f"{backend}_{entrypoint}_profile_{profile_detail}",
+                "binary_sha256": authority[backend],
+            }
+        )
     require(
         qualification.get("revalidated_cells") == expected_revalidated,
         "change-impact qualification revalidated cell set differs",
@@ -1544,6 +1627,11 @@ def validate_qualification_closure(
         and qualification.get("open_invalidated_cells") == [],
         "change-impact qualification still has invalidated R1 cells",
     )
+    for backend in {"cuda", "metal"} - affected_backends:
+        require(
+            authority[backend] == previous[backend],
+            f"unqualified {backend} binary authority changed",
+        )
     return authority
 
 
@@ -1552,6 +1640,7 @@ def verify_impact_qualification(
     *,
     verify_checkout: bool,
     expected_source: dict[str, Any],
+    _verification_context: _VerificationContext | None = None,
 ) -> dict[str, Any]:
     try:
         import runtime_vnext_change_impact_qualification as impact_qualification
@@ -1562,6 +1651,7 @@ def verify_impact_qualification(
             path,
             verify_checkout=verify_checkout,
             expected_source=expected_source,
+            _verification_context=_verification_context,
         )
     except (OSError, RuntimeError, ValueError) as error:
         raise R1Error(f"change-impact qualification rejected: {error}") from error
@@ -1576,23 +1666,26 @@ def verify_impact_qualification(
 def validate_cumulative_inputs(
     paths: dict[str, Path], source: dict[str, Any]
 ) -> dict[str, Any]:
+    context = _VerificationContext()
     require(
         set(paths) == {"prior_r1", "impact_qualification"},
         "cumulative R1 input path set differs",
     )
     prior_path = paths["prior_r1"].expanduser().resolve()
     prior_manifest = read_json(prior_path, "prior R1 manifest")
-    require_full_prior_manifest_shape(prior_manifest)
+    require_supported_prior_manifest_shape(prior_manifest)
     prior_source = normalize_source(prior_manifest.get("source"), "prior R1")
     prior = verify_manifest(
         prior_path,
         verify_checkout=False,
         expected_source=prior_source,
+        _verification_context=context,
     )
     qualification = verify_impact_qualification(
         paths["impact_qualification"].expanduser().resolve(),
         verify_checkout=False,
         expected_source=source,
+        _verification_context=context,
     )
     require(
         qualification.get("source") == source,
@@ -1693,16 +1786,20 @@ def build(paths: dict[str, Path], out: Path) -> str:
 
 
 def validate_cumulative_dependencies(
-    dependencies: dict[str, Any], source: dict[str, Any]
-) -> dict[str, Any]:
+    dependencies: dict[str, Any],
+    source: dict[str, Any],
+    *,
+    _verification_context: _VerificationContext,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     prior_path = validate_ref(dependencies.get("prior_r1"), "prior R1 manifest")
     prior_manifest = read_json(prior_path, "prior R1 manifest")
-    require_full_prior_manifest_shape(prior_manifest)
+    require_supported_prior_manifest_shape(prior_manifest)
     prior_source = normalize_source(prior_manifest.get("source"), "prior R1")
     prior = verify_manifest(
         prior_path,
         verify_checkout=False,
         expected_source=prior_source,
+        _verification_context=_verification_context,
     )
     qualification_path = validate_ref(
         dependencies.get("impact_qualification"),
@@ -1712,6 +1809,7 @@ def validate_cumulative_dependencies(
         qualification_path,
         verify_checkout=False,
         expected_source=source,
+        _verification_context=_verification_context,
     )
     require(
         qualification.get("source") == source,
@@ -1730,7 +1828,11 @@ def validate_cumulative_dependencies(
         "change-impact qualification reference drifted",
     )
     authority = validate_qualification_closure(prior["acceptance"], qualification)
-    return cumulative_acceptance(prior["acceptance"], authority)
+    prior_key = _artifact_key("r1", prior_path)
+    prior_meta = _verification_context.r1_meta.get(prior_key)
+    return cumulative_acceptance(prior["acceptance"], authority), _next_cumulative_meta(
+        prior_meta
+    )
 
 
 def verify_manifest(
@@ -1738,10 +1840,13 @@ def verify_manifest(
     *,
     verify_checkout: bool = True,
     expected_source: dict[str, Any] | None = None,
+    _verification_context: _VerificationContext | None = None,
 ) -> dict[str, Any]:
     path = manifest_path.expanduser().resolve()
     root = path.parent
     manifest = read_json(path, "R1 manifest")
+    context = _coerce_verification_context(_verification_context)
+    artifact_key = _artifact_key("r1", path)
     required = {
         "schema_version",
         "artifact_type",
@@ -1779,19 +1884,42 @@ def verify_manifest(
         require(source == expected, "R1 aggregate source is stale")
     dependencies = manifest.get("dependencies")
     require(isinstance(dependencies, dict), "R1 dependencies are missing")
-    if set(dependencies) == CUMULATIVE_DEPENDENCY_KEYS:
-        accepted = validate_cumulative_dependencies(dependencies, source)
+    require(
+        artifact_key not in context.active,
+        "R1/qualification dependency cycle detected",
+    )
+    cached = context.r1_memo.get(artifact_key)
+    if cached is not None:
         require(
-            dependencies.get("acceptance") == accepted
-            and manifest.get("acceptance") == accepted,
-            "cumulative R1 acceptance summary drifted",
+            artifact_key in context.r1_meta,
+            "cached R1 verification metadata is missing",
         )
-        return {
-            "kind": "vnext-r1",
-            "child_manifest": {"path": str(path), "sha256": sha256(path)},
-            "source": source,
-            "acceptance": copy.deepcopy(accepted),
-        }
+        return copy.deepcopy(cached)
+    context.active.add(artifact_key)
+    if set(dependencies) == CUMULATIVE_DEPENDENCY_KEYS:
+        try:
+            accepted, meta = validate_cumulative_dependencies(
+                dependencies,
+                source,
+                _verification_context=context,
+            )
+            require(
+                dependencies.get("acceptance") == accepted
+                and manifest.get("acceptance") == accepted,
+                "cumulative R1 acceptance summary drifted",
+            )
+            summary = {
+                "kind": "vnext-r1",
+                "child_manifest": {"path": str(path), "sha256": sha256(path)},
+                "source": source,
+                "acceptance": copy.deepcopy(accepted),
+            }
+            context.r1_meta[artifact_key] = copy.deepcopy(meta)
+            context.r1_memo[artifact_key] = copy.deepcopy(summary)
+            return copy.deepcopy(summary)
+        finally:
+            context.active.remove(artifact_key)
+    context.active.remove(artifact_key)
     require(
         set(dependencies) == FULL_DEPENDENCY_KEYS,
         "R1 dependency set mismatch",
@@ -1882,12 +2010,19 @@ def verify_manifest(
         and manifest.get("acceptance") == accepted,
         "R1 acceptance summary drifted",
     )
-    return {
+    summary = {
         "kind": "vnext-r1",
         "child_manifest": {"path": str(path), "sha256": sha256(path)},
         "source": source,
         "acceptance": copy.deepcopy(accepted),
     }
+    context.r1_meta[artifact_key] = {
+        "depth_to_full": 0,
+        "full_anchor_key": artifact_key,
+        "full_anchor_path": str(path),
+    }
+    context.r1_memo[artifact_key] = copy.deepcopy(summary)
+    return copy.deepcopy(summary)
 
 
 def fixture_matrix(key: str, binary: str, hardware: str, root: Path) -> dict[str, Any]:
@@ -2117,6 +2252,18 @@ def self_test() -> int:
             and "evidence_backend_binary_sha256" not in accepted,
             "R1 cumulative acceptance did not preserve evidence and rebind authority",
         )
+        next_qualified_binaries = {
+            "cuda": "5" * 64,
+            "metal": qualified_binaries["metal"],
+        }
+        chained = cumulative_acceptance(cumulative, next_qualified_binaries)
+        require(
+            chained["evidence_backend_binary_sha256"]
+            == accepted["backend_binary_sha256"]
+            and chained["backend_binary_sha256"] == next_qualified_binaries
+            and chained["total_matrix_case_count"] == 1867,
+            "R1 cumulative chain did not preserve the full evidence anchor",
+        )
         expected_reused = expected_cumulative_reused_cells(accepted)
         qualification = {
             "profile_id": "vnext-reusable-startup-diagnostic-observability",
@@ -2161,6 +2308,27 @@ def self_test() -> int:
             == qualification["backend_binary_sha256"],
             "R1 cumulative qualification closure fixture differs",
         )
+        timing_qualification = copy.deepcopy(qualification)
+        timing_qualification["profile_id"] = "vnext-profile-timing-observability"
+        timing_qualification["qualified_scopes"] = [
+            {"backend": "cuda", "entrypoint": "run", "profile_detail": "full"}
+        ]
+        timing_qualification["revalidated_cells"] = [
+            {
+                "cell_id": "cuda.run.profile_full",
+                "backend": "cuda",
+                "entrypoint": "run",
+                "profile_detail": "full",
+                "evidence": "diagnostic_observability",
+                "check_id": "cuda_run_profile_full",
+                "binary_sha256": qualified_binaries["cuda"],
+            }
+        ]
+        require(
+            validate_qualification_closure(accepted, timing_qualification)
+            == timing_qualification["backend_binary_sha256"],
+            "R1 profile-timing qualification closure fixture differs",
+        )
         forged_reuse = copy.deepcopy(qualification)
         forged_reuse["reused_cells"].pop()
         expect_reject(
@@ -2176,15 +2344,48 @@ def self_test() -> int:
         require_full_prior_manifest_shape(
             {"dependencies": {key: {} for key in FULL_DEPENDENCY_KEYS}}
         )
+        require(
+            require_supported_prior_manifest_shape(
+                {"dependencies": {key: {} for key in FULL_DEPENDENCY_KEYS}}
+            )
+            == "full"
+            and require_supported_prior_manifest_shape(
+                {"dependencies": {key: {} for key in CUMULATIVE_DEPENDENCY_KEYS}}
+            )
+            == "cumulative",
+            "R1 supported prior dependency shapes differ",
+        )
         expect_reject(
             lambda: require_full_prior_manifest_shape(
                 {"dependencies": {key: {} for key in CUMULATIVE_DEPENDENCY_KEYS}}
             ),
             "cumulative bridge chained onto another cumulative R1",
         )
+        anchor_key = ("r1", "/fixture/full-r1.json", 1, "a" * 64)
+        depth_128 = _next_cumulative_meta(
+            {
+                "depth_to_full": MAX_CUMULATIVE_R1_DEPTH - 1,
+                "full_anchor_key": anchor_key,
+                "full_anchor_path": anchor_key[1],
+            }
+        )
+        require(
+            depth_128["depth_to_full"] == MAX_CUMULATIVE_R1_DEPTH,
+            "R1 cumulative depth boundary differs",
+        )
         expect_reject(
-            lambda: cumulative_acceptance(cumulative, qualified_binaries),
-            "cumulative acceptance chained twice",
+            lambda: _next_cumulative_meta(depth_128),
+            "129th cumulative R1 after a cached depth-128 chain",
+        )
+        expect_reject(
+            lambda: _coerce_verification_context({}),
+            "caller-supplied untyped verification cache",
+        )
+        shared_context = _coerce_verification_context(None)
+        shared_context.active.add(anchor_key)
+        require(
+            _coerce_verification_context(shared_context).active == {anchor_key},
+            "R1 and qualification do not share the dependency-cycle set",
         )
         missing_authority = copy.deepcopy(qualified_binaries)
         missing_authority.pop("metal")

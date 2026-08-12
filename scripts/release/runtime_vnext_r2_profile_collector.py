@@ -768,6 +768,32 @@ def merge_interval_length(intervals: Iterable[tuple[int, int]]) -> int:
     return sum(end - start for start, end in merged)
 
 
+def validate_device_interval_contract(
+    intervals: Sequence[tuple[int, int]], *, elapsed_ns: int, context: str
+) -> int:
+    """Validate the ordering and exact-duration contract emitted by Rust."""
+    require(intervals, f"{context} has no device subwork intervals")
+    accounted_ns = 0
+    previous_end: int | None = None
+    for index, (start, end) in enumerate(intervals):
+        require(
+            type(start) is int and type(end) is int and 0 <= start < end,
+            f"{context} device subwork interval {index} has invalid bounds",
+        )
+        require(
+            previous_end is None or previous_end <= start,
+            f"{context} device subwork intervals are not ordered and non-overlapping",
+        )
+        accounted_ns += end - start
+        previous_end = end
+    require(
+        accounted_ns == elapsed_ns,
+        f"{context} device subwork intervals account for {accounted_ns} ns, "
+        f"not elapsed {elapsed_ns} ns",
+    )
+    return accounted_ns
+
+
 def unavailable_stage_timing(
     *,
     reason: str,
@@ -1330,23 +1356,28 @@ def validate_identity_and_device_contract(
                 )
             )
             intervals = detail.get("device_intervals") if isinstance(detail, dict) else None
-            interval_length = 0
-            if isinstance(intervals, list):
-                local_intervals: list[tuple[int, int]] = []
-                for interval in intervals:
-                    require(isinstance(interval, dict), "CUDA device subwork interval is not an object")
-                    start = interval.get("start_offset_ns")
-                    end = interval.get("end_offset_ns")
-                    subwork_id = interval.get("subwork_id")
-                    require(
-                        type(start) is int and type(end) is int and 0 <= start < end <= elapsed,
-                        "CUDA device subwork interval is outside its measured command",
-                    )
-                    require(non_empty(subwork_id), "CUDA device subwork interval lacks kernel/native identity")
-                    kernel_ids.add(str(subwork_id))
-                    local_intervals.append((start, end))
-                interval_length = merge_interval_length(local_intervals)
-                require(interval_length <= elapsed, "CUDA device subwork intervals exceed elapsed time")
+            require(
+                isinstance(intervals, list),
+                "measured CUDA row lacks device subwork intervals",
+            )
+            local_intervals: list[tuple[int, int]] = []
+            for interval in intervals:
+                require(isinstance(interval, dict), "CUDA device subwork interval is not an object")
+                start = interval.get("start_offset_ns")
+                end = interval.get("end_offset_ns")
+                subwork_id = interval.get("subwork_id")
+                require(
+                    type(start) is int and type(end) is int and 0 <= start < end,
+                    "CUDA device subwork interval bounds are invalid",
+                )
+                require(non_empty(subwork_id), "CUDA device subwork interval lacks kernel/native identity")
+                kernel_ids.add(str(subwork_id))
+                local_intervals.append((start, end))
+            interval_length = validate_device_interval_contract(
+                local_intervals,
+                elapsed_ns=elapsed,
+                context="CUDA measured row",
+            )
             interval_device_ns += interval_length
             if has_native_mapping or interval_length > 0:
                 attributed_device_ns += elapsed
@@ -2178,8 +2209,8 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
         native["backend_detail"] = {
             "device_intervals": [
                 {
-                    "start_offset_ns": 0,
-                    "end_offset_ns": 850,
+                    "start_offset_ns": 100,
+                    "end_offset_ns": 1_000,
                     "subwork_id": "kernel.decode",
                 }
             ]
@@ -2196,6 +2227,45 @@ def run_selftest() -> int:
         backend="cuda", basic_events=cuda[0], replay_events=cuda[1], full_events=cuda[2]
     )
     require(cuda_result["status"] == "pass", "positive CUDA fixture did not pass")
+    incomplete_device_interval = json.loads(json.dumps(cuda))
+    incomplete_device_interval[2][-2]["backend_detail"]["device_intervals"][0][
+        "end_offset_ns"
+    ] = 101
+    try:
+        validate_identity_and_device_contract(
+            backend="cuda",
+            basic_events=incomplete_device_interval[0],
+            replay_events=incomplete_device_interval[1],
+            full_events=incomplete_device_interval[2],
+        )
+    except CollectorError:
+        incomplete_device_interval_rejected = True
+    else:
+        incomplete_device_interval_rejected = False
+    overlapping_device_intervals = json.loads(json.dumps(cuda))
+    overlapping_device_intervals[2][-2]["backend_detail"]["device_intervals"] = [
+        {
+            "start_offset_ns": 100,
+            "end_offset_ns": 550,
+            "subwork_id": "kernel.decode.first",
+        },
+        {
+            "start_offset_ns": 500,
+            "end_offset_ns": 950,
+            "subwork_id": "kernel.decode.second",
+        },
+    ]
+    try:
+        validate_identity_and_device_contract(
+            backend="cuda",
+            basic_events=overlapping_device_intervals[0],
+            replay_events=overlapping_device_intervals[1],
+            full_events=overlapping_device_intervals[2],
+        )
+    except CollectorError:
+        overlapping_device_intervals_rejected = True
+    else:
+        overlapping_device_intervals_rejected = False
     baseline_stage = calculate_stage_coverage(cuda[2])
     require(
         baseline_stage["formal_coverage_eligible"] is True
@@ -2340,6 +2410,11 @@ def run_selftest() -> int:
         and target_duplicate_rejected
         and missing_clock_rejected,
         "negative fixtures did not reject",
+    )
+    require(
+        incomplete_device_interval_rejected
+        and overlapping_device_intervals_rejected,
+        "invalid device interval contract unexpectedly passed",
     )
     require(
         missing_execution_stage_rejected

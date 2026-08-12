@@ -511,6 +511,58 @@ def default_r1_verifier(path: Path) -> dict[str, Any]:
         raise R2Error(f"R1 child provenance failed: {error}") from error
 
 
+def trace_r1_full_anchor(
+    child_path: Path,
+    child_manifest: dict[str, Any],
+    r1_module: Any,
+    *,
+    reference_validator: Callable[[Any, str], Path] = validate_ref,
+    manifest_reader: Callable[[Path, str], dict[str, Any]] = read_json,
+) -> tuple[Path, dict[str, Any]]:
+    """Follow authenticated cumulative R1 links to their final full aggregate."""
+    current_path = child_path.expanduser().resolve()
+    current_manifest = child_manifest
+    visited: set[Path] = set()
+    depth = 0
+    while True:
+        require(current_path not in visited, "cumulative R1 dependency cycle detected")
+        visited.add(current_path)
+        dependencies = current_manifest.get("dependencies")
+        require(isinstance(dependencies, dict), "R1 child dependencies are missing")
+        dependency_keys = set(dependencies)
+        require(
+            dependency_keys == r1_module.FULL_DEPENDENCY_KEYS
+            or dependency_keys == r1_module.CUMULATIVE_DEPENDENCY_KEYS,
+            "R1 child dependency shape differs",
+        )
+        if dependency_keys == r1_module.FULL_DEPENDENCY_KEYS:
+            try:
+                r1_module.require_full_prior_manifest_shape(current_manifest)
+            except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+                raise R2Error(f"final R1 full anchor shape failed: {error}") from error
+            return current_path, current_manifest
+
+        depth += 1
+        require(depth <= 128, "cumulative R1 dependency depth exceeds 128")
+        # Authenticate every edge, including qualifications that are consumed by
+        # the canonical recursive verifier, before allowing it to recurse.  This
+        # makes cycles and malformed chains fail closed instead of risking an
+        # unbounded verifier recursion.
+        reference_validator(
+            dependencies.get("impact_qualification"),
+            f"cumulative R1 depth {depth} impact qualification",
+        )
+        prior_path = reference_validator(
+            dependencies.get("prior_r1"),
+            f"cumulative R1 depth {depth} prior manifest",
+        ).expanduser().resolve()
+        require(prior_path not in visited, "cumulative R1 dependency cycle detected")
+        current_path = prior_path
+        current_manifest = manifest_reader(
+            current_path, f"cumulative R1 depth {depth} prior manifest"
+        )
+
+
 def validate_cumulative_profile_off_evidence(
     child_path: Path,
     child_manifest: dict[str, Any],
@@ -533,8 +585,13 @@ def validate_cumulative_profile_off_evidence(
         )
         return None
 
+    anchor_path, anchor_manifest = trace_r1_full_anchor(
+        child_path, child_manifest, r1_module
+    )
+
     # The cumulative exception is available only after the canonical R1 verifier
-    # has recursively revalidated the qualification and its prior full R1.
+    # has recursively revalidated every qualification and prior R1 in the safe,
+    # structurally authenticated chain above.
     try:
         deep_summary = r1_module.verify_manifest(
             child_path,
@@ -545,49 +602,56 @@ def validate_cumulative_profile_off_evidence(
         raise R2Error(f"cumulative R1 deep provenance failed: {error}") from error
     require(deep_summary == summary, "cumulative R1 deep summary differs")
 
-    prior_path = validate_ref(dependencies.get("prior_r1"), "prior full R1")
-    prior_manifest = read_json(prior_path, "prior full R1")
+    anchor_source = normalize_source(anchor_manifest.get("source"), "final full R1")
     try:
-        r1_module.require_full_prior_manifest_shape(prior_manifest)
+        anchor_summary = r1_module.verify_manifest(
+            anchor_path,
+            verify_checkout=False,
+            expected_source=anchor_source,
+        )
     except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
-        raise R2Error(f"prior R1 is not a deeply verified full aggregate: {error}") from error
-    prior_source = normalize_source(prior_manifest.get("source"), "prior full R1")
-    prior_acceptance = prior_manifest.get("acceptance")
-    require(isinstance(prior_acceptance, dict), "prior full R1 acceptance is missing")
-    prior_binaries = prior_acceptance.get("backend_binary_sha256")
-    evidence_binaries = acceptance.get("evidence_backend_binary_sha256")
-    prior_hardware = prior_acceptance.get("backend_hardware_id")
+        raise R2Error(f"final full R1 canonical verification failed: {error}") from error
     require(
-        isinstance(prior_binaries, dict)
-        and set(prior_binaries) == set(BACKENDS)
-        and all(SHA256_RE.fullmatch(str(value)) for value in prior_binaries.values())
-        and evidence_binaries == prior_binaries,
-        "cumulative R1 evidence binary authority differs from prior full R1",
+        isinstance(anchor_summary, dict)
+        and anchor_summary.get("kind") == "vnext-r1"
+        and anchor_summary.get("source") == anchor_source,
+        "final full R1 canonical summary differs",
+    )
+    anchor_acceptance = anchor_summary.get("acceptance")
+    require(isinstance(anchor_acceptance, dict), "final full R1 acceptance is missing")
+    anchor_binaries = anchor_acceptance.get("backend_binary_sha256")
+    evidence_binaries = acceptance.get("evidence_backend_binary_sha256")
+    anchor_hardware = anchor_acceptance.get("backend_hardware_id")
+    require(
+        isinstance(anchor_binaries, dict)
+        and set(anchor_binaries) == set(BACKENDS)
+        and all(SHA256_RE.fullmatch(str(value)) for value in anchor_binaries.values())
+        and evidence_binaries == anchor_binaries,
+        "cumulative R1 evidence binary authority differs from final full R1",
     )
     require(
-        isinstance(prior_hardware, dict)
-        and set(prior_hardware) == set(BACKENDS)
-        and acceptance.get("backend_hardware_id") == prior_hardware,
-        "cumulative R1 hardware authority differs from prior full R1",
+        isinstance(anchor_hardware, dict)
+        and set(anchor_hardware) == set(BACKENDS)
+        and acceptance.get("backend_hardware_id") == anchor_hardware,
+        "cumulative R1 hardware authority differs from final full R1",
     )
     qualification_path = validate_ref(
         dependencies.get("impact_qualification"),
         "cumulative R1 impact qualification",
     )
-    prior_ref = file_ref(prior_path)
+    anchor_ref = file_ref(anchor_path)
     qualification_ref = file_ref(qualification_path)
     require(
-        prior_ref == dependencies["prior_r1"]
-        and qualification_ref == dependencies["impact_qualification"],
+        qualification_ref == dependencies["impact_qualification"],
         "cumulative R1 dependency reference drifted",
     )
     return {
         "mode": "cumulative-r1-prior-full-profile-off",
-        "source": prior_source,
-        "r1_child_manifest": prior_ref,
+        "source": anchor_source,
+        "r1_child_manifest": anchor_ref,
         "impact_qualification": qualification_ref,
         "backend_binary_sha256": copy.deepcopy(evidence_binaries),
-        "backend_hardware_id": copy.deepcopy(prior_hardware),
+        "backend_hardware_id": copy.deepcopy(anchor_hardware),
     }
 
 
@@ -4738,6 +4802,208 @@ def self_test() -> None:
             "cuda",
         ),
         "profile-off evidence without cumulative R1",
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="ferrum-r2-cumulative-chain-selftest-"
+    ) as chain_temp:
+        chain_root = Path(chain_temp).resolve()
+        anchor_source = copy.deepcopy(prior_source)
+        middle_source = {
+            "git_sha": "8" * 40,
+            "git_tree_sha": "9" * 40,
+            "dirty": False,
+        }
+        anchor_acceptance = {
+            "backend_binary_sha256": copy.deepcopy(evidence_binaries),
+            "backend_hardware_id": copy.deepcopy(hardware),
+        }
+        middle_acceptance = {
+            **copy.deepcopy(anchor_acceptance),
+            "backend_binary_sha256": {"cuda": "a" * 64, "metal": "b" * 64},
+            "evidence_backend_binary_sha256": copy.deepcopy(evidence_binaries),
+        }
+        head_acceptance = {
+            **copy.deepcopy(middle_acceptance),
+            "backend_binary_sha256": copy.deepcopy(binaries),
+        }
+        anchor_path = chain_root / "full.json"
+        qualification_one = chain_root / "qualification-1.json"
+        qualification_two = chain_root / "qualification-2.json"
+        write_json(qualification_one, {}, exclusive=True)
+        write_json(qualification_two, {}, exclusive=True)
+        write_json(
+            anchor_path,
+            {
+                "source": anchor_source,
+                "dependencies": {
+                    key: {} for key in ("r0", "matrices", "llama_dense", "acceptance")
+                },
+                "acceptance": anchor_acceptance,
+            },
+            exclusive=True,
+        )
+        middle_path = chain_root / "middle.json"
+        write_json(
+            middle_path,
+            {
+                "source": middle_source,
+                "dependencies": {
+                    "prior_r1": file_ref(anchor_path),
+                    "impact_qualification": file_ref(qualification_one),
+                    "acceptance": middle_acceptance,
+                },
+                "acceptance": middle_acceptance,
+            },
+            exclusive=True,
+        )
+        head_path = chain_root / "head.json"
+        head_manifest = {
+            "source": source,
+            "dependencies": {
+                "prior_r1": file_ref(middle_path),
+                "impact_qualification": file_ref(qualification_two),
+                "acceptance": head_acceptance,
+            },
+            "acceptance": head_acceptance,
+        }
+        write_json(head_path, head_manifest, exclusive=True)
+
+        class FixtureR1Module:
+            FULL_DEPENDENCY_KEYS = {
+                "r0",
+                "matrices",
+                "llama_dense",
+                "acceptance",
+            }
+            CUMULATIVE_DEPENDENCY_KEYS = {
+                "prior_r1",
+                "impact_qualification",
+                "acceptance",
+            }
+
+            def __init__(self) -> None:
+                self.calls: list[Path] = []
+
+            @staticmethod
+            def require_full_prior_manifest_shape(manifest: dict[str, Any]) -> None:
+                require(
+                    set(manifest.get("dependencies", {}))
+                    == FixtureR1Module.FULL_DEPENDENCY_KEYS,
+                    "fixture full R1 shape differs",
+                )
+
+            def verify_manifest(
+                self,
+                path: Path,
+                *,
+                verify_checkout: bool,
+                expected_source: dict[str, Any],
+            ) -> dict[str, Any]:
+                del verify_checkout
+                resolved = path.expanduser().resolve()
+                self.calls.append(resolved)
+                manifest = read_json(resolved, "fixture R1")
+                require(
+                    manifest.get("source") == expected_source,
+                    "fixture R1 source differs",
+                )
+                dependencies = manifest.get("dependencies")
+                if set(dependencies) == self.CUMULATIVE_DEPENDENCY_KEYS:
+                    prior = validate_ref(dependencies["prior_r1"], "fixture prior R1")
+                    prior_manifest = read_json(prior, "fixture prior R1")
+                    self.verify_manifest(
+                        prior,
+                        verify_checkout=False,
+                        expected_source=prior_manifest["source"],
+                    )
+                return {
+                    "kind": "vnext-r1",
+                    "source": copy.deepcopy(manifest["source"]),
+                    "acceptance": copy.deepcopy(manifest["acceptance"]),
+                }
+
+        fixture_r1 = FixtureR1Module()
+        head_summary = fixture_r1.verify_manifest(
+            head_path, verify_checkout=False, expected_source=source
+        )
+        fixture_r1.calls.clear()
+        chained_evidence = validate_cumulative_profile_off_evidence(
+            head_path,
+            head_manifest,
+            head_summary,
+            fixture_r1,
+        )
+        require(
+            chained_evidence is not None
+            and chained_evidence["source"] == anchor_source
+            and chained_evidence["r1_child_manifest"] == file_ref(anchor_path)
+            and chained_evidence["backend_binary_sha256"] == evidence_binaries
+            and fixture_r1.calls.count(anchor_path) == 2,
+            "cumulative-on-cumulative R1 did not bind the final full anchor",
+        )
+
+        forged_acceptance = copy.deepcopy(head_acceptance)
+        forged_acceptance["evidence_backend_binary_sha256"]["cuda"] = "f" * 64
+        forged_manifest = copy.deepcopy(head_manifest)
+        forged_manifest["acceptance"] = forged_acceptance
+        forged_manifest["dependencies"]["acceptance"] = forged_acceptance
+        write_json(head_path, forged_manifest)
+        forged_summary = fixture_r1.verify_manifest(
+            head_path, verify_checkout=False, expected_source=source
+        )
+        expect_reject(
+            lambda: validate_cumulative_profile_off_evidence(
+                head_path,
+                forged_manifest,
+                forged_summary,
+                fixture_r1,
+            ),
+            "cumulative chain forged final evidence authority",
+        )
+
+    cycle_a = Path("/fixture/cycle-a.json")
+    cycle_b = Path("/fixture/cycle-b.json")
+    cycle_manifests = {
+        cycle_a: {
+            "dependencies": {
+                "prior_r1": {"path": str(cycle_b)},
+                "impact_qualification": {"path": "/fixture/q-a.json"},
+                "acceptance": {},
+            }
+        },
+        cycle_b: {
+            "dependencies": {
+                "prior_r1": {"path": str(cycle_a)},
+                "impact_qualification": {"path": "/fixture/q-b.json"},
+                "acceptance": {},
+            }
+        },
+    }
+
+    def fixture_reference(value: Any, _: str) -> Path:
+        require(isinstance(value, dict) and isinstance(value.get("path"), str), "fixture reference differs")
+        return Path(value["path"])
+
+    expect_reject(
+        lambda: trace_r1_full_anchor(
+            cycle_a,
+            cycle_manifests[cycle_a],
+            FixtureR1Module(),
+            reference_validator=fixture_reference,
+            manifest_reader=lambda path, _: cycle_manifests[path],
+        ),
+        "cumulative R1 dependency cycle",
+    )
+    expect_reject(
+        lambda: trace_r1_full_anchor(
+            Path("/fixture/bad-shape.json"),
+            {"dependencies": {"prior_r1": {}}},
+            FixtureR1Module(),
+            reference_validator=fixture_reference,
+            manifest_reader=lambda path, _: cycle_manifests[path],
+        ),
+        "cumulative R1 unsupported dependency shape",
     )
 
     with tempfile.TemporaryDirectory(prefix="ferrum-r2-selftest-") as raw_temp:
