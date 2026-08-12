@@ -10254,6 +10254,25 @@ mod tests {
                 false,
             ));
         }
+        for timing_mode in [
+            DeviceTimingMode::Off,
+            DeviceTimingMode::Completion,
+            DeviceTimingMode::Replay,
+        ] {
+            assert_eq!(
+                reusable_program_identity_required(
+                    true,
+                    true,
+                    timing_mode.direct_reusable_execution_allowed(),
+                    false,
+                ),
+                reusable_catalog_lookup_allowed(
+                    true,
+                    timing_mode.direct_reusable_execution_allowed(),
+                    false,
+                ),
+            );
+        }
         assert!(reusable_program_identity_required(true, false, false, true));
         assert!(!reusable_program_identity_required(
             false, false, true, false

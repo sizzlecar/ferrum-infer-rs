@@ -11,6 +11,10 @@
   provider conformance 和 `production_legacy_selection_count=0` 均不删减。
 - legacy baseline 的冻结 703/702/783/782 分母不变。本修订只作用于
   `g08-model-matrix-v1` candidate contract。
+- 首次取得 R1 PASS 后，后续阶段修复采用累积证据和预定义影响范围回归；本文件中任何旧的
+  source-SHA freshness 表述不得解释为“修改产品代码后从 R0 或完整 R1 重新开始”。具体计算规则以
+  [`CHANGE_IMPACT_REGRESSION_PLAN_2026-08-12.md`](CHANGE_IMPACT_REGRESSION_PLAN_2026-08-12.md)
+  为准。
 
 ## 决策
 
@@ -96,51 +100,40 @@ reasoning 模式错误或 history 不一致仍必须 REJECT。
 ## 失败后的执行策略
 
 1. 首次失败只运行 exact case reproducer。
-2. exact case 通过后运行 affected scenario 和同架构 sentinel。
-3. 只有达到新的 R1 milestone 才重新运行该 lane 的 112/111/120/119 矩阵。
-4. 不因单 case 失败重启 M1 的 703/702 或其他 backend 的完整 lane。
-5. release candidate staged binary 复验使用同一 R1 分层矩阵，不恢复旧的跨模型重复分母。
+2. 在修复代码落地、任何回归命令启动前，由 validator 按版本化的通用 change-impact 规则计算
+   affected case closure；输出必须列出 diff、规则 ID、受影响 case/lane/入口/后端/架构/模式和因果边。
+3. exact case 通过后，只执行 closure 中尚未由当前修复验证的 affected scenario 和 architecture
+   sentinel。只有调用链确实跨入口、后端、架构或阶段 contract，才扩大到该相邻范围。
+4. closure 内所有规定 case PASS 后，该 failure class 关闭，原阶段资格恢复，并从已累积的下一阶段
+   进度继续；不得退回 R0，也不得重启 M1 的 703/702、M2/M3 的 112/111/120/119 或其他完整 lane。
+5. 首次取得 R1 PASS 仍要求本修订定义的完整 `1867` case 矩阵，且 R1 PASS 前不得进入 R2；本条不把
+   后续阶段修复变成第二次完整 R1。
+6. release candidate staged binary 复验仍使用目标要求的 R3 完整矩阵和 exact staged bytes，不恢复旧的
+   跨模型重复分母，也不得用开发期 focused regression 缩减 R3。
 
 ## 证据复用边界
 
-M1 已通过工件只有在记录 SHA 是当前 SHA 的祖先，且中间变化严格限于本修订的文档与 R1
-矩阵控制面文件时才可复用。任何 `crates/`、Cargo、模型锁、运行配置、产品场景 manifest 或生产
-实现变化都会使工件 stale。M2/M3 工件原则上必须与当前 source 完全一致；唯一的祖先复用例外
-是 diff 严格限于不参与 matrix 执行的 R1 控制面：`scripts/release/run_scenarios.py`、本修订文档、
-`scripts/release/runtime_vnext_r1_product_correctness.py`，以及只记录 reviewed source SHA 的
-`scripts/release/configs/runtime_vnext_g08a_source_contract.json`。该例外不覆盖任何 `crates/`、Cargo、
-模型锁、运行配置、matrix runner、matrix scenario manifest 或生产实现变化，也不免除 Llama 自身
-在当前 source 上重跑完整 `run`/`serve`/stream 三用例。validator 必须有正例接受上述因果隔离 diff，
-并有反例拒绝任一产品源码 diff。
+正式证据是按 case 和 contract domain 累积的，不按“当前 source SHA 是否等于 artifact SHA”整体
+失效。首次 R1 PASS 后发生代码变化时，validator 必须计算从 baseline 到 current source 的实际 diff
+到 case 的传递影响闭包：
 
-`scripts/release/runtime_vnext_g08a_same_history_collector.py` 的 bounded worker containment 只参与
-G08A numerics，不参与 S2 或 R1 模型矩阵执行。R0 可跨该文件的单独 containment 变化消费内部所有
-child 仍严格同 SHA 的 S2 聚合证据，但不得因此复用旧 numerics；R1 模型矩阵可跨该 exact 文件及
-R0/R1 aggregator 的因果隔离变化。该例外不扩展为目录或相邻文件白名单，Llama 三用例仍必须在
-最终 source SHA 上重跑。
+- 闭包之外的历史 PASS case 保持有效，即使其 artifact 绑定的是当前 SHA 的祖先；聚合器必须保留其
+  原始 source/binary identity，不能伪装成当前 SHA 的新执行。
+- 闭包之内的历史 case 暂停用于当前阶段资格，必须在修复后的 source/binary 上按规定范围重跑；全部
+  PASS 后恢复资格。若 closure 同时触及 R0 contract，只重验受影响的 R0 gate；若未触及，不得退回 R0。
+- 影响面由机器可执行、版本化、可复用的语义规则计算，不能依赖某个 commit、SHA、blob 转换、日期、
+  一次性 bridge 或人工写出的 reviewed-diff 白名单。人工说明可以补充因果理由，不能缩小 validator
+  计算出的集合，也不能作为 waiver。
+- 无法分类的 diff 必须 fail closed，并先补充通用映射规则及其正反 self-test；fail closed 的含义是
+  阻止阶段继续，不是默认要求从零执行全部 R0/R1。规则补齐后由 validator 重新计算精确 closure。
+- validator 必须拒绝漏掉真实 consumer 的映射，并证明：backend-local 不污染另一 backend，
+  profile-only 不污染 profile-off/default correctness，无关模型/入口保持可复用，shared contract 则
+  只扩展到实际消费者。
+- `known-fail`、`blocked`、skip、waiver、error 和 unexpected 仍必须为 `0`；累积复用不是降低 case
+  oracle，也不是把旧 failure 提升为 PASS。
 
-### 2026-08-12 一次性 G02 roster bridge
-
-从 clean source `05a5d2f8611ed3a3fedb5c69ff3ba11e533bc4c7` 到其紧接的 G02 roster
-修复 checkpoint，只允许以下五个文件出现在 source diff 中：
-
-- `scripts/release/runtime_vnext_g02_core.py`
-- `scripts/release/runtime_vnext_s2_cuda_product_contract.py`
-- `scripts/release/runtime_vnext_r0_core_closure.py`
-- `scripts/release/runtime_vnext_r1_product_correctness.py`
-- `docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md`
-
-其中 G02 文件必须是 Git blob
-`38b832c95ecee833240a1477678fb5ce350f52fb` 到
-`fa369a3ee52535ead59aefb4b3f675844feb09b8` 的精确转换：只补登记已经由
-`c1faf845f821d60c8aab01542eaa58f6bf9d5900` 加入的
-`legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable` 测试，并增加该 12-test
-精确 roster 的 self-test。其余三个 Python 文件只可实现和验证这次两域 source closure；本段文档
-只记录该闭包。任一额外路径、不同 G02 blob、`crates/`、Cargo、model lock、runtime config、
-产品场景 manifest、matrix runner 或生产实现变化都必须使 bridge fail closed，不得按文件名前缀或
-相邻目录扩展白名单。
-
-该 bridge 允许重新执行当前 source 的 G02 L0/L1，并让新的 S2、R0、R1 aggregate 对仍绑定
-`05a5d2f8` 的未变产品 raw evidence 和已完成 matrix evidence 做深度重验；它不把旧 G02 failure
-提升为 PASS，也不免除 G02、S2 和 R0 在当前 source 重新打印正式 PASS。Llama CUDA/Metal
-`run`、`serve`、stream 三用例仍必须严格在最终 current source SHA 上重新执行，不能消费该 bridge。
+任何旧的一次性 G02 roster bridge、特定文件 allowlist 或 exact blob 例外均由上述通用机制取代，
+不得继续作为后续改动的验收依据。为深度认证首次完整 R1 的原始历史 artifact，validator 仍可按该
+artifact 当时记录的 sealed bridge 重建其原始 provenance；这种历史重验只证明 baseline 本身未被
+篡改，不能缩小 baseline 到 current 的影响闭包。最终 R3 仍必须对 exact staged bytes 执行 active amendments
+规定的完整复验；祖先 source 的累积证据不能替代该最终 binary-level 签字。

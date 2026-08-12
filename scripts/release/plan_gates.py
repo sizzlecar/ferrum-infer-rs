@@ -7,6 +7,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -121,7 +122,7 @@ def normalize_changed_files(files: list[str]) -> list[str]:
     return sorted(out)
 
 
-def load_rules(path: Path) -> list[dict[str, Any]]:
+def load_rule_config(path: Path) -> dict[str, Any]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if data.get("schema_version") != 1:
         raise PlannerError(f"{path}: schema_version must be 1")
@@ -146,6 +147,98 @@ def load_rules(path: Path) -> list[dict[str, Any]]:
     }
     if not available_scenarios:
         raise PlannerError(f"{PRODUCT_SCENARIOS}: scenarios must be a non-empty list")
+    profiles = data.get("qualification_profiles", {})
+    if not isinstance(profiles, dict):
+        raise PlannerError(f"{path}: qualification_profiles must be an object")
+    for profile_id, profile in profiles.items():
+        if not isinstance(profile_id, str) or not profile_id:
+            raise PlannerError(f"{path}: qualification profile ids must be non-empty strings")
+        if not isinstance(profile, dict):
+            raise PlannerError(f"{path}: qualification_profiles.{profile_id} must be an object")
+        for key in ("domains", "qualified_scopes", "required_checks"):
+            values = profile.get(key)
+            if not isinstance(values, list) or not values:
+                raise PlannerError(
+                    f"{path}: qualification_profiles.{profile_id}.{key} must be a non-empty list"
+                )
+        if not all(isinstance(item, str) and item for item in profile["domains"]):
+            raise PlannerError(
+                f"{path}: qualification_profiles.{profile_id}.domains must contain non-empty strings"
+            )
+        if not all(isinstance(item, str) and item for item in profile["required_checks"]):
+            raise PlannerError(
+                f"{path}: qualification_profiles.{profile_id}.required_checks must contain non-empty strings"
+            )
+        for scope_index, scope in enumerate(profile["qualified_scopes"]):
+            if not isinstance(scope, dict):
+                raise PlannerError(
+                    f"{path}: qualification_profiles.{profile_id}.qualified_scopes[{scope_index}] "
+                    "must be an object"
+                )
+            for key in ("backend", "entrypoint", "profile_detail"):
+                if not isinstance(scope.get(key), str) or not scope[key]:
+                    raise PlannerError(
+                        f"{path}: qualification_profiles.{profile_id}.qualified_scopes"
+                        f"[{scope_index}].{key} must be a non-empty string"
+                    )
+        selector = profile.get("selector")
+        if not isinstance(selector, dict) or selector.get("kind") != "structured_rewrites":
+            raise PlannerError(
+                f"{path}: qualification_profiles.{profile_id}.selector.kind must be structured_rewrites"
+            )
+        if not isinstance(selector.get("allow_test_changes", False), bool):
+            raise PlannerError(
+                f"{path}: qualification_profiles.{profile_id}.selector.allow_test_changes "
+                "must be boolean"
+            )
+        selector_files = selector.get("files")
+        if not isinstance(selector_files, list) or not selector_files:
+            raise PlannerError(
+                f"{path}: qualification_profiles.{profile_id}.selector.files must be a non-empty list"
+            )
+        for file_index, file_selector in enumerate(selector_files):
+            if not isinstance(file_selector, dict):
+                raise PlannerError(
+                    f"{path}: qualification_profiles.{profile_id}.selector.files[{file_index}] "
+                    "must be an object"
+                )
+            selected_path = file_selector.get("path")
+            rewrites = file_selector.get("rewrites")
+            if not isinstance(selected_path, str) or not selected_path:
+                raise PlannerError(
+                    f"{path}: qualification_profiles.{profile_id}.selector.files"
+                    f"[{file_index}].path must be a non-empty string"
+                )
+            if not isinstance(rewrites, list) or not rewrites:
+                raise PlannerError(
+                    f"{path}: qualification_profiles.{profile_id}.selector.files"
+                    f"[{file_index}].rewrites must be a non-empty list"
+                )
+            rewrite_ids: set[str] = set()
+            for rewrite_index, rewrite in enumerate(rewrites):
+                if not isinstance(rewrite, dict):
+                    raise PlannerError(
+                        f"{path}: qualification_profiles.{profile_id}.selector.files"
+                        f"[{file_index}].rewrites[{rewrite_index}] must be an object"
+                    )
+                for key in ("id", "before", "after"):
+                    if not isinstance(rewrite.get(key), str) or not rewrite[key]:
+                        raise PlannerError(
+                            f"{path}: qualification_profiles.{profile_id}.selector.files"
+                            f"[{file_index}].rewrites[{rewrite_index}].{key} must be a non-empty string"
+                        )
+                rewrite_id = str(rewrite["id"])
+                if rewrite_id in rewrite_ids:
+                    raise PlannerError(
+                        f"{path}: qualification_profiles.{profile_id}.selector.files"
+                        f"[{file_index}].rewrites contains duplicate id {rewrite_id!r}"
+                    )
+                rewrite_ids.add(rewrite_id)
+                if rewrite["before"] == rewrite["after"]:
+                    raise PlannerError(
+                        f"{path}: qualification_profiles.{profile_id}.selector.files"
+                        f"[{file_index}].rewrites[{rewrite_index}] must change its snippet"
+                    )
     for idx, rule in enumerate(rules):
         if not isinstance(rule, dict):
             raise PlannerError(f"{path}: rules[{idx}] must be an object")
@@ -170,7 +263,207 @@ def load_rules(path: Path) -> list[dict[str, Any]]:
             )
         if not isinstance(rule["exceptions"], list):
             raise PlannerError(f"{path}: rules[{idx}].exceptions must be a list")
-    return rules
+        profile_refs = rule.get("qualification_profiles", [])
+        if not isinstance(profile_refs, list) or not all(
+            isinstance(item, str) and item for item in profile_refs
+        ):
+            raise PlannerError(f"{path}: rules[{idx}].qualification_profiles must be a string list")
+        unknown_profiles = sorted(set(profile_refs) - set(profiles))
+        if unknown_profiles:
+            raise PlannerError(
+                f"{path}: rules[{idx}].qualification_profiles references unknown profiles: "
+                f"{unknown_profiles}"
+            )
+    return {"rules": rules, "qualification_profiles": profiles}
+
+
+def load_rules(path: Path) -> list[dict[str, Any]]:
+    """Compatibility helper for callers that only need broad path rules."""
+
+    return load_rule_config(path)["rules"]
+
+
+def git_file_text(revision: str, path: str) -> str | None:
+    proc = subprocess.run(
+        ["git", "show", f"{revision}:{path}"],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def git_file_versions(base: str, head: str, changed_files: list[str]) -> dict[str, dict[str, str]]:
+    versions: dict[str, dict[str, str]] = {}
+    for path in changed_files:
+        before = git_file_text(base, path)
+        after = git_file_text(head, path)
+        if before is not None and after is not None:
+            versions[path] = {"before": before, "after": after}
+    return versions
+
+
+def rust_block_end(text: str, opening_brace: int) -> int | None:
+    """Return the end of a Rust block, conservatively ignoring comments and strings."""
+
+    if opening_brace >= len(text) or text[opening_brace] != "{":
+        return None
+    depth = 0
+    index = opening_brace
+    block_comment_depth = 0
+    while index < len(text):
+        if block_comment_depth:
+            if text.startswith("/*", index):
+                block_comment_depth += 1
+                index += 2
+            elif text.startswith("*/", index):
+                block_comment_depth -= 1
+                index += 2
+            else:
+                index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            block_comment_depth = 1
+            index += 2
+            continue
+
+        raw_match = re.match(r"(?:br|rb|r)(?P<hashes>#{0,255})\"", text[index:])
+        if raw_match:
+            terminator = '"' + raw_match.group("hashes")
+            raw_end = text.find(terminator, index + raw_match.end())
+            if raw_end < 0:
+                return None
+            index = raw_end + len(terminator)
+            continue
+        if text[index] == '"':
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                elif text[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+            else:
+                return None
+            continue
+        if text[index] == "'":
+            char_end = index + 1
+            escaped = False
+            while char_end < len(text) and char_end - index <= 32:
+                char = text[char_end]
+                if char == "\n":
+                    break
+                if char == "'" and not escaped:
+                    index = char_end + 1
+                    break
+                if char == "\\" and not escaped:
+                    escaped = True
+                else:
+                    escaped = False
+                char_end += 1
+            if index == char_end + 1:
+                continue
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+            if depth < 0:
+                return None
+        index += 1
+    return None
+
+
+def production_text(text: str, allow_test_changes: bool) -> tuple[str | None, str | None]:
+    if not allow_test_changes:
+        return text, None
+    marker = "#[cfg(test)]\nmod tests {"
+    if text.count(marker) != 1:
+        return None, "test_module_marker_missing_or_ambiguous"
+    marker_start = text.index(marker)
+    opening_brace = marker_start + len(marker) - 1
+    module_end = rust_block_end(text, opening_brace)
+    if module_end is None:
+        return None, "test_module_block_is_invalid"
+    if text[module_end:].strip():
+        return None, "test_module_is_not_final_top_level_item"
+    return text[:marker_start], None
+
+
+def structured_rewrites_match(
+    *,
+    before: str,
+    after: str,
+    file_selector: dict[str, Any],
+    allow_test_changes: bool,
+) -> tuple[bool, list[str], str | None]:
+    """Accept exactly the ordered, uniquely matched production rewrites in the rule."""
+
+    expected, before_error = production_text(before, allow_test_changes)
+    actual, after_error = production_text(after, allow_test_changes)
+    if expected is None:
+        return False, [], f"base_{before_error}"
+    if actual is None:
+        return False, [], f"head_{after_error}"
+    applied: list[str] = []
+    for rewrite in file_selector["rewrites"]:
+        before_snippet = str(rewrite["before"])
+        after_snippet = str(rewrite["after"])
+        occurrences = expected.count(before_snippet)
+        if occurrences != 1:
+            return (
+                False,
+                applied,
+                f"rewrite_{rewrite['id']}_before_occurrences_{occurrences}",
+            )
+        expected = expected.replace(before_snippet, after_snippet, 1)
+        applied.append(str(rewrite["id"]))
+    if expected != actual:
+        return False, applied, "production_diff_exceeds_structured_rewrites"
+    return True, applied, None
+
+
+def qualification_for_path(
+    path: str,
+    profile_id: str,
+    profile: dict[str, Any],
+    file_versions: dict[str, dict[str, str]],
+) -> dict[str, Any] | None:
+    selector = profile["selector"]
+    file_selector = next(
+        (item for item in selector["files"] if item.get("path") == path),
+        None,
+    )
+    versions = file_versions.get(path)
+    if file_selector is None or versions is None:
+        return None
+    matched, applied_rewrites, mismatch_reason = structured_rewrites_match(
+        before=str(versions.get("before", "")),
+        after=str(versions.get("after", "")),
+        file_selector=file_selector,
+        allow_test_changes=bool(selector.get("allow_test_changes", False)),
+    )
+    if not matched:
+        return None
+    return {
+        "profile_id": profile_id,
+        "path": path,
+        "selector_kind": "structured_rewrites",
+        "applied_rewrites": applied_rewrites,
+        "changed_regions": applied_rewrites,
+        "qualified_scopes": profile["qualified_scopes"],
+        "required_checks": profile["required_checks"],
+        "mismatch_reason": mismatch_reason,
+    }
 
 
 def matches_any(path: str, globs: list[str]) -> bool:
@@ -296,6 +589,8 @@ def plan_from_files(
     head_sha: str,
     dirty: bool,
     rules: list[dict[str, Any]],
+    qualification_profiles: dict[str, dict[str, Any]] | None = None,
+    file_versions: dict[str, dict[str, str]] | None = None,
     previous_artifacts: list[dict[str, Any]] | None = None,
     required_gate_overrides: set[str] | None = None,
 ) -> dict[str, Any]:
@@ -305,15 +600,49 @@ def plan_from_files(
     required_product_scenarios: set[str] = set()
     invalidated: set[str] = set()
     optional_diagnostic_gates: set[str] = set()
+    required_checks: set[str] = set()
+    qualified_scopes_by_key: dict[str, dict[str, str]] = {}
+    qualification_matches: list[dict[str, Any]] = []
     unknown_files: list[str] = []
     decision_log: list[dict[str, Any]] = []
+    qualification_profiles = qualification_profiles or {}
+    file_versions = file_versions or {}
 
     for changed in changed_files:
         matched = False
+        path_qualification_matches: dict[str, dict[str, Any]] = {}
+        for rule in rules:
+            if not matches_any(changed, rule["path_globs"]):
+                continue
+            for profile_id in rule.get("qualification_profiles", []):
+                if profile_id in path_qualification_matches:
+                    continue
+                match = qualification_for_path(
+                    changed,
+                    profile_id,
+                    qualification_profiles[profile_id],
+                    file_versions,
+                )
+                if match is not None:
+                    path_qualification_matches[profile_id] = match
         for rule in rules:
             if not matches_any(changed, rule["path_globs"]):
                 continue
             matched = True
+            matched_profile_ids = sorted(
+                set(rule.get("qualification_profiles", [])) & set(path_qualification_matches)
+            )
+            if matched_profile_ids:
+                decision_log.append(
+                    {
+                        "path": changed,
+                        "rule_id": rule["id"],
+                        "qualification_profiles": matched_profile_ids,
+                        "broad_rule_replaced": True,
+                        "reason": "production diff exactly matched the profile's structured rewrites",
+                    }
+                )
+                continue
             impact_domains.update(str(domain) for domain in rule["domains"])
             before_gates = set(required_gates)
             before_scenarios = set(required_product_scenarios)
@@ -335,6 +664,26 @@ def plan_from_files(
                     "release_invalidation": rule["release_invalidation"],
                     "owner": rule["owner"],
                     "reason": rule["reason"],
+                }
+            )
+        for profile_id, match in sorted(path_qualification_matches.items()):
+            profile = qualification_profiles[profile_id]
+            impact_domains.update(str(domain) for domain in profile["domains"])
+            required_checks.update(str(check) for check in profile["required_checks"])
+            for scope in profile["qualified_scopes"]:
+                scope_key = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+                qualified_scopes_by_key[scope_key] = dict(scope)
+            qualification_matches.append(match)
+            decision_log.append(
+                {
+                    "path": changed,
+                    "rule_id": None,
+                    "qualification_profile": profile_id,
+                    "domains": profile["domains"],
+                    "required_checks_added": profile["required_checks"],
+                    "qualified_scopes": profile["qualified_scopes"],
+                    "applied_rewrites": match["applied_rewrites"],
+                    "reason": profile.get("reason"),
                 }
             )
         if not matched:
@@ -372,6 +721,9 @@ def plan_from_files(
         "impact_domains": sorted(impact_domains),
         "required_gates": sorted(required_gates),
         "required_product_scenarios": sorted(required_product_scenarios),
+        "required_checks": sorted(required_checks),
+        "qualified_scopes": [qualified_scopes_by_key[key] for key in sorted(qualified_scopes_by_key)],
+        "qualification_matches": qualification_matches,
         "optional_diagnostic_gates": sorted(optional_diagnostic_gates),
         "invalidated_previous_gates": sorted(invalidated),
         "unknown_files": unknown_files,
@@ -392,8 +744,10 @@ def markdown_plan(plan: dict[str, Any]) -> str:
         f"- dirty: `{plan['dirty']}`",
         f"- impact domains: {', '.join(plan['impact_domains']) or '(none)'}",
         f"- required gates: {', '.join(plan['required_gates']) or '(none)'}",
+        f"- required qualified checks: {', '.join(plan['required_checks']) or '(none)'}",
         "- required product scenarios: "
         f"{', '.join(plan['required_product_scenarios']) or '(none)'}",
+        f"- qualified scopes: {json.dumps(plan['qualified_scopes'], sort_keys=True)}",
         f"- invalidated gates: {', '.join(plan['invalidated_previous_gates']) or '(none)'}",
         "",
         "## Changed Files",
@@ -426,6 +780,9 @@ def release_candidate_manifest(plan: dict[str, Any]) -> dict[str, Any]:
         "impact_domains": plan["impact_domains"],
         "required_gates": plan["required_gates"],
         "required_product_scenarios": plan["required_product_scenarios"],
+        "required_checks": plan["required_checks"],
+        "qualified_scopes": plan["qualified_scopes"],
+        "qualification_matches": plan["qualification_matches"],
         "satisfied_gates": [
             artifact.get("gate") for artifact in plan["satisfied_artifacts"] if artifact.get("gate")
         ],
@@ -519,6 +876,9 @@ def write_standard_artifact_files(
             "impact_domains": plan["impact_domains"],
             "required_gates": plan["required_gates"],
             "required_product_scenarios": plan["required_product_scenarios"],
+            "required_checks": plan["required_checks"],
+            "qualified_scopes": plan["qualified_scopes"],
+            "qualification_match_count": len(plan["qualification_matches"]),
             "unknown_file_count": len(plan["unknown_files"]),
             "stale_artifact_count": len(plan["stale_artifacts"]),
             "satisfied_artifact_count": len(plan["satisfied_artifacts"]),
@@ -551,10 +911,27 @@ def load_fixture_data(path: Path) -> list[dict[str, Any]]:
     return fixtures
 
 
-def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, Any]:
+def run_selftest(
+    rules: list[dict[str, Any]],
+    qualification_profiles: dict[str, dict[str, Any]],
+    fixtures_path: Path,
+) -> dict[str, Any]:
     fixture_results: list[dict[str, Any]] = []
     failures: list[str] = []
     fixtures = load_fixture_data(fixtures_path)
+    safe_product, safe_error = production_text(
+        'fn product() { let sample = r#"{ignored}"#; }\n\n#[cfg(test)]\nmod tests {\n'
+        '    #[test]\n    fn test_only() { assert_eq!("}", "}"); }\n}\n',
+        True,
+    )
+    if safe_error is not None or safe_product != 'fn product() { let sample = r#"{ignored}"#; }\n\n':
+        failures.append(f"final test module was not isolated safely: {safe_error}")
+    unsafe_product, unsafe_error = production_text(
+        "fn product() {}\n\n#[cfg(test)]\nmod tests {\n}\n\nfn production_tail() {}\n",
+        True,
+    )
+    if unsafe_product is not None or unsafe_error != "test_module_is_not_final_top_level_item":
+        failures.append("production item after test module was not rejected")
     for fixture in fixtures:
         fid = str(fixture.get("id"))
         expected_error = fixture.get("expect_error_contains")
@@ -565,6 +942,8 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
                 head_sha="fixture-head",
                 dirty=False,
                 rules=rules,
+                qualification_profiles=qualification_profiles,
+                file_versions=dict(fixture.get("file_versions") or {}),
                 previous_artifacts=list(fixture.get("previous_artifacts") or []),
                 required_gate_overrides=FINAL_STAGE_GATES
                 if fixture.get("require_final_stage_gates")
@@ -602,6 +981,9 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
         fixture_failures += assert_contains(
             "impact_domains", plan["impact_domains"], list(fixture.get("expect_domains") or [])
         )
+        fixture_failures += assert_not_contains(
+            "impact_domains", plan["impact_domains"], list(fixture.get("forbid_domains") or [])
+        )
         fixture_failures += assert_contains(
             "required_gates", plan["required_gates"], list(fixture.get("expect_required_gates") or [])
         )
@@ -613,6 +995,29 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
         fixture_failures += assert_not_contains(
             "required_gates", plan["required_gates"], list(fixture.get("forbid_required_gates") or [])
         )
+        fixture_failures += assert_contains(
+            "required_checks", plan["required_checks"], list(fixture.get("expect_required_checks") or [])
+        )
+        fixture_failures += assert_not_contains(
+            "required_checks", plan["required_checks"], list(fixture.get("forbid_required_checks") or [])
+        )
+        actual_profile_ids = sorted(
+            str(match.get("profile_id")) for match in plan["qualification_matches"]
+        )
+        fixture_failures += assert_contains(
+            "qualification_profile_ids",
+            actual_profile_ids,
+            list(fixture.get("expect_qualification_profile_ids") or []),
+        )
+        fixture_failures += assert_not_contains(
+            "qualification_profile_ids",
+            actual_profile_ids,
+            list(fixture.get("forbid_qualification_profile_ids") or []),
+        )
+        if "expect_qualified_scopes" in fixture and plan["qualified_scopes"] != fixture["expect_qualified_scopes"]:
+            fixture_failures.append(
+                f"qualified_scopes {plan['qualified_scopes']!r} != {fixture['expect_qualified_scopes']!r}"
+            )
         if "expect_unknown_files" in fixture and plan["unknown_files"] != fixture["expect_unknown_files"]:
             fixture_failures.append(
                 f"unknown_files {plan['unknown_files']!r} != {fixture['expect_unknown_files']!r}"
@@ -651,6 +1056,9 @@ def run_selftest(rules: list[dict[str, Any]], fixtures_path: Path) -> dict[str, 
                 "impact_domains": plan["impact_domains"],
                 "required_gates": plan["required_gates"],
                 "required_product_scenarios": plan["required_product_scenarios"],
+                "required_checks": plan["required_checks"],
+                "qualified_scopes": plan["qualified_scopes"],
+                "qualification_profile_ids": actual_profile_ids,
                 "unknown_files": plan["unknown_files"],
                 "invalidated_previous_gates": plan["invalidated_previous_gates"],
                 "failures": fixture_failures,
@@ -703,9 +1111,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     started_at = int(time.time())
     args = parse_args()
-    rules = load_rules(args.rules)
+    rule_config = load_rule_config(args.rules)
+    rules = rule_config["rules"]
+    qualification_profiles = rule_config["qualification_profiles"]
     if args.self_test:
-        selfcheck = run_selftest(rules, args.fixtures)
+        selfcheck = run_selftest(rules, qualification_profiles, args.fixtures)
         if args.out:
             plan = plan_from_files(
                 changed_files=[],
@@ -713,6 +1123,7 @@ def main() -> int:
                 head_sha="self-test",
                 dirty=False,
                 rules=rules,
+                qualification_profiles=qualification_profiles,
             )
             write_outputs(
                 args.out,
@@ -740,12 +1151,14 @@ def main() -> int:
         changed_files = normalize_changed_files(args.changed_file)
         base_sha = resolve_git_rev(args.base) if args.base else "manual-base"
         head_sha = resolve_git_rev(args.head) if args.head else "manual-head"
+        file_versions: dict[str, dict[str, str]] = {}
     else:
         if not args.base or not args.head:
             raise PlannerError("provide --base and --head, or one or more --changed-file entries")
         changed_files = git_changed_files(args.base, args.head)
         base_sha = resolve_git_rev(args.base)
         head_sha = resolve_git_rev(args.head)
+        file_versions = git_file_versions(base_sha, head_sha, changed_files)
     previous_artifacts = load_previous_artifacts(args.previous_artifact)
     previous_artifacts.extend(normalize_stage_artifact(value, head_sha) for value in args.stage_artifact)
     plan = plan_from_files(
@@ -754,6 +1167,8 @@ def main() -> int:
         head_sha=head_sha,
         dirty=git_dirty(),
         rules=rules,
+        qualification_profiles=qualification_profiles,
+        file_versions=file_versions,
         previous_artifacts=previous_artifacts,
         required_gate_overrides=FINAL_STAGE_GATES if args.require_final_stage_gates else set(),
     )

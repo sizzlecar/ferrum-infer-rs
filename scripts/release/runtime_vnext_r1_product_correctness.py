@@ -90,6 +90,12 @@ DOES_NOT_PROVE = [
     "R3 release assets, publication, or installed regression",
     "v0.8.0 release readiness",
 ]
+FULL_DEPENDENCY_KEYS = {"r0", "matrices", "llama_dense", "acceptance"}
+CUMULATIVE_DEPENDENCY_KEYS = {
+    "prior_r1",
+    "impact_qualification",
+    "acceptance",
+}
 
 
 class R1Error(RuntimeError):
@@ -798,7 +804,6 @@ def validate_host_suspend_matrix(
     try:
         bundle = matrix.validate_host_suspend_assembly_manifest(
             manifest_path,
-            verify_checkout=True,
         )
     except matrix.ScenarioError as error:
         raise R1Error(f"M1 Metal host-suspend assembly rejected: {error}") from error
@@ -1397,7 +1402,225 @@ def acceptance(
     }
 
 
+def require_full_prior_manifest_shape(manifest: dict[str, Any]) -> None:
+    dependencies = manifest.get("dependencies")
+    require(
+        isinstance(dependencies, dict)
+        and set(dependencies) == FULL_DEPENDENCY_KEYS,
+        "prior R1 must be a full aggregate, not another cumulative aggregate",
+    )
+
+
+def cumulative_acceptance(
+    prior: dict[str, Any], authority: dict[str, Any]
+) -> dict[str, Any]:
+    previous_binaries = prior.get("backend_binary_sha256")
+    require(
+        isinstance(previous_binaries, dict)
+        and set(previous_binaries) == {"cuda", "metal"},
+        "prior R1 backend binary authority is missing",
+    )
+    require(
+        set(authority) == {"cuda", "metal"},
+        "impact qualification backend binary authority differs",
+    )
+    for backend in ("cuda", "metal"):
+        require_sha(previous_binaries.get(backend), f"prior R1 {backend} binary")
+        require_sha(authority.get(backend), f"qualified {backend} binary")
+    accepted = copy.deepcopy(prior)
+    require(
+        "evidence_backend_binary_sha256" not in accepted,
+        "prior R1 is already cumulative",
+    )
+    accepted["evidence_backend_binary_sha256"] = copy.deepcopy(previous_binaries)
+    accepted["backend_binary_sha256"] = copy.deepcopy(authority)
+    return accepted
+
+
+def expected_cumulative_reused_cells(prior: dict[str, Any]) -> list[dict[str, Any]]:
+    models = prior.get("models")
+    require(isinstance(models, dict), "prior R1 accepted model rows are missing")
+    rows: list[dict[str, Any]] = []
+    total = 0
+    for key, lane in MATRIX_LANES.items():
+        model = models.get(key)
+        require(isinstance(model, dict), f"prior R1 accepted {key} row is missing")
+        cases = model.get("cases")
+        require(
+            isinstance(cases, str) and "/" in cases,
+            f"prior R1 accepted {key} cases differ",
+        )
+        passed, denominator = (int(value) for value in cases.split("/", 1))
+        require(
+            passed == denominator == lane.spec.expected_case_count,
+            f"prior R1 accepted {key} denominator differs",
+        )
+        total += denominator
+        rows.append(
+            {
+                "cell_id": f"r1.matrix.{key}",
+                "backend": lane.backend,
+                "mode": "profile_off",
+                "evidence": "correctness",
+                "case_count": denominator,
+            }
+        )
+    require(
+        total == prior.get("total_matrix_case_count") == 1867,
+        "prior R1 cumulative matrix denominator differs",
+    )
+    for backend in ("cuda", "metal"):
+        rows.append(
+            {
+                "cell_id": f"r1.llama.{backend}",
+                "backend": backend,
+                "mode": "profile_off",
+                "evidence": "correctness",
+                "scenario_count": 3,
+            }
+        )
+    return rows
+
+
+def validate_qualification_closure(
+    prior: dict[str, Any], qualification: dict[str, Any]
+) -> dict[str, Any]:
+    authority = qualification.get("backend_binary_sha256")
+    require(isinstance(authority, dict), "qualified backend binary authority is missing")
+    previous = prior.get("backend_binary_sha256")
+    require(
+        isinstance(previous, dict) and set(previous) == {"cuda", "metal"},
+        "prior R1 backend binary authority is missing",
+    )
+    require(
+        authority.get("metal") == previous.get("metal"),
+        "unaffected Metal binary authority changed",
+    )
+    require(
+        qualification.get("profile_id")
+        == "vnext-reusable-startup-diagnostic-observability"
+        and qualification.get("qualified_scopes")
+        == [
+            {"backend": "cuda", "entrypoint": "run", "profile_detail": "full"},
+            {
+                "backend": "cuda",
+                "entrypoint": "serve",
+                "profile_detail": "verify",
+            },
+        ],
+        "change-impact qualification scope differs",
+    )
+    expected_reused = expected_cumulative_reused_cells(prior)
+    require(
+        qualification.get("reused_cells") == expected_reused,
+        "change-impact qualification did not preserve the complete R1 denominator",
+    )
+    expected_revalidated = [
+        {
+            "cell_id": "cuda.run.profile_full",
+            "backend": "cuda",
+            "entrypoint": "run",
+            "profile_detail": "full",
+            "evidence": "diagnostic_observability",
+            "check_id": "cuda_run_profile_full",
+            "binary_sha256": authority.get("cuda"),
+        },
+        {
+            "cell_id": "cuda.serve.profile_verify",
+            "backend": "cuda",
+            "entrypoint": "serve",
+            "profile_detail": "verify",
+            "evidence": "diagnostic_observability",
+            "check_id": "cuda_serve_profile_verify",
+            "binary_sha256": authority.get("cuda"),
+        },
+    ]
+    require(
+        qualification.get("revalidated_cells") == expected_revalidated,
+        "change-impact qualification revalidated cell set differs",
+    )
+    require(
+        qualification.get("invalidated_cells") == []
+        and qualification.get("open_invalidated_cells") == [],
+        "change-impact qualification still has invalidated R1 cells",
+    )
+    return authority
+
+
+def verify_impact_qualification(
+    path: Path,
+    *,
+    verify_checkout: bool,
+    expected_source: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        import runtime_vnext_change_impact_qualification as impact_qualification
+    except ImportError as error:
+        raise R1Error("change-impact qualification validator is unavailable") from error
+    try:
+        qualified = impact_qualification.verify_manifest(
+            path,
+            verify_checkout=verify_checkout,
+            expected_source=expected_source,
+        )
+    except (OSError, RuntimeError, ValueError) as error:
+        raise R1Error(f"change-impact qualification rejected: {error}") from error
+    require(
+        isinstance(qualified, dict)
+        and qualified.get("kind") == "runtime-vnext-change-impact-qualification",
+        "change-impact qualification identity differs",
+    )
+    return qualified
+
+
+def validate_cumulative_inputs(
+    paths: dict[str, Path], source: dict[str, Any]
+) -> dict[str, Any]:
+    require(
+        set(paths) == {"prior_r1", "impact_qualification"},
+        "cumulative R1 input path set differs",
+    )
+    prior_path = paths["prior_r1"].expanduser().resolve()
+    prior_manifest = read_json(prior_path, "prior R1 manifest")
+    require_full_prior_manifest_shape(prior_manifest)
+    prior_source = normalize_source(prior_manifest.get("source"), "prior R1")
+    prior = verify_manifest(
+        prior_path,
+        verify_checkout=False,
+        expected_source=prior_source,
+    )
+    qualification = verify_impact_qualification(
+        paths["impact_qualification"].expanduser().resolve(),
+        verify_checkout=False,
+        expected_source=source,
+    )
+    require(
+        qualification.get("source") == source,
+        "change-impact qualification head differs from current R1 source",
+    )
+    require(
+        qualification.get("prior_source") == prior_source,
+        "change-impact qualification base differs from prior R1 source",
+    )
+    prior_ref = file_ref(prior_path)
+    require(
+        qualification.get("prior_r1") == prior_ref,
+        "change-impact qualification is bound to a different prior R1",
+    )
+    authority = validate_qualification_closure(prior["acceptance"], qualification)
+    accepted = cumulative_acceptance(prior["acceptance"], authority)
+    qualification_ref = qualification.get("manifest")
+    validate_ref(qualification_ref, "change-impact qualification manifest")
+    return {
+        "prior_r1": prior_ref,
+        "impact_qualification": qualification_ref,
+        "acceptance": accepted,
+    }
+
+
 def validate_inputs(paths: dict[str, Path], source: dict[str, Any]) -> dict[str, Any]:
+    if set(paths) == {"prior_r1", "impact_qualification"}:
+        return validate_cumulative_inputs(paths, source)
     require(
         set(paths)
         == {"r0", *MATRIX_LANES, "llama_cuda", "llama_metal"},
@@ -1469,6 +1692,47 @@ def build(paths: dict[str, Path], out: Path) -> str:
         raise
 
 
+def validate_cumulative_dependencies(
+    dependencies: dict[str, Any], source: dict[str, Any]
+) -> dict[str, Any]:
+    prior_path = validate_ref(dependencies.get("prior_r1"), "prior R1 manifest")
+    prior_manifest = read_json(prior_path, "prior R1 manifest")
+    require_full_prior_manifest_shape(prior_manifest)
+    prior_source = normalize_source(prior_manifest.get("source"), "prior R1")
+    prior = verify_manifest(
+        prior_path,
+        verify_checkout=False,
+        expected_source=prior_source,
+    )
+    qualification_path = validate_ref(
+        dependencies.get("impact_qualification"),
+        "change-impact qualification manifest",
+    )
+    qualification = verify_impact_qualification(
+        qualification_path,
+        verify_checkout=False,
+        expected_source=source,
+    )
+    require(
+        qualification.get("source") == source,
+        "change-impact qualification head differs from cumulative R1 source",
+    )
+    require(
+        qualification.get("prior_source") == prior_source,
+        "change-impact qualification base differs from prior R1 source",
+    )
+    require(
+        qualification.get("prior_r1") == dependencies.get("prior_r1"),
+        "change-impact qualification is bound to a different prior R1",
+    )
+    require(
+        qualification.get("manifest") == dependencies.get("impact_qualification"),
+        "change-impact qualification reference drifted",
+    )
+    authority = validate_qualification_closure(prior["acceptance"], qualification)
+    return cumulative_acceptance(prior["acceptance"], authority)
+
+
 def verify_manifest(
     manifest_path: Path,
     *,
@@ -1514,9 +1778,22 @@ def verify_manifest(
     if expected is not None:
         require(source == expected, "R1 aggregate source is stale")
     dependencies = manifest.get("dependencies")
+    require(isinstance(dependencies, dict), "R1 dependencies are missing")
+    if set(dependencies) == CUMULATIVE_DEPENDENCY_KEYS:
+        accepted = validate_cumulative_dependencies(dependencies, source)
+        require(
+            dependencies.get("acceptance") == accepted
+            and manifest.get("acceptance") == accepted,
+            "cumulative R1 acceptance summary drifted",
+        )
+        return {
+            "kind": "vnext-r1",
+            "child_manifest": {"path": str(path), "sha256": sha256(path)},
+            "source": source,
+            "acceptance": copy.deepcopy(accepted),
+        }
     require(
-        isinstance(dependencies, dict)
-        and set(dependencies) == {"r0", "matrices", "llama_dense", "acceptance"},
+        set(dependencies) == FULL_DEPENDENCY_KEYS,
         "R1 dependency set mismatch",
     )
     matrices = dependencies["matrices"]
@@ -1829,6 +2106,92 @@ def self_test() -> int:
             and accepted["production_legacy_selection_count"] == 0,
             "R1 fixture acceptance differs",
         )
+        qualified_binaries = {"cuda": "3" * 64, "metal": "4" * 64}
+        cumulative = cumulative_acceptance(accepted, qualified_binaries)
+        require(
+            cumulative["total_matrix_case_count"] == 1867
+            and cumulative["backend_hardware_id"] == accepted["backend_hardware_id"]
+            and cumulative["evidence_backend_binary_sha256"]
+            == accepted["backend_binary_sha256"]
+            and cumulative["backend_binary_sha256"] == qualified_binaries
+            and "evidence_backend_binary_sha256" not in accepted,
+            "R1 cumulative acceptance did not preserve evidence and rebind authority",
+        )
+        expected_reused = expected_cumulative_reused_cells(accepted)
+        qualification = {
+            "profile_id": "vnext-reusable-startup-diagnostic-observability",
+            "qualified_scopes": [
+                {"backend": "cuda", "entrypoint": "run", "profile_detail": "full"},
+                {
+                    "backend": "cuda",
+                    "entrypoint": "serve",
+                    "profile_detail": "verify",
+                },
+            ],
+            "reused_cells": expected_reused,
+            "revalidated_cells": [
+                {
+                    "cell_id": "cuda.run.profile_full",
+                    "backend": "cuda",
+                    "entrypoint": "run",
+                    "profile_detail": "full",
+                    "evidence": "diagnostic_observability",
+                    "check_id": "cuda_run_profile_full",
+                    "binary_sha256": qualified_binaries["cuda"],
+                },
+                {
+                    "cell_id": "cuda.serve.profile_verify",
+                    "backend": "cuda",
+                    "entrypoint": "serve",
+                    "profile_detail": "verify",
+                    "evidence": "diagnostic_observability",
+                    "check_id": "cuda_serve_profile_verify",
+                    "binary_sha256": qualified_binaries["cuda"],
+                },
+            ],
+            "invalidated_cells": [],
+            "open_invalidated_cells": [],
+            "backend_binary_sha256": {
+                "cuda": qualified_binaries["cuda"],
+                "metal": accepted["backend_binary_sha256"]["metal"],
+            },
+        }
+        require(
+            validate_qualification_closure(accepted, qualification)
+            == qualification["backend_binary_sha256"],
+            "R1 cumulative qualification closure fixture differs",
+        )
+        forged_reuse = copy.deepcopy(qualification)
+        forged_reuse["reused_cells"].pop()
+        expect_reject(
+            lambda: validate_qualification_closure(accepted, forged_reuse),
+            "incomplete R1 reused cell denominator",
+        )
+        forged_metal = copy.deepcopy(qualification)
+        forged_metal["backend_binary_sha256"]["metal"] = "9" * 64
+        expect_reject(
+            lambda: validate_qualification_closure(accepted, forged_metal),
+            "unaffected Metal authority rebound",
+        )
+        require_full_prior_manifest_shape(
+            {"dependencies": {key: {} for key in FULL_DEPENDENCY_KEYS}}
+        )
+        expect_reject(
+            lambda: require_full_prior_manifest_shape(
+                {"dependencies": {key: {} for key in CUMULATIVE_DEPENDENCY_KEYS}}
+            ),
+            "cumulative bridge chained onto another cumulative R1",
+        )
+        expect_reject(
+            lambda: cumulative_acceptance(cumulative, qualified_binaries),
+            "cumulative acceptance chained twice",
+        )
+        missing_authority = copy.deepcopy(qualified_binaries)
+        missing_authority.pop("metal")
+        expect_reject(
+            lambda: cumulative_acceptance(accepted, missing_authority),
+            "incomplete qualified backend authority",
+        )
         bad = copy.deepcopy(matrices)
         bad.pop("m3_metal")
         expect_reject(lambda: acceptance(bad, llamas), "missing matrix lane")
@@ -1855,6 +2218,8 @@ def main() -> int:
         parser.add_argument(f"--{key.replace('_', '-')}", type=Path)
     parser.add_argument("--llama-cuda", type=Path)
     parser.add_argument("--llama-metal", type=Path)
+    parser.add_argument("--prior-r1", type=Path)
+    parser.add_argument("--impact-qualification", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -1867,9 +2232,33 @@ def main() -> int:
             "llama_cuda": args.llama_cuda,
             "llama_metal": args.llama_metal,
         }
-        missing = [key for key, value in values.items() if value is None]
-        require(not missing and args.out is not None, "missing required inputs: " + ", ".join(missing))
-        paths = {key: value for key, value in values.items() if value is not None}
+        cumulative_values = {
+            "prior_r1": args.prior_r1,
+            "impact_qualification": args.impact_qualification,
+        }
+        if any(value is not None for value in cumulative_values.values()):
+            missing = [
+                key for key, value in cumulative_values.items() if value is None
+            ]
+            mixed = [key for key, value in values.items() if value is not None]
+            require(
+                not missing and not mixed,
+                "cumulative inputs require --prior-r1 and --impact-qualification "
+                "and are mutually exclusive with full R1 inputs",
+            )
+            paths = {
+                key: value
+                for key, value in cumulative_values.items()
+                if value is not None
+            }
+        else:
+            missing = [key for key, value in values.items() if value is None]
+            require(
+                not missing,
+                "missing required full R1 inputs: " + ", ".join(missing),
+            )
+            paths = {key: value for key, value in values.items() if value is not None}
+        require(args.out is not None, "missing required input: out")
         assert args.out is not None
         print(build(paths, args.out))
         return 0

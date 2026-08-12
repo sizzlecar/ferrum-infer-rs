@@ -1,5 +1,54 @@
 {
   "schema_version": 1,
+  "qualification_profiles": {
+    "vnext-reusable-startup-diagnostic-observability": {
+      "domains": ["diagnostic_observability"],
+      "selector": {
+        "kind": "structured_rewrites",
+        "allow_test_changes": true,
+        "files": [
+          {
+            "path": "crates/ferrum-models/src/executor/vnext_executor.rs",
+            "rewrites": [
+              {
+                "id": "insert_reusable_identity_predicate",
+                "before": "const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {",
+                "after": "const fn reusable_program_identity_required(\n    has_startup_plan: bool,\n    catalog_installed: bool,\n    direct_reusable_execution_allowed: bool,\n    direct_reusable_execution_already_attempted: bool,\n) -> bool {\n    has_startup_plan\n        && (!catalog_installed\n            || reusable_catalog_lookup_allowed(\n                true,\n                direct_reusable_execution_allowed,\n                direct_reusable_execution_already_attempted,\n            ))\n}\n\nconst fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {"
+              },
+              {
+                "id": "bind_catalog_and_use_identity_predicate",
+                "before": "            let mut reusable_catalog_miss = None;\n            let reusable_program = if !reusable_catalog_lookup_allowed(\n                self.reusable_execution_startup_plan.is_some(),\n                device_timing_mode.direct_reusable_execution_allowed(),\n                reusable_direct_attempted,\n            ) {",
+                "after": "            let mut reusable_catalog_miss = None;\n            let catalog = self.reusable_execution_catalog.get();\n            let reusable_program = if !reusable_program_identity_required(\n                self.reusable_execution_startup_plan.is_some(),\n                catalog.is_some(),\n                device_timing_mode.direct_reusable_execution_allowed(),\n                reusable_direct_attempted,\n            ) {"
+              },
+              {
+                "id": "remove_late_catalog_binding",
+                "before": "                let catalog = self.reusable_execution_catalog.get();\n                match program_id {",
+                "after": "                match program_id {"
+              }
+            ]
+          }
+        ]
+      },
+      "qualified_scopes": [
+        {
+          "backend": "cuda",
+          "entrypoint": "run",
+          "profile_detail": "full"
+        },
+        {
+          "backend": "cuda",
+          "entrypoint": "serve",
+          "profile_detail": "verify"
+        }
+      ],
+      "required_checks": [
+        "executor_unit_reusable_program_identity",
+        "cuda_run_profile_full",
+        "cuda_serve_profile_verify"
+      ],
+      "reason": "Reusable startup identity bookkeeping is diagnostic-only only when production code equals the three structured rewrites exactly; any other production change falls back to the broad runtime rules."
+    }
+  },
   "rules": [
     {
       "id": "engine-shared-runtime",
@@ -221,6 +270,9 @@
         "product_sentinel",
         "support_matrix"
       ],
+      "qualification_profiles": [
+        "vnext-reusable-startup-diagnostic-observability"
+      ],
       "exceptions": [],
       "owner": "models",
       "reason": "model capabilities, templates, registry, and manifests affect supported model behavior"
@@ -332,6 +384,9 @@
         "metal_full",
         "cuda_full",
         "cuda_llama_dense"
+      ],
+      "qualification_profiles": [
+        "vnext-reusable-startup-diagnostic-observability"
       ],
       "exceptions": [],
       "owner": "runtime-vnext",

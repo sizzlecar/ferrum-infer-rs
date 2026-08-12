@@ -588,6 +588,108 @@
       "expect_required_gates": ["native_operator_artifact", "cuda_sentinel", "model_contract"]
     },
     {
+      "id": "vnext_reusable_identity_diagnostic_observability_qualified",
+      "changed_files": ["crates/ferrum-models/src/executor/vnext_executor.rs"],
+      "file_versions": {
+        "crates/ferrum-models/src/executor/vnext_executor.rs": {
+          "before": "const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n            let mut reusable_catalog_miss = None;\n            let reusable_program = if !reusable_catalog_lookup_allowed(\n                self.reusable_execution_startup_plan.is_some(),\n                device_timing_mode.direct_reusable_execution_allowed(),\n                reusable_direct_attempted,\n            ) {\n                None\n            } else {\n                let catalog = self.reusable_execution_catalog.get();\n                match program_id {\n                    Some(program_id) => {\n                        match catalog {\n                            Some(catalog) => match catalog.programs.get(&program_id) {\n                                Some(program) if program.has_resident_segments() => Some(program),\n                                _ => None,\n                            },\n                            None => None,\n                        }\n                    }\n                    None => None,\n                }\n            };\n}\n\n#[cfg(test)]\nmod tests {\n    fn old_test() {}\n}\n",
+          "after": "const fn reusable_program_identity_required(\n    has_startup_plan: bool,\n    catalog_installed: bool,\n    direct_reusable_execution_allowed: bool,\n    direct_reusable_execution_already_attempted: bool,\n) -> bool {\n    has_startup_plan\n        && (!catalog_installed\n            || reusable_catalog_lookup_allowed(\n                true,\n                direct_reusable_execution_allowed,\n                direct_reusable_execution_already_attempted,\n            ))\n}\n\nconst fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n            let mut reusable_catalog_miss = None;\n            let catalog = self.reusable_execution_catalog.get();\n            let reusable_program = if !reusable_program_identity_required(\n                self.reusable_execution_startup_plan.is_some(),\n                catalog.is_some(),\n                device_timing_mode.direct_reusable_execution_allowed(),\n                reusable_direct_attempted,\n            ) {\n                None\n            } else {\n                match program_id {\n                    Some(program_id) => {\n                        match catalog {\n                            Some(catalog) => match catalog.programs.get(&program_id) {\n                                Some(program) if program.has_resident_segments() => Some(program),\n                                _ => None,\n                            },\n                            None => None,\n                        }\n                    }\n                    None => None,\n                }\n            };\n}\n\n#[cfg(test)]\nmod tests {\n    fn new_test_for_identity() {}\n}\n"
+        }
+      },
+      "expect_domains": ["diagnostic_observability"],
+      "forbid_domains": ["model_contract", "shared_runtime", "vnext_execution_contract"],
+      "expect_required_checks": [
+        "executor_unit_reusable_program_identity",
+        "cuda_run_profile_full",
+        "cuda_serve_profile_verify"
+      ],
+      "expect_qualification_profile_ids": [
+        "vnext-reusable-startup-diagnostic-observability"
+      ],
+      "expect_qualified_scopes": [
+        {
+          "backend": "cuda",
+          "entrypoint": "run",
+          "profile_detail": "full"
+        },
+        {
+          "backend": "cuda",
+          "entrypoint": "serve",
+          "profile_detail": "verify"
+        }
+      ],
+      "forbid_required_gates": [
+        "unit",
+        "model_contract",
+        "vnext_g01",
+        "metal_sentinel",
+        "cuda_sentinel"
+      ]
+    },
+    {
+      "id": "vnext_reusable_identity_resident_selection_change_falls_back_broad",
+      "changed_files": ["crates/ferrum-models/src/executor/vnext_executor.rs"],
+      "file_versions": {
+        "crates/ferrum-models/src/executor/vnext_executor.rs": {
+          "before": "const fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n            let mut reusable_catalog_miss = None;\n            let reusable_program = if !reusable_catalog_lookup_allowed(\n                self.reusable_execution_startup_plan.is_some(),\n                device_timing_mode.direct_reusable_execution_allowed(),\n                reusable_direct_attempted,\n            ) {\n                None\n            } else {\n                let catalog = self.reusable_execution_catalog.get();\n                match program_id {\n                    Some(program_id) => {\n                        match catalog {\n                            Some(catalog) => match catalog.programs.get(&program_id) {\n                                Some(program) if program.has_resident_segments() => Some(program),\n                                _ => None,\n                            },\n                            None => None,\n                        }\n                    }\n                    None => None,\n                }\n            };\n}\n\n#[cfg(test)]\nmod tests {\n    fn old_test() {}\n}\n",
+          "after": "const fn reusable_program_identity_required(\n    has_startup_plan: bool,\n    catalog_installed: bool,\n    direct_reusable_execution_allowed: bool,\n    direct_reusable_execution_already_attempted: bool,\n) -> bool {\n    has_startup_plan\n        && (!catalog_installed\n            || reusable_catalog_lookup_allowed(\n                true,\n                direct_reusable_execution_allowed,\n                direct_reusable_execution_already_attempted,\n            ))\n}\n\nconst fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n            let mut reusable_catalog_miss = None;\n            let catalog = self.reusable_execution_catalog.get();\n            let reusable_program = if !reusable_program_identity_required(\n                self.reusable_execution_startup_plan.is_some(),\n                catalog.is_some(),\n                device_timing_mode.direct_reusable_execution_allowed(),\n                reusable_direct_attempted,\n            ) {\n                None\n            } else {\n                match program_id {\n                    Some(program_id) => {\n                        match catalog {\n                            Some(catalog) => match catalog.programs.get(&program_id) {\n                                Some(program) => Some(program),\n                                _ => None,\n                            },\n                            None => None,\n                        }\n                    }\n                    None => None,\n                }\n            };\n}\n\n#[cfg(test)]\nmod tests {\n    fn new_test_for_identity() {}\n}\n"
+        }
+      },
+      "expect_domains": ["model_contract", "shared_runtime", "vnext_execution_contract"],
+      "expect_required_gates": ["unit", "model_contract", "vnext_g01", "metal_sentinel", "cuda_sentinel"],
+      "forbid_required_checks": [
+        "executor_unit_reusable_program_identity",
+        "cuda_run_profile_full",
+        "cuda_serve_profile_verify"
+      ],
+      "forbid_qualification_profile_ids": [
+        "vnext-reusable-startup-diagnostic-observability"
+      ],
+      "expect_qualified_scopes": []
+    },
+    {
+      "id": "vnext_reusable_identity_noncanonical_rewrite_falls_back_broad",
+      "changed_files": ["crates/ferrum-models/src/executor/vnext_executor.rs"],
+      "file_versions": {
+        "crates/ferrum-models/src/executor/vnext_executor.rs": {
+          "before": "const fn reusable_catalog_lookup_allowed(\n    has_startup_plan: bool,\n    direct_reusable_execution_allowed: bool,\n    direct_reusable_execution_already_attempted: bool,\n) -> bool {\n    has_startup_plan\n        && direct_reusable_execution_allowed\n        && !direct_reusable_execution_already_attempted\n}\n\nconst fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n            let mut reusable_catalog_miss = None;\n            let reusable_program = if !reusable_catalog_lookup_allowed(\n                has_startup_plan,\n                direct_allowed,\n                reusable_direct_attempted,\n            ) {\n                None\n            } else {\n                lookup_program()\n            };\n            reusable_direct_attempted |= reusable_program.is_some();\n}\n\n#[cfg(test)]\nmod tests {\n    use super::reusable_catalog_lookup_allowed;\n}\n",
+          "after": "const fn reusable_catalog_lookup_allowed(\n    has_startup_plan: bool,\n    direct_reusable_execution_allowed: bool,\n    direct_reusable_execution_already_attempted: bool,\n) -> bool {\n    has_startup_plan\n        && direct_reusable_execution_allowed\n        && !direct_reusable_execution_already_attempted\n}\n\nconst fn reusable_program_identity_required(\n    has_startup_plan: bool,\n    catalog_installed: bool,\n    direct_allowed: bool,\n    attempted: bool,\n) -> bool {\n    has_startup_plan && (!catalog_installed || direct_allowed && !attempted)\n}\n\nconst fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n            let mut reusable_catalog_miss = None;\n            let catalog = reusable_execution_catalog.get();\n            let reusable_program = if !reusable_program_identity_required(\n                has_startup_plan,\n                catalog.is_some(),\n                direct_allowed,\n                reusable_direct_attempted,\n            ) {\n                None\n            } else {\n                record_or_lookup_program(catalog)\n            };\n            reusable_direct_attempted |= reusable_program.is_some();\n}\n\n#[cfg(test)]\nmod tests {\n    use super::{reusable_catalog_lookup_allowed, reusable_program_identity_required};\n\n    #[test]\n    fn records_identity_before_catalog_installation() {\n        assert!(reusable_program_identity_required(true, false, false, false));\n    }\n}\n"
+        }
+      },
+      "expect_domains": ["model_contract", "shared_runtime", "vnext_execution_contract"],
+      "expect_required_gates": ["unit", "model_contract", "vnext_g01", "metal_sentinel", "cuda_sentinel"],
+      "forbid_required_checks": [
+        "executor_unit_reusable_program_identity",
+        "cuda_run_profile_full",
+        "cuda_serve_profile_verify"
+      ],
+      "forbid_qualification_profile_ids": [
+        "vnext-reusable-startup-diagnostic-observability"
+      ],
+      "expect_qualified_scopes": []
+    },
+    {
+      "id": "vnext_reusable_identity_outside_anchor_falls_back_broad",
+      "changed_files": ["crates/ferrum-models/src/executor/vnext_executor.rs"],
+      "file_versions": {
+        "crates/ferrum-models/src/executor/vnext_executor.rs": {
+          "before": "const fn reusable_catalog_lookup_allowed(\n    has_startup_plan: bool,\n    direct_reusable_execution_allowed: bool,\n    direct_reusable_execution_already_attempted: bool,\n) -> bool {\n    has_startup_plan\n        && direct_reusable_execution_allowed\n        && !direct_reusable_execution_already_attempted\n}\n\nconst fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n            let mut reusable_catalog_miss = None;\n            let reusable_program = lookup_program();\n            reusable_direct_attempted |= reusable_program.is_some();\n}\n\n#[cfg(test)]\nmod tests {\n}\n",
+          "after": "const fn reusable_catalog_lookup_allowed(\n    has_startup_plan: bool,\n    direct_reusable_execution_allowed: bool,\n    direct_reusable_execution_already_attempted: bool,\n) -> bool {\n    has_startup_plan\n        && direct_reusable_execution_allowed\n        && !direct_reusable_execution_already_attempted\n}\n\nconst fn reusable_program_identity_required() -> bool {\n    true\n}\n\nconst fn resolved_sequence_fit_policy(policy: SequenceFitPolicy) -> AdmissionFitPolicy {\n    resolve(policy)\n}\n\nfn dispatch() {\n    let scheduler_behavior_changed = true;\n            let mut reusable_catalog_miss = None;\n            let reusable_program = lookup_program_with_identity();\n            reusable_direct_attempted |= reusable_program.is_some();\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn identity() {}\n}\n"
+        }
+      },
+      "expect_domains": ["model_contract", "shared_runtime", "vnext_execution_contract"],
+      "expect_required_gates": ["unit", "model_contract", "vnext_g01", "metal_sentinel", "cuda_sentinel"],
+      "forbid_required_checks": [
+        "executor_unit_reusable_program_identity",
+        "cuda_run_profile_full",
+        "cuda_serve_profile_verify"
+      ],
+      "forbid_qualification_profile_ids": [
+        "vnext-reusable-startup-diagnostic-observability"
+      ],
+      "expect_qualified_scopes": []
+    },
+    {
       "id": "stale_shared_runtime_artifact",
       "changed_files": ["crates/ferrum-engine/src/continuous_engine/inner.rs"],
       "previous_artifacts": [
