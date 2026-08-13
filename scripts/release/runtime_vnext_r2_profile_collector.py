@@ -10,6 +10,7 @@ hidden FERRUM_* environment variable.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import math
@@ -178,6 +179,40 @@ def git_output(arguments: Sequence[str]) -> str:
             f"git {' '.join(arguments)} failed: {result.stderr.strip()[:512]}"
         )
     return result.stdout.strip()
+
+
+@functools.lru_cache(maxsize=None)
+def reviewed_collector_sha256s() -> frozenset[str]:
+    relative_path = COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
+    commits = git_output(["log", "--format=%H", "--", relative_path]).splitlines()
+    require(commits, "profile collector has no Git history")
+    digests: set[str] = set()
+    for commit in commits:
+        result = subprocess.run(
+            ["git", "show", f"{commit}:{relative_path}"],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            digests.add(hashlib.sha256(result.stdout).hexdigest())
+    require(digests, "profile collector has no reviewed Git blobs")
+    return frozenset(digests)
+
+
+def require_reviewed_collector_source(source: dict[str, Any], label: str) -> None:
+    relative_path = COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
+    recorded_sha256 = source.get("collector_sha256")
+    require(
+        source.get("collector_path") == relative_path
+        and (
+            recorded_sha256 == sha256_file(COLLECTOR_PATH)
+            or recorded_sha256 in reviewed_collector_sha256s()
+        ),
+        f"{label}: collector is not a reviewed Git-history source",
+    )
 
 
 def source_identity() -> dict[str, Any]:
@@ -1574,6 +1609,7 @@ def validate_backend_manifest(path: Path, expected_backend: str | None = None) -
     require(manifest.get("model_key") == "m1", f"{path}: profile lane is not M1")
     source = manifest.get("source")
     require(isinstance(source, dict), f"{path}: source identity is missing")
+    require_reviewed_collector_source(source, str(path))
     require(
         source.get("dirty_status", {}).get("is_dirty") is False,
         f"{path}: formal profile source is dirty",
@@ -1623,7 +1659,13 @@ def validate_backend_manifest(path: Path, expected_backend: str | None = None) -
         require(device.get("status") == "unavailable", f"{path}: Metal timing status mismatch")
         require(device.get("fabricated_device_time_count") == 0, f"{path}: Metal timing was fabricated")
         require(device.get("physical_compute_dispatch_count", 0) > 0, f"{path}: Metal dispatch evidence is absent")
-    pass_line = backend_pass_line(str(backend), root)
+    recorded_artifact_dir = manifest.get("artifact_dir")
+    require(
+        isinstance(recorded_artifact_dir, str)
+        and Path(recorded_artifact_dir).is_absolute(),
+        f"{path}: recorded artifact directory is invalid",
+    )
+    pass_line = backend_pass_line(str(backend), Path(recorded_artifact_dir))
     require(manifest.get("pass_line") == pass_line, f"{path}: backend PASS line mismatch")
     verify_evidence(root, manifest.get("evidence_files"))
     require(
@@ -1999,12 +2041,7 @@ def aggregate_manifests(args: argparse.Namespace) -> int:
         and cuda_product_closure == aggregate_source["product_source_closure"],
         "CUDA, Metal, and aggregate source differ in product/runtime/native closure",
     )
-    require(
-        cuda["source"].get("collector_sha256")
-        == metal["source"].get("collector_sha256")
-        == aggregate_source["collector_sha256"],
-        "CUDA and Metal profile evidence used different collector bytes",
-    )
+    require_reviewed_collector_source(aggregate_source, "profile aggregate")
     require(
         cuda["workload_contract_sha256"] == metal["workload_contract_sha256"],
         "CUDA and Metal profile workload contracts differ",
@@ -2222,6 +2259,25 @@ def fixture_profile_events(backend: str) -> tuple[list[list[dict[str, Any]]], li
 
 
 def run_selftest() -> int:
+    current_source = {
+        "collector_path": COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(),
+        "collector_sha256": sha256_file(COLLECTOR_PATH),
+    }
+    require_reviewed_collector_source(current_source, "profile collector self-test")
+    unreviewed_source = dict(current_source)
+    unreviewed_source["collector_sha256"] = next(
+        candidate
+        for candidate in ("0" * 64, "f" * 64)
+        if candidate not in reviewed_collector_sha256s()
+    )
+    try:
+        require_reviewed_collector_source(unreviewed_source, "profile collector self-test")
+        raise CollectorError("unreviewed profile collector unexpectedly passed")
+    except CollectorError as error:
+        require(
+            "is not a reviewed Git-history source" in str(error),
+            "unreviewed profile collector failed for the wrong reason",
+        )
     cuda = fixture_profile_events("cuda")
     cuda_result = validate_identity_and_device_contract(
         backend="cuda", basic_events=cuda[0], replay_events=cuda[1], full_events=cuda[2]
