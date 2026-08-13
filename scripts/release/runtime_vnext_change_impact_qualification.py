@@ -113,7 +113,7 @@ TEXT_BYTE_EXPECTED_SCOPES = [
     {"backend": "metal", "entrypoint": "run", "profile_detail": "off"},
     {"backend": "metal", "entrypoint": "serve", "profile_detail": "off"},
 ]
-TEXT_BYTE_EXPECTED_GATES = [
+TEXT_BYTE_PROFILE_REQUIRED_GATES = [
     "backend_boundary",
     "cuda_sentinel",
     "docs_review",
@@ -124,6 +124,15 @@ TEXT_BYTE_EXPECTED_GATES = [
     "resource_invariant",
     "unit",
 ]
+TEXT_BYTE_UNIT_G0_PROVED_GATES = [
+    "product_backend_sentinel_selftest",
+    "product_sentinel_dry_run",
+    "run_scenarios_selftest",
+    "unit",
+]
+TEXT_BYTE_EXPECTED_GATES = sorted(
+    {*TEXT_BYTE_PROFILE_REQUIRED_GATES, *TEXT_BYTE_UNIT_G0_PROVED_GATES}
+)
 TEXT_BYTE_SCENARIOS = [
     ("run_multiturn_recall", "run_multiturn"),
     ("serve_concurrency_quality", "serve_concurrency_quality"),
@@ -932,9 +941,36 @@ def validate_unit_gate_manifest(
         isinstance(child_pass, str) and child_pass.startswith("G0 SOURCE unit PASS: "),
         "unit source gate PASS line differs",
     )
+    child_artifacts = manifest.get("child_execution_artifacts")
+    child_stdout_rows = [
+        row
+        for row in child_artifacts
+        if isinstance(row, dict) and row.get("path") == "run_gate.child.stdout"
+    ] if isinstance(child_artifacts, list) else []
+    require(
+        len(child_stdout_rows) == 1
+        and set(child_stdout_rows[0]) == {"path", "sha256", "size_bytes"},
+        "unit child stdout reference differs",
+    )
+    child_stdout = root / "run_gate.child.stdout"
+    child_stdout_row = child_stdout_rows[0]
+    child_stdout_lines = child_stdout.read_text(
+        encoding="utf-8", errors="replace"
+    ).splitlines() if child_stdout.is_file() and not child_stdout.is_symlink() else []
+    require(
+        child_stdout.is_file()
+        and not child_stdout.is_symlink()
+        and child_stdout.stat().st_size == child_stdout_row.get("size_bytes")
+        and sha256(child_stdout) == child_stdout_row.get("sha256")
+        and child_stdout_lines.count("G0 VALIDATOR SELFTEST PASS") == 1
+        and child_stdout_lines[-1:] == [child_pass],
+        "unit G0 validator self-test proof differs",
+    )
     return {
         "gate": "unit",
+        "proved_gates": TEXT_BYTE_UNIT_G0_PROVED_GATES,
         "manifest": file_ref(manifest_path),
+        "validator_selftest": file_ref(child_stdout),
         "pass_line": manifest["pass_line"],
         "child_pass_line": child_pass,
     }
@@ -1265,6 +1301,10 @@ def validate_text_byte_scenario_artifact(
         "scenario_count": 6,
         "entrypoints": ["run", "serve"],
         "profile_detail": "off",
+        "proved_gates": [
+            f"{backend}_sentinel",
+            "product_sentinel_dry_run",
+        ],
         "hardware": copy.deepcopy(candidate["hardware"]),
     }
 
@@ -4428,12 +4468,12 @@ def verify_text_byte_contract(
     )
     proved_gates = sorted(
         {
-            unit["gate"],
+            *unit["proved_gates"],
             *exact["proved_gates"],
             *control["gates"],
             docs["gate"],
-            "cuda_sentinel",
-            "metal_sentinel",
+            *scenarios["cuda"]["proved_gates"],
+            *scenarios["metal"]["proved_gates"],
         }
     )
     require(
@@ -4839,8 +4879,15 @@ def self_test() -> int:
         == TEXT_BYTE_EXPECTED_CHECKS
         and text_profile.get("qualified_scopes") == TEXT_BYTE_EXPECTED_SCOPES
         and sorted(text_profile.get("required_gates", []))
-        == TEXT_BYTE_EXPECTED_GATES,
+        == TEXT_BYTE_PROFILE_REQUIRED_GATES,
         "self-test canonical text-byte qualification profile differs",
+    )
+    require(
+        TEXT_BYTE_EXPECTED_GATES
+        == sorted(
+            {*TEXT_BYTE_PROFILE_REQUIRED_GATES, *TEXT_BYTE_UNIT_G0_PROVED_GATES}
+        ),
+        "self-test text-byte scenario control gate closure differs",
     )
     mixed_product_path = "crates/ferrum-engine/src/continuous_engine/inner/decode.rs"
     mixed_changed = sorted([mixed_product_path, *CONTROL_PLANE_PATHS])
