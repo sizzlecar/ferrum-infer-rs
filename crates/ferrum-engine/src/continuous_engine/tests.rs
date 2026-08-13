@@ -12232,6 +12232,48 @@ fn sample_resamples_candidate_that_would_flush_replacement_char() {
 }
 
 #[test]
+fn pending_utf8_fragment_temporarily_requires_full_logits_for_resampling() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(FragmentedUtf8PolicyTokenizer::new());
+    let fire_head = TokenId::new(FragmentedUtf8PolicyTokenizer::FIRE_HEAD);
+    let fire_tail = TokenId::new(FragmentedUtf8PolicyTokenizer::FIRE_TAIL);
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE),
+    );
+
+    state
+        .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), fire_head)
+        .expect("the first half of a valid UTF-8 token pair must remain selectable");
+    assert!(state.pending_decoded_utf8_fragment);
+    assert!(matches!(
+        state.model_decode_logits_policy(),
+        LogitsReturnPolicy::FullLogits
+    ));
+
+    let mut logits = vec![f32::NEG_INFINITY; FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE];
+    logits[b'x' as usize] = 100.0;
+    logits[usize::from(fire_tail)] = 1.0;
+    let sampled = state
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .expect("full-logits fallback must resample the UTF-8 continuation");
+
+    assert_eq!(sampled, fire_tail);
+    assert_eq!(logits[b'x' as usize], f32::NEG_INFINITY);
+    assert!(!state.pending_decoded_utf8_fragment);
+    assert!(matches!(
+        state.model_decode_logits_policy(),
+        LogitsReturnPolicy::GreedyArgmax { .. }
+    ));
+    assert_eq!(
+        tokenizer.decode(&state.generated_tokens, true).unwrap(),
+        "🔥"
+    );
+}
+
+#[test]
 fn sample_candidate_checks_from_streamed_text_boundary() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         7,
