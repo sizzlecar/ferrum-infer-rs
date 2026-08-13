@@ -616,6 +616,14 @@ def cuda_bridge_evidence(root: Path, sampler: dict[str, Any]) -> dict[str, Any] 
         return None
     audit_path: Path = bridge["audit"]
     require(audit_path.is_file() and audit_path.stat().st_size > 0, "CUDA PID bridge audit is missing")
+    real_binary_sha256 = bridge.get("real_binary_sha256")
+    if real_binary_sha256 is None:
+        real_binary_sha256 = file_sha256(bridge["real_binary"])
+    require(
+        isinstance(real_binary_sha256, str)
+        and SHA256_RE.fullmatch(real_binary_sha256) is not None,
+        "CUDA PID bridge real binary identity is invalid",
+    )
     return {
         "contract": CUDA_PID_NAMESPACE_BRIDGE_CONTRACT,
         "bridge_source_path": COLLECTOR_RELATIVE_PATH,
@@ -624,7 +632,7 @@ def cuda_bridge_evidence(root: Path, sampler: dict[str, Any]) -> dict[str, Any] 
         "preflight": artifact_ref(root, bridge["preflight"], kind="cuda-pid-namespace-preflight"),
         "audit": artifact_ref(root, audit_path, kind="cuda-pid-namespace-audit"),
         "real_nvidia_smi_path": str(bridge["real_binary"]),
-        "real_nvidia_smi_sha256": file_sha256(bridge["real_binary"]),
+        "real_nvidia_smi_sha256": real_binary_sha256,
         "server_pid": bridge["server_pid"],
         "server_pgid": bridge["server_pgid"],
         "sampler_environment_sha256": canonical_json_sha256(bridge["environment"]),
@@ -687,6 +695,7 @@ def validate_cuda_bridge_evidence(
             and row.get("collector_sha256") == collector_sha
             and row.get("server_pid") == evidence.get("server_pid")
             and row.get("server_pgid") == evidence.get("server_pgid")
+            and row.get("real_nvidia_smi_path") == evidence.get("real_nvidia_smi_path")
             and row.get("status") == "pass"
             and row.get("real_returncode") == 0
             for row in audit_rows
@@ -1968,7 +1977,12 @@ def cell_resource_evidence(
                 "probe_errors": errors,
             }
         )
-    eligible_ms = sum(row["duration_ms"] for row in interval_rows if row["eligible"])
+    eligible_ms = 0.0
+    total_interval_duration_ms = 0.0
+    for row in interval_rows:
+        total_interval_duration_ms += row["duration_ms"]
+        if row["eligible"]:
+            eligible_ms += row["duration_ms"]
     require(interval_rows and eligible_ms > 0, f"{record['cell_id']} has no eligible active intervals")
     interval_document = {
         "schema_version": SCHEMA_VERSION,
@@ -1979,7 +1993,7 @@ def cell_resource_evidence(
         "measurement_finished_at": record["finished_at"],
         "definition": "adjacent 250ms samples clipped to the measured window; eligible only when both probes are live and error-free; active count is conservative interval minimum",
         "eligible_duration_ms": eligible_ms,
-        "total_interval_duration_ms": sum(row["duration_ms"] for row in interval_rows),
+        "total_interval_duration_ms": total_interval_duration_ms,
         "intervals": interval_rows,
     }
     atomic_write_json(interval_path, interval_document)
@@ -2104,6 +2118,21 @@ def portable_artifact_argv(argv: Any, label: str) -> list[str]:
     require(isinstance(argv, list) and all(isinstance(value, str) for value in argv), f"{label} argv is invalid")
     marker = f"{os.sep}r2-ferrum{os.sep}"
     return [f"<artifact-root>{marker}{value.split(marker, 1)[1]}" if marker in value else value for value in argv]
+
+
+def portable_sampler_argv(argv: Any, label: str) -> list[str]:
+    normalized = portable_artifact_argv(argv, label)
+    sampler_suffix = ("scripts", "release", RESOURCE_SAMPLER_PATH.name)
+    if (
+        len(normalized) >= 2
+        and Path(normalized[0]).is_absolute()
+        and re.fullmatch(r"python3(?:\.\d+)?", Path(normalized[0]).name) is not None
+        and Path(normalized[1]).is_absolute()
+        and tuple(Path(normalized[1]).parts[-len(sampler_suffix) :]) == sampler_suffix
+    ):
+        normalized[0] = "<python3>"
+        normalized[1] = "<source-root>/scripts/release/" + RESOURCE_SAMPLER_PATH.name
+    return normalized
 
 
 def observation_active_envelope(
@@ -2251,22 +2280,99 @@ def restore_checkpoint_cuda_bridge(root: Path, raw: Any, label: str) -> dict[str
     )
     audit = validate_artifact_ref(root, raw.get("audit"), f"{label}.cuda_bridge.audit")
     real_binary_raw = raw.get("real_nvidia_smi_path")
-    require(isinstance(real_binary_raw, str) and real_binary_raw, f"{label} CUDA bridge binary path is invalid")
-    real_binary = Path(real_binary_raw).resolve()
     require(
-        real_binary.is_file() and file_sha256(real_binary) == raw.get("real_nvidia_smi_sha256"),
-        f"{label} CUDA bridge binary changed",
+        isinstance(real_binary_raw, str) and Path(real_binary_raw).is_absolute(),
+        f"{label} CUDA bridge binary path is invalid",
     )
+    real_binary_sha256 = raw.get("real_nvidia_smi_sha256")
+    require(
+        isinstance(real_binary_sha256, str)
+        and SHA256_RE.fullmatch(real_binary_sha256) is not None,
+        f"{label} CUDA bridge binary identity is invalid",
+    )
+    require(
+        preflight_document.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
+        and preflight_document.get("collector_path") == COLLECTOR_RELATIVE_PATH
+        and preflight_document.get("real_nvidia_smi_path") == real_binary_raw
+        and preflight_document.get("real_nvidia_smi_sha256") == real_binary_sha256
+        and preflight_document.get("compute_apps") == []
+        and preflight_document.get("gpu_count") == 1,
+        f"{label} CUDA bridge preflight identity is invalid",
+    )
+    real_binary = Path(real_binary_raw)
     return {
         "wrapper": wrapper,
         "preflight": preflight,
         "audit": audit,
         "real_binary": real_binary,
+        "real_binary_sha256": real_binary_sha256,
         "server_pid": raw.get("server_pid"),
         "server_pgid": raw.get("server_pgid"),
-        "environment": cuda_bridge_sampler_environment(wrapper),
+        "environment": None,
         "collector_sha256": collector_sha256,
     }
+
+
+def restore_checkpoint_cuda_bridge_environment(
+    bridge: dict[str, Any] | None,
+    *,
+    raw_bridge: Any,
+    sampler_argv: Any,
+    observations_ref: Any,
+    base_environment: Any,
+    label: str,
+) -> dict[str, Any] | None:
+    if bridge is None:
+        return None
+    require(isinstance(raw_bridge, dict), f"{label} CUDA bridge checkpoint is invalid")
+    require(
+        isinstance(base_environment, dict)
+        and all(isinstance(key, str) and isinstance(value, str) for key, value in base_environment.items())
+        and isinstance(base_environment.get("PATH"), str),
+        f"{label} CUDA bridge base environment is invalid",
+    )
+    argv = portable_artifact_argv(sampler_argv, f"{label} sampler")
+    out_indexes = [index for index, value in enumerate(argv) if value == "--out"]
+    require(
+        len(out_indexes) == 1 and out_indexes[0] + 1 < len(argv),
+        f"{label} CUDA bridge sampler output path is missing",
+    )
+    recorded_out = sampler_argv[out_indexes[0] + 1]
+    require(
+        isinstance(recorded_out, str) and Path(recorded_out).is_absolute(),
+        f"{label} CUDA bridge sampler output path is invalid",
+    )
+    require(isinstance(observations_ref, dict), f"{label} CUDA bridge observations reference is invalid")
+    observations_relative = observations_ref.get("path")
+    require(
+        isinstance(observations_relative, str)
+        and observations_relative
+        and not Path(observations_relative).is_absolute(),
+        f"{label} CUDA bridge observations path is invalid",
+    )
+    recorded_out_posix = Path(recorded_out).as_posix()
+    observations_suffix = "/" + Path(observations_relative).as_posix()
+    require(
+        recorded_out_posix.endswith(observations_suffix),
+        f"{label} CUDA bridge sampler output origin mismatch",
+    )
+    recorded_root = recorded_out_posix[: -len(observations_suffix)] or "/"
+    wrapper_ref = raw_bridge.get("wrapper")
+    require(isinstance(wrapper_ref, dict), f"{label} CUDA bridge wrapper reference is invalid")
+    wrapper_relative = wrapper_ref.get("path")
+    require(
+        isinstance(wrapper_relative, str)
+        and wrapper_relative
+        and not Path(wrapper_relative).is_absolute(),
+        f"{label} CUDA bridge wrapper path is invalid",
+    )
+    recorded_wrapper = Path(recorded_root) / wrapper_relative
+    environment = copy.deepcopy(base_environment)
+    environment["PATH"] = (
+        f"{recorded_wrapper.parent.as_posix()}{os.pathsep}{environment['PATH']}"
+    )
+    bridge["environment"] = dict(sorted(environment.items()))
+    return bridge
 
 
 def make_completed_cell_checkpoint(
@@ -2650,6 +2756,17 @@ def validate_completed_cell_checkpoint(
         and record.get("candidate_binary_sha256") == inputs["binary"]["sha256"],
         f"{identifier} checkpoint benchmark binding mismatch",
     )
+    record_environment = record.get("environment")
+    require(
+        isinstance(record_environment, dict)
+        and all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in record_environment.items()
+        )
+        and record.get("environment_sha256")
+        == canonical_json_sha256(record_environment),
+        f"{identifier} checkpoint benchmark environment identity mismatch",
+    )
     for key in ("stdout", "stderr"):
         validate_artifact_ref(root, record.get(key), f"{identifier}.{key}")
     request_path = validate_artifact_ref(
@@ -2664,8 +2781,8 @@ def validate_completed_cell_checkpoint(
     )
     observations = validate_artifact_ref(root, sampler_document.get("observations"), f"{identifier}.observations")
     require(
-        portable_artifact_argv(sampler_document.get("argv"), f"{identifier} sampler")
-        == portable_artifact_argv(
+        portable_sampler_argv(sampler_document.get("argv"), f"{identifier} sampler")
+        == portable_sampler_argv(
             cell_sampler_argv(attempt_dir, epoch, config, cell),
             f"{identifier} expected sampler",
         ),
@@ -2717,12 +2834,22 @@ def validate_completed_cell_checkpoint(
             f"{identifier} checkpoint has neither failed-attempt cleanup nor a clean finalized epoch",
         )
         epoch_session["finished_at"] = finalized_session["finished_at"]
+    raw_cuda_bridge = sampler_document.get("cuda_pid_namespace_bridge")
+    restored_cuda_bridge = restore_checkpoint_cuda_bridge(
+        root, raw_cuda_bridge, identifier
+    )
+    restored_cuda_bridge = restore_checkpoint_cuda_bridge_environment(
+        restored_cuda_bridge,
+        raw_bridge=raw_cuda_bridge,
+        sampler_argv=sampler_document.get("argv"),
+        observations_ref=sampler_document.get("observations"),
+        base_environment=record_environment,
+        label=identifier,
+    )
     sampler = {
         "argv": copy.deepcopy(sampler_document.get("argv")),
         "observations": observations,
-        "cuda_pid_namespace_bridge": restore_checkpoint_cuda_bridge(
-            root, sampler_document.get("cuda_pid_namespace_bridge"), identifier
-        ),
+        "cuda_pid_namespace_bridge": restored_cuda_bridge,
     }
     record = copy.deepcopy(record)
     record["resources"] = cell_resource_evidence(root, epoch_session, record, sampler, config)
@@ -2963,7 +3090,11 @@ def validate_server_bundle(
             resources,
             backend=config["backend"],
             label=f"formal_reports[{index}].resources",
-            expected_collector_sha256=(legacy_epoch or {}).get("collector_sha256"),
+            expected_collector_sha256=(
+                (legacy_epoch or {}).get("collector_sha256")
+                if legacy_single_epoch
+                else checkpoint_documents[index - 1]["collection_epoch"]["collector_sha256"]
+            ),
         )
     parity_path = validate_artifact_ref(root, parity.get("raw_report"), "run_serve_parity_report.raw_report")
     require(parity.get("session_id") in epoch_session_ids, "run/serve parity report has an unknown epoch")
@@ -2978,7 +3109,11 @@ def validate_server_bundle(
         parity.get("resources", {}),
         backend=config["backend"],
         label="run_serve_parity_report.resources",
-        expected_collector_sha256=(legacy_epoch or {}).get("collector_sha256"),
+        expected_collector_sha256=(
+            (legacy_epoch or {}).get("collector_sha256")
+            if legacy_single_epoch
+            else checkpoint_documents[-1]["collection_epoch"]["collector_sha256"]
+        ),
     )
     for key in ("runtime_log", "scheduler_trace", "product_effective_config"):
         validate_artifact_ref(root, session.get(key), f"session.{key}")
@@ -3998,6 +4133,45 @@ def self_test() -> int:
         and captured_process_epoch is not PROCESS_COLLECTION_EPOCH,
         "process collection epoch is not frozen and copy-safe",
     )
+    remote_sampler_argv = [
+        "/usr/bin/python3",
+        "/workspace/ferrum-infer-rs/scripts/release/runtime_vnext_resource_sampler.py",
+        "--out",
+        "/workspace/artifacts/runtime-vnext/r2-ferrum/m2/cuda/random-c1.resource-observations.jsonl",
+        "--pid",
+        "123",
+        "--max-duration-sec",
+        "7320",
+    ]
+    local_sampler_argv = [
+        sys.executable,
+        str(RESOURCE_SAMPLER_PATH),
+        "--out",
+        "/tmp/runtime-vnext/r2-ferrum/m2/cuda/random-c1.resource-observations.jsonl",
+        "--pid",
+        "123",
+        "--max-duration-sec",
+        "7320",
+    ]
+    require(
+        portable_sampler_argv(remote_sampler_argv, "remote sampler")
+        == portable_sampler_argv(local_sampler_argv, "local sampler"),
+        "relocated sampler argv normalization self-test failed",
+    )
+    for index, replacement in (
+        (0, "/usr/bin/bash"),
+        (1, "/workspace/ferrum-infer-rs/scripts/release/other_sampler.py"),
+        (3, "/workspace/artifacts/runtime-vnext/r2-ferrum/m2/cuda/other.jsonl"),
+        (5, "124"),
+        (7, "7319"),
+    ):
+        rejected_sampler_argv = copy.deepcopy(remote_sampler_argv)
+        rejected_sampler_argv[index] = replacement
+        require(
+            portable_sampler_argv(rejected_sampler_argv, "rejected sampler")
+            != portable_sampler_argv(local_sampler_argv, "local sampler"),
+            "relocated sampler argv negative self-test failed",
+        )
     reviewed_epoch = {
         identity_key: next(iter(reviewed_git_blob_sha256s(relative_path)))
         for identity_key, relative_path in COLLECTION_EPOCH_SOURCE_PATHS.items()
@@ -4329,41 +4503,94 @@ def self_test() -> int:
         bridge_wrapper = bridge_dir / "nvidia-smi"
         bridge_preflight = bridge_dir / "preflight.json"
         bridge_audit = bridge_dir / "audit.jsonl"
+        bridge_observations = resume_dir / "bridge-observations.jsonl"
         atomic_write_text(bridge_wrapper, "#!/bin/sh\nexit 0\n")
         atomic_write_json(
             bridge_preflight,
             {
-                "status": "idle",
+                "contract": CUDA_PID_NAMESPACE_BRIDGE_CONTRACT,
+                "collector_path": COLLECTOR_RELATIVE_PATH,
                 "collector_sha256": PROCESS_COLLECTION_EPOCH["collector_sha256"],
+                "real_nvidia_smi_path": "/remote-host/usr/bin/nvidia-smi",
+                "real_nvidia_smi_sha256": "a" * 64,
+                "compute_apps": [],
+                "gpu_count": 1,
             },
         )
         atomic_write_text(bridge_audit, '{"status":"mapped"}\n')
-        real_nvidia_smi = Path("/usr/bin/true").resolve()
+        atomic_write_text(bridge_observations, "{}\n")
+        real_nvidia_smi = Path("/remote-host/usr/bin/nvidia-smi")
+        require(not real_nvidia_smi.exists(), "relocated CUDA bridge fixture unexpectedly exists locally")
+        bridge_checkpoint = {
+            "wrapper": artifact_ref(
+                root, bridge_wrapper, kind="cuda-pid-namespace-wrapper"
+            ),
+            "preflight": artifact_ref(
+                root, bridge_preflight, kind="cuda-pid-namespace-preflight"
+            ),
+            "audit": artifact_ref(
+                root, bridge_audit, kind="cuda-pid-namespace-audit"
+            ),
+            "real_nvidia_smi_path": str(real_nvidia_smi),
+            "real_nvidia_smi_sha256": "a" * 64,
+            "server_pid": 101,
+            "server_pgid": 101,
+        }
         restored_bridge = restore_checkpoint_cuda_bridge(
             root,
-            {
-                "wrapper": artifact_ref(
-                    root, bridge_wrapper, kind="cuda-pid-namespace-wrapper"
-                ),
-                "preflight": artifact_ref(
-                    root, bridge_preflight, kind="cuda-pid-namespace-preflight"
-                ),
-                "audit": artifact_ref(
-                    root, bridge_audit, kind="cuda-pid-namespace-audit"
-                ),
-                "real_nvidia_smi_path": str(real_nvidia_smi),
-                "real_nvidia_smi_sha256": file_sha256(real_nvidia_smi),
-                "server_pid": 101,
-                "server_pgid": 101,
-            },
+            bridge_checkpoint,
             "selftest CUDA bridge",
+        )
+        bridge_observations_ref = artifact_ref(
+            root, bridge_observations, kind="resource-observations"
+        )
+        bridge_sampler_argv = [
+            "/usr/bin/python3",
+            "/remote-source/scripts/release/runtime_vnext_resource_sampler.py",
+            "--out",
+            "/remote-artifacts/" + bridge_observations_ref["path"],
+        ]
+        bridge_base_environment = {"PATH": "/usr/bin", "TERM": "screen"}
+        restored_bridge = restore_checkpoint_cuda_bridge_environment(
+            restored_bridge,
+            raw_bridge=bridge_checkpoint,
+            sampler_argv=bridge_sampler_argv,
+            observations_ref=bridge_observations_ref,
+            base_environment=bridge_base_environment,
+            label="selftest CUDA bridge",
         )
         require(
             restored_bridge is not None
             and restored_bridge["environment"]
-            == cuda_bridge_sampler_environment(bridge_wrapper),
+            == {
+                "PATH": "/remote-artifacts/resume/cuda-bridge:/usr/bin",
+                "TERM": "screen",
+            },
             "restored CUDA bridge sampler environment self-test failed",
         )
+        restored_evidence = cuda_bridge_evidence(
+            root, {"cuda_pid_namespace_bridge": restored_bridge}
+        )
+        require(
+            restored_evidence is not None
+            and restored_evidence["real_nvidia_smi_path"] == str(real_nvidia_smi)
+            and restored_evidence["real_nvidia_smi_sha256"] == "a" * 64,
+            "relocated CUDA bridge binary identity self-test failed",
+        )
+        for field, replacement in (
+            ("real_nvidia_smi_path", "/other-host/usr/bin/nvidia-smi"),
+            ("real_nvidia_smi_sha256", "b" * 64),
+        ):
+            rejected_bridge = copy.deepcopy(bridge_checkpoint)
+            rejected_bridge[field] = replacement
+            try:
+                restore_checkpoint_cuda_bridge(root, rejected_bridge, "rejected CUDA bridge")
+                raise R2CollectorError("mismatched CUDA bridge identity unexpectedly passed")
+            except R2CollectorError as exc:
+                require(
+                    "preflight identity" in str(exc),
+                    "mismatched CUDA bridge failed for the wrong reason",
+                )
         observations = resume_dir / "cell.resource-observations.jsonl"
         observation_rows = [
             {
