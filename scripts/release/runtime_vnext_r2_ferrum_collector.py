@@ -262,6 +262,17 @@ def file_sha256(path: Path) -> str:
     return collector_support.file_sha256(path)
 
 
+PROCESS_COLLECTION_EPOCH = {
+    "collector_sha256": file_sha256(COLLECTOR_PATH),
+    "support_sha256": file_sha256(SUPPORT_PATH),
+    "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+}
+
+
+def process_collection_epoch() -> dict[str, str]:
+    return copy.deepcopy(PROCESS_COLLECTION_EPOCH)
+
+
 def canonical_json_sha256(value: Any) -> str:
     return collector_support.canonical_json_sha256(value)
 
@@ -380,19 +391,23 @@ def cuda_pid_namespace_bridge(args: argparse.Namespace) -> int:
         "contract": CUDA_PID_NAMESPACE_BRIDGE_CONTRACT,
         "observed_at": now_iso(),
         "collector_path": COLLECTOR_RELATIVE_PATH,
-        "collector_sha256": file_sha256(COLLECTOR_PATH),
+        "collector_sha256": args.bridge_collector_sha256,
         "server_pid": args.bridge_server_pid,
         "server_pgid": args.bridge_server_pgid,
         "nvidia_smi_argv": child_argv,
         "status": "reject",
     }
     try:
+        require(
+            args.bridge_collector_sha256 == file_sha256(COLLECTOR_PATH),
+            "CUDA bridge collector source changed after the parent process started",
+        )
         real_binary = args.real_nvidia_smi.expanduser().resolve()
         require(real_binary.is_file(), f"real nvidia-smi is missing: {real_binary}")
         preflight = read_json(args.bridge_preflight.expanduser().resolve())
         require(
             preflight.get("contract") == CUDA_PID_NAMESPACE_BRIDGE_CONTRACT
-            and preflight.get("collector_sha256") == file_sha256(COLLECTOR_PATH)
+            and preflight.get("collector_sha256") == args.bridge_collector_sha256
             and preflight.get("real_nvidia_smi_path") == str(real_binary)
             and preflight.get("real_nvidia_smi_sha256") == file_sha256(real_binary)
             and preflight.get("gpu_count") == 1
@@ -484,7 +499,7 @@ def capture_cuda_bridge_preflight(attempt_dir: Path) -> dict[str, Any]:
         "artifact_type": "runtime_vnext_r2_cuda_pid_namespace_preflight",
         "captured_at": now_iso(),
         "collector_path": COLLECTOR_RELATIVE_PATH,
-        "collector_sha256": file_sha256(COLLECTOR_PATH),
+        "collector_sha256": PROCESS_COLLECTION_EPOCH["collector_sha256"],
         "real_nvidia_smi_path": str(real_binary),
         "real_nvidia_smi_sha256": file_sha256(real_binary),
         "compute_query": [str(real_binary), *CUDA_COMPUTE_QUERY],
@@ -553,6 +568,8 @@ def prepare_cuda_bridge(
         sys.executable,
         str(COLLECTOR_PATH),
         "--cuda-pid-namespace-bridge",
+        "--bridge-collector-sha256",
+        PROCESS_COLLECTION_EPOCH["collector_sha256"],
         "--real-nvidia-smi",
         str(preflight["real_binary"]),
         "--bridge-server-pid",
@@ -581,6 +598,7 @@ def prepare_cuda_bridge(
         "server_pid": pid,
         "server_pgid": pgid,
         "environment": environment,
+        "collector_sha256": PROCESS_COLLECTION_EPOCH["collector_sha256"],
     }
 
 
@@ -601,7 +619,7 @@ def cuda_bridge_evidence(root: Path, sampler: dict[str, Any]) -> dict[str, Any] 
     return {
         "contract": CUDA_PID_NAMESPACE_BRIDGE_CONTRACT,
         "bridge_source_path": COLLECTOR_RELATIVE_PATH,
-        "bridge_source_sha256": file_sha256(COLLECTOR_PATH),
+        "bridge_source_sha256": bridge["collector_sha256"],
         "wrapper": artifact_ref(root, bridge["wrapper"], kind="cuda-pid-namespace-wrapper"),
         "preflight": artifact_ref(root, bridge["preflight"], kind="cuda-pid-namespace-preflight"),
         "audit": artifact_ref(root, audit_path, kind="cuda-pid-namespace-audit"),
@@ -627,7 +645,7 @@ def validate_cuda_bridge_evidence(
         require(evidence is None, f"{label} unexpectedly contains a CUDA PID bridge")
         return
     require(isinstance(evidence, dict), f"{label} CUDA PID bridge evidence is missing")
-    collector_sha = expected_collector_sha256 or file_sha256(COLLECTOR_PATH)
+    collector_sha = expected_collector_sha256 or PROCESS_COLLECTION_EPOCH["collector_sha256"]
     require(
         isinstance(collector_sha, str) and SHA256_RE.fullmatch(collector_sha) is not None,
         f"{label} expected CUDA PID bridge collector identity is invalid",
@@ -1094,9 +1112,9 @@ def collection_fingerprint(
 ) -> str:
     material = {
         "contract": CONTRACT,
-        "collector_sha256": collector_sha256 or file_sha256(COLLECTOR_PATH),
-        "support_sha256": support_sha256 or file_sha256(SUPPORT_PATH),
-        "resource_sampler_sha256": resource_sampler_sha256 or file_sha256(RESOURCE_SAMPLER_PATH),
+        "collector_sha256": collector_sha256 or PROCESS_COLLECTION_EPOCH["collector_sha256"],
+        "support_sha256": support_sha256 or PROCESS_COLLECTION_EPOCH["support_sha256"],
+        "resource_sampler_sha256": resource_sampler_sha256 or PROCESS_COLLECTION_EPOCH["resource_sampler_sha256"],
         "models_lock_sha256": file_sha256(context["models_lock_path"]),
         "correctness_manifest_sha256": file_sha256(context["correctness_path"]),
         "candidate_binary_sha256": file_sha256(context["binary_path"]),
@@ -1131,11 +1149,11 @@ def prepare_plan(root: Path, config: dict[str, Any], context: dict[str, Any], *,
         "artifact_type": "runtime_vnext_r2_ferrum_collection_plan",
         "collector": {
             "path": COLLECTOR_RELATIVE_PATH,
-            "sha256": file_sha256(COLLECTOR_PATH),
+            "sha256": PROCESS_COLLECTION_EPOCH["collector_sha256"],
             "support_path": SUPPORT_PATH.relative_to(REPO_ROOT).as_posix(),
-            "support_sha256": file_sha256(SUPPORT_PATH),
+            "support_sha256": PROCESS_COLLECTION_EPOCH["support_sha256"],
             "resource_sampler_path": RESOURCE_SAMPLER_PATH.relative_to(REPO_ROOT).as_posix(),
-            "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
+            "resource_sampler_sha256": PROCESS_COLLECTION_EPOCH["resource_sampler_sha256"],
         },
         "config_fingerprint": fingerprint,
         "config": artifact_ref(root, normalized_path, kind="normalized-config"),
@@ -2225,6 +2243,12 @@ def restore_checkpoint_cuda_bridge(root: Path, raw: Any, label: str) -> dict[str
     require(isinstance(raw, dict), f"{label} CUDA bridge checkpoint is invalid")
     wrapper = validate_artifact_ref(root, raw.get("wrapper"), f"{label}.cuda_bridge.wrapper")
     preflight = validate_artifact_ref(root, raw.get("preflight"), f"{label}.cuda_bridge.preflight")
+    preflight_document = read_json(preflight)
+    collector_sha256 = preflight_document.get("collector_sha256")
+    require(
+        isinstance(collector_sha256, str) and SHA256_RE.fullmatch(collector_sha256) is not None,
+        f"{label} CUDA bridge collector identity is invalid",
+    )
     audit = validate_artifact_ref(root, raw.get("audit"), f"{label}.cuda_bridge.audit")
     real_binary_raw = raw.get("real_nvidia_smi_path")
     require(isinstance(real_binary_raw, str) and real_binary_raw, f"{label} CUDA bridge binary path is invalid")
@@ -2241,6 +2265,7 @@ def restore_checkpoint_cuda_bridge(root: Path, raw: Any, label: str) -> dict[str
         "server_pid": raw.get("server_pid"),
         "server_pgid": raw.get("server_pgid"),
         "environment": cuda_bridge_sampler_environment(wrapper),
+        "collector_sha256": collector_sha256,
     }
 
 
@@ -2262,11 +2287,7 @@ def make_completed_cell_checkpoint(
     sequence = record["sequence"]
     path = checkpoint_path(lane, sequence)
     probe = checkpoint_probe_refs(root, quiescence["probe"], f"cell {sequence}")
-    identities = collection_epoch or {
-        "collector_sha256": file_sha256(COLLECTOR_PATH),
-        "support_sha256": file_sha256(SUPPORT_PATH),
-        "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
-    }
+    identities = collection_epoch or process_collection_epoch()
     require(
         set(identities) == {"collector_sha256", "support_sha256", "resource_sampler_sha256"}
         and all(isinstance(value, str) and SHA256_RE.fullmatch(value) is not None for value in identities.values()),
@@ -3171,11 +3192,7 @@ def collect_server_session(
                 {
                     "kind": "current-server-session",
                     "session_id": session["session_id"],
-                    "collection_epoch": {
-                        "collector_sha256": file_sha256(COLLECTOR_PATH),
-                        "support_sha256": file_sha256(SUPPORT_PATH),
-                        "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
-                    },
+                    "collection_epoch": process_collection_epoch(),
                     "completed_cell_sequences": [record["sequence"] for record in new_records],
                 }
             ],
@@ -3632,11 +3649,7 @@ def collect_run_sample(
                 "schema_version": SCHEMA_VERSION,
                 "contract": CONTRACT,
                 "config_fingerprint": fingerprint,
-                "collection_epoch": {
-                    "collector_sha256": file_sha256(COLLECTOR_PATH),
-                    "support_sha256": file_sha256(SUPPORT_PATH),
-                    "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
-                },
+                "collection_epoch": process_collection_epoch(),
                 "sample": sample,
             }
             bundle_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3979,6 +3992,12 @@ def synthetic_bench_report(config: dict[str, Any], cell: dict[str, Any]) -> dict
 
 def self_test() -> int:
     template = config_template()
+    captured_process_epoch = process_collection_epoch()
+    require(
+        captured_process_epoch == PROCESS_COLLECTION_EPOCH
+        and captured_process_epoch is not PROCESS_COLLECTION_EPOCH,
+        "process collection epoch is not frozen and copy-safe",
+    )
     reviewed_epoch = {
         identity_key: next(iter(reviewed_git_blob_sha256s(relative_path)))
         for identity_key, relative_path in COLLECTION_EPOCH_SOURCE_PATHS.items()
@@ -4311,7 +4330,13 @@ def self_test() -> int:
         bridge_preflight = bridge_dir / "preflight.json"
         bridge_audit = bridge_dir / "audit.jsonl"
         atomic_write_text(bridge_wrapper, "#!/bin/sh\nexit 0\n")
-        atomic_write_json(bridge_preflight, {"status": "idle"})
+        atomic_write_json(
+            bridge_preflight,
+            {
+                "status": "idle",
+                "collector_sha256": PROCESS_COLLECTION_EPOCH["collector_sha256"],
+            },
+        )
         atomic_write_text(bridge_audit, '{"status":"mapped"}\n')
         real_nvidia_smi = Path("/usr/bin/true").resolve()
         restored_bridge = restore_checkpoint_cuda_bridge(
@@ -4533,6 +4558,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exec-barrier-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--release-file", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--cuda-pid-namespace-bridge", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--bridge-collector-sha256", help=argparse.SUPPRESS)
     parser.add_argument("--real-nvidia-smi", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--bridge-server-pid", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--bridge-server-pgid", type=int, help=argparse.SUPPRESS)
@@ -4547,6 +4573,8 @@ def main() -> int:
     if args.cuda_pid_namespace_bridge:
         require(
             args.real_nvidia_smi is not None
+            and isinstance(args.bridge_collector_sha256, str)
+            and SHA256_RE.fullmatch(args.bridge_collector_sha256) is not None
             and isinstance(args.bridge_server_pid, int)
             and args.bridge_server_pid > 0
             and isinstance(args.bridge_server_pgid, int)
