@@ -119,6 +119,7 @@ R2_CONTROL_PLANE_FILES = frozenset(
         "docs/goals/runtime-vnext-0.8.0-2026-07-10/METAL_HOST_GLOBAL_SWAP_NOISE_AMENDMENT_2026-08-13.md",
         "docs/goals/runtime-vnext-0.8.0-2026-07-10/PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md",
         "scripts/release/bounded_command.py",
+        "scripts/release/runtime_vnext_change_impact_qualification.py",
         "scripts/release/runtime_vnext_r2_ferrum_collector.py",
         "scripts/release/runtime_vnext_r2_ferrum_terminal_recovery.py",
         "scripts/release/runtime_vnext_r2_performance_build_profile.py",
@@ -5597,6 +5598,11 @@ def self_test() -> None:
     require(
         "scripts/release/bounded_command.py" in R2_CONTROL_PLANE_FILES,
         "bounded command must remain an R2 evidence-control-plane file",
+    )
+    require(
+        "scripts/release/runtime_vnext_change_impact_qualification.py"
+        in R2_CONTROL_PLANE_FILES,
+        "change-impact qualification must remain an R2 evidence-control-plane file",
     )
 
     def occupancy_counter(
