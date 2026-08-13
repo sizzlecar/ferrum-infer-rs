@@ -314,6 +314,11 @@ pub struct SequenceState {
     pub argmax_token_mask: Option<TokenSelectionMask>,
     /// First-token variant that also applies `initial_forbidden_token_ids`.
     pub initial_argmax_token_mask: Option<TokenSelectionMask>,
+    /// A byte-level token may decode to a trailing replacement character
+    /// until a later token supplies the remaining UTF-8 bytes.  The next
+    /// step needs full logits so the engine can reject candidates that would
+    /// flush that incomplete fragment into user-visible output.
+    pub pending_decoded_utf8_fragment: bool,
     /// Bytes of decoded `generated_tokens` already flushed via the stream
     /// channel. Used by `send_stream_update` to compute per-call delta from
     /// the full-history decode, so multi-byte UTF-8 sequences (Chinese chars,
@@ -818,6 +823,7 @@ impl SequenceState {
             stop_text_seqs,
             argmax_token_mask,
             initial_argmax_token_mask,
+            pending_decoded_utf8_fragment: false,
             streamed_text_len: 0,
         })
     }
@@ -1328,6 +1334,7 @@ impl SequenceState {
             && params.tfs.is_none()
             && params.typical_p.is_none()
             && params.mirostat.is_none()
+            && !self.pending_decoded_utf8_fragment
             && self.structured_output_processor.is_none()
             && matches!(params.response_format, ResponseFormat::Text)
     }
@@ -1445,6 +1452,17 @@ impl SequenceState {
         self.accept_response_completion_token(tokenizer, token)?;
         self.generated_tokens.push(token);
         self.sampling_history.record(token);
+        self.pending_decoded_utf8_fragment = tokenizer.is_some_and(|tokenizer| {
+            tokenizer
+                .decode(&self.generated_tokens, true)
+                .map(|text| {
+                    self.streamed_text_len <= text.len()
+                        && text.is_char_boundary(self.streamed_text_len)
+                        && text[self.streamed_text_len..].contains('\u{FFFD}')
+                        && text.ends_with('\u{FFFD}')
+                })
+                .unwrap_or(true)
+        });
         Ok(())
     }
 
