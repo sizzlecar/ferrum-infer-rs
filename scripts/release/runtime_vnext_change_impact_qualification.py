@@ -1636,7 +1636,12 @@ def _validate_raw_execution_v1(
                     isinstance(event, dict),
                     f"{check_id} profile event {line_number} is not an object",
                 )
-                profile_events.append(event)
+                # Legacy startup-identity qualifications still stream-parse and
+                # validate every row, but never consume the full event list.
+                # Retaining a multi-gigabyte profile here made cumulative R1
+                # verification use several times the evidence size in memory.
+                if require_timing_metrics:
+                    profile_events.append(event)
                 attributes = event.get("attributes")
                 request_id = event.get("request_id")
                 if (
