@@ -179,6 +179,11 @@ def canonical_json_sha256(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def canonical_json_equal(left: Any, right: Any) -> bool:
+    """Compare evidence after applying the JSON representation used on disk."""
+    return canonical_json_sha256(left) == canonical_json_sha256(right)
+
+
 def collector_canonical_json_sha256(value: Any) -> str:
     """Match the checked-in Ferrum performance collector hash encoding."""
     payload = json.dumps(
@@ -5170,7 +5175,9 @@ def validate_profile_aggregate(
             raise R2Error(f"profile {backend} raw contract failed: {error}") from error
         require(
             recomputed_overhead == child.get("overhead")
-            and recomputed_contract == child.get("profile_contract")
+            and canonical_json_equal(
+                recomputed_contract, child.get("profile_contract")
+            )
             and replay_row["run_summary"]["content_sha256"]
             == full_row["run_summary"]["content_sha256"],
             f"profile {backend} overhead/identity summary is not raw-derived",
@@ -5653,6 +5660,20 @@ def expect_reject(action: Callable[[], Any], label: str) -> None:
 
 
 def self_test() -> None:
+    require(
+        canonical_json_equal(
+            {"plan_ids": ("plan/sha256/example",)},
+            {"plan_ids": ["plan/sha256/example"]},
+        ),
+        "profile contract JSON round-trip changed semantic equality",
+    )
+    require(
+        not canonical_json_equal(
+            {"plan_ids": ("plan/sha256/example",)},
+            {"plan_ids": ["plan/sha256/different"]},
+        ),
+        "profile contract JSON equality accepted different plan identity",
+    )
     require(
         "scripts/release/bounded_command.py" in R2_CONTROL_PLANE_FILES,
         "bounded command must remain an R2 evidence-control-plane file",
