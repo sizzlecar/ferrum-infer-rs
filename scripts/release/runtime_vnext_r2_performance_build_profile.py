@@ -4174,18 +4174,14 @@ def floor_catalog_from_collectors(
     """Create a deterministic calibration catalog from six immutable collectors."""
     require(set(paths) == set(LANE_KEYS), "floor template requires six performance lanes")
     lanes: dict[str, dict[str, Any]] = {}
-    common_source: dict[str, Any] | None = None
     for lane_key, (model_key, backend) in LANE_KEYS.items():
         lane = lane_loader(
             paths[lane_key],
             expected_model=model_key,
             expected_backend=backend,
-            expected_source=common_source,
+            expected_source=None,
         )
-        if common_source is None:
-            common_source = lane["source"]
         lanes[lane_key] = lane
-    require(common_source is not None, "floor template source is missing")
     frozen_dt = max(
         datetime.fromisoformat(lane["created_at"].replace("Z", "+00:00"))
         for lane in lanes.values()
@@ -5400,10 +5396,6 @@ def validate_inputs(
     validate_performance_hardware_cohort(lanes)
     profile = profile_validator(paths["profile"], source=source, r1=r1)
     build = validate_build(paths["build"], source=source, verifier=build_verifier)
-    candidate_sources = {
-        canonical_json_sha256(row["source"]) for row in lanes.values()
-    }
-    require(len(candidate_sources) == 1, "six performance lanes must share one candidate source")
     accepted = acceptance(lanes, profile, build, floor_summary)
     return {
         "r1": r1,
@@ -6939,6 +6931,68 @@ def self_test() -> None:
             write_json(root / "manifest.json", manifest, exclusive=True)
             performance_paths[lane_key] = root
 
+        mixed_floor_lane_key = "m2_cuda"
+
+        def load_mixed_calibration_lane(
+            path: Path, **kwargs: Any
+        ) -> dict[str, Any]:
+            lane = load_calibration_lane(path, **kwargs)
+            if path.resolve() == performance_paths[mixed_floor_lane_key].resolve():
+                lane["source"] = copy.deepcopy(prior_source)
+            return lane
+
+        mixed_catalog_path = temp / "mixed-source-floor-catalog.json"
+        mixed_catalog = floor_catalog_from_collectors(
+            performance_paths, lane_loader=load_mixed_calibration_lane
+        )
+        mixed_collectors = {
+            row["lane_key"]: row["manifest_sha256"]
+            for row in mixed_catalog["collectors"]
+        }
+        for floor_row in mixed_catalog["rows"]:
+            key = floor_row["key"]
+            lane_key = f"{key['model_key'].split('-', 1)[0]}_{key['backend']}"
+            expected_row_source = (
+                prior_source if lane_key == mixed_floor_lane_key else source
+            )
+            require(
+                floor_row["source_git_sha"] == expected_row_source["git_sha"]
+                and floor_row["collector_manifest_sha256"]
+                == mixed_collectors[lane_key],
+                f"mixed-source floor identity differs for {lane_key}",
+            )
+        write_floor_catalog_template(
+            performance_paths,
+            mixed_catalog_path,
+            lane_loader=load_mixed_calibration_lane,
+        )
+        require(
+            read_json(mixed_catalog_path, "mixed-source floor catalog")
+            == mixed_catalog,
+            "mixed-source floor template differs from its deterministic catalog",
+        )
+        bad_collector_catalog = copy.deepcopy(mixed_catalog)
+        bad_collector_catalog["rows"][0]["collector_manifest_sha256"] = (
+            mixed_collectors[mixed_floor_lane_key]
+        )
+        canonical_scope = copy.deepcopy(bad_collector_catalog)
+        canonical_scope.pop("canonical_sha256")
+        bad_collector_catalog["canonical_sha256"] = canonical_json_sha256(
+            canonical_scope
+        )
+        bad_collector_catalog_path = temp / "bad-collector-floor-catalog.json"
+        write_json(
+            bad_collector_catalog_path,
+            bad_collector_catalog,
+            exclusive=True,
+        )
+        expect_reject(
+            lambda: validate_floor_catalog(
+                bad_collector_catalog_path, require_checked_in=False
+            ),
+            "mixed-source floor row collector binding",
+        )
+
         catalog_path = temp / "generated-floor-catalog.json"
         first_catalog = floor_catalog_from_collectors(
             performance_paths, lane_loader=load_calibration_lane
@@ -7184,6 +7238,97 @@ def self_test() -> None:
             and dependencies["acceptance"]["measured_request_count"] == 7380
             and dependencies["acceptance"]["run_sample_count"] == 18,
             "positive fixture denominator differs",
+        )
+
+        def mixed_source_performance_validator(
+            cumulative_lane_source: dict[str, Any],
+        ) -> Callable[..., dict[str, Any]]:
+            def validator(path: Path, **kwargs: Any) -> dict[str, Any]:
+                row = validate_selftest_performance_lane(path, **kwargs)
+                backend = str(kwargs["expected_backend"])
+                lane_key = (
+                    f"{str(kwargs['expected_model']).split('-', 1)[0]}_{backend}"
+                )
+                authenticated_r1 = copy.deepcopy(kwargs["r1"])
+                authenticated_r1["cumulative_profile_off_evidence"] = {
+                    "mode": "cumulative-r1-prior-full-profile-off",
+                    "source": copy.deepcopy(prior_source),
+                    "r1_child_manifest": copy.deepcopy(prior_child_ref),
+                    "impact_qualification": copy.deepcopy(qualification_ref),
+                    "backend_binary_sha256": copy.deepcopy(evidence_binaries),
+                    "backend_hardware_id": copy.deepcopy(hardware),
+                }
+                if lane_key == mixed_floor_lane_key:
+                    lane_authority = {
+                        "profile_detail": "off",
+                        "source": copy.deepcopy(cumulative_lane_source),
+                        "binary_sha256": evidence_binaries[backend],
+                        "correctness_manifest_sha256": prior_child_ref["sha256"],
+                    }
+                else:
+                    lane_authority = {
+                        "profile_detail": "off",
+                        "source": copy.deepcopy(row["source"]),
+                        "binary_sha256": row["binary_sha256"],
+                        "correctness_manifest_sha256": authenticated_r1[
+                            "child_manifest"
+                        ]["sha256"],
+                    }
+                closure = performance_lane_r1_source_closure(
+                    lane_authority,
+                    kwargs["source"],
+                    authenticated_r1,
+                    backend,
+                )
+                row["source"] = lane_authority["source"]
+                row["source_closure"] = closure
+                row["binary_sha256"] = lane_authority["binary_sha256"]
+                return row
+
+            return validator
+
+        mixed_dependencies = validate_inputs(
+            paths,
+            source,
+            require_checked_in_catalog=False,
+            r1_verifier=r1_verifier,
+            build_verifier=build_verifier,
+            performance_validator=mixed_source_performance_validator(prior_source),
+            profile_validator=validate_profile,
+        )
+        require(
+            {
+                canonical_json_sha256(row["source"])
+                for row in mixed_dependencies["performance"].values()
+            }
+            == {
+                canonical_json_sha256(source),
+                canonical_json_sha256(prior_source),
+            }
+            and mixed_dependencies["performance"][mixed_floor_lane_key][
+                "source_closure"
+            ]["policy"]
+            == "cumulative-r1-prior-full-profile-off",
+            "authenticated mixed-source aggregate differs",
+        )
+        arbitrary_stale_source = {
+            "git_sha": "e" * 40,
+            "git_tree_sha": "f" * 40,
+            "dirty": False,
+        }
+        expect_reject(
+            lambda: validate_inputs(
+                paths,
+                source,
+                require_checked_in_catalog=False,
+                r1_verifier=r1_verifier,
+                build_verifier=build_verifier,
+                performance_validator=mixed_source_performance_validator(
+                    arbitrary_stale_source
+                ),
+                profile_validator=validate_profile,
+            ),
+            "aggregate arbitrary stale performance source",
         )
         replacement_cuda_lanes: dict[str, dict[str, Any]] = {}
         for ordinal, (key, (_, backend)) in enumerate(LANE_KEYS.items(), start=1):
