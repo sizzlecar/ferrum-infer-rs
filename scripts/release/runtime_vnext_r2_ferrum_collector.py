@@ -58,14 +58,6 @@ MODEL_KEYS = {
     "m2-qwen35-35b-a3b",
     "m3-qwen3-30b-a3b",
 }
-TYPED_ACTIVE_CAP_FLOORS = {
-    ("m1-qwen35-4b", "cuda"): 32,
-    ("m2-qwen35-35b-a3b", "cuda"): 16,
-    ("m3-qwen3-30b-a3b", "cuda"): 32,
-    ("m1-qwen35-4b", "metal"): 16,
-    ("m2-qwen35-35b-a3b", "metal"): 4,
-    ("m3-qwen3-30b-a3b", "metal"): 16,
-}
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_PROMPT = (
@@ -121,17 +113,6 @@ RESERVED_EXTRA_OPTIONS = {
 
 class R2CollectorError(RuntimeError):
     pass
-
-
-def validate_typed_active_cap(model_key: str, backend: str, value: Any) -> int:
-    floor = TYPED_ACTIVE_CAP_FLOORS[(model_key, backend)]
-    require(
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and value >= floor,
-        f"typed_active_cap must meet the {model_key}/{backend} active floor {floor}",
-    )
-    return floor
 
 
 class CollectorInterrupted(BaseException):
@@ -978,7 +959,8 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
 
     typed_active_cap = config.get("typed_active_cap")
     memory_budget_bytes = config.get("memory_budget_bytes")
-    validate_typed_active_cap(str(model_key), str(backend), typed_active_cap)
+    top = 32 if backend == "cuda" else 16
+    require(isinstance(typed_active_cap, int) and not isinstance(typed_active_cap, bool) and typed_active_cap >= top, f"typed_active_cap must cover c{top}")
     require(
         isinstance(memory_budget_bytes, int)
         and not isinstance(memory_budget_bytes, bool)
@@ -3946,31 +3928,6 @@ def synthetic_bench_report(config: dict[str, Any], cell: dict[str, Any]) -> dict
 
 def self_test() -> int:
     template = config_template()
-    expected_active_cap_floors = {
-        ("m1-qwen35-4b", "cuda"): 32,
-        ("m2-qwen35-35b-a3b", "cuda"): 16,
-        ("m3-qwen3-30b-a3b", "cuda"): 32,
-        ("m1-qwen35-4b", "metal"): 16,
-        ("m2-qwen35-35b-a3b", "metal"): 4,
-        ("m3-qwen3-30b-a3b", "metal"): 16,
-    }
-    require(
-        TYPED_ACTIVE_CAP_FLOORS == expected_active_cap_floors,
-        "typed active-cap floor matrix self-test failed",
-    )
-    for (model_key, backend), floor in expected_active_cap_floors.items():
-        require(
-            validate_typed_active_cap(model_key, backend, floor) == floor,
-            "typed active-cap floor acceptance self-test failed",
-        )
-        try:
-            validate_typed_active_cap(model_key, backend, floor - 1)
-            raise R2CollectorError("below-floor typed active cap unexpectedly passed")
-        except R2CollectorError as exc:
-            require(
-                f"active floor {floor}" in str(exc),
-                "typed active-cap rejection self-test failed for the wrong reason",
-            )
     authority_source = {
         "git_sha": "1" * 40,
         "git_tree_sha": "2" * 40,
