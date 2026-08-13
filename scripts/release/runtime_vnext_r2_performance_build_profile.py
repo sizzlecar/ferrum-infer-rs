@@ -73,6 +73,7 @@ PHYSICAL_HEADROOM_FLOOR_BYTES = {
     "cuda": 512 * 1024**2,
     "metal": 2 * 1024**3,
 }
+CUDA_COHORT_MIN_MEMORY_BYTES = 24_000_000_000
 FLOOR_METRICS = (
     "throughput",
     "ttft_p95",
@@ -3932,6 +3933,7 @@ def load_ferrum_collector_lane(
         "created_at": session["formal_measurement_finished_at"],
         "binary_sha256": binary,
         "hardware_id": hardware["id"],
+        "hardware": copy.deepcopy(hardware),
         "hardware_sha256": canonical_json_sha256(hardware),
         "model_sha256": canonical_json_sha256(model_files),
         "typed_config_sha256": sha256(config_path),
@@ -4130,6 +4132,7 @@ def validate_ferrum_performance_lane(
         "backend": expected_backend,
         "binary_sha256": lane["binary_sha256"],
         "hardware_id": lane["hardware_id"],
+        "hardware": copy.deepcopy(lane["hardware"]),
         "r1_correctness_hardware_id": r1["backend_hardware_id"][expected_backend],
         "model_sha256": lane["model_sha256"],
         "typed_config_sha256": lane["typed_config_sha256"],
@@ -5405,17 +5408,72 @@ def validate_inputs(
     }
 
 
+def normalized_cuda_accelerator_model(value: Any) -> str:
+    require(isinstance(value, str) and value.strip(), "CUDA accelerator model is missing")
+    normalized = re.sub(r"[^a-z0-9]+", "", value.lower())
+    for vendor_prefix in ("nvidiageforce", "nvidia"):
+        if normalized.startswith(vendor_prefix):
+            normalized = normalized[len(vendor_prefix) :]
+            break
+    return normalized
+
+
 def validate_performance_hardware_cohort(lanes: dict[str, dict[str, Any]]) -> None:
-    for backend in BACKENDS:
-        hardware_ids = {
-            lanes[key]["hardware_id"]
-            for key, (_, lane_backend) in LANE_KEYS.items()
-            if lane_backend == backend
-        }
+    cuda_signatures: set[tuple[int, str]] = set()
+    metal_ids: set[str] = set()
+    metal_fingerprints: set[str] = set()
+    for key, (_, backend) in LANE_KEYS.items():
+        hardware = lanes[key].get("hardware")
+        require(isinstance(hardware, dict), f"{key} R2 hardware facts are missing")
         require(
-            len(hardware_ids) == 1,
-            f"three {backend} performance lanes must share one R2 hardware identity",
+            lanes[key].get("hardware_id") == hardware.get("id"),
+            f"{key} R2 hardware id differs from its artifact facts",
         )
+        count = hardware.get("accelerator_count")
+        model = hardware.get("accelerator_model")
+        memory_bytes = hardware.get("memory_bytes")
+        require(
+            isinstance(memory_bytes, int)
+            and not isinstance(memory_bytes, bool)
+            and memory_bytes > 0,
+            f"{key} R2 hardware memory is invalid",
+        )
+        if backend == "cuda":
+            normalized_model = normalized_cuda_accelerator_model(model)
+            require(
+                count == 1
+                and normalized_model == "rtx4090"
+                and memory_bytes >= CUDA_COHORT_MIN_MEMORY_BYTES,
+                f"{key} must use exactly one RTX 4090 with at least 24 GB VRAM",
+            )
+            cuda_signatures.add((count, normalized_model))
+        else:
+            require(
+                count == 1
+                and model == "Apple M1 Max"
+                and hardware.get("gpu_core_count") == 24
+                and memory_bytes == 32 * 1024**3,
+                f"{key} must use the fixed 32 GiB / 24-GPU-core Apple M1 Max",
+            )
+            hardware_id = hardware.get("id")
+            fingerprint = hardware.get("fingerprint")
+            require(
+                isinstance(hardware_id, str)
+                and bool(hardware_id)
+                and isinstance(fingerprint, str)
+                and bool(fingerprint),
+                f"{key} Metal hardware identity is missing",
+            )
+            metal_ids.add(hardware_id)
+            metal_fingerprints.add(fingerprint)
+    require(
+        len(cuda_signatures) == 1,
+        "three CUDA performance lanes must share one RTX 4090 hardware specification",
+    )
+    require(
+        len(metal_ids) == 1 and len(metal_fingerprints) == 1,
+        "three Metal performance lanes must share the fixed host identity",
+    )
 
 
 def build_with_source(
@@ -6195,6 +6253,34 @@ def self_test() -> None:
     }
     binaries = {"cuda": "1" * 64, "metal": "2" * 64}
     hardware = {"cuda": "selftest-rtx4090", "metal": "selftest-mac"}
+    selftest_hardware = {
+        "cuda": {
+            "id": hardware["cuda"],
+            "fingerprint": "4" * 64,
+            "accelerator_model": "NVIDIA GeForce RTX 4090",
+            "accelerator_count": 1,
+            "memory_bytes": 25_757_220_864,
+        },
+        "metal": {
+            "id": hardware["metal"],
+            "fingerprint": "5" * 64,
+            "accelerator_model": "Apple M1 Max",
+            "accelerator_count": 1,
+            "gpu_core_count": 24,
+            "memory_bytes": 32 * 1024**3,
+        },
+    }
+
+    def validate_selftest_performance_lane(
+        path: Path, **kwargs: Any
+    ) -> dict[str, Any]:
+        row = validate_performance_lane(path, **kwargs)
+        backend = str(kwargs["expected_backend"])
+        facts = copy.deepcopy(selftest_hardware[backend])
+        facts["id"] = row["hardware_id"]
+        row["hardware"] = facts
+        return row
+
     timestamp = "2026-08-09T00:00:00+00:00"
     current_child_ref = {
         "path": "/fixture/current-r1.json",
@@ -7068,7 +7154,7 @@ def self_test() -> None:
             require_checked_in_catalog=False,
             r1_verifier=r1_verifier,
             build_verifier=build_verifier,
-            performance_validator=validate_performance_lane,
+            performance_validator=validate_selftest_performance_lane,
             profile_validator=validate_profile,
         )
         require(
@@ -7078,14 +7164,32 @@ def self_test() -> None:
             and dependencies["acceptance"]["run_sample_count"] == 18,
             "positive fixture denominator differs",
         )
-        mixed_hardware_lanes = {
-            key: {"hardware_id": hardware[backend]}
-            for key, (_, backend) in LANE_KEYS.items()
-        }
-        mixed_hardware_lanes["m3_cuda"]["hardware_id"] = "other-rtx4090"
+        replacement_cuda_lanes: dict[str, dict[str, Any]] = {}
+        for ordinal, (key, (_, backend)) in enumerate(LANE_KEYS.items(), start=1):
+            facts = copy.deepcopy(selftest_hardware[backend])
+            if backend == "cuda":
+                facts["id"] = f"vast-replacement-{ordinal}"
+                facts["fingerprint"] = f"{ordinal:x}" * 64
+                facts["memory_bytes"] += ordinal * 1024**2
+            replacement_cuda_lanes[key] = {
+                "hardware_id": facts["id"],
+                "hardware": facts,
+            }
+        validate_performance_hardware_cohort(replacement_cuda_lanes)
+
+        cuda_spec_drift_lanes = copy.deepcopy(replacement_cuda_lanes)
+        cuda_spec_drift_lanes["m3_cuda"]["hardware"]["accelerator_model"] = (
+            "NVIDIA GeForce RTX 4080"
+        )
         expect_reject(
-            lambda: validate_performance_hardware_cohort(mixed_hardware_lanes),
-            "mixed R2 hardware cohort",
+            lambda: validate_performance_hardware_cohort(cuda_spec_drift_lanes),
+            "CUDA R2 hardware specification drift",
+        )
+        metal_identity_drift_lanes = copy.deepcopy(replacement_cuda_lanes)
+        metal_identity_drift_lanes["m3_metal"]["hardware"]["fingerprint"] = "6" * 64
+        expect_reject(
+            lambda: validate_performance_hardware_cohort(metal_identity_drift_lanes),
+            "Metal R2 fixed-host identity drift",
         )
         output = temp / "r2-output"
         pass_line = build_with_source(
@@ -7095,7 +7199,7 @@ def self_test() -> None:
             require_checked_in_catalog=False,
             r1_verifier=r1_verifier,
             build_verifier=build_verifier,
-            performance_validator=validate_performance_lane,
+            performance_validator=validate_selftest_performance_lane,
             profile_validator=validate_profile,
         )
         require(pass_line == f"{PASS_PREFIX}: {output}", "R2 PASS line differs")
@@ -7106,7 +7210,7 @@ def self_test() -> None:
             require_checked_in_catalog=False,
             r1_verifier=r1_verifier,
             build_verifier=build_verifier,
-            performance_validator=validate_performance_lane,
+            performance_validator=validate_selftest_performance_lane,
             profile_validator=validate_profile,
         )
 
