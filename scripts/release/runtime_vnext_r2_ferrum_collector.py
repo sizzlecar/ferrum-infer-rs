@@ -546,8 +546,7 @@ def prepare_cuda_bridge(
     ) + "\n"
     atomic_write_text(wrapper, script)
     wrapper.chmod(0o755)
-    environment = collector_support.sanitized_environment()
-    environment["PATH"] = f"{bridge_dir}{os.pathsep}{environment.get('PATH', '')}"
+    environment = cuda_bridge_sampler_environment(wrapper)
     return {
         "dir": bridge_dir,
         "wrapper": wrapper,
@@ -556,8 +555,16 @@ def prepare_cuda_bridge(
         "real_binary": preflight["real_binary"],
         "server_pid": pid,
         "server_pgid": pgid,
-        "environment": dict(sorted(environment.items())),
+        "environment": environment,
     }
+
+
+def cuda_bridge_sampler_environment(wrapper: Path) -> dict[str, str]:
+    environment = collector_support.sanitized_environment()
+    environment["PATH"] = (
+        f"{wrapper.resolve().parent}{os.pathsep}{environment.get('PATH', '')}"
+    )
+    return dict(sorted(environment.items()))
 
 
 def cuda_bridge_evidence(root: Path, sampler: dict[str, Any]) -> dict[str, Any] | None:
@@ -2178,6 +2185,7 @@ def restore_checkpoint_cuda_bridge(root: Path, raw: Any, label: str) -> dict[str
         "real_binary": real_binary,
         "server_pid": raw.get("server_pid"),
         "server_pgid": raw.get("server_pgid"),
+        "environment": cuda_bridge_sampler_environment(wrapper),
     }
 
 
@@ -4201,6 +4209,40 @@ def self_test() -> int:
 
         resume_dir = root / "resume"
         resume_dir.mkdir()
+        bridge_dir = resume_dir / "cuda-bridge"
+        bridge_dir.mkdir()
+        bridge_wrapper = bridge_dir / "nvidia-smi"
+        bridge_preflight = bridge_dir / "preflight.json"
+        bridge_audit = bridge_dir / "audit.jsonl"
+        atomic_write_text(bridge_wrapper, "#!/bin/sh\nexit 0\n")
+        atomic_write_json(bridge_preflight, {"status": "idle"})
+        atomic_write_text(bridge_audit, '{"status":"mapped"}\n')
+        real_nvidia_smi = Path("/usr/bin/true").resolve()
+        restored_bridge = restore_checkpoint_cuda_bridge(
+            root,
+            {
+                "wrapper": artifact_ref(
+                    root, bridge_wrapper, kind="cuda-pid-namespace-wrapper"
+                ),
+                "preflight": artifact_ref(
+                    root, bridge_preflight, kind="cuda-pid-namespace-preflight"
+                ),
+                "audit": artifact_ref(
+                    root, bridge_audit, kind="cuda-pid-namespace-audit"
+                ),
+                "real_nvidia_smi_path": str(real_nvidia_smi),
+                "real_nvidia_smi_sha256": file_sha256(real_nvidia_smi),
+                "server_pid": 101,
+                "server_pgid": 101,
+            },
+            "selftest CUDA bridge",
+        )
+        require(
+            restored_bridge is not None
+            and restored_bridge["environment"]
+            == cuda_bridge_sampler_environment(bridge_wrapper),
+            "restored CUDA bridge sampler environment self-test failed",
+        )
         observations = resume_dir / "cell.resource-observations.jsonl"
         observation_rows = [
             {
