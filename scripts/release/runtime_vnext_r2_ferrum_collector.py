@@ -43,6 +43,12 @@ COLLECTOR_PATH = Path(__file__).resolve()
 COLLECTOR_RELATIVE_PATH = COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix()
 SUPPORT_PATH = Path(collector_support.__file__).resolve()
 RESOURCE_SAMPLER_PATH = Path(collector_support.RESOURCE_SAMPLER_PATH).resolve()
+COLLECTION_EPOCH_SOURCE_PATHS = {
+    "collector_sha256": COLLECTOR_PATH.relative_to(REPO_ROOT).as_posix(),
+    "support_sha256": SUPPORT_PATH.relative_to(REPO_ROOT).as_posix(),
+    "resource_sampler_sha256": RESOURCE_SAMPLER_PATH.relative_to(REPO_ROOT).as_posix(),
+}
+_REVIEWED_GIT_BLOB_SHA256S: dict[str, frozenset[str]] = {}
 SCHEMA_VERSION = 1
 CONTRACT = "ferrum.runtime-vnext.r2.ferrum-collector.v1"
 CELL_CHECKPOINT_CONTRACT = "ferrum.runtime-vnext.r2.completed-cell-checkpoint.v1"
@@ -812,6 +818,37 @@ def git_output(argv: list[str]) -> str:
     )
     require(process.returncode == 0, f"git {' '.join(argv)} failed: {process.stderr.strip()}")
     return process.stdout.strip()
+
+
+def reviewed_git_blob_sha256s(relative_path: str) -> frozenset[str]:
+    cached = _REVIEWED_GIT_BLOB_SHA256S.get(relative_path)
+    if cached is not None:
+        return cached
+    commits = git_output(["log", "--format=%H", "--", relative_path]).splitlines()
+    require(commits, f"collection epoch source has no Git history: {relative_path}")
+    digests: set[str] = set()
+    for commit in commits:
+        process = subprocess.run(
+            ["git", "show", f"{commit}:{relative_path}"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+        )
+        if process.returncode == 0:
+            digests.add(hashlib.sha256(process.stdout).hexdigest())
+    require(digests, f"collection epoch source has no reviewed Git blobs: {relative_path}")
+    result = frozenset(digests)
+    _REVIEWED_GIT_BLOB_SHA256S[relative_path] = result
+    return result
+
+
+def require_reviewed_native_collection_epoch(collection_epoch: dict[str, str], label: str) -> None:
+    for identity_key, relative_path in COLLECTION_EPOCH_SOURCE_PATHS.items():
+        digest = collection_epoch[identity_key]
+        require(
+            digest in reviewed_git_blob_sha256s(relative_path),
+            f"{label} {identity_key} is not a reviewed Git-history source",
+        )
 
 
 def load_locked_model(models_lock: dict[str, Any], model_key: str, backend: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2540,14 +2577,10 @@ def validate_completed_cell_checkpoint(
                 frozen_collector.get("resource_sampler_sha256") if isinstance(frozen_collector, dict) else None
             ),
         }
+        require(collection_epoch == expected_epoch, f"{identifier} checkpoint collection epoch binding mismatch")
     else:
         require(provenance == "native-completed-cell", f"{identifier} checkpoint provenance is invalid")
-        expected_epoch = {
-            "collector_sha256": file_sha256(COLLECTOR_PATH),
-            "support_sha256": file_sha256(SUPPORT_PATH),
-            "resource_sampler_sha256": file_sha256(RESOURCE_SAMPLER_PATH),
-        }
-    require(collection_epoch == expected_epoch, f"{identifier} checkpoint collection epoch binding mismatch")
+        require_reviewed_native_collection_epoch(collection_epoch, f"{identifier} checkpoint collection epoch")
     attempt_relative = checkpoint.get("attempt_dir")
     require(isinstance(attempt_relative, str) and not Path(attempt_relative).is_absolute(), f"{identifier} checkpoint attempt path is invalid")
     attempt_dir = (root / attempt_relative).resolve()
@@ -3946,6 +3979,26 @@ def synthetic_bench_report(config: dict[str, Any], cell: dict[str, Any]) -> dict
 
 def self_test() -> int:
     template = config_template()
+    reviewed_epoch = {
+        identity_key: next(iter(reviewed_git_blob_sha256s(relative_path)))
+        for identity_key, relative_path in COLLECTION_EPOCH_SOURCE_PATHS.items()
+    }
+    require_reviewed_native_collection_epoch(reviewed_epoch, "self-test native collection epoch")
+    rejected_epoch = copy.deepcopy(reviewed_epoch)
+    rejected_digest = next(
+        candidate
+        for candidate in ("0" * 64, "f" * 64)
+        if candidate not in reviewed_git_blob_sha256s(COLLECTION_EPOCH_SOURCE_PATHS["collector_sha256"])
+    )
+    rejected_epoch["collector_sha256"] = rejected_digest
+    try:
+        require_reviewed_native_collection_epoch(rejected_epoch, "self-test native collection epoch")
+        raise R2CollectorError("unreviewed native collection epoch unexpectedly passed")
+    except R2CollectorError as exc:
+        require(
+            "is not a reviewed Git-history source" in str(exc),
+            "unreviewed native collection epoch failed for the wrong reason",
+        )
     expected_active_cap_floors = {
         ("m1-qwen35-4b", "cuda"): 32,
         ("m2-qwen35-35b-a3b", "cuda"): 16,
