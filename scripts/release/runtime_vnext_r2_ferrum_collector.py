@@ -1912,6 +1912,8 @@ def cell_resource_evidence(
     record: dict[str, Any],
     sampler: dict[str, Any],
     config: dict[str, Any],
+    *,
+    existing_active_intervals: Any = None,
 ) -> dict[str, Any]:
     observations: Path = sampler["observations"]
     summary = collector_support.resource_sampler.derive_summary(
@@ -1977,12 +1979,7 @@ def cell_resource_evidence(
                 "probe_errors": errors,
             }
         )
-    eligible_ms = 0.0
-    total_interval_duration_ms = 0.0
-    for row in interval_rows:
-        total_interval_duration_ms += row["duration_ms"]
-        if row["eligible"]:
-            eligible_ms += row["duration_ms"]
+    eligible_ms = sum(row["duration_ms"] for row in interval_rows if row["eligible"])
     require(interval_rows and eligible_ms > 0, f"{record['cell_id']} has no eligible active intervals")
     interval_document = {
         "schema_version": SCHEMA_VERSION,
@@ -1993,10 +1990,47 @@ def cell_resource_evidence(
         "measurement_finished_at": record["finished_at"],
         "definition": "adjacent 250ms samples clipped to the measured window; eligible only when both probes are live and error-free; active count is conservative interval minimum",
         "eligible_duration_ms": eligible_ms,
-        "total_interval_duration_ms": total_interval_duration_ms,
+        "total_interval_duration_ms": sum(row["duration_ms"] for row in interval_rows),
         "intervals": interval_rows,
     }
-    atomic_write_json(interval_path, interval_document)
+    if existing_active_intervals is None:
+        atomic_write_json(interval_path, interval_document)
+    else:
+        existing_interval_path = validate_artifact_ref(
+            root, existing_active_intervals, f"{record['cell_id']}.active_intervals"
+        )
+        require(
+            existing_interval_path == interval_path,
+            f"{record['cell_id']} active interval path mismatch",
+        )
+        existing_interval_document = read_json(existing_interval_path)
+        for key in (
+            "schema_version",
+            "artifact_type",
+            "source_observations",
+            "cell_id",
+            "measurement_started_at",
+            "measurement_finished_at",
+            "definition",
+            "intervals",
+        ):
+            require(
+                existing_interval_document.get(key) == interval_document[key],
+                f"{record['cell_id']} active interval {key} differs",
+            )
+        for key in ("eligible_duration_ms", "total_interval_duration_ms"):
+            existing_value = existing_interval_document.get(key)
+            require(
+                isinstance(existing_value, (int, float))
+                and not isinstance(existing_value, bool)
+                and math.isclose(
+                    float(existing_value),
+                    float(interval_document[key]),
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ),
+                f"{record['cell_id']} active interval {key} differs",
+            )
     return {
         "collector": artifact_ref(root, RESOURCE_SAMPLER_PATH, kind="resource-sampler-source")
         if RESOURCE_SAMPLER_PATH.is_relative_to(root)
@@ -2672,6 +2706,7 @@ def validate_completed_cell_checkpoint(
     cell: dict[str, Any],
     *,
     finalized_session: dict[str, Any] | None = None,
+    expected_record: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     identifier = cell_id(cell)
     require(checkpoint.get("contract") == CELL_CHECKPOINT_CONTRACT, f"{identifier} checkpoint contract mismatch")
@@ -2852,7 +2887,19 @@ def validate_completed_cell_checkpoint(
         "cuda_pid_namespace_bridge": restored_cuda_bridge,
     }
     record = copy.deepcopy(record)
-    record["resources"] = cell_resource_evidence(root, epoch_session, record, sampler, config)
+    expected_resources = expected_record.get("resources") if isinstance(expected_record, dict) else None
+    record["resources"] = cell_resource_evidence(
+        root,
+        epoch_session,
+        record,
+        sampler,
+        config,
+        existing_active_intervals=(
+            expected_resources.get("active_intervals")
+            if isinstance(expected_resources, dict)
+            else None
+        ),
+    )
     return record, checkpoint, epoch_session
 
 
@@ -3070,6 +3117,7 @@ def validate_server_bundle(
                 checkpoint_document,
                 cell,
                 finalized_session=session,
+                expected_record=expected_record,
             )
             require(checkpoint_record == expected_record, f"{cell_id(cell)} finalized checkpoint record mismatch")
     expected = list(expected_cells(config["backend"]))
