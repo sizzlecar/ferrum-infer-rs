@@ -268,14 +268,23 @@ def load_rule_config(path: Path) -> dict[str, Any]:
                     isinstance(contract, dict) and contract.get("kind") in behavioral_kinds
                     for contract in contracts
                 ):
-                    if not isinstance(semantic_policy, dict) or semantic_policy.get("kind") != "timing_observability":
+                    supported_semantic_policies = {
+                        "timing_observability",
+                        "text_byte_sampling_correctness",
+                    }
+                    if (
+                        not isinstance(semantic_policy, dict)
+                        or semantic_policy.get("kind") not in supported_semantic_policies
+                    ):
                         raise PlannerError(
                             f"{path}: qualification_profiles.{profile_id}.selector.files"
-                            f"[{file_index}].semantic_policy.kind must be timing_observability"
+                            f"[{file_index}].semantic_policy.kind must be one of "
+                            f"{sorted(supported_semantic_policies)}"
                         )
                     for key in (
                         "allowed_identifiers",
                         "allowed_identifier_patterns",
+                        "forbidden_identifier_patterns",
                         "required_identifiers",
                         "required_identifier_patterns",
                         "allowed_literals",
@@ -292,6 +301,7 @@ def load_rule_config(path: Path) -> dict[str, Any]:
                             )
                     for key in (
                         "allowed_identifier_patterns",
+                        "forbidden_identifier_patterns",
                         "required_identifier_patterns",
                         "allowed_literal_patterns",
                     ):
@@ -1069,26 +1079,46 @@ def semantic_policy_match(
 ) -> tuple[bool, str | None]:
     if before_source and not after_source:
         return False, f"contract_{contract_id}_removal_not_allowed"
+    policy_kind = str(policy.get("kind", ""))
     changed = semantic_change_tokens(before_source, after_source, language=language)
     allowed_identifiers = set(policy.get("allowed_identifiers", [])) | contract_allowed_identifiers
     identifier_patterns = [re.compile(pattern) for pattern in policy.get("allowed_identifier_patterns", [])]
+    forbidden_identifier_patterns = [
+        re.compile(pattern) for pattern in policy.get("forbidden_identifier_patterns", [])
+    ]
     required_identifiers = set(policy.get("required_identifiers", []))
     required_patterns = [re.compile(pattern) for pattern in policy.get("required_identifier_patterns", [])]
     allowed_literals = set(policy.get("allowed_literals", []))
     literal_patterns = [re.compile(pattern) for pattern in policy.get("allowed_literal_patterns", [])]
     allowed_operators = set(policy.get("allowed_operators", [])) | SEMANTIC_NEUTRAL_OPERATORS
     changed_identifiers = {value for kind, value in changed if kind == "identifier"}
+    if policy_kind == "timing_observability":
+        implicit_identifiers = SEMANTIC_NEUTRAL_IDENTIFIERS | SEMANTIC_OBSERVABILITY_IDENTIFIERS
+        implicit_identifier_match = TIMING_OBSERVABILITY_IDENTIFIER.fullmatch
+        protected_identifier_match = PROTECTED_PRODUCT_IDENTIFIER.search
+        implicit_literal_match = TIMING_OBSERVABILITY_LITERAL.fullmatch
+    elif policy_kind == "text_byte_sampling_correctness":
+        implicit_identifiers = SEMANTIC_NEUTRAL_IDENTIFIERS
+        implicit_identifier_match = lambda _value: None
+        protected_identifier_match = lambda value: next(
+            (pattern for pattern in forbidden_identifier_patterns if pattern.fullmatch(value)),
+            None,
+        )
+        implicit_literal_match = lambda _value: None
+    else:
+        return False, f"contract_{contract_id}_semantic_policy_kind_unsupported"
     protected = sorted(
-        identifier for identifier in changed_identifiers if PROTECTED_PRODUCT_IDENTIFIER.search(identifier)
+        identifier
+        for identifier in changed_identifiers
+        if protected_identifier_match(identifier) is not None
     )
     if protected:
         return False, f"contract_{contract_id}_protected_product_identifier_changed"
     unexpected_identifiers = sorted(
         identifier
         for identifier in changed_identifiers
-        if identifier not in SEMANTIC_NEUTRAL_IDENTIFIERS
-        and identifier not in SEMANTIC_OBSERVABILITY_IDENTIFIERS
-        and not TIMING_OBSERVABILITY_IDENTIFIER.fullmatch(identifier)
+        if identifier not in implicit_identifiers
+        and not implicit_identifier_match(identifier)
         and identifier not in allowed_identifiers
         and not any(pattern.fullmatch(identifier) for pattern in identifier_patterns)
     )
@@ -1105,7 +1135,7 @@ def semantic_policy_match(
         or (
             re.fullmatch(r"[0-9].*", literal) is None
             and literal not in allowed_literals
-            and not TIMING_OBSERVABILITY_LITERAL.fullmatch(literal)
+            and not implicit_literal_match(literal)
             and not any(pattern.fullmatch(literal) for pattern in literal_patterns)
         )
     )
@@ -1115,7 +1145,13 @@ def semantic_policy_match(
     if changed_operators - allowed_operators:
         return False, f"contract_{contract_id}_operator_delta_exceeded"
     has_required_marker = (
-        any(TIMING_OBSERVABILITY_IDENTIFIER.fullmatch(identifier) for identifier in changed_identifiers)
+        (
+            policy_kind == "timing_observability"
+            and any(
+                TIMING_OBSERVABILITY_IDENTIFIER.fullmatch(identifier)
+                for identifier in changed_identifiers
+            )
+        )
         or bool(changed_identifiers & required_identifiers)
         or any(
         pattern.fullmatch(identifier)
@@ -1841,6 +1877,38 @@ def plan_from_files(
     qualification_profiles = qualification_profiles or {}
     file_versions = file_versions or {}
 
+    # A multi-file semantic profile is one closure, not a collection of
+    # independent file allowlists.  Activate it only when every changed path
+    # named by its selector matches and at least one matched selector is
+    # production.  This prevents a test-only companion file from suppressing
+    # broad rules when the corresponding production edit escaped the profile.
+    active_profile_matches: dict[str, dict[str, dict[str, Any]]] = {}
+    for profile_id, profile in qualification_profiles.items():
+        selector_files = {
+            str(item.get("path")): item
+            for item in profile.get("selector", {}).get("files", [])
+            if isinstance(item, dict) and isinstance(item.get("path"), str)
+        }
+        selected_changed = [path for path in changed_files if path in selector_files]
+        if not selected_changed:
+            continue
+        matches: dict[str, dict[str, Any]] = {}
+        for path in selected_changed:
+            match = qualification_for_path(
+                path,
+                profile_id,
+                profile,
+                file_versions,
+            )
+            if match is not None:
+                matches[path] = match
+        matched_production = any(
+            not bool(selector_files[path].get("test_only", False))
+            for path in matches
+        )
+        if len(matches) == len(selected_changed) and matched_production:
+            active_profile_matches[profile_id] = matches
+
     for changed in changed_files:
         matched = False
         path_qualification_matches: dict[str, dict[str, Any]] = {}
@@ -1852,12 +1920,7 @@ def plan_from_files(
             for profile_id in rule.get("qualification_profiles", []):
                 if profile_id in path_qualification_matches:
                     continue
-                match = qualification_for_path(
-                    changed,
-                    profile_id,
-                    qualification_profiles[profile_id],
-                    file_versions,
-                )
+                match = active_profile_matches.get(profile_id, {}).get(changed)
                 if match is not None:
                     path_qualification_matches[profile_id] = match
         for rule in path_rules:

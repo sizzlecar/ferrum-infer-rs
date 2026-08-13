@@ -588,6 +588,152 @@
       "expect_required_gates": ["native_operator_artifact", "cuda_sentinel", "model_contract"]
     },
     {
+      "id": "vnext_text_byte_sampling_correctness_qualified",
+      "changed_files": [
+        "crates/ferrum-engine/src/continuous_engine.rs",
+        "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+        "crates/ferrum-engine/src/continuous_engine/tests.rs"
+      ],
+      "file_versions": {
+        "crates/ferrum-engine/src/continuous_engine.rs": {
+          "before": "struct TokenPolicyCacheEntry {}\n\nfn advance_pending_utf8_fragment() {}\n",
+          "after": "struct TokenPolicyCacheEntry {}\n\nfn advance_pending_utf8_fragment() {\n    let pending_utf8_fragment = Vec::new();\n}\n"
+        },
+        "crates/ferrum-engine/src/continuous_engine/sequence.rs": {
+          "before": "pub struct SequenceState {\n    pub stable: bool,\n}\n",
+          "after": "pub struct SequenceState {\n    pub stable: bool,\n    pub pending_decoded_utf8_bytes: Vec<u8>,\n}\n"
+        },
+        "crates/ferrum-engine/src/continuous_engine/tests.rs": {
+          "before": "fn old_utf8_test() {}\n",
+          "after": "fn pending_utf8_bytes_test() {}\n"
+        }
+      },
+      "expect_domains_exact": ["text_byte_sampling_correctness"],
+      "expect_required_gates_exact": [
+        "backend_boundary",
+        "cuda_sentinel",
+        "docs_review",
+        "metal_sentinel",
+        "planner_selftest",
+        "preset_snapshot",
+        "release_validator_selftest",
+        "resource_invariant",
+        "unit"
+      ],
+      "expect_required_checks_exact": [
+        "cuda_run_serve_text_byte_sampling",
+        "metal_run_serve_text_byte_sampling",
+        "text_byte_sampling_exact_contracts"
+      ],
+      "expect_qualification_profile_ids": [
+        "vnext-text-byte-sampling-correctness"
+      ],
+      "expect_qualified_scopes": [
+        {"backend": "cuda", "entrypoint": "run", "profile_detail": "off"},
+        {"backend": "cuda", "entrypoint": "serve", "profile_detail": "off"},
+        {"backend": "metal", "entrypoint": "run", "profile_detail": "off"},
+        {"backend": "metal", "entrypoint": "serve", "profile_detail": "off"}
+      ],
+      "forbid_domains": ["shared_runtime", "vnext_execution_contract"],
+      "expect_unknown_files": []
+    },
+    {
+      "id": "vnext_text_byte_sampling_kv_change_falls_back_broad",
+      "changed_files": [
+        "crates/ferrum-engine/src/continuous_engine.rs",
+        "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+        "crates/ferrum-engine/src/continuous_engine/tests.rs"
+      ],
+      "file_versions": {
+        "crates/ferrum-engine/src/continuous_engine.rs": {
+          "before": "struct TokenPolicyCacheEntry {}\n\nfn advance_pending_utf8_fragment() {}\n",
+          "after": "struct TokenPolicyCacheEntry {}\n\nfn advance_pending_utf8_fragment() {\n    let pending_utf8_fragment = Vec::new();\n    let kv_capacity = 3;\n}\n"
+        },
+        "crates/ferrum-engine/src/continuous_engine/sequence.rs": {
+          "before": "pub struct SequenceState {\n    pub stable: bool,\n}\n",
+          "after": "pub struct SequenceState {\n    pub stable: bool,\n    pub pending_decoded_utf8_bytes: Vec<u8>,\n}\n"
+        },
+        "crates/ferrum-engine/src/continuous_engine/tests.rs": {
+          "before": "fn old_utf8_test() {}\n",
+          "after": "fn pending_utf8_bytes_test() {}\n"
+        }
+      },
+      "expect_domains": ["shared_runtime", "vnext_execution_contract"],
+      "expect_required_gates": ["unit", "vnext_g01", "metal_sentinel", "cuda_sentinel"],
+      "expect_required_scenarios": [
+        "run_multiturn_recall",
+        "serve_concurrency_quality",
+        "serve_multiturn_recall",
+        "serve_stream_done_usage",
+        "serve_structured_output",
+        "serve_tool_call"
+      ],
+      "forbid_required_checks": [
+        "cuda_run_serve_text_byte_sampling",
+        "metal_run_serve_text_byte_sampling",
+        "text_byte_sampling_exact_contracts"
+      ],
+      "forbid_qualification_profile_ids": [
+        "vnext-text-byte-sampling-correctness"
+      ],
+      "expect_qualified_scopes": []
+    },
+    {
+      "id": "vnext_text_byte_sampling_threshold_change_falls_back_broad",
+      "changed_files": [
+        "crates/ferrum-engine/src/continuous_engine.rs",
+        "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+        "crates/ferrum-engine/src/continuous_engine/tests.rs"
+      ],
+      "file_versions": {
+        "crates/ferrum-engine/src/continuous_engine.rs": {
+          "before": "struct TokenPolicyCacheEntry {}\n\nfn advance_pending_utf8_fragment() {}\n",
+          "after": "struct TokenPolicyCacheEntry {}\n\nfn advance_pending_utf8_fragment() {\n    let pending_utf8_fragment = Vec::new();\n}\n"
+        },
+        "crates/ferrum-engine/src/continuous_engine/sequence.rs": {
+          "before": "pub struct SequenceState {\n    pub pending_decoded_utf8_fragment: bool,\n}\n\nimpl SequenceState {\n    fn can_use_model_greedy_argmax(&self) -> bool {\n        !self.pending_decoded_utf8_fragment\n    }\n}\n",
+          "after": "pub struct SequenceState {\n    pub pending_decoded_utf8_fragment: bool,\n}\n\nimpl SequenceState {\n    fn can_use_model_greedy_argmax(&self) -> bool {\n        !self.pending_decoded_utf8_fragment && self.temperature == 0\n    }\n}\n"
+        },
+        "crates/ferrum-engine/src/continuous_engine/tests.rs": {
+          "before": "fn old_utf8_test() {}\n",
+          "after": "fn pending_utf8_bytes_test() {}\n"
+        }
+      },
+      "expect_domains": ["shared_runtime", "vnext_execution_contract"],
+      "expect_required_gates": ["unit", "vnext_g01", "metal_sentinel", "cuda_sentinel"],
+      "forbid_required_checks": [
+        "cuda_run_serve_text_byte_sampling",
+        "metal_run_serve_text_byte_sampling",
+        "text_byte_sampling_exact_contracts"
+      ],
+      "forbid_qualification_profile_ids": [
+        "vnext-text-byte-sampling-correctness"
+      ],
+      "expect_qualified_scopes": []
+    },
+    {
+      "id": "vnext_text_byte_sampling_test_only_cannot_self_qualify",
+      "changed_files": ["crates/ferrum-engine/src/continuous_engine/tests.rs"],
+      "file_versions": {
+        "crates/ferrum-engine/src/continuous_engine/tests.rs": {
+          "before": "fn old_utf8_test() {}\n",
+          "after": "fn pending_utf8_bytes_test() {}\n"
+        }
+      },
+      "expect_domains": ["shared_runtime", "vnext_execution_contract"],
+      "expect_required_gates": ["unit", "vnext_g01", "metal_sentinel", "cuda_sentinel"],
+      "forbid_required_checks": [
+        "cuda_run_serve_text_byte_sampling",
+        "metal_run_serve_text_byte_sampling",
+        "text_byte_sampling_exact_contracts"
+      ],
+      "forbid_qualification_profile_ids": [
+        "vnext-text-byte-sampling-correctness",
+        "vnext-profile-timing-observability"
+      ],
+      "expect_qualified_scopes": []
+    },
+    {
       "id": "vnext_reusable_identity_diagnostic_observability_qualified",
       "changed_files": ["crates/ferrum-models/src/executor/vnext_executor.rs"],
       "file_versions": {
