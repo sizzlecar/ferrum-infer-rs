@@ -1,6 +1,296 @@
 {
   "schema_version": 1,
   "qualification_profiles": {
+    "vnext-text-byte-sampling-correctness": {
+      "domains": [
+        "text_byte_sampling_correctness"
+      ],
+      "selector": {
+        "kind": "symbol_contracts",
+        "files": [
+          {
+            "path": "crates/ferrum-engine/src/continuous_engine.rs",
+            "language": "rust",
+            "allow_test_changes": false,
+            "semantic_policy": {
+              "kind": "text_byte_sampling_correctness",
+              "allowed_identifiers": [
+                "Arc",
+                "FFFD",
+                "HashMap",
+                "HashSet",
+                "Mutex",
+                "Result",
+                "Send",
+                "Sync",
+                "TOKEN_POLICY_CACHE",
+                "Tokenizer",
+                "_",
+                "cache",
+                "chain",
+                "clone",
+                "combined",
+                "contains",
+                "contains_replacement_char_mojibake",
+                "context_free_bytes_invalid",
+                "downgrade",
+                "dyn",
+                "entry",
+                "error",
+                "error_len",
+                "expect",
+                "extend_from_slice",
+                "filter",
+                "get",
+                "get_or_init",
+                "id",
+                "insert",
+                "is_empty",
+                "is_err",
+                "is_none",
+                "is_none_or",
+                "iter",
+                "key",
+                "len",
+                "lock",
+                "map",
+                "map_err",
+                "new",
+                "next",
+                "pending",
+                "ptr_eq",
+                "result",
+                "saturating_add",
+                "std",
+                "strong_count",
+                "sync",
+                "text",
+                "tok",
+                "to_vec",
+                "u",
+                "u32",
+                "u8",
+                "unwrap_or_default",
+                "valid_prefix",
+                "valid_up_to",
+                "vocab_size",
+                "with_capacity"
+              ],
+              "allowed_identifier_patterns": [
+                "(?i).*(?:utf8|byte|fragment).*$",
+                "(?i).*(?:tokenizer|token|decode|forbidden|greedy|argmax|mask).*$"
+              ],
+              "forbidden_identifier_patterns": [
+                "(?i)(?!with_capacity$).*(?:admission|capacity|concurr|kv|profile|resource|scheduler).*$",
+                "(?i).*(?:response|structured|stream|tool).*$",
+                "(?i)^(?:max_tokens|min_tokens|min_p|temperature|threshold.*|top_k|top_p|.*penalty.*)$"
+              ],
+              "required_identifiers": [],
+              "required_identifier_patterns": [
+                "(?i).*(?:utf8|byte|fragment|model_greedy_forbidden).*$"
+              ],
+              "allowed_literals": [],
+              "allowed_literal_patterns": [
+                "(?is)[rubf]*(?:\"|').*(?:utf-8|utf8|fragment|token policy cache).*(?:\"|')"
+              ],
+              "allowed_operators": [
+                "'",
+                "+",
+                "->",
+                "..",
+                "<",
+                "<=",
+                ">",
+                "&&",
+                "\\",
+                "|",
+                "||"
+              ]
+            },
+            "contracts": [
+              {
+                "id": "token_policy_model_greedy_forbidden",
+                "kind": "rust_struct_field",
+                "symbol": "TokenPolicyCacheEntry::model_greedy_forbidden"
+              },
+              {
+                "id": "resolve_sampling_token_constraints",
+                "kind": "rust_function",
+                "symbol": "resolve_sampling_token_constraints"
+              },
+              {
+                "id": "build_argmax_token_mask",
+                "kind": "rust_function",
+                "symbol": "build_argmax_token_mask"
+              },
+              {
+                "id": "cached_forbidden_generation_tokens",
+                "kind": "rust_function",
+                "symbol": "cached_forbidden_generation_tokens"
+              },
+              {
+                "id": "cached_model_greedy_forbidden_tokens",
+                "kind": "rust_function",
+                "symbol": "cached_model_greedy_forbidden_tokens",
+                "allowed_numeric_literals": [
+                  "0"
+                ]
+              },
+              {
+                "id": "advance_pending_utf8_fragment",
+                "kind": "rust_function",
+                "symbol": "advance_pending_utf8_fragment",
+                "allowed_numeric_literals": [
+                  "3"
+                ]
+              }
+            ]
+          },
+          {
+            "path": "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+            "language": "rust",
+            "allow_test_changes": false,
+            "semantic_policy": {
+              "kind": "text_byte_sampling_correctness",
+              "allowed_identifiers": [
+                "FFFD",
+                "FerrumError",
+                "_",
+                "and_then",
+                "as_ref",
+                "candidate_is_stop",
+                "clear",
+                "contains",
+                "ends_with",
+                "format",
+                "get",
+                "is_char_boundary",
+                "is_empty",
+                "is_err",
+                "is_some_and",
+                "len",
+                "map",
+                "model",
+                "new",
+                "pending",
+                "result",
+                "streamed_text_len",
+                "text",
+                "u",
+                "u8",
+                "unreachable",
+                "unwrap_or"
+              ],
+              "allowed_identifier_patterns": [
+                "(?i).*(?:utf8|byte|fragment).*$",
+                "(?i).*(?:tokenizer|token|decode|forbidden|greedy|argmax|mask).*$"
+              ],
+              "forbidden_identifier_patterns": [
+                "(?i)(?!with_capacity$).*(?:admission|capacity|concurr|kv|profile|resource|scheduler).*$",
+                "(?i).*(?:response|structured|stream(?!ed_text_len)|tool).*$",
+                "(?i)^(?:max_tokens|min_tokens|min_p|temperature|threshold.*|top_k|top_p|.*penalty.*)$"
+              ],
+              "required_identifiers": [],
+              "required_identifier_patterns": [
+                "(?i).*(?:utf8|byte|fragment|model_greedy_forbidden).*$"
+              ],
+              "allowed_literals": [],
+              "allowed_literal_patterns": [
+                "(?is)[rubf]*(?:\"|').*(?:utf-8|utf8|fragment).*(?:\"|')"
+              ],
+              "allowed_operators": [
+                "'",
+                "..",
+                "<",
+                "<=",
+                ">",
+                "&&",
+                "\\",
+                "|"
+              ]
+            },
+            "contracts": [
+              {
+                "id": "sequence_pending_utf8_fragment",
+                "kind": "rust_struct_field",
+                "symbol": "SequenceState::pending_decoded_utf8_fragment"
+              },
+              {
+                "id": "sequence_pending_utf8_bytes",
+                "kind": "rust_struct_field",
+                "symbol": "SequenceState::pending_decoded_utf8_bytes"
+              },
+              {
+                "id": "sequence_sampling_construction",
+                "kind": "rust_impl_method",
+                "symbol": "SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory"
+              },
+              {
+                "id": "sequence_model_greedy_eligibility",
+                "kind": "rust_impl_method",
+                "symbol": "SequenceState::can_use_model_greedy_argmax"
+              },
+              {
+                "id": "sequence_generated_token_commit",
+                "kind": "rust_impl_method",
+                "symbol": "SequenceState::commit_generated_token"
+              },
+              {
+                "id": "sequence_candidate_output_quality",
+                "kind": "rust_impl_method",
+                "symbol": "SequenceState::sample_candidate_decodes_to_forbidden_output"
+              }
+            ]
+          },
+          {
+            "path": "crates/ferrum-engine/src/continuous_engine/tests.rs",
+            "language": "rust",
+            "test_only": true,
+            "allow_test_changes": false,
+            "contracts": []
+          }
+        ]
+      },
+      "qualified_scopes": [
+        {
+          "backend": "cuda",
+          "entrypoint": "run",
+          "profile_detail": "off"
+        },
+        {
+          "backend": "cuda",
+          "entrypoint": "serve",
+          "profile_detail": "off"
+        },
+        {
+          "backend": "metal",
+          "entrypoint": "run",
+          "profile_detail": "off"
+        },
+        {
+          "backend": "metal",
+          "entrypoint": "serve",
+          "profile_detail": "off"
+        }
+      ],
+      "required_checks": [
+        "cuda_run_serve_text_byte_sampling",
+        "metal_run_serve_text_byte_sampling",
+        "text_byte_sampling_exact_contracts"
+      ],
+      "required_gates": [
+        "backend_boundary",
+        "cuda_sentinel",
+        "docs_review",
+        "metal_sentinel",
+        "planner_selftest",
+        "preset_snapshot",
+        "release_validator_selftest",
+        "resource_invariant",
+        "unit"
+      ],
+      "reason": "Default text-byte validity changes are qualified only when the diff stays inside the tokenizer-byte, forbidden-token mask, greedy eligibility, and sequence commit/output-quality call chain. Admission, KV, scheduling, resource, profile, API/tool/structured-output, sampling-threshold, and unrelated engine changes fall back to the broad shared-runtime rules. Both product entrypoints and both accelerator consumers remain required."
+    },
     "vnext-reusable-startup-diagnostic-observability": {
       "domains": ["diagnostic_observability"],
       "required_gates": [
@@ -605,6 +895,7 @@
         "cuda_llama_dense"
       ],
       "qualification_profiles": [
+        "vnext-text-byte-sampling-correctness",
         "vnext-profile-timing-observability"
       ],
       "exceptions": [],
@@ -924,6 +1215,7 @@
       ],
       "qualification_profiles": [
         "vnext-reusable-startup-diagnostic-observability",
+        "vnext-text-byte-sampling-correctness",
         "vnext-profile-timing-observability"
       ],
       "exceptions": [],

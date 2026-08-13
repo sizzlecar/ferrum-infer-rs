@@ -1,0 +1,66 @@
+{
+  "backend": "cuda",
+  "ferrum_bin": "target/release/ferrum",
+  "goal_scope": {
+    "change_impact_profile": "vnext-text-byte-sampling-correctness",
+    "full_r1": false
+  },
+  "schema_version": 1,
+  "server": {
+    "args": [
+      "--backend",
+      "cuda"
+    ],
+    "mode": "start"
+  },
+  "timeout_sec": 600,
+  "scenarios": [
+    {
+      "name": "run_multiturn_recall",
+      "type": "run_multiturn",
+      "backend": "cuda",
+      "enable_thinking": false,
+      "secret": "ferrum-blue",
+      "expected_recall": "ferrum-blue",
+      "min_assistant_turns": 2,
+      "temperature": 0.0,
+      "prompts": [
+        "The code is ferrum-blue. Reply with only OK.",
+        "What was the code from my previous message? Reply with only that code."
+      ]
+    },
+    {
+      "name": "serve_concurrency_quality",
+      "type": "serve_concurrency_quality",
+      "enable_thinking": false,
+      "concurrency_cells": [
+        1,
+        4
+      ]
+    },
+    {
+      "name": "serve_multiturn_recall",
+      "type": "serve_multiturn_recall",
+      "enable_thinking": false,
+      "secret": "ferrum-blue"
+    },
+    {
+      "name": "serve_stream_done_usage",
+      "type": "serve_stream",
+      "enable_thinking": false
+    },
+    {
+      "name": "serve_tool_call",
+      "type": "serve_tool_call",
+      "enable_thinking": false
+    },
+    {
+      "name": "serve_structured_output",
+      "type": "serve_structured_output",
+      "enable_thinking": false,
+      "expected_object": {
+        "answer": "scenario-ok"
+      }
+    }
+  ]
+}

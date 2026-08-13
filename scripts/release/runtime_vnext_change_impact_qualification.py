@@ -28,6 +28,7 @@ WITNESS_TYPE = "runtime_vnext_change_impact_witness"
 RAW_EVIDENCE_TYPE = "runtime_vnext_change_impact_raw_execution"
 PROFILE_ID = "vnext-profile-timing-observability"
 LEGACY_PROFILE_ID = "vnext-reusable-startup-diagnostic-observability"
+TEXT_BYTE_PROFILE_ID = "vnext-text-byte-sampling-correctness"
 PASS_PREFIX = "FERRUM RUNTIME VNEXT CHANGE IMPACT QUALIFICATION PASS"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT CHANGE IMPACT QUALIFICATION SELFTEST PASS"
 CONTROL_SELFTEST_PASS_LINE = (
@@ -101,9 +102,51 @@ LEGACY_EXPECTED_SCOPES = [
     {"backend": "cuda", "entrypoint": "run", "profile_detail": "full"},
     {"backend": "cuda", "entrypoint": "serve", "profile_detail": "verify"},
 ]
+TEXT_BYTE_EXPECTED_CHECKS = [
+    "cuda_run_serve_text_byte_sampling",
+    "metal_run_serve_text_byte_sampling",
+    "text_byte_sampling_exact_contracts",
+]
+TEXT_BYTE_EXPECTED_SCOPES = [
+    {"backend": "cuda", "entrypoint": "run", "profile_detail": "off"},
+    {"backend": "cuda", "entrypoint": "serve", "profile_detail": "off"},
+    {"backend": "metal", "entrypoint": "run", "profile_detail": "off"},
+    {"backend": "metal", "entrypoint": "serve", "profile_detail": "off"},
+]
+TEXT_BYTE_EXPECTED_GATES = [
+    "backend_boundary",
+    "cuda_sentinel",
+    "docs_review",
+    "metal_sentinel",
+    "planner_selftest",
+    "preset_snapshot",
+    "release_validator_selftest",
+    "resource_invariant",
+    "unit",
+]
+TEXT_BYTE_SCENARIOS = [
+    ("run_multiturn_recall", "run_multiturn"),
+    ("serve_concurrency_quality", "serve_concurrency_quality"),
+    ("serve_multiturn_recall", "serve_multiturn_recall"),
+    ("serve_stream_done_usage", "serve_stream"),
+    ("serve_tool_call", "serve_tool_call"),
+    ("serve_structured_output", "serve_structured_output"),
+]
+TEXT_BYTE_SCENARIO_MANIFESTS = {
+    "cuda": REPO_ROOT
+    / "scripts/release/scenarios/runtime_vnext_text_byte_sampling_cuda.json",
+    "metal": REPO_ROOT
+    / "scripts/release/scenarios/runtime_vnext_text_byte_sampling_metal.json",
+}
+TEXT_BYTE_EXACT_PASS_LINE = (
+    "FERRUM RUNTIME VNEXT TEXT BYTE SAMPLING EXACT CONTRACTS PASS"
+)
+CANDIDATE_BUILD_ARTIFACT_TYPE = "runtime_vnext_candidate_build_identity"
+CANDIDATE_BUILD_PASS_PREFIX = "FERRUM RUNTIME VNEXT CANDIDATE BUILD IDENTITY PASS"
 QUALIFICATION_CONTRACTS = {
     (SCHEMA_VERSION, ARTIFACT_TYPE, PROFILE_ID): "profile-timing-v1",
     (SCHEMA_VERSION, ARTIFACT_TYPE, LEGACY_PROFILE_ID): "legacy-startup-v1",
+    (SCHEMA_VERSION, ARTIFACT_TYPE, TEXT_BYTE_PROFILE_ID): "text-byte-sampling-v1",
 }
 QUALIFICATION_MANIFEST_FIELDS = {
     "schema_version",
@@ -312,6 +355,271 @@ def current_source() -> dict[str, Any]:
     return source_at(git_text("rev-parse", "HEAD"))
 
 
+def validate_candidate_bounded_build(
+    receipt: dict[str, Any], backend: str
+) -> list[str]:
+    require(
+        receipt.get("schema") == "ferrum.bounded-command-receipt.v1"
+        and receipt.get("status") == "pass"
+        and receipt.get("rc") == 0
+        and receipt.get("reason") == "command_completed"
+        and receipt.get("violation") is None
+        and receipt.get("cleanup") == {"process_group_gone": True}
+        and receipt.get("termination") == {"errors": [], "signals": []}
+        and receipt.get("sampling_error_count") == 0
+        and receipt.get("sampling_errors") == [],
+        f"candidate {backend} bounded build did not pass cleanly",
+    )
+    command = receipt.get("command")
+    require(
+        isinstance(command, list)
+        and command
+        and all(isinstance(item, str) and item for item in command),
+        f"candidate {backend} build command is invalid",
+    )
+    command_text = " ".join(command)
+    for marker in ("cargo", "build", "--release", "ferrum-cli", "--features"):
+        require(marker in command_text, f"candidate {backend} build lacks {marker}")
+    required_features = (
+        ("cuda", "vllm-moe-marlin", "vllm-paged-attn-v2")
+        if backend == "cuda"
+        else ("metal",)
+    )
+    for feature in required_features:
+        require(feature in command_text, f"candidate {backend} build lacks {feature}")
+    return list(command)
+
+
+def record_candidate_build_identity(
+    *, backend: str, binary: Path, bounded_receipt: Path, out: Path
+) -> str:
+    require(backend in {"cuda", "metal"}, "candidate backend must be cuda or metal")
+    output = out.expanduser().resolve()
+    require(
+        output != REPO_ROOT and REPO_ROOT not in output.parents,
+        "candidate identity output must be outside the source tree",
+    )
+    require(
+        not output.exists() or not any(output.iterdir()),
+        f"candidate identity output must be absent or empty: {output}",
+    )
+    source = current_source()
+    binary_path = binary.expanduser().resolve()
+    require(
+        binary_path.is_file()
+        and not binary_path.is_symlink()
+        and os.access(binary_path, os.X_OK)
+        and binary_path.name == "ferrum",
+        "candidate binary must be an executable ferrum file",
+    )
+    bounded_path = bounded_receipt.expanduser().resolve()
+    bounded = read_json(bounded_path, f"candidate {backend} bounded build")
+    command = validate_candidate_bounded_build(bounded, backend)
+    output.mkdir(parents=True, exist_ok=True)
+    copied_bounded = output / "bounded.receipt.json"
+    shutil.copyfile(bounded_path, copied_bounded)
+    hardware_command = (
+        [
+            "nvidia-smi",
+            "--query-gpu=index,name,uuid,memory.total,driver_version",
+            "--format=csv,noheader,nounits",
+        ]
+        if backend == "cuda"
+        else [
+            "system_profiler",
+            "SPHardwareDataType",
+            "SPDisplaysDataType",
+            "-json",
+        ]
+    )
+    hardware_process = subprocess.run(
+        hardware_command,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    require(hardware_process.returncode == 0, f"candidate {backend} hardware probe failed")
+    hardware = {
+        "command": hardware_command,
+        "returncode": hardware_process.returncode,
+        "stdout": hardware_process.stdout,
+        "stderr": hardware_process.stderr,
+    }
+    features = (
+        ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]
+        if backend == "cuda"
+        else ["metal"]
+    )
+    document = {
+        "schema_version": 1,
+        "artifact_type": CANDIDATE_BUILD_ARTIFACT_TYPE,
+        "status": "pass",
+        "backend": backend,
+        "source": source,
+        "dirty_status": {"is_dirty": False, "status_short": []},
+        "binary": {
+            "name": binary_path.name,
+            "size_bytes": binary_path.stat().st_size,
+            "sha256": sha256(binary_path),
+        },
+        "build_command": command,
+        "cargo_features": features,
+        "hardware": hardware,
+        "bounded_receipt": {
+            "path": copied_bounded.name,
+            "size_bytes": copied_bounded.stat().st_size,
+            "sha256": sha256(copied_bounded),
+        },
+        "recorded_artifact_dir": str(output),
+        "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "pass_line": f"{CANDIDATE_BUILD_PASS_PREFIX}: {output}",
+    }
+    write_json(output / "manifest.json", document)
+    validate_candidate_build_identity(
+        output / "manifest.json", backend=backend, qualified_source=source
+    )
+    return str(document["pass_line"])
+
+
+def validate_candidate_build_identity(
+    path: Path, *, backend: str, qualified_source: dict[str, Any]
+) -> dict[str, Any]:
+    candidate_path = path.expanduser().resolve()
+    document = read_json(candidate_path, f"candidate {backend} identity")
+    require(
+        set(document)
+        == {
+            "schema_version",
+            "artifact_type",
+            "status",
+            "backend",
+            "source",
+            "dirty_status",
+            "binary",
+            "build_command",
+            "cargo_features",
+            "hardware",
+            "bounded_receipt",
+            "recorded_artifact_dir",
+            "created_at",
+            "pass_line",
+        }
+        and document.get("schema_version") == 1
+        and document.get("artifact_type") == CANDIDATE_BUILD_ARTIFACT_TYPE
+        and document.get("status") == "pass"
+        and document.get("backend") == backend
+        and document.get("dirty_status") == {"is_dirty": False, "status_short": []},
+        f"candidate {backend} identity/status differs",
+    )
+    source = normalize_source(document.get("source"), f"candidate {backend}")
+    projection = release_product_projection(source, qualified_source)
+    binary = document.get("binary")
+    require(
+        isinstance(binary, dict)
+        and set(binary) == {"name", "size_bytes", "sha256"}
+        and binary.get("name") == "ferrum"
+        and isinstance(binary.get("size_bytes"), int)
+        and binary["size_bytes"] > 0,
+        f"candidate {backend} binary identity differs",
+    )
+    binary_sha = require_sha256(binary.get("sha256"), f"candidate {backend} binary")
+    bounded_ref = document.get("bounded_receipt")
+    require(
+        isinstance(bounded_ref, dict)
+        and set(bounded_ref) == {"path", "size_bytes", "sha256"}
+        and bounded_ref.get("path") == "bounded.receipt.json",
+        f"candidate {backend} bounded receipt reference differs",
+    )
+    bounded_path = candidate_path.parent / "bounded.receipt.json"
+    require(
+        bounded_path.is_file()
+        and not bounded_path.is_symlink()
+        and bounded_path.stat().st_size == bounded_ref.get("size_bytes")
+        and sha256(bounded_path) == bounded_ref.get("sha256"),
+        f"candidate {backend} bounded receipt binding differs",
+    )
+    bounded = read_json(bounded_path, f"candidate {backend} bounded build")
+    command = validate_candidate_bounded_build(bounded, backend)
+    expected_features = (
+        ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]
+        if backend == "cuda"
+        else ["metal"]
+    )
+    recorded_root = document.get("recorded_artifact_dir")
+    hardware = document.get("hardware")
+    require(
+        isinstance(hardware, dict)
+        and set(hardware) == {"command", "returncode", "stdout", "stderr"}
+        and hardware.get("returncode") == 0,
+        f"candidate {backend} hardware proof differs",
+    )
+    if backend == "cuda":
+        rows = [line for line in str(hardware.get("stdout", "")).splitlines() if line.strip()]
+        require(
+            hardware.get("command")
+            == [
+                "nvidia-smi",
+                "--query-gpu=index,name,uuid,memory.total,driver_version",
+                "--format=csv,noheader,nounits",
+            ]
+            and len(rows) == 1
+            and "RTX 4090" in rows[0],
+            "candidate CUDA hardware is not exactly one RTX 4090",
+        )
+    else:
+        require(
+            hardware.get("command")
+            == [
+                "system_profiler",
+                "SPHardwareDataType",
+                "SPDisplaysDataType",
+                "-json",
+            ],
+            "candidate Metal hardware probe command differs",
+        )
+        try:
+            hardware_json = json.loads(str(hardware.get("stdout", "")))
+        except json.JSONDecodeError as error:
+            raise QualificationError("candidate Metal hardware JSON is invalid") from error
+        hardware_rows = hardware_json.get("SPHardwareDataType")
+        display_rows = hardware_json.get("SPDisplaysDataType")
+        require(
+            isinstance(hardware_rows, list)
+            and len(hardware_rows) == 1
+            and hardware_rows[0].get("chip_type") == "Apple M1 Max"
+            and hardware_rows[0].get("physical_memory") == "32 GB"
+            and isinstance(display_rows, list)
+            and any(
+                isinstance(row, dict)
+                and row.get("sppci_model") == "Apple M1 Max"
+                and str(row.get("sppci_cores")) == "24"
+                for row in display_rows
+            ),
+            "candidate Metal hardware is not 32GB/24-core Apple M1 Max",
+        )
+    require(
+        isinstance(recorded_root, str)
+        and Path(recorded_root).is_absolute()
+        and document.get("pass_line")
+        == f"{CANDIDATE_BUILD_PASS_PREFIX}: {recorded_root}"
+        and document.get("build_command") == command
+        and document.get("cargo_features") == expected_features,
+        f"candidate {backend} build contract differs",
+    )
+    return {
+        "manifest": file_ref(candidate_path),
+        "backend": backend,
+        "build_source": source,
+        "release_product_projection": projection,
+        "binary_sha256": binary_sha,
+        "binary_size_bytes": binary["size_bytes"],
+        "build_command": command,
+        "hardware": copy.deepcopy(hardware),
+        "bounded_receipt": file_ref(bounded_path),
+    }
+
+
 def control_selftest_command(source: dict[str, Any]) -> list[str]:
     return [
         "python3",
@@ -354,6 +662,611 @@ def legacy_exact_unit_test_command(source: dict[str, Any]) -> list[str]:
         "--expected-source-sha",
         source["git_sha"],
     ]
+
+
+def text_byte_exact_contracts_command(
+    source: dict[str, Any], out: Path
+) -> list[str]:
+    return [
+        "python3",
+        "-B",
+        "scripts/release/runtime_vnext_change_impact_qualification.py",
+        "--run-text-byte-exact-contracts",
+        "--expected-source-sha",
+        source["git_sha"],
+        "--out",
+        str(out.expanduser().resolve()),
+    ]
+
+
+def run_logged_command(command: list[str], root: Path, label: str) -> dict[str, Any]:
+    env = dict(os.environ)
+    env["CARGO_BUILD_JOBS"] = "2"
+    env["CARGO_INCREMENTAL"] = "0"
+    env["RUST_TEST_THREADS"] = "1"
+    process = subprocess.run(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    stdout = root / f"{label}.stdout.log"
+    stderr = root / f"{label}.stderr.log"
+    stdout.write_text(process.stdout, encoding="utf-8")
+    stderr.write_text(process.stderr, encoding="utf-8")
+    require(process.returncode == 0, f"{label} failed; see {stderr}")
+    return {
+        "label": label,
+        "command": command,
+        "returncode": process.returncode,
+        "stdout": file_ref(stdout),
+        "stderr": file_ref(stderr),
+    }
+
+
+def run_text_byte_exact_contracts(expected_source_sha: str, out: Path) -> int:
+    source = current_source()
+    require(
+        source["git_sha"] == expected_source_sha,
+        "text-byte exact-contract source SHA differs",
+    )
+    output = out.expanduser().resolve()
+    require(
+        output != REPO_ROOT and REPO_ROOT not in output.parents,
+        "text-byte exact-contract output must be outside the source tree",
+    )
+    require(
+        not output.exists() or not any(output.iterdir()),
+        f"text-byte exact-contract output must be absent or empty: {output}",
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    tests = [
+        "continuous_engine::tests::sample_resamples_candidate_that_would_flush_replacement_char",
+        "continuous_engine::tests::sample_resamples_orphan_utf8_continuation_without_pending_lead",
+        "continuous_engine::tests::pending_utf8_fragment_temporarily_requires_full_logits_for_resampling",
+    ]
+    commands: list[dict[str, Any]] = []
+    for index, test_name in enumerate(tests, start=1):
+        commands.append(
+            run_logged_command(
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "ferrum-engine",
+                    "--lib",
+                    test_name,
+                    "--",
+                    "--exact",
+                    "--test-threads=1",
+                ],
+                output,
+                f"unit-{index}",
+            )
+        )
+    gate_commands = [
+        (
+            "backend-boundary",
+            [
+                "python3",
+                "scripts/release/backend_boundary_audit.py",
+                "--out",
+                str(output / "backend-boundary"),
+            ],
+        ),
+        (
+            "preset-snapshot",
+            [
+                "python3",
+                "scripts/release/backend_runtime_preset_snapshot.py",
+                "--out",
+                str(output / "preset-snapshot"),
+            ],
+        ),
+        (
+            "resource-invariant",
+            [
+                "python3",
+                "scripts/release/resource_invariant_gate.py",
+                "--out",
+                str(output / "resource-invariant"),
+            ],
+        ),
+    ]
+    for label, command in gate_commands:
+        commands.append(run_logged_command(command, output, label))
+    require(current_source() == source, "text-byte exact-contract source changed")
+    document = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_text_byte_sampling_exact_contracts",
+        "status": "pass",
+        "source": source,
+        "tests": tests,
+        "commands": commands,
+        "pass_line": f"{TEXT_BYTE_EXACT_PASS_LINE}: {output}",
+    }
+    write_json(output / "manifest.json", document)
+    print(document["pass_line"])
+    return 0
+
+
+def validate_text_byte_exact_contracts_receipt(
+    path: Path, qualified_source: dict[str, Any]
+) -> dict[str, Any]:
+    receipt = read_json(path, "text-byte exact-contract bounded receipt")
+    require(
+        receipt.get("schema") == "ferrum.bounded-command-receipt.v1"
+        and receipt.get("status") == "pass"
+        and receipt.get("rc") == 0
+        and receipt.get("reason") == "command_completed"
+        and receipt.get("violation") is None
+        and receipt.get("cleanup") == {"process_group_gone": True}
+        and receipt.get("termination") == {"errors": [], "signals": []}
+        and receipt.get("sampling_error_count") == 0
+        and receipt.get("sampling_errors") == [],
+        "text-byte exact-contract receipt did not pass cleanly",
+    )
+    command = receipt.get("command")
+    require(
+        isinstance(command, list)
+        and len(command) == 8
+        and command[:6]
+        == [
+            "python3",
+            "-B",
+            "scripts/release/runtime_vnext_change_impact_qualification.py",
+            "--run-text-byte-exact-contracts",
+            "--expected-source-sha",
+            qualified_source["git_sha"],
+        ]
+        and command[6] == "--out",
+        "text-byte exact-contract command/source binding differs",
+    )
+    output = Path(str(command[7])).expanduser().resolve()
+    require(
+        command == text_byte_exact_contracts_command(qualified_source, output),
+        "text-byte exact-contract command differs",
+    )
+    stdout_path = validate_ref(receipt.get("stdout"), "text-byte exact stdout")
+    stderr_path = validate_ref(receipt.get("stderr"), "text-byte exact stderr")
+    stdout_lines = stdout_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    pass_line = f"{TEXT_BYTE_EXACT_PASS_LINE}: {output}"
+    require(
+        stdout_lines.count(pass_line) == 1 and stdout_lines[-1:] == [pass_line],
+        "text-byte exact-contract PASS line differs",
+    )
+    manifest_path = output / "manifest.json"
+    manifest = read_json(manifest_path, "text-byte exact-contract manifest")
+    tests = [
+        "continuous_engine::tests::sample_resamples_candidate_that_would_flush_replacement_char",
+        "continuous_engine::tests::sample_resamples_orphan_utf8_continuation_without_pending_lead",
+        "continuous_engine::tests::pending_utf8_fragment_temporarily_requires_full_logits_for_resampling",
+    ]
+    require(
+        manifest.get("schema_version") == 1
+        and manifest.get("artifact_type")
+        == "runtime_vnext_text_byte_sampling_exact_contracts"
+        and manifest.get("status") == "pass"
+        and manifest.get("source") == qualified_source
+        and manifest.get("tests") == tests
+        and manifest.get("pass_line") == pass_line,
+        "text-byte exact-contract manifest differs",
+    )
+    commands = manifest.get("commands")
+    require(isinstance(commands, list) and len(commands) == 6, "text-byte exact command set differs")
+    for index, row in enumerate(commands):
+        require(
+            isinstance(row, dict)
+            and row.get("returncode") == 0
+            and isinstance(row.get("command"), list),
+            f"text-byte exact command[{index}] failed",
+        )
+        validate_ref(row.get("stdout"), f"text-byte exact command[{index}] stdout")
+        validate_ref(row.get("stderr"), f"text-byte exact command[{index}] stderr")
+    boundary = read_json(
+        output / "backend-boundary/backend_boundary_audit.json",
+        "text-byte backend boundary",
+    )
+    preset = read_json(
+        output / "preset-snapshot/summary.json", "text-byte preset snapshot"
+    )
+    resource = read_json(
+        output / "resource-invariant/gate.manifest.json",
+        "text-byte resource invariant",
+    )
+    require(
+        boundary.get("status") == "pass"
+        and boundary.get("violation_count") == 0
+        and preset.get("status") == "pass"
+        and isinstance(preset.get("cases"), list)
+        and len(preset["cases"]) == 4
+        and resource.get("status") == "pass"
+        and resource.get("git_sha") == qualified_source["git_sha"]
+        and resource.get("pass_line")
+        == f"RESOURCE INVARIANT GATE PASS: {output / 'resource-invariant'}",
+        "text-byte exact supporting gates differ",
+    )
+    return {
+        "check_id": "text_byte_sampling_exact_contracts",
+        "receipt": file_ref(path),
+        "stdout": file_ref(stdout_path),
+        "stderr": file_ref(stderr_path),
+        "manifest": file_ref(manifest_path),
+        "artifact_dir": str(output),
+        "proved_gates": [
+            "backend_boundary",
+            "preset_snapshot",
+            "resource_invariant",
+        ],
+    }
+
+
+def validate_unit_gate_manifest(
+    path: Path, qualified_source: dict[str, Any]
+) -> dict[str, Any]:
+    manifest_path = path.expanduser().resolve()
+    manifest = read_json(manifest_path, "unit gate manifest")
+    root = manifest_path.parent
+    require(
+        manifest.get("schema_version") == 1
+        and manifest.get("lane") == "unit"
+        and manifest.get("status") == "pass"
+        and manifest.get("git_sha") == qualified_source["git_sha"]
+        and manifest.get("dirty_status") == {"is_dirty": False, "status_short": []}
+        and manifest.get("child_returncode") == 0
+        and manifest.get("artifact_dir") == str(root)
+        and manifest.get("pass_line") == f"FERRUM GATE unit PASS: {root}",
+        "unit gate identity/source/PASS differs",
+    )
+    command = manifest.get("command_line")
+    require(
+        isinstance(command, list)
+        and "scripts/release/run_gate.py" in command
+        and "unit" in command,
+        "unit gate command differs",
+    )
+    child_pass = manifest.get("child_pass_line")
+    require(
+        isinstance(child_pass, str) and child_pass.startswith("G0 SOURCE unit PASS: "),
+        "unit source gate PASS line differs",
+    )
+    return {
+        "gate": "unit",
+        "manifest": file_ref(manifest_path),
+        "pass_line": manifest["pass_line"],
+        "child_pass_line": child_pass,
+    }
+
+
+def canonical_json_sha256(value: dict[str, Any]) -> str:
+    return sha256_bytes(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    )
+
+
+def validate_canonical_self_hash(value: dict[str, Any], label: str) -> None:
+    digest = value.get("canonical_sha256")
+    require_sha256(digest, f"{label} canonical SHA256")
+    projected = copy.deepcopy(value)
+    projected.pop("canonical_sha256", None)
+    require(
+        projected.get("canonical_sha256_scope")
+        == "document_without_canonical_sha256_fields"
+        and canonical_json_sha256(projected) == digest,
+        f"{label} canonical SHA256 differs",
+    )
+
+
+def resolve_recorded_member(
+    actual_root: Path, recorded_root: Path, value: Any, label: str
+) -> Path:
+    require(isinstance(value, str) and value, f"{label} path is invalid")
+    recorded_path = Path(value)
+    require(recorded_path.is_absolute(), f"{label} path is not absolute")
+    try:
+        relative = recorded_path.relative_to(recorded_root)
+    except ValueError as error:
+        raise QualificationError(f"{label} escapes its recorded root") from error
+    candidate = actual_root / relative
+    require(
+        candidate.is_file() and not candidate.is_symlink(),
+        f"{label} is missing: {candidate}",
+    )
+    return candidate
+
+
+def validate_portable_artifact_tree(
+    actual_root: Path, recorded_root: Path, label: str
+) -> dict[str, Any]:
+    tree_path = actual_root / "artifact_tree.json"
+    tree = read_json(tree_path, f"{label} artifact tree")
+    validate_canonical_self_hash(tree, f"{label} artifact tree")
+    rows = tree.get("files")
+    require(
+        tree.get("schema_version") == 1
+        and tree.get("artifact_root") == str(recorded_root)
+        and isinstance(rows, list)
+        and tree.get("file_count") == len(rows),
+        f"{label} artifact tree identity/count differs",
+    )
+    indexed: set[str] = set()
+    for index, row in enumerate(rows):
+        require(
+            isinstance(row, dict)
+            and set(row) == {"path", "size", "sha256"}
+            and isinstance(row.get("path"), str)
+            and row["path"] not in indexed,
+            f"{label} artifact tree row[{index}] differs",
+        )
+        member = actual_root / row["path"]
+        require(
+            member.is_file()
+            and not member.is_symlink()
+            and member.stat().st_size == row.get("size")
+            and sha256(member) == row.get("sha256"),
+            f"{label} artifact tree binding differs: {row.get('path')}",
+        )
+        indexed.add(row["path"])
+    actual = {
+        member.relative_to(actual_root).as_posix()
+        for member in actual_root.rglob("*")
+        if member.is_file()
+        and not member.is_symlink()
+        and member.name != "artifact_tree.json"
+    }
+    require(indexed == actual, f"{label} artifact tree coverage differs")
+    return file_ref(tree_path)
+
+
+def validate_text_byte_scenario_artifact(
+    path: Path,
+    *,
+    backend: str,
+    qualified_source: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    require(backend in {"cuda", "metal"}, "text-byte scenario backend is invalid")
+    candidate_path = path.expanduser().resolve()
+    summary_path = candidate_path / "summary.json" if candidate_path.is_dir() else candidate_path
+    root = summary_path.parent
+    summary = read_json(summary_path, f"text-byte {backend} scenario summary")
+    recorded_root = Path(str(summary.get("artifact_dir", "")))
+    require(recorded_root.is_absolute(), f"text-byte {backend} recorded root is invalid")
+    names = [name for name, _kind in TEXT_BYTE_SCENARIOS]
+    require(
+        summary.get("schema_version") == 1
+        and summary.get("status") == "pass"
+        and summary.get("backend") == backend
+        and "qwen3-30b-a3b" in str(summary.get("model", "")).lower()
+        and summary.get("git_sha") == qualified_source["git_sha"]
+        and summary.get("dirty_status") == {"is_dirty": False, "status_short": []}
+        and summary.get("scenario_count") == 6
+        and summary.get("manifest_scenario_count") == 6
+        and summary.get("requested_scenarios") == []
+        and summary.get("selected_scenarios") == names
+        and summary.get("failed") == 0
+        and summary.get("skipped") == 0
+        and summary.get("observability") is None
+        and summary.get("pass_line")
+        == f"BACKEND REGRESSION SMOKE PASS: {recorded_root}",
+        f"text-byte {backend} scenario identity/source/result differs",
+    )
+    rows = summary.get("scenarios")
+    require(
+        isinstance(rows, list)
+        and len(rows) == 6
+        and [
+            (row.get("name"), row.get("type"))
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        == TEXT_BYTE_SCENARIOS,
+        f"text-byte {backend} scenario row order differs",
+    )
+    result_by_name: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        require(
+            isinstance(row, dict) and row.get("status") == "pass",
+            f"text-byte {backend} scenario failed",
+        )
+        result_path = resolve_recorded_member(
+            root,
+            recorded_root,
+            row.get("artifact"),
+            f"text-byte {backend} {row.get('name')} result",
+        )
+        require(
+            read_json(result_path, f"text-byte {backend} result") == row,
+            f"text-byte {backend} result binding differs: {row.get('name')}",
+        )
+        result_by_name[str(row["name"])] = row
+        bad_values = [
+            value
+            for value in recursive_strings(row)
+            if any(
+                marker in value
+                for marker in ("<unk", "[PAD", "\ufffd", "ï¿½", "Ã", "Â")
+            )
+        ]
+        require(not bad_values, f"text-byte {backend} result contains forbidden text")
+    run = result_by_name["run_multiturn_recall"]
+    concurrency = result_by_name["serve_concurrency_quality"]
+    multiturn = result_by_name["serve_multiturn_recall"]
+    stream = result_by_name["serve_stream_done_usage"]
+    tool = result_by_name["serve_tool_call"]
+    structured = result_by_name["serve_structured_output"]
+    require(
+        run.get("assistant_turns", 0) >= 2
+        and run.get("length_finishes") == 0,
+        f"text-byte {backend} ferrum run contract failed",
+    )
+    cells = concurrency.get("cells")
+    require(
+        isinstance(cells, list)
+        and [cell.get("concurrency") for cell in cells if isinstance(cell, dict)] == [1, 4]
+        and all(
+            isinstance(cell, dict)
+            and cell.get("passed") is True
+            and cell.get("crosstalk") == 0
+            and cell.get("forbidden_count") == 0
+            and cell.get("length_finishes") == 0
+            and cell.get("status_200") == cell.get("requests")
+            and cell.get("json_ok") == cell.get("requests")
+            and cell.get("format_ok") == cell.get("requests")
+            and cell.get("marker_ok") == cell.get("requests")
+            for cell in cells
+        ),
+        f"text-byte {backend} concurrency quality contract failed",
+    )
+    require(
+        multiturn.get("assistant_turns") == 2
+        and multiturn.get("recalled_secret") is True,
+        f"text-byte {backend} serve multi-turn contract failed",
+    )
+    require(
+        stream.get("done_count") == 1
+        and stream.get("content_delta_count", 0) > 0
+        and stream.get("malformed_json") == 0
+        and stream.get("usage_chunks") == 1
+        and stream.get("errors") == [],
+        f"text-byte {backend} stream contract failed",
+    )
+    checks = tool.get("checks")
+    require(
+        isinstance(checks, dict)
+        and checks
+        and all(
+            isinstance(check, dict) and check.get("passed") is True
+            for check in checks.values()
+        ),
+        f"text-byte {backend} tool-call contract failed",
+    )
+    require(
+        structured.get("object") == {"answer": "scenario-ok"},
+        f"text-byte {backend} structured-output contract failed",
+    )
+    receipt_path = root / "execution_receipt.json"
+    receipt = read_json(receipt_path, f"text-byte {backend} execution receipt")
+    validate_canonical_self_hash(receipt, f"text-byte {backend} execution receipt")
+    require(
+        receipt.get("schema_version") == 1
+        and receipt.get("mode") == "start"
+        and receipt.get("backend") == backend
+        and receipt.get("model") == summary.get("model")
+        and receipt.get("git_sha") == qualified_source["git_sha"]
+        and receipt.get("dirty_status") == {"is_dirty": False, "status_short": []}
+        and receipt.get("selected_scenarios") == names
+        and receipt.get("scenario_count") == 6
+        and receipt.get("failed") == 0
+        and receipt.get("skipped") == 0
+        and receipt.get("binary_sha256") == candidate["binary_sha256"],
+        f"text-byte {backend} execution receipt differs",
+    )
+    child_env = receipt.get("child_env")
+    require(
+        isinstance(child_env, dict)
+        and not any(str(key).startswith("FERRUM_") for key in child_env),
+        f"text-byte {backend} used hidden FERRUM environment",
+    )
+    server_argv = receipt.get("server_argv")
+    require(
+        isinstance(server_argv, list)
+        and server_argv.count("--backend") == 1
+        and server_argv[server_argv.index("--backend") + 1] == backend
+        and "--profile-detail" not in server_argv
+        and "--profile-jsonl" not in server_argv
+        and server_argv[-1] == summary.get("model"),
+        f"text-byte {backend} serve command/default mode differs",
+    )
+    inputs = receipt.get("input_artifacts")
+    require(isinstance(inputs, dict), f"text-byte {backend} input artifacts are missing")
+    expected_inputs = {
+        "runner": REPO_ROOT / "scripts/release/run_scenarios.py",
+        "manifest": TEXT_BYTE_SCENARIO_MANIFESTS[backend],
+    }
+    for key, current in expected_inputs.items():
+        item = inputs.get(key)
+        require(
+            isinstance(item, dict) and set(item) == {"path", "sha256"},
+            f"text-byte {backend} {key} input differs",
+        )
+        copied = resolve_recorded_member(
+            root,
+            recorded_root,
+            item.get("path"),
+            f"text-byte {backend} {key} input",
+        )
+        require(
+            item.get("sha256") == sha256(copied) == sha256(current),
+            f"text-byte {backend} {key} source differs",
+        )
+    summary_receipt = summary.get("execution_receipt")
+    require(
+        isinstance(summary_receipt, dict)
+        and summary_receipt.get("artifact_sha256") == sha256(receipt_path)
+        and summary_receipt.get("canonical_sha256") == receipt["canonical_sha256"]
+        and summary_receipt.get("runner_sha256")
+        == sha256(REPO_ROOT / "scripts/release/run_scenarios.py")
+        and summary_receipt.get("manifest_sha256")
+        == sha256(TEXT_BYTE_SCENARIO_MANIFESTS[backend])
+        and summary_receipt.get("binary_sha256") == candidate["binary_sha256"],
+        f"text-byte {backend} summary/receipt binding differs",
+    )
+    run_command = read_json(
+        root / "run_multiturn_recall/command.json",
+        f"text-byte {backend} run command",
+    )
+    argv = run_command.get("argv")
+    require(
+        run_command.get("binary_sha256") == candidate["binary_sha256"]
+        and run_command.get("env_policy") == "remove_FERRUM_prefix"
+        and isinstance(argv, list)
+        and argv[1:4] == ["run", "--backend", backend]
+        and "--profile-detail" not in argv
+        and argv[-1] == summary.get("model"),
+        f"text-byte {backend} run command/default mode differs",
+    )
+    if backend == "cuda":
+        hardware = receipt.get("hardware")
+        gpu_rows = [
+            line for line in str(hardware.get("stdout", "")).splitlines() if line.strip()
+        ] if isinstance(hardware, dict) else []
+        require(
+            isinstance(hardware, dict)
+            and hardware.get("returncode") == 0
+            and len(gpu_rows) == 1
+            and "RTX 4090" in gpu_rows[0],
+            "text-byte CUDA scenario did not use exactly one RTX 4090",
+        )
+    server_log = root / "server.log"
+    server_text = server_log.read_text(encoding="utf-8", errors="replace")
+    fatal_markers = [
+        marker
+        for marker in ("panicked at", "thread '" , "invalid utf-8", "kv cache overflow")
+        if marker in server_text.lower()
+    ]
+    require(not fatal_markers, f"text-byte {backend} server log contains fatal markers")
+    tree = validate_portable_artifact_tree(root, recorded_root, f"text-byte {backend}")
+    return {
+        "check_id": f"{backend}_run_serve_text_byte_sampling",
+        "backend": backend,
+        "summary": file_ref(summary_path),
+        "execution_receipt": file_ref(receipt_path),
+        "artifact_tree": tree,
+        "binary_sha256": candidate["binary_sha256"],
+        "model": summary["model"],
+        "scenario_count": 6,
+        "entrypoints": ["run", "serve"],
+        "profile_detail": "off",
+        "hardware": copy.deepcopy(candidate["hardware"]),
+    }
 
 
 def changed_paths(base_sha: str, head_sha: str) -> list[str]:
@@ -2914,6 +3827,8 @@ def plan_classification(
     expected_control_gates = (
         LEGACY_EXPECTED_CONTROL_GATES
         if profile_id == LEGACY_PROFILE_ID
+        else TEXT_BYTE_EXPECTED_GATES
+        if profile_id == TEXT_BYTE_PROFILE_ID
         else EXPECTED_CONTROL_GATES
     )
     require(
@@ -2927,6 +3842,20 @@ def plan_classification(
             plan=plan,
             matches=matches,
             rule_config=rule_config,
+        )
+    elif profile_id == TEXT_BYTE_PROFILE_ID:
+        matched_paths = sorted(str(match.get("path")) for match in matches)
+        require(
+            len(matched_paths) == len(set(matched_paths))
+            and matched_paths == sorted(product_changed),
+            "text-byte qualification did not select every and only product path",
+        )
+        require(
+            plan.get("required_product_scenarios") == []
+            and "text_byte_sampling_correctness" in plan.get("impact_domains", [])
+            and not set(plan.get("impact_domains", []))
+            & {"diagnostic_observability", "shared_runtime", "vnext_execution_contract"},
+            "text-byte qualification escaped its exact correctness domain",
         )
     selector: dict[str, Any] = (
         matches[0]
@@ -2954,7 +3883,11 @@ def plan_classification(
                     f"{scope['backend']}.{scope['entrypoint']}."
                     f"profile_{scope['profile_detail']}"
                 ),
-                "reason": "machine-selected diagnostic observability consumer",
+                "reason": (
+                    "machine-selected default text-byte sampling consumer"
+                    if profile_id == TEXT_BYTE_PROFILE_ID
+                    else "machine-selected diagnostic observability consumer"
+                ),
             }
             for scope in expected_scopes
         ]
@@ -2980,6 +3913,10 @@ def qualification_profile_contract(
     if profile_id == LEGACY_PROFILE_ID:
         return copy.deepcopy(LEGACY_EXPECTED_CHECKS), copy.deepcopy(
             LEGACY_EXPECTED_SCOPES
+        )
+    if profile_id == TEXT_BYTE_PROFILE_ID:
+        return copy.deepcopy(TEXT_BYTE_EXPECTED_CHECKS), copy.deepcopy(
+            TEXT_BYTE_EXPECTED_SCOPES
         )
     raise QualificationError(f"unsupported qualification profile: {profile_id}")
 
@@ -3022,9 +3959,32 @@ def docs_review_closure(
 
 
 def revalidated_cells(
-    binary_sha256: str, profile_id: str = PROFILE_ID
+    binary_sha256: str | dict[str, str], profile_id: str = PROFILE_ID
 ) -> list[dict[str, Any]]:
     _, scopes = qualification_profile_contract(profile_id)
+    if profile_id == TEXT_BYTE_PROFILE_ID:
+        require(
+            isinstance(binary_sha256, dict)
+            and set(binary_sha256) == {"cuda", "metal"},
+            "text-byte revalidated binary authority differs",
+        )
+        return [
+            {
+                "cell_id": (
+                    f"{scope['backend']}.{scope['entrypoint']}.profile_off"
+                ),
+                "backend": scope["backend"],
+                "entrypoint": scope["entrypoint"],
+                "profile_detail": "off",
+                "evidence": "text_byte_sampling_correctness",
+                "check_id": (
+                    f"{scope['backend']}_run_serve_text_byte_sampling"
+                ),
+                "binary_sha256": binary_sha256[scope["backend"]],
+            }
+            for scope in scopes
+        ]
+    require(isinstance(binary_sha256, str), "diagnostic binary authority differs")
     return [
         {
             "cell_id": (
@@ -3130,6 +4090,142 @@ def qualification_document(
         "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
         "pass_line": f"{PASS_PREFIX}: {output}",
     }
+
+
+def text_byte_qualification_document(
+    *,
+    output: Path,
+    source: dict[str, Any],
+    prior_path: Path,
+    prior: dict[str, Any],
+    candidate_cuda: dict[str, Any],
+    candidate_metal: dict[str, Any],
+    unit_gate: dict[str, Any],
+    exact_contracts: dict[str, Any],
+    control_gate: dict[str, Any],
+    cuda_scenario: dict[str, Any],
+    metal_scenario: dict[str, Any],
+) -> dict[str, Any]:
+    classification = plan_classification_at_source(
+        prior["source"], source, TEXT_BYTE_PROFILE_ID
+    )
+    authority = {
+        "cuda": candidate_cuda["binary_sha256"],
+        "metal": candidate_metal["binary_sha256"],
+    }
+    partition = {
+        "source": "planner_qualified_scopes",
+        "affected_backends": ["cuda", "metal"],
+        "unaffected_backends": [],
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "artifact_type": ARTIFACT_TYPE,
+        "status": "pass",
+        "profile_id": TEXT_BYTE_PROFILE_ID,
+        "artifact_dir": str(output),
+        "source": source,
+        "prior_source": prior["source"],
+        "prior_r1": file_ref(prior_path),
+        "canonical_inputs": canonical_input_refs(source),
+        "diff": diff_identity(prior["source"], source),
+        "classification": classification,
+        "proofs": {
+            "candidate_cuda": candidate_cuda,
+            "candidate_metal": candidate_metal,
+            "unit": unit_gate,
+            "text_byte_sampling_exact_contracts": exact_contracts,
+            "release_validator_selftest": control_gate,
+            "docs_review": docs_review_closure(classification, source),
+            "cuda_run_serve_text_byte_sampling": cuda_scenario,
+            "metal_run_serve_text_byte_sampling": metal_scenario,
+            "backend_scope_partition": partition,
+        },
+        "reused_cells": prior["reused_cells"],
+        "revalidated_cells": revalidated_cells(authority, TEXT_BYTE_PROFILE_ID),
+        "invalidated_cells": [],
+        "open_invalidated_cells": [],
+        "backend_binary_sha256": authority,
+        "prior_reachability": prior["reachability"],
+        "does_not_prove": DOES_NOT_PROVE,
+        "created_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "pass_line": f"{PASS_PREFIX}: {output}",
+    }
+
+
+def build_text_byte_qualification(
+    *,
+    prior_r1: Path,
+    candidate_cuda_identity: Path,
+    candidate_metal_identity: Path,
+    unit_gate_manifest: Path,
+    exact_contracts_receipt: Path,
+    control_gate_receipt: Path,
+    cuda_scenario: Path,
+    metal_scenario: Path,
+    out: Path,
+) -> str:
+    output = out.expanduser().resolve()
+    require(
+        output != REPO_ROOT and REPO_ROOT not in output.parents,
+        "qualification output must be outside the source tree",
+    )
+    require(
+        not output.exists() or not any(output.iterdir()),
+        f"qualification output must be absent or empty: {output}",
+    )
+    source = current_source()
+    prior_path = prior_r1.expanduser().resolve()
+    prior = prior_r1_summary(prior_path)
+    candidate_cuda = validate_candidate_build_identity(
+        candidate_cuda_identity,
+        backend="cuda",
+        qualified_source=source,
+    )
+    candidate_metal = validate_candidate_build_identity(
+        candidate_metal_identity,
+        backend="metal",
+        qualified_source=source,
+    )
+    unit_gate = validate_unit_gate_manifest(unit_gate_manifest, source)
+    exact_contracts = validate_text_byte_exact_contracts_receipt(
+        exact_contracts_receipt, source
+    )
+    control_gate = validate_control_gate_receipt(control_gate_receipt, source)
+    cuda_result = validate_text_byte_scenario_artifact(
+        cuda_scenario,
+        backend="cuda",
+        qualified_source=source,
+        candidate=candidate_cuda,
+    )
+    metal_result = validate_text_byte_scenario_artifact(
+        metal_scenario,
+        backend="metal",
+        qualified_source=source,
+        candidate=candidate_metal,
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    try:
+        document = text_byte_qualification_document(
+            output=output,
+            source=source,
+            prior_path=prior_path,
+            prior=prior,
+            candidate_cuda=candidate_cuda,
+            candidate_metal=candidate_metal,
+            unit_gate=unit_gate,
+            exact_contracts=exact_contracts,
+            control_gate=control_gate,
+            cuda_scenario=cuda_result,
+            metal_scenario=metal_result,
+        )
+        write_json(output / "manifest.json", document)
+        verify_manifest(output / "manifest.json", verify_checkout=True)
+        return str(document["pass_line"])
+    except BaseException:
+        if output.is_dir() and not output.is_symlink():
+            shutil.rmtree(output)
+        raise
 
 
 def build(
@@ -3245,6 +4341,147 @@ def validate_qualification_envelope(
     return source, contract_id
 
 
+def verify_text_byte_contract(
+    *,
+    manifest: dict[str, Any],
+    path: Path,
+    source: dict[str, Any],
+    prior: dict[str, Any],
+    prior_path: Path,
+    classification: dict[str, Any],
+) -> dict[str, Any]:
+    proofs = manifest.get("proofs")
+    expected_proofs = {
+        "candidate_cuda",
+        "candidate_metal",
+        "unit",
+        "text_byte_sampling_exact_contracts",
+        "release_validator_selftest",
+        "docs_review",
+        "cuda_run_serve_text_byte_sampling",
+        "metal_run_serve_text_byte_sampling",
+        "backend_scope_partition",
+    }
+    require(
+        isinstance(proofs, dict) and set(proofs) == expected_proofs,
+        "text-byte qualification proof set differs",
+    )
+    candidates: dict[str, dict[str, Any]] = {}
+    for backend in ("cuda", "metal"):
+        recorded = proofs[f"candidate_{backend}"]
+        require(isinstance(recorded, dict), f"candidate {backend} proof is invalid")
+        candidate_path = validate_ref(
+            recorded.get("manifest"), f"candidate {backend} manifest"
+        )
+        derived = validate_candidate_build_identity(
+            candidate_path,
+            backend=backend,
+            qualified_source=source,
+        )
+        require(recorded == derived, f"candidate {backend} proof drifted")
+        candidates[backend] = derived
+    unit_recorded = proofs["unit"]
+    require(isinstance(unit_recorded, dict), "unit proof is invalid")
+    unit_path = validate_ref(unit_recorded.get("manifest"), "unit gate manifest")
+    unit = validate_unit_gate_manifest(unit_path, source)
+    require(unit_recorded == unit, "unit gate proof drifted")
+    exact_recorded = proofs["text_byte_sampling_exact_contracts"]
+    require(isinstance(exact_recorded, dict), "text-byte exact proof is invalid")
+    exact_path = validate_ref(
+        exact_recorded.get("receipt"), "text-byte exact receipt"
+    )
+    exact = validate_text_byte_exact_contracts_receipt(exact_path, source)
+    require(exact_recorded == exact, "text-byte exact proof drifted")
+    control_recorded = proofs["release_validator_selftest"]
+    require(isinstance(control_recorded, dict), "control gate proof is invalid")
+    control_path = validate_ref(
+        control_recorded.get("receipt"), "qualification control self-test receipt"
+    )
+    control = validate_control_gate_receipt(control_path, source)
+    require(control_recorded == control, "qualification control proof drifted")
+    docs = docs_review_closure(classification, source)
+    require(proofs["docs_review"] == docs, "qualification docs review drifted")
+    scenarios: dict[str, dict[str, Any]] = {}
+    for backend in ("cuda", "metal"):
+        key = f"{backend}_run_serve_text_byte_sampling"
+        recorded = proofs[key]
+        require(isinstance(recorded, dict), f"text-byte {backend} scenario proof is invalid")
+        summary_path = validate_ref(
+            recorded.get("summary"), f"text-byte {backend} scenario summary"
+        )
+        derived = validate_text_byte_scenario_artifact(
+            summary_path,
+            backend=backend,
+            qualified_source=source,
+            candidate=candidates[backend],
+        )
+        require(recorded == derived, f"text-byte {backend} scenario proof drifted")
+        scenarios[backend] = derived
+    partition = {
+        "source": "planner_qualified_scopes",
+        "affected_backends": ["cuda", "metal"],
+        "unaffected_backends": [],
+    }
+    require(
+        proofs["backend_scope_partition"] == partition,
+        "text-byte backend scope partition drifted",
+    )
+    proved_gates = sorted(
+        {
+            unit["gate"],
+            *exact["proved_gates"],
+            *control["gates"],
+            docs["gate"],
+            "cuda_sentinel",
+            "metal_sentinel",
+        }
+    )
+    require(
+        classification["required_control_gates"] == proved_gates,
+        "text-byte qualification gates are not fully proved",
+    )
+    authority = {
+        "cuda": candidates["cuda"]["binary_sha256"],
+        "metal": candidates["metal"]["binary_sha256"],
+    }
+    reused = prior["reused_cells"]
+    revalidated = revalidated_cells(authority, TEXT_BYTE_PROFILE_ID)
+    require(manifest.get("reused_cells") == reused, "R1 reused denominator drifted")
+    require(
+        manifest.get("revalidated_cells") == revalidated,
+        "text-byte revalidated cell set drifted",
+    )
+    require(
+        manifest.get("invalidated_cells") == []
+        and manifest.get("open_invalidated_cells") == [],
+        "text-byte qualification still has invalidated cells",
+    )
+    require(
+        manifest.get("backend_binary_sha256") == authority,
+        "text-byte backend binary authority differs",
+    )
+    require(
+        manifest.get("prior_reachability") == prior["reachability"],
+        "text-byte prior R1 reachability drifted",
+    )
+    return {
+        "kind": "runtime-vnext-change-impact-qualification",
+        "manifest": file_ref(path),
+        "profile_id": TEXT_BYTE_PROFILE_ID,
+        "source": source,
+        "prior_source": prior["source"],
+        "prior_r1": file_ref(prior_path),
+        "selector": classification["selector"],
+        "qualified_scopes": classification["qualified_scopes"],
+        "reused_cells": copy.deepcopy(reused),
+        "revalidated_cells": copy.deepcopy(revalidated),
+        "invalidated_cells": [],
+        "open_invalidated_cells": [],
+        "backend_binary_sha256": authority,
+        "proofs": copy.deepcopy(proofs),
+    }
+
+
 def _verify_manifest_uncached(
     manifest_path: Path,
     *,
@@ -3283,6 +4520,15 @@ def _verify_manifest_uncached(
         manifest.get("classification") == classification,
         "qualification classification differs",
     )
+    if contract_id == "text-byte-sampling-v1":
+        return verify_text_byte_contract(
+            manifest=manifest,
+            path=path,
+            source=source,
+            prior=prior,
+            prior_path=prior_path,
+            classification=classification,
+        )
     proofs = manifest.get("proofs")
     legacy = contract_id == "legacy-startup-v1"
     expected_proofs = (
@@ -3554,6 +4800,22 @@ def self_test() -> int:
         == ["cuda.run.profile_full", "cuda.serve.profile_verify"],
         "self-test legacy revalidated cell set differs",
     )
+    text_binaries = {"cuda": "3" * 64, "metal": "4" * 64}
+    require(
+        [
+            row["cell_id"]
+            for row in revalidated_cells(
+                text_binaries, TEXT_BYTE_PROFILE_ID
+            )
+        ]
+        == [
+            "cuda.run.profile_off",
+            "cuda.serve.profile_off",
+            "metal.run.profile_off",
+            "metal.serve.profile_off",
+        ],
+        "self-test text-byte revalidated cell set differs",
+    )
     expect_reject(
         lambda: derive_reused_cells(
             {**acceptance, "total_matrix_case_count": 1866}
@@ -3569,6 +4831,16 @@ def self_test() -> int:
         and sorted(profile.get("required_checks", [])) == EXPECTED_CHECKS
         and profile.get("qualified_scopes") == EXPECTED_SCOPES,
         "self-test canonical qualification profile differs",
+    )
+    text_profile = rule_config["qualification_profiles"].get(TEXT_BYTE_PROFILE_ID)
+    require(
+        isinstance(text_profile, dict)
+        and sorted(text_profile.get("required_checks", []))
+        == TEXT_BYTE_EXPECTED_CHECKS
+        and text_profile.get("qualified_scopes") == TEXT_BYTE_EXPECTED_SCOPES
+        and sorted(text_profile.get("required_gates", []))
+        == TEXT_BYTE_EXPECTED_GATES,
+        "self-test canonical text-byte qualification profile differs",
     )
     mixed_product_path = "crates/ferrum-engine/src/continuous_engine/inner/decode.rs"
     mixed_changed = sorted([mixed_product_path, *CONTROL_PLANE_PATHS])
@@ -3792,6 +5064,7 @@ def self_test() -> int:
             == {
                 (SCHEMA_VERSION, ARTIFACT_TYPE, PROFILE_ID): "profile-timing-v1",
                 (SCHEMA_VERSION, ARTIFACT_TYPE, LEGACY_PROFILE_ID): "legacy-startup-v1",
+                (SCHEMA_VERSION, ARTIFACT_TYPE, TEXT_BYTE_PROFILE_ID): "text-byte-sampling-v1",
             },
             "qualification version dispatch differs",
         )
@@ -5297,6 +6570,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prior-r1", type=Path)
     parser.add_argument("--profile-id", default=PROFILE_ID)
+    parser.add_argument("--record-candidate-build", action="store_true")
+    parser.add_argument("--candidate-backend", choices=("cuda", "metal"))
+    parser.add_argument("--candidate-binary", type=Path)
+    parser.add_argument("--candidate-bounded-receipt", type=Path)
+    parser.add_argument("--candidate-cuda-identity", type=Path)
+    parser.add_argument("--candidate-metal-identity", type=Path)
+    parser.add_argument("--unit-gate-manifest", type=Path)
+    parser.add_argument("--cuda-scenario", type=Path)
+    parser.add_argument("--metal-scenario", type=Path)
     parser.add_argument("--candidate-cuda-binary", type=Path)
     parser.add_argument("--candidate-cuda-build-receipt", type=Path)
     parser.add_argument("--exact-contracts-receipt", type=Path)
@@ -5309,6 +6591,7 @@ def main() -> int:
     parser.add_argument("--control-self-test", action="store_true")
     parser.add_argument("--run-exact-unit-test", action="store_true")
     parser.add_argument("--run-profile-timing-exact-contracts", action="store_true")
+    parser.add_argument("--run-text-byte-exact-contracts", action="store_true")
     parser.add_argument("--run-profile-collector-selftest", action="store_true")
     parser.add_argument("--expected-source-sha")
     args = parser.parse_args()
@@ -5321,6 +6604,24 @@ def main() -> int:
                 "--control-self-test requires --expected-source-sha",
             )
             return control_self_test(args.expected_source_sha)
+        if args.record_candidate_build:
+            required = {
+                "candidate_backend": args.candidate_backend,
+                "candidate_binary": args.candidate_binary,
+                "candidate_bounded_receipt": args.candidate_bounded_receipt,
+                "out": args.out,
+            }
+            missing = [key for key, value in required.items() if value is None]
+            require(not missing, f"missing candidate-build inputs: {missing}")
+            print(
+                record_candidate_build_identity(
+                    backend=args.candidate_backend,
+                    binary=args.candidate_binary,
+                    bounded_receipt=args.candidate_bounded_receipt,
+                    out=args.out,
+                )
+            )
+            return 0
         if args.run_exact_unit_test:
             require(
                 args.expected_source_sha is not None,
@@ -5333,6 +6634,12 @@ def main() -> int:
                 "--run-profile-timing-exact-contracts requires --expected-source-sha",
             )
             return run_profile_timing_exact_contracts(args.expected_source_sha)
+        if args.run_text_byte_exact_contracts:
+            require(
+                args.expected_source_sha is not None and args.out is not None,
+                "--run-text-byte-exact-contracts requires --expected-source-sha and --out",
+            )
+            return run_text_byte_exact_contracts(args.expected_source_sha, args.out)
         if args.run_profile_collector_selftest:
             require(
                 args.expected_source_sha is not None,
@@ -5342,6 +6649,34 @@ def main() -> int:
         if args.verify_manifest is not None:
             verified = verify_manifest(args.verify_manifest, verify_checkout=True)
             print(f"{PASS_PREFIX}: {Path(verified['manifest']['path']).parent}")
+            return 0
+        if args.profile_id == TEXT_BYTE_PROFILE_ID:
+            required = {
+                "prior_r1": args.prior_r1,
+                "candidate_cuda_identity": args.candidate_cuda_identity,
+                "candidate_metal_identity": args.candidate_metal_identity,
+                "unit_gate_manifest": args.unit_gate_manifest,
+                "exact_contracts_receipt": args.exact_contracts_receipt,
+                "control_gate_receipt": args.control_gate_receipt,
+                "cuda_scenario": args.cuda_scenario,
+                "metal_scenario": args.metal_scenario,
+                "out": args.out,
+            }
+            missing = [key for key, value in required.items() if value is None]
+            require(not missing, f"missing text-byte qualification inputs: {missing}")
+            print(
+                build_text_byte_qualification(
+                    prior_r1=args.prior_r1,
+                    candidate_cuda_identity=args.candidate_cuda_identity,
+                    candidate_metal_identity=args.candidate_metal_identity,
+                    unit_gate_manifest=args.unit_gate_manifest,
+                    exact_contracts_receipt=args.exact_contracts_receipt,
+                    control_gate_receipt=args.control_gate_receipt,
+                    cuda_scenario=args.cuda_scenario,
+                    metal_scenario=args.metal_scenario,
+                    out=args.out,
+                )
+            )
             return 0
         required = {
             "prior_r1": args.prior_r1,

@@ -1586,6 +1586,7 @@ def validate_qualification_closure(
         and scopes,
         "change-impact qualification scope is missing",
     )
+    text_byte_profile = profile_id == "vnext-text-byte-sampling-correctness"
     normalized_scopes: list[dict[str, str]] = []
     for index, scope in enumerate(scopes):
         require(
@@ -1594,7 +1595,11 @@ def validate_qualification_closure(
             and scope.get("backend") in {"cuda", "metal"}
             and scope.get("entrypoint") in {"run", "serve"}
             and isinstance(scope.get("profile_detail"), str)
-            and scope.get("profile_detail") not in {"", "off"},
+            and (
+                scope.get("profile_detail") == "off"
+                if text_byte_profile
+                else scope.get("profile_detail") not in {"", "off"}
+            ),
             f"change-impact qualification scope[{index}] is invalid",
         )
         normalized_scopes.append(copy.deepcopy(scope))
@@ -1615,17 +1620,30 @@ def validate_qualification_closure(
         entrypoint = scope["entrypoint"]
         profile_detail = scope["profile_detail"]
         affected_backends.add(backend)
-        expected_revalidated.append(
-            {
-                "cell_id": f"{backend}.{entrypoint}.profile_{profile_detail}",
-                "backend": backend,
-                "entrypoint": entrypoint,
-                "profile_detail": profile_detail,
-                "evidence": "diagnostic_observability",
-                "check_id": f"{backend}_{entrypoint}_profile_{profile_detail}",
-                "binary_sha256": authority[backend],
-            }
-        )
+        if text_byte_profile:
+            expected_revalidated.append(
+                {
+                    "cell_id": f"{backend}.{entrypoint}.profile_off",
+                    "backend": backend,
+                    "entrypoint": entrypoint,
+                    "profile_detail": "off",
+                    "evidence": "text_byte_sampling_correctness",
+                    "check_id": f"{backend}_run_serve_text_byte_sampling",
+                    "binary_sha256": authority[backend],
+                }
+            )
+        else:
+            expected_revalidated.append(
+                {
+                    "cell_id": f"{backend}.{entrypoint}.profile_{profile_detail}",
+                    "backend": backend,
+                    "entrypoint": entrypoint,
+                    "profile_detail": profile_detail,
+                    "evidence": "diagnostic_observability",
+                    "check_id": f"{backend}_{entrypoint}_profile_{profile_detail}",
+                    "binary_sha256": authority[backend],
+                }
+            )
     require(
         qualification.get("revalidated_cells") == expected_revalidated,
         "change-impact qualification revalidated cell set differs",
@@ -2336,6 +2354,43 @@ def self_test() -> int:
             validate_qualification_closure(accepted, timing_qualification)
             == timing_qualification["backend_binary_sha256"],
             "R1 profile-timing qualification closure fixture differs",
+        )
+        text_qualification = {
+            "profile_id": "vnext-text-byte-sampling-correctness",
+            "qualified_scopes": [
+                {"backend": "cuda", "entrypoint": "run", "profile_detail": "off"},
+                {"backend": "cuda", "entrypoint": "serve", "profile_detail": "off"},
+                {"backend": "metal", "entrypoint": "run", "profile_detail": "off"},
+                {"backend": "metal", "entrypoint": "serve", "profile_detail": "off"},
+            ],
+            "reused_cells": expected_reused,
+            "revalidated_cells": [
+                {
+                    "cell_id": f"{backend}.{entrypoint}.profile_off",
+                    "backend": backend,
+                    "entrypoint": entrypoint,
+                    "profile_detail": "off",
+                    "evidence": "text_byte_sampling_correctness",
+                    "check_id": f"{backend}_run_serve_text_byte_sampling",
+                    "binary_sha256": qualified_binaries[backend],
+                }
+                for backend in ("cuda", "metal")
+                for entrypoint in ("run", "serve")
+            ],
+            "invalidated_cells": [],
+            "open_invalidated_cells": [],
+            "backend_binary_sha256": qualified_binaries,
+        }
+        require(
+            validate_qualification_closure(accepted, text_qualification)
+            == qualified_binaries,
+            "R1 text-byte qualification closure fixture differs",
+        )
+        text_bad_mode = copy.deepcopy(text_qualification)
+        text_bad_mode["qualified_scopes"][0]["profile_detail"] = "full"
+        expect_reject(
+            lambda: validate_qualification_closure(accepted, text_bad_mode),
+            "text-byte profile-enabled scope",
         )
         forged_reuse = copy.deepcopy(qualification)
         forged_reuse["reused_cells"].pop()
