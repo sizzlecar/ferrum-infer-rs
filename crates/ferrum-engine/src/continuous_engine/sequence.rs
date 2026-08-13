@@ -319,6 +319,10 @@ pub struct SequenceState {
     /// step needs full logits so the engine can reject candidates that would
     /// flush that incomplete fragment into user-visible output.
     pub pending_decoded_utf8_fragment: bool,
+    /// Raw byte-level tokenizer suffix that is a syntactically valid but
+    /// incomplete UTF-8 scalar.  Unlike a lossy decoded string, this preserves
+    /// whether a continuation token can actually complete the pending scalar.
+    pub pending_decoded_utf8_bytes: Vec<u8>,
     /// Bytes of decoded `generated_tokens` already flushed via the stream
     /// channel. Used by `send_stream_update` to compute per-call delta from
     /// the full-history decode, so multi-byte UTF-8 sequences (Chinese chars,
@@ -730,12 +734,16 @@ impl SequenceState {
             .as_ref()
             .map(ferrum_types::ApiRequest::generated_control_token_texts)
             .unwrap_or_default();
-        let (forbidden_token_ids, tokenizer_base_vocab_size, allowed_extended_token_ids) =
-            resolve_sampling_token_constraints(
-                tokenizer.as_ref(),
-                &stop_token_ids,
-                request_generated_control_token_texts,
-            );
+        let (
+            forbidden_token_ids,
+            model_greedy_forbidden_token_ids,
+            tokenizer_base_vocab_size,
+            allowed_extended_token_ids,
+        ) = resolve_sampling_token_constraints(
+            tokenizer.as_ref(),
+            &stop_token_ids,
+            request_generated_control_token_texts,
+        );
         let mut initial_forbidden_token_ids = HashSet::new();
         let initial_forbidden_token_texts = request
             .metadata
@@ -754,6 +762,7 @@ impl SequenceState {
                 tok,
                 model_vocab_size,
                 &forbidden_token_ids,
+                &model_greedy_forbidden_token_ids,
                 &empty_initial_forbidden,
                 &stop_token_ids,
                 &allowed_extended_token_ids,
@@ -767,6 +776,7 @@ impl SequenceState {
                     tok,
                     model_vocab_size,
                     &forbidden_token_ids,
+                    &model_greedy_forbidden_token_ids,
                     &initial_forbidden_token_ids,
                     &stop_token_ids,
                     &allowed_extended_token_ids,
@@ -824,6 +834,7 @@ impl SequenceState {
             argmax_token_mask,
             initial_argmax_token_mask,
             pending_decoded_utf8_fragment: false,
+            pending_decoded_utf8_bytes: Vec::new(),
             streamed_text_len: 0,
         })
     }
@@ -1449,20 +1460,42 @@ impl SequenceState {
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
         token: TokenId,
     ) -> Result<()> {
+        let next_pending_utf8_bytes = tokenizer
+            .and_then(|tokenizer| tokenizer.token_bytes(token))
+            .map(|bytes| advance_pending_utf8_fragment(&self.pending_decoded_utf8_bytes, &bytes));
+        if next_pending_utf8_bytes
+            .as_ref()
+            .is_some_and(|result| result.is_err())
+        {
+            return Err(FerrumError::model(format!(
+                "token {} violates the pending UTF-8 byte fragment",
+                token.get()
+            )));
+        }
         self.accept_response_completion_token(tokenizer, token)?;
         self.generated_tokens.push(token);
         self.sampling_history.record(token);
-        self.pending_decoded_utf8_fragment = tokenizer.is_some_and(|tokenizer| {
-            tokenizer
-                .decode(&self.generated_tokens, true)
-                .map(|text| {
-                    self.streamed_text_len <= text.len()
-                        && text.is_char_boundary(self.streamed_text_len)
-                        && text[self.streamed_text_len..].contains('\u{FFFD}')
-                        && text.ends_with('\u{FFFD}')
-                })
-                .unwrap_or(true)
-        });
+        match next_pending_utf8_bytes {
+            Some(Ok(bytes)) => {
+                self.pending_decoded_utf8_fragment = !bytes.is_empty();
+                self.pending_decoded_utf8_bytes = bytes;
+            }
+            Some(Err(())) => unreachable!("invalid UTF-8 fragment was rejected before commit"),
+            None => {
+                self.pending_decoded_utf8_bytes.clear();
+                self.pending_decoded_utf8_fragment = tokenizer.is_some_and(|tokenizer| {
+                    tokenizer
+                        .decode(&self.generated_tokens, true)
+                        .map(|text| {
+                            self.streamed_text_len <= text.len()
+                                && text.is_char_boundary(self.streamed_text_len)
+                                && text[self.streamed_text_len..].contains('\u{FFFD}')
+                                && text.ends_with('\u{FFFD}')
+                        })
+                        .unwrap_or(true)
+                });
+            }
+        }
         Ok(())
     }
 
@@ -1758,6 +1791,13 @@ impl SequenceState {
         let candidate_is_stop = self.stop_token_ids.contains(&token.get());
         let candidate_is_non_stop_control =
             self.allowed_extended_token_ids.contains(&token.get()) && !candidate_is_stop;
+        if let Some(bytes) = tokenizer.token_bytes(token) {
+            match advance_pending_utf8_fragment(&self.pending_decoded_utf8_bytes, &bytes) {
+                Ok(pending) if candidate_is_stop && !pending.is_empty() => return true,
+                Ok(_) => {}
+                Err(()) => return true,
+            }
+        }
         tokenizer
             .decode(&tokens, true)
             .map(|text| {

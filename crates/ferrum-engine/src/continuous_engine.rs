@@ -122,6 +122,7 @@ const GENERATED_CONTROL_TOKEN_TEXTS: &[&str] = &[
 struct TokenPolicyCacheEntry {
     tokenizer: Weak<dyn Tokenizer + Send + Sync>,
     forbidden: HashSet<u32>,
+    model_greedy_forbidden: HashSet<u32>,
 }
 
 static TOKEN_POLICY_CACHE: OnceLock<
@@ -721,10 +722,10 @@ fn resolve_sampling_token_constraints(
     tokenizer: Option<&Arc<dyn Tokenizer + Send + Sync>>,
     stop_token_ids: &HashSet<u32>,
     request_generated_control_token_texts: &[&str],
-) -> (HashSet<u32>, Option<usize>, HashSet<u32>) {
+) -> (HashSet<u32>, HashSet<u32>, Option<usize>, HashSet<u32>) {
     let mut allowed_extended = stop_token_ids.clone();
     let Some(tok) = tokenizer else {
-        return (HashSet::new(), None, allowed_extended);
+        return (HashSet::new(), HashSet::new(), None, allowed_extended);
     };
 
     if let Some(eos) = tok.special_tokens().eos_token {
@@ -745,14 +746,21 @@ fn resolve_sampling_token_constraints(
     }
 
     let forbidden = cached_forbidden_generation_tokens(tok, &allowed_extended);
+    let model_greedy_forbidden = cached_model_greedy_forbidden_tokens(tok);
 
-    (forbidden, Some(tok.vocab_size()), allowed_extended)
+    (
+        forbidden,
+        model_greedy_forbidden,
+        Some(tok.vocab_size()),
+        allowed_extended,
+    )
 }
 
 fn build_argmax_token_mask(
     tok: &(dyn Tokenizer + Send + Sync),
     model_vocab_size: Option<usize>,
     forbidden_token_ids: &HashSet<u32>,
+    model_greedy_forbidden_token_ids: &HashSet<u32>,
     initial_forbidden_token_ids: &HashSet<u32>,
     stop_token_ids: &HashSet<u32>,
     allowed_extended_token_ids: &HashSet<u32>,
@@ -772,6 +780,7 @@ fn build_argmax_token_mask(
     let mut valid = vec![1i8; mask_len];
     for &token_id in forbidden_token_ids
         .iter()
+        .chain(model_greedy_forbidden_token_ids.iter())
         .chain(initial_forbidden_token_ids.iter())
     {
         if let Some(slot) = valid.get_mut(token_id as usize) {
@@ -821,6 +830,7 @@ fn cached_forbidden_generation_tokens(
     }
 
     let mut forbidden = HashSet::new();
+    let mut model_greedy_forbidden = HashSet::new();
     let scan_limit = tok.vocab_size().min(GENERATION_POLICY_SCAN_LIMIT);
     let has_reverse_vocab =
         (0..scan_limit).any(|token_id| tok.token_text(TokenId::new(token_id as u32)).is_some());
@@ -864,6 +874,12 @@ fn cached_forbidden_generation_tokens(
             .decode(&[token], true)
             .map(|text| decoded_token_is_statically_forbidden(tok.as_ref(), token, &text))
             .unwrap_or(true);
+        let context_free_bytes_invalid = tok
+            .token_bytes(token)
+            .is_none_or(|bytes| advance_pending_utf8_fragment(&[], &bytes).is_err());
+        if context_free_bytes_invalid {
+            model_greedy_forbidden.insert(id);
+        }
         if missing_token_text || raw_text_forbidden || decoded_text_forbidden {
             forbidden.insert(id);
         }
@@ -876,11 +892,26 @@ fn cached_forbidden_generation_tokens(
         TokenPolicyCacheEntry {
             tokenizer: tokenizer_identity,
             forbidden: forbidden.clone(),
+            model_greedy_forbidden,
         },
     );
     drop(cache);
     forbidden.retain(|token_id| !allowed_generated_controls.contains(token_id));
     forbidden
+}
+
+fn cached_model_greedy_forbidden_tokens(tok: &Arc<dyn Tokenizer + Send + Sync>) -> HashSet<u32> {
+    let key = (tokenizer_cache_key(tok), tok.vocab_size());
+    let cache = TOKEN_POLICY_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    cache
+        .lock()
+        .expect("token policy cache poisoned")
+        .get(&key)
+        .filter(|entry| {
+            entry.tokenizer.ptr_eq(&Arc::downgrade(tok)) && entry.tokenizer.strong_count() > 0
+        })
+        .map(|entry| entry.model_greedy_forbidden.clone())
+        .unwrap_or_default()
 }
 
 fn tokenizer_cache_key(tok: &Arc<dyn Tokenizer + Send + Sync>) -> usize {
@@ -1045,6 +1076,35 @@ fn is_potential_utf8_fragment(bytes: &[u8]) -> bool {
 
 fn is_utf8_continuation(byte: u8) -> bool {
     matches!(byte, 0x80..=0xBF)
+}
+
+fn advance_pending_utf8_fragment(pending: &[u8], next: &[u8]) -> std::result::Result<Vec<u8>, ()> {
+    let mut combined = Vec::with_capacity(pending.len().saturating_add(next.len()));
+    combined.extend_from_slice(pending);
+    combined.extend_from_slice(next);
+    match std::str::from_utf8(&combined) {
+        Ok(text) => {
+            if text.contains('\u{FFFD}') || contains_replacement_char_mojibake(text) {
+                Err(())
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        Err(error) if error.error_len().is_none() => {
+            let valid_prefix =
+                std::str::from_utf8(&combined[..error.valid_up_to()]).map_err(|_| ())?;
+            if valid_prefix.contains('\u{FFFD}') || contains_replacement_char_mojibake(valid_prefix)
+            {
+                return Err(());
+            }
+            let fragment = &combined[error.valid_up_to()..];
+            if fragment.is_empty() || fragment.len() > 3 {
+                return Err(());
+            }
+            Ok(fragment.to_vec())
+        }
+        Err(_) => Err(()),
+    }
 }
 
 fn decoded_delta_has_forbidden_quality(

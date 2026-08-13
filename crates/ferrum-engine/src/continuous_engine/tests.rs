@@ -11347,6 +11347,7 @@ fn token_policy_cache_rejects_an_expired_tokenizer_identity() {
         TokenPolicyCacheEntry {
             tokenizer: expired_identity,
             forbidden: HashSet::from([u32::MAX]),
+            model_greedy_forbidden: HashSet::from([u32::MAX]),
         },
     );
 
@@ -12232,6 +12233,30 @@ fn sample_resamples_candidate_that_would_flush_replacement_char() {
 }
 
 #[test]
+fn sample_resamples_orphan_utf8_continuation_without_pending_lead() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
+        Arc::new(FragmentedUtf8PolicyTokenizer::new());
+    let orphan_continuation = TokenId::new(FragmentedUtf8PolicyTokenizer::FIRE_TAIL);
+    let normal = TokenId::new(b'x' as u32);
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+        Some(FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE),
+    );
+    let mut logits = vec![f32::NEG_INFINITY; FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE];
+    logits[usize::from(orphan_continuation)] = 100.0;
+    logits[usize::from(normal)] = 1.0;
+
+    let sampled = state
+        .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+        .expect("full-logits sampling must recover from an orphan UTF-8 continuation");
+
+    assert_eq!(sampled, normal);
+    assert_eq!(logits[usize::from(orphan_continuation)], f32::NEG_INFINITY);
+}
+
+#[test]
 fn pending_utf8_fragment_temporarily_requires_full_logits_for_resampling() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> =
         Arc::new(FragmentedUtf8PolicyTokenizer::new());
@@ -12244,10 +12269,29 @@ fn pending_utf8_fragment_temporarily_requires_full_logits_for_resampling() {
         Some(FragmentedUtf8PolicyTokenizer::MODEL_VOCAB_SIZE),
     );
 
+    let LogitsReturnPolicy::GreedyArgmax {
+        token_mask: Some(mask),
+        repetition_penalty: None,
+    } = state.model_decode_logits_policy()
+    else {
+        panic!("initial greedy decode must carry the byte-validity mask");
+    };
+    assert_eq!(
+        mask.valid_token_mask[usize::from(fire_head)],
+        1,
+        "a UTF-8 lead fragment must remain selectable"
+    );
+    assert_eq!(
+        mask.valid_token_mask[usize::from(fire_tail)],
+        0,
+        "an orphan UTF-8 continuation must be masked without a pending lead"
+    );
+
     state
         .validate_and_commit_model_greedy_argmax_token(Some(tokenizer.as_ref()), fire_head)
         .expect("the first half of a valid UTF-8 token pair must remain selectable");
     assert!(state.pending_decoded_utf8_fragment);
+    assert_eq!(state.pending_decoded_utf8_bytes, vec![0xF0, 0x9F]);
     assert!(matches!(
         state.model_decode_logits_policy(),
         LogitsReturnPolicy::FullLogits
@@ -12263,6 +12307,7 @@ fn pending_utf8_fragment_temporarily_requires_full_logits_for_resampling() {
     assert_eq!(sampled, fire_tail);
     assert_eq!(logits[b'x' as usize], f32::NEG_INFINITY);
     assert!(!state.pending_decoded_utf8_fragment);
+    assert!(state.pending_decoded_utf8_bytes.is_empty());
     assert!(matches!(
         state.model_decode_logits_policy(),
         LogitsReturnPolicy::GreedyArgmax { .. }
