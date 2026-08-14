@@ -212,6 +212,36 @@ RELEASE_REGRESSION_HARDENING_GOAL_GATE = REPO_ROOT / "scripts/release/release_re
 ACTUAL_MODEL_REGRESSION_SUMMARY_GATE = REPO_ROOT / "scripts/release/actual_model_regression_summary_gate.py"
 L2_ACTUAL_MODEL_ARTIFACT_GATE = REPO_ROOT / "scripts/release/l2_actual_model_artifact_gate.py"
 SUPPORT_MATRIX_CONTRACT_GATE = REPO_ROOT / "scripts/release/support_matrix_contract_gate.py"
+RUNTIME_VNEXT_RELEASE_CONTROL_SELFTESTS = (
+    (
+        REPO_ROOT / "scripts/release/runtime_vnext_release_workflow_policy.py",
+        "FERRUM RELEASE WORKFLOW POLICY SELFTEST PASS",
+    ),
+    (
+        REPO_ROOT / "scripts/release/runtime_vnext_goal_gate.py",
+        "FERRUM RUNTIME VNEXT GOAL GATE SELFTEST PASS",
+    ),
+    (
+        REPO_ROOT / "scripts/release/runtime_vnext_sampled_final.py",
+        "FERRUM RUNTIME VNEXT SAMPLED FINAL SELFTEST PASS",
+    ),
+    (
+        REPO_ROOT / "scripts/release/runtime_vnext_g0_llama_sampled_execution.py",
+        "FERRUM G0 LLAMA SAMPLED EXECUTION SELFTEST PASS",
+    ),
+    (
+        REPO_ROOT / "scripts/release/runtime_vnext_crates_io_release.py",
+        "FERRUM CRATES IO V0.8.0 SELFTEST PASS",
+    ),
+    (
+        REPO_ROOT / "scripts/release/runtime_vnext_homebrew_release.py",
+        "FERRUM HOMEBREW V0.8.0 SELFTEST PASS",
+    ),
+    (
+        REPO_ROOT / "scripts/release/runtime_vnext_r2_ferrum_collector.py",
+        "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR SELFTEST PASS",
+    ),
+)
 RUNTIME_VNEXT_BASELINE_FAST_SELFTEST_PASS = (
     "FERRUM RUNTIME VNEXT G00 BASELINE FAST SELFTEST PASS"
 )
@@ -316,15 +346,36 @@ def make_metal_artifact(root: Path) -> None:
 def make_summary_artifact(root: Path) -> None:
     for rel in [
         "source-unit/unit.gate.json",
-        "source-metal/metal.gate.json",
-        "source-cuda-full/g0_cuda4090_full.gate.json",
-        "source-cuda-llama-dense/g0_cuda4090_llama_dense.gate.json",
         "metal-tarball/gate.json",
         "cuda-tarball/gate.json",
         "homebrew-metal/gate.json",
         "homebrew-cuda-fetch/gate.json",
     ]:
         write_json(root / rel, {"status": "pass"})
+    import validate_release_completion_manifest as completion_validator
+
+    completion_validator.make_selftest_manifest(
+        root / "_completion-fixture.json",
+        artifact_root=root,
+    )
+    return
+
+    for lane in [
+        "runtime-vnext-metal-three-model",
+        "runtime-vnext-cuda-three-model",
+        "runtime-vnext-published-assets",
+        "runtime-vnext-prepromotion",
+    ]:
+        artifact = root / lane
+        write_json(
+            artifact / "gate.manifest.json",
+            {
+                "status": "pass",
+                "lane": lane,
+                "artifact_dir": str(artifact),
+                "pass_line": f"FERRUM GATE {lane} PASS: {artifact}",
+            },
+        )
 
 
 def load_release_binary_gate():
@@ -384,11 +435,79 @@ def test_summary_validator() -> None:
         require(ok.returncode == 0, ok.stderr or ok.stdout)
         require("G0 RELEASE PASS" in ok.stdout, ok.stdout)
         require((root / "g0_release_summary.json").is_file(), "missing summary output")
+        require(
+            not (root / "source-metal/metal.gate.json").exists()
+            and not (root / "source-cuda-full/g0_cuda4090_full.gate.json").exists()
+            and not (
+                root
+                / "source-cuda-llama-dense/g0_cuda4090_llama_dense.gate.json"
+            ).exists(),
+            "summary fixture unexpectedly depends on legacy full accelerator gates",
+        )
+
+        sampled_gate = root / "vnext-g08-rc/gate.manifest.json"
+        held_sampled_gate = root / "vnext-g08-rc/gate.manifest.json.missing"
+        sampled_gate.rename(held_sampled_gate)
+        missing_sampled = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
+        require(
+            missing_sampled.returncode != 0,
+            "release summary without sampled correctness unexpectedly passed",
+        )
+        require("vnext-g08-rc" in missing_sampled.stderr, missing_sampled.stderr)
+        held_sampled_gate.rename(sampled_gate)
 
         write_json(root / "cuda-tarball/gate.json", {"status": "fail"})
         bad = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
         require(bad.returncode != 0, "bad release summary unexpectedly passed")
         require("G0 RELEASE FAIL" in bad.stderr, bad.stderr)
+
+        write_json(root / "cuda-tarball/gate.json", {"status": "pass"})
+        published = root / "runtime-vnext-published-assets/gate.manifest.json"
+        published_doc = json.loads(published.read_text())
+        published_doc["lane"] = "runtime-vnext-prepromotion"
+        write_json(published, published_doc)
+        wrong_lane = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
+        require(wrong_lane.returncode != 0, "wrong vNext release lane unexpectedly passed")
+        require("gate lane differs" in wrong_lane.stderr, wrong_lane.stderr)
+
+        published_doc["lane"] = "runtime-vnext-published-assets"
+        write_json(published, published_doc)
+        import validate_release_completion_manifest as completion_validator
+
+        g10b_child_path = root / "vnext-g10b/manifest.json"
+        g10b_child = json.loads(g10b_child_path.read_text())
+        g10b_child["release"]["prerelease"] = True
+        write_json(g10b_child_path, g10b_child)
+        g10b_outer_path = root / "vnext-g10b/gate.manifest.json"
+        g10b_outer = json.loads(g10b_outer_path.read_text())
+        g10b_outer["child_artifacts"]["child_manifest"] = (
+            completion_validator._fixture_ref(g10b_child_path)
+        )
+        write_json(g10b_outer_path, g10b_outer)
+        g10_child_path = root / "vnext-g10/manifest.json"
+        g10_child = json.loads(g10_child_path.read_text())
+        g10_child["release"]["prerelease"] = True
+        g10_child["inputs"]["g10b"] = completion_validator._fixture_ref(
+            g10b_child_path
+        )
+        write_json(g10_child_path, g10_child)
+        g10_outer_path = root / "vnext-g10/gate.manifest.json"
+        g10_outer = json.loads(g10_outer_path.read_text())
+        g10_outer["child_artifacts"]["child_manifest"] = (
+            completion_validator._fixture_ref(g10_child_path)
+        )
+        write_json(g10_outer_path, g10_outer)
+        prepromotion_summary = run(
+            [sys.executable, str(SUMMARY_VALIDATOR), str(root)]
+        )
+        require(
+            prepromotion_summary.returncode != 0,
+            "prepromotion-only release summary unexpectedly passed",
+        )
+        require(
+            "promotion is incomplete" in prepromotion_summary.stderr,
+            prepromotion_summary.stderr,
+        )
 
 
 def test_release_binary_gate_staged_asset_path() -> None:
@@ -1421,6 +1540,13 @@ def test_support_matrix_contract_gate_selftest() -> None:
     require("SUPPORT MATRIX CONTRACT SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
+def test_runtime_vnext_release_control_selftests() -> None:
+    for script, pass_line in RUNTIME_VNEXT_RELEASE_CONTROL_SELFTESTS:
+        ok = run([sys.executable, str(script), "--self-test"])
+        require(ok.returncode == 0, ok.stderr or ok.stdout)
+        require(pass_line in ok.stdout, ok.stdout)
+
+
 def test_m3_quality_gate_artifact_validators() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-m3-gates-") as tmp:
         root = Path(tmp)
@@ -1581,6 +1707,7 @@ def main() -> int:
     test_actual_model_regression_summary_gate_selftest()
     test_support_matrix_contract_gate_selftest()
     test_release_regression_hardening_goal_gate_selftest()
+    test_runtime_vnext_release_control_selftests()
     test_m3_quality_gate_artifact_validators()
     print("G0 VALIDATOR SELFTEST PASS")
     return 0

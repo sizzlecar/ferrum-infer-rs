@@ -203,6 +203,7 @@ CANDIDATE_REQUIRED_CUDA_NATIVE_OPERATORS = (
     "ferrum.cuda.vllm_paged_attention_v2",
 )
 CUDA_CORRECTNESS_BUILD_MODE = "cuda-correctness-cache-only"
+STAGED_RELEASE_ASSET_BUILD_MODE = "staged-release-asset"
 CUDA_CORRECTNESS_ARTIFACT_TYPE = "runtime-vnext-cuda-correctness-binary"
 CUDA_CORRECTNESS_SCHEMA_VERSION = 6
 CUDA_RELEASE_PLAN_REFERENCE_TYPE = plan_reference.ARTIFACT_TYPE
@@ -2233,18 +2234,181 @@ def validate_candidate_build_receipt(
     backend = require_string(expected.get("backend"), "candidate build expected backend")
     require(backend in CANDIDATE_BUILD_COMMANDS, "candidate build expected backend is unsupported")
     require(receipt.get("backend") == backend, "candidate build receipt backend mismatch")
+    build_mode = receipt.get("build_mode", "release")
     recorded_artifact_root: Path | None = None
     native_operator_set_lock: dict[str, Any] | None = None
-    if backend == "cuda":
+    if backend == "cuda" and build_mode != STAGED_RELEASE_ASSET_BUILD_MODE:
         recorded_artifact_root, native_operator_set_lock, _ = (
             validate_candidate_cuda_native_operator_set(root, receipt)
         )
     else:
         require(
             "native_operator_set_lock" not in receipt,
-            "Metal candidate build unexpectedly carries a native operator set lock",
+            "candidate build unexpectedly carries a native operator set lock",
         )
-    build_mode = receipt.get("build_mode", "release")
+    if build_mode == STAGED_RELEASE_ASSET_BUILD_MODE:
+        source_observations = require_object(
+            receipt.get("source_observations"),
+            "staged release binding source_observations",
+        )
+        require(
+            set(source_observations) == {"before", "after"}
+            and all(
+                source_observations.get(phase)
+                == {
+                    "source_git_sha": receipt["source_git_sha"],
+                    "source_tree_sha": receipt["source_tree_sha"],
+                    "dirty_status": {"is_dirty": False, "status_short": []},
+                }
+                for phase in ("before", "after")
+            ),
+            "staged release binding source observations changed",
+        )
+        parse_timestamp(receipt.get("bound_at"), "staged release binding bound_at")
+        require(
+            all(
+                key not in receipt
+                for key in (
+                    "command",
+                    "bounded_receipt",
+                    "stdout",
+                    "stderr",
+                    "probe_artifacts",
+                    "returncode",
+                )
+            ),
+            "staged release binding must not impersonate a source build",
+        )
+        binary_path, _, _ = validate_artifact_ref(
+            root,
+            receipt.get("binary_artifact"),
+            "staged release bound binary",
+            allowed_kinds={"binary"},
+        )
+        binary_sha = require_sha256(
+            receipt.get("binary_sha256"),
+            "staged release bound binary_sha256",
+        )
+        require(
+            file_sha256(binary_path) == binary_sha == expected.get("binary_sha256"),
+            "staged release bound binary SHA mismatch",
+        )
+        if "binary_path" in expected:
+            require(
+                binary_path == expected["binary_path"],
+                "staged release bound binary path mismatch",
+            )
+        _, _, staged_raw = validate_artifact_ref(
+            root,
+            receipt.get("staged_assets_manifest"),
+            "staged assets manifest",
+            allowed_kinds={"raw-json"},
+        )
+        staged = require_object(staged_raw, "staged assets manifest JSON")
+        require(
+            staged.get("schema_version") == 1
+            and staged.get("artifact_type")
+            == "runtime_vnext_staged_assets_manifest"
+            and staged.get("status") == "pass",
+            "staged assets manifest contract mismatch",
+        )
+        require(
+            staged.get("version") == receipt.get("release_version") == "0.8.0",
+            "staged assets release version mismatch",
+        )
+        require(
+            staged.get("publish_release") is False,
+            "staged assets manifest is not a publish_release=false build",
+        )
+        release_candidate = require_object(
+            staged.get("release_candidate"),
+            "staged assets release_candidate",
+        )
+        require(
+            release_candidate
+            == {
+                "git_sha": receipt["source_git_sha"],
+                "git_tree_sha": receipt["source_tree_sha"],
+                "dirty": False,
+            },
+            "staged assets release candidate identity mismatch",
+        )
+        assets = require_object(staged.get("assets"), "staged assets map")
+        require(
+            set(assets) == {"cpu", "metal", "cuda"},
+            "staged assets backend set mismatch",
+        )
+        selected = require_object(
+            receipt.get("selected_staged_asset"),
+            "selected staged asset",
+        )
+        require(
+            assets.get(backend) == selected,
+            "selected staged asset differs from its frozen manifest row",
+        )
+        require(
+            selected.get("backend") == backend,
+            "selected staged asset backend mismatch",
+        )
+        tarball = require_object(
+            selected.get("tarball"),
+            "selected staged asset tarball",
+        )
+        require_sha256(tarball.get("sha256"), "selected staged asset tarball SHA256")
+        require_count(
+            tarball.get("size_bytes"),
+            "selected staged asset tarball size",
+            minimum=1,
+        )
+        archived_binary = require_object(
+            selected.get("binary"),
+            "selected staged asset binary",
+        )
+        archive_path = require_string(
+            archived_binary.get("archive_path"),
+            "selected staged asset binary archive_path",
+        )
+        require(
+            Path(archive_path).name == "ferrum"
+            and not Path(archive_path).is_absolute()
+            and ".." not in Path(archive_path).parts,
+            "selected staged binary archive_path is unsafe",
+        )
+        require(
+            archived_binary.get("sha256") == binary_sha
+            and archived_binary.get("size_bytes") == binary_path.stat().st_size,
+            "selected staged binary identity mismatch",
+        )
+        metadata = require_object(
+            receipt.get("staged_metadata_artifacts"),
+            "staged release metadata artifacts",
+        )
+        required_metadata = {
+            "artifact_manifest",
+            "sha256_file",
+            "version_manifest",
+            "dependency_abi_manifest",
+        }
+        require(
+            set(metadata) == required_metadata,
+            "staged release metadata artifact set mismatch",
+        )
+        for name in sorted(required_metadata):
+            source_ref = require_object(
+                selected.get(name),
+                f"selected staged asset {name}",
+            )
+            metadata_path, _, _ = validate_artifact_ref(
+                root,
+                metadata.get(name),
+                f"staged release metadata {name}",
+            )
+            require(
+                source_ref.get("sha256") == file_sha256(metadata_path)
+                and source_ref.get("size_bytes") == metadata_path.stat().st_size,
+                f"staged release metadata {name} identity mismatch",
+            )
+        return receipt, receipt_path, file_sha256(receipt_path), binary_path
     if build_mode == CUDA_CORRECTNESS_BUILD_MODE:
         require(backend == "cuda", "CUDA correctness build binding is CUDA-only")
         source_observations = require_object(

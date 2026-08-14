@@ -1,29 +1,30 @@
-name: Release CUDA Binary
+name: Stage CUDA sm89 release asset
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Release tag to publish, or label dry-run artifacts with. Optional when publish_release=false.'
-        required: false
-        default: ''
-        type: string
-      cuda_compute_cap:
-        description: 'CUDA compute capability without dot; 89 targets RTX 4090/Ada.'
+      release_candidate_sha:
+        description: Exact clean G10A release-candidate commit to build
         required: true
-        default: '89'
+        type: string
+      release_candidate_tag:
+        description: Annotated RC tag whose peeled commit is release_candidate_sha
+        required: true
+        default: v0.8.0-rc.1
+        type: string
+      staging_label:
+        description: Immutable artifact label; this does not create a tag or release
+        required: true
+        default: v0.8.0-rc
         type: string
       publish_release:
-        description: 'Create/update the GitHub Release. Leave false for pre-release binary testing.'
+        description: Safety lock; production staging requires false
         required: true
         default: false
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 defaults:
   run:
@@ -34,57 +35,67 @@ env:
   CARGO_INCREMENTAL: 0
   CUDA_HOME: /usr/local/cuda
   CUDA_ROOT: /usr/local/cuda
+  CUDA_COMPUTE_CAP: 89
 
 jobs:
-  linux-x86_64-cuda:
-    name: Linux x86_64 CUDA
+  linux-x86_64-cuda-sm89:
+    name: Stage Linux x86_64 CUDA sm89
     runs-on: ubuntu-22.04
     container:
       image: nvidia/cuda:12.6.0-devel-ubuntu22.04
     steps:
-      - name: Validate manual release inputs
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' && github.event.inputs.tag == ''
+      - name: Validate immutable staging inputs
         run: |
-          echo "tag is required when publish_release=true" >&2
-          exit 1
+          if [[ "${{ inputs.publish_release }}" != "false" ]]; then
+            echo "publish_release must remain false; this workflow only stages bytes" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.release_candidate_sha }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_candidate_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.0-rc\.[1-9][0-9]*$ ]]; then
+            echo "release_candidate_tag must match v0.8.0-rc.N" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.staging_label }}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid staging_label" >&2
+            exit 1
+          fi
 
-      - name: Install system deps and Rust
+      - name: Install system dependencies and Rust
         run: |
           apt-get update
-          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file libnccl2 libnccl-dev
+          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file python3 libnccl2 libnccl-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain 1.91.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ inputs.release_candidate_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact clean release candidate
+        run: |
+          expected_sha="${{ inputs.release_candidate_sha }}"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$expected_sha"
+          test -z "$(git status --porcelain)"
+          expected_tag="${{ inputs.release_candidate_tag }}"
+          test "$(git cat-file -t "$expected_tag")" = tag
+          test "$(git rev-parse "$expected_tag^{}")" = "$expected_sha"
 
       - name: Verify native operator source boundary
-        run: |
-          python3 scripts/release/native_operator_artifact_gate.py --self-test
+        run: python3 scripts/release/native_operator_artifact_gate.py --self-test
 
-      - name: Resolve version and CUDA target
-        id: version
+      - name: Verify workspace release version
+        id: metadata
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            tag="${{ github.event.inputs.tag }}"
-            cuda_compute_cap="${{ github.event.inputs.cuda_compute_cap }}"
-            if [[ -z "$tag" ]]; then
-              tag="dry-run-${GITHUB_SHA::7}"
-            fi
-          else
-            tag="${GITHUB_REF#refs/tags/}"
-            cuda_compute_cap="89"
-          fi
-          cuda_compute_cap="${cuda_compute_cap//./}"
-          if ! [[ "$cuda_compute_cap" =~ ^[0-9]+$ ]]; then
-            echo "invalid cuda_compute_cap: $cuda_compute_cap" >&2
-            exit 1
-          fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "cuda_compute_cap=$cuda_compute_cap" >> "$GITHUB_OUTPUT"
-          echo "asset=ferrum-linux-x86_64-cuda-sm${cuda_compute_cap}" >> "$GITHUB_OUTPUT"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ferrum-cli"))')"
+          test "$version" = "0.8.0"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v4
         with:
@@ -92,81 +103,133 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-linux-x86_64-cuda-sm${{ steps.version.outputs.cuda_compute_cap }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            release-linux-x86_64-cuda-sm${{ steps.version.outputs.cuda_compute_cap }}-
-            release-linux-x86_64-cuda-
+          key: stage-v0.8.0-linux-x86_64-cuda-sm89-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.0-linux-x86_64-cuda-sm89-
 
-      - name: Build (release, CUDA)
-        env:
-          CUDA_COMPUTE_CAP: ${{ steps.version.outputs.cuda_compute_cap }}
+      - name: Build release CUDA sm89 binary exactly once
         run: |
           export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-          cargo build --release -p ferrum-cli --bin ferrum \
+          cargo build --release --locked -p ferrum-cli --bin ferrum \
             --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 
-      - name: Strip binary
-        run: strip target/release/ferrum
-
-      - name: Dependency audit
+      - name: Strip and audit CUDA binary
         run: |
-          ldd target/release/ferrum | tee "${{ steps.version.outputs.asset }}.ldd.txt"
-          if grep -Ei 'torch|python|vllm' "${{ steps.version.outputs.asset }}.ldd.txt"; then
-            echo "CUDA release binary must not link Torch/Python/vLLM" >&2
+          strip target/release/ferrum
+          file target/release/ferrum | tee ferrum-linux-x86_64-cuda-sm89.dependencies.txt
+          ldd target/release/ferrum | tee -a ferrum-linux-x86_64-cuda-sm89.dependencies.txt
+          if grep -Eiq 'python|torch|vllm' ferrum-linux-x86_64-cuda-sm89.dependencies.txt; then
+            echo "CUDA release binary must not link Python, Torch, or vLLM" >&2
             exit 1
           fi
 
-      - name: Package tarball
+      - name: Package staged CUDA asset and adjacent manifests
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          RC_SHA: ${{ inputs.release_candidate_sha }}
+          RC_TAG: ${{ inputs.release_candidate_tag }}
+          STAGING_LABEL: ${{ inputs.staging_label }}
         run: |
-          asset="${{ steps.version.outputs.asset }}"
+          asset="ferrum-linux-x86_64-cuda-sm89.tar.gz"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
           cp LICENSE dist/LICENSE
           cp README.md dist/README.md
-          cat > dist/CUDA-BUILD.txt <<EOF
-          Ferrum CUDA release binary
-
-          Tag: ${{ steps.version.outputs.tag }}
+          cat > dist/CUDA-BUILD.txt <<'EOF'
+          Ferrum v0.8.0 CUDA release binary
           CUDA toolkit image: nvidia/cuda:12.6.0-devel-ubuntu22.04
-          CUDA_COMPUTE_CAP: ${{ steps.version.outputs.cuda_compute_cap }}
+          CUDA_COMPUTE_CAP: 89
           Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2
-
-          This package does not bundle NVIDIA driver/runtime libraries.
-          Install a compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host.
+          NVIDIA driver, compatible CUDA runtime, and NCCL runtime are required.
           EOF
-          tar -C dist -czf "${asset}.tar.gz" ferrum LICENSE README.md CUDA-BUILD.txt
-          ls -lh "${asset}.tar.gz"
-          sha256sum "${asset}.tar.gz" | tee "${asset}.tar.gz.sha256"
+          tar -C dist -czf "$asset" ferrum LICENSE README.md CUDA-BUILD.txt
+          ASSET="$asset" BINARY="target/release/ferrum" DEPENDENCIES="ferrum-linux-x86_64-cuda-sm89.dependencies.txt" \
+            TARGET_TRIPLE="x86_64-unknown-linux-gnu" BACKEND="cuda" \
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
 
-      - name: Smoke test the packaged binary
+          asset = Path(os.environ["ASSET"])
+          binary = Path(os.environ["BINARY"])
+          dependencies = Path(os.environ["DEPENDENCIES"])
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          asset_sha = digest(asset)
+          binary_sha = digest(binary)
+          dependency_sha = digest(dependencies)
+          forbidden_runtime_linkage_found = bool(
+              re.search(r"python|torch|vllm", dependencies.read_text(encoding="utf-8"), re.IGNORECASE)
+          )
+          assert not forbidden_runtime_linkage_found
+          Path(f"{asset}.sha256").write_text(f"{asset_sha}  {asset.name}\n", encoding="utf-8")
+          Path(f"{asset}.binary.sha256").write_text(f"{binary_sha}  ferrum\n", encoding="utf-8")
+          common = {
+              "schema_version": 1,
+              "asset_name": asset.name,
+              "asset_sha256": asset_sha,
+              "binary_name": "ferrum",
+              "binary_sha256": binary_sha,
+              "release_candidate_sha": os.environ["RC_SHA"],
+              "release_candidate_tag": os.environ["RC_TAG"],
+              "staging_label": os.environ["STAGING_LABEL"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+          }
+          version = dict(common, version=os.environ["VERSION"])
+          dependency = dict(
+              common,
+              audit_file=dependencies.name,
+              audit_sha256=dependency_sha,
+              forbidden_runtime_linkage=["python", "torch", "vllm"],
+              forbidden_runtime_linkage_found=forbidden_runtime_linkage_found,
+          )
+          abi = dict(
+              common,
+              target_triple=os.environ["TARGET_TRIPLE"],
+              backend=os.environ["BACKEND"],
+              cuda_compute_capability="89",
+              cuda_toolkit_image="nvidia/cuda:12.6.0-devel-ubuntu22.04",
+              cargo_features=["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"],
+              dependency_audit_sha256=dependency_sha,
+          )
+          for suffix, payload in (
+              ("version.json", version),
+              ("dependency.json", dependency),
+              ("abi.json", abi),
+          ):
+              Path(f"{asset}.{suffix}").write_text(
+                  json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+              )
+          PY
+
+      - name: Deferred CUDA smoke contract
         run: |
-          asset="${{ steps.version.outputs.asset }}"
           mkdir -p smoke
-          tar -C smoke -xzf "${asset}.tar.gz"
+          tar -C smoke -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
           if ldconfig -p 2>/dev/null | grep -q 'libcuda.so.1'; then
-            LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --help | head -5
+            LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --version
+            LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" ./smoke/ferrum --help >/dev/null
           else
-            echo "libcuda.so.1 is not available in the GitHub Actions container; deferring executable smoke to the GPU release gate."
+            echo "Executable smoke is deferred to the exact staged-byte GPU gate."
             ldd ./smoke/ferrum
           fi
 
-      - name: Upload dry-run artifact
+      - name: Upload staged CUDA asset
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.version.outputs.asset }}-${{ steps.version.outputs.tag }}
+          name: ferrum-linux-x86_64-cuda-sm89-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
+          if-no-files-found: error
+          retention-days: 14
           path: |
-            ${{ steps.version.outputs.asset }}.tar.gz
-            ${{ steps.version.outputs.asset }}.tar.gz.sha256
-            ${{ steps.version.outputs.asset }}.ldd.txt
-
-      - uses: softprops/action-gh-release@v2
-        if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            ${{ steps.version.outputs.asset }}.tar.gz
-            ${{ steps.version.outputs.asset }}.tar.gz.sha256
-            ${{ steps.version.outputs.asset }}.ldd.txt
+            ferrum-linux-x86_64-cuda-sm89.tar.gz
+            ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+            ferrum-linux-x86_64-cuda-sm89.tar.gz.binary.sha256
+            ferrum-linux-x86_64-cuda-sm89.tar.gz.version.json
+            ferrum-linux-x86_64-cuda-sm89.tar.gz.dependency.json
+            ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json
+            ferrum-linux-x86_64-cuda-sm89.dependencies.txt

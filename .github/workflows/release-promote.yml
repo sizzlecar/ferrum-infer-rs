@@ -1,0 +1,348 @@
+name: Promote validated v0.8.0 prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate_sha:
+        description: Exact G10A release-candidate commit and annotated tag target
+        required: true
+        type: string
+      release_id:
+        description: Existing v0.8.0 GitHub prerelease id
+        required: true
+        type: string
+      prepromotion_asset_id:
+        description: Asset id on the fixed runtime-vnext diagnostics release
+        required: true
+        type: string
+      prepromotion_archive_sha256:
+        description: SHA256 of the immutable two-file prepromotion bundle
+        required: true
+        type: string
+      prepromotion_child_sha256:
+        description: SHA256 of manifest.json inside the prepromotion bundle
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: promote-validated-prerelease-v0.8.0
+  cancel-in-progress: false
+
+jobs:
+  promote-validated-prerelease:
+    name: Consume prepromotion PASS and flip prerelease only
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_ID: ${{ inputs.release_id }}
+      RELEASE_TAG: v0.8.0
+      DIAGNOSTICS_TAG: runtime-vnext-diagnostics-v1
+      RC_SHA: ${{ inputs.release_candidate_sha }}
+      PREPROMOTION_ASSET_ID: ${{ inputs.prepromotion_asset_id }}
+      PREPROMOTION_ARCHIVE_SHA256: ${{ inputs.prepromotion_archive_sha256 }}
+      PREPROMOTION_CHILD_SHA256: ${{ inputs.prepromotion_child_sha256 }}
+      PREPROMOTION_MANIFEST: prepromotion/manifest.json
+      CONSUMPTION_CLAIM_NAME: ferrum-v0.8.0-prepromotion-pending-${{ inputs.release_id }}-${{ inputs.prepromotion_child_sha256 }}
+      CONSUMPTION_COMPLETE_NAME: ferrum-v0.8.0-prepromotion-complete-${{ inputs.release_id }}-${{ inputs.prepromotion_child_sha256 }}
+    steps:
+      - name: Validate immutable promotion inputs
+        shell: bash
+        run: |
+          test "$RELEASE_TAG" = "v0.8.0"
+          test "$DIAGNOSTICS_TAG" = "runtime-vnext-diagnostics-v1"
+          [[ "$RC_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PREPROMOTION_ASSET_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PREPROMOTION_ARCHIVE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$PREPROMOTION_CHILD_SHA256" =~ ^[0-9a-f]{64}$ ]]
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_candidate_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact clean release candidate
+        shell: bash
+        run: |
+          expected_sha="${{ inputs.release_candidate_sha }}"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$expected_sha"
+          test -z "$(git status --porcelain)"
+
+      - name: Resolve immutable diagnostics release asset
+        shell: bash
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${DIAGNOSTICS_TAG}" > prepromotion-diagnostics-release.json
+          python3 - <<'PY'
+          import json
+          import os
+
+          release = json.load(open("prepromotion-diagnostics-release.json", encoding="utf-8"))
+          assert release["tag_name"] == os.environ["DIAGNOSTICS_TAG"]
+          assert release["draft"] is False
+          assert release["prerelease"] is True
+          expected_id = int(os.environ["PREPROMOTION_ASSET_ID"])
+          matches = [asset for asset in release["assets"] if asset["id"] == expected_id]
+          assert len(matches) == 1, "diagnostics release does not contain the selected asset id"
+          asset = matches[0]
+          assert asset["name"] == f'ferrum-v0.8.0-prepromotion-{os.environ["RC_SHA"]}.zip'
+          assert asset["size"] > 0
+          assert asset.get("digest") == f'sha256:{os.environ["PREPROMOTION_ARCHIVE_SHA256"]}'
+          json.dump(
+              {
+                  "schema_version": 1,
+                  "diagnostics_tag": os.environ["DIAGNOSTICS_TAG"],
+                  "asset_id": expected_id,
+                  "asset_name": asset["name"],
+                  "archive_sha256": os.environ["PREPROMOTION_ARCHIVE_SHA256"],
+                  "child_sha256": os.environ["PREPROMOTION_CHILD_SHA256"],
+                  "release_candidate_sha": os.environ["RC_SHA"],
+              },
+              open("prepromotion-asset-identity.json", "w", encoding="utf-8"),
+              indent=2,
+              sort_keys=True,
+          )
+          PY
+
+      - name: Download diagnostics asset by immutable id
+        shell: bash
+        run: |
+          gh api -H "Accept: application/octet-stream" "repos/${GITHUB_REPOSITORY}/releases/assets/${PREPROMOTION_ASSET_ID}" > prepromotion-bundle.zip
+
+      - name: Safely verify and extract the two-file prepromotion bundle
+        shell: bash
+        run: |
+          python3 scripts/release/runtime_vnext_prepromotion_bundle.py verify \
+            --archive prepromotion-bundle.zip \
+            --expected-archive-sha256 "$PREPROMOTION_ARCHIVE_SHA256" \
+            --expected-child-sha256 "$PREPROMOTION_CHILD_SHA256" \
+            --out prepromotion \
+            --receipt prepromotion-bundle.verify.json
+
+      - name: Strictly validate runtime-vnext-prepromotion child
+        shell: bash
+        run: |
+          python3 scripts/release/runtime_vnext_release_workflow_policy.py \
+            --validate-prepromotion-manifest "$PREPROMOTION_MANIFEST" \
+            --expected-manifest-sha256 "$PREPROMOTION_CHILD_SHA256" \
+            --release-candidate-sha "$RC_SHA" \
+            --expected-tag "$RELEASE_TAG" \
+            --expected-release-id "$RELEASE_ID"
+
+      - name: Re-read annotated tag and current prerelease state
+        id: release_state
+        shell: bash
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release-before.json
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/v0.8.0" > tag-ref.json
+          tag_object_sha="$(python3 -c 'import json; data=json.load(open("tag-ref.json")); assert data["object"]["type"] == "tag", "v0.8.0 must be annotated"; print(data["object"]["sha"])')"
+          gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object_sha}" > annotated-tag.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+
+          def fingerprint(assets):
+              rows = []
+              for asset in assets:
+                  digest = asset.get("digest")
+                  assert isinstance(digest, str) and digest.startswith("sha256:"), "release asset digest is unavailable"
+                  rows.append({"id": asset["id"], "name": asset["name"], "size": asset["size"], "digest": digest})
+              payload = json.dumps(sorted(rows, key=lambda row: (row["name"], row["id"])), separators=(",", ":"), sort_keys=True).encode()
+              return hashlib.sha256(payload).hexdigest(), rows
+
+          release = json.load(open("release-before.json", encoding="utf-8"))
+          tag = json.load(open("annotated-tag.json", encoding="utf-8"))
+          manifest = json.load(open(os.environ["PREPROMOTION_MANIFEST"], encoding="utf-8"))
+          assert str(release["id"]) == os.environ["RELEASE_ID"]
+          assert release["tag_name"] == os.environ["RELEASE_TAG"]
+          assert release["draft"] is False
+          assert release["prerelease"] in (True, False)
+          assert tag["object"]["type"] == "commit"
+          assert tag["object"]["sha"] == os.environ["RC_SHA"]
+          asset_set_sha256, rows = fingerprint(release["assets"])
+          assert asset_set_sha256 == manifest["release"]["asset_set_sha256"], "published asset identity changed after prepromotion"
+          json.dump(rows, open("release-assets-before.json", "w", encoding="utf-8"), indent=2, sort_keys=True)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f'already_promoted={str(release["prerelease"] is False).lower()}\n')
+          PY
+
+      - name: Reject complete use or resolve one pending retry
+        id: consumption
+        shell: bash
+        env:
+          ALREADY_PROMOTED: ${{ steps.release_state.outputs.already_promoted }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${CONSUMPTION_COMPLETE_NAME}&per_page=100" > prior-complete-artifacts.json
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=${CONSUMPTION_CLAIM_NAME}&per_page=100" > prior-pending-artifacts.json
+          python3 - <<'PY'
+          import json
+          import os
+          import stat
+          import subprocess
+          import zipfile
+
+          def live(path):
+              payload = json.load(open(path, encoding="utf-8"))
+              return [artifact for artifact in payload["artifacts"] if not artifact.get("expired", False)]
+
+          complete = live("prior-complete-artifacts.json")
+          assert not complete, "prepromotion manifest already has a durable complete marker"
+          pending = live("prior-pending-artifacts.json")
+          assert len(pending) <= 1, "prepromotion manifest has multiple live pending claims"
+          if not pending:
+              assert os.environ["ALREADY_PROMOTED"] == "false", "promoted release lacks its durable consumption evidence"
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("resume_claim=false\n")
+              raise SystemExit(0)
+
+          artifact = pending[0]
+          assert artifact["name"] == os.environ["CONSUMPTION_CLAIM_NAME"]
+          with open("prior-consumption-claim.zip", "wb") as archive:
+              subprocess.run(
+                  ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/artifacts/{artifact['id']}/zip"],
+                  check=True,
+                  stdout=archive,
+              )
+          with zipfile.ZipFile("prior-consumption-claim.zip") as archive:
+              members = archive.infolist()
+              assert len(members) == 1 and members[0].filename == "promotion-consumption.json"
+              member = members[0]
+              assert not member.is_dir() and member.file_size <= 1024 * 1024
+              mode = member.external_attr >> 16
+              assert stat.S_IFMT(mode) != stat.S_IFLNK
+              claim_bytes = archive.read(member)
+          claim = json.loads(claim_bytes)
+          manifest = json.load(open(os.environ["PREPROMOTION_MANIFEST"], encoding="utf-8"))
+          assert claim["schema_version"] == 1
+          assert claim["state"] == "consumed"
+          assert str(claim["release_id"]) == os.environ["RELEASE_ID"]
+          assert claim["tag"] == os.environ["RELEASE_TAG"]
+          assert claim["diagnostics_tag"] == os.environ["DIAGNOSTICS_TAG"]
+          assert claim["release_candidate_sha"] == os.environ["RC_SHA"]
+          assert str(claim["prepromotion_asset_id"]) == os.environ["PREPROMOTION_ASSET_ID"]
+          assert claim["prepromotion_archive_sha256"] == os.environ["PREPROMOTION_ARCHIVE_SHA256"]
+          assert claim["prepromotion_manifest_sha256"] == os.environ["PREPROMOTION_CHILD_SHA256"]
+          assert claim["prepromotion_manifest_id"] == manifest["manifest_id"]
+          assert claim["consumption_token"] == manifest["consumption"]["token"]
+          assert claim["promotion"] == {"state": "pending"}
+          open("promotion-consumption.json", "wb").write(claim_bytes)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("resume_claim=true\n")
+          PY
+
+      - name: Record single-use pending manifest consumption
+        if: steps.consumption.outputs.resume_claim != 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+
+          manifest = json.load(open(os.environ["PREPROMOTION_MANIFEST"], encoding="utf-8"))
+          payload = {
+              "schema_version": 1,
+              "state": "consumed",
+              "release_id": os.environ["RELEASE_ID"],
+              "tag": os.environ["RELEASE_TAG"],
+              "diagnostics_tag": os.environ["DIAGNOSTICS_TAG"],
+              "release_candidate_sha": os.environ["RC_SHA"],
+              "prepromotion_asset_id": int(os.environ["PREPROMOTION_ASSET_ID"]),
+              "prepromotion_archive_sha256": os.environ["PREPROMOTION_ARCHIVE_SHA256"],
+              "prepromotion_manifest_sha256": os.environ["PREPROMOTION_CHILD_SHA256"],
+              "prepromotion_manifest_id": manifest["manifest_id"],
+              "consumption_token": manifest["consumption"]["token"],
+              "workflow_run_id": int(os.environ["GITHUB_RUN_ID"]),
+              "workflow_run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "consumed_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "consumed_by": "release-promote.yml",
+              "promotion": {"state": "pending"},
+          }
+          json.dump(payload, open("promotion-consumption.json", "w", encoding="utf-8"), indent=2, sort_keys=True)
+          PY
+
+      - name: Persist consumption claim before release mutation
+        if: steps.consumption.outputs.resume_claim != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.CONSUMPTION_CLAIM_NAME }}
+          if-no-files-found: error
+          retention-days: 90
+          path: promotion-consumption.json
+
+      - name: Flip only prerelease to false
+        if: steps.release_state.outputs.already_promoted != 'true'
+        shell: bash
+        run: |
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F prerelease=false > release-after.json
+
+      - name: Reuse already-promoted release response after a pending retry
+        if: steps.release_state.outputs.already_promoted == 'true'
+        shell: bash
+        run: cp release-before.json release-after.json
+
+      - name: Verify promotion and construct durable complete receipt
+        shell: bash
+        env:
+          ALREADY_PROMOTED: ${{ steps.release_state.outputs.already_promoted }}
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+
+          before = json.load(open("release-before.json", encoding="utf-8"))
+          after = json.load(open("release-after.json", encoding="utf-8"))
+          before_assets = sorted((a["id"], a["name"], a["size"], a.get("digest")) for a in before["assets"])
+          after_assets = sorted((a["id"], a["name"], a["size"], a.get("digest")) for a in after["assets"])
+          assert before["id"] == after["id"]
+          assert before["tag_name"] == after["tag_name"]
+          assert before["target_commitish"] == after["target_commitish"]
+          assert before["draft"] is False and after["draft"] is False
+          already_promoted = os.environ["ALREADY_PROMOTED"] == "true"
+          assert before["prerelease"] is (False if already_promoted else True)
+          assert after["prerelease"] is False
+          assert before_assets == after_assets, "promotion changed release asset ids, sizes, or digests"
+          receipt = json.load(open("promotion-consumption.json", encoding="utf-8"))
+          assert receipt["promotion"] == {"state": "pending"}
+          receipt["promotion"] = {
+              "state": "complete",
+              "promoted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+          }
+          receipt["asset_ids"] = [asset[0] for asset in after_assets]
+          for diagnostics_only in (
+              "diagnostics_tag",
+              "prepromotion_asset_id",
+              "prepromotion_archive_sha256",
+          ):
+              receipt.pop(diagnostics_only)
+          json.dump(receipt, open("promotion-consumption.json", "w", encoding="utf-8"), indent=2, sort_keys=True)
+          print("FERRUM RELEASE PROMOTION PASS: promotion-consumption.json")
+          PY
+
+      - name: Upload durable promotion completion marker
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.CONSUMPTION_COMPLETE_NAME }}
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            promotion-consumption.json
+            release-before.json
+            release-after.json
+            release-assets-before.json
+            annotated-tag.json
+            prepromotion-diagnostics-release.json
+            prepromotion-asset-identity.json
+            prepromotion-bundle.zip
+            prepromotion-bundle.verify.json
+            prepromotion/gate.manifest.json
+            prepromotion/manifest.json
+            prior-complete-artifacts.json
+            prior-pending-artifacts.json
+            prior-consumption-claim.zip
