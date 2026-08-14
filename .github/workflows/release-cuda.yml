@@ -44,7 +44,7 @@ jobs:
     name: Stage Linux x86_64 CUDA sm89
     runs-on: ubuntu-22.04
     container:
-      image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+      image: nvidia/cuda:12.4.0-devel-ubuntu22.04
     steps:
       - name: Validate immutable staging inputs
         run: |
@@ -171,7 +171,7 @@ jobs:
           cp README.md dist/README.md
           cat > dist/CUDA-BUILD.txt <<'EOF'
           Ferrum v0.8.0 CUDA release binary
-          CUDA toolkit image: nvidia/cuda:12.6.0-devel-ubuntu22.04
+          CUDA toolkit image: nvidia/cuda:12.4.0-devel-ubuntu22.04
           CUDA_COMPUTE_CAP: 89
           Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2
           NVIDIA driver, compatible CUDA runtime, and NCCL runtime are required.
@@ -227,7 +227,7 @@ jobs:
               target_triple=os.environ["TARGET_TRIPLE"],
               backend=os.environ["BACKEND"],
               cuda_compute_capability="89",
-              cuda_toolkit_image="nvidia/cuda:12.6.0-devel-ubuntu22.04",
+              cuda_toolkit_image="nvidia/cuda:12.4.0-devel-ubuntu22.04",
               cargo_features=["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"],
               dependency_audit_sha256=dependency_sha,
           )
