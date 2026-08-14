@@ -758,9 +758,9 @@ G0_UNIT_BENCH_CASES = (
 )
 G0_UNIT_BOUNDED_LIMITS = {
     "wall_timeout_seconds": 1800.0,
-    "max_processes": 16,
-    "max_group_threads": 96,
-    "max_per_process_threads": 48,
+    "max_processes": 128,
+    "max_group_threads": 1024,
+    "max_per_process_threads": 256,
     "sample_interval_seconds": 0.05,
     "max_sampling_errors": 3,
     "term_grace_seconds": 1.0,
