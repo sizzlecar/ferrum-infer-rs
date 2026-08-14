@@ -135,9 +135,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: stage-v0.8.0-linux-x86_64-cuda-sm89-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: stage-v0.8.0-linux-x86_64-cuda-sm89-
+          key: stage-v0.8.0-linux-x86_64-cuda-sm89-cuda12.4-native-d229c130-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.0-linux-x86_64-cuda-sm89-cuda12.4-native-d229c130-cargo-
 
       - name: Build release CUDA sm89 binary exactly once
         run: |

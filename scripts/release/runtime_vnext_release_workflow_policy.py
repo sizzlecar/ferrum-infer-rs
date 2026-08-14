@@ -313,6 +313,35 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
         container.get("image") == "nvidia/cuda:12.4.0-devel-ubuntu22.04",
         "release-cuda.yml CUDA build image must match the pinned native operator set toolchain",
     )
+    cuda_steps = job_steps(
+        cuda_job,
+        "release-cuda.yml.jobs.linux-x86_64-cuda-sm89",
+    )
+    cache_steps = [
+        step
+        for step in cuda_steps
+        if str(step.get("uses", "")).startswith("actions/cache@")
+    ]
+    require(len(cache_steps) == 1, "release-cuda.yml must contain exactly one cache step")
+    cache_with = require_mapping(
+        cache_steps[0].get("with"),
+        "release-cuda.yml CUDA cache.with",
+    )
+    require(
+        str(cache_with.get("path", "")).splitlines()
+        == ["~/.cargo/registry", "~/.cargo/git"],
+        "release-cuda.yml must not restore target/ across CUDA/native-set identities",
+    )
+    cache_prefix = (
+        "stage-v0.8.0-linux-x86_64-cuda-sm89-"
+        "cuda12.4-native-d229c130-cargo-"
+    )
+    require(
+        cache_with.get("key")
+        == cache_prefix + "${{ hashFiles('**/Cargo.lock') }}"
+        and cache_with.get("restore-keys") == cache_prefix,
+        "release-cuda.yml cache key must bind CUDA 12.4 and native set d229c130",
+    )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_URL")
         == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/runtime-vnext-diagnostics-v1/native-operator-set-5503d913.tar.zst",
@@ -808,6 +837,18 @@ def run_selftest(texts: dict[str, str]) -> None:
     _expect_policy_failure(
         "cuda-toolkit-native-operator-mismatch",
         lambda: validate_workflow_set(cuda_toolkit_mismatch),
+    )
+
+    cuda_cache_mismatch = dict(texts)
+    cuda_cache_mismatch["release-cuda.yml"] = _replace_once(
+        cuda_cache_mismatch["release-cuda.yml"],
+        "cuda12.4-native-d229c130-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda12.6-native-d229c130-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda-cache-toolchain-mismatch",
+    )
+    _expect_policy_failure(
+        "cuda-cache-toolchain-mismatch",
+        lambda: validate_workflow_set(cuda_cache_mismatch),
     )
 
     diagnostics_tag_mismatch = dict(texts)
