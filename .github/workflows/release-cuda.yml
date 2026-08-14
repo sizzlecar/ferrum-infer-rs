@@ -78,6 +78,7 @@ jobs:
 
       - name: Verify exact clean release candidate
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           expected_sha="${{ inputs.release_candidate_sha }}"
           actual_sha="$(git rev-parse HEAD)"
           test "$actual_sha" = "$expected_sha"
