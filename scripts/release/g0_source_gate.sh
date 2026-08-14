@@ -92,7 +92,7 @@ PY
     --sample-interval-seconds 0.05 \
     --max-sampling-errors 3 \
     --term-grace-seconds 1 \
-    -- env PYTHONDONTWRITEBYTECODE=1 CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=1 \
+    -- env PYTHONDONTWRITEBYTECODE=1 CARGO_BUILD_JOBS=8 RUST_TEST_THREADS=1 \
       cargo test --workspace --all-targets
   python3 - "$OUT_ROOT/release-scripts-pycompile-cache" \
     scripts/metal_readme_regression.py \
@@ -141,6 +141,15 @@ PY
     scripts/release/bounded_command.py \
     scripts/release/run_gate.py \
     scripts/release/run_scenarios.py \
+    scripts/release/runtime_vnext_crates_io_release.py \
+    scripts/release/runtime_vnext_g0_llama_sampled_execution.py \
+    scripts/release/runtime_vnext_g08b_cuda_matrix_prepare.py \
+    scripts/release/runtime_vnext_goal_gate.py \
+    scripts/release/runtime_vnext_homebrew_release.py \
+    scripts/release/runtime_vnext_prepromotion_bundle.py \
+    scripts/release/runtime_vnext_release_workflow_policy.py \
+    scripts/release/runtime_vnext_r2_ferrum_collector.py \
+    scripts/release/runtime_vnext_sampled_final.py \
     scripts/release/selftest_g0_validators.py \
     scripts/release/selftest_g1_g3_g4_release_regression.py \
     scripts/release/validate_release_completion_manifest.py <<'PY' 2>&1 | tee "$OUT_ROOT/release-scripts-pycompile.log"
@@ -176,7 +185,7 @@ source_path = pathlib.Path(sys.argv[5]).resolve()
 expected_command = [
     "env",
     "PYTHONDONTWRITEBYTECODE=1",
-    "CARGO_BUILD_JOBS=2",
+    "CARGO_BUILD_JOBS=8",
     "RUST_TEST_THREADS=1",
     "cargo",
     "test",
@@ -367,7 +376,7 @@ manifest = {
     "command": expected_command,
     "env_overrides": {
         "PYTHONDONTWRITEBYTECODE": "1",
-        "CARGO_BUILD_JOBS": "2",
+        "CARGO_BUILD_JOBS": "8",
         "RUST_TEST_THREADS": "1",
     },
     "receipt_schema": "ferrum.bounded-command-receipt.v1",

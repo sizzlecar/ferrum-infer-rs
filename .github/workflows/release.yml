@@ -1,46 +1,75 @@
-name: Release Binaries
+name: Stage CPU and Metal release assets
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
     inputs:
-      tag:
-        description: 'Release tag to publish, or label dry-run artifacts with. Optional when publish_release=false.'
-        required: false
-        default: ''
+      release_candidate_sha:
+        description: Exact clean G10A release-candidate commit to build
+        required: true
+        type: string
+      release_candidate_tag:
+        description: Annotated RC tag whose peeled commit is release_candidate_sha
+        required: true
+        default: v0.8.0-rc.1
+        type: string
+      staging_label:
+        description: Immutable artifact label; this does not create a tag or release
+        required: true
+        default: v0.8.0-rc
         type: string
       publish_release:
-        description: 'Create/update the GitHub Release. Leave false for pre-release binary testing.'
+        description: Safety lock; production staging requires false
         required: true
         default: false
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
 jobs:
-  # ── Linux x86_64 (CPU only) ──────────────────────────────────────────
-  # Built on ubuntu-22.04 for broader glibc compatibility (2.35 covers
-  # Ubuntu 22.04+, Debian 12+, RHEL 9+, Fedora 36+). CUDA users build
-  # from source — bundling CUDA in the release tarball is too large
-  # and pins them to a specific toolkit version anyway.
   linux-x86_64:
-    name: Linux x86_64
+    name: Stage Linux x86_64 CPU
     runs-on: ubuntu-22.04
     steps:
-      - name: Validate manual release inputs
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' && github.event.inputs.tag == ''
+      - name: Validate immutable staging inputs
+        shell: bash
         run: |
-          echo "tag is required when publish_release=true" >&2
-          exit 1
+          if [[ "${{ inputs.publish_release }}" != "false" ]]; then
+            echo "publish_release must remain false; this workflow only stages bytes" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.release_candidate_sha }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_candidate_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.0-rc\.[1-9][0-9]*$ ]]; then
+            echo "release_candidate_tag must match v0.8.0-rc.N" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.staging_label }}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid staging_label" >&2
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_candidate_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact clean release candidate
+        shell: bash
+        run: |
+          expected_sha="${{ inputs.release_candidate_sha }}"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$expected_sha"
+          test -z "$(git status --porcelain)"
+          expected_tag="${{ inputs.release_candidate_tag }}"
+          test "$(git cat-file -t "$expected_tag")" = tag
+          test "$(git rev-parse "$expected_tag^{}")" = "$expected_sha"
 
       - name: Free disk space
         run: |
@@ -50,154 +79,313 @@ jobs:
           sudo docker system prune -af --volumes 2>/dev/null || true
           df -h /
 
-      - name: Install system deps
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config build-essential
+          sudo apt-get install -y libssl-dev pkg-config build-essential file
 
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: x86_64-unknown-linux-gnu
 
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-linux-x86_64-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-linux-x86_64-
+          key: stage-v0.8.0-linux-x86_64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.0-linux-x86_64-
 
-      - name: Build (release, CPU)
-        run: cargo build --release -p ferrum-cli --bin ferrum
-
-      - name: Strip binary
-        run: strip target/release/ferrum
-
-      - name: Resolve version
-        id: version
+      - name: Verify workspace release version
+        id: metadata
+        shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            tag="${{ github.event.inputs.tag }}"
-            if [[ -z "$tag" ]]; then
-              tag="dry-run-${GITHUB_SHA::7}"
-            fi
-            echo "tag=$tag" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ferrum-cli"))')"
+          test "$version" = "0.8.0"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build release CPU binary exactly once
+        run: cargo build --release --locked -p ferrum-cli --bin ferrum
+
+      - name: Strip and audit binary
+        shell: bash
+        run: |
+          strip target/release/ferrum
+          file target/release/ferrum | tee ferrum-linux-x86_64.dependencies.txt
+          ldd target/release/ferrum | tee -a ferrum-linux-x86_64.dependencies.txt
+          if grep -Eiq 'python|torch|vllm' ferrum-linux-x86_64.dependencies.txt; then
+            echo "CPU release binary must not link Python, Torch, or vLLM" >&2
+            exit 1
           fi
 
-      - name: Package tarball
-        id: package
+      - name: Package staged CPU asset and adjacent manifests
+        shell: bash
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          RC_SHA: ${{ inputs.release_candidate_sha }}
+          RC_TAG: ${{ inputs.release_candidate_tag }}
+          STAGING_LABEL: ${{ inputs.staging_label }}
         run: |
+          asset="ferrum-linux-x86_64.tar.gz"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
           cp LICENSE dist/LICENSE
           cp README.md dist/README.md
-          tar -C dist -czf ferrum-linux-x86_64.tar.gz ferrum LICENSE README.md
-          ls -lh ferrum-linux-x86_64.tar.gz
-          shasum -a 256 ferrum-linux-x86_64.tar.gz | tee ferrum-linux-x86_64.tar.gz.sha256
+          tar -C dist -czf "$asset" ferrum LICENSE README.md
+          ASSET="$asset" BINARY="target/release/ferrum" DEPENDENCIES="ferrum-linux-x86_64.dependencies.txt" \
+            TARGET_TRIPLE="x86_64-unknown-linux-gnu" BACKEND="cpu" \
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
 
-      - name: Smoke test the packaged binary
+          asset = Path(os.environ["ASSET"])
+          binary = Path(os.environ["BINARY"])
+          dependencies = Path(os.environ["DEPENDENCIES"])
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          asset_sha = digest(asset)
+          binary_sha = digest(binary)
+          dependency_sha = digest(dependencies)
+          forbidden_runtime_linkage_found = bool(
+              re.search(r"python|torch|vllm", dependencies.read_text(encoding="utf-8"), re.IGNORECASE)
+          )
+          assert not forbidden_runtime_linkage_found
+          Path(f"{asset}.sha256").write_text(f"{asset_sha}  {asset.name}\n", encoding="utf-8")
+          Path(f"{asset}.binary.sha256").write_text(f"{binary_sha}  ferrum\n", encoding="utf-8")
+          common = {
+              "schema_version": 1,
+              "asset_name": asset.name,
+              "asset_sha256": asset_sha,
+              "binary_name": "ferrum",
+              "binary_sha256": binary_sha,
+              "release_candidate_sha": os.environ["RC_SHA"],
+              "release_candidate_tag": os.environ["RC_TAG"],
+              "staging_label": os.environ["STAGING_LABEL"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+          }
+          version = dict(common, version=os.environ["VERSION"])
+          dependency = dict(
+              common,
+              audit_file=dependencies.name,
+              audit_sha256=dependency_sha,
+              forbidden_runtime_linkage=["python", "torch", "vllm"],
+              forbidden_runtime_linkage_found=forbidden_runtime_linkage_found,
+          )
+          abi = dict(
+              common,
+              target_triple=os.environ["TARGET_TRIPLE"],
+              backend=os.environ["BACKEND"],
+              dependency_audit_sha256=dependency_sha,
+          )
+          for suffix, payload in (
+              ("version.json", version),
+              ("dependency.json", dependency),
+              ("abi.json", abi),
+          ):
+              Path(f"{asset}.{suffix}").write_text(
+                  json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+              )
+          PY
+
+      - name: Smoke test staged CPU binary
+        shell: bash
         run: |
-          mkdir -p smoke && tar -C smoke -xzf ferrum-linux-x86_64.tar.gz
-          ./smoke/ferrum --help | head -5
+          mkdir -p smoke
+          tar -C smoke -xzf ferrum-linux-x86_64.tar.gz
+          ./smoke/ferrum --version
+          ./smoke/ferrum --help >/dev/null
 
-      - name: Upload dry-run artifact
+      - name: Upload staged CPU asset
         uses: actions/upload-artifact@v4
         with:
-          name: ferrum-linux-x86_64-${{ steps.version.outputs.tag }}
+          name: ferrum-linux-x86_64-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
+          if-no-files-found: error
+          retention-days: 14
           path: |
             ferrum-linux-x86_64.tar.gz
             ferrum-linux-x86_64.tar.gz.sha256
+            ferrum-linux-x86_64.tar.gz.binary.sha256
+            ferrum-linux-x86_64.tar.gz.version.json
+            ferrum-linux-x86_64.tar.gz.dependency.json
+            ferrum-linux-x86_64.tar.gz.abi.json
+            ferrum-linux-x86_64.dependencies.txt
 
-      - uses: softprops/action-gh-release@v2
-        if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            ferrum-linux-x86_64.tar.gz
-            ferrum-linux-x86_64.tar.gz.sha256
-
-  # ── macOS aarch64 (Apple Silicon, Metal) ─────────────────────────────
-  # Built on the macos-14 Apple Silicon runner so we get a native
-  # aarch64 binary. Metal is bundled — same backend as our M1 Max
-  # benchmarks ship.
   macos-aarch64:
-    name: macOS aarch64 (Apple Silicon)
+    name: Stage macOS aarch64 Metal
     runs-on: macos-14
     steps:
-      - name: Validate manual release inputs
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true' && github.event.inputs.tag == ''
+      - name: Validate immutable staging inputs
+        shell: bash
         run: |
-          echo "tag is required when publish_release=true" >&2
-          exit 1
+          if [[ "${{ inputs.publish_release }}" != "false" ]]; then
+            echo "publish_release must remain false; this workflow only stages bytes" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.release_candidate_sha }}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_candidate_sha must be a full lowercase commit SHA" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.0-rc\.[1-9][0-9]*$ ]]; then
+            echo "release_candidate_tag must match v0.8.0-rc.N" >&2
+            exit 1
+          fi
+          if ! [[ "${{ inputs.staging_label }}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "invalid staging_label" >&2
+            exit 1
+          fi
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_candidate_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact clean release candidate
+        shell: bash
+        run: |
+          expected_sha="${{ inputs.release_candidate_sha }}"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$expected_sha"
+          test -z "$(git status --porcelain)"
+          expected_tag="${{ inputs.release_candidate_tag }}"
+          test "$(git cat-file -t "$expected_tag")" = tag
+          test "$(git rev-parse "$expected_tag^{}")" = "$expected_sha"
 
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: aarch64-apple-darwin
 
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: release-macos-aarch64-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: release-macos-aarch64-
+          key: stage-v0.8.0-macos-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.0-macos-aarch64-
 
-      - name: Build (release, Metal)
-        run: cargo build --release -p ferrum-cli --bin ferrum --features metal
-
-      - name: Strip binary
-        run: strip target/release/ferrum
-
-      - name: Resolve version
-        id: version
+      - name: Verify workspace release version
+        id: metadata
+        shell: bash
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            tag="${{ github.event.inputs.tag }}"
-            if [[ -z "$tag" ]]; then
-              tag="dry-run-${GITHUB_SHA::7}"
-            fi
-            echo "tag=$tag" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ferrum-cli"))')"
+          test "$version" = "0.8.0"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build release Metal binary exactly once
+        run: cargo build --release --locked -p ferrum-cli --bin ferrum --features metal
+
+      - name: Strip and audit binary
+        shell: bash
+        run: |
+          strip target/release/ferrum
+          file target/release/ferrum | tee ferrum-macos-aarch64.dependencies.txt
+          otool -L target/release/ferrum | tee -a ferrum-macos-aarch64.dependencies.txt
+          if grep -Eiq 'python|torch|vllm' ferrum-macos-aarch64.dependencies.txt; then
+            echo "Metal release binary must not link Python, Torch, or vLLM" >&2
+            exit 1
           fi
 
-      - name: Package tarball
+      - name: Package staged Metal asset and adjacent manifests
+        shell: bash
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+          RC_SHA: ${{ inputs.release_candidate_sha }}
+          RC_TAG: ${{ inputs.release_candidate_tag }}
+          STAGING_LABEL: ${{ inputs.staging_label }}
         run: |
+          asset="ferrum-macos-aarch64.tar.gz"
           mkdir -p dist
           cp target/release/ferrum dist/ferrum
           cp LICENSE dist/LICENSE
           cp README.md dist/README.md
-          tar -C dist -czf ferrum-macos-aarch64.tar.gz ferrum LICENSE README.md
-          ls -lh ferrum-macos-aarch64.tar.gz
-          shasum -a 256 ferrum-macos-aarch64.tar.gz | tee ferrum-macos-aarch64.tar.gz.sha256
+          tar -C dist -czf "$asset" ferrum LICENSE README.md
+          ASSET="$asset" BINARY="target/release/ferrum" DEPENDENCIES="ferrum-macos-aarch64.dependencies.txt" \
+            TARGET_TRIPLE="aarch64-apple-darwin" BACKEND="metal" \
+            python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          from pathlib import Path
 
-      - name: Smoke test the packaged binary
+          asset = Path(os.environ["ASSET"])
+          binary = Path(os.environ["BINARY"])
+          dependencies = Path(os.environ["DEPENDENCIES"])
+
+          def digest(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          asset_sha = digest(asset)
+          binary_sha = digest(binary)
+          dependency_sha = digest(dependencies)
+          forbidden_runtime_linkage_found = bool(
+              re.search(r"python|torch|vllm", dependencies.read_text(encoding="utf-8"), re.IGNORECASE)
+          )
+          assert not forbidden_runtime_linkage_found
+          Path(f"{asset}.sha256").write_text(f"{asset_sha}  {asset.name}\n", encoding="utf-8")
+          Path(f"{asset}.binary.sha256").write_text(f"{binary_sha}  ferrum\n", encoding="utf-8")
+          common = {
+              "schema_version": 1,
+              "asset_name": asset.name,
+              "asset_sha256": asset_sha,
+              "binary_name": "ferrum",
+              "binary_sha256": binary_sha,
+              "release_candidate_sha": os.environ["RC_SHA"],
+              "release_candidate_tag": os.environ["RC_TAG"],
+              "staging_label": os.environ["STAGING_LABEL"],
+              "workflow_run_id": os.environ["GITHUB_RUN_ID"],
+              "workflow_run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+          }
+          version = dict(common, version=os.environ["VERSION"])
+          dependency = dict(
+              common,
+              audit_file=dependencies.name,
+              audit_sha256=dependency_sha,
+              forbidden_runtime_linkage=["python", "torch", "vllm"],
+              forbidden_runtime_linkage_found=forbidden_runtime_linkage_found,
+          )
+          abi = dict(
+              common,
+              target_triple=os.environ["TARGET_TRIPLE"],
+              backend=os.environ["BACKEND"],
+              dependency_audit_sha256=dependency_sha,
+          )
+          for suffix, payload in (
+              ("version.json", version),
+              ("dependency.json", dependency),
+              ("abi.json", abi),
+          ):
+              Path(f"{asset}.{suffix}").write_text(
+                  json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+              )
+          PY
+
+      - name: Smoke test staged Metal binary
+        shell: bash
         run: |
-          mkdir -p smoke && tar -C smoke -xzf ferrum-macos-aarch64.tar.gz
-          ./smoke/ferrum --help | head -5
+          mkdir -p smoke
+          tar -C smoke -xzf ferrum-macos-aarch64.tar.gz
+          ./smoke/ferrum --version
+          ./smoke/ferrum --help >/dev/null
 
-      - name: Upload dry-run artifact
+      - name: Upload staged Metal asset
         uses: actions/upload-artifact@v4
         with:
-          name: ferrum-macos-aarch64-${{ steps.version.outputs.tag }}
+          name: ferrum-macos-aarch64-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
+          if-no-files-found: error
+          retention-days: 14
           path: |
             ferrum-macos-aarch64.tar.gz
             ferrum-macos-aarch64.tar.gz.sha256
-
-      - uses: softprops/action-gh-release@v2
-        if: github.event_name == 'push' || github.event.inputs.publish_release == 'true'
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.tag }}
-          generate_release_notes: true
-          files: |
-            ferrum-macos-aarch64.tar.gz
-            ferrum-macos-aarch64.tar.gz.sha256
+            ferrum-macos-aarch64.tar.gz.binary.sha256
+            ferrum-macos-aarch64.tar.gz.version.json
+            ferrum-macos-aarch64.tar.gz.dependency.json
+            ferrum-macos-aarch64.tar.gz.abi.json
+            ferrum-macos-aarch64.dependencies.txt

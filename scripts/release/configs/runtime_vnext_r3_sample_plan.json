@@ -1,0 +1,245 @@
+{
+  "artifact_type": "runtime_vnext_r3_sample_plan",
+  "collection_scope": "sampled_final_regression",
+  "correctness": {
+    "llama31-8b-compat": {
+      "cuda": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "producer": "g0-llama-dense-execution-binding-v1",
+        "raw_status": "pass",
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "run-multiturn",
+          "serve-multiturn",
+          "serve-stream"
+        ]
+      },
+      "metal": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "producer": "g0-llama-dense-execution-binding-v1",
+        "raw_status": "pass",
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "run-multiturn",
+          "serve-multiturn",
+          "serve-stream"
+        ]
+      }
+    },
+    "m1-qwen35-4b": {
+      "cuda": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "case_count": 60,
+        "checks_per_case": 5,
+        "comparison_count": 300,
+        "producer": "g08-focused-c17-v1",
+        "raw_decision": "KEEP",
+        "raw_formal_pass_allowed": false,
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "C17"
+        ]
+      },
+      "metal": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "case_count": 60,
+        "checks_per_case": 5,
+        "comparison_count": 300,
+        "producer": "g08-focused-c17-v1",
+        "raw_decision": "KEEP",
+        "raw_formal_pass_allowed": false,
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "C17"
+        ]
+      }
+    },
+    "m2-qwen35-35b-a3b": {
+      "cuda": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "case_count": 6,
+        "checks_per_case": 5,
+        "comparison_count": 30,
+        "producer": "g08-focused-c17-v1",
+        "raw_decision": "KEEP",
+        "raw_formal_pass_allowed": false,
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "C17"
+        ]
+      },
+      "metal": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "case_count": 6,
+        "checks_per_case": 5,
+        "comparison_count": 30,
+        "producer": "g08-focused-c17-v1",
+        "raw_decision": "KEEP",
+        "raw_formal_pass_allowed": false,
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "C17"
+        ]
+      }
+    },
+    "m3-qwen3-30b-a3b": {
+      "cuda": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "case_count": 6,
+        "checks_per_case": 5,
+        "comparison_count": 30,
+        "producer": "g08-focused-c17-v1",
+        "raw_decision": "KEEP",
+        "raw_formal_pass_allowed": false,
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "C17"
+        ]
+      },
+      "metal": {
+        "entrypoints": [
+          "run",
+          "serve"
+        ],
+        "case_count": 6,
+        "checks_per_case": 5,
+        "comparison_count": 30,
+        "producer": "g08-focused-c17-v1",
+        "raw_decision": "KEEP",
+        "raw_formal_pass_allowed": false,
+        "sample_selection_status": "pass",
+        "scenario_ids": [
+          "C17"
+        ]
+      }
+    }
+  },
+  "error_count": 0,
+  "full_matrix_claim": false,
+  "performance": {
+    "llama31-8b-compat": {
+      "cuda": {
+        "concurrency": 1,
+        "dataset": "random",
+        "floor": {
+          "artifact_path": "docs/release/g0/0.7.7/cuda-llama-dense/bench-serve.json",
+          "artifact_sha256": "ecceadb69d12b94dedba476f85223e43e3ae9d48c1fbb98738b6f0d48535cf86",
+          "hardware_contract": "one-rtx-4090-24gb",
+          "metric": "output_throughput_tps.mean",
+          "value": 122.94173274085911
+        },
+        "floor_ratio": 0.95,
+        "producer": "g0-llama-dense-execution-binding-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      },
+      "metal": {
+        "concurrency": 1,
+        "dataset": "random",
+        "floor": {
+          "artifact_path": "docs/release/g0/0.7.7/metal/metal-readme/summary.json",
+          "artifact_sha256": "3040a1d70bbe43ab3f105260a3559557cd5d1b7aae989b08ba427fd4ac636566",
+          "hardware_contract": "apple-m1-max-24core-32gib",
+          "metric": "models.llama31_8b.cells.c1.baseline_tps",
+          "value": 29.1
+        },
+        "floor_ratio": 0.95,
+        "producer": "g0-llama-dense-execution-binding-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      }
+    },
+    "m1-qwen35-4b": {
+      "cuda": {
+        "concurrency": 32,
+        "dataset": "random",
+        "floor_ratio": 0.95,
+        "floor_source": "runtime-vnext-r2-frozen-catalog",
+        "producer": "r3-exact-staged-ferrum-collector-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      },
+      "metal": {
+        "concurrency": 16,
+        "dataset": "random",
+        "floor_ratio": 0.95,
+        "floor_source": "runtime-vnext-r2-frozen-catalog",
+        "producer": "r3-exact-staged-ferrum-collector-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      }
+    },
+    "m2-qwen35-35b-a3b": {
+      "cuda": {
+        "concurrency": 16,
+        "dataset": "random",
+        "floor_ratio": 0.95,
+        "floor_source": "runtime-vnext-r2-frozen-catalog",
+        "producer": "r3-exact-staged-ferrum-collector-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      },
+      "metal": {
+        "concurrency": 4,
+        "dataset": "random",
+        "floor_ratio": 0.95,
+        "floor_source": "runtime-vnext-r2-frozen-catalog",
+        "producer": "r3-exact-staged-ferrum-collector-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      }
+    },
+    "m3-qwen3-30b-a3b": {
+      "cuda": {
+        "concurrency": 32,
+        "dataset": "random",
+        "floor_ratio": 0.95,
+        "floor_source": "runtime-vnext-r2-frozen-catalog",
+        "producer": "r3-exact-staged-ferrum-collector-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      },
+      "metal": {
+        "concurrency": 16,
+        "dataset": "random",
+        "floor_ratio": 0.95,
+        "floor_source": "runtime-vnext-r2-frozen-catalog",
+        "producer": "r3-exact-staged-ferrum-collector-v1",
+        "repeats": 3,
+        "run_parity": true,
+        "run_serve_ratio_floor": 0.9
+      }
+    }
+  },
+  "schema_version": 1,
+  "unselected_status": "not_evaluated",
+  "version": "0.8.0"
+}

@@ -51,11 +51,13 @@ COLLECTION_EPOCH_SOURCE_PATHS = {
 _REVIEWED_GIT_BLOB_SHA256S: dict[str, frozenset[str]] = {}
 SCHEMA_VERSION = 1
 CONTRACT = "ferrum.runtime-vnext.r2.ferrum-collector.v1"
+R3_CONTRACT = "ferrum.runtime-vnext.r3.exact-staged-ferrum-collector.v1"
 CELL_CHECKPOINT_CONTRACT = "ferrum.runtime-vnext.r2.completed-cell-checkpoint.v1"
 R1_CORRECTNESS_ARTIFACT_TYPE = (
     "runtime_vnext_r1_product_correctness_manifest"
 )
 PASS_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR PASS"
+R3_PASS_PREFIX = "FERRUM RUNTIME VNEXT R3 EXACT STAGED FERRUM COLLECTOR PASS"
 PLAN_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR PLAN"
 SELFTEST_PASS_LINE = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR SELFTEST PASS"
 TEMPLATE_PREFIX = "FERRUM RUNTIME VNEXT R2 FERRUM COLLECTOR CONFIG TEMPLATE"
@@ -64,6 +66,11 @@ MODEL_KEYS = {
     "m2-qwen35-35b-a3b",
     "m3-qwen3-30b-a3b",
 }
+R3_AUTHORITY_MODE = "g08-rc-staged"
+R3_AUTHORITY_PATH_FIELDS = (
+    "g10a_manifest_path", "g08_rc_manifest_path", "staged_assets_manifest_path"
+)
+R3_SAMPLE_PLAN_PATH = REPO_ROOT / "scripts/release/configs/runtime_vnext_r3_sample_plan.json"
 TYPED_ACTIVE_CAP_FLOORS = {
     ("m1-qwen35-4b", "cuda"): 32,
     ("m2-qwen35-35b-a3b", "cuda"): 16,
@@ -809,6 +816,45 @@ def cell_id(cell: dict[str, Any]) -> str:
     return f"{cell['dataset']}:c{cell['concurrency']}"
 
 
+def normalize_selected_cells(raw: Any, model_key: str, backend: str) -> list[str]:
+    canonical = {cell_id(cell) for cell in expected_cells(backend)}
+    plan = read_json(R3_SAMPLE_PLAN_PATH)
+    performance = plan.get("performance", {})
+    lane = performance.get(model_key, {}).get(backend, {}) if isinstance(performance, dict) else {}
+    require(
+        plan.get("artifact_type") == "runtime_vnext_r3_sample_plan"
+        and plan.get("full_matrix_claim") is False
+        and plan.get("unselected_status") == "not_evaluated"
+        and lane.get("repeats") == 3 and lane.get("run_parity") is True
+        and type(lane.get("concurrency")) is int,
+        "checked-in R3 sample plan is invalid",
+    )
+    frozen = [f"random:c{lane['concurrency']}"]
+    require(
+        isinstance(raw, list) and raw == frozen and set(raw) < canonical,
+        f"R3 selected_cells must equal the frozen non-empty {model_key}/{backend} sample",
+    )
+    return list(raw)
+
+
+def configured_cells(config: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    full = expected_cells(config["backend"])
+    if "selected_cells" not in config:
+        return full
+    selected = set(config["selected_cells"])
+    return tuple(
+        {**copy.deepcopy(cell), "sequence": sequence}
+        for sequence, cell in enumerate(
+            (cell for cell in full if cell_id(cell) in selected), start=1
+        )
+    )
+
+
+def configured_run_parity_cell(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **run_parity_cell(config["backend"]),
+        "sequence": len(configured_cells(config)) + 1,
+    }
 def parse_extra_argv(raw: Any, label: str) -> list[str]:
     require(isinstance(raw, list), f"{label} must be an argv list")
     require(all(isinstance(value, str) and value for value in raw), f"{label} contains an invalid token")
@@ -962,6 +1008,110 @@ def validate_r1_correctness_authority(
     )
 
 
+def validate_r3_lane_binding(
+    lane: dict[str, Any],
+    asset: dict[str, Any],
+    receipt: dict[str, Any],
+    *,
+    model_key: str,
+    backend: str,
+    source: dict[str, Any],
+    binary_sha256: str,
+) -> None:
+    require(
+        (
+            lane.get("model_key"), lane.get("backend"), lane.get("source"),
+            lane.get("binary_sha256"), lane.get("tarball_sha256"),
+            lane.get("entrypoints"), lane.get("full_matrix_claim"),
+        )
+        == (
+            model_key, backend, source, binary_sha256,
+            asset["tarball"]["sha256"], ["run", "serve"], False,
+        )
+        and type(lane.get("sample_count")) is int and lane["sample_count"] > 0,
+        "R3 G08 sampled lane identity/scope differs",
+    )
+    require(
+        (
+            receipt.get("status"), receipt.get("build_mode"),
+            receipt.get("release_version"), receipt.get("source_git_sha"),
+            receipt.get("source_tree_sha"), receipt.get("backend"),
+            receipt.get("binary_sha256"), receipt.get("selected_staged_asset"),
+        )
+        == (
+            "pass", "staged-release-asset", "0.8.0", source["git_sha"],
+            source["git_tree_sha"], backend, binary_sha256, asset,
+        ),
+        "R3 staged build receipt binding differs",
+    )
+
+
+def validate_r3_staged_correctness_authority(
+    *,
+    g10a_path: Path,
+    g08_rc_path: Path,
+    correctness_path: Path,
+    staged_assets_path: Path,
+    build_receipt_path: Path,
+    model_key: str,
+    backend: str,
+    candidate_source: dict[str, Any],
+    candidate_binary_path: Path,
+) -> dict[str, Any]:
+    try:
+        try:
+            import runtime_vnext_goal_gate as goal_gate
+        except ModuleNotFoundError:
+            from scripts.release import runtime_vnext_goal_gate as goal_gate
+        g10a = goal_gate.verify_goal_manifest(g10a_path, expected_lane="vnext-g10a")
+        g08 = goal_gate.verify_goal_manifest(g08_rc_path, expected_lane="vnext-g08-rc")
+        staged = goal_gate.validate_staged_assets_manifest(staged_assets_path)
+        source = g10a["source"]
+        require(
+            source == g08["source"] == staged["release_candidate"] == candidate_source
+            and g10a["manifest"]["release_candidate_tag"] == staged["release_candidate_tag"],
+            "R3 G10A/G08/staged release candidate differs",
+        )
+        resolve = lambda raw, label, root: goal_gate.resolve_evidence_ref(raw, label, root=root)
+        g10_staged, g10_staged_path = resolve(
+            g10a["manifest"]["inputs"]["staged_assets"], "R3 staged assets", g10a["path"].parent
+        )
+        _, g10_sample_path = resolve(
+            g10a["manifest"]["inputs"]["sample_plan"], "R3 sample plan", g10a["path"].parent
+        )
+        g08_g10, g08_g10_path = resolve(
+            g08["manifest"]["inputs"]["g10a"], "R3 G10A authority", g08["path"].parent
+        )
+        lane = g08["manifest"]["lanes"][f"{model_key.split('-', 1)[0]}_{backend}"]
+        _, checkpoint_path = resolve(lane["checkpoint"], "R3 correctness", g08["path"].parent)
+        _, receipt_path = resolve(lane["binary_build_receipt"], "R3 build receipt", g08["path"].parent)
+        require(
+            (g10_staged_path, g10_sample_path, g08_g10_path, checkpoint_path, receipt_path)
+            == (staged_assets_path.resolve(), R3_SAMPLE_PLAN_PATH.resolve(), g10a_path.resolve(), correctness_path.resolve(), build_receipt_path.resolve())
+            and g08["manifest"]["staged_assets"]["sha256"] == g10_staged["sha256"]
+            and g08_g10["sha256"] == g10a["ref"]["sha256"],
+            "R3 configured authority refs differ",
+        )
+        asset = staged["assets"][backend]
+        binary_sha256 = file_sha256(candidate_binary_path)
+        receipt = read_json(build_receipt_path)
+        require(
+            asset["binary"]["sha256"] == binary_sha256
+            and asset["binary"]["size_bytes"] == candidate_binary_path.stat().st_size
+            and receipt.get("staged_assets_manifest", {}).get("sha256") == staged["ref"]["sha256"],
+            "R3 staged binary/manifest identity differs",
+        )
+        validate_r3_lane_binding(
+            lane, asset, receipt, model_key=model_key, backend=backend,
+            source=source, binary_sha256=binary_sha256,
+        )
+    except goal_gate.GoalGateError as exc:
+        raise R2CollectorError(f"R3 authority rejected: {exc}") from exc
+    return {
+        "source": source, "binary_sha256": binary_sha256,
+        "tarball_sha256": asset["tarball"]["sha256"],
+        "release_candidate_tag": staged["release_candidate_tag"],
+    }
 def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     collector_support.reject_secret_material(raw)
     require(raw.get("schema_version") == SCHEMA_VERSION, "config.schema_version must be 1")
@@ -970,10 +1120,28 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
     backend = config.get("backend")
     require(model_key in MODEL_KEYS, f"config.model_key must be one of {sorted(MODEL_KEYS)}")
     require(backend in {"cuda", "metal"}, "config.backend must be cuda or metal")
+    authority_mode = config.get("authority_mode")
+    require(authority_mode in {None, R3_AUTHORITY_MODE}, "config.authority_mode is unsupported")
+    if authority_mode is None:
+        require(
+            "selected_cells" not in config
+            and all(field not in config for field in R3_AUTHORITY_PATH_FIELDS),
+            "R2 config cannot carry R3 staged/sample fields",
+        )
+    else:
+        config["selected_cells"] = normalize_selected_cells(
+            config.get("selected_cells"), str(model_key), str(backend)
+        )
     require(isinstance(config.get("request_model"), str) and config["request_model"], "config.request_model is required")
 
     models_lock_path = resolve_file(config.get("models_lock_path"), "config.models_lock_path")
     correctness_path = resolve_file(config.get("correctness_manifest_path"), "config.correctness_manifest_path")
+    authority_paths: dict[str, Path] = {}
+    if authority_mode == R3_AUTHORITY_MODE:
+        authority_paths = {
+            field: resolve_file(config.get(field), f"config.{field}")
+            for field in R3_AUTHORITY_PATH_FIELDS
+        }
     models_lock = read_json(models_lock_path)
     correctness = read_json(correctness_path)
     model, lane = load_locked_model(models_lock, str(model_key), str(backend))
@@ -1015,16 +1183,31 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
     require(backend in features, f"candidate.cargo_features must include {backend}")
     candidate_env = collector_support.sanitized_environment(candidate.get("env"))
     candidate_binary_sha256 = file_sha256(binary_path)
-    validate_r1_correctness_authority(
-        correctness,
-        backend=str(backend),
-        candidate_source={
-            "git_sha": source_sha,
-            "git_tree_sha": source_tree_sha,
-            "dirty": False,
-        },
-        candidate_binary_sha256=candidate_binary_sha256,
-    )
+    candidate_source = {
+        "git_sha": source_sha,
+        "git_tree_sha": source_tree_sha,
+        "dirty": False,
+    }
+    r3_authority: dict[str, Any] | None = None
+    if authority_mode is None:
+        validate_r1_correctness_authority(
+            correctness,
+            backend=str(backend),
+            candidate_source=candidate_source,
+            candidate_binary_sha256=candidate_binary_sha256,
+        )
+    else:
+        r3_authority = validate_r3_staged_correctness_authority(
+            g10a_path=authority_paths["g10a_manifest_path"],
+            g08_rc_path=authority_paths["g08_rc_manifest_path"],
+            correctness_path=correctness_path,
+            staged_assets_path=authority_paths["staged_assets_manifest_path"],
+            build_receipt_path=build_receipt_path,
+            model_key=str(model_key),
+            backend=str(backend),
+            candidate_source=candidate_source,
+            candidate_binary_path=binary_path,
+        )
 
     hardware = config.get("hardware")
     require(isinstance(hardware, dict), "config.hardware is required")
@@ -1082,6 +1265,7 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
             "tokenizer_source_root": str(tokenizer_root),
         }
     )
+    config.update({field: str(path) for field, path in authority_paths.items()})
     candidate.update(
         {
             "binary_path": str(binary_path),
@@ -1108,7 +1292,13 @@ def normalize_config(raw: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
         "build_log_path": build_log_path,
         "build_receipt_path": build_receipt_path,
     }
+    if r3_authority is not None:
+        context.update({"r3_authority": r3_authority, **authority_paths})
     return config, context
+
+
+def is_r3_config(config: dict[str, Any]) -> bool:
+    return config.get("authority_mode") == R3_AUTHORITY_MODE
 
 
 def collection_fingerprint(
@@ -1120,7 +1310,7 @@ def collection_fingerprint(
     resource_sampler_sha256: str | None = None,
 ) -> str:
     material = {
-        "contract": CONTRACT,
+        "contract": R3_CONTRACT if is_r3_config(config) else CONTRACT,
         "collector_sha256": collector_sha256 or PROCESS_COLLECTION_EPOCH["collector_sha256"],
         "support_sha256": support_sha256 or PROCESS_COLLECTION_EPOCH["support_sha256"],
         "resource_sampler_sha256": resource_sampler_sha256 or PROCESS_COLLECTION_EPOCH["resource_sampler_sha256"],
@@ -1134,11 +1324,16 @@ def collection_fingerprint(
         "realistic_dataset_sha256": file_sha256(context["dataset_path"]),
         "config": config,
     }
+    if is_r3_config(config):
+        material["r3_authority_sha256"] = {
+            field: file_sha256(context[field]) for field in R3_AUTHORITY_PATH_FIELDS
+        }
     return canonical_json_sha256(material)
 
 
 def lane_dir(root: Path, config: dict[str, Any]) -> Path:
-    return root / "r2-ferrum" / config["model_key"] / config["backend"]
+    prefix = "r3-exact-staged-ferrum" if is_r3_config(config) else "r2-ferrum"
+    return root / prefix / config["model_key"] / config["backend"]
 
 
 def prepare_plan(root: Path, config: dict[str, Any], context: dict[str, Any], *, resume: bool) -> tuple[Path, str]:
@@ -1172,8 +1367,8 @@ def prepare_plan(root: Path, config: dict[str, Any], context: dict[str, Any], *,
         "profile_detail": "off",
         "server_process_count_per_epoch": 1,
         "server_epoch_policy": "one fresh server process resumes after the validated completed-cell prefix",
-        "server_cell_order": [copy.deepcopy(cell) for cell in expected_cells(config["backend"])],
-        "run_serve_parity_probe": copy.deepcopy(run_parity_cell(config["backend"])),
+        "server_cell_order": [copy.deepcopy(cell) for cell in configured_cells(config)],
+        "run_serve_parity_probe": copy.deepcopy(configured_run_parity_cell(config)),
         "run_process_count": RUN_SAMPLE_COUNT,
         "run_policy": {
             "prompt_sha256": hashlib.sha256(RUN_PROMPT.encode("utf-8")).hexdigest(),
@@ -1190,6 +1385,16 @@ def prepare_plan(root: Path, config: dict[str, Any], context: dict[str, Any], *,
         "legacy_binary": None,
         "abba_order": None,
     }
+    if is_r3_config(config):
+        plan.update(
+            {
+                "authority_mode": R3_AUTHORITY_MODE,
+                "sample_contract": "selected-performance-evidence-v1",
+                "selected_cells": list(config["selected_cells"]),
+                "full_matrix_claim": False,
+                "unselected_cells": "not_evaluated",
+            }
+        )
     if plan_path.exists():
         require(resume, f"collection plan already exists; pass --resume: {plan_path}")
         frozen_plan = read_json(plan_path)
@@ -1269,7 +1474,7 @@ def stage_inputs(root: Path, lane: Path, config: dict[str, Any], context: dict[s
         require(read_json(run_prompt) == prompt_document, "run prompt changed during resume")
     else:
         atomic_write_json(run_prompt, prompt_document)
-    return {
+    inputs = {
         "binary_path": binary,
         "binary": artifact_ref(root, binary, kind="candidate-binary"),
         "build_log": artifact_ref(root, build_log, kind="build-log"),
@@ -1284,6 +1489,17 @@ def stage_inputs(root: Path, lane: Path, config: dict[str, Any], context: dict[s
         "run_parity_dataset": artifact_ref(root, parity_dataset, kind="run-parity-dataset"),
         "run_prompt": artifact_ref(root, run_prompt, kind="run-prompt"),
     }
+    if is_r3_config(config):
+        for key, field, name in (
+            ("release_freeze_manifest", "g10a_manifest_path", "g10a.json"),
+            ("authority", "g08_rc_manifest_path", "g08-rc.json"),
+            ("staged_assets_manifest", "staged_assets_manifest_path", "staged-assets.json"),
+        ):
+            staged = collector_support.stage_file(
+                root, context[field], f"{prefix}/authority/{name}"
+            )
+            inputs[key] = artifact_ref(root, staged, kind=key)
+    return inputs
 
 
 def server_argv(binary: Path, attempt_dir: Path, config: dict[str, Any]) -> tuple[list[str], Path, Path]:
@@ -2912,7 +3128,7 @@ def load_completed_cell_prefix(
     *,
     resume: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
+    cells = [*configured_cells(config), configured_run_parity_cell(config)]
     checkpoint_dir = lane / "cell-checkpoints"
     existing_paths = sorted(checkpoint_dir.glob("cell-*.json")) if checkpoint_dir.is_dir() else []
     existing_sequences = []
@@ -3024,7 +3240,7 @@ def finalize_recovered_only_server_bundle(
         "finished_at": cleanup["failed_at"],
         "duration_sec": duration_seconds(last_epoch["started_at"], cleanup["failed_at"]),
         "formal_measurement_started_at": records[0]["started_at"],
-        "formal_measurement_finished_at": records[len(expected_cells(config["backend"])) - 1]["finished_at"],
+        "formal_measurement_finished_at": records[len(configured_cells(config)) - 1]["finished_at"],
         "parity_measurement_started_at": records[-1]["started_at"],
         "parity_measurement_finished_at": records[-1]["finished_at"],
         "returncode": cleanup["cleanup_returncode"],
@@ -3049,8 +3265,8 @@ def finalize_recovered_only_server_bundle(
             )
             for checkpoint in checkpoints
         ],
-        "formal_reports": records[: len(expected_cells(config["backend"]))],
-        "run_serve_parity_report": records[len(expected_cells(config["backend"]))],
+        "formal_reports": records[: len(configured_cells(config))],
+        "run_serve_parity_report": records[len(configured_cells(config))],
     }
     path = lane / "server-session.json"
     atomic_write_json(path, bundle)
@@ -3082,7 +3298,7 @@ def validate_server_bundle(
     else:
         require(isinstance(epochs, list) and epochs, "server bundle session epochs are missing")
         require(
-            isinstance(checkpoints, list) and len(checkpoints) == len(expected_cells(config["backend"])) + 1,
+            isinstance(checkpoints, list) and len(checkpoints) == len(configured_cells(config)) + 1,
             "server bundle completed-cell checkpoint set is incomplete",
         )
     checkpoint_documents: list[dict[str, Any]] = []
@@ -3102,11 +3318,11 @@ def validate_server_bundle(
         session.get("server_process_ordinal") == actual_process_count,
         "server bundle process ordinal does not match explicit epoch count",
     )
-    require(isinstance(reports, list) and len(reports) == len(expected_cells(config["backend"])), "server bundle formal cell count mismatch")
+    require(isinstance(reports, list) and len(reports) == len(configured_cells(config)), "server bundle formal cell count mismatch")
     require(isinstance(parity, dict), "server bundle lacks run/serve parity probe")
     if not legacy_single_epoch:
         all_records = [*reports, parity]
-        all_cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
+        all_cells = [*configured_cells(config), configured_run_parity_cell(config)]
         for checkpoint_document, cell, expected_record in zip(checkpoint_documents, all_cells, all_records):
             checkpoint_record, _, _ = validate_completed_cell_checkpoint(
                 root,
@@ -3120,7 +3336,7 @@ def validate_server_bundle(
                 expected_record=expected_record,
             )
             require(checkpoint_record == expected_record, f"{cell_id(cell)} finalized checkpoint record mismatch")
-    expected = list(expected_cells(config["backend"]))
+    expected = list(configured_cells(config))
     for index, (record, cell) in enumerate(zip(reports, expected), start=1):
         require(record.get("sequence") == index and record.get("cell_id") == cell_id(cell), "server bundle cell order mismatch")
         require(record.get("session_id") in epoch_session_ids, "server bundle formal report has an unknown epoch")
@@ -3146,7 +3362,7 @@ def validate_server_bundle(
         )
     parity_path = validate_artifact_ref(root, parity.get("raw_report"), "run_serve_parity_report.raw_report")
     require(parity.get("session_id") in epoch_session_ids, "run/serve parity report has an unknown epoch")
-    validate_bench_report(read_json(parity_path), config, run_parity_cell(config["backend"]))
+    validate_bench_report(read_json(parity_path), config, configured_run_parity_cell(config))
     for key in ("stdout", "stderr"):
         validate_artifact_ref(root, parity.get(key), f"run_serve_parity_report.{key}")
     validate_artifact_ref(root, parity.get("raw_request_evidence"), "run_serve_parity_report.raw_request_evidence")
@@ -3192,7 +3408,7 @@ def collect_server_session(
         inputs,
         resume=resume,
     )
-    all_cells = [*expected_cells(config["backend"]), run_parity_cell(config["backend"])]
+    all_cells = [*configured_cells(config), configured_run_parity_cell(config)]
     if len(recovered_records) == len(all_cells):
         return finalize_recovered_only_server_bundle(
             root,
@@ -3326,7 +3542,7 @@ def collect_server_session(
                 )
             )
         session["formal_measurement_started_at"] = records[0]["started_at"]
-        session["formal_measurement_finished_at"] = records[len(expected_cells(config["backend"])) - 1]["finished_at"]
+        session["formal_measurement_finished_at"] = records[len(configured_cells(config)) - 1]["finished_at"]
         session["parity_measurement_started_at"] = records[-1]["started_at"]
         session["parity_measurement_finished_at"] = records[-1]["finished_at"]
         session["cell_quiescence"] = quiescence
@@ -3362,7 +3578,7 @@ def collect_server_session(
         checkpoints = [read_json(checkpoint_path(lane, row["sequence"])) for row in records]
         for record, sampler in zip(new_records, samplers):
             record["resources"] = cell_resource_evidence(root, session, record, sampler, config)
-        formal_count = len(expected_cells(config["backend"]))
+        formal_count = len(configured_cells(config))
         bundle = {
             "schema_version": SCHEMA_VERSION,
             "contract": CONTRACT,
@@ -3979,9 +4195,15 @@ def write_artifact_index(
     return path
 
 
-def validate_final_manifest(root: Path, manifest: dict[str, Any], fingerprint: str) -> None:
+def validate_final_manifest(
+    root: Path,
+    manifest: dict[str, Any],
+    fingerprint: str,
+    config: dict[str, Any] | None = None,
+) -> None:
     require(manifest.get("schema_version") == SCHEMA_VERSION, "final manifest schema mismatch")
-    require(manifest.get("contract") == CONTRACT, "final manifest contract mismatch")
+    expected_contract = R3_CONTRACT if config and is_r3_config(config) else CONTRACT
+    require(manifest.get("contract") == expected_contract, "final manifest contract mismatch")
     require(manifest.get("status") == "pass", "final manifest status is not pass")
     require(manifest.get("config_fingerprint") == fingerprint, "final manifest fingerprint mismatch")
     epochs = manifest.get("collection_epochs")
@@ -4068,10 +4290,18 @@ def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool
     manifest_path = lane / "manifest.json"
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "contract": CONTRACT,
-        "artifact_type": "runtime_vnext_r2_ferrum_lane_manifest",
+        "contract": R3_CONTRACT if is_r3_config(config) else CONTRACT,
+        "artifact_type": (
+            "runtime_vnext_r3_exact_staged_ferrum_lane_manifest"
+            if is_r3_config(config)
+            else "runtime_vnext_r2_ferrum_lane_manifest"
+        ),
         "status": "pass",
-        "formal_r2_aggregate_status": "not-evaluated",
+        **(
+            {}
+            if is_r3_config(config)
+            else {"formal_r2_aggregate_status": "not-evaluated"}
+        ),
         "model_key": config["model_key"],
         "backend": config["backend"],
         "hardware": copy.deepcopy(config["hardware"]),
@@ -4086,8 +4316,8 @@ def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool
         "plan": artifact_ref(root, plan_path, kind="collection-plan"),
         "inputs": {key: copy.deepcopy(value) for key, value in inputs.items() if isinstance(value, dict)},
         "server_session": artifact_ref(root, server_bundle_path, kind="server-session-bundle"),
-        "formal_http_cell_count": len(expected_cells(config["backend"])),
-        "formal_http_cells": [cell_id(cell) for cell in expected_cells(config["backend"])],
+        "formal_http_cell_count": len(configured_cells(config)),
+        "formal_http_cells": [cell_id(cell) for cell in configured_cells(config)],
         "run_serve_parity_probe": copy.deepcopy(server_bundle["run_serve_parity_report"]),
         "run_samples": [artifact_ref(root, path, kind="run-sample-bundle") for path in run_bundle_paths],
         "run_performance": summary,
@@ -4103,6 +4333,25 @@ def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool
         ],
         "pass_line": f"{PASS_PREFIX}: {config['model_key']}/{config['backend']}: {manifest_path}",
     }
+    if is_r3_config(config):
+        authority = context["r3_authority"]
+        manifest.update(
+            {
+                "authority_mode": R3_AUTHORITY_MODE,
+                "evidence_stage": "release-candidate-exact-staged-binary",
+                "sample_contract": "selected-performance-evidence-v1",
+                "selected_cells": list(config["selected_cells"]),
+                "full_matrix_claim": False,
+                "unselected_cells": "not_evaluated",
+                "formal_r3_aggregate_status": "not-evaluated",
+                "release_version": "0.8.0",
+                "release_candidate": copy.deepcopy(authority["source"]),
+                "release_candidate_tag": authority["release_candidate_tag"],
+                "staged_binary_sha256": authority["binary_sha256"],
+                "staged_tarball_sha256": authority["tarball_sha256"],
+                "pass_line": f"{R3_PASS_PREFIX}: {config['model_key']}/{config['backend']}: {manifest_path}",
+            }
+        )
     if manifest_path.exists():
         require(resume, f"final manifest already exists; pass --resume: {manifest_path}")
         require(read_json(manifest_path) == manifest, "final manifest changed during resume")
@@ -4111,7 +4360,7 @@ def collect_lane(root: Path, config_path: Path, *, resume: bool, plan_only: bool
     validate_server_bundle(root, server_bundle, fingerprint, config, inputs)
     for ordinal, bundle in enumerate(run_bundles, start=1):
         validate_run_bundle(root, bundle, fingerprint, ordinal)
-    validate_final_manifest(root, manifest, fingerprint)
+    validate_final_manifest(root, manifest, fingerprint, config)
     print(manifest["pass_line"])
     return manifest_path
 
@@ -4265,6 +4514,44 @@ def self_test() -> int:
                 f"active floor {floor}" in str(exc),
                 "typed active-cap rejection self-test failed for the wrong reason",
             )
+    sample_plan = read_json(R3_SAMPLE_PLAN_PATH)["performance"]
+    for model_key in sorted(MODEL_KEYS):
+        for backend in ("cuda", "metal"):
+            selected = [f"random:c{sample_plan[model_key][backend]['concurrency']}"]
+            require(
+                normalize_selected_cells(selected, model_key, backend) == selected
+                and [cell_id(cell) for cell in configured_cells(
+                    {"backend": backend, "selected_cells": selected}
+                )] == selected,
+                f"R3 frozen sample self-test failed for {model_key}/{backend}",
+            )
+            try:
+                normalize_selected_cells([cell_id(expected_cells(backend)[-1])], model_key, backend)
+                raise R2CollectorError("non-frozen R3 sample unexpectedly passed")
+            except R2CollectorError as exc:
+                require("frozen" in str(exc), "R3 sample rejection used the wrong reason")
+    require(
+        configured_cells({"backend": "cuda"}) == expected_cells("cuda"),
+        "R2 default cell matrix changed",
+    )
+    staged_source = {"git_sha": "1" * 40, "git_tree_sha": "2" * 40, "dirty": False}
+    staged_asset = {"tarball": {"sha256": "3" * 64}}
+    staged_lane = {
+        "model_key": "m1-qwen35-4b", "backend": "cuda", "source": staged_source,
+        "binary_sha256": "4" * 64, "tarball_sha256": "3" * 64,
+        "entrypoints": ["run", "serve"], "sample_count": 1, "full_matrix_claim": False,
+    }
+    staged_receipt = {
+        "status": "pass", "build_mode": "staged-release-asset", "release_version": "0.8.0",
+        "source_git_sha": "1" * 40, "source_tree_sha": "2" * 40, "backend": "cuda",
+        "binary_sha256": "4" * 64, "selected_staged_asset": staged_asset,
+    }
+    validate_r3_lane_binding(staged_lane, staged_asset, staged_receipt, model_key="m1-qwen35-4b", backend="cuda", source=staged_source, binary_sha256="4" * 64)
+    try:
+        validate_r3_lane_binding({**staged_lane, "binary_sha256": "5" * 64}, staged_asset, staged_receipt, model_key="m1-qwen35-4b", backend="cuda", source=staged_source, binary_sha256="4" * 64)
+        raise R2CollectorError("mismatched R3 staged binary unexpectedly passed")
+    except R2CollectorError as exc:
+        require("identity/scope" in str(exc), "R3 staged rejection used the wrong reason")
     authority_source = {
         "git_sha": "1" * 40,
         "git_tree_sha": "2" * 40,

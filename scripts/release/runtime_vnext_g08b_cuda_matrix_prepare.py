@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +31,8 @@ G08B_SERVED_MODEL_NAME = "m2-qwen35-35b-a3b"
 BUILD_DIR = Path("build/candidate")
 BUILD_RECEIPT_REL = BUILD_DIR / "candidate-build-receipt.json"
 BUILD_BINARY_REL = BUILD_DIR / "ferrum"
+STAGED_MANIFEST_REL = BUILD_DIR / "staged-assets-manifest.json"
+STAGED_METADATA_DIR = BUILD_DIR / "staged-metadata"
 CUDA_CORRECTNESS_IMPORT_REL = BUILD_DIR / "cuda-correctness-artifact"
 MODELS_LOCK_REL = Path("models.lock.json")
 EXECUTION_MANIFEST_REL = Path("execution-manifest.json")
@@ -632,6 +637,330 @@ def bind_cuda_correctness_artifact(
     return receipt_path
 
 
+def safe_relative_path(value: Any, label: str) -> Path:
+    require(isinstance(value, str) and value, f"{label} must be a non-empty path")
+    path = Path(value)
+    require(
+        not path.is_absolute() and ".." not in path.parts,
+        f"{label} must be a safe relative path",
+    )
+    return path
+
+
+def staged_file_ref(
+    manifest_root: Path,
+    raw: Any,
+    label: str,
+) -> tuple[dict[str, Any], Path]:
+    require(isinstance(raw, dict), f"{label} must be an object")
+    require(
+        set(raw) == {"path", "sha256", "size_bytes"},
+        f"{label} must contain exactly path, sha256, and size_bytes",
+    )
+    relative = safe_relative_path(raw.get("path"), f"{label}.path")
+    path = (manifest_root / relative).resolve()
+    require(
+        path.is_relative_to(manifest_root.resolve()),
+        f"{label}.path escapes the staged asset root",
+    )
+    require(
+        path.is_file() and not path.is_symlink(),
+        f"{label} is not a regular non-symlink file: {path}",
+    )
+    digest = matrix.require_sha256(raw.get("sha256"), f"{label}.sha256")
+    size = raw.get("size_bytes")
+    require(
+        type(size) is int and size > 0,
+        f"{label}.size_bytes must be a positive integer",
+    )
+    require(path.stat().st_size == size, f"{label} size mismatch")
+    require(matrix.file_sha256(path) == digest, f"{label} SHA256 mismatch")
+    return copy.deepcopy(raw), path
+
+
+def validate_staged_asset_input(
+    staged_assets_manifest: Path,
+    *,
+    backend: str,
+    expected_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    require(backend in {"cuda", "metal"}, "staged matrix backend must be CUDA or Metal")
+    manifest_path = staged_assets_manifest.expanduser().resolve()
+    require(
+        manifest_path.is_file() and not manifest_path.is_symlink(),
+        f"staged assets manifest is not a regular file: {manifest_path}",
+    )
+    document = matrix.require_object(
+        matrix.read_json(manifest_path),
+        "staged assets manifest",
+    )
+    require(document.get("schema_version") == 1, "staged assets schema_version mismatch")
+    require(
+        document.get("artifact_type") == "runtime_vnext_staged_assets_manifest",
+        "staged assets artifact_type mismatch",
+    )
+    require(document.get("status") == "pass", "staged assets status is not pass")
+    require(document.get("version") == "0.8.0", "staged assets version is not 0.8.0")
+    require(
+        document.get("publish_release") is False,
+        "staged assets must come from publish_release=false",
+    )
+    release_candidate = matrix.require_object(
+        document.get("release_candidate"),
+        "staged assets release_candidate",
+    )
+    require(
+        release_candidate.get("dirty") is False,
+        "staged assets release candidate is dirty",
+    )
+    require(
+        release_candidate.get("git_sha") == expected_source.get("source_git_sha"),
+        "staged assets release candidate source SHA mismatch",
+    )
+    require(
+        release_candidate.get("git_tree_sha")
+        == expected_source.get("source_tree_sha"),
+        "staged assets release candidate source tree mismatch",
+    )
+    assets = matrix.require_object(document.get("assets"), "staged assets map")
+    require(
+        set(assets) == {"cpu", "metal", "cuda"},
+        "staged assets must contain exactly cpu, metal, and cuda",
+    )
+    selected = matrix.require_object(
+        assets.get(backend),
+        f"staged assets {backend} row",
+    )
+    require(
+        selected.get("backend") == backend,
+        f"staged assets selected backend is not {backend}",
+    )
+    workflow_run_id = selected.get("workflow_run_id")
+    require(
+        type(workflow_run_id) is int and workflow_run_id > 0,
+        "staged asset workflow_run_id must be a positive integer",
+    )
+    artifact = matrix.require_object(selected.get("artifact"), "staged workflow artifact")
+    require(
+        set(artifact) == {"id", "name", "digest"}
+        and type(artifact.get("id")) is int
+        and artifact["id"] > 0
+        and isinstance(artifact.get("name"), str)
+        and bool(artifact["name"].strip())
+        and isinstance(artifact.get("digest"), str)
+        and artifact["digest"].startswith("sha256:")
+        and len(artifact["digest"]) == 71,
+        "staged workflow artifact identity is malformed",
+    )
+    matrix.require_sha256(
+        artifact["digest"].removeprefix("sha256:"),
+        "staged workflow artifact digest",
+    )
+    if backend == "cuda":
+        require(selected.get("target_sm") == "89", "staged CUDA target_sm is not 89")
+
+    manifest_root = manifest_path.parent
+    resolved_refs: dict[str, dict[str, Any]] = {}
+    resolved_paths: dict[str, Path] = {}
+    for name in (
+        "artifact_manifest",
+        "tarball",
+        "sha256_file",
+        "version_manifest",
+        "dependency_abi_manifest",
+    ):
+        resolved_refs[name], resolved_paths[name] = staged_file_ref(
+            manifest_root,
+            selected.get(name),
+            f"staged {backend} {name}",
+        )
+    tarball_ref = resolved_refs["tarball"]
+    sha_text = resolved_paths["sha256_file"].read_text(
+        encoding="utf-8", errors="strict"
+    )
+    sha_parts = sha_text.split()
+    require(
+        sha_parts and sha_parts[0] == tarball_ref["sha256"],
+        "staged tarball adjacent SHA256 file mismatch",
+    )
+
+    binary = matrix.require_object(selected.get("binary"), "staged asset binary")
+    require(
+        set(binary) == {"archive_path", "sha256", "size_bytes"},
+        "staged asset binary identity fields mismatch",
+    )
+    archive_path = safe_relative_path(
+        binary.get("archive_path"),
+        "staged asset binary archive_path",
+    )
+    require(archive_path.name == "ferrum", "staged asset binary basename is not ferrum")
+    binary_sha = matrix.require_sha256(
+        binary.get("sha256"),
+        "staged asset binary SHA256",
+    )
+    binary_size = binary.get("size_bytes")
+    require(
+        type(binary_size) is int and binary_size > 0,
+        "staged asset binary size must be positive",
+    )
+    try:
+        with tarfile.open(resolved_paths["tarball"], mode="r:*") as archive:
+            members = [
+                member
+                for member in archive.getmembers()
+                if member.name == archive_path.as_posix()
+            ]
+            require(
+                len(members) == 1,
+                "staged tarball must contain the exact binary archive_path once",
+            )
+            member = members[0]
+            require(
+                member.isfile() and not member.issym() and not member.islnk(),
+                "staged tarball binary is not a regular file",
+            )
+            require(member.size == binary_size, "staged tarball binary size mismatch")
+            stream = archive.extractfile(member)
+            require(stream is not None, "staged tarball binary cannot be read")
+            digest = hashlib.sha256()
+            observed_size = 0
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                observed_size += len(chunk)
+                digest.update(chunk)
+            require(observed_size == binary_size, "staged tarball binary read size mismatch")
+            require(digest.hexdigest() == binary_sha, "staged tarball binary SHA256 mismatch")
+    except (tarfile.TarError, EOFError) as error:
+        raise PreparationError(f"staged tarball cannot be read: {error}") from error
+    return {
+        "manifest_path": manifest_path,
+        "document": document,
+        "selected": copy.deepcopy(selected),
+        "resolved_refs": resolved_refs,
+        "resolved_paths": resolved_paths,
+        "archive_path": archive_path,
+        "binary_sha256": binary_sha,
+        "binary_size_bytes": binary_size,
+    }
+
+
+def bind_staged_asset(
+    root: Path,
+    *,
+    staged_assets_manifest: Path,
+    hardware_id: str,
+    spec: BackendSpec,
+) -> Path:
+    require(
+        hardware_id.strip() == hardware_id and hardware_id,
+        "hardware id must be non-empty and trimmed",
+    )
+    receipt_path = root / BUILD_RECEIPT_REL
+    candidate_binary = root / BUILD_BINARY_REL
+    copied_manifest = root / STAGED_MANIFEST_REL
+    require(not receipt_path.exists(), f"candidate build receipt already exists: {receipt_path}")
+    require(not candidate_binary.exists(), f"candidate binary already exists: {candidate_binary}")
+    require(not copied_manifest.exists(), f"staged assets manifest already exists: {copied_manifest}")
+    before = source_observation(spec)
+    validated = validate_staged_asset_input(
+        staged_assets_manifest,
+        backend=spec.backend,
+        expected_source=before,
+    )
+    copied_manifest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(validated["manifest_path"], copied_manifest)
+    require(
+        matrix.file_sha256(copied_manifest)
+        == matrix.file_sha256(validated["manifest_path"]),
+        "copied staged assets manifest differs from its source",
+    )
+    metadata_refs: dict[str, dict[str, str]] = {}
+    for name in (
+        "artifact_manifest",
+        "sha256_file",
+        "version_manifest",
+        "dependency_abi_manifest",
+    ):
+        source_path = validated["resolved_paths"][name]
+        suffix = "".join(source_path.suffixes)
+        destination = root / STAGED_METADATA_DIR / f"{name}{suffix}"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, destination)
+        require(
+            matrix.file_sha256(destination) == validated["resolved_refs"][name]["sha256"]
+            and destination.stat().st_size
+            == validated["resolved_refs"][name]["size_bytes"],
+            f"copied staged metadata {name} differs from its source",
+        )
+        metadata_refs[name] = matrix.existing_artifact_ref(
+            root,
+            destination,
+            "staged-metadata",
+        )
+    with tarfile.open(validated["resolved_paths"]["tarball"], mode="r:*") as archive:
+        member = next(
+            member
+            for member in archive.getmembers()
+            if member.name == validated["archive_path"].as_posix()
+        )
+        stream = archive.extractfile(member)
+        require(stream is not None, "staged binary cannot be extracted")
+        candidate_binary.parent.mkdir(parents=True, exist_ok=True)
+        with candidate_binary.open("xb") as destination:
+            shutil.copyfileobj(stream, destination, length=1024 * 1024)
+        candidate_binary.chmod(candidate_binary.stat().st_mode | 0o111)
+    require(
+        candidate_binary.stat().st_size == validated["binary_size_bytes"]
+        and matrix.file_sha256(candidate_binary) == validated["binary_sha256"],
+        "extracted staged candidate binary identity mismatch",
+    )
+    after = source_observation(spec)
+    require(after == before, "candidate source changed during staged asset binding")
+    binary_ref = matrix.existing_artifact_ref(root, candidate_binary, "binary")
+    receipt = {
+        "schema_version": matrix.SCHEMA_VERSION,
+        "artifact_type": matrix.CANDIDATE_BUILD_RECEIPT_TYPE,
+        "status": "pass",
+        "execution_contract": matrix.G08_EXECUTION_CONTRACT,
+        **before,
+        "hardware_id": hardware_id,
+        "backend": spec.backend,
+        "artifact_root": str(root),
+        "repository_root": str(REPO_ROOT),
+        "build_mode": matrix.STAGED_RELEASE_ASSET_BUILD_MODE,
+        "bound_at": matrix.iso_now(),
+        "source_observations": {"before": before, "after": after},
+        "release_version": "0.8.0",
+        "staged_assets_manifest": matrix.existing_artifact_ref(
+            root,
+            copied_manifest,
+            "raw-json",
+        ),
+        "selected_staged_asset": validated["selected"],
+        "staged_metadata_artifacts": metadata_refs,
+        "binary_artifact": binary_ref,
+        "binary_sha256": binary_ref["sha256"],
+    }
+    write_json(receipt_path, receipt)
+    matrix.validate_candidate_build_receipt(
+        root,
+        matrix.existing_artifact_ref(root, receipt_path, "raw-json"),
+        expected={
+            "source_git_sha": before["source_git_sha"],
+            "source_tree_sha": before["source_tree_sha"],
+            "hardware_id": hardware_id,
+            "backend": spec.backend,
+            "binary_sha256": binary_ref["sha256"],
+            "binary_path": candidate_binary,
+        },
+        allow_internal_fixture=False,
+    )
+    print(
+        "FERRUM RUNTIME VNEXT STAGED BINARY BOUND "
+        f"{spec.backend.upper()}: {receipt_path}"
+    )
+    return receipt_path
+
+
 def materialize_exact(path: Path, payload: bytes, label: str) -> None:
     if path.exists():
         require(path.is_file() and path.read_bytes() == payload, f"existing {label} differs from the canonical bytes")
@@ -663,6 +992,228 @@ def normalized_model_arg(
         )
         return normalized / relative_path
     return normalized
+
+
+def self_test_staged_asset_binding(root: Path, spec: BackendSpec) -> None:
+    staged_root = root / "staged-assets"
+    staged_root.mkdir(parents=True)
+    binary_bytes = b"staged ferrum v0.8.0 fixture bytes\n"
+    tarball = staged_root / f"ferrum-{spec.backend}.tar.gz"
+    archive_path = "package/ferrum"
+    with tarfile.open(tarball, mode="w:gz") as archive:
+        member = tarfile.TarInfo(archive_path)
+        member.mode = 0o755
+        member.size = len(binary_bytes)
+        archive.addfile(member, io.BytesIO(binary_bytes))
+
+    metadata_paths = {
+        "artifact_manifest": staged_root / "artifact-manifest.json",
+        "version_manifest": staged_root / "version.json",
+        "dependency_abi_manifest": staged_root / "dependency-abi.json",
+    }
+    write_json(metadata_paths["artifact_manifest"], {"status": "pass"})
+    write_json(metadata_paths["version_manifest"], {"version": "0.8.0"})
+    write_json(metadata_paths["dependency_abi_manifest"], {"backend": spec.backend})
+    sha_path = staged_root / f"{tarball.name}.sha256"
+    sha_path.write_text(
+        f"{matrix.file_sha256(tarball)}  {tarball.name}\n",
+        encoding="utf-8",
+    )
+
+    def plain_ref(path: Path) -> dict[str, Any]:
+        return {
+            "path": path.relative_to(staged_root).as_posix(),
+            "sha256": matrix.file_sha256(path),
+            "size_bytes": path.stat().st_size,
+        }
+
+    source = {
+        "source_git_sha": matrix.FROZEN_LEGACY_SHA,
+        "source_tree_sha": matrix.frozen_tree_sha(),
+        "dirty_status": {"is_dirty": False, "status_short": []},
+    }
+    artifact_digest = hashlib.sha256(b"workflow artifact fixture").hexdigest()
+    selected: dict[str, Any] = {
+        "backend": spec.backend,
+        "workflow_run_id": 42,
+        "artifact": {
+            "id": 43,
+            "name": f"ferrum-{spec.backend}-v0.8.0",
+            "digest": f"sha256:{artifact_digest}",
+        },
+        "artifact_manifest": plain_ref(metadata_paths["artifact_manifest"]),
+        "tarball": plain_ref(tarball),
+        "sha256_file": plain_ref(sha_path),
+        "version_manifest": plain_ref(metadata_paths["version_manifest"]),
+        "dependency_abi_manifest": plain_ref(
+            metadata_paths["dependency_abi_manifest"]
+        ),
+        "binary": {
+            "archive_path": archive_path,
+            "sha256": hashlib.sha256(binary_bytes).hexdigest(),
+            "size_bytes": len(binary_bytes),
+        },
+    }
+    if spec.backend == "cuda":
+        selected["target_sm"] = "89"
+    document = {
+        "schema_version": 1,
+        "artifact_type": "runtime_vnext_staged_assets_manifest",
+        "status": "pass",
+        "version": "0.8.0",
+        "publish_release": False,
+        "release_candidate": {
+            "git_sha": source["source_git_sha"],
+            "git_tree_sha": source["source_tree_sha"],
+            "dirty": False,
+        },
+        "assets": {
+            "cpu": {},
+            "metal": copy.deepcopy(selected) if spec.backend == "metal" else {},
+            "cuda": copy.deepcopy(selected) if spec.backend == "cuda" else {},
+        },
+    }
+    manifest_path = staged_root / "manifest.json"
+    write_json(manifest_path, document)
+    validated = validate_staged_asset_input(
+        manifest_path,
+        backend=spec.backend,
+        expected_source=source,
+    )
+    require(
+        validated["binary_sha256"] == hashlib.sha256(binary_bytes).hexdigest(),
+        "staged binary self-test identity drifted",
+    )
+
+    bound_root = root / f"staged-bound-{spec.backend}"
+    bound_binary = bound_root / BUILD_BINARY_REL
+    bound_binary.parent.mkdir(parents=True)
+    bound_binary.write_bytes(binary_bytes)
+    bound_binary.chmod(0o755)
+    bound_manifest = bound_root / STAGED_MANIFEST_REL
+    bound_manifest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(manifest_path, bound_manifest)
+    bound_metadata: dict[str, dict[str, str]] = {}
+    for name in (
+        "artifact_manifest",
+        "sha256_file",
+        "version_manifest",
+        "dependency_abi_manifest",
+    ):
+        destination = bound_root / STAGED_METADATA_DIR / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(validated["resolved_paths"][name], destination)
+        bound_metadata[name] = matrix.existing_artifact_ref(
+            bound_root,
+            destination,
+            "staged-metadata",
+        )
+    receipt_path = bound_root / BUILD_RECEIPT_REL
+    receipt = {
+        "schema_version": matrix.SCHEMA_VERSION,
+        "artifact_type": matrix.CANDIDATE_BUILD_RECEIPT_TYPE,
+        "status": "pass",
+        "execution_contract": matrix.G08_EXECUTION_CONTRACT,
+        **source,
+        "hardware_id": f"{spec.backend}-staged-fixture",
+        "backend": spec.backend,
+        "artifact_root": str(bound_root.resolve()),
+        "repository_root": str(REPO_ROOT),
+        "build_mode": matrix.STAGED_RELEASE_ASSET_BUILD_MODE,
+        "bound_at": matrix.iso_now(),
+        "source_observations": {"before": source, "after": source},
+        "release_version": "0.8.0",
+        "staged_assets_manifest": matrix.existing_artifact_ref(
+            bound_root,
+            bound_manifest,
+            "raw-json",
+        ),
+        "selected_staged_asset": validated["selected"],
+        "staged_metadata_artifacts": bound_metadata,
+        "binary_artifact": matrix.existing_artifact_ref(
+            bound_root,
+            bound_binary,
+            "binary",
+        ),
+        "binary_sha256": hashlib.sha256(binary_bytes).hexdigest(),
+    }
+    write_json(receipt_path, receipt)
+    matrix.validate_candidate_build_receipt(
+        bound_root,
+        matrix.existing_artifact_ref(
+            bound_root,
+            receipt_path,
+            "raw-json",
+        ),
+        expected={
+            "source_git_sha": source["source_git_sha"],
+            "source_tree_sha": source["source_tree_sha"],
+            "hardware_id": receipt["hardware_id"],
+            "backend": spec.backend,
+            "binary_sha256": receipt["binary_sha256"],
+            "binary_path": bound_binary.resolve(),
+        },
+        allow_internal_fixture=True,
+    )
+
+    def expect_reject(
+        name: str,
+        mutate: Any,
+        marker: str,
+    ) -> None:
+        hostile = copy.deepcopy(document)
+        mutate(hostile)
+        hostile_path = staged_root / f"hostile-{name}.json"
+        write_json(hostile_path, hostile)
+        try:
+            validate_staged_asset_input(
+                hostile_path,
+                backend=spec.backend,
+                expected_source=source,
+            )
+        except PreparationError as error:
+            require(
+                marker.lower() in str(error).lower(),
+                f"staged {name} fixture failed unexpectedly: {error}",
+            )
+            return
+        raise AssertionError(f"staged {name} fixture unexpectedly passed")
+
+    def asset_row(value: dict[str, Any]) -> dict[str, Any]:
+        return value["assets"][spec.backend]
+
+    expect_reject(
+        "wrong-tar",
+        lambda value: asset_row(value)["tarball"].update({"sha256": "0" * 64}),
+        "tarball SHA256 mismatch",
+    )
+    expect_reject(
+        "wrong-binary",
+        lambda value: asset_row(value)["binary"].update({"sha256": "0" * 64}),
+        "binary SHA256 mismatch",
+    )
+    expect_reject(
+        "wrong-source",
+        lambda value: value["release_candidate"].update({"git_sha": "0" * 40}),
+        "source SHA mismatch",
+    )
+    expect_reject(
+        "wrong-backend",
+        lambda value: asset_row(value).update(
+            {"backend": "metal" if spec.backend == "cuda" else "cuda"}
+        ),
+        "selected backend",
+    )
+    expect_reject(
+        "wrong-version",
+        lambda value: value.update({"version": "0.8.1"}),
+        "version is not 0.8.0",
+    )
+    expect_reject(
+        "dirty-source",
+        lambda value: value["release_candidate"].update({"dirty": True}),
+        "candidate is dirty",
+    )
 
 
 def prepare_manifest(
@@ -930,6 +1481,7 @@ def self_test(spec: BackendSpec) -> None:
             require("binary SHA mismatch" in str(error), f"hostile receipt failed for an unexpected reason: {error}")
         else:
             raise AssertionError("candidate build receipt accepted a changed binary SHA")
+        self_test_staged_asset_binding(root, spec)
     print(spec.prepare_selftest_pass_line)
 
 
@@ -964,6 +1516,13 @@ def parse_args(
     bind_parser.add_argument("--artifact-root", required=True)
     bind_parser.add_argument("--correctness-build-manifest", required=True)
     bind_parser.add_argument("--hardware-id", required=True)
+    staged_parser = subparsers.add_parser(
+        "bind-staged",
+        help="extract and bind the exact binary from a frozen staged release tarball",
+    )
+    staged_parser.add_argument("--artifact-root", required=True)
+    staged_parser.add_argument("--staged-assets-manifest", required=True)
+    staged_parser.add_argument("--hardware-id", required=True)
     manifest_parser = subparsers.add_parser("manifest", help="validate model snapshots and write the execution manifest")
     manifest_parser.add_argument("--artifact-root", required=True)
     manifest_parser.add_argument("--model-dir", required=True)
@@ -972,7 +1531,7 @@ def parse_args(
     args = parser.parse_args()
     require(
         args.self_test or args.command is not None,
-        "choose --self-test, build, bind-correctness, or manifest",
+        "choose --self-test, build, bind-correctness, bind-staged, or manifest",
     )
     require(not (args.self_test and args.command is not None), "--self-test cannot be combined with a command")
     return args
@@ -1005,6 +1564,13 @@ def main(
             bind_cuda_correctness_artifact(
                 artifact_root(args.artifact_root),
                 correctness_build_manifest=Path(args.correctness_build_manifest),
+                hardware_id=args.hardware_id,
+                spec=spec,
+            )
+        elif args.command == "bind-staged":
+            bind_staged_asset(
+                artifact_root(args.artifact_root),
+                staged_assets_manifest=Path(args.staged_assets_manifest),
                 hardware_id=args.hardware_id,
                 spec=spec,
             )

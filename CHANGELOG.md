@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes.
 
+## [0.8.0] - 2026-08-14
+
+### Added
+- Added the typed vNext execution path for the three release models across Apple Metal and NVIDIA CUDA, with shared `ferrum run` and OpenAI-compatible `ferrum serve` contracts.
+- Added tokenizer-aware constrained decoding for `json_object` and strict `json_schema`, request replay/profile modes, and release-gated resource admission evidence.
+- Added reproducible release-candidate correctness, performance, staged-asset, and publication gates.
+
+### Changed
+- Runtime memory, admission, scheduling, model resolution, and profiling policies are represented by typed CLI/config values and recorded in release artifacts.
+- The v0.8.0 release ships CPU, Apple Silicon Metal, and Linux CUDA sm89 tarballs. It does not ship or promise an officially maintained Docker distribution.
+
+### Fixed
+- Fixed streaming text-byte sampling around incomplete UTF-8 fragments, request-local forbidden-token handling, and multiple scheduler/resource cleanup regressions.
+- Fixed performance evidence portability while retaining binary, source, hardware, command, and raw-artifact identity checks.
+
+### Known scope
+- v0.8.0 is a language-only release. It does not claim vision or multimodal model support.
+- Non-release model migration and exhaustive legacy physical removal remain post-release hardening work; unsupported paths continue to fail closed.
+
 ## [0.7.6] - 2026-06-05
 
 ### Added

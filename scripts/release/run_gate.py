@@ -85,6 +85,16 @@ LANES = (
     "vnext-r0",
     "vnext-r1",
     "vnext-r2",
+    "vnext-g10a",
+    "vnext-g08-rc",
+    "vnext-g09-rc",
+    "runtime-vnext-metal-three-model",
+    "runtime-vnext-cuda-three-model",
+    "runtime-vnext-published-assets",
+    "runtime-vnext-prepromotion",
+    "vnext-g10b",
+    "vnext-g10",
+    "vnext-r3",
     "vnext-g08b-cuda",
     "vnext-g08b-metal",
     "vnext-g08c-cuda",
@@ -114,6 +124,28 @@ ENV_ALLOW_KEYS = (
 SECRET_KEY_FRAGMENTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+R3_GOAL_CHILD_PASS_PREFIXES = {
+    "vnext-g10a": "FERRUM RUNTIME VNEXT G10A RELEASE FREEZE PASS",
+    "vnext-g08-rc": (
+        "FERRUM RUNTIME VNEXT G08 RELEASE CANDIDATE CORRECTNESS PASS"
+    ),
+    "vnext-g09-rc": (
+        "FERRUM RUNTIME VNEXT G09 RELEASE CANDIDATE PERFORMANCE PASS"
+    ),
+    "runtime-vnext-metal-three-model": (
+        "FERRUM RUNTIME VNEXT THREE MODEL METAL SOURCE PASS"
+    ),
+    "runtime-vnext-cuda-three-model": (
+        "FERRUM RUNTIME VNEXT THREE MODEL CUDA SOURCE PASS"
+    ),
+    "runtime-vnext-published-assets": (
+        "FERRUM RUNTIME VNEXT PUBLISHED ASSETS PASS"
+    ),
+    "runtime-vnext-prepromotion": "FERRUM V0.8.0 PREPROMOTION PASS",
+    "vnext-g10b": "FERRUM RUNTIME VNEXT G10B PUBLISHED RELEASE PASS",
+    "vnext-g10": "FERRUM RUNTIME VNEXT G10 V0.8.0 RELEASE PASS",
+    "vnext-r3": "FERRUM RUNTIME VNEXT R3 V0.8.0 PUBLISHED PASS",
+}
 SAFETENSORS_SHARD_RE = re.compile(
     r"-(\d{5,6})-of-(\d{5,6})\.safetensors$"
 )
@@ -698,7 +730,7 @@ VNEXT_G01A_BOUNDED_TEST_PROFILES = {
 G0_UNIT_BOUNDED_COMMAND = [
     "env",
     "PYTHONDONTWRITEBYTECODE=1",
-    "CARGO_BUILD_JOBS=2",
+    "CARGO_BUILD_JOBS=8",
     "RUST_TEST_THREADS=1",
     "cargo",
     "test",
@@ -707,7 +739,7 @@ G0_UNIT_BOUNDED_COMMAND = [
 ]
 G0_UNIT_BOUNDED_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
-    "CARGO_BUILD_JOBS": "2",
+    "CARGO_BUILD_JOBS": "8",
     "RUST_TEST_THREADS": "1",
 }
 G0_UNIT_BENCH_CASES = (
@@ -783,6 +815,16 @@ FRESH_OUTPUT_PROVENANCE_KINDS = frozenset(
         "vnext-r0",
         "vnext-r1",
         "vnext-r2",
+        "vnext-g10a",
+        "vnext-g08-rc",
+        "vnext-g09-rc",
+        "runtime-vnext-metal-three-model",
+        "runtime-vnext-cuda-three-model",
+        "runtime-vnext-published-assets",
+        "runtime-vnext-prepromotion",
+        "vnext-g10b",
+        "vnext-g10",
+        "vnext-r3",
     }
 )
 
@@ -1683,6 +1725,102 @@ def build_lane_command(args: argparse.Namespace, out_dir: Path) -> LaneCommand:
             ),
             child_manifest_path=out_dir / "manifest.json",
             provenance_kind="vnext-r2",
+        )
+    if lane in R3_GOAL_CHILD_PASS_PREFIXES:
+        lane_requirements = {
+            "vnext-g10a": {
+                "--r0": args.r0,
+                "--r1": args.r1,
+                "--r2": args.r2,
+                "--workflow-policy": args.workflow_policy,
+                "--staged-assets": args.staged_assets,
+            },
+            "vnext-g08-rc": {
+                "--g10a": args.g10a,
+                "--m1-cuda": args.m1_cuda,
+                "--m1-metal": args.m1_metal,
+                "--m2-cuda": args.m2_cuda,
+                "--m2-metal": args.m2_metal,
+                "--m3-cuda": args.m3_cuda,
+                "--m3-metal": args.m3_metal,
+                "--llama-cuda": args.llama_cuda,
+                "--llama-metal": args.llama_metal,
+            },
+            "vnext-g09-rc": {
+                "--g10a": args.g10a,
+                "--g08-rc": args.g08_rc,
+                "--m1-cuda": args.m1_cuda,
+                "--m1-metal": args.m1_metal,
+                "--m2-cuda": args.m2_cuda,
+                "--m2-metal": args.m2_metal,
+                "--m3-cuda": args.m3_cuda,
+                "--m3-metal": args.m3_metal,
+                "--llama-cuda": args.llama_cuda,
+                "--llama-metal": args.llama_metal,
+            },
+            "runtime-vnext-metal-three-model": {
+                "--g10a": args.g10a,
+                "--g08-rc": args.g08_rc,
+                "--g09-rc": args.g09_rc,
+            },
+            "runtime-vnext-cuda-three-model": {
+                "--g10a": args.g10a,
+                "--g08-rc": args.g08_rc,
+                "--g09-rc": args.g09_rc,
+            },
+            "runtime-vnext-published-assets": {
+                "--g10a": args.g10a,
+                "--g08-rc": args.g08_rc,
+                "--g09-rc": args.g09_rc,
+            },
+            "runtime-vnext-prepromotion": {
+                "--published-assets": args.published_assets,
+                "--crates-io": args.crates_io,
+                "--homebrew-metal": args.homebrew_metal,
+                "--homebrew-cuda-fetch": args.homebrew_cuda_fetch,
+                "--workflow-policy": args.workflow_policy,
+            },
+            "vnext-g10b": {
+                "--g10a": args.g10a,
+                "--g08-rc": args.g08_rc,
+                "--g09-rc": args.g09_rc,
+                "--published-assets": args.published_assets,
+                "--prepromotion": args.prepromotion,
+                "--promotion-receipt": args.promotion_receipt,
+            },
+            "vnext-g10": {
+                "--g10a": args.g10a,
+                "--g08-rc": args.g08_rc,
+                "--g09-rc": args.g09_rc,
+                "--g10b": args.g10b,
+            },
+            "vnext-r3": {
+                "--g10": args.g10,
+                "--release-summary": args.release_summary,
+                "--completion": args.completion,
+            },
+        }[lane]
+        missing = [flag for flag, value in lane_requirements.items() if value is None]
+        if missing:
+            raise GateError(f"{lane} requires {', '.join(missing)}")
+        cmd = [
+            sys.executable,
+            "scripts/release/runtime_vnext_goal_gate.py",
+            lane,
+        ]
+        if lane == "vnext-g10a":
+            cmd.extend(["--source-root", str(REPO_ROOT)])
+        for flag, value in lane_requirements.items():
+            assert value is not None
+            cmd.extend([flag, str(value.expanduser().resolve())])
+        cmd.extend(["--out", str(out_dir)])
+        return LaneCommand(
+            cmd=cmd,
+            expected_child_pass_line=(
+                f"{R3_GOAL_CHILD_PASS_PREFIXES[lane]}: {out_dir}"
+            ),
+            child_manifest_path=out_dir / "manifest.json",
+            provenance_kind=lane,
         )
     if lane == "vnext-g08b-cuda":
         if args.g08b_artifact_root is None:
@@ -6834,6 +6972,35 @@ def verify_child_pass_line(
     ):
         raise GateError(f"delegated manifest source_git_sha mismatch: {lane_command.child_manifest_path}")
     child_manifest_digest = hashlib.sha256(child_manifest_bytes).hexdigest()
+    if lane_command.provenance_kind in R3_GOAL_CHILD_PASS_PREFIXES:
+        try:
+            import runtime_vnext_goal_gate as goal_gate
+
+            summary = goal_gate.verify_goal_manifest(
+                lane_command.child_manifest_path,
+                expected_lane=lane_command.provenance_kind,
+                verify_checkout=False,
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as error:
+            raise GateError(
+                f"{lane_command.provenance_kind} provenance failed: {error}"
+            ) from error
+        require_gate(
+            summary.get("kind") == lane_command.provenance_kind
+            and summary.get("child_manifest", {}).get("sha256")
+            == child_manifest_digest,
+            f"{lane_command.provenance_kind} child manifest binding mismatch",
+        )
+        # The authoritative goal validator intentionally returns live ``Path``
+        # objects and the parsed child document for in-process consumers.  The
+        # canonical outer manifest is a JSON artifact, so persist only the
+        # immutable JSON-safe provenance subset instead of leaking that runtime
+        # object graph into ``json.dumps``.
+        return {
+            "kind": summary["kind"],
+            "child_manifest": copy.deepcopy(summary["child_manifest"]),
+            "source": copy.deepcopy(summary["source"]),
+        }
     if lane_command.provenance_kind == "vnext-g00a":
         return validate_vnext_g00a_provenance(
             lane_command,
@@ -8445,42 +8612,293 @@ def make_selftest_release_summary_artifact(root: Path) -> None:
         "homebrew-cuda-fetch/gate.json",
     ]:
         write_selftest_json(root / rel, {"status": "pass"})
+    import validate_release_completion_manifest as completion_validator
+
+    completion_validator.make_selftest_manifest(
+        root / "_completion-fixture.json",
+        artifact_root=root,
+    )
+    return
+
+    for lane in (
+        "runtime-vnext-metal-three-model",
+        "runtime-vnext-cuda-three-model",
+        "runtime-vnext-published-assets",
+        "runtime-vnext-prepromotion",
+    ):
+        artifact = root / lane
+        write_selftest_json(
+            artifact / "gate.manifest.json",
+            {
+                "status": "pass",
+                "lane": lane,
+                "artifact_dir": str(artifact),
+                "pass_line": f"FERRUM GATE {lane} PASS: {artifact}",
+            },
+        )
+
+
+def selftest_r3_goal_outer_serialization(root: Path) -> None:
+    """Exercise the real final-lane child verifier and outer JSON writer."""
+
+    out = (root / "vnext-g10b-outer-smoke").resolve()
+    out.mkdir(parents=True)
+    dependency = out / "promotion-consumption.json"
+    write_selftest_json(dependency, {"status": "pass"})
+    dependency_digest = sha256(dependency)
+    require_selftest(dependency_digest is not None, dependency)
+    source = {
+        "git_sha": "1" * 40,
+        "git_tree_sha": "2" * 40,
+        "dirty": False,
+    }
+    expected_child_pass = (
+        f"{R3_GOAL_CHILD_PASS_PREFIXES['vnext-g10b']}: {out}"
+    )
+    child_path = out / "manifest.json"
+    write_selftest_json(
+        child_path,
+        {
+            "schema_version": 1,
+            "artifact_type": "runtime_vnext_g10b_published_release_manifest",
+            "lane": "vnext-g10b",
+            "status": "pass",
+            "canonical": True,
+            "version": "0.8.0",
+            "release_candidate": source,
+            "artifact_dir": str(out),
+            "inputs": {
+                "promotion_receipt": {
+                    "path": str(dependency),
+                    "sha256": dependency_digest,
+                    "size_bytes": dependency.stat().st_size,
+                }
+            },
+            "acceptance": {"final_release": True},
+            "created_at": "2026-08-14T00:00:00+00:00",
+            "pass_line": expected_child_pass,
+            "additional_pass_lines": [],
+            "release": {
+                "id": "12345",
+                "tag_name": "v0.8.0",
+                "tag_sha": source["git_sha"],
+                "draft": False,
+                "prerelease": False,
+                "asset_set_sha256": "3" * 64,
+            },
+            "promotion": {"state": "complete"},
+        },
+    )
+    lane_command = LaneCommand(
+        cmd=[sys.executable, "scripts/release/runtime_vnext_goal_gate.py", "vnext-g10b"],
+        expected_child_pass_line=expected_child_pass,
+        child_manifest_path=child_path,
+        provenance_kind="vnext-g10b",
+    )
+    child_artifacts = verify_child_pass_line(
+        lane_command,
+        expected_child_pass + "\n",
+        verify_checkout=False,
+    )
+    require_selftest(child_artifacts is not None, child_artifacts)
+    outer = manifest(
+        args=argparse.Namespace(lane="vnext-g10b", model=None),
+        out_dir=out,
+        lane_command=lane_command,
+        status="pass",
+        started_at="2026-08-14T00:00:00+00:00",
+        finished_at="2026-08-14T00:00:01+00:00",
+        duration_sec=1.0,
+        child_returncode=0,
+        child_pass_line=expected_child_pass,
+        child_artifacts=child_artifacts,
+        error=None,
+    )
+    outer_path = out / "gate.manifest.json"
+    write_json(outer_path, outer)
+    persisted = json.loads(outer_path.read_text(encoding="utf-8"))
+    require_selftest(
+        persisted["child_artifacts"]
+        == {
+            "kind": "vnext-g10b",
+            "child_manifest": {
+                "path": str(child_path),
+                "sha256": sha256(child_path),
+                "size_bytes": child_path.stat().st_size,
+            },
+            "source": source,
+        },
+        persisted["child_artifacts"],
+    )
 
 
 def make_selftest_completion_manifest(path: Path) -> None:
+    import validate_release_completion_manifest as completion_validator
+
+    completion_validator.make_selftest_manifest(path)
+    return
+
     root = path.parent
-    artifacts = {}
-    for name in [
-        "metal_source_gate_artifact",
-        "cuda_full_source_gate_artifact",
-        "cuda_dense_source_gate_artifact",
-        "metal_tarball_gate_artifact",
-        "cuda_tarball_gate_artifact",
-        "homebrew_metal_gate_artifact",
-        "homebrew_cuda_fetch_gate_artifact",
-    ]:
-        artifact = root / "artifacts" / name
-        artifact.mkdir(parents=True)
-        artifacts[name] = str(artifact)
+    source_sha = "1" * 40
+    tree_sha = "2" * 40
+    release_id = 12345
+    release_url = "https://example.invalid/releases/v0.8.0"
+    gate_contracts = {
+        "unit_source_gate_artifact": ("unit", "FERRUM GATE unit PASS: "),
+        "metal_source_gate_artifact": ("metal", "FERRUM GATE metal PASS: "),
+        "cuda_full_source_gate_artifact": (
+            "cuda-full",
+            "FERRUM GATE cuda-full PASS: ",
+        ),
+        "cuda_dense_source_gate_artifact": (
+            "cuda-llama-dense",
+            "FERRUM GATE cuda-llama-dense PASS: ",
+        ),
+        "metal_tarball_gate_artifact": (None, "METAL TARBALL GATE PASS: "),
+        "cuda_tarball_gate_artifact": (None, "CUDA TARBALL GATE PASS: "),
+        "homebrew_metal_gate_artifact": (None, "HOMEBREW METAL GATE PASS: "),
+        "homebrew_cuda_fetch_gate_artifact": (
+            None,
+            "HOMEBREW CUDA FETCH GATE PASS: ",
+        ),
+        "workflow_policy_gate_artifact": (
+            None,
+            "FERRUM RELEASE WORKFLOW POLICY PASS: ",
+        ),
+        "g10a_gate_artifact": ("vnext-g10a", "FERRUM GATE vnext-g10a PASS: "),
+        "g08_rc_gate_artifact": (
+            "vnext-g08-rc",
+            "FERRUM GATE vnext-g08-rc PASS: ",
+        ),
+        "g09_rc_gate_artifact": (
+            "vnext-g09-rc",
+            "FERRUM GATE vnext-g09-rc PASS: ",
+        ),
+        "metal_three_model_gate_artifact": (
+            "runtime-vnext-metal-three-model",
+            "FERRUM GATE runtime-vnext-metal-three-model PASS: ",
+        ),
+        "cuda_three_model_gate_artifact": (
+            "runtime-vnext-cuda-three-model",
+            "FERRUM GATE runtime-vnext-cuda-three-model PASS: ",
+        ),
+        "published_assets_gate_artifact": (
+            "runtime-vnext-published-assets",
+            "FERRUM GATE runtime-vnext-published-assets PASS: ",
+        ),
+        "crates_io_gate_artifact": (None, "FERRUM CRATES IO V0.8.0 PASS: "),
+        "prepromotion_gate_artifact": (
+            "runtime-vnext-prepromotion",
+            "FERRUM GATE runtime-vnext-prepromotion PASS: ",
+        ),
+        "g10b_gate_artifact": ("vnext-g10b", "FERRUM GATE vnext-g10b PASS: "),
+    }
+    artifacts: dict[str, str] = {}
+    prepromotion_manifest_id = "3" * 64
+    for field, (lane, prefix) in gate_contracts.items():
+        artifact = root / "artifacts" / field / "gate.manifest.json"
+        document = {
+            "status": "pass",
+            "artifact_dir": str(artifact.parent),
+            "pass_line": prefix + str(artifact.parent),
+        }
+        if lane is not None:
+            document["lane"] = lane
+        if field == "prepromotion_gate_artifact":
+            document["manifest_id"] = prepromotion_manifest_id
+        write_selftest_json(artifact, document)
+        artifacts[field] = str(artifact)
+
+    staged_assets = root / "artifacts/staged-assets/manifest.json"
+    write_selftest_json(staged_assets, {"schema_version": 1, "status": "pass"})
+    release_summary = root / "artifacts/release-summary/g0_release_summary.json"
+    write_selftest_json(release_summary, {"schema_version": 1, "status": "pass"})
+    primary_assets = [
+        {
+            "id": 101 + index,
+            "name": name,
+            "size_bytes": 1024 + index,
+            "sha256": str(index + 4) * 64,
+            "staged_sha256": str(index + 4) * 64,
+            "binary_sha256": str(index + 7) * 64,
+        }
+        for index, name in enumerate(
+            (
+                "ferrum-linux-x86_64.tar.gz",
+                "ferrum-linux-x86_64-cuda-sm89.tar.gz",
+                "ferrum-macos-aarch64.tar.gz",
+            )
+        )
+    ]
+    promotion_receipt = root / "artifacts/promotion/promotion-consumption.json"
+    write_selftest_json(
+        promotion_receipt,
+        {
+            "schema_version": 1,
+            "state": "consumed",
+            "release_id": str(release_id),
+            "tag": "v0.8.0",
+            "release_candidate_sha": source_sha,
+            "prepromotion_manifest_id": prepromotion_manifest_id,
+            "consumed_at": "2026-08-14T00:00:00Z",
+            "consumed_by": "release-promote.yml",
+            "promotion": {
+                "state": "complete",
+                "promoted_at": "2026-08-14T00:01:00Z",
+            },
+            # Promotion binds every GitHub companion asset; the completion
+            # manifest lists only the three primary tarballs.
+            "asset_ids": [asset["id"] for asset in primary_assets]
+            + list(range(201, 216)),
+        },
+    )
     write_selftest_json(
         path,
         {
-            "git_sha": "selftest",
+            "version": "0.8.0",
+            "git_sha": source_sha,
+            "git_tree_sha": tree_sha,
             "dirty_status": {"is_dirty": False, "status_short": []},
-            "tag": "v0.0.0-selftest",
-            "github_release_url": "https://example.invalid/selftest",
-            "release_assets": [
-                {
-                    "name": "ferrum-selftest.tar.gz",
-                    "sha256": "0" * 64,
-                }
-            ],
+            "tag": "v0.8.0",
+            "release_id": release_id,
+            "github_release_url": release_url,
+            "github_release": {
+                "id": release_id,
+                "tag": "v0.8.0",
+                "target_git_sha": source_sha,
+                "draft": False,
+                "prerelease": False,
+                "published_at": "2026-08-14T00:01:00Z",
+                "url": release_url,
+            },
+            "release_assets": primary_assets,
+            "staged_assets_manifest": str(staged_assets),
+            "release_summary_artifact": str(release_summary),
+            "promotion_receipt": str(promotion_receipt),
             "cargo_workspace_crates": [
                 {
-                    "name": "ferrum-cli",
-                    "version": "0.0.0-selftest",
+                    "name": name,
+                    "version": "0.8.0",
                     "crates_io_visible": True,
                 }
+                for name in (
+                    "ferrum-bench-core",
+                    "ferrum-cli",
+                    "ferrum-engine",
+                    "ferrum-interfaces",
+                    "ferrum-kernels",
+                    "ferrum-kv",
+                    "ferrum-models",
+                    "ferrum-native-ops",
+                    "ferrum-native-ops-builder",
+                    "ferrum-quantization",
+                    "ferrum-sampler",
+                    "ferrum-scheduler",
+                    "ferrum-server",
+                    "ferrum-testkit",
+                    "ferrum-tokenizer",
+                    "ferrum-types",
+                )
             ],
             **artifacts,
         },
@@ -8500,14 +8918,14 @@ def self_test() -> int:
         encoding="utf-8"
     )
     shell_command = (
-        "    -- env PYTHONDONTWRITEBYTECODE=1 CARGO_BUILD_JOBS=2 "
+        "    -- env PYTHONDONTWRITEBYTECODE=1 CARGO_BUILD_JOBS=8 "
         "RUST_TEST_THREADS=1 \\\n"
         "      cargo test --workspace --all-targets"
     )
     shell_expected_command = """expected_command = [
     "env",
     "PYTHONDONTWRITEBYTECODE=1",
-    "CARGO_BUILD_JOBS=2",
+    "CARGO_BUILD_JOBS=8",
     "RUST_TEST_THREADS=1",
     "cargo",
     "test",
@@ -11461,6 +11879,8 @@ def self_test() -> int:
             except GateError as exc:
                 require_selftest(marker in str(exc), str(exc))
 
+        selftest_r3_goal_outer_serialization(root)
+
         release_root = root / "release-root"
         make_selftest_release_summary_artifact(release_root)
         summary_out = root / "release-summary"
@@ -11599,6 +12019,22 @@ def main() -> int:
     parser.add_argument("--g08a-metal-performance", type=Path)
     parser.add_argument("--r0", type=Path)
     parser.add_argument("--r1", type=Path)
+    parser.add_argument("--r2", type=Path)
+    parser.add_argument("--workflow-policy", type=Path)
+    parser.add_argument("--staged-assets", type=Path)
+    parser.add_argument("--g10a", type=Path)
+    parser.add_argument("--g08-rc", type=Path)
+    parser.add_argument("--g09-rc", type=Path)
+    parser.add_argument("--published-assets", type=Path)
+    parser.add_argument("--crates-io", type=Path)
+    parser.add_argument("--homebrew-metal", type=Path)
+    parser.add_argument("--homebrew-cuda-fetch", type=Path)
+    parser.add_argument("--prepromotion", type=Path)
+    parser.add_argument("--promotion-receipt", type=Path)
+    parser.add_argument("--g10b", type=Path)
+    parser.add_argument("--g10", type=Path)
+    parser.add_argument("--release-summary", type=Path)
+    parser.add_argument("--completion", type=Path)
     parser.add_argument("--prior-r1", type=Path)
     parser.add_argument("--impact-qualification", type=Path)
     parser.add_argument("--m1-cuda", type=Path)
@@ -11631,7 +12067,12 @@ def main() -> int:
     if args.out is None:
         parser.error("--out is required")
 
-    out_dir = args.out.resolve() if args.lane.startswith("vnext-") else args.out
+    out_dir = (
+        args.out.resolve()
+        if args.lane.startswith("vnext-")
+        or args.lane.startswith("runtime-vnext-")
+        else args.out
+    )
     if args.lane in {
         "vnext-g00",
         "vnext-g00f",
@@ -11657,6 +12098,16 @@ def main() -> int:
         "vnext-r0",
         "vnext-r1",
         "vnext-r2",
+        "vnext-g10a",
+        "vnext-g08-rc",
+        "vnext-g09-rc",
+        "runtime-vnext-metal-three-model",
+        "runtime-vnext-cuda-three-model",
+        "runtime-vnext-published-assets",
+        "runtime-vnext-prepromotion",
+        "vnext-g10b",
+        "vnext-g10",
+        "vnext-r3",
     }:
         try:
             require_external_vnext_g00_output(out_dir)
@@ -11726,10 +12177,35 @@ def main() -> int:
         child_artifacts=child_artifacts,
         error=error,
     )
+    if (
+        status == "pass"
+        and args.lane == "runtime-vnext-prepromotion"
+        and lane_command is not None
+        and lane_command.child_manifest_path is not None
+    ):
+        child = json.loads(lane_command.child_manifest_path.read_text(encoding="utf-8"))
+        for key in (
+            "manifest_id",
+            "release_candidate_sha",
+            "prepromotion_pass_line",
+            "release",
+            "consumption",
+            "dependencies",
+        ):
+            doc[key] = copy.deepcopy(child[key])
     write_json(out_dir / "gate.manifest.json", doc)
     if status == "pass":
-        if args.lane.startswith("vnext-") and child_pass_line is not None:
+        if (
+            args.lane.startswith("vnext-")
+            or args.lane.startswith("runtime-vnext-")
+        ) and child_pass_line is not None:
             print(child_pass_line)
+            if lane_command is not None and lane_command.child_manifest_path is not None:
+                child = json.loads(
+                    lane_command.child_manifest_path.read_text(encoding="utf-8")
+                )
+                for extra in child.get("additional_pass_lines", []):
+                    print(extra)
         print(doc["pass_line"])
         return 0
     print(f"FERRUM GATE {args.lane} FAIL: {out_dir}: {error}", file=sys.stderr)
