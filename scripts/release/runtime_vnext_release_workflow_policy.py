@@ -300,6 +300,19 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
     )
     env = require_mapping(document.get("env"), "release-cuda.yml.env")
     require(str(env.get("CUDA_COMPUTE_CAP")) == "89", "release-cuda.yml must target CUDA sm89")
+    jobs = workflow_jobs(document, "release-cuda.yml")
+    cuda_job = require_mapping(
+        jobs.get("linux-x86_64-cuda-sm89"),
+        "release-cuda.yml.jobs.linux-x86_64-cuda-sm89",
+    )
+    container = require_mapping(
+        cuda_job.get("container"),
+        "release-cuda.yml.jobs.linux-x86_64-cuda-sm89.container",
+    )
+    require(
+        container.get("image") == "nvidia/cuda:12.4.0-devel-ubuntu22.04",
+        "release-cuda.yml CUDA build image must match the pinned native operator set toolchain",
+    )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_URL")
         == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/runtime-vnext-diagnostics-v1/native-operator-set-5503d913.tar.zst",
@@ -783,6 +796,18 @@ def run_selftest(texts: dict[str, str]) -> None:
     _expect_policy_failure(
         "release-candidate-tag-mismatch",
         lambda: validate_workflow_set(tag_mismatch),
+    )
+
+    cuda_toolkit_mismatch = dict(texts)
+    cuda_toolkit_mismatch["release-cuda.yml"] = _replace_once(
+        cuda_toolkit_mismatch["release-cuda.yml"],
+        "      image: nvidia/cuda:12.4.0-devel-ubuntu22.04",
+        "      image: nvidia/cuda:12.6.0-devel-ubuntu22.04",
+        "cuda-toolkit-native-operator-mismatch",
+    )
+    _expect_policy_failure(
+        "cuda-toolkit-native-operator-mismatch",
+        lambda: validate_workflow_set(cuda_toolkit_mismatch),
     )
 
     diagnostics_tag_mismatch = dict(texts)
