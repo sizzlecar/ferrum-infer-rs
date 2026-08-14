@@ -354,7 +354,13 @@ def validate_receipt(
     for key in ("stdout", "stderr"):
         raw = receipt.get(key)
         require(isinstance(raw, dict), f"{receipt_path}: missing {key} identity")
-        artifact = Path(str(raw.get("path", "")))
+        recorded = Path(str(raw.get("path", "")))
+        artifact = receipt_path.parent / f"{key}.log"
+        require(
+            recorded.is_absolute()
+            and recorded.parts[-3:] == artifact.parts[-3:],
+            f"{receipt_path}: {key} log path is not a portable action-local path",
+        )
         require(artifact.is_file(), f"{receipt_path}: missing {key} log {artifact}")
         require(
             raw.get("size_bytes") == artifact.stat().st_size
@@ -2489,6 +2495,58 @@ def run_selftest() -> int:
             lexical_model.name == logical_model.name and lexical_model.is_symlink(),
             "profile model path dereferenced the logical GGUF filename",
         )
+        action = root / "portable" / "raw" / "off-1"
+        action.mkdir(parents=True)
+        stdout = action / "stdout.log"
+        stderr = action / "stderr.log"
+        stdout.write_text("portable stdout\n", encoding="utf-8")
+        stderr.write_text("portable stderr\n", encoding="utf-8")
+        command = ["/usr/bin/env", "NO_COLOR=1", "/bin/true"]
+        receipt_path = action / "bounded.receipt.json"
+        receipt = {
+            "schema": "ferrum.bounded-command-receipt.v1",
+            "status": "pass",
+            "rc": 0,
+            "command": command,
+            "limits": {
+                "wall_timeout_seconds": 600.0,
+                "max_processes": MAX_PROCESSES,
+                "max_group_threads": MAX_GROUP_THREADS,
+                "max_per_process_threads": MAX_PER_PROCESS_THREADS,
+            },
+            "cleanup": {"process_group_gone": True},
+            "stdout": {
+                "path": "/workspace/original/raw/off-1/stdout.log",
+                "size_bytes": stdout.stat().st_size,
+                "sha256": sha256_file(stdout),
+            },
+            "stderr": {
+                "path": "/workspace/original/raw/off-1/stderr.log",
+                "size_bytes": stderr.stat().st_size,
+                "sha256": sha256_file(stderr),
+            },
+        }
+        atomic_write_json(receipt_path, receipt)
+        validate_receipt(
+            receipt_path,
+            expected_command=command,
+            expected_timeout=600.0,
+        )
+        invalid_receipt = json.loads(json.dumps(receipt))
+        invalid_receipt["stdout"]["path"] = "/workspace/original/raw/other/stdout.log"
+        atomic_write_json(receipt_path, invalid_receipt)
+        try:
+            validate_receipt(
+                receipt_path,
+                expected_command=command,
+                expected_timeout=600.0,
+            )
+            raise CollectorError("misbound relocated receipt log unexpectedly passed")
+        except CollectorError as error:
+            require(
+                "is not a portable action-local path" in str(error),
+                "misbound relocated receipt log failed for the wrong reason",
+            )
     print(SELFTEST_PASS_LINE)
     return 0
 
