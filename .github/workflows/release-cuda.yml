@@ -36,6 +36,8 @@ env:
   CUDA_HOME: /usr/local/cuda
   CUDA_ROOT: /usr/local/cuda
   CUDA_COMPUTE_CAP: 89
+  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/runtime-vnext-diagnostics-v1/native-operator-set-5503d913.tar.zst
+  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d229c130cbc6bbb3cac86137c29d2e458e8812420d4d57a0d18505c88ca5461e
 
 jobs:
   linux-x86_64-cuda-sm89:
@@ -66,7 +68,7 @@ jobs:
       - name: Install system dependencies and Rust
         run: |
           apt-get update
-          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file python3 libnccl2 libnccl-dev
+          apt-get install -y --allow-change-held-packages ca-certificates curl build-essential pkg-config libssl-dev git file python3 zstd libnccl2 libnccl-dev
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain 1.91.0
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -90,6 +92,36 @@ jobs:
       - name: Verify native operator source boundary
         run: python3 scripts/release/native_operator_artifact_gate.py --self-test
 
+      - name: Materialize pinned CUDA native operator set
+        run: |
+          archive="$RUNNER_TEMP/native-operator-set-5503d913.tar.zst"
+          root="$RUNNER_TEMP/ferrum-native-operator-set"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
+          printf '%s  %s\n' "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" "$archive" \
+            | sha256sum --check --strict
+          mkdir -p "$root"
+          zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
+          lock="$root/inputs/native-operator-set.lock.json"
+          PYTHONPATH=scripts/release python3 - "$lock" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          from runtime_vnext_native_operator_set import (
+              public_identity,
+              validate_native_operator_set,
+          )
+          from runtime_vnext_plan_reference import REQUIRED_CUDA_NATIVE_OPERATORS
+
+          lock = Path(sys.argv[1])
+          identity = public_identity(
+              validate_native_operator_set(lock, REQUIRED_CUDA_NATIVE_OPERATORS)
+          )
+          print(json.dumps(identity, sort_keys=True))
+          PY
+          echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
+
       - name: Verify workspace release version
         id: metadata
         run: |
@@ -111,6 +143,7 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
           export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+          test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --release --locked -p ferrum-cli --bin ferrum \
             --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 

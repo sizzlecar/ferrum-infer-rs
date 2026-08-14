@@ -300,11 +300,26 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
     )
     env = require_mapping(document.get("env"), "release-cuda.yml.env")
     require(str(env.get("CUDA_COMPUTE_CAP")) == "89", "release-cuda.yml must target CUDA sm89")
+    require(
+        env.get("NATIVE_OPERATOR_SET_ARCHIVE_URL")
+        == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/runtime-vnext-diagnostics-v1/native-operator-set-5503d913.tar.zst",
+        "release-cuda.yml native operator set URL is not frozen",
+    )
+    require(
+        env.get("NATIVE_OPERATOR_SET_ARCHIVE_SHA256")
+        == "d229c130cbc6bbb3cac86137c29d2e458e8812420d4d57a0d18505c88ca5461e",
+        "release-cuda.yml native operator set SHA256 is not frozen",
+    )
     scripts = "\n".join(
         combined_run_scripts(job_steps(job, f"release-cuda.yml.jobs.{name}"))
         for name, job in workflow_jobs(document, "release-cuda.yml").items()
     )
     require("--features cuda,vllm-moe-marlin,vllm-paged-attn-v2" in scripts, "release-cuda.yml feature set is incomplete")
+    require(
+        "validate_native_operator_set" in scripts
+        and "FERRUM_NATIVE_OPERATOR_SET_LOCK" in scripts,
+        "release-cuda.yml does not validate and bind the pinned native operator set",
+    )
     require("python|torch|vllm" in scripts, "release-cuda.yml lacks forbidden runtime-linkage scan")
 
 
