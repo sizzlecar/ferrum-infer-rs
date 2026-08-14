@@ -86,9 +86,9 @@ PY
     --stderr-log "$unit_stderr" \
     --cwd "$PWD" \
     --wall-timeout-seconds 1800 \
-    --max-processes 16 \
-    --max-group-threads 96 \
-    --max-per-process-threads 48 \
+    --max-processes 128 \
+    --max-group-threads 1024 \
+    --max-per-process-threads 256 \
     --sample-interval-seconds 0.05 \
     --max-sampling-errors 3 \
     --term-grace-seconds 1 \
@@ -194,9 +194,9 @@ expected_command = [
 ]
 expected_limits = {
     "wall_timeout_seconds": 1800.0,
-    "max_processes": 16,
-    "max_group_threads": 96,
-    "max_per_process_threads": 48,
+    "max_processes": 128,
+    "max_group_threads": 1024,
+    "max_per_process_threads": 256,
     "sample_interval_seconds": 0.05,
     "max_sampling_errors": 3,
     "term_grace_seconds": 1.0,
