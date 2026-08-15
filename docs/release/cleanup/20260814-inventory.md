@@ -12106,3 +12106,92 @@ inventory still consumed by the S0A validator,
   `continue-on-error` commands for the removed `ferrum-attention` package.
 - Remove the duplicate `/target` ignore entry and stale commented Candle 0.6
   placeholder.
+
+## Script cleanup wave 2 applied 2026-08-15
+
+The second pass traces current CI, Cargo, `run_gate.py`, workflows, root user
+documentation, and release validators transitively. Historical goal and bench
+documents are not treated as operational callers; removed tools remain
+recoverable from the `v0.8.0` tag and Git history.
+
+### Superseded benchmark, pod, graph, and finalization scripts
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `scripts/aggregate_m3_80pct.py` | obsolete report aggregator | 0 | Superseded by typed benchmark reports and canonical release aggregators. |
+| `scripts/aggregate_sweep.py` | obsolete report aggregator | 0 | Its only caller was the removed fixed-pod sweep workflow. |
+| `scripts/analyze_unified_graph_log.py` | one-off diagnostic parser | 0 | No current runner emits or consumes its ad-hoc text format. |
+| `scripts/bench_chat_completions.sh` | duplicate benchmark client | 0 | `ferrum bench-serve` is the sole canonical HTTP performance client. |
+| `scripts/bottleneck_localize.sh` | obsolete profiler wrapper | 0 | Replaced by structured profile collectors and typed artifacts. |
+| `scripts/compare_nsys_kernels.py` | one-off Nsight comparator | 0 | Uncalled post-processing tool for a closed M3 investigation. |
+| `scripts/graph_repro_v2.cu` | superseded graph experiment | 0 | Historical iteration; conclusions are retained in Git history and current graph tests. |
+| `scripts/graph_repro_v3.cu` | superseded graph experiment | 0 | Historical iteration; conclusions are retained in Git history and current graph tests. |
+| `scripts/graph_repro_v5.cu` | superseded graph experiment | 0 | Historical iteration; conclusions are retained in Git history and current graph tests. |
+| `scripts/graph_repro_v6.cu` | superseded graph experiment | 0 | Replaced by the segment/upload probes and product graph tests. |
+| `scripts/graph_repro_v7.cu` | superseded graph experiment | 0 | Replaced by the segment/upload probes and product graph tests. |
+| `scripts/graph_repro_v8.cu` | superseded graph experiment | 0 | Replaced by the segment/upload probes and product graph tests. |
+| `scripts/run_graph_repro.sh` | obsolete wrapper | 0 | Wrapped only an early standalone graph reproduction. |
+| `scripts/lock_gpu.sh` | obsolete host mutator | 0 | Current gates record hardware state without changing global GPU clocks. |
+| `scripts/unlock_gpu.sh` | obsolete host mutator | 0 | Paired only with the removed GPU lock helper. |
+| `scripts/paris_bisect.sh` | obsolete correctness bisector | 0 | Replaced by manifest-driven product scenarios and G0 gates. |
+| `scripts/parse_decode_profile.py` | obsolete profile parser | 0 | Parsed the removed bottleneck-localization log format. |
+| `scripts/pod_bench.sh` | obsolete pod operator | 0 | Fixed-pod workflow replaced by the bounded Vast/G0 process. |
+| `scripts/pod_collect_m3_80pct.sh` | obsolete pod collector | 0 | Hard-coded a closed 2026-05 session and has no current caller. |
+| `scripts/pod_session_m3_80pct.sh` | obsolete pod orchestrator | 0 | Replaced by current paid-GPU inventory, lifecycle, and gate policy. |
+| `scripts/pod_setup.sh` | obsolete pod bootstrap | fixture-only, removed | Its planner fixture entry is removed in the same patch. |
+| `scripts/sweep_bottleneck.sh` | obsolete sweep runner | 0 | Replaced by typed selected-cell collectors. |
+| `scripts/test_chat_suites.sh` | duplicate test wrapper | 0 | Duplicated the maintained `chat-smoke.yml` workflow targets. |
+| `scripts/test_gpu.sh` | obsolete GPU suite | 0 | Used hidden legacy knobs and emitted no canonical gate artifact. |
+| `scripts/pod_w1_final_armored.sh` | completed one-shot orchestration | 0 | W1 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w1_gates5.sh` | completed one-shot orchestration | 0 | W1 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w1_gates6.sh` | completed one-shot orchestration | 0 | W1 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w1_l5_final.sh` | completed one-shot orchestration | 0 | W1 L5 results are already checked in. |
+| `scripts/pod_w2_gates.sh` | completed one-shot orchestration | 0 | W2 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w2_gemma3.sh` | completed one-shot orchestration | 0 | W2 results are frozen; its private environment aliases are removed from the registry. |
+| `scripts/w1_finalize_cells.py` | completed result finalizer | 0 | Its finalized W1 matrix is checked in. |
+| `scripts/w1_l5_batch.sh` | completed one-shot runner | 0 | Its L5 outputs are checked in. |
+| `scripts/w1_perf_spread.py` | completed one-shot analyzer | 0 | Its W1 performance conclusion is frozen in release evidence. |
+
+### Obsolete CUDA microbenches
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `scripts/microbenches/h2d_microbench.cu` | superseded probe | 0 | No current source, test, gate, or documentation entrypoint consumes it. |
+| `scripts/microbenches/graph_bench.cu` | superseded probe | 0 | Replaced by the segment and Gemma3 shadow graph probes. |
+| `scripts/microbenches/sync_barrier_bench.cu` | superseded probe | 0 | Closed host-barrier hypothesis with no current caller. |
+| `scripts/microbenches/scalar_type_id_test.cu` | superseded ABI probe | 0 | Native bundle validators and native-operator tests now enforce the contract. |
+| `scripts/microbenches/scalar_type_id_test_other_tu.cu` | superseded ABI probe | 0 | Companion translation unit for the removed scalar-ID probe. |
+| `scripts/microbenches/build_and_run_varlen_vllm_tiled_q_perf.sh` | deprecated negative control | 0 | Wrapper for the removed tiled-Q experiment. |
+| `scripts/microbenches/varlen_vllm_tiled_q_perf.cu` | deprecated negative control | 0 | Registry marks this path non-default-worthy and no gate consumes it. |
+| `scripts/microbenches/build_and_run_fa2_direct_ffi_probe.sh` | completed feasibility probe | 0 | Replaced by the retained direct-FFI shim and M3 A/B diagnostic. |
+| `scripts/microbenches/fa2_direct_ffi_probe.cpp` | completed feasibility probe | 0 | Replaced by the retained direct-FFI shim implementation. |
+| `scripts/microbenches/build_fa2_ferrum_source_shim.sh` | removed product-path aid | 0 | Source-linked FA2 was explicitly retired; only the compatibility sentinel remains. |
+| `scripts/microbenches/fa2_ferrum_source_shim.cu` | removed product-path aid | 0 | Source-linked FA2 was explicitly retired. |
+| `scripts/microbenches/vllm_flash_attn_varlen_probe.py` | completed feasibility probe | 0 | Python/vLLM sizing probe is not part of the Ferrum product or release path. |
+| `scripts/microbenches/moe_marlin_active65_perf.cu` | stale ABI probe | 0 | Declares an older MoE native ABI and is unsafe against the current operator set. |
+| `scripts/microbenches/moe_marlin_correctness.cu` | stale ABI probe | 0 | Declares an older MoE native ABI; canonical parity tests replace it. |
+| `scripts/microbenches/build_and_run_moe_marlin_perf.sh` | stale ABI wrapper | 0 | Wrapper for the removed stale-ABI probe. |
+| `scripts/microbenches/moe_marlin_perf.cu` | stale ABI probe | 0 | Declares an older MoE native ABI and cannot safely call current operators. |
+
+### Completed Runtime vNext authoring and attribution tools
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `scripts/release/runtime_vnext_c13_vllm_reference.py` | completed reference producer | selftest-only, removed | C13 alignment concluded `KEEP_REFERENCE_ALIGNMENT`; it was never a formal G08B gate. |
+| `scripts/release/runtime_vnext_c13_logits_reference.py` | completed reference comparator | selftest-only, removed | C13 alignment is frozen in v0.8 evidence and no current gate calls it. |
+| `scripts/release/configs/runtime_vnext_c13_022_reference.json` | orphaned reference config | 0 | Only the removed C13 producer consumed it. |
+| `scripts/release/runtime_vnext_cuda_replay_kernel_attribution.py` | completed offline diagnostic | selftest-only, removed | One-off Nsight/replay attribution for a closed G06 investigation. |
+| `scripts/release/runtime_vnext_expectation_amendment.py` | one-shot authoring tool | compile/selftest-only, removed | Generated review candidates before G00 expectations were frozen. |
+| `scripts/release/runtime_vnext_g00_orchestrator.py` | completed evidence preparer | compile/selftest-only, removed | `run_gate vnext-g00` uses the baseline gate directly; this was not final authority. |
+| `scripts/release/runtime_vnext_historical_capture.py` | completed receipt producer | compile/selftest-only, removed | Historical corpus/replay validators remain; the one-time capture producer has no current entrypoint. |
+
+### Wave 2 index simplifications
+
+- Update `scripts/README.md` and `scripts/microbenches/README.md` to list only
+  retained entrypoints and probes.
+- Remove deleted script owners and obsolete-only variables from
+  `docs/runtime-env-registry.tsv`.
+- Remove the obsolete pod path from the change-impact fixture and the two
+  legacy GPU lock helpers from the benchmark playbook.
+- Remove deleted Runtime vNext scripts from Python compilation and validator
+  selftest registries.

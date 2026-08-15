@@ -33,23 +33,14 @@ RUNTIME_VNEXT_PLAN_REFERENCE = (
 RUNTIME_VNEXT_CUDA_CANDLE_BOUNDARY = (
     REPO_ROOT / "scripts/release/runtime_vnext_cuda_candle_boundary.py"
 )
-RUNTIME_VNEXT_C13_VLLM_REFERENCE = (
-    REPO_ROOT / "scripts/release/runtime_vnext_c13_vllm_reference.py"
-)
-RUNTIME_VNEXT_C13_LOGITS_REFERENCE = (
-    REPO_ROOT / "scripts/release/runtime_vnext_c13_logits_reference.py"
-)
 JSONL_PRODUCT_SESSION = REPO_ROOT / "scripts/release/jsonl_product_session.py"
 RUNTIME_VNEXT_BASELINE_SCENARIOS = REPO_ROOT / "scripts/release/runtime_vnext_baseline_scenarios.py"
-RUNTIME_VNEXT_EXPECTATION_AMENDMENT = REPO_ROOT / "scripts/release/runtime_vnext_expectation_amendment.py"
 RUNTIME_VNEXT_BLOCKED_LANE = REPO_ROOT / "scripts/release/runtime_vnext_blocked_lane.py"
 RUNTIME_VNEXT_RESOURCE_SAMPLER = REPO_ROOT / "scripts/release/runtime_vnext_resource_sampler.py"
 RUNTIME_VNEXT_PERFORMANCE_COLLECTOR = REPO_ROOT / "scripts/release/runtime_vnext_performance_collector.py"
 RUNTIME_VNEXT_G00A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g00a_checkpoint.py"
-RUNTIME_VNEXT_G00_ORCHESTRATOR = REPO_ROOT / "scripts/release/runtime_vnext_g00_orchestrator.py"
 RUNTIME_VNEXT_HISTORICAL_CORPUS = REPO_ROOT / "scripts/release/runtime_vnext_historical_corpus.py"
 RUNTIME_VNEXT_HISTORICAL_REPLAY = REPO_ROOT / "scripts/release/runtime_vnext_historical_replay.py"
-RUNTIME_VNEXT_HISTORICAL_CAPTURE = REPO_ROOT / "scripts/release/runtime_vnext_historical_capture.py"
 RUNTIME_VNEXT_G01A_CHECKPOINT = REPO_ROOT / "scripts/release/runtime_vnext_g01a_checkpoint.py"
 RUNTIME_VNEXT_NUMERICAL_TOLERANCES = (
     REPO_ROOT / "scripts/release/runtime_vnext_numerical_tolerances.py"
@@ -138,9 +129,6 @@ RUNTIME_VNEXT_G08C_METAL_MATRIX_PREPARE = (
 )
 RUNTIME_VNEXT_G08_PERFORMANCE_SMOKE = (
     REPO_ROOT / "scripts/release/runtime_vnext_g08_performance_smoke.py"
-)
-RUNTIME_VNEXT_CUDA_REPLAY_KERNEL_ATTRIBUTION = (
-    REPO_ROOT / "scripts/release/runtime_vnext_cuda_replay_kernel_attribution.py"
 )
 RUNTIME_VNEXT_G07B_NATIVE_CHAIN_VALIDATOR = (
     REPO_ROOT / "scripts/release/validate_runtime_vnext_g07b_native_chain.py"
@@ -661,25 +649,6 @@ def test_runtime_vnext_cuda_candle_boundary_selftest() -> None:
     )
 
 
-def test_runtime_vnext_c13_reference_selftests() -> None:
-    collector = run(
-        [sys.executable, str(RUNTIME_VNEXT_C13_VLLM_REFERENCE), "--self-test"]
-    )
-    require(collector.returncode == 0, collector.stderr or collector.stdout)
-    require(
-        "FERRUM C13 VLLM RAW LOGITS REFERENCE PASS" in collector.stdout,
-        collector.stdout,
-    )
-    comparator = run(
-        [sys.executable, str(RUNTIME_VNEXT_C13_LOGITS_REFERENCE), "--self-test"]
-    )
-    require(comparator.returncode == 0, comparator.stderr or comparator.stdout)
-    require(
-        "FERRUM C13 LOGITS REFERENCE SELF-TEST PASS" in comparator.stdout,
-        comparator.stdout,
-    )
-
-
 def test_jsonl_product_session_selftest() -> None:
     ok = run([sys.executable, str(JSONL_PRODUCT_SESSION), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -690,12 +659,6 @@ def test_runtime_vnext_baseline_scenarios_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_BASELINE_SCENARIOS), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require("FERRUM RUNTIME VNEXT G00 SCENARIOS SELFTEST PASS" in ok.stdout, ok.stdout)
-
-
-def test_runtime_vnext_expectation_amendment_selftest() -> None:
-    ok = run([sys.executable, str(RUNTIME_VNEXT_EXPECTATION_AMENDMENT), "--self-test"])
-    require(ok.returncode == 0, ok.stderr or ok.stdout)
-    require("RUNTIME VNEXT EXPECTATION AMENDMENT SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
 def test_runtime_vnext_blocked_lane_selftest() -> None:
@@ -722,15 +685,6 @@ def test_runtime_vnext_g00a_checkpoint_selftest() -> None:
     require("FERRUM RUNTIME VNEXT G00A FACT CHECKPOINT SELFTEST PASS" in ok.stdout, ok.stdout)
 
 
-def test_runtime_vnext_g00_orchestrator_selftest() -> None:
-    ok = run([sys.executable, str(RUNTIME_VNEXT_G00_ORCHESTRATOR), "--self-test"])
-    require(ok.returncode == 0, ok.stderr or ok.stdout)
-    require(
-        "FERRUM RUNTIME VNEXT G00 ORCHESTRATOR SELFTEST PASS" in ok.stdout,
-        ok.stdout,
-    )
-
-
 def test_runtime_vnext_historical_corpus_selftest() -> None:
     ok = run([sys.executable, str(RUNTIME_VNEXT_HISTORICAL_CORPUS), "--self-test"])
     require(ok.returncode == 0, ok.stderr or ok.stdout)
@@ -745,15 +699,6 @@ def test_runtime_vnext_historical_replay_selftest() -> None:
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require(
         "FERRUM RUNTIME VNEXT HISTORICAL REPLAY SELFTEST PASS" in ok.stdout,
-        ok.stdout,
-    )
-
-
-def test_runtime_vnext_historical_capture_selftest() -> None:
-    ok = run([sys.executable, str(RUNTIME_VNEXT_HISTORICAL_CAPTURE), "--self-test"])
-    require(ok.returncode == 0, ok.stderr or ok.stdout)
-    require(
-        "FERRUM RUNTIME VNEXT G00 HISTORICAL CAPTURE SELFTEST PASS" in ok.stdout,
         ok.stdout,
     )
 
@@ -1139,21 +1084,6 @@ def test_runtime_vnext_g08_performance_smoke_selftest() -> None:
     require(ok.returncode == 0, ok.stderr or ok.stdout)
     require(
         "FERRUM RUNTIME VNEXT G08 PERFORMANCE SMOKE SELFTEST PASS" in ok.stdout,
-        ok.stdout,
-    )
-
-
-def test_runtime_vnext_cuda_replay_kernel_attribution_selftest() -> None:
-    ok = run(
-        [
-            sys.executable,
-            str(RUNTIME_VNEXT_CUDA_REPLAY_KERNEL_ATTRIBUTION),
-            "--self-test",
-        ]
-    )
-    require(ok.returncode == 0, ok.stderr or ok.stdout)
-    require(
-        "CUDA REPLAY KERNEL ATTRIBUTION SELFTEST PASS" in ok.stdout,
         ok.stdout,
     )
 
@@ -1632,18 +1562,14 @@ def main() -> int:
     test_runtime_vnext_cuda_correctness_build_selftest()
     test_runtime_vnext_plan_reference_selftest()
     test_runtime_vnext_cuda_candle_boundary_selftest()
-    test_runtime_vnext_c13_reference_selftests()
     test_jsonl_product_session_selftest()
     test_runtime_vnext_baseline_scenarios_selftest()
-    test_runtime_vnext_expectation_amendment_selftest()
     test_runtime_vnext_blocked_lane_selftest()
     test_runtime_vnext_resource_sampler_selftest()
     test_runtime_vnext_performance_collector_selftest()
     test_runtime_vnext_g00a_checkpoint_selftest()
-    test_runtime_vnext_g00_orchestrator_selftest()
     test_runtime_vnext_historical_corpus_selftest()
     test_runtime_vnext_historical_replay_selftest()
-    test_runtime_vnext_historical_capture_selftest()
     test_runtime_vnext_g01a_checkpoint_selftest()
     test_runtime_vnext_numerical_tolerances_selftest()
     test_runtime_vnext_checkpoint_artifact_selftest()
@@ -1673,7 +1599,6 @@ def main() -> int:
     test_runtime_vnext_g08c_metal_matrix_checkpoint_selftest()
     test_runtime_vnext_g08c_metal_matrix_prepare_selftest()
     test_runtime_vnext_g08_performance_smoke_selftest()
-    test_runtime_vnext_cuda_replay_kernel_attribution_selftest()
     test_runtime_vnext_g07a_build_iteration_selftests()
     test_runtime_vnext_g07b_checkpoint_selftest()
     test_runtime_vnext_g07_checkpoint_selftest()
