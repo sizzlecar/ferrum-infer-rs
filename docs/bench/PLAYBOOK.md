@@ -540,7 +540,7 @@ The reordering principle: **prove the gap is engineering before building enginee
 | 0.3 | `--n-repeats N` + Student-t CI95 in `bench` and `bench-serve` |
 | 0.4 | `--request-rate R` (Poisson) + `--goodput` SLO in `bench-serve` |
 | 0.5 | `--concurrency-sweep` shorthand |
-| 0.6 | `scripts/lock_gpu.sh` (CUDA `nvidia-smi` lock-down) + `scripts/unlock_gpu.sh` |
+| 0.6 | Capture GPU clocks, power and process state in the benchmark artifact before and after each run. |
 | 0.7 | `scripts/bench_vs_vllm.sh` — runs both engines, dumps effective config parity table, then identical bench |
 | 0.8 | `--warmup-requests N` (default 10) |
 | 0.9 | `env_hash` computation + report header |
@@ -590,7 +590,7 @@ Inspect the parity-confirmed report. Three branches:
 | 0.1 | ✓ `crates/ferrum-bench-core` — schema, Profiler, Student-t CI95, Poisson arrivals, env_hash |
 | 0.2–0.5,0.8 | ✓ `bench-serve --n-repeats / --request-rate / --concurrency-sweep / --goodput / --warmup-requests` |
 | 0.3,0.9 | ✓ `bench` CLI consumes ferrum-bench-core |
-| 0.6 | ✓ `scripts/lock_gpu.sh` + `scripts/unlock_gpu.sh` |
+| 0.6 | ✓ Hardware state is captured by the current gate manifest and sampler artifacts. |
 | 0.7 | ✓ `scripts/bench_vs_vllm.sh` with config-parity dump |
 | 1.1 | ✓ `BackendTimer` trait + CPU/Metal/CUDA impls in `crates/ferrum-kernels/src/backend/timer.rs` (CUDA via `cuEventRecord/Synchronize/ElapsedTime`; Metal via sync-wrap; CPU via `Instant`) |
 | 1.2 | ✓ `Backend::Timer` associated type + `make_timer()` + `start_probe_timer` / `finish_probe_timer` helpers. 4 hot `B::sync + Instant::now()` probe sites in `qwen3_moe.rs` migrated (attn / moe / prefill / decode-stage). Closure-shaped sites in `moe/forward.rs` and wall-clock-by-design sites are unchanged — different refactor. |

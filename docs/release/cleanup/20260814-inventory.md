@@ -1,6 +1,6 @@
 # crates/docs/scripts inventory
 
-Generated from `/Users/chejinxuan/rust_ws/ferrum-infer-rs`.
+Generated from `/Users/chejinxuan/rust_ws/ferrum-infer-rs-cleanup-unused`.
 
 ## Workspace crate members
 
@@ -57,8 +57,6 @@ Crates on disk not listed in workspace:
 
 ### GPU setup/pod helper
 
-- `scripts/__pycache__/validate_cuda_build_boundary_manifest.cpython-314.pyc`
-- `scripts/__pycache__/validate_cuda_build_summary.cpython-314.pyc`
 - `scripts/pod_bench.sh`
 - `scripts/pod_l1_reference_match.py`
 - `scripts/pod_setup.sh`
@@ -75,10 +73,6 @@ Crates on disk not listed in workspace:
 
 ### M3/CUDA runner
 
-- `scripts/__pycache__/check_m3_runner_wrappers.cpython-314.pyc`
-- `scripts/__pycache__/m3_ab_runner.cpython-314.pyc`
-- `scripts/__pycache__/m3_cuda_build_boundary_probe.cpython-314.pyc`
-- `scripts/__pycache__/m3_validate_runner_artifact.cpython-314.pyc`
 - `scripts/aggregate_m3_80pct.py`
 - `scripts/check_m3_runner_wrappers.py`
 - `scripts/m3_ab_runner.py`
@@ -97,16 +91,7 @@ Crates on disk not listed in workspace:
 
 ### benchmark/report utility
 
-- `scripts/.DS_Store`
 - `scripts/README.md`
-- `scripts/__pycache__/analyze_layer_dump.cpython-314.pyc`
-- `scripts/__pycache__/analyze_unified_graph_log.cpython-314.pyc`
-- `scripts/__pycache__/check_ferrum_env_registry.cpython-314.pyc`
-- `scripts/__pycache__/gen_chat_template_goldens.cpython-314.pyc`
-- `scripts/__pycache__/inspect_hf_gptq_tensor.cpython-314.pyc`
-- `scripts/__pycache__/metal_readme_regression.cpython-314.pyc`
-- `scripts/__pycache__/w1_goal_validator.cpython-314.pyc`
-- `scripts/__pycache__/w2_goal_validator.cpython-314.pyc`
 - `scripts/aggregate_sweep.py`
 - `scripts/bench_chat_completions.sh`
 - `scripts/bench_m1_q4_k_m.sh`
@@ -215,142 +200,7 @@ Crates on disk not listed in workspace:
 
 ### release gate
 
-- `scripts/release/__pycache__/actual_model_regression_summary_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/analyze_ferrum_profile.cpython-314.pyc`
-- `scripts/release/__pycache__/analyze_scheduler_trace.cpython-314.pyc`
-- `scripts/release/__pycache__/backend_boundary_audit.cpython-314.pyc`
-- `scripts/release/__pycache__/backend_runtime_preset_goal_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/backend_runtime_preset_snapshot.cpython-314.pyc`
-- `scripts/release/__pycache__/bounded_command.cpython-314.pyc`
-- `scripts/release/__pycache__/explosion_radius.cpython-314.pyc`
-- `scripts/release/__pycache__/g0_cuda_llama33_70b_4bit_2x4090_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/g0_cuda_llama_dense_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/g0_release_summary.cpython-314.pyc`
-- `scripts/release/__pycache__/g1_g3_g4_release_regression.cpython-314.pyc`
-- `scripts/release/__pycache__/g1_g4_manifest.cpython-314.pyc`
-- `scripts/release/__pycache__/g1_vllm_migration_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/g2_agent_serving_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/g3_cache_product_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/g4_lora_startup_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/inventory_tree.cpython-314.pyc`
-- `scripts/release/__pycache__/jsonl_product_session.cpython-314.pyc`
-- `scripts/release/__pycache__/l2_actual_model_artifact_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/layer_split_perf_goal_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/llama33_70b_4bit_2x4090_goal_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/model_onboarding_contract_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/model_release_grade_goal_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/model_release_grade_manifest.cpython-314.pyc`
-- `scripts/release/__pycache__/native_operator_artifact_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/native_operator_source_bundle.cpython-314.pyc`
-- `scripts/release/__pycache__/native_work_attribution_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/observability_profile_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/observability_vertical_slice_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/openai_concurrency_quality_regression.cpython-314.pyc`
-- `scripts/release/__pycache__/openai_tool_call_regression.cpython-314.pyc`
-- `scripts/release/__pycache__/plan_gates.cpython-314.pyc`
-- `scripts/release/__pycache__/product_backend_sentinel_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/product_observability_l1_smoke.cpython-314.pyc`
-- `scripts/release/__pycache__/product_observability_wiring_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/qwen35_gguf_full_attention_reference.cpython-311.pyc`
-- `scripts/release/__pycache__/qwen35_gguf_full_attention_reference.cpython-314.pyc`
-- `scripts/release/__pycache__/qwen35_gguf_linear_attention_reference.cpython-311.pyc`
-- `scripts/release/__pycache__/qwen35_gguf_linear_attention_reference.cpython-314.pyc`
-- `scripts/release/__pycache__/qwen35_gguf_model_reference.cpython-314.pyc`
-- `scripts/release/__pycache__/readme_model_matrix.cpython-314.pyc`
-- `scripts/release/__pycache__/release_binary_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/release_regression_hardening_goal_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/request_replay_bundle_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/resource_invariant_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/run_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/run_layer_split_perf_goal.cpython-314.pyc`
-- `scripts/release/__pycache__/run_scenarios.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_active_timeline.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_baseline_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_baseline_scenarios.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_blocked_lane.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_build_timing.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_c13_contract.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_c13_logits_reference.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_c13_vllm_reference.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_checkpoint_artifact.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_cuda_candle_boundary.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_cuda_correctness_build.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_cuda_determinism.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_cuda_determinism_collect.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_cuda_replay_kernel_attribution.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_expectation_amendment.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g00_orchestrator.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g00a_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g00f_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g01_core_contracts.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g01a_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g01b_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g02_core.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g07a_build_iteration.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g07a_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g07b_native_chain.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08_performance_smoke.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08b_cuda_matrix_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08b_cuda_matrix_prepare.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08b_metal_matrix_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08b_metal_matrix_prepare.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08c_cuda_matrix_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08c_cuda_matrix_prepare.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08c_metal_matrix_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_g08c_metal_matrix_prepare.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_hardware_probe.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_historical_capture.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_historical_corpus.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_historical_replay.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_inventory.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_model_resolver.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_native_operator_set.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_numerical_tolerances.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_performance_collector.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_plan_reference.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_qwen35_full_attention_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_qwen35_layer_reference_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_qwen35_model_reference_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_resource_sampler.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s0a_contract_split.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s1_cuda_basic_collector.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s1_cuda_capacity.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s1_cuda_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s1_cuda_decode_capacity.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_api_modality_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_cuda_product_contract.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_historical_resource_source.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_latency_failure_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_latency_failure_collector.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_multiturn_concurrency_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_response_format_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_stream_disconnect_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/runtime_vnext_s2_tool_schema_checkpoint.cpython-314.pyc`
-- `scripts/release/__pycache__/selftest_g0_validators.cpython-314.pyc`
-- `scripts/release/__pycache__/selftest_g1_g3_g4_release_regression.cpython-314.pyc`
-- `scripts/release/__pycache__/support_matrix_contract_gate.cpython-314.pyc`
 - `scripts/release/__pycache__/test_arch_goal_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/test_arch_regression_repair_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/validate_metal_readme_regression.cpython-314.pyc`
-- `scripts/release/__pycache__/validate_release_completion_manifest.cpython-314.pyc`
-- `scripts/release/__pycache__/validate_runtime_vnext_g07a_build_iteration.cpython-314.pyc`
-- `scripts/release/__pycache__/validate_runtime_vnext_g07b_native_chain.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_delta_rule_s0_microbench.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_deltanet_s1_layer_compare.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_hf_config_probe.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_l0_template_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_l1_numeric_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_l2_quantized_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_l4_agent_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_l5_concurrency_gate.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_qwen35_cuda_release_lane.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_qwen35_hf_layer_dump.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_qwen35_layer_compare.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_qwen35_product_smoke.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_qwen35_real_product_report.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_qwen35_vast_c32_diagnostic.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_qwen35_weight_index_probe.cpython-314.pyc`
-- `scripts/release/__pycache__/w3_s0_design_gate.cpython-314.pyc`
 - `scripts/release/actual_model_regression_summary_gate.py`
 - `scripts/release/analyze_ferrum_profile.py`
 - `scripts/release/analyze_scheduler_trace.py`
@@ -370,6 +220,10 @@ Crates on disk not listed in workspace:
 - `scripts/release/configs/layer_split_perf_qwen72b_candidate_batch_tuned_smoke.json`
 - `scripts/release/configs/runtime_vnext_c13_022_reference.json`
 - `scripts/release/configs/runtime_vnext_g07a_build_iteration.json`
+- `scripts/release/configs/runtime_vnext_g08a_m1_cuda.models.lock.json`
+- `scripts/release/configs/runtime_vnext_g08a_m1_metal.models.lock.json`
+- `scripts/release/configs/runtime_vnext_g08a_m1_token_parity_prompts.json`
+- `scripts/release/configs/runtime_vnext_g08a_source_contract.json`
 - `scripts/release/configs/runtime_vnext_g08b_m2_cuda.models.lock.json`
 - `scripts/release/configs/runtime_vnext_g08b_m2_metal.models.lock.json`
 - `scripts/release/configs/runtime_vnext_g08c_m3_cuda.models.lock.json`
@@ -382,6 +236,8 @@ Crates on disk not listed in workspace:
 - `scripts/release/configs/runtime_vnext_legacy_correctness_expectations.json`
 - `scripts/release/configs/runtime_vnext_models.json`
 - `scripts/release/configs/runtime_vnext_numerical_tolerances.json`
+- `scripts/release/configs/runtime_vnext_r2_ferrum_floors.json`
+- `scripts/release/configs/runtime_vnext_r3_sample_plan.json`
 - `scripts/release/configs/runtime_vnext_s2_historical_resources.json`
 - `scripts/release/explosion_radius.py`
 - `scripts/release/fixtures/change_impact/planner_fixtures.json`
@@ -484,6 +340,7 @@ Crates on disk not listed in workspace:
 - `scripts/release/layer_split_perf_goal_gate.py`
 - `scripts/release/llama33_70b_4bit_2x4090_goal_gate.py`
 - `scripts/release/llama_logits_dump.cpp`
+- `scripts/release/llama_teacher_logits_dump.cpp`
 - `scripts/release/model_onboarding_contract.schema.json`
 - `scripts/release/model_onboarding_contract_gate.py`
 - `scripts/release/model_release_grade_goal_gate.py`
@@ -504,6 +361,7 @@ Crates on disk not listed in workspace:
 - `scripts/release/qwen35_gguf_full_attention_reference.py`
 - `scripts/release/qwen35_gguf_linear_attention_reference.py`
 - `scripts/release/qwen35_gguf_model_reference.py`
+- `scripts/release/qwen35_gguf_teacher_logits_reference.py`
 - `scripts/release/readme_model_matrix.py`
 - `scripts/release/release_binary_gate.py`
 - `scripts/release/release_regression_hardening_goal_gate.py`
@@ -521,7 +379,9 @@ Crates on disk not listed in workspace:
 - `scripts/release/runtime_vnext_c13_contract.py`
 - `scripts/release/runtime_vnext_c13_logits_reference.py`
 - `scripts/release/runtime_vnext_c13_vllm_reference.py`
+- `scripts/release/runtime_vnext_change_impact_qualification.py`
 - `scripts/release/runtime_vnext_checkpoint_artifact.py`
+- `scripts/release/runtime_vnext_crates_io_release.py`
 - `scripts/release/runtime_vnext_cuda_candle_boundary.py`
 - `scripts/release/runtime_vnext_cuda_correctness_build.py`
 - `scripts/release/runtime_vnext_cuda_determinism.py`
@@ -535,10 +395,26 @@ Crates on disk not listed in workspace:
 - `scripts/release/runtime_vnext_g01a_checkpoint.py`
 - `scripts/release/runtime_vnext_g01b_checkpoint.py`
 - `scripts/release/runtime_vnext_g02_core.py`
+- `scripts/release/runtime_vnext_g03_live_catalog_checkpoint.py`
+- `scripts/release/runtime_vnext_g03_live_catalog_collect.py`
+- `scripts/release/runtime_vnext_g07_checkpoint.py`
 - `scripts/release/runtime_vnext_g07a_build_iteration.py`
 - `scripts/release/runtime_vnext_g07a_checkpoint.py`
+- `scripts/release/runtime_vnext_g07b_checkpoint.py`
 - `scripts/release/runtime_vnext_g07b_native_chain.py`
 - `scripts/release/runtime_vnext_g08_performance_smoke.py`
+- `scripts/release/runtime_vnext_g08a_checkpoint.py`
+- `scripts/release/runtime_vnext_g08a_cuda_matrix_checkpoint.py`
+- `scripts/release/runtime_vnext_g08a_cuda_matrix_prepare.py`
+- `scripts/release/runtime_vnext_g08a_matrix_specs.py`
+- `scripts/release/runtime_vnext_g08a_metal_matrix_checkpoint.py`
+- `scripts/release/runtime_vnext_g08a_metal_matrix_prepare.py`
+- `scripts/release/runtime_vnext_g08a_metal_op_numerics.py`
+- `scripts/release/runtime_vnext_g08a_numerics.py`
+- `scripts/release/runtime_vnext_g08a_same_history.py`
+- `scripts/release/runtime_vnext_g08a_same_history_collector.py`
+- `scripts/release/runtime_vnext_g08a_source_contract.py`
+- `scripts/release/runtime_vnext_g08a_token_parity_collector.py`
 - `scripts/release/runtime_vnext_g08b_cuda_matrix_checkpoint.py`
 - `scripts/release/runtime_vnext_g08b_cuda_matrix_prepare.py`
 - `scripts/release/runtime_vnext_g08b_metal_matrix_checkpoint.py`
@@ -547,19 +423,30 @@ Crates on disk not listed in workspace:
 - `scripts/release/runtime_vnext_g08c_cuda_matrix_prepare.py`
 - `scripts/release/runtime_vnext_g08c_metal_matrix_checkpoint.py`
 - `scripts/release/runtime_vnext_g08c_metal_matrix_prepare.py`
+- `scripts/release/runtime_vnext_g0_llama_sampled_execution.py`
+- `scripts/release/runtime_vnext_goal_gate.py`
 - `scripts/release/runtime_vnext_hardware_probe.py`
 - `scripts/release/runtime_vnext_historical_capture.py`
 - `scripts/release/runtime_vnext_historical_corpus.py`
 - `scripts/release/runtime_vnext_historical_replay.py`
+- `scripts/release/runtime_vnext_homebrew_release.py`
 - `scripts/release/runtime_vnext_inventory.py`
 - `scripts/release/runtime_vnext_model_resolver.py`
 - `scripts/release/runtime_vnext_native_operator_set.py`
 - `scripts/release/runtime_vnext_numerical_tolerances.py`
 - `scripts/release/runtime_vnext_performance_collector.py`
 - `scripts/release/runtime_vnext_plan_reference.py`
+- `scripts/release/runtime_vnext_prepromotion_bundle.py`
 - `scripts/release/runtime_vnext_qwen35_full_attention_gate.py`
 - `scripts/release/runtime_vnext_qwen35_layer_reference_gate.py`
 - `scripts/release/runtime_vnext_qwen35_model_reference_gate.py`
+- `scripts/release/runtime_vnext_r0_core_closure.py`
+- `scripts/release/runtime_vnext_r1_product_correctness.py`
+- `scripts/release/runtime_vnext_r2_ferrum_collector.py`
+- `scripts/release/runtime_vnext_r2_ferrum_terminal_recovery.py`
+- `scripts/release/runtime_vnext_r2_performance_build_profile.py`
+- `scripts/release/runtime_vnext_r2_profile_collector.py`
+- `scripts/release/runtime_vnext_release_workflow_policy.py`
 - `scripts/release/runtime_vnext_resource_sampler.py`
 - `scripts/release/runtime_vnext_s0a_contract_split.py`
 - `scripts/release/runtime_vnext_s1_cuda_basic_collector.py`
@@ -575,14 +462,19 @@ Crates on disk not listed in workspace:
 - `scripts/release/runtime_vnext_s2_response_format_checkpoint.py`
 - `scripts/release/runtime_vnext_s2_stream_disconnect_checkpoint.py`
 - `scripts/release/runtime_vnext_s2_tool_schema_checkpoint.py`
+- `scripts/release/runtime_vnext_sampled_final.py`
 - `scripts/release/scenarios/product_backend_sentinel.json`
 - `scripts/release/scenarios/product_regression.json`
 - `scripts/release/scenarios/product_regression_smoke.json`
+- `scripts/release/scenarios/runtime_vnext_r1_llama_dense_cuda.json`
+- `scripts/release/scenarios/runtime_vnext_r1_llama_dense_metal.json`
 - `scripts/release/scenarios/runtime_vnext_s2_c14_c15_cuda.json`
 - `scripts/release/scenarios/runtime_vnext_s2_c16_c20_cuda.json`
 - `scripts/release/scenarios/runtime_vnext_s2_c21_cuda_smoke.json`
 - `scripts/release/scenarios/runtime_vnext_s2_multiturn_concurrency_cuda.json`
 - `scripts/release/scenarios/runtime_vnext_s2_remaining_cuda.json`
+- `scripts/release/scenarios/runtime_vnext_text_byte_sampling_cuda.json`
+- `scripts/release/scenarios/runtime_vnext_text_byte_sampling_metal.json`
 - `scripts/release/schemas/ferrum_artifact_manifest.schema.json`
 - `scripts/release/schemas/ferrum_observability_profile_event.schema.json`
 - `scripts/release/schemas/native_operator_manifest.schema.json`
@@ -1931,7 +1823,6 @@ Crates on disk not listed in workspace:
 
 ### public product docs
 
-- `docs/.DS_Store`
 - `docs/DEVELOPMENT.md`
 - `docs/ROADMAP.md`
 - `docs/agent-serving.md`
@@ -1944,12 +1835,10 @@ Crates on disk not listed in workspace:
 - `docs/design/fused-moe-marlin.md`
 - `docs/dev-loop-product-api-goal-2026-05-30.md`
 - `docs/fused-transformer-status.md`
-- `docs/goals/.DS_Store`
 - `docs/goals/backend-runtime-preset-fast-iteration/GOAL.md`
 - `docs/goals/layer-split-performance-2026-06-08/GOAL.md`
 - `docs/goals/layer-split-performance-2026-06-08/STATUS.md`
 - `docs/goals/llama33-70b-4bit-2x4090/GOAL.md`
-- `docs/goals/model-coverage-2026-06-12/.DS_Store`
 - `docs/goals/model-coverage-2026-06-12/ACTIVE_PODS.md`
 - `docs/goals/model-coverage-2026-06-12/GOAL.md`
 - `docs/goals/model-coverage-2026-06-12/HANDOFF_W3_QWEN35_20260621.md`
@@ -2337,7 +2226,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/remote/nvidia_smi_before.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/remote/start_utc.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/remote_runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/run_remote.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/run_remote_active_chunk_diag.sh`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/server/chunk32/nvidia_smi_after_bench.txt`
@@ -2383,46 +2271,23 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_active_decode_prefill_chunk_c16_diag_2026-06-16/vast_shutdown/stopped.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/.gitignore`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/gpu_contract.md`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/ferrum_99859ce6.bundle`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/ferrum_99859ce6.bundle.sha256`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/query_41256521_after_ssh255.raw.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/query_41256521_before.raw.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_checkout.err`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_checkout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_001.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_001.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_002.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_002.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_003.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_003.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_004.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_004.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_005.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_005.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_006.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_006.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_007.err`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_monitor_007.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_target_probe.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/remote_target_probe.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/rsync_remote.stderr`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/rsync_remote.stdout`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/running_41256521.raw.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/scp_bundle.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/scp_bundle.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/scp_script.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/scp_script.stdout`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/ssh_cuda_check.err`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/ssh_cuda_check.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/start_41256521.raw.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/start_41256521_poll.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/start_41256521_poll_tmp.raw.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/stop_41256521.raw.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/stop_41256521_final.raw.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/stop_41256521_poll.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/stop_41256521_poll_tmp.raw.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/tmux_start.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/local_vast/tmux_start.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/remote/build/cargo_build_release.log`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/remote/correctness/effective_config_keys.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_autosize_serve_smoke_cuda_2026-06-17/remote/correctness/log_blocker_scan.txt`
@@ -2512,7 +2377,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/remote/nvidia_smi_before_profile.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/remote/runner.pid`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/remote/start_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/server/models.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_batch_prefill_fallback_reason_diag_2026-06-16/server/models_curl_last.err`
@@ -3169,7 +3033,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_active_decode_prefill_source_2026-06-17/summary.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17/.gitignore`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17/gpu_contract.md`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17/local_vast/ferrum_3880af03_to_9fbfb773.bundle`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17/local_vast/ferrum_3880af03_to_9fbfb773.bundle.sha256`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17/local_vast/query_41241013_before.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_c32_serve_smoke_cuda_2026-06-17/local_vast/remote_checkout.txt`
@@ -3215,9 +3078,7 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/create_request_40219701.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/create_response_40219701.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/create_response_40219701_http_code.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/ferrum_9fbfb773_to_75c0f711.bundle`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/ferrum_9fbfb773_to_75c0f711.bundle.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/ferrum_head_75c0f711.bundle`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/ferrum_head_75c0f711.bundle.sha256`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/instances_after_create_40219701.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/instances_audit_after_insufficient_credit.sanitized.json`
@@ -3236,7 +3097,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/restart_41276321_response.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/restart_41276321_retry.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/restart_41276321_retry_http_code.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/resume_probe_20260617T_after_checkpoint/vast_status.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/resume_probe_20260617T_after_checkpoint/vast_status.summary.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/run_remote_full_matrix.sh`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_dynamic_kv_full_matrix_samehw_cuda_2026-06-17/local_vast/run_remote_full_matrix.sh.sha256`
@@ -3309,11 +3169,9 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/bench/bench-serve.stderr`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/bench/bench-serve.stdout`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/bench/bench_fa2_source_sharegpt_c16_16x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/config/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/diagnostic_check.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/driver.nohup.log`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/driver.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/gpu_contract.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/local/remote_start_run.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/local/run_fa2_source_smoke.sh`
@@ -3358,11 +3216,9 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/vast_shutdown/stop_poll_01.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/vast_shutdown/stop_poll_02.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_full_config_smoke_2026-06-16/vast_shutdown/stop_request_response.sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/config/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/diagnostic_check.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/driver.nohup.log`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/driver.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/gpu_contract.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/local/remote_start_run.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_fa2_source_gemma_smoke_2026-06-16/local/run_fa2_source_smoke.sh`
@@ -3532,7 +3388,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/remote/source.diff`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/remote/ssh_cuda_probe.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/remote/start_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/server/models.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_full_logits_unified_prefill_cuda_diag_2026-06-16/server/models_curl_last.err`
@@ -3645,81 +3500,7 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gate_up_split_native_probe_2026-06-16/vast_instance_40826362.final.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_active_decode_chunk_source_2026-06-17/summary.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/l5_gemma3-27b-gptq_cuda_1_4_16.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/embed.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_00.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_01.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_02.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_03.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_04.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_05.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_06.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_07.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_08.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_09.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_10.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_11.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_12.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_13.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_14.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_15.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_16.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_17.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_18.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_19.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_20.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_21.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_22.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_23.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_24.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_25.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_26.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_27.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_28.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_29.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_30.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_31.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_32.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_33.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_34.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_35.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_36.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_37.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_38.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_39.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_40.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_41.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_42.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_43.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_44.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_45.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_46.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_47.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_48.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_49.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_50.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_51.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_52.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_53.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_54.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_55.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_56.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_57.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_58.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_59.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_60.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/layer_61.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/logit_dump_smoke/logits.bin`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/smoke_gemma3-27b-gptq.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/embed.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_00.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_01.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_02.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_03.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_04.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_05.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_06.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/layer_07.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_nan_logits_2026-06-13/gates_early/logit_dump_smoke/logits.bin`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/gpu_contract.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/bundle_finite_verify.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_shadow_graph_native_probe_2026-06-15/local/bundle_fix_verify.txt`
@@ -3866,134 +3647,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_greedy_argmax_default_diag_2026-06-15/vast_shutdown/poll_03.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_greedy_argmax_default_diag_2026-06-15/vast_shutdown/stop_response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_greedy_argmax_default_diag_2026-06-15/vast_shutdown/stopped_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/embed.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_00.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_01.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_02.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_03.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_04.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_05.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_06.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_07.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_08.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_09.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_10.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_11.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_12.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_13.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_14.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_15.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_16.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_17.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_18.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_19.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_20.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_21.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_22.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_23.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_24.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_25.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_26.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_27.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_28.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_29.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_30.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_31.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_32.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_33.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_34.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_35.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_36.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_37.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_38.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_39.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_40.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_41.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_42.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_43.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_44.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_45.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_46.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_47.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_48.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_49.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_50.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_51.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_52.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_53.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_54.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_55.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_56.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_57.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_58.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_59.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_60.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/layer_61.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/run_nan/layer_dump/logits.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/embed.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_00.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_01.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_02.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_03.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_04.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_05.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_06.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_07.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_08.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_09.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_10.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_11.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_12.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_13.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_14.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_15.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_16.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_17.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_18.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_19.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_20.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_21.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_22.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_23.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_24.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_25.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_26.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_27.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_28.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_29.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_30.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_31.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_32.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_33.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_34.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_35.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_36.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_37.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_38.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_39.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_40.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_41.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_42.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_43.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_44.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_45.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_46.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_47.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_48.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_49.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_50.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_51.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_52.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_53.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_54.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_55.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_56.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_57.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_58.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_59.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_60.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/layer_61.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_host_shadow_cuda_2026-06-13/smoke/logit_dump/logits.bin`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/build/build.command.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/build/cargo_build_release.log`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_kv_defer_full_sweep_hist58_2026-06-17_8181a99d/correctness/models.json`
@@ -4236,7 +3889,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16/remote/pre_run_status.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16/remote/runner.pid`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16/remote/start_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16/run_remote_marlin_profile.sh`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_marlin_gather_profile_2026-06-16/server/models.json`
@@ -4582,7 +4234,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/remote/nvidia_smi_before_profile.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/remote/runner.pid`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/remote/start_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/server/models.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_paged_kv_unified_cuda_smoke_2026-06-16/server/models_curl_last.err`
@@ -5186,7 +4837,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/rsync_artifact.stdout`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/rsync_source.stderr`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/rsync_source.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/scp_contract.stderr`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_profiler_graph_disabled_retry_2026-06-16/server/models.json`
@@ -5624,7 +5274,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/remote/build.pid`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/remote/ferrum.base.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/remote/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/remote/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/remote/git_sha.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/remote/git_status_short.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/remote/gpu_health.txt`
@@ -5682,7 +5331,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/run_token_budget_ab.sh`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_token_budget_c16_ab_2026-06-16/summary.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_ttft_profile_c16_2026-06-16/gpu_contract.md`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_ttft_profile_c16_2026-06-16/remote/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_ttft_profile_c16_2026-06-16/run_profile.sh`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_ttft_profile_c16_2026-06-16/summary.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/bench/bench_c16.command.txt`
@@ -5708,7 +5356,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/remote/nvidia_smi_before.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/remote/nvidia_smi_before_profile.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/remote/vast_status_raw.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/run_profile.nohup.log`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/run_profile.pid`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_decode_profile_2026-06-16/run_profile.rc`
@@ -5749,7 +5396,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_2026-06-16/remote/nvidia_smi_before.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_2026-06-16/remote/nvidia_smi_before_profile.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_2026-06-16/remote/start_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_2026-06-16/run_remote_profile.sh`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_2026-06-16/server/models.json`
@@ -5831,7 +5477,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/rsync_artifact.stdout`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/rsync_source.stderr`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/rsync_source.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/scp_contract.stderr`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_capture_retry_2026-06-16/server/models.json`
@@ -5886,7 +5531,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/remote/nvidia_smi_before.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/remote/nvidia_smi_before_profile.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/remote/start_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/run_remote_profile.sh`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_typed_prefill_profile_retry_2026-06-16/server/models.json`
@@ -5935,7 +5579,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/remote/c16_profile/bench.stdout`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/remote/c16_profile/nvidia_smi_after.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/remote/ferrum.base.toml`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/remote/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/remote/log_scan.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/remote/meta/cargo_version.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_argmax_c16_cuda_diag_2026-06-17/remote/meta/ferrum.sha256`
@@ -6035,7 +5678,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/remote/nvidia_smi_before_profile.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/remote/runner.pid`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/remote/start_utc.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/run_cwd/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/run_profile.rc`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/server/models.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_decode_fallback_reason_cuda_diag_2026-06-16/server/models_curl_last.err`
@@ -6408,7 +6050,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/remote/c16_profile_kv512/bench.stderr`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/remote/c16_profile_kv512/bench.stdout`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/remote/c16_profile_kv512/nvidia_smi_after.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/remote/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/remote/log_scan_kv512.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/remote/meta/ferrum.sha256`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_unified_op_profile_c16_rerun_2026-06-16/remote/meta/git_sha.txt`
@@ -6696,8 +6337,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_sharegpt_baseline_probe_2026-06-15/vast_shutdown/stopped.sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_source_diff_2026-06-16/summary.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_vllm_source_diff_2026-06-16/summary.md`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T121726Z_8181a99d/cuda_build/input.bin`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T121726Z_8181a99d/cuda_build/output.bin`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/cuda_run.stderr.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/cuda_run.stdout.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T123139Z_da2802bd/cuda_build/delta_rule_s0`
@@ -6716,10 +6355,8 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/cuda_build/cuda_run.stdout.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/cuda_build/delta_rule_s0`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/cuda_build/delta_rule_s0.cu`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/cuda_build/input.bin`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/cuda_build/nvcc_compile.stderr.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/cuda_build/nvcc_compile.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/cuda_build/output.bin`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/local_vast/vast_cleanup_summary.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/nvcc_version.txt`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_delta_rule_s0_cuda_20260617T203149Z_c8b8da1f/nvidia_smi_gpu.csv`
@@ -7049,7 +6686,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on/behavior/04_custom_stop.response.request.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on/behavior/05_reasoning_extraction.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on/known_answer_report.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on/known_answers/01_addition_2_plus_3.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_aux_overlap_ab_20260621T153830Z_dirty/correctness_default_on/known_answers/01_addition_2_plus_3.response.request.json`
@@ -7584,7 +7220,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cleanup_real_product_20260621T120820Z_17d8eb38_dirty/behavior/04_custom_stop.response.request.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cleanup_real_product_20260621T120820Z_17d8eb38_dirty/behavior/05_reasoning_extraction.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cleanup_real_product_20260621T120820Z_17d8eb38_dirty/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cleanup_real_product_20260621T120820Z_17d8eb38_dirty/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cleanup_real_product_20260621T120820Z_17d8eb38_dirty/known_answer_report.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cleanup_real_product_20260621T120820Z_17d8eb38_dirty/known_answers/01_addition_2_plus_3.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_cleanup_real_product_20260621T120820Z_17d8eb38_dirty/known_answers/01_addition_2_plus_3.response.request.json`
@@ -8813,7 +8448,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty/behavior/04_custom_stop.response.request.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty/behavior/05_reasoning_extraction.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty/known_answer_report.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty/known_answers/01_addition_2_plus_3.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_linear_scratch_real_product_20260621T130848Z_dirty/known_answers/01_addition_2_plus_3.response.request.json`
@@ -9500,7 +9134,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8/behavior/04_custom_stop.response.request.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8/behavior/05_reasoning_extraction.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8/known_answer_report.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8/known_answers/01_addition_2_plus_3.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_block8_policy_ab_20260621T160946Z_dirty/correctness_default_block8/known_answers/01_addition_2_plus_3.response.request.json`
@@ -9548,7 +9181,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/bench_c32_100x1.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/decision_trace.jsonl`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/gpu_after_bench.csv`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/gpu_before_bench.csv`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_off/health.json`
@@ -9561,7 +9193,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/bench_c32_100x1.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/decision_trace.jsonl`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/gpu_after_bench.csv`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/gpu_before_bench.csv`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/bench_graph_on/health.json`
@@ -9583,7 +9214,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/correctness_graph_on/behavior/04_custom_stop.response.request.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/correctness_graph_on/behavior/05_reasoning_extraction.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/correctness_graph_on/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/correctness_graph_on/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/correctness_graph_on/known_answer_report.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/correctness_graph_on/known_answers/01_addition_2_plus_3.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_moe_body_graph_ab_20260621T144117Z_dirty/correctness_graph_on/known_answers/01_addition_2_plus_3.response.request.json`
@@ -10371,7 +10001,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_step_diag_20260621T180847Z_8b14507d/local_vast/instances_after_insufficient_credit.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_step_diag_20260621T180847Z_8b14507d/local_vast/lane_contract.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_prefill_step_diag_20260621T180847Z_8b14507d/local_vast/selected_offer.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model/config.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model/model.safetensors`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_product_smoke_local_20260617T222748Z/qwen35-reference-model/tokenizer.json`
@@ -10564,945 +10193,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_residual_fuse_085fe3ce_20260624/vast/instance_before_stop_sanitized.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_residual_fuse_085fe3ce_20260624/vast/stop_poll.tsv`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_residual_fuse_085fe3ce_20260624/vast/stop_response_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/account_probe_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/action_time_ledger_20260623.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_diag_payload_40361339_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_diag_response_40361339_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_full_l5_payload_31740755_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_full_l5_response_31740755_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_payload_36867729_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_response_36867729_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_retry_payload_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_retry_selected_offers_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/create_retry_summary_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/instance_41422823_status_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/instance_42184688_after_failed_start_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/instance_42184688_running_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/instance_42194222_running_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/instances_list_41422823_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/local_resume_full_l5_39ffe5db.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/offers_1x4090_current_20260623_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/offers_1x4090_resume_20260623_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/offers_1x4090_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote/ssh_cuda_check.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/build/build.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/build/build.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/build/build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/build/build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/logs/git_sync.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/logs/metadata.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/logs/runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/logs/runner.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/logs/runner.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/run_default/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/run_default/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/run_default/ferrum_run.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/run_default/ferrum_run.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/run_default/ferrum_run.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/run_default/ferrum_run.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/run_smoke.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/curl.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/curl.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/serve.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry1_20260623/serve_default/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/logs/metadata.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/logs/pass.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/response_check.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_autosize_35b31ec3_retry2_serve_20260623/serve_default/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/build/build.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/build/build.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/build/build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/build/build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/logs/nohup.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/logs/nohup.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/logs/nvidia_after_forced_stop.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/logs/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/logs/runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/perf/bench-ferrum-c16.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/run_diag.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_diag_71d01876_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/build/build.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/build/build.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/build/build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/build/build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/logs/nohup.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/logs/nohup.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/logs/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/logs/runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/perf/bench-ferrum-c16.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/perf/bench_ferrum_c16_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/run_diag.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_compact_state_syncfix_diag_013546b7_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/logs/nohup.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/logs/nohup.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/logs/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/logs/runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/perf/bench-ferrum-c16.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/run_diag.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_c16_typed_maxseqs_diag_5198214c_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/PASS.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/bin/ferrum_new.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/bin/ferrum_old.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/git_status_after_pull.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/git_sync.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/git_sync.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/new_build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/new_build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/new_checkout.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/new_checkout.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/new_git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/new_git_status.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/old_build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/old_build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/old_checkout.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/old_checkout.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/old_git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/env/old_git_status.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/hardware/nvidia_smi_after.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/lane.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/perf/bench_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/runtime_env.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/new/variant.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/perf/bench_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/runtime_env.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/old/variant.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/run.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/run.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/script_head.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_decode_moe_reuse_ab_ee208427_20260623_retry2/summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/build/build.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/build/build.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/build/build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/build/build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/logs/nohup.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/logs/nohup.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/logs/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/logs/runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/perf/bench-ferrum-c16.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/perf/bench_ferrum_c16_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/run_diag.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_c16_smoke_39ffe5db_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/build/build.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/build/build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/build/build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/commands/w3_l5_concurrency.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/commands/w3_l5_concurrency.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/commands/w3_l5_concurrency.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/env/git_status_tracked.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/env/rustc_version.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/hardware/nvidia_smi_before_l5.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/hardware/nvidia_smi_query.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/l5/w3_l5_concurrency.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/logs/full_l5.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/logs/full_l5.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/logs/full_l5.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/logs/full_l5_preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/logs/nvidia_after_l5.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/logs/pass.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/perf/bench-ferrum.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/perf/bench_ferrum_sharegpt_sweep_100x3.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/prefetch/prefetch.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/prefetch/prefetch.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/prefetch/prefetch.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/scheduler_trace_by_cell_summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/scheduler_trace_summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/scripts/build_cuda.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/scripts/prefetch_model.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/scripts/run_full_l5.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_checkout.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_checkout.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_clone.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_clone.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_fetch.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_fetch.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_pull.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/git_pull.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/pip_install.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/pip_install.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/rust_toolchain.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/rust_toolchain.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/rustup-init.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/rustup_install.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_default_full_l5_39ffe5db_new42216671_20260623/setup/rustup_install.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/action_time_ledger_20260623.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/build/build.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/build/build_cuda.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/build/build_cuda.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run/ferrum_run.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run/ferrum_run.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run/ferrum_run.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run/ferrum_run.stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c1/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c1/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c1/ferrum_run.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c1/ferrum_run.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c1/ferrum_run.stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c16/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c16/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c16/ferrum_run.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c16/ferrum_run.stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c16/terminated_after_oom.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c4/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c4/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c4/ferrum_run.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c4/ferrum_run.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c4/ferrum_run.stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c8/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c8/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c8/ferrum_run.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c8/ferrum_run.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/diag_run_c8/ferrum_run.stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/gpu_contract.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/hardware/nvcc_version.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/hardware/nvidia_smi_query.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l2_from_product_c8/w3_l2_quantized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l2_from_product_c8.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l2_from_product_c8.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l2_from_product_c8.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/negative/negative_response_format.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/negative/negative_response_format.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/negative/negative_tool_choice.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/negative/negative_tool_choice.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_00.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_00.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_01.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_01.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_02.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_02.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_03.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_03.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_04.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_04.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_05.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_05.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_06.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_06.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_07.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_07.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_08.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_08.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_09.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_09.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_10.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_10.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_11.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_11.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_12.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_12.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_13.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_13.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_14.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_14.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_15.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_15.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_16.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_16.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_17.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_17.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_18.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_18.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_19.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/strict_schema/strict_schema_19.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_00.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_00.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_01.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_01.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_02.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_02.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_03.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_03.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_04.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_04.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_05.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_05.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_06.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_06.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_07.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_07.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_08.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_08.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_09.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/tool_calls/tool_09.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate/w3_l4_agent.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/gate.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/hidden_env_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/health.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/health.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/serve.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/wrapper.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l4_c8/wrapper.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/gate.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/hidden_env_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/perf/bench-ferrum.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/health.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/health.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/serve.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/wrapper.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8/wrapper.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/hidden_env_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/perf/bench_c16_smoke.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/health.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/health.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/serve.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt192_c16_smoke/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/hidden_env_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/server/health.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/server/health.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/server/serve.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/wrapper.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/l5_c8_mbt2048_c16_smoke/wrapper.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/logs/git_sha_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/logs/git_status_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/prefetch/prefetch.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/prefetch/prefetch.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/prefetch/prefetch.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/01_multi_turn.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/01_multi_turn.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/02_stream_match_nonstream.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/02_stream_match_nonstream.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/02_stream_match_stream.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/02_stream_match_stream.response.sse`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/03_natural_eos.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/03_natural_eos.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/04_custom_stop.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/04_custom_stop.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/05_reasoning_extraction.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/ferrum.toml`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answer_report.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/01_addition_2_plus_3.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/01_addition_2_plus_3.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/02_subtraction_7_minus_4.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/02_subtraction_7_minus_4.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/03_capital_france.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/03_capital_france.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/04_capital_italy.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/04_capital_italy.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/05_capital_japan.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/05_capital_japan.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/06_clear_sky_color.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/06_clear_sky_color.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/07_opposite_hot.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/07_opposite_hot.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/08_alphabet_first_letter.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/08_alphabet_first_letter.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/09_days_in_week.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/09_days_in_week.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/10_freezing_water_celsius.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/known_answers/10_freezing_water_celsius.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/report.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/report.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/report.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/run_command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/run_stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/run_stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/serve_command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/w3_l3_behavior.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/w3_qwen35_real_product_report.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_diag_2e5b2721_20260623/product_c8/w3_s2_whole_model_product_path.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/build/build.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/build/build.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/build/build.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/build/build.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/commands/w3_l5_concurrency.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/commands/w3_l5_concurrency.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/commands/w3_l5_concurrency.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/hardware/nvidia_smi_query.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/l5/w3_l5_concurrency.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/l5_effective/w3_l5_concurrency.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/logs/nohup.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/logs/nohup.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/logs/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/logs/runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/perf/bench-ferrum.command.fixed.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/perf/bench-ferrum.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/perf/bench_ferrum_sharegpt_sweep_100x3.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/run_l5.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_l5_autosize_35b31ec3_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/perf/bench_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/runtime_env.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block32/variant.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/perf/bench_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/runtime_env.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/block8/variant.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/perf/bench_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/runtime_env.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/default/variant.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/env/git_status.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/env/git_sync.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/env/git_sync.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/hardware/nvidia_smi_after.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_moe_block_ab_diag_e5daa58c_20260623/summary.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/perf/bench_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/runtime_env.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/baseline/variant.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/env/git_status.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/env/git_sync.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/env/git_sync.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/hardware/nvidia_smi_after.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/perf/bench_32x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/runtime_env.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/pair_ids/variant.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_pair_ids_ab_diag_e5daa58c_20260623/summary.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l2.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l2.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l2.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l2.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l4.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l4.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l4.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/l4.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/product.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/product.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/product.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/commands/product.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l2/w3_l2_quantized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/negative/negative_response_format.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/negative/negative_response_format.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/negative/negative_tool_choice.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/negative/negative_tool_choice.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_00.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_00.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_01.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_01.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_02.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_02.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_03.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_03.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_04.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_04.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_05.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_05.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_06.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_06.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_07.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_07.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_08.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_08.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_09.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_09.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_10.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_10.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_11.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_11.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_12.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_12.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_13.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_13.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_14.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_14.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_15.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_15.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_16.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_16.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_17.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_17.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_18.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_18.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_19.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/strict_schema/strict_schema_19.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_00.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_00.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_01.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_01.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_02.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_02.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_03.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_03.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_04.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_04.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_05.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_05.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_06.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_06.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_07.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_07.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_08.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_08.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_09.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/tool_calls/tool_09.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/l4/w3_l4_agent.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/logs/nohup.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/logs/nohup.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/logs/pass_lines.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/logs/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/logs/runner.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/01_multi_turn.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/01_multi_turn.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/02_stream_match_nonstream.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/02_stream_match_nonstream.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/02_stream_match_stream.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/02_stream_match_stream.response.sse`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/03_natural_eos.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/03_natural_eos.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/04_custom_stop.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/04_custom_stop.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/05_reasoning_extraction.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/ferrum.toml`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answer_report.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/01_addition_2_plus_3.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/01_addition_2_plus_3.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/02_subtraction_7_minus_4.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/02_subtraction_7_minus_4.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/03_capital_france.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/03_capital_france.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/04_capital_italy.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/04_capital_italy.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/05_capital_japan.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/05_capital_japan.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/06_clear_sky_color.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/06_clear_sky_color.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/07_opposite_hot.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/07_opposite_hot.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/08_alphabet_first_letter.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/08_alphabet_first_letter.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/09_days_in_week.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/09_days_in_week.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/10_freezing_water_celsius.response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/known_answers/10_freezing_water_celsius.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/run_command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/run_stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/run_stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/serve_command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/w3_l3_behavior.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/w3_qwen35_real_product_report.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/product/w3_s2_whole_model_product_path.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/run_product_l2_l4.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_product_l2_l4_autosize_35b31ec3_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/env/git_status.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/env/git_sync.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/env/git_sync.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/hardware/nvidia_smi_after.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/perf/bench.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/perf/bench.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/perf/bench.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/perf/bench.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/perf/bench_profile_16x1.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/chat_smoke.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/chat_smoke_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/profile.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/serve.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/serve.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_profile_diag_e5daa58c_20260623/summary.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/baseline_override/README.md`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/baseline_override/bench-vllm-fixed-output.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/baseline_preflight/configured_baseline/baseline_build_command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/baseline_preflight/configured_baseline/baseline_server_command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/baseline_preflight.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/build/build_cuda.command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/build/build_cuda.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/build/build_cuda.result.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/build/build_cuda.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/build/build_cuda.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/commands/w3_product_report.command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/commands/w3_product_report.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/commands/w3_product_report.result.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/commands/w3_product_report.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/commands/w3_product_report.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/env/binary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/env/git_status.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/env/scrubbed_hidden_env.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/gpu_contract.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/hardware/hardware.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/hardware/nvcc_version.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/hardware/nvidia_smi_query.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/lane_summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/logs/git_sha_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/logs/git_status_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/logs/lane.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/logs/lane.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/logs/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/prefetch/prefetch.command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/prefetch/prefetch.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/prefetch/prefetch.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/prefetch/prefetch.result.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/product/ferrum.toml`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/product/run_command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/product/run_stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623/product/run_stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/baseline_override/README.md`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/baseline_override/bench-vllm-fixed-output.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/baseline_preflight/configured_baseline/baseline_build_command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/baseline_preflight/configured_baseline/baseline_server_command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/baseline_preflight.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/commands/w3_product_report.command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/commands/w3_product_report.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/commands/w3_product_report.result.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/commands/w3_product_report.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/commands/w3_product_report.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/env/binary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/env/git_status.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/env/scrubbed_hidden_env.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/gpu_contract.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/hardware/hardware.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/hardware/nvcc_version.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/hardware/nvidia_smi_query.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/lane_summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/logs/git_sha_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/logs/git_status_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/logs/lane.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/logs/lane.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/logs/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/prefetch/prefetch.skipped.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/product/ferrum.toml`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/product/run_command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/product/run_stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192/product/run_stdout.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/baseline_override/README.md`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/baseline_override/bench-vllm-fixed-output.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/baseline_preflight/configured_baseline/baseline_build_command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/baseline_preflight/configured_baseline/baseline_server_command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/baseline_preflight.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/commands/w3_product_report.command.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/commands/w3_product_report.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/commands/w3_product_report.result.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/commands/w3_product_report.stderr.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/commands/w3_product_report.stdout.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/env/binary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/env/git_status.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/env/scrubbed_hidden_env.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/gpu_contract.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/hardware/hardware.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/hardware/nvcc_version.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/hardware/nvidia_smi_query.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/lane_summary.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/logs/git_sha_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/logs/git_status_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/logs/lane.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/logs/lane.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/logs/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/prefetch/prefetch.skipped.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_release_current_75537857_20260623_kv8192_blocks512/product/ferrum.toml`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_true_c32_guard_e5daa58c_20260623/command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_true_c32_guard_e5daa58c_20260623/exit_code.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_true_c32_guard_e5daa58c_20260623/stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_true_c32_guard_e5daa58c_20260623/stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/env/ferrum.sha256`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/env/git_sha.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/hardware/nvidia_smi_before.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/logs/diag.exit`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/logs/diag.stderr.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/logs/diag.stdout.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/logs/nvidia_after.csv`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/logs/preflight.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/scripts/run_typed_c32_diag.sh`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/decision_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/effective_config.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/models.curl.err`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/models.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/scheduler_trace.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/serve.command.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/serve.log`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/server.pid`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/server.wait.stderr`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_artifacts/w3_qwen35_typed_c32_short_diag_39ffe5db_new42216671_20260623/server/server.wait.stdout`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/remote_diag_42194222/ssh_cuda_check.txt`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/start_42184688_poll_2.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/start_42184688_response_2.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/start_poll_42184688.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/start_poll_42194222.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/stop_42184688_poll.jsonl`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/stop_42184688_response.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/stop_42184688_status_sanitized.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_resume_vast_state_20260623/vast_instance_42216671_stop_20260623.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/compare/w3_qwen35_layer_compare_manifest.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump/tensors/a_raw.bin`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_s1_compare_20260617T144200Z_7dc3de10/ferrum_dump/tensors/b_raw.bin`
@@ -11904,7 +10594,6 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/behavior/04_custom_stop.response.request.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/behavior/05_reasoning_extraction.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/behavior/05_reasoning_extraction.response.request.json`
-- `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/ferrum.toml`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/known_answer_report.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/known_answers/01_addition_2_plus_3.response.json`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w3_qwen35_unified_prefill_cuda_smoke_20260620T021129Z_75ec7e6e/real_product_report/known_answers/01_addition_2_plus_3.response.request.json`
@@ -12074,6 +10763,7 @@ Crates on disk not listed in workspace:
 - `docs/goals/model-coverage-2026-06-12/w3_qwen35_current_evidence_config.json`
 - `docs/goals/release-0.7.7-2026-06-11/GOAL.md`
 - `docs/goals/release-regression-hardening-2026-06-28/GOAL.md`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/CORRECTNESS_ACCEPTANCE_AMENDMENT_2026-08-07.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/EXECUTION_STRATEGY_AMENDMENT_2026-07-14.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_BASELINE.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/G00_M3_METAL_32GB_AMENDMENT.md`
@@ -12094,7 +10784,13 @@ Crates on disk not listed in workspace:
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/G09_PERFORMANCE.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/G10_RELEASE.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/GOAL.md`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/HANDOFF_2026-08-13.md`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/HOST_SUSPEND_EVIDENCE_AMENDMENT_2026-08-12.md`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/METAL_HOST_GLOBAL_SWAP_NOISE_AMENDMENT_2026-08-13.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/MODEL_MATRIX.md`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/PERFORMANCE_ACCEPTANCE_AMENDMENT_2026-08-06.md`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/RELEASE_ACCELERATION_AMENDMENT_2026-08-06.md`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/REUSABLE_EXECUTION_CAPTURE_POLICY.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/S0A_CONTRACT_SPLIT_MAP.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/S0A_EVENT_DEPENDENCY_AUDIT.md`
 - `docs/goals/runtime-vnext-0.8.0-2026-07-10/S0A_EXECUTION_DEPENDENCY_AUDIT.md`
@@ -12389,6 +11085,7 @@ Crates on disk not listed in workspace:
 - `docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md`
 - `docs/release/cleanup/20260802-operation-s0a-inventory.md`
 - `docs/release/cleanup/20260804-invocation-backing-initialization-inventory.md`
+- `docs/release/cleanup/20260805-device-operation-driver-split-inventory.md`
 - `docs/release/cleanup/20260805-dispatch-owner-split-inventory.md`
 - `docs/release/g0/0.7.7/README.md`
 - `docs/release/g0/0.7.7/cargo-publish/crates_io_visibility.json`
@@ -12978,26 +11675,6 @@ Crates on disk not listed in workspace:
 - `docs/release/g0/0.7.7/unit/g0-validator-selftest.log`
 - `docs/release/g0/0.7.7/unit/g1-g3-g4-validator-selftest.log`
 - `docs/release/g0/0.7.7/unit/gate.manifest.json`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__metal_readme_regression.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__backend_boundary_audit.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__backend_runtime_preset_goal_gate.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__backend_runtime_preset_snapshot.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__g0_cuda_llama33_70b_4bit_2x4090_gate.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__g0_cuda_llama_dense_gate.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__g0_release_summary.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__inventory_tree.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__layer_split_perf_goal_gate.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__llama33_70b_4bit_2x4090_goal_gate.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__openai_concurrency_quality_regression.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__openai_tool_call_regression.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__release_binary_gate.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__run_gate.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__run_layer_split_perf_goal.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__run_scenarios.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__selftest_g0_validators.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__selftest_g1_g3_g4_release_regression.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__validate_metal_readme_regression.py.pyc`
-- `docs/release/g0/0.7.7/unit/release-scripts-pycompile-cache/scripts__release__validate_release_completion_manifest.py.pyc`
 - `docs/release/g0/0.7.7/unit/release-scripts-pycompile.log`
 - `docs/release/g0/0.7.7/unit/run_gate.child.command.json`
 - `docs/release/g0/0.7.7/unit/run_gate.child.stderr`
@@ -13274,6 +11951,10 @@ Crates on disk not listed in workspace:
 - `docs/release/qwen3-api-issues/20260605-112838-85c9edb4/run-multiturn-final/run_multiturn.summary.json`
 - `docs/release/qwen3-api-issues/20260605-112838-85c9edb4/targeted-regression-summary.json`
 - `docs/release/qwen3-api-issues/20260605-112838-85c9edb4/targeted-regression-summary.md`
+- `docs/release/runtime-vnext/0.8.0/MIGRATION.md`
+- `docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md`
+- `docs/release/runtime-vnext/0.8.0/RELEASE_NOTES.md`
+- `docs/release/runtime-vnext/0.8.0/SUPPORT_MATRIX.md`
 - `docs/release/runtime-vnext/0.8.0/diagnostics/20260714-cuda-embedding-compile/attempt-1-instance.json`
 - `docs/release/runtime-vnext/0.8.0/diagnostics/20260714-cuda-embedding-compile/attempt-1-result.json`
 - `docs/release/runtime-vnext/0.8.0/diagnostics/20260714-cuda-embedding-compile/attempt-2-instance.json`
@@ -13291,6 +11972,7 @@ Crates on disk not listed in workspace:
 - `docs/cuda-tts-graph-session-2026-04-19.md`
 - `docs/dim5-model-wireup-plan.md`
 - `docs/goals/model-coverage-2026-06-12/artifacts/w2_gemma3_cuda_host_shadow_l5_fail_2026-06-13/gates/session_metadata.json`
+- `docs/goals/runtime-vnext-0.8.0-2026-07-10/CHANGE_IMPACT_REGRESSION_PLAN_2026-08-12.md`
 - `docs/m1-max-qwen3-moe-perf-plan.md`
 - `docs/marlin-integration-postmortem.md`
 - `docs/phase-d-migration-plan.md`
@@ -13317,43 +11999,199 @@ Crates on disk not listed in workspace:
 
 ## Archive/delete candidate reference counts
 
-- `scripts/analyze_layer_dump.py`: git-grep references = 29
-- `scripts/analyze_unified_graph_log.py`: git-grep references = 24
-- `scripts/bottleneck_localize.sh`: git-grep references = 31
-- `scripts/check_ferrum_env_registry.py`: git-grep references = 43
-- `scripts/gemma3_l1_reference.py`: git-grep references = 27
-- `scripts/gen_chat_template_goldens.py`: git-grep references = 32
-- `scripts/graph_repro.cu`: git-grep references = 29
-- `scripts/graph_repro_v2.cu`: git-grep references = 27
-- `scripts/graph_repro_v3.cu`: git-grep references = 27
-- `scripts/graph_repro_v4.cu`: git-grep references = 28
-- `scripts/graph_repro_v5.cu`: git-grep references = 27
-- `scripts/graph_repro_v6.cu`: git-grep references = 26
-- `scripts/graph_repro_v7.cu`: git-grep references = 26
-- `scripts/graph_repro_v8.cu`: git-grep references = 26
-- `scripts/inspect_hf_gptq_tensor.py`: git-grep references = 30
-- `scripts/lm_eval_light.sh`: git-grep references = 34
-- `scripts/lock_gpu.sh`: git-grep references = 36
-- `scripts/metal_readme_regression.py`: git-grep references = 44
-- `scripts/model_coverage_smoke.sh`: git-grep references = 72
-- `scripts/paris_bisect.sh`: git-grep references = 33
-- `scripts/phase-e-gen-baseline.py`: git-grep references = 27
-- `scripts/phase-e-verify.sh`: git-grep references = 31
-- `scripts/probe_chat.sh`: git-grep references = 24
-- `scripts/regen-fused-moe-tile-sweep.sh`: git-grep references = 30
-- `scripts/regen-triton-ptx.sh`: git-grep references = 27
-- `scripts/release.sh`: git-grep references = 31
-- `scripts/remote.sh`: git-grep references = 26
-- `scripts/run_graph_repro.sh`: git-grep references = 26
-- `scripts/setup_gpu.sh`: git-grep references = 28
-- `scripts/sweep-fused-moe-tiles.sh`: git-grep references = 28
-- `scripts/sweep_bottleneck.sh`: git-grep references = 42
-- `scripts/test_chat_suites.sh`: git-grep references = 31
-- `scripts/test_gpu.sh`: git-grep references = 30
-- `scripts/unlock_gpu.sh`: git-grep references = 34
-- `scripts/visualize_layerwise.py`: git-grep references = 33
-- `scripts/w1_finalize_cells.py`: git-grep references = 24
-- `scripts/w1_goal_validator.py`: git-grep references = 37
-- `scripts/w1_l5_batch.sh`: git-grep references = 24
-- `scripts/w1_perf_spread.py`: git-grep references = 25
-- `scripts/w2_goal_validator.py`: git-grep references = 38
+- `scripts/analyze_layer_dump.py`: git-grep references = 33
+- `scripts/analyze_unified_graph_log.py`: git-grep references = 28
+- `scripts/bottleneck_localize.sh`: git-grep references = 35
+- `scripts/check_ferrum_env_registry.py`: git-grep references = 47
+- `scripts/gemma3_l1_reference.py`: git-grep references = 31
+- `scripts/gen_chat_template_goldens.py`: git-grep references = 36
+- `scripts/graph_repro.cu`: git-grep references = 33
+- `scripts/graph_repro_v2.cu`: git-grep references = 31
+- `scripts/graph_repro_v3.cu`: git-grep references = 31
+- `scripts/graph_repro_v4.cu`: git-grep references = 32
+- `scripts/graph_repro_v5.cu`: git-grep references = 31
+- `scripts/graph_repro_v6.cu`: git-grep references = 30
+- `scripts/graph_repro_v7.cu`: git-grep references = 30
+- `scripts/graph_repro_v8.cu`: git-grep references = 30
+- `scripts/inspect_hf_gptq_tensor.py`: git-grep references = 34
+- `scripts/lm_eval_light.sh`: git-grep references = 38
+- `scripts/lock_gpu.sh`: git-grep references = 40
+- `scripts/metal_readme_regression.py`: git-grep references = 46
+- `scripts/model_coverage_smoke.sh`: git-grep references = 76
+- `scripts/paris_bisect.sh`: git-grep references = 37
+- `scripts/phase-e-gen-baseline.py`: git-grep references = 31
+- `scripts/phase-e-verify.sh`: git-grep references = 37
+- `scripts/probe_chat.sh`: git-grep references = 28
+- `scripts/regen-fused-moe-tile-sweep.sh`: git-grep references = 34
+- `scripts/regen-triton-ptx.sh`: git-grep references = 31
+- `scripts/release.sh`: git-grep references = 35
+- `scripts/remote.sh`: git-grep references = 30
+- `scripts/run_graph_repro.sh`: git-grep references = 30
+- `scripts/setup_gpu.sh`: git-grep references = 32
+- `scripts/sweep-fused-moe-tiles.sh`: git-grep references = 32
+- `scripts/sweep_bottleneck.sh`: git-grep references = 46
+- `scripts/test_chat_suites.sh`: git-grep references = 35
+- `scripts/test_gpu.sh`: git-grep references = 34
+- `scripts/unlock_gpu.sh`: git-grep references = 38
+- `scripts/visualize_layerwise.py`: git-grep references = 37
+- `scripts/w1_finalize_cells.py`: git-grep references = 28
+- `scripts/w1_goal_validator.py`: git-grep references = 41
+- `scripts/w1_l5_batch.sh`: git-grep references = 28
+- `scripts/w1_perf_spread.py`: git-grep references = 29
+- `scripts/w2_goal_validator.py`: git-grep references = 42
+
+## Cleanup plan applied 2026-08-15
+
+Reference counts below exclude `docs/release/cleanup/*`, because generated
+inventories enumerate one another without creating an operational dependency.
+All removed files remain recoverable from Git history.
+
+### Stale documentation
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `docs/DEVELOPMENT.md` | obsolete developer guide | 0 | Describes removed `ferrum-runtime` / `cuda-ffi` crates and conflicts with the current `AGENTS.md` gate workflow. |
+| `docs/voice-clone-debug.md` | superseded debug note | 0 | Mid-investigation snapshot superseded by the checked-in voice-clone postmortems. |
+| `docs/phase-f-qwen3-tts-port.md` | completed migration plan | 0 | References removed attention paths; the implementation now lives under `multimodal/` and `ferrum-kernels`. |
+| `docs/cuda-graphs-plan.md` | obsolete design plan | 0 | Refers to removed graph and Qwen3 paths; current CUDA graph code is under `backend/cuda/`. |
+| `docs/design/fused-moe-marlin.md` | superseded planning note | 0 | Still says planning and references removed Marlin files after the implementation landed elsewhere. |
+
+### Obsolete scripts and generated files
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `scripts/release/__pycache__/test_arch_goal_gate.cpython-314.pyc` | generated bytecode | 0 | Ignored build product accidentally committed to Git. |
+| `scripts/phase-e-gen-baseline.py` | one-shot baseline generator | 0 | Explicitly marked “Run this ONCE”; no checked-in consumer remains. |
+| `scripts/probe_chat.sh` | superseded smoke helper | 0 | Replaced by `scripts/release/run_scenarios.py` and checked-in scenario manifests. |
+| `scripts/remote.sh` | obsolete remote operator | 0 | Hard-codes a removed TP branch and performs destructive remote resets outside the current Vast/G0 workflow. |
+| `scripts/setup_gpu.sh` | obsolete bootstrap helper | 0 | Deletes old feature branches and predates the current bounded Vast/G0 bootstrap workflow. |
+| `crates/ferrum-kernels/triton_ptx/.gitkeep` | empty directory marker | 0 | The directory already contains 22 tracked PTX files. |
+
+### Broken container recipes
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `Dockerfile.cuda-dev` | broken legacy recipe | 0 | Copies removed `ferrum-attention` and `ferrum-runtime` manifests, so it cannot build. |
+| `Dockerfile.cuda-check` | broken legacy recipe | 0 | Unreferenced and masks Cargo failures through pipelines without `pipefail`. |
+
+### Superseded generated inventories
+
+These snapshots have zero references outside the cleanup directory and are
+replaced for repository-cleanup purposes by this inventory. The one historical
+inventory still consumed by the S0A validator,
+`docs/release/cleanup/20260802-operation-s0a-inventory.md`, is retained.
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `docs/release/cleanup/20260603-inventory.md` | generated inventory | 0 | Superseded whole-tree snapshot. |
+| `docs/release/cleanup/20260703-fa2-source-removal-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+| `docs/release/cleanup/20260704-fa2-stub-removal-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+| `docs/release/cleanup/20260712-inventory.md` | generated inventory | 0 | Superseded whole-tree snapshot. |
+| `docs/release/cleanup/20260714-inventory.md` | generated inventory | 0 | Superseded whole-tree snapshot. |
+| `docs/release/cleanup/20260715-inventory.md` | generated inventory | 0 | Superseded whole-tree snapshot. |
+| `docs/release/cleanup/20260718-inventory.md` | generated inventory | 0 | Superseded whole-tree snapshot. |
+| `docs/release/cleanup/20260722-qwen35-legacy-removal-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+| `docs/release/cleanup/20260727-operation-module-split-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+| `docs/release/cleanup/20260730-inventory.md` | generated inventory | 0 | Superseded whole-tree snapshot. |
+| `docs/release/cleanup/20260731-g01a-dynamic-pool-split-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+| `docs/release/cleanup/20260804-invocation-backing-initialization-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+| `docs/release/cleanup/20260805-device-operation-driver-split-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+| `docs/release/cleanup/20260805-dispatch-owner-split-inventory.md` | generated inventory | 0 | Superseded snapshot; no live validator consumes it. |
+
+### Non-file-removal simplifications
+
+- Remove 22 root workspace dependency declarations that no member inherits via
+  `workspace = true`; member-local direct versions remain unchanged.
+- Remove CI reruns already covered by `cargo test --workspace`, plus three
+  `continue-on-error` commands for the removed `ferrum-attention` package.
+- Remove the duplicate `/target` ignore entry and stale commented Candle 0.6
+  placeholder.
+
+## Script cleanup wave 2 applied 2026-08-15
+
+The second pass traces current CI, Cargo, `run_gate.py`, workflows, root user
+documentation, and release validators transitively. Historical goal and bench
+documents are not treated as operational callers; removed tools remain
+recoverable from the `v0.8.0` tag and Git history.
+
+### Superseded benchmark, pod, graph, and finalization scripts
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `scripts/aggregate_m3_80pct.py` | obsolete report aggregator | 0 | Superseded by typed benchmark reports and canonical release aggregators. |
+| `scripts/aggregate_sweep.py` | obsolete report aggregator | 0 | Its only caller was the removed fixed-pod sweep workflow. |
+| `scripts/analyze_unified_graph_log.py` | one-off diagnostic parser | 0 | No current runner emits or consumes its ad-hoc text format. |
+| `scripts/bench_chat_completions.sh` | duplicate benchmark client | 0 | `ferrum bench-serve` is the sole canonical HTTP performance client. |
+| `scripts/bottleneck_localize.sh` | obsolete profiler wrapper | 0 | Replaced by structured profile collectors and typed artifacts. |
+| `scripts/compare_nsys_kernels.py` | one-off Nsight comparator | 0 | Uncalled post-processing tool for a closed M3 investigation. |
+| `scripts/graph_repro_v2.cu` | superseded graph experiment | 0 | Historical iteration; conclusions are retained in Git history and current graph tests. |
+| `scripts/graph_repro_v3.cu` | superseded graph experiment | 0 | Historical iteration; conclusions are retained in Git history and current graph tests. |
+| `scripts/graph_repro_v5.cu` | superseded graph experiment | 0 | Historical iteration; conclusions are retained in Git history and current graph tests. |
+| `scripts/graph_repro_v6.cu` | superseded graph experiment | 0 | Replaced by the segment/upload probes and product graph tests. |
+| `scripts/graph_repro_v7.cu` | superseded graph experiment | 0 | Replaced by the segment/upload probes and product graph tests. |
+| `scripts/graph_repro_v8.cu` | superseded graph experiment | 0 | Replaced by the segment/upload probes and product graph tests. |
+| `scripts/run_graph_repro.sh` | obsolete wrapper | 0 | Wrapped only an early standalone graph reproduction. |
+| `scripts/lock_gpu.sh` | obsolete host mutator | 0 | Current gates record hardware state without changing global GPU clocks. |
+| `scripts/unlock_gpu.sh` | obsolete host mutator | 0 | Paired only with the removed GPU lock helper. |
+| `scripts/paris_bisect.sh` | obsolete correctness bisector | 0 | Replaced by manifest-driven product scenarios and G0 gates. |
+| `scripts/parse_decode_profile.py` | obsolete profile parser | 0 | Parsed the removed bottleneck-localization log format. |
+| `scripts/pod_bench.sh` | obsolete pod operator | 0 | Fixed-pod workflow replaced by the bounded Vast/G0 process. |
+| `scripts/pod_collect_m3_80pct.sh` | obsolete pod collector | 0 | Hard-coded a closed 2026-05 session and has no current caller. |
+| `scripts/pod_session_m3_80pct.sh` | obsolete pod orchestrator | 0 | Replaced by current paid-GPU inventory, lifecycle, and gate policy. |
+| `scripts/pod_setup.sh` | obsolete pod bootstrap | fixture-only, removed | Its planner fixture entry is removed in the same patch. |
+| `scripts/sweep_bottleneck.sh` | obsolete sweep runner | 0 | Replaced by typed selected-cell collectors. |
+| `scripts/test_chat_suites.sh` | duplicate test wrapper | 0 | Duplicated the maintained `chat-smoke.yml` workflow targets. |
+| `scripts/test_gpu.sh` | obsolete GPU suite | 0 | Used hidden legacy knobs and emitted no canonical gate artifact. |
+| `scripts/pod_w1_final_armored.sh` | completed one-shot orchestration | 0 | W1 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w1_gates5.sh` | completed one-shot orchestration | 0 | W1 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w1_gates6.sh` | completed one-shot orchestration | 0 | W1 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w1_l5_final.sh` | completed one-shot orchestration | 0 | W1 L5 results are already checked in. |
+| `scripts/pod_w2_gates.sh` | completed one-shot orchestration | 0 | W2 results are frozen in checked-in matrices and release evidence. |
+| `scripts/pod_w2_gemma3.sh` | completed one-shot orchestration | 0 | W2 results are frozen; its private environment aliases are removed from the registry. |
+| `scripts/w1_finalize_cells.py` | completed result finalizer | 0 | Its finalized W1 matrix is checked in. |
+| `scripts/w1_l5_batch.sh` | completed one-shot runner | 0 | Its L5 outputs are checked in. |
+| `scripts/w1_perf_spread.py` | completed one-shot analyzer | 0 | Its W1 performance conclusion is frozen in release evidence. |
+
+### Obsolete CUDA microbenches
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `scripts/microbenches/h2d_microbench.cu` | superseded probe | 0 | No current source, test, gate, or documentation entrypoint consumes it. |
+| `scripts/microbenches/graph_bench.cu` | superseded probe | 0 | Replaced by the segment and Gemma3 shadow graph probes. |
+| `scripts/microbenches/sync_barrier_bench.cu` | superseded probe | 0 | Closed host-barrier hypothesis with no current caller. |
+| `scripts/microbenches/scalar_type_id_test.cu` | superseded ABI probe | 0 | Native bundle validators and native-operator tests now enforce the contract. |
+| `scripts/microbenches/scalar_type_id_test_other_tu.cu` | superseded ABI probe | 0 | Companion translation unit for the removed scalar-ID probe. |
+| `scripts/microbenches/build_and_run_varlen_vllm_tiled_q_perf.sh` | deprecated negative control | 0 | Wrapper for the removed tiled-Q experiment. |
+| `scripts/microbenches/varlen_vllm_tiled_q_perf.cu` | deprecated negative control | 0 | Registry marks this path non-default-worthy and no gate consumes it. |
+| `scripts/microbenches/build_and_run_fa2_direct_ffi_probe.sh` | completed feasibility probe | 0 | Replaced by the retained direct-FFI shim and M3 A/B diagnostic. |
+| `scripts/microbenches/fa2_direct_ffi_probe.cpp` | completed feasibility probe | 0 | Replaced by the retained direct-FFI shim implementation. |
+| `scripts/microbenches/build_fa2_ferrum_source_shim.sh` | removed product-path aid | 0 | Source-linked FA2 was explicitly retired; only the compatibility sentinel remains. |
+| `scripts/microbenches/fa2_ferrum_source_shim.cu` | removed product-path aid | 0 | Source-linked FA2 was explicitly retired. |
+| `scripts/microbenches/vllm_flash_attn_varlen_probe.py` | completed feasibility probe | 0 | Python/vLLM sizing probe is not part of the Ferrum product or release path. |
+| `scripts/microbenches/moe_marlin_active65_perf.cu` | stale ABI probe | 0 | Declares an older MoE native ABI and is unsafe against the current operator set. |
+| `scripts/microbenches/moe_marlin_correctness.cu` | stale ABI probe | 0 | Declares an older MoE native ABI; canonical parity tests replace it. |
+| `scripts/microbenches/build_and_run_moe_marlin_perf.sh` | stale ABI wrapper | 0 | Wrapper for the removed stale-ABI probe. |
+| `scripts/microbenches/moe_marlin_perf.cu` | stale ABI probe | 0 | Declares an older MoE native ABI and cannot safely call current operators. |
+
+### Completed Runtime vNext authoring and attribution tools
+
+| File | Category | Operational references | Reason |
+| --- | --- | ---: | --- |
+| `scripts/release/runtime_vnext_c13_vllm_reference.py` | completed reference producer | selftest-only, removed | C13 alignment concluded `KEEP_REFERENCE_ALIGNMENT`; it was never a formal G08B gate. |
+| `scripts/release/runtime_vnext_c13_logits_reference.py` | completed reference comparator | selftest-only, removed | C13 alignment is frozen in v0.8 evidence and no current gate calls it. |
+| `scripts/release/configs/runtime_vnext_c13_022_reference.json` | orphaned reference config | 0 | Only the removed C13 producer consumed it. |
+| `scripts/release/runtime_vnext_cuda_replay_kernel_attribution.py` | completed offline diagnostic | selftest-only, removed | One-off Nsight/replay attribution for a closed G06 investigation. |
+| `scripts/release/runtime_vnext_expectation_amendment.py` | one-shot authoring tool | compile/selftest-only, removed | Generated review candidates before G00 expectations were frozen. |
+| `scripts/release/runtime_vnext_g00_orchestrator.py` | completed evidence preparer | compile/selftest-only, removed | `run_gate vnext-g00` uses the baseline gate directly; this was not final authority. |
+| `scripts/release/runtime_vnext_historical_capture.py` | completed receipt producer | compile/selftest-only, removed | Historical corpus/replay validators remain; the one-time capture producer has no current entrypoint. |
+
+### Wave 2 index simplifications
+
+- Update `scripts/README.md` and `scripts/microbenches/README.md` to list only
+  retained entrypoints and probes.
+- Remove deleted script owners and obsolete-only variables from
+  `docs/runtime-env-registry.tsv`.
+- Remove the obsolete pod path from the change-impact fixture and the two
+  legacy GPU lock helpers from the benchmark playbook.
+- Remove deleted Runtime vNext scripts from Python compilation and validator
+  selftest registries.

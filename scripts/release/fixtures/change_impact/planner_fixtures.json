@@ -72,8 +72,7 @@
     {
       "id": "root_release_scripts",
       "changed_files": [
-        "scripts/phase-e-verify.sh",
-        "scripts/pod_setup.sh"
+        "scripts/phase-e-verify.sh"
       ],
       "expect_domains": ["release_gate"],
       "expect_required_gates": ["release_validator_selftest"],

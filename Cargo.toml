@@ -21,7 +21,7 @@ members = [
     # Weight-format abstraction (Dense / GPTQ / AWQ / GGUF)
     "crates/ferrum-quantization",
 
-    # Existing crates (to be refactored)
+    # Product crates
     "crates/ferrum-engine",
     "crates/ferrum-models",
     "crates/ferrum-server",
@@ -58,7 +58,6 @@ thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utils
 uuid = { version = "1.6", features = ["v4", "serde"] }
@@ -76,35 +75,11 @@ metrics-exporter-prometheus = "0.13"
 config = "0.14"
 toml = "0.8"
 
-# HTTP - Using Axum
-axum = "0.7"
-axum-extra = { version = "0.9", features = ["typed-header"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace", "compression"] }
-hyper = "1.0"
-hyper-util = { version = "0.1", default-features = false, features = ["client", "http1", "http2", "tokio"] }
-http = "1.0"
-http-body = "1.0"
-mime = "0.3"
-
-# Authentication
-jsonwebtoken = "9.2"
-base64 = "0.22"
-
 # CLI utilities
 clap = "4.4"
-console = "0.15"
-indicatif = "0.17"
-dialoguer = "0.11"
-colored = "2.1"
-walkdir = "2.4"
-serde_yaml = "0.9"
 
 # HTTP client (using rustls to avoid macOS system-configuration issues)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks", "stream", "json"] }
-
-# Benchmarking
-criterion = "0.5"
 
 # System utilities
 num_cpus = "1.16"
@@ -112,11 +87,7 @@ dirs = "5.0"
 
 # Stream processing
 futures = "0.3"
-futures-util = "0.3"
-async-stream = "0.3"
 
-# ML Framework - Mock for MVP (Candle to be added later)
-## candle-core = { version = "0.6", default-features = false }
 hf-hub = "0.4.1"
 tokenizers = { version = "0.21", features = ["onig"] }
 safetensors = "0.4"
@@ -126,8 +97,7 @@ rand = "0.9.0"
 rand_chacha = "=0.9.0"
 rand_distr = "0.4.3"
 
-# Tensor operations
-ndarray = "0.15"
+# Numeric types and parallelism
 half = { version = "2.5.0", features = ["num-traits", "use-intrinsics", "rand_distr"] }
 float8 = "0.7.0"
 rayon = "1.11"
@@ -156,7 +126,7 @@ ferrum-kernels = { path = "crates/ferrum-kernels", version = "0.8.0" }
 # Weight-format abstraction (Dense / GPTQ / AWQ / GGUF)
 ferrum-quantization = { path = "crates/ferrum-quantization", version = "0.8.0" }
 
-# Internal crates - Existing crates (to be refactored)
+# Internal product crates
 ferrum-engine = { path = "crates/ferrum-engine", version = "0.8.0" }
 ferrum-models = { path = "crates/ferrum-models", version = "0.8.0" }
 ferrum-server = { path = "crates/ferrum-server", version = "0.8.0" }
