@@ -117,15 +117,12 @@ PY
     scripts/release/runtime_vnext_hardware_probe.py \
     scripts/release/runtime_vnext_build_timing.py \
     scripts/release/runtime_vnext_baseline_scenarios.py \
-    scripts/release/runtime_vnext_expectation_amendment.py \
     scripts/release/runtime_vnext_blocked_lane.py \
     scripts/release/runtime_vnext_resource_sampler.py \
     scripts/release/runtime_vnext_performance_collector.py \
     scripts/release/runtime_vnext_g00a_checkpoint.py \
-    scripts/release/runtime_vnext_g00_orchestrator.py \
     scripts/release/runtime_vnext_historical_corpus.py \
     scripts/release/runtime_vnext_historical_replay.py \
-    scripts/release/runtime_vnext_historical_capture.py \
     scripts/release/runtime_vnext_g01a_checkpoint.py \
     scripts/release/runtime_vnext_plan_reference.py \
     scripts/release/runtime_vnext_cuda_correctness_build.py \

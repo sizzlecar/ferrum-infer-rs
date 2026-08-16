@@ -20,22 +20,22 @@ This directory keeps release gates, CUDA/M3 runners, benchmark utilities, and mi
 - `scripts/m3_validate_runner_artifact.py`: validator for M3 runner artifacts.
 - `ferrum bench-serve`: canonical HTTP performance client for `/v1/chat/completions`.
 
-## FA2 special gates
+## FA2 compatibility diagnostics
 
-- `scripts/m3_fa2_direct_ffi_ab.sh`: FA2 direct/source A/B wrapper. Use only for FA2/direct/source path changes.
-- `scripts/m3_fa2_source_allcells_ab.sh`: all-cell source-linked FA2 wrapper. It delegates to the shared M3 runner through `scripts/m3_fa2_direct_ffi_ab.sh` with `FA2_SOURCE=1`.
-- `scripts/microbenches/build_fa2_ferrum_source_shim.sh` and related `fa2_*` probes: microbench/build aids, not release gates by themselves.
+- `scripts/m3_fa2_direct_ffi_ab.sh`: retained diagnostic for the current direct-FFI shim; it is not a release gate.
+- `scripts/m3_fa2_source_allcells_ab.sh`: retired compatibility sentinel that intentionally rejects the removed source-linked FA2 path.
 
 ## Benchmark/report utilities
 
-- `scripts/bench_chat_completions.sh`: lightweight HTTP smoke/throughput utility.
 - `scripts/bench_vs_vllm.sh`: apples-to-apples ferrum/vLLM comparison helper.
-- `scripts/aggregate_m3_80pct.py`, `scripts/m3_collect_allcell_runner_artifacts.py`, `scripts/compare_bench.py`: report aggregation/validation helpers.
+- `scripts/m3_collect_allcell_runner_artifacts.py`, `scripts/compare_bench.py`: report aggregation/validation helpers.
 
-## GPU setup/pod helpers
+## CUDA build diagnostics
 
-- `scripts/pod_session_m3_80pct.sh`, `scripts/pod_bench.sh`, `scripts/pod_collect_m3_80pct.sh`: pod/session helpers.
 - `scripts/validate_cuda_build_summary.py`, `scripts/validate_cuda_build_boundary_manifest.py`, `scripts/m3_cuda_build_boundary_probe.py`: CUDA build/cache validation aids.
+
+Paid GPU orchestration follows the Vast and G0 workflow in `AGENTS.md`; the
+obsolete fixed-pod helpers have been removed.
 
 ## Microbenches
 
