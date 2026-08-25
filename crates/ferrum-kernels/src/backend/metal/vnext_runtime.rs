@@ -2782,7 +2782,7 @@ mod tests {
             .expect("destination allocation");
         let region = destination.region(0..8).expect("destination region");
         let command = MetalDeviceCommand::operation(
-            "batched device zero",
+            "batched.device.zero",
             vec![region],
             |encoder, regions| {
                 encoder.with_blit_commands(3, |blit| {
@@ -2846,7 +2846,7 @@ mod tests {
             .allocate_request(&buffer_request("resource/failing-operation"))
             .expect("allocation");
         let command = MetalDeviceCommand::operation(
-            "failing operation",
+            "failing.operation",
             vec![buffer.region(0..8).expect("region")],
             |_encoder, _regions| Err(MetalDeviceRuntimeError::contract("expected encode failure")),
         )

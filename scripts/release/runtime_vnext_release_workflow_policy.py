@@ -334,22 +334,22 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
     )
     cache_prefix = (
         "stage-v0.8.0-linux-x86_64-cuda-sm89-"
-        "cuda12.4-native-d229c130-cargo-"
+        "cuda12.4-native-b450d931-cargo-"
     )
     require(
         cache_with.get("key")
         == cache_prefix + "${{ hashFiles('**/Cargo.lock') }}"
         and cache_with.get("restore-keys") == cache_prefix,
-        "release-cuda.yml cache key must bind CUDA 12.4 and native set d229c130",
+        "release-cuda.yml cache key must bind CUDA 12.4 and native set b450d931",
     )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_URL")
-        == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/runtime-vnext-diagnostics-v1/native-operator-set-5503d913.tar.zst",
+        == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v1/native-operator-set-cuda12.4-sm89-v1.tar.zst",
         "release-cuda.yml native operator set URL is not frozen",
     )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_SHA256")
-        == "d229c130cbc6bbb3cac86137c29d2e458e8812420d4d57a0d18505c88ca5461e",
+        == "b450d93182112a57cb96e9a1dd14ec147c7fd549dc4bd3ed9648bfc67e17eb37",
         "release-cuda.yml native operator set SHA256 is not frozen",
     )
     scripts = "\n".join(
@@ -842,8 +842,8 @@ def run_selftest(texts: dict[str, str]) -> None:
     cuda_cache_mismatch = dict(texts)
     cuda_cache_mismatch["release-cuda.yml"] = _replace_once(
         cuda_cache_mismatch["release-cuda.yml"],
-        "cuda12.4-native-d229c130-cargo-${{ hashFiles('**/Cargo.lock') }}",
-        "cuda12.6-native-d229c130-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda12.4-native-b450d931-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda12.6-native-b450d931-cargo-${{ hashFiles('**/Cargo.lock') }}",
         "cuda-cache-toolchain-mismatch",
     )
     _expect_policy_failure(
