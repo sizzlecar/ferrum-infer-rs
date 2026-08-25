@@ -616,34 +616,14 @@ fn push_true_entry(entries: &mut Vec<RuntimeConfigEntry>, key: &str, value: Opti
 }
 
 impl CliConfig {
-    /// Load configuration from file
+    /// Load configuration from file, falling back to typed defaults when the
+    /// optional file does not exist. Loading config must not mutate the
+    /// caller's current directory.
     pub async fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
 
         if !path.exists() {
-            // Create default config file
-            let default_config = Self::default();
-            let content = toml::to_string_pretty(&default_config).map_err(|e| {
-                ferrum_types::FerrumError::configuration(format!(
-                    "Failed to serialize default config: {}",
-                    e
-                ))
-            })?;
-
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).await.map_err(|e| {
-                    ferrum_types::FerrumError::io_str(format!(
-                        "Failed to create config directory: {}",
-                        e
-                    ))
-                })?;
-            }
-
-            fs::write(path, content).await.map_err(|e| {
-                ferrum_types::FerrumError::io_str(format!("Failed to write default config: {}", e))
-            })?;
-
-            return Ok(default_config);
+            return Ok(Self::default());
         }
 
         let content = fs::read_to_string(path).await.map_err(|e| {
@@ -792,6 +772,28 @@ impl Default for DevConfig {
 mod tests {
     use super::*;
     use ferrum_types::RuntimeConfigEffect;
+
+    #[tokio::test]
+    async fn missing_optional_config_uses_defaults_without_creating_a_file() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ferrum-missing-config-{}-{nonce}.toml",
+            std::process::id()
+        ));
+
+        assert!(!path.exists());
+        let config = CliConfig::load(&path).await.unwrap();
+
+        assert!(
+            !path.exists(),
+            "loading an optional config must be read-only"
+        );
+        assert_eq!(config.server.port, 8000);
+        assert!(config.models.default_model.is_none());
+    }
 
     #[test]
     fn runtime_cli_config_emits_config_file_source_entries() {

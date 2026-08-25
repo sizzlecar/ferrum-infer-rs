@@ -32,6 +32,7 @@ impl VNextDiagnosticFaultArg {
 
 pub mod bench;
 pub mod bench_serve;
+pub mod doctor;
 pub mod embed;
 pub mod list;
 pub mod pull;

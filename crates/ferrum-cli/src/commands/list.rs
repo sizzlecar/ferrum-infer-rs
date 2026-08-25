@@ -139,12 +139,11 @@ fn check_model_complete(snapshots_dir: &PathBuf) -> bool {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Check for model weight files
-                if path.join("model.safetensors").exists()
-                    || path.join("model.safetensors.index.json").exists()
-                    || path.join("pytorch_model.bin").exists()
-                    || path.join("pytorch_model.bin.index.json").exists()
-                {
+                // A snapshot may contain a single file, sharded weights plus
+                // an index, or a curated GGUF filename.
+                let has_weights = fs::read_dir(&path)
+                    .is_ok_and(|files| files.flatten().any(|file| is_weight_file(&file.path())));
+                if has_weights {
                     return true;
                 }
             }
@@ -152,6 +151,18 @@ fn check_model_complete(snapshots_dir: &PathBuf) -> bool {
     }
 
     false
+}
+
+fn is_weight_file(path: &std::path::Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower.ends_with(".safetensors")
+        || lower.ends_with(".safetensors.index.json")
+        || lower.ends_with(".gguf")
+        || (lower.starts_with("pytorch_model")
+            && (lower.ends_with(".bin") || lower.ends_with(".bin.index.json")))
 }
 
 fn get_dir_size(path: &PathBuf) -> u64 {
@@ -193,4 +204,42 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
     }
     let configured = shellexpand::tilde(&config.models.download.hf_cache_dir).to_string();
     PathBuf::from(configured)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temporary_snapshot(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ferrum-list-{name}-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(root.join("snapshots/revision")).unwrap();
+        root
+    }
+
+    #[test]
+    fn gguf_snapshot_is_complete() {
+        let root = temporary_snapshot("gguf");
+        fs::write(
+            root.join("snapshots/revision/Qwen3.5-4B-Q4_K_M.gguf"),
+            b"weight",
+        )
+        .unwrap();
+
+        assert!(check_model_complete(&root.join("snapshots")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tokenizer_only_snapshot_is_incomplete() {
+        let root = temporary_snapshot("tokenizer");
+        fs::write(root.join("snapshots/revision/tokenizer.json"), b"{}").unwrap();
+
+        assert!(!check_model_complete(&root.join("snapshots")));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

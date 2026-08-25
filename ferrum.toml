@@ -1,7 +1,7 @@
-# Ferrum CLI Configuration for MVP Testing
+# Optional Ferrum CLI configuration
 
 [client]
-base_url = "http://localhost:8080"
+base_url = "http://127.0.0.1:8000"
 timeout_seconds = 300
 
 [client.retry]
@@ -13,7 +13,9 @@ backoff_multiplier = 2.0
 [models]
 model_dir = "./models"
 cache_dir = "./model_cache"
-default_model = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+# Set this only when you intentionally want `ferrum serve` to start without
+# an explicit `--model`. The CLI otherwise asks you to choose a model.
+# default_model = "Qwen/Qwen3.5-4B"
 
 [models.aliases]
 
@@ -56,12 +58,5 @@ test_data_dir = "./test_data"
 # kv_max_blocks = 2048
 # paged_max_seqs = 32
 # max_batched_tokens = 2048
-# Startup capture has an independent hard width bound of 32; runtime admission
-# may be higher and uncovered widths use eager fallback.
-# reusable_execution_exact_decode_widths = [1, 2, 4, 8, 16, 24, 32]
-# reusable_execution_max_automatic_exact_decode_width = 32
 # prefix_cache = false
 # moe_graph = true
-# marlin_profile = true
-# marlin_trace_shapes = true
-# marlin_trace_shapes_max = 64

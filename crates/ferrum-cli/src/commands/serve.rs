@@ -384,8 +384,18 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Resolve model
     let model_name = model
         .or(model_option)
-        .or(config.models.default_model.clone())
-        .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
+        .or_else(|| {
+            config
+                .models
+                .default_model
+                .clone()
+                .filter(|model| !model.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            FerrumError::config(crate::source_resolver::first_success_model_help(
+                "serve --model",
+            ))
+        })?;
     let serve_start = std::time::Instant::now();
     let product_observability = crate::observability_product::ProductObservabilityConfig::new(
         ferrum_types::ProfileEntrypoint::Serve,
