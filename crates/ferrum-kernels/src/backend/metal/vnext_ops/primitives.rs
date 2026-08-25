@@ -1502,26 +1502,6 @@ fn dispatch_embedding(
     );
 }
 
-fn dispatch_rms_norm(
-    pipelines: &MetalPrimitivePipelines,
-    encoder: &ComputeCommandEncoderRef,
-    input: &MetalBufferRegion,
-    weight: &MetalBufferRegion,
-    output: &MetalBufferRegion,
-    params: RmsNormParams,
-) {
-    dispatch_rms_norm_typed(
-        pipelines,
-        encoder,
-        input,
-        weight,
-        output,
-        params,
-        ElementType::F16,
-        ElementType::F16,
-    );
-}
-
 fn dispatch_rms_norm_typed(
     pipelines: &MetalPrimitivePipelines,
     encoder: &ComputeCommandEncoderRef,
@@ -1607,35 +1587,6 @@ pub(super) fn dispatch_rms_norm_f32_to_f16_at(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn dispatch_rms_norm_f32_at(
-    pipelines: &MetalPrimitivePipelines,
-    encoder: &ComputeCommandEncoderRef,
-    input: &MetalBufferRegion,
-    input_offset_bytes: u64,
-    weight: &MetalBufferRegion,
-    output: &MetalBufferRegion,
-    output_offset_bytes: u64,
-    rows: u32,
-    hidden_size: u32,
-    epsilon: f32,
-) {
-    dispatch_rms_norm_typed_at(
-        pipelines,
-        encoder,
-        input,
-        input_offset_bytes,
-        weight,
-        output,
-        output_offset_bytes,
-        rows,
-        hidden_size,
-        epsilon,
-        ElementType::F32,
-        ElementType::F32,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
 fn dispatch_rms_norm_typed_at(
     pipelines: &MetalPrimitivePipelines,
     encoder: &ComputeCommandEncoderRef,
@@ -1674,27 +1625,6 @@ fn dispatch_rms_norm_typed_at(
     encoder.dispatch_thread_groups(
         MTLSize::new(u64::from(params.rows), 1, 1),
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
-    );
-}
-
-fn dispatch_residual_add(
-    pipelines: &MetalPrimitivePipelines,
-    encoder: &ComputeCommandEncoderRef,
-    left: &MetalBufferRegion,
-    right: &MetalBufferRegion,
-    output: &MetalBufferRegion,
-    params: ResidualAddParams,
-) {
-    dispatch_residual_add_typed(
-        pipelines,
-        encoder,
-        left,
-        right,
-        output,
-        params,
-        ElementType::F16,
-        ElementType::F16,
-        ElementType::F16,
     );
 }
 

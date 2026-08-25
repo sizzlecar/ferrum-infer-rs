@@ -18,6 +18,11 @@ pub mod sampler;
 pub mod scheduler;
 pub mod tensor;
 pub mod tokenizer;
+#[allow(
+    dead_code,
+    unused_imports,
+    reason = "reviewed vNext contracts stay isolated and byte-stable until the product runtime migration"
+)]
 pub mod vnext;
 
 // Re-export core traits and important types

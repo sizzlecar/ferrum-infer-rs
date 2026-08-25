@@ -56,6 +56,11 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"ferrum","messages":[{"role":"user","content":"Hello"}]}'
 ```
 
+For a short direct answer from a model whose template enables reasoning by
+default, add `--disable-thinking` to `ferrum run` or `ferrum serve`. Omitting
+the flag preserves the model template's default; an HTTP request can override
+the server default with `chat_template_kwargs.enable_thinking`.
+
 `ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
 commands without downloading the model or starting an inference engine.
 

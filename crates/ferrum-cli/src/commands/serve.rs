@@ -49,6 +49,16 @@ pub struct ServeCommand {
     )]
     pub served_model_name: Vec<String>,
 
+    /// Enable model reasoning by default when a request omits
+    /// `chat_template_kwargs.enable_thinking`.
+    #[arg(long, conflicts_with = "disable_thinking")]
+    pub enable_thinking: bool,
+
+    /// Disable model reasoning by default when a request omits
+    /// `chat_template_kwargs.enable_thinking`.
+    #[arg(long, conflicts_with = "enable_thinking")]
+    pub disable_thinking: bool,
+
     /// Host to bind to
     #[arg(long)]
     pub host: Option<String>,
@@ -305,6 +315,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         model_option,
         product_sources,
         served_model_name,
+        enable_thinking,
+        disable_thinking,
         host,
         port,
         tts_slots,
@@ -364,6 +376,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         lora,
         lora_model_id_template,
     } = cmd;
+
+    let default_enable_thinking = if enable_thinking {
+        Some(true)
+    } else if disable_thinking {
+        Some(false)
+    } else {
+        None
+    };
 
     // Reject malformed adapter specs before selecting a device or resolving,
     // downloading, and preparing the base model.
@@ -1048,7 +1068,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
         }
     }
-    .with_auto_config(startup_auto_config);
+    .with_auto_config(startup_auto_config)
+    .with_default_enable_thinking(default_enable_thinking);
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();

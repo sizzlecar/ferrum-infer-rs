@@ -48,7 +48,7 @@ support matrix and are hidden from the default CLI help.
 | `stop` | Supported | Accepts a string or string array and strips a trailing stop sentinel from returned text. |
 | `stream` | Supported | Emits OpenAI-shaped SSE chunks followed by `[DONE]`. |
 | `stream_options.include_usage` | Supported with `stream=true` | Emits a final usage chunk with `choices: []`; `stream_options` without streaming is rejected. |
-| `chat_template_kwargs.enable_thinking` | Supported when the model template reads it | Boolean vLLM-compatible chat-template variable. Ferrum forwards it to the model-provided template. Templates that do not use `enable_thinking` are unaffected; non-boolean values return HTTP 400. |
+| `chat_template_kwargs.enable_thinking` | Supported when the model template reads it | Boolean vLLM-compatible chat-template variable. Ferrum forwards it to the model-provided template. `ferrum serve --enable-thinking` or `--disable-thinking` sets the default for omitted requests; the request value wins. Templates that do not use `enable_thinking` are unaffected; non-boolean values return HTTP 400. |
 | `n` | Restricted | Only `n=1` is supported; other values return HTTP 400 with `param=n`. |
 | `logit_bias` | Rejected | Non-empty maps return HTTP 400 with `param=logit_bias`. |
 | `logprobs` | Rejected | Returns HTTP 400 with `param=logprobs`. |

@@ -21,6 +21,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # Treat every rustc warning as an error. Keeps the tree clean — dev
+  # opts into warnings locally for iteration and silences them via
+  # `#[allow(...)]` on the specific item, never at the CI level.
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   # ── CPU (Linux) ──────────────────────────────────────────────────────

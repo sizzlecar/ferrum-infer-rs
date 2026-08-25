@@ -55,10 +55,16 @@ impl ServerFixture {
         let port = free_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let mut cmd = Command::new(ferrum_bin());
-        cmd.args(["serve", model, "--port", &port.to_string()])
-            .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args([
+            "serve",
+            model,
+            "--disable-thinking",
+            "--port",
+            &port.to_string(),
+        ])
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         for (k, v) in extra_env {
             cmd.env(k, v);
         }

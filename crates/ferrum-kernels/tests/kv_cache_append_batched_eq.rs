@@ -54,7 +54,7 @@ fn kv_append_batched_matches_per_item_head_major() {
             let sentinel = vec![0.0f32; NKV * CAPACITY * HD];
             // The simplest way to seed is from_slice + write; but
             // we'll use B::sync after each append to read back.
-            let mut seed_buf = CudaBackend::from_slice(&sentinel);
+            let seed_buf = CudaBackend::from_slice(&sentinel);
             CudaBackend::copy_slice(&mut ctx, &seed_buf, 0, &mut buf, 0, NKV * CAPACITY * HD);
             let _ = seed_buf;
             buf
@@ -93,7 +93,7 @@ fn kv_append_batched_matches_per_item_head_major() {
     let per_item_cache_1_h = CudaBackend::to_vec(&per_item_caches[1], NKV * CAPACITY * HD);
 
     // ── Batched path ──────────────────────────────────────────────────
-    let mut batched_caches: Vec<_> = (0..M)
+    let batched_caches: Vec<_> = (0..M)
         .map(|_| {
             let zero = vec![0.0f32; NKV * CAPACITY * HD];
             let seed_buf = CudaBackend::from_slice(&zero);
