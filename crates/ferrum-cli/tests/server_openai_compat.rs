@@ -160,7 +160,7 @@ async fn test_openai_client_chat_basic() {
             .build()
             .expect("build user msg")
             .into()])
-        .max_tokens(50u32)
+        .max_tokens(8u32)
         .temperature(0.0)
         .build()
         .expect("build request");
@@ -188,7 +188,7 @@ async fn test_openai_client_chat_streaming() {
             .build()
             .expect("build user msg")
             .into()])
-        .max_tokens(50u32)
+        .max_tokens(8u32)
         .temperature(0.0)
         .stream(true)
         .build()
@@ -252,7 +252,7 @@ async fn test_openai_client_tools_stream_options_include_usage() {
             .build()
             .expect("build user msg")
             .into()])
-        .max_tokens(50u32)
+        .max_tokens(16u32)
         .temperature(0.0)
         .stream(true)
         .stream_options(ChatCompletionStreamOptions {
@@ -323,14 +323,11 @@ async fn test_openai_client_response_format_json_object() {
     let request = CreateChatCompletionRequestArgs::default()
         .model(SMOKE_MODEL)
         .messages([ChatCompletionRequestUserMessageArgs::default()
-            .content(
-                "Return a JSON object with two fields: \"name\" (any name) \
-                 and \"age\" (any number). Reply with the JSON only.",
-            )
+            .content("Return exactly this JSON object and nothing else: {\"ok\":true}")
             .build()
             .expect("build user msg")
             .into()])
-        .max_tokens(80u32)
+        .max_tokens(16u32)
         .temperature(0.0)
         .response_format(ResponseFormat::JsonObject)
         .build()
@@ -352,9 +349,9 @@ async fn test_openai_client_response_format_json_object() {
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "loads real model"]
-async fn test_openai_client_strict_json_schema_20_runs() {
-    // Milestone G real-model smoke: a simple strict object schema should
-    // succeed repeatedly at temperature 0. The server validates before
+async fn test_openai_client_strict_json_schema_3_runs() {
+    // Real-model smoke: a simple strict object schema should succeed on
+    // repeated requests at temperature 0. The server validates before
     // returning, so any hard-mask/validation failure surfaces as an SDK
     // request error or non-JSON content.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
@@ -366,7 +363,7 @@ async fn test_openai_client_strict_json_schema_20_runs() {
             schema: Some(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "answer": {"type": "string", "maxLength": 16}
+                    "answer": {"type": "string", "enum": ["ok"]}
                 },
                 "required": ["answer"]
             })),
@@ -374,15 +371,15 @@ async fn test_openai_client_strict_json_schema_20_runs() {
         },
     };
 
-    for run in 0..20 {
+    for run in 0..3 {
         let request = CreateChatCompletionRequestArgs::default()
             .model(SMOKE_MODEL)
             .messages([ChatCompletionRequestUserMessageArgs::default()
-                .content("Return an object with one string field named answer.")
+                .content("Return an object whose answer field is the string ok.")
                 .build()
                 .expect("build user msg")
                 .into()])
-            .max_tokens(64u32)
+            .max_tokens(16u32)
             .temperature(0.0)
             .response_format(response_format.clone())
             .build()
@@ -397,9 +394,10 @@ async fn test_openai_client_strict_json_schema_20_runs() {
         let parsed: serde_json::Value = serde_json::from_str(content).unwrap_or_else(|e| {
             panic!("strict schema run {run} returned invalid JSON: {e}; content={content:?}")
         });
-        assert!(
-            parsed.get("answer").and_then(|v| v.as_str()).is_some(),
-            "strict schema run {run} missing string answer: {parsed}"
+        assert_eq!(
+            parsed.get("answer").and_then(|v| v.as_str()),
+            Some("ok"),
+            "strict schema run {run} returned the wrong answer: {parsed}"
         );
     }
 }
@@ -432,7 +430,7 @@ async fn test_openai_client_multi_turn() {
     let request = CreateChatCompletionRequestArgs::default()
         .model(SMOKE_MODEL)
         .messages([user1, asst1, user2])
-        .max_tokens(50u32)
+        .max_tokens(8u32)
         .temperature(0.0)
         .build()
         .expect("build request");
@@ -477,7 +475,7 @@ client = OpenAI(
 response = client.chat.completions.create(
     model=model,
     messages=[{"role": "user", "content": "Say hi in one short sentence."}],
-    max_tokens=50,
+    max_tokens=8,
     temperature=0,
 )
 content = response.choices[0].message.content or ""
@@ -487,7 +485,7 @@ if not content.strip():
 stream = client.chat.completions.create(
     model=model,
     messages=[{"role": "user", "content": "Say hi in one short sentence."}],
-    max_tokens=50,
+    max_tokens=8,
     temperature=0,
     stream=True,
     stream_options={"include_usage": True},

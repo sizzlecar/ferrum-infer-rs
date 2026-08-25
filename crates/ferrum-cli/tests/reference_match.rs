@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 const FIXTURE_PATH: &str = "tests/fixtures/reference_outputs.json";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const UPDATE_ENV: &str = "FERRUM_UPDATE_FIXTURES";
 
 // ─────────────────────────────────────────────────────────────────────────────

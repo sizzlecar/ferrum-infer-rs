@@ -54,12 +54,12 @@ struct ServerFixture {
 
 impl ServerFixture {
     async fn spawn(model: &str) -> Self {
-        Self::spawn_with_env(model, &[]).await
+        Self::spawn_with_args(model, &[]).await
     }
 
-    /// Spawn the server with extra env vars. Used by tests that need to
-    /// opt in to non-default engine knobs (e.g. `FERRUM_PREFIX_CACHE=1`).
-    async fn spawn_with_env(model: &str, extra_env: &[(&str, &str)]) -> Self {
+    /// Spawn the server with explicit product arguments. Tests that opt in
+    /// to non-default behavior must use the same typed CLI users can see.
+    async fn spawn_with_args(model: &str, extra_args: &[&str]) -> Self {
         let port = free_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let mut cmd = Command::new(ferrum_bin());
@@ -73,9 +73,7 @@ impl ServerFixture {
         .env("NO_COLOR", "1")
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
+        cmd.args(extra_args);
         let child = cmd.spawn().expect("spawn ferrum serve");
 
         let client = http_client();
@@ -147,7 +145,7 @@ async fn test_concurrent_8_requests() {
                 .json(&json!({
                     "model": SMOKE_MODEL,
                     "messages": [{"role": "user", "content": p}],
-                    "max_tokens": 30,
+                    "max_tokens": 8,
                     "temperature": 0.0
                 }))
                 .send()
@@ -179,12 +177,12 @@ async fn test_prefix_cache_speedup() {
     //
     // Prefix cache now defaults OFF (see continuous_engine.rs for the
     // CoW gap that motivated the flip). This test opts in explicitly
-    // via `FERRUM_PREFIX_CACHE=1`. Once the CoW write-fork lands, the
+    // through the public CLI. Once the CoW write-fork lands, the
     // default can flip back to ON and this opt-in becomes redundant.
     //
     // Threshold is generous (second ≤ 110 % of first) to avoid CI flake
     // on slow first-iteration scheduler warmup.
-    let fx = ServerFixture::spawn_with_env(SMOKE_MODEL, &[("FERRUM_PREFIX_CACHE", "1")]).await;
+    let fx = ServerFixture::spawn_with_args(SMOKE_MODEL, &["--enable-prefix-cache"]).await;
     let client = http_client();
     let url = fx.chat_url();
 
@@ -211,7 +209,7 @@ async fn test_prefix_cache_speedup() {
                     {"role": "system", "content": system},
                     {"role": "user", "content": "Say hi."}
                 ],
-                "max_tokens": 10,
+                "max_tokens": 8,
                 "temperature": 0.0
             }))
             .send()

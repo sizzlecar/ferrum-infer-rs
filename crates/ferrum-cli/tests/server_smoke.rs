@@ -7,7 +7,8 @@
 //! axum router + handler, full `messages` array per call.
 //!
 //! Loads a real model and is `#[ignore]`'d by default. Each test spawns
-//! its own server (4 cold-loads ~ 60 s). Opt in:
+//! its own server. Completion budgets stay intentionally small because
+//! these are protocol/correctness checks, not generation benchmarks. Opt in:
 //!
 //!     ferrum pull qwen3:0.6b
 //!     cargo test --release -p ferrum-cli --features metal --test server_smoke \
@@ -154,7 +155,7 @@ async fn test_chat_completion_basic() {
         .json(&json!({
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": "Say hi in one short sentence."}],
-            "max_tokens": 100,
+            "max_tokens": 8,
             "temperature": 0.0
         }))
         .send()
@@ -182,7 +183,7 @@ async fn test_chat_streaming_sse() {
         .json(&json!({
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": "Say hi in one short sentence."}],
-            "max_tokens": 100,
+            "max_tokens": 8,
             "temperature": 0.0,
             "stream": true
         }))
@@ -228,7 +229,7 @@ async fn test_chat_multi_turn_messages() {
                 {"role": "assistant", "content": "Got it. Your name is XiaoMing."},
                 {"role": "user", "content": "What is my name? Reply with just the name."}
             ],
-            "max_tokens": 50,
+            "max_tokens": 8,
             "temperature": 0.0
         }))
         .send()
@@ -255,7 +256,7 @@ async fn test_chat_no_template_leak() {
         .json(&json!({
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": "Tell me a small number."}],
-            "max_tokens": 50,
+            "max_tokens": 8,
             "temperature": 0.0
         }))
         .send()
@@ -338,8 +339,8 @@ async fn test_chat_custom_stop_strips_sentinel() {
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
-            "messages": [{"role": "user", "content": "Reply with one sentence ending in a period."}],
-            "max_tokens": 80,
+            "messages": [{"role": "user", "content": "Reply exactly with OK followed by a period."}],
+            "max_tokens": 16,
             "temperature": 0.0,
             "stop": ["."]
         }))
@@ -432,7 +433,7 @@ async fn test_chat_concurrent_2_requests() {
         .json(&json!({
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": "Say hi in one short sentence."}],
-            "max_tokens": 40,
+            "max_tokens": 8,
             "temperature": 0.0
         }))
         .send();
@@ -441,7 +442,7 @@ async fn test_chat_concurrent_2_requests() {
         .json(&json!({
             "model": SMOKE_MODEL,
             "messages": [{"role": "user", "content": "Reply with the word OK."}],
-            "max_tokens": 40,
+            "max_tokens": 8,
             "temperature": 0.0
         }))
         .send();
@@ -475,7 +476,7 @@ async fn test_chat_greedy_is_deterministic() {
     let req = json!({
         "model": SMOKE_MODEL,
         "messages": [{"role": "user", "content": "Reply with the digits 1 2 3 in order."}],
-        "max_tokens": 20,
+        "max_tokens": 8,
         "temperature": 0.0
     });
     let mut contents = Vec::new();
