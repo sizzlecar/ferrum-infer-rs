@@ -29,9 +29,7 @@ env:
 jobs:
   metal:
     name: Chat smoke (macOS Metal)
-    # Match the production Metal release builder instead of allowing
-    # `macos-latest` to drift onto a newly published macOS image.
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
