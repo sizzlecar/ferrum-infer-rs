@@ -412,17 +412,17 @@ async fn test_openai_client_multi_turn() {
     let client = fx.client();
 
     let user1 = ChatCompletionRequestUserMessageArgs::default()
-        .content("Remember this fact: my name is XiaoMing.")
+        .content("Remember the code name.")
         .build()
         .expect("build user msg 1")
         .into();
     let asst1 = ChatCompletionRequestAssistantMessageArgs::default()
-        .content("Got it. Your name is XiaoMing.")
+        .content("The code name is XiaoMing.")
         .build()
         .expect("build asst msg")
         .into();
     let user2 = ChatCompletionRequestUserMessageArgs::default()
-        .content("What is my name? Reply with just the name.")
+        .content("Copy only the code name from the previous assistant message.")
         .build()
         .expect("build user msg 2")
         .into();
@@ -430,7 +430,7 @@ async fn test_openai_client_multi_turn() {
     let request = CreateChatCompletionRequestArgs::default()
         .model(SMOKE_MODEL)
         .messages([user1, asst1, user2])
-        .max_tokens(8u32)
+        .max_tokens(16u32)
         .temperature(0.0)
         .build()
         .expect("build request");

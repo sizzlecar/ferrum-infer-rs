@@ -225,11 +225,11 @@ async fn test_chat_multi_turn_messages() {
         .json(&json!({
             "model": SMOKE_MODEL,
             "messages": [
-                {"role": "user", "content": "Remember this fact: my name is XiaoMing."},
-                {"role": "assistant", "content": "Got it. Your name is XiaoMing."},
-                {"role": "user", "content": "What is my name? Reply with just the name."}
+                {"role": "user", "content": "Remember the code name."},
+                {"role": "assistant", "content": "The code name is XiaoMing."},
+                {"role": "user", "content": "Copy only the code name from the previous assistant message."}
             ],
-            "max_tokens": 8,
+            "max_tokens": 16,
             "temperature": 0.0
         }))
         .send()
@@ -331,18 +331,18 @@ async fn test_chat_max_tokens_truncation() {
 #[ignore = "loads real model"]
 async fn test_chat_custom_stop_strips_sentinel() {
     // OpenAI convention: a user-supplied `stop` sequence marks a boundary
-    // and is NOT included in the returned completion. The server strips
-    // a trailing stop sentinel on the way out (see `strip_trailing_stop`
-    // in `ferrum-server/src/axum_server.rs`).
+    // and is NOT included in the returned completion. Use an explicit word
+    // sentinel so this protocol check does not spend tokens waiting for the
+    // model to end a free-form sentence.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
     let body: Value = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
-            "messages": [{"role": "user", "content": "Reply exactly with OK followed by a period."}],
-            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Reply with the single word END."}],
+            "max_tokens": 8,
             "temperature": 0.0,
-            "stop": ["."]
+            "stop": ["END"]
         }))
         .send()
         .await
@@ -354,8 +354,8 @@ async fn test_chat_custom_stop_strips_sentinel() {
         .as_str()
         .unwrap_or("");
     assert!(
-        !content.trim_end().ends_with('.'),
-        "stop sentinel '.' should have been stripped; got: {content:?}"
+        !content.contains("END"),
+        "stop sentinel 'END' should have been stripped; got: {content:?}"
     );
     let fr = body["choices"][0]["finish_reason"].as_str();
     assert!(
