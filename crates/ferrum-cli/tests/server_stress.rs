@@ -16,6 +16,14 @@ use std::time::{Duration, Instant};
 
 const SMOKE_MODEL: &str = "qwen3:0.6b";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn http_client() -> Client {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("build HTTP client")
+}
 
 fn ferrum_bin() -> PathBuf {
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_ferrum") {
@@ -63,14 +71,14 @@ impl ServerFixture {
             &port.to_string(),
         ])
         .env("NO_COLOR", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
         let child = cmd.spawn().expect("spawn ferrum serve");
 
-        let client = Client::new();
+        let client = http_client();
         let healthz = format!("{base_url}/health");
         let start = Instant::now();
         loop {
@@ -116,7 +124,7 @@ async fn test_concurrent_8_requests() {
     // across the continuous-batch scheduler, and OS thread starvation.
     // 8 is well under typical paged-KV capacity for Qwen3-0.6B on Metal.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let client = Client::new();
+    let client = http_client();
     let url = fx.chat_url();
 
     let prompts = [
@@ -177,7 +185,7 @@ async fn test_prefix_cache_speedup() {
     // Threshold is generous (second ≤ 110 % of first) to avoid CI flake
     // on slow first-iteration scheduler warmup.
     let fx = ServerFixture::spawn_with_env(SMOKE_MODEL, &[("FERRUM_PREFIX_CACHE", "1")]).await;
-    let client = Client::new();
+    let client = http_client();
     let url = fx.chat_url();
 
     // ~700-char system prompt — long enough to dominate prefill cost,

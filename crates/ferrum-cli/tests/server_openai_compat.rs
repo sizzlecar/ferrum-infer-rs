@@ -39,6 +39,14 @@ use std::time::{Duration, Instant};
 
 const SMOKE_MODEL: &str = "qwen3:0.6b";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn http_client() -> ReqwestClient {
+    ReqwestClient::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("build HTTP client")
+}
 
 fn ferrum_bin() -> PathBuf {
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_ferrum") {
@@ -90,12 +98,12 @@ impl ServerFixture {
                 &port.to_string(),
             ])
             .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn ferrum serve");
 
-        let probe = ReqwestClient::new();
+        let probe = http_client();
         let healthz = format!("{base_url}/health");
         let start = Instant::now();
         loop {
@@ -121,7 +129,7 @@ impl ServerFixture {
         let config = OpenAIConfig::new()
             .with_api_base(format!("{}/v1", self.base_url))
             .with_api_key("dummy-key-not-checked");
-        Client::with_config(config)
+        Client::with_config(config).with_http_client(http_client())
     }
 }
 
@@ -358,7 +366,7 @@ async fn test_openai_client_strict_json_schema_20_runs() {
             schema: Some(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "answer": {"type": "string"}
+                    "answer": {"type": "string", "maxLength": 16}
                 },
                 "required": ["answer"]
             })),
@@ -459,7 +467,12 @@ except Exception as exc:
 
 base_url = os.environ["FERRUM_OPENAI_BASE_URL"]
 model = os.environ["FERRUM_OPENAI_MODEL"]
-client = OpenAI(base_url=f"{base_url}/v1", api_key="dummy-key-not-checked")
+client = OpenAI(
+    base_url=f"{base_url}/v1",
+    api_key="dummy-key-not-checked",
+    timeout=300.0,
+    max_retries=0,
+)
 
 response = client.chat.completions.create(
     model=model,

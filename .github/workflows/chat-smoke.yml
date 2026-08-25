@@ -81,7 +81,7 @@ jobs:
           cargo test --release -p ferrum-cli --features metal \
             --test server_smoke -- --ignored --test-threads=1
 
-      - name: HTTP server OpenAI client contract (4 tests — async-openai)
+      - name: HTTP server OpenAI client contract (7 tests — async-openai/Python SDK)
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test server_openai_compat -- --ignored --test-threads=1

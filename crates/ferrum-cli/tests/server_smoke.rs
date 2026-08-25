@@ -22,6 +22,14 @@ use std::time::{Duration, Instant};
 
 const SMOKE_MODEL: &str = "qwen3:0.6b";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+fn http_client() -> Client {
+    Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("build HTTP client")
+}
 
 fn ferrum_bin() -> PathBuf {
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_ferrum") {
@@ -67,13 +75,15 @@ impl ServerFixture {
                 &port.to_string(),
             ])
             .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // These real-model processes can emit enough load progress to
+            // fill an unread pipe and block before the HTTP request returns.
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn ferrum serve");
 
         // Poll /health.
-        let client = Client::new();
+        let client = http_client();
         let healthz = format!("{url}/health");
         let start = Instant::now();
         loop {
@@ -139,7 +149,7 @@ fn parse_sse(body: &str) -> (Vec<Value>, bool) {
 #[ignore = "loads real model — run with `cargo test -- --ignored`"]
 async fn test_chat_completion_basic() {
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let resp = Client::new()
+    let resp = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
@@ -167,7 +177,7 @@ async fn test_chat_completion_basic() {
 #[ignore = "loads real model"]
 async fn test_chat_streaming_sse() {
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let resp = Client::new()
+    let resp = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
@@ -209,7 +219,7 @@ async fn test_chat_streaming_sse() {
 #[ignore = "loads real model"]
 async fn test_chat_multi_turn_messages() {
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let resp = Client::new()
+    let resp = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
@@ -240,7 +250,7 @@ async fn test_chat_multi_turn_messages() {
 #[ignore = "loads real model"]
 async fn test_chat_no_template_leak() {
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let resp = Client::new()
+    let resp = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
@@ -285,7 +295,7 @@ async fn test_chat_max_tokens_truncation() {
     // a "long story" request in 5 tokens. Catches regressions where
     // max_tokens isn't propagated from the OpenAI request to SamplingParams.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let body: Value = Client::new()
+    let body: Value = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
@@ -324,7 +334,7 @@ async fn test_chat_custom_stop_strips_sentinel() {
     // a trailing stop sentinel on the way out (see `strip_trailing_stop`
     // in `ferrum-server/src/axum_server.rs`).
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let body: Value = Client::new()
+    let body: Value = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
@@ -359,7 +369,7 @@ async fn test_chat_empty_messages_400() {
     // OpenAI spec rejects empty messages with 400 BadRequest. We enforce
     // this in `chat_completions_handler` before tokenization.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let resp = Client::new()
+    let resp = http_client()
         .post(fx.chat_url())
         .json(&json!({
             "model": SMOKE_MODEL,
@@ -382,7 +392,7 @@ async fn test_models_endpoint_lists_loaded() {
     // the currently loaded model. Catches regressions where the engine
     // forgets to plumb its `EngineConfig.model.model_id` into `status()`.
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let resp = Client::new()
+    let resp = http_client()
         .get(format!("{}/v1/models", fx.url))
         .send()
         .await
@@ -414,7 +424,7 @@ async fn test_chat_concurrent_2_requests() {
     // stronger "each response reflects its own prompt" check is in PR 10
     // stress where we run 16+ and look for cross-talk patterns.)
     let fx = ServerFixture::spawn(SMOKE_MODEL).await;
-    let client = Client::new();
+    let client = http_client();
     let url = fx.chat_url();
 
     let req_a = client
@@ -470,7 +480,7 @@ async fn test_chat_greedy_is_deterministic() {
     });
     let mut contents = Vec::new();
     for _ in 0..2 {
-        let body: Value = Client::new()
+        let body: Value = http_client()
             .post(fx.chat_url())
             .json(&req)
             .send()

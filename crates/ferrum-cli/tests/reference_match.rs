@@ -139,8 +139,8 @@ impl ServerFixture {
                 &port.to_string(),
             ])
             .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn ferrum serve");
 
