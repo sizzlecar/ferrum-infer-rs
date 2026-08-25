@@ -661,9 +661,8 @@ G00 按统一分类器另算。2026-06-17 至 06-26 的 git subject 中有 `255`
 提交中 `qwen35.rs` 被改动 114 次、128 个 Qwen35 artifact 目录和约 40.28 小时本地 ledger。
 继续局部收敛只会把现有耦合固化为下一轮重构的前置债务。
 
-上述证据分别来自
-[`test-architecture HANDOFF`](../test-architecture-2026-06-10/HANDOFF.md) 和
-[`W3 Qwen3.5 retrospective`](../model-coverage-2026-06-12/W3_QWEN35_RETROSPECTIVE_20260626.md)。
+上述证据来自历史 test-architecture handoff 与 W3 Qwen3.5 retrospective；两份过程性
+文档已在 2026-08-25 清理，耐久结论仍保留在各自 STATUS/GOAL 和提交历史中。
 G00 必须把统计命令和结果重新写入 artifact；本段数字只用于立项，不替代 baseline PASS。
 
 ### 1.1 仓库证据快照

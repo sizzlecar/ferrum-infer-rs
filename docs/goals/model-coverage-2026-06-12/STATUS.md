@@ -9,7 +9,8 @@
   - User correctly challenged that a 10-minute pass could not have fully read
     the recent commits, core code, ledger, and artifact history.
 - Addendum:
-  - `docs/goals/model-coverage-2026-06-12/W3_QWEN35_DEEP_REVIEW_ADDENDUM_20260626.md`.
+  - the process-only addendum was removed by the 2026-08-25 bounded cleanup;
+    its durable findings remain summarized in this entry.
 - Scope actually checked in this addendum:
   - `git pull --rebase --autostash` confirmed local/origin already up to date
     at `1ec261ef`;
@@ -61,7 +62,8 @@
 ## 2026-06-26 ZZZ222 — W3 Qwen35 long-run first-pass retrospective
 
 - Review artifact:
-  - `docs/goals/model-coverage-2026-06-12/W3_QWEN35_RETROSPECTIVE_20260626.md`.
+  - the process-only retrospective was removed by the 2026-08-25 bounded
+    cleanup; its durable findings remain summarized in this entry.
 - Depth correction:
   - ZZZ223 supersedes this as the deeper review.
   - This entry should be read as a first-pass evidence index, not complete
