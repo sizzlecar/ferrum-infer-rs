@@ -8,7 +8,8 @@ name: Chat Smoke (nightly)
 #   - Manual via workflow_dispatch (use when iterating on cli run /
 #     cli serve / REPL / ferrum-server)
 #
-# Not on every PR — model pulls + cold-loads cost ~5–10 min per lane.
+# Not on every PR — a clean macOS runner can exceed 45 min for the full
+# real-model matrix; dependency and model caches make repeat runs faster.
 # PR-time CI (.github/workflows/ci.yml) already catches compile errors
 # via `cargo check --all-targets`.
 
@@ -29,7 +30,7 @@ jobs:
   metal:
     name: Chat smoke (macOS Metal)
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -75,7 +76,7 @@ jobs:
           cargo test --release -p ferrum-cli --features metal \
             --test chat_stress -- --ignored --test-threads=1
 
-      - name: HTTP server smoke (9 tests — OpenAI /v1/chat/completions)
+      - name: HTTP server smoke (10 tests — OpenAI /v1/chat/completions)
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test server_smoke -- --ignored --test-threads=1
