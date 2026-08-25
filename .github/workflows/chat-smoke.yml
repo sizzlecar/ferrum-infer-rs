@@ -81,8 +81,17 @@ jobs:
           cargo test --release -p ferrum-cli --features metal \
             --test server_smoke -- --ignored --test-threads=1
 
+      - name: Set up Python SDK runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: HTTP server OpenAI client contract (7 tests — async-openai/Python SDK)
         run: |
+          python3 -m venv "$RUNNER_TEMP/ferrum-openai-sdk"
+          "$RUNNER_TEMP/ferrum-openai-sdk/bin/python" -m pip install \
+            --disable-pip-version-check "openai==2.41.1"
+          export FERRUM_PYTHON="$RUNNER_TEMP/ferrum-openai-sdk/bin/python"
           cargo test --release -p ferrum-cli --features metal \
             --test server_openai_compat -- --ignored --test-threads=1
 

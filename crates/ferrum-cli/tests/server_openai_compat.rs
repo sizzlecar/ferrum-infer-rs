@@ -379,7 +379,9 @@ async fn test_openai_client_strict_json_schema_3_runs() {
                 .build()
                 .expect("build user msg")
                 .into()])
-            .max_tokens(16u32)
+            // Keep the real-model smoke bounded while leaving enough room for
+            // valid JSON whitespace/structural tokens on slower Metal hosts.
+            .max_tokens(32u32)
             .temperature(0.0)
             .response_format(response_format.clone())
             .build()
