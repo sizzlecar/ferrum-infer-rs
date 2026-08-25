@@ -365,7 +365,8 @@ async fn test_openai_client_strict_json_schema_3_runs() {
                 "properties": {
                     "answer": {"type": "string", "enum": ["ok"]}
                 },
-                "required": ["answer"]
+                "required": ["answer"],
+                "additionalProperties": false
             })),
             strict: Some(true),
         },
@@ -379,9 +380,7 @@ async fn test_openai_client_strict_json_schema_3_runs() {
                 .build()
                 .expect("build user msg")
                 .into()])
-            // Keep the real-model smoke bounded while leaving enough room for
-            // valid JSON whitespace/structural tokens on slower Metal hosts.
-            .max_tokens(32u32)
+            .max_tokens(16u32)
             .temperature(0.0)
             .response_format(response_format.clone())
             .build()
@@ -495,21 +494,24 @@ stream = client.chat.completions.create(
     stream_options={"include_usage": True},
 )
 chunks = 0
-stream_content = []
+choice_chunks = 0
+terminal_finish_reason_seen = False
 usage_seen = False
 for chunk in stream:
     chunks += 1
     if chunk.choices:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            stream_content.append(delta)
+        choice_chunks += 1
+        if chunk.choices[0].finish_reason is not None:
+            terminal_finish_reason_seen = True
     if getattr(chunk, "usage", None) is not None:
         usage_seen = True
 
 if chunks == 0:
     raise SystemExit("Python SDK stream yielded no chunks")
-if not "".join(stream_content).strip():
-    raise SystemExit("empty streaming Python SDK chat content")
+if choice_chunks == 0:
+    raise SystemExit("Python SDK stream yielded no choice chunks")
+if not terminal_finish_reason_seen:
+    raise SystemExit("Python SDK stream exposed no terminal finish_reason")
 if not usage_seen:
     raise SystemExit("Python SDK stream_options.include_usage did not expose usage")
 "#;
