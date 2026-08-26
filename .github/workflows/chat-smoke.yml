@@ -17,6 +17,12 @@ on:
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
+    inputs:
+      reference_only:
+        description: Run only the focused reference-output reproducer
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: chat-smoke-${{ github.ref }}
@@ -57,37 +63,47 @@ jobs:
 
       - name: Pre-pull required models
         run: |
-          ./target/release/ferrum pull qwen3:0.6b
-          ./target/release/ferrum pull qwen3:0.6b-gguf
-          ./target/release/ferrum pull tinyllama
-          ./target/release/ferrum pull qwen2.5:0.5b
+          if [[ "${{ inputs.reference_only }}" == "true" ]]; then
+            ./target/release/ferrum pull qwen3:0.6b-gguf
+          else
+            ./target/release/ferrum pull qwen3:0.6b
+            ./target/release/ferrum pull qwen3:0.6b-gguf
+            ./target/release/ferrum pull tinyllama
+            ./target/release/ferrum pull qwen2.5:0.5b
+          fi
 
       - name: Chat smoke (JSONL stdin pipe — 13 instances)
+        if: ${{ inputs.reference_only != true }}
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test chat_smoke -- --ignored --test-threads=1
 
       - name: Chat pty smoke (3 tests — bye / Ctrl+D / SIGINT)
+        if: ${{ inputs.reference_only != true }}
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test chat_pty -- --ignored --test-threads=1
 
       - name: Chat stress (30-turn no-OOM + 3-way concurrency)
+        if: ${{ inputs.reference_only != true }}
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test chat_stress -- --ignored --test-threads=1
 
       - name: HTTP server smoke (10 tests — OpenAI /v1/chat/completions)
+        if: ${{ inputs.reference_only != true }}
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test server_smoke -- --ignored --test-threads=1
 
       - name: Set up Python SDK runtime
+        if: ${{ inputs.reference_only != true }}
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: HTTP server OpenAI client contract (7 tests — async-openai/Python SDK)
+        if: ${{ inputs.reference_only != true }}
         run: |
           python3 -m venv "$RUNNER_TEMP/ferrum-openai-sdk"
           "$RUNNER_TEMP/ferrum-openai-sdk/bin/python" -m pip install \
@@ -97,6 +113,7 @@ jobs:
             --test server_openai_compat -- --ignored --test-threads=1
 
       - name: HTTP server stress (8 concurrent + prefix cache speedup)
+        if: ${{ inputs.reference_only != true }}
         run: |
           cargo test --release -p ferrum-cli --features metal \
             --test server_stress -- --ignored --test-threads=1
