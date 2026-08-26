@@ -28,7 +28,7 @@
 //!     FERRUM_UPDATE_FIXTURES=1 cargo test --release -p ferrum-cli \
 //!         --features metal --test reference_match -- --ignored --test-threads=1
 //!
-//! Verify (CI nightly):
+//! Verify manually on supported Metal hardware:
 //!
 //!     cargo test --release -p ferrum-cli --features metal \
 //!         --test reference_match -- --ignored --test-threads=1
