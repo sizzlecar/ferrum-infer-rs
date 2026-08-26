@@ -23,6 +23,12 @@ brew install ferrum
 brew install ferrum-cuda
 ```
 
+下载权重前先检查安装的二进制：
+
+```bash
+ferrum doctor
+```
+
 直接运行模型：
 
 ```bash
@@ -32,6 +38,9 @@ ferrum run qwen3.5:4b-q4_k_m
 # Linux CUDA（safetensors）
 ferrum run qwen3.5:4b
 ```
+
+Ferrum 不会静默选择模型。`run` 必须提供 MODEL；`serve` 必须提供 `--model`，
+或者在 `ferrum.toml` 中有意设置 `default_model`。
 
 通过 OpenAI 兼容 API 提供服务：
 
@@ -46,6 +55,9 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"ferrum","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+`ferrum doctor <MODEL>` 只解析模型来源并打印下一条 `run`、`serve` 命令，
+不会下载模型或启动推理 engine。
 
 ## 功能
 

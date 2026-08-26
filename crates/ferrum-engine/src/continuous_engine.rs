@@ -918,49 +918,6 @@ fn tokenizer_cache_key(tok: &Arc<dyn Tokenizer + Send + Sync>) -> usize {
     Arc::as_ptr(tok).cast::<()>() as usize
 }
 
-fn maybe_trace_prompt_tokens(
-    tok: &(dyn Tokenizer + Send + Sync),
-    request_id: &RequestId,
-    prompt: &str,
-) {
-    if std::env::var_os("FERRUM_TRACE_PROMPT_TOKENS").is_none() {
-        return;
-    }
-
-    let prompt_json = serde_json::to_string(prompt).unwrap_or_else(|_| "<json-error>".to_string());
-    eprintln!("[prompt-tokens] request_id={request_id} prompt={prompt_json}");
-    for add_special in [true, false] {
-        match tok.encode(prompt, add_special) {
-            Ok(tokens) => {
-                let ids: Vec<u32> = tokens.iter().map(|token| token.get()).collect();
-                let head_ids: Vec<u32> = ids.iter().copied().take(96).collect();
-                let mut tail_ids: Vec<u32> = ids.iter().rev().copied().take(32).collect();
-                tail_ids.reverse();
-                let head_texts: Vec<String> = tokens
-                    .iter()
-                    .take(24)
-                    .map(|token| {
-                        tok.decode(&[*token], false)
-                            .unwrap_or_else(|_| "<decode-error>".to_string())
-                    })
-                    .collect();
-                eprintln!(
-                    "[prompt-tokens] request_id={request_id} add_special={add_special} len={} head_ids={:?} tail_ids={:?} head_texts={:?}",
-                    tokens.len(),
-                    head_ids,
-                    tail_ids,
-                    head_texts,
-                );
-            }
-            Err(err) => {
-                eprintln!(
-                    "[prompt-tokens] request_id={request_id} add_special={add_special} error={err}"
-                );
-            }
-        }
-    }
-}
-
 fn is_forbidden_generation_token_text(text: &str) -> bool {
     let text = text.trim();
     if text.is_empty() {
@@ -3003,7 +2960,6 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let infer_start = Instant::now();
         counter!("ferrum.engine.requests_total").increment(1);
 
-        maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,
@@ -3128,7 +3084,6 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let receiver_drop_wake = ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
         let request_id = request.id.clone();
 
-        maybe_trace_prompt_tokens(&*self.inner.tokenizer, &request_id, &request.prompt);
         let input_tokens = self.inner.tokenizer.encode(&request.prompt, true)?;
         clamp_default_max_tokens_to_context(
             &mut request,

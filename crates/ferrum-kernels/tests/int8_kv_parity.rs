@@ -99,7 +99,7 @@ fn int8_kv_append_roundtrip() {
     let mut v_scales: cudarc::driver::CudaSlice<f16> = stream
         .alloc_zeros::<f16>(POOL_TOKENS * NUM_KV_HEADS)
         .unwrap();
-    let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
+    let slot_dev = stream.clone_htod(&slot_mapping).unwrap();
 
     launch_int8_kv_cache_append(
         &ctx,
@@ -118,10 +118,10 @@ fn int8_kv_append_roundtrip() {
 
     stream.synchronize().unwrap();
 
-    let k_pool_h: Vec<i8> = stream.memcpy_dtov(&k_pool).unwrap();
-    let v_pool_h: Vec<i8> = stream.memcpy_dtov(&v_pool).unwrap();
-    let k_scales_h: Vec<f16> = stream.memcpy_dtov(&k_scales).unwrap();
-    let v_scales_h: Vec<f16> = stream.memcpy_dtov(&v_scales).unwrap();
+    let k_pool_h: Vec<i8> = stream.clone_dtoh(&k_pool).unwrap();
+    let v_pool_h: Vec<i8> = stream.clone_dtoh(&v_pool).unwrap();
+    let k_scales_h: Vec<f16> = stream.clone_dtoh(&k_scales).unwrap();
+    let v_scales_h: Vec<f16> = stream.clone_dtoh(&v_scales).unwrap();
 
     // Dequantize and compare. INT8 sym-quant is lossy by ~1/127 of the
     // per-token-head max — assert a generous bound.
@@ -255,13 +255,13 @@ fn int8_paged_decode_parity_vs_host_ref() {
     let stream = ctx.default_stream();
 
     let q_dev = CudaBackend::from_slice(&q_data);
-    let k_pool_i8 = stream.memcpy_stod(&k_q).unwrap();
-    let v_pool_i8 = stream.memcpy_stod(&v_q).unwrap();
+    let k_pool_i8 = stream.clone_htod(&k_q).unwrap();
+    let v_pool_i8 = stream.clone_htod(&v_q).unwrap();
     let k_scales_h: Vec<f16> = k_s.iter().map(|x| f16::from_f32(*x)).collect();
     let v_scales_h: Vec<f16> = v_s.iter().map(|x| f16::from_f32(*x)).collect();
-    let k_scales_dev = stream.memcpy_stod(&k_scales_h).unwrap();
-    let v_scales_dev = stream.memcpy_stod(&v_scales_h).unwrap();
-    let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+    let k_scales_dev = stream.clone_htod(&k_scales_h).unwrap();
+    let v_scales_dev = stream.clone_htod(&v_scales_h).unwrap();
+    let bt_dev = stream.clone_htod(&block_table).unwrap();
 
     let mut out_dev = CudaBackend::alloc(NUM_HEADS * HEAD_DIM);
     launch_int8_paged_decode_attention(
@@ -408,8 +408,8 @@ fn int8_kv_append_then_decode_e2e() {
     let mut v_scales: cudarc::driver::CudaSlice<f16> = stream
         .alloc_zeros::<f16>(pool_tokens * NUM_KV_HEADS)
         .unwrap();
-    let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
-    let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+    let slot_dev = stream.clone_htod(&slot_mapping).unwrap();
+    let bt_dev = stream.clone_htod(&block_table).unwrap();
 
     launch_int8_kv_cache_append(
         &ctx,
@@ -542,8 +542,8 @@ fn kv_cache_quant_int8_e2e() {
     let q_dev = CudaBackend::from_slice(&q_data);
     let k_in_dev = CudaBackend::from_slice(&k_in_data);
     let v_in_dev = CudaBackend::from_slice(&v_in_data);
-    let slot_dev = stream.memcpy_stod(&slot_mapping).unwrap();
-    let bt_dev = stream.memcpy_stod(&block_table).unwrap();
+    let slot_dev = stream.clone_htod(&slot_mapping).unwrap();
+    let bt_dev = stream.clone_htod(&block_table).unwrap();
 
     // Append.
     launch_int8_kv_cache_append(

@@ -37,7 +37,7 @@ fn ferrum_bin() -> PathBuf {
 
 fn spawn_ferrum_run() -> rexpect::session::PtySession {
     let mut cmd = Command::new(ferrum_bin());
-    cmd.args(["run", SMOKE_MODEL]);
+    cmd.args(["run", SMOKE_MODEL, "--disable-thinking"]);
     cmd.env("NO_COLOR", "1");
     spawn_command(cmd, Some(SPAWN_TIMEOUT_MS)).expect("spawn ferrum on pty")
 }

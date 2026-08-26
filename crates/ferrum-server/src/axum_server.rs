@@ -241,6 +241,13 @@ impl AxumServer {
         self
     }
 
+    /// Set the server-wide reasoning default for requests that omit
+    /// `chat_template_kwargs.enable_thinking`. Per-request values still win.
+    pub fn with_default_enable_thinking(mut self, enable_thinking: Option<bool>) -> Self {
+        self.state = self.state.with_default_enable_thinking(enable_thinking);
+        self
+    }
+
     /// Install the public OpenAI model namespace used for request routing and
     /// `/v1/models`. The registry keeps public aliases separate from the
     /// engine's internal model id.
@@ -344,6 +351,7 @@ pub struct AppState {
     pub tts: Option<Arc<dyn TtsEngine + Send + Sync>>,
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
+    pub default_enable_thinking: Option<bool>,
     pub served_model_registry: Arc<ServedModelRegistry>,
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
@@ -402,6 +410,11 @@ impl AppState {
 
     pub fn with_prompt_template(mut self, prompt_template: Option<ModelChatTemplate>) -> Self {
         self.prompt_template = prompt_template.map(Arc::new);
+        self
+    }
+
+    pub fn with_default_enable_thinking(mut self, enable_thinking: Option<bool>) -> Self {
+        self.default_enable_thinking = enable_thinking;
         self
     }
 
@@ -1133,10 +1146,11 @@ async fn chat_completions_handler(
     )?;
 
     // Convert OpenAI request to internal format
-    let mut inference_request = convert_chat_request_with_template_model(
+    let mut inference_request = convert_chat_request_with_template_model_and_default(
         &request,
         &engine_model_id.0,
         state.prompt_template.as_deref(),
+        state.default_enable_thinking,
     )
     .map_err(server_error_from_ferrum_error)?;
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
@@ -3116,6 +3130,20 @@ fn convert_chat_request_with_template_model(
     template_model_id: &str,
     model_template: Option<&ModelChatTemplate>,
 ) -> ferrum_types::Result<InferenceRequest> {
+    convert_chat_request_with_template_model_and_default(
+        request,
+        template_model_id,
+        model_template,
+        None,
+    )
+}
+
+fn convert_chat_request_with_template_model_and_default(
+    request: &ChatCompletionsRequest,
+    template_model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    default_enable_thinking: Option<bool>,
+) -> ferrum_types::Result<InferenceRequest> {
     let no_tools: &[ChatTool] = &[];
     let tools = if tool_choice_none_hides_tools(request.tool_choice.as_ref(), model_template) {
         no_tools
@@ -3138,7 +3166,8 @@ fn convert_chat_request_with_template_model(
         .then(|| requested_response_format_for_sampling(request))
         .transpose()?
         .flatten();
-    let chat_template_options = chat_template_options_for_request(request, model_template)?;
+    let chat_template_options =
+        chat_template_options_for_request(request, model_template, default_enable_thinking)?;
     let response_format = forced_response_format
         .or(requested_response_format)
         .unwrap_or(ferrum_types::ResponseFormat::Text);
@@ -3325,8 +3354,10 @@ fn tool_choice_none_hides_tools(
 fn chat_template_options_for_request(
     request: &ChatCompletionsRequest,
     model_template: Option<&ModelChatTemplate>,
+    default_enable_thinking: Option<bool>,
 ) -> ferrum_types::Result<ChatTemplateOptions> {
     let mut options = ChatTemplateOptions::default_for_template(model_template);
+    options.enable_thinking = default_enable_thinking;
     let Some(kwargs) = request.chat_template_kwargs.as_ref() else {
         return Ok(options);
     };
@@ -6385,6 +6416,13 @@ mod tests {
     fn router_with_capturing_llm_and_template(
         template: ModelChatTemplate,
     ) -> (Router, Arc<CapturingLlm>) {
+        router_with_capturing_llm_and_template_default(template, None)
+    }
+
+    fn router_with_capturing_llm_and_template_default(
+        template: ModelChatTemplate,
+        default_enable_thinking: Option<bool>,
+    ) -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
         let registry = ServedModelRegistry::try_new(
             "qwen3",
@@ -6396,6 +6434,7 @@ mod tests {
         let router = AxumServer::from_llm(engine.clone())
             .with_served_model_registry(registry)
             .with_prompt_template(Some(template))
+            .with_default_enable_thinking(default_enable_thinking)
             .build_router();
         (router, engine)
     }
@@ -8600,6 +8639,52 @@ mod tests {
 
         let request = engine.last_request();
         assert!(request.prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+        assert!(!request
+            .metadata
+            .contains_key(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
+    }
+
+    #[tokio::test]
+    async fn server_thinking_default_applies_but_request_override_wins() {
+        let template = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}{% endif %}",
+            "test-template",
+        );
+        let (router, engine) =
+            router_with_capturing_llm_and_template_default(template, Some(false));
+
+        let response = post_json(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let request = engine.last_request();
+        assert_eq!(request.prompt, "<assistant><think>\n\n</think>\n\n");
+        assert_eq!(
+            request
+                .metadata
+                .get(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY),
+            Some(&serde_json::json!([THINK_END_TAG, THINK_START_TAG]))
+        );
+
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"enable_thinking": true}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let request = engine.last_request();
+        assert_eq!(request.prompt, "<assistant><think>\n");
         assert!(!request
             .metadata
             .contains_key(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));

@@ -3873,21 +3873,30 @@ fn host_compiler_raw_output(
             path: compiler.to_path_buf(),
             source,
         })?;
-    child
-        .stdin
-        .take()
-        .expect("host compiler stdin is piped")
-        .write_all(stdin)
-        .map_err(|source| NativeOperatorBuilderError::Io {
-            path: compiler.to_path_buf(),
-            source,
-        })?;
+    let stdin_result = {
+        let mut child_stdin = child.stdin.take().expect("host compiler stdin is piped");
+        let result = child_stdin.write_all(stdin);
+        drop(child_stdin);
+        result
+    };
     let output = child
         .wait_with_output()
         .map_err(|source| NativeOperatorBuilderError::Io {
             path: compiler.to_path_buf(),
             source,
         })?;
+    if let Err(source) = stdin_result {
+        // A successful compiler probe may close stdin before the parent gets
+        // scheduled to write the tiny probe payload. The child exit status is
+        // authoritative in that case; treating EPIPE as a tool-access failure
+        // makes concurrent probes flaky and can also leave the child unreaped.
+        if source.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(NativeOperatorBuilderError::Io {
+                path: compiler.to_path_buf(),
+                source,
+            });
+        }
+    }
     if !output.status.success() {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "host compiler probe failed for {:?}: path={} status={}",
@@ -5558,6 +5567,32 @@ mod tests {
             roots,
             [second.display().to_string(), first.display().to_string(),]
         );
+    }
+
+    #[test]
+    fn successful_host_probe_may_close_stdin_before_parent_finishes_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let compiler = root.path().join("successful-probe");
+        fs::write(
+            &compiler,
+            "#!/bin/sh\nexec 0<&-\nprintf 'probe complete\\n'\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&compiler).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&compiler, permissions).unwrap();
+        let environment = BTreeMap::from([
+            ("LANG".to_string(), "C".to_string()),
+            ("LC_ALL".to_string(), "C".to_string()),
+            ("TZ".to_string(), "UTC".to_string()),
+        ]);
+
+        let output =
+            host_compiler_raw_output(&compiler, &[], &vec![b'x'; 1024 * 1024], &environment)
+                .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"probe complete\n");
     }
 
     #[test]

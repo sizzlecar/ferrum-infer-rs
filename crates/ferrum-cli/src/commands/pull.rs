@@ -7,7 +7,7 @@ use ferrum_types::Result;
 
 #[derive(Args)]
 pub struct PullCommand {
-    /// Model name to download (e.g., tinyllama, qwen2.5:7b, TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+    /// Model to download (for example `qwen3.5:4b-q4_k_m` on Metal or `qwen3.5:4b` on CUDA)
     pub model: String,
 }
 

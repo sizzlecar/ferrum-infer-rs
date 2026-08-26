@@ -25,6 +25,18 @@
 //! [`resolve_model_source`].
 
 use std::path::{Path, PathBuf};
+
+/// Small, release-supported starter models used by CLI guidance. These are
+/// intentionally not implicit defaults: users should see what will download.
+pub const METAL_FIRST_SUCCESS_MODEL: &str = "qwen3.5:4b-q4_k_m";
+pub const CUDA_FIRST_SUCCESS_MODEL: &str = "qwen3.5:4b";
+
+/// Keep missing-model guidance identical for `run` and `serve`.
+pub fn first_success_model_help(command: &str) -> String {
+    format!(
+        "no model selected. Choose one explicitly:\n  Metal: ferrum {command} {METAL_FIRST_SUCCESS_MODEL}\n  CUDA:  ferrum {command} {CUDA_FIRST_SUCCESS_MODEL}\nRun `ferrum doctor` to inspect this binary before downloading a model."
+    )
+}
 use std::sync::Arc;
 
 use clap::Args;

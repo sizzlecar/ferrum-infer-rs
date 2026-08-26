@@ -3,11 +3,10 @@
 //! Commands:
 //! - serve: Start the inference server
 //! - run: Run a model and start interactive chat
-//! - embed: Generate text embeddings using BERT models
-//! - transcribe: Transcribe audio files using Whisper models
 //! - stop: Stop the running server
 //! - pull: Download a model
 //! - list: List downloaded models
+//! - doctor: Inspect a binary and model source without downloading weights
 
 use clap::{Parser, Subcommand};
 use colored::*;
@@ -19,7 +18,7 @@ use std::process;
 #[command(about = "Ferrum - Fast LLM Inference Engine")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(
-    long_about = "A high-performance LLM inference engine with Metal/CUDA acceleration.\n\nExamples:\n  ferrum run tinyllama        # Start chat with TinyLlama\n  ferrum pull qwen2.5:7b      # Download Qwen 2.5 7B model\n  ferrum list                 # Show downloaded models\n  ferrum serve                # Start HTTP server"
+    long_about = "A high-performance LLM inference engine with Metal/CUDA acceleration.\n\nExamples:\n  ferrum doctor                                      # Inspect this binary\n  ferrum run qwen3.5:4b-q4_k_m                      # Metal chat\n  ferrum run qwen3.5:4b                             # CUDA chat\n  ferrum serve --model qwen3.5:4b --port 8000       # OpenAI-compatible server\n  ferrum list                                        # Show downloaded models"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -32,34 +31,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a model and start interactive chat. Accepts an alias / HF repo id /
-    /// path to a `.gguf` file — the last routes to candle-transformers'
-    /// quantized loaders for the M1 Max bench path.
+    /// Run a model in interactive chat or with a one-shot prompt
     #[command(visible_alias = "r")]
     Run(run::RunCommand),
 
     /// Benchmark model throughput and latency
+    #[command(hide = true)]
     Bench(bench::BenchCommand),
 
     /// HTTP serve-side bench with tokenizer-aware random prompts
     /// (apples-to-apples vs `vllm bench serve --dataset-name random`)
+    #[command(hide = true)]
     BenchServe(bench_serve::BenchServeCommand),
 
     /// Validate and replay a request replay bundle without starting HTTP.
+    #[command(hide = true)]
     ReplayBundle(replay_bundle::ReplayBundleCommand),
 
     /// Collect bitwise CUDA vNext evidence for the release model matrix.
+    #[command(hide = true)]
     VnextDeterminism(vnext_determinism::VNextDeterminismCommand),
 
     /// Generate text embeddings using BERT models
-    #[command(visible_alias = "e")]
+    #[command(visible_alias = "e", hide = true)]
     Embed(embed::EmbedCommand),
 
     /// Transcribe audio files using Whisper models
-    #[command(visible_alias = "t")]
+    #[command(visible_alias = "t", hide = true)]
     Transcribe(transcribe::TranscribeCommand),
 
     /// Text-to-speech synthesis using Qwen3-TTS models
+    #[command(hide = true)]
     Tts(tts::TtsCommand),
 
     /// Start the inference HTTP server
@@ -74,6 +76,9 @@ enum Commands {
     /// List downloaded models
     #[command(visible_alias = "ls")]
     List(list::ListCommand),
+
+    /// Inspect the binary, backend, cache, and a model source without downloading it
+    Doctor(doctor::DoctorCommand),
 }
 
 #[tokio::main]
@@ -87,7 +92,7 @@ async fn main() {
         process::exit(1);
     }
 
-    // Load configuration (create default if not exists)
+    // Load the optional local configuration without creating files.
     let config = match CliConfig::load("ferrum.toml").await {
         Ok(config) => config,
         Err(e) => {
@@ -112,6 +117,7 @@ async fn main() {
         Commands::Stop(cmd) => stop::execute(cmd).await,
         Commands::Pull(cmd) => pull::execute(cmd, config).await,
         Commands::List(cmd) => list::execute(cmd, config).await,
+        Commands::Doctor(cmd) => doctor::execute(cmd, config).await,
     };
 
     if let Err(e) = result {

@@ -79,6 +79,42 @@ HOT_DIRECT_ENV_READ_CLASSIFICATIONS = (
         "read_phase": "test-only",
         "reason": "ignored manual GPU capture test guard, not a product runtime Ferrum knob",
     },
+    {
+        "path": "crates/ferrum-models/src/vnext/qwen35.rs",
+        "call": "std::env::var",
+        "env_name": "FERRUM_TEST_QWEN35_SEMANTIC_DIR",
+        "expected_count": 1,
+        "classification": "ignored_real_model_test_fixture",
+        "read_phase": "test-only",
+        "reason": "ignored real-model Qwen3.5 GGUF test input, never read by product code",
+    },
+    {
+        "path": "crates/ferrum-models/src/vnext/qwen35.rs",
+        "call": "std::env::var",
+        "env_name": "FERRUM_TEST_GGUF_PATH",
+        "expected_count": 1,
+        "classification": "ignored_real_model_test_fixture",
+        "read_phase": "test-only",
+        "reason": "ignored real-model Qwen3.5 GGUF test input, never read by product code",
+    },
+    {
+        "path": "crates/ferrum-models/src/vnext/qwen35.rs",
+        "call": "std::env::var",
+        "env_name": "FERRUM_TEST_QWEN35_MOE_SEMANTIC_DIR",
+        "expected_count": 1,
+        "classification": "ignored_real_model_test_fixture",
+        "read_phase": "test-only",
+        "reason": "ignored real-model Qwen3.5 MoE GGUF test input, never read by product code",
+    },
+    {
+        "path": "crates/ferrum-models/src/vnext/qwen35.rs",
+        "call": "std::env::var",
+        "env_name": "FERRUM_TEST_QWEN35_MOE_GGUF_PATH",
+        "expected_count": 1,
+        "classification": "ignored_real_model_test_fixture",
+        "read_phase": "test-only",
+        "reason": "ignored real-model Qwen3.5 MoE GGUF test input, never read by product code",
+    },
 )
 
 PROCESS_ENV_WRITE_CLASSIFICATIONS = (
@@ -1104,28 +1140,32 @@ def main() -> int:
     else:
         print(render_human(scan))
 
-    if args.fail_on_registry_gap and (
+    audit_invariant_failure = (
         ignored["errors"]
         or comparison["errors"]
-        or comparison["missing_count"]
-        or comparison["extra_count"]
         or scan["hot_direct_env_reads_unclassified"]
         or scan["process_env_writes_unclassified"]
         or scan["product_config_surface"]["errors"]
         or scan["threshold_errors"]
+    )
+
+    if args.fail_on_registry_gap and (
+        audit_invariant_failure
+        or comparison["missing_count"]
+        or comparison["extra_count"]
     ):
         return 1
     if args.fail_on_new_missing and missing_baseline_report is not None:
         if (
-            ignored["errors"]
-            or comparison["errors"]
+            audit_invariant_failure
             or missing_baseline_report["errors"]
             or missing_baseline_report["new_missing_count"]
         ):
             return 1
     if args.fail_on_baseline_drift and missing_baseline_report is not None:
         if (
-            missing_baseline_report["errors"]
+            audit_invariant_failure
+            or missing_baseline_report["errors"]
             or missing_baseline_report["new_missing_count"]
             or missing_baseline_report["resolved_missing_count"]
         ):

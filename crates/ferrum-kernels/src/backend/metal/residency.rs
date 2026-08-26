@@ -1,3 +1,8 @@
+#![allow(
+    unexpected_cfgs,
+    reason = "objc 0.2 macros expand their legacy cargo-clippy feature cfg in the calling crate"
+)]
+
 use ferrum_types::{FerrumError, Result};
 use metal::objc::runtime::{Class, Object, BOOL, YES};
 use metal::objc::{msg_send, sel, sel_impl};
@@ -55,9 +60,11 @@ impl MetalResidencySet {
                     ns_error_description(error)
                 )));
             }
-            let raw = NonNull::new(raw)
-                .ok_or_else(|| FerrumError::device("Metal returned a null residency set"))?;
-            Ok(Some(Self { raw }))
+            // Some virtualized Metal devices expose the selector but return
+            // neither a residency set nor an NSError. Treat that as an
+            // unsupported optional capability and keep the normal buffer
+            // retention path active.
+            Ok(NonNull::new(raw).map(|raw| Self { raw }))
         }
     }
 

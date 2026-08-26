@@ -351,8 +351,8 @@ fn cudarc_graph_shared_host_array_multi_memcpy() {
     }
 
     // Verify dev1 vs dev2 actually got DIFFERENT data on replay
-    let dev1_host: Vec<u64> = stream.memcpy_dtov(&dev1).expect("dtov dev1");
-    let dev2_host: Vec<u64> = stream.memcpy_dtov(&dev2).expect("dtov dev2");
+    let dev1_host: Vec<u64> = stream.clone_dtoh(&dev1).expect("dtoh dev1");
+    let dev2_host: Vec<u64> = stream.clone_dtoh(&dev2).expect("dtoh dev2");
     eprintln!("[shared-host-multi] dev1 = {:?}", dev1_host);
     eprintln!("[shared-host-multi] dev2 = {:?}", dev2_host);
     eprintln!("[shared-host-multi] SUCCESS — ran without hang. Data correctness:");
@@ -403,8 +403,8 @@ extern "C" __global__ void square(float* buf, int n) {
 
     // cuBLAS handle + workspace + DEVICE pointer mode (matches our config).
     let blas = CudaBlas::new(stream.clone()).expect("CudaBlas::new");
-    let alpha_f32 = stream.memcpy_stod(&[1.0f32]).expect("alpha");
-    let beta_f32 = stream.memcpy_stod(&[0.0f32]).expect("beta");
+    let alpha_f32 = stream.clone_htod(&[1.0f32]).expect("alpha");
+    let beta_f32 = stream.clone_htod(&[0.0f32]).expect("beta");
     unsafe {
         blas_sys::cublasSetPointerMode_v2(
             *blas.handle(),

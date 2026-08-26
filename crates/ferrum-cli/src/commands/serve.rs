@@ -49,6 +49,16 @@ pub struct ServeCommand {
     )]
     pub served_model_name: Vec<String>,
 
+    /// Enable model reasoning by default when a request omits
+    /// `chat_template_kwargs.enable_thinking`.
+    #[arg(long, conflicts_with = "disable_thinking")]
+    pub enable_thinking: bool,
+
+    /// Disable model reasoning by default when a request omits
+    /// `chat_template_kwargs.enable_thinking`.
+    #[arg(long, conflicts_with = "enable_thinking")]
+    pub disable_thinking: bool,
+
     /// Host to bind to
     #[arg(long)]
     pub host: Option<String>,
@@ -305,6 +315,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         model_option,
         product_sources,
         served_model_name,
+        enable_thinking,
+        disable_thinking,
         host,
         port,
         tts_slots,
@@ -365,6 +377,14 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         lora_model_id_template,
     } = cmd;
 
+    let default_enable_thinking = if enable_thinking {
+        Some(true)
+    } else if disable_thinking {
+        Some(false)
+    } else {
+        None
+    };
+
     // Reject malformed adapter specs before selecting a device or resolving,
     // downloading, and preparing the base model.
     let lora_specs = parse_lora_specs(&lora)?;
@@ -384,8 +404,18 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     // Resolve model
     let model_name = model
         .or(model_option)
-        .or(config.models.default_model.clone())
-        .unwrap_or_else(|| "TinyLlama/TinyLlama-1.1B-Chat-v1.0".to_string());
+        .or_else(|| {
+            config
+                .models
+                .default_model
+                .clone()
+                .filter(|model| !model.trim().is_empty())
+        })
+        .ok_or_else(|| {
+            FerrumError::config(crate::source_resolver::first_success_model_help(
+                "serve --model",
+            ))
+        })?;
     let serve_start = std::time::Instant::now();
     let product_observability = crate::observability_product::ProductObservabilityConfig::new(
         ferrum_types::ProfileEntrypoint::Serve,
@@ -1038,7 +1068,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
             AxumServer::from_llm(engine).with_prompt_template(model_chat_template)
         }
     }
-    .with_auto_config(startup_auto_config);
+    .with_auto_config(startup_auto_config)
+    .with_default_enable_thinking(default_enable_thinking);
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();

@@ -3,6 +3,11 @@
 Ferrum exposes OpenAI-shaped HTTP endpoints for local serving. This document
 describes the current product contract for the always-on server path.
 
+Ferrum v0.8 release support is language-model serving: chat completions, text
+completions, and model discovery. Embedding, ASR, and TTS routes remain in the
+source tree for legacy/specialized engines, but are outside the v0.8 release
+support matrix and are hidden from the default CLI help.
+
 ## Endpoints
 
 | Endpoint | Status | Notes |
@@ -10,9 +15,9 @@ describes the current product contract for the always-on server path.
 | `POST /v1/chat/completions` | Supported | Non-streaming and streaming chat responses. |
 | `POST /v1/completions` | Supported | Non-streaming and streaming text completions with a single string `prompt`; prompt arrays/objects are rejected with `param=prompt`. |
 | `GET /v1/models` | Supported | Lists models known to the server. |
-| `POST /v1/embeddings` | Supported for embedding servers | Text and image embedding support depends on the loaded model. |
-| `POST /v1/audio/transcriptions` | Supported for ASR servers | Multipart form input. |
-| `POST /v1/audio/speech` | Supported for TTS servers | Speech output depends on the loaded TTS model. |
+| `POST /v1/embeddings` | Experimental / outside v0.8 release scope | Text and image embedding support depends on a specialized loaded model. |
+| `POST /v1/audio/transcriptions` | Experimental / outside v0.8 release scope | Multipart form input for specialized ASR engines. |
+| `POST /v1/audio/speech` | Experimental / outside v0.8 release scope | Speech output depends on a specialized TTS engine. |
 
 ## Modality Endpoint Fields
 
@@ -43,7 +48,7 @@ describes the current product contract for the always-on server path.
 | `stop` | Supported | Accepts a string or string array and strips a trailing stop sentinel from returned text. |
 | `stream` | Supported | Emits OpenAI-shaped SSE chunks followed by `[DONE]`. |
 | `stream_options.include_usage` | Supported with `stream=true` | Emits a final usage chunk with `choices: []`; `stream_options` without streaming is rejected. |
-| `chat_template_kwargs.enable_thinking` | Supported when the model template reads it | Boolean vLLM-compatible chat-template variable. Ferrum forwards it to the model-provided template. Templates that do not use `enable_thinking` are unaffected; non-boolean values return HTTP 400. |
+| `chat_template_kwargs.enable_thinking` | Supported when the model template reads it | Boolean vLLM-compatible chat-template variable. Ferrum forwards it to the model-provided template. `ferrum serve --enable-thinking` or `--disable-thinking` sets the default for omitted requests; the request value wins. Templates that do not use `enable_thinking` are unaffected; non-boolean values return HTTP 400. |
 | `n` | Restricted | Only `n=1` is supported; other values return HTTP 400 with `param=n`. |
 | `logit_bias` | Rejected | Non-empty maps return HTTP 400 with `param=logit_bias`. |
 | `logprobs` | Rejected | Returns HTTP 400 with `param=logprobs`. |

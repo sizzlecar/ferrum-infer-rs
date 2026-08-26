@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "shared integration-test support is included by multiple focused test binaries"
+)]
+
 pub(crate) use ferrum_interfaces::vnext::*;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
@@ -5,7 +10,9 @@ pub(crate) use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use std::error::Error;
 pub(crate) use std::fmt;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[allow(unused_imports)] // Shared by a subset of the integration-test binaries.
 pub(crate) use std::sync::{mpsc, Arc, Barrier, Mutex};
+#[allow(unused_imports)] // Shared by a subset of the integration-test binaries.
 pub(crate) use std::time::{Duration, Instant};
 
 pub(crate) const EXPECTED_LEGACY_AUTHORITY_CASES: usize = 13;

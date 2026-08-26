@@ -5,6 +5,11 @@
 //! and the returned fence retains all buffers and staging storage until Metal
 //! reports a quiescent terminal state.
 
+#![allow(
+    unexpected_cfgs,
+    reason = "objc 0.2 macros expand their legacy cargo-clippy feature cfg in the calling crate"
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::ffi::{c_void, CStr};
@@ -16,7 +21,7 @@ use std::time::Instant;
 
 use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
-    DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch, DeviceCommandEntry,
+    DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
     DeviceCommandExecutionTiming, DeviceCommandLogicalWork, DeviceCommandPhase,
     DeviceComputePathRequirement, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
     DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionTiming, DeviceId,
@@ -696,19 +701,22 @@ struct MetalCounterCaptureBuilder {
 }
 
 impl MetalCounterCaptureBuilder {
-    fn new(device: metal::Device, counter_set: CounterSet) -> Self {
+    fn new(device: metal::Device, counter_set: CounterSet) -> Option<Self> {
         let mut cpu_anchor_start = 0;
         let mut gpu_anchor_start = 0;
         device.sample_timestamps(&mut cpu_anchor_start, &mut gpu_anchor_start);
-        Self {
+        if cpu_anchor_start == 0 || gpu_anchor_start == 0 {
+            return None;
+        }
+        Some(Self {
             device,
             counter_set,
             pages: Vec::new(),
             mappings: Vec::new(),
             cpu_anchor_start,
             gpu_anchor_start,
-            unavailable: cpu_anchor_start == 0 || gpu_anchor_start == 0,
-        }
+            unavailable: false,
+        })
     }
 
     fn add_page(&mut self) -> Result<(), ()> {
@@ -1786,9 +1794,9 @@ impl MetalDeviceRuntime {
         }
         let counter_capture = if physical_span_attribution {
             match self.timestamp_counter_support() {
-                MetalTimestampCounterSupport::Supported(counter_set) => Some(
-                    MetalCounterCaptureBuilder::new(self.device.clone(), counter_set),
-                ),
+                MetalTimestampCounterSupport::Supported(counter_set) => {
+                    MetalCounterCaptureBuilder::new(self.device.clone(), counter_set)
+                }
                 MetalTimestampCounterSupport::Unsupported => None,
             }
         } else {
@@ -2726,8 +2734,12 @@ mod tests {
             terminal.execution_timing(),
             DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
         ));
-        let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
-            panic!("Metal kernel profile must report command counter timing")
+        let timing = match terminal.submission_timing() {
+            DeviceTimingMeasurement::Measured(timing) => timing,
+            DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendUnsupported,
+            ) => return,
+            other => panic!("Metal kernel profile command timing failed: {other:?}"),
         };
         let [timing] = timing.spans() else {
             panic!("expected exactly one command timing row")
@@ -2767,8 +2779,12 @@ mod tests {
             terminal.execution_timing(),
             DeviceTimingMeasurement::Measured(timing) if timing.elapsed_ns() > 0
         ));
-        let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
-            panic!("Metal replay profile must report physical command timing")
+        let timing = match terminal.submission_timing() {
+            DeviceTimingMeasurement::Measured(timing) => timing,
+            DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendUnsupported,
+            ) => return,
+            other => panic!("Metal replay profile command timing failed: {other:?}"),
         };
         assert_eq!(timing.command_count(), 1);
         assert_eq!(timing.spans().len(), 1);
@@ -2782,7 +2798,7 @@ mod tests {
             .expect("destination allocation");
         let region = destination.region(0..8).expect("destination region");
         let command = MetalDeviceCommand::operation(
-            "batched device zero",
+            "batched.device.zero",
             vec![region],
             |encoder, regions| {
                 encoder.with_blit_commands(3, |blit| {
@@ -2821,8 +2837,12 @@ mod tests {
 
         let terminal = runtime.wait_fence(&fence).expect("terminal fence");
         assert!(terminal.terminal().is_succeeded());
-        let DeviceTimingMeasurement::Measured(timing) = terminal.submission_timing() else {
-            panic!("Metal kernel profile must report command counter timing")
+        let timing = match terminal.submission_timing() {
+            DeviceTimingMeasurement::Measured(timing) => timing,
+            DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendUnsupported,
+            ) => return,
+            other => panic!("Metal kernel profile command timing failed: {other:?}"),
         };
         let [timing] = timing.spans() else {
             panic!("expected exactly one command timing row")
@@ -2846,7 +2866,7 @@ mod tests {
             .allocate_request(&buffer_request("resource/failing-operation"))
             .expect("allocation");
         let command = MetalDeviceCommand::operation(
-            "failing operation",
+            "failing.operation",
             vec![buffer.region(0..8).expect("region")],
             |_encoder, _regions| Err(MetalDeviceRuntimeError::contract("expected encode failure")),
         )
