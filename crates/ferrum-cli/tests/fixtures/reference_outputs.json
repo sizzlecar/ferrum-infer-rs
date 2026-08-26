@@ -4,8 +4,8 @@
   "$update_command": "FERRUM_UPDATE_FIXTURES=1 cargo test --release -p ferrum-cli --features metal --test reference_match -- --ignored --test-threads=1",
   "cases": [
     {
-      "id": "qwen3-0.6b-arith-2-plus-3",
-      "model": "qwen3:0.6b",
+      "id": "qwen3-0.6b-gguf-arith-2-plus-3",
+      "model": "qwen3:0.6b-gguf",
       "messages": [
         {
           "role": "user",
@@ -21,8 +21,8 @@
       }
     },
     {
-      "id": "qwen3-0.6b-list-three-colors",
-      "model": "qwen3:0.6b",
+      "id": "qwen3-0.6b-gguf-list-three-colors",
+      "model": "qwen3:0.6b-gguf",
       "messages": [
         {
           "role": "user",
@@ -38,8 +38,8 @@
       }
     },
     {
-      "id": "qwen3-0.6b-cjk-capital-china",
-      "model": "qwen3:0.6b",
+      "id": "qwen3-0.6b-gguf-cjk-capital-china",
+      "model": "qwen3:0.6b-gguf",
       "messages": [
         {
           "role": "user",
@@ -55,8 +55,8 @@
       }
     },
     {
-      "id": "qwen3-0.6b-system-calculator",
-      "model": "qwen3:0.6b",
+      "id": "qwen3-0.6b-gguf-system-calculator",
+      "model": "qwen3:0.6b-gguf",
       "messages": [
         {
           "role": "system",
@@ -76,8 +76,8 @@
       }
     },
     {
-      "id": "qwen3-0.6b-multi-turn-recall",
-      "model": "qwen3:0.6b",
+      "id": "qwen3-0.6b-gguf-multi-turn-recall",
+      "model": "qwen3:0.6b-gguf",
       "messages": [
         {
           "role": "user",

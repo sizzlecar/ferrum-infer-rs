@@ -58,6 +58,7 @@ jobs:
       - name: Pre-pull required models
         run: |
           ./target/release/ferrum pull qwen3:0.6b
+          ./target/release/ferrum pull qwen3:0.6b-gguf
           ./target/release/ferrum pull tinyllama
           ./target/release/ferrum pull qwen2.5:0.5b
 
@@ -101,9 +102,11 @@ jobs:
             --test server_stress -- --ignored --test-threads=1
 
       - name: Reference output match (byte-equal regression gate)
-        # Frozen baseline of greedy decode outputs (vLLM test_fingerprint
-        # style). Any tokenizer / kernel / sampler drift surfaces here as
-        # a content / finish_reason / completion_tokens mismatch.
+        # Frozen baseline of greedy GGUF decode outputs (vLLM
+        # test_fingerprint style). The quantized artifact matches the Metal
+        # release path and avoids making this gate depend on f32 execution.
+        # Any tokenizer / kernel / sampler drift surfaces here as a content /
+        # finish_reason / completion_tokens mismatch.
         # Update baseline (after human-reviewed change) with:
         #   FERRUM_UPDATE_FIXTURES=1 cargo test --release ... --test reference_match ...
         run: |
