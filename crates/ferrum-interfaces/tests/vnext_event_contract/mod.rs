@@ -1,4 +1,8 @@
-#![allow(dead_code, unused_imports)]
+#![allow(
+    dead_code,
+    unused_imports,
+    reason = "shared integration-test support is included by multiple focused test binaries"
+)]
 
 pub(crate) use ferrum_interfaces::vnext::*;
 pub(crate) use serde::{Deserialize, Serialize};

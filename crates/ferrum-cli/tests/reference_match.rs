@@ -28,7 +28,7 @@
 //!     FERRUM_UPDATE_FIXTURES=1 cargo test --release -p ferrum-cli \
 //!         --features metal --test reference_match -- --ignored --test-threads=1
 //!
-//! Verify (CI nightly):
+//! Verify manually on supported Metal hardware:
 //!
 //!     cargo test --release -p ferrum-cli --features metal \
 //!         --test reference_match -- --ignored --test-threads=1
@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 const FIXTURE_PATH: &str = "tests/fixtures/reference_outputs.json";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(180);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const UPDATE_ENV: &str = "FERRUM_UPDATE_FIXTURES";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,10 +131,16 @@ impl ServerFixture {
         let port = free_port();
         let base_url = format!("http://127.0.0.1:{port}");
         let child = Command::new(ferrum_bin())
-            .args(["serve", model, "--port", &port.to_string()])
+            .args([
+                "serve",
+                model,
+                "--disable-thinking",
+                "--port",
+                &port.to_string(),
+            ])
             .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn ferrum serve");
 

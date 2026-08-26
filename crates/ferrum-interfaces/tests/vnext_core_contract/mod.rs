@@ -1,9 +1,16 @@
+#![allow(
+    dead_code,
+    reason = "shared integration-test support is included by multiple focused test binaries"
+)]
+
 pub(crate) use ferrum_interfaces::vnext::*;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
 pub(crate) use sha2::{Digest, Sha256};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
+#[allow(unused_imports)] // Shared by a subset of the integration-test binaries.
 pub(crate) use std::fs;
+#[allow(unused_imports)] // Shared by a subset of the integration-test binaries.
 pub(crate) use std::path::PathBuf;
 pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::Arc;

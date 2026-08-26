@@ -102,17 +102,20 @@ fn cli_help_lists_commands() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage: ferrum"));
     assert!(stdout.contains("run"));
-    assert!(stdout.contains("embed"));
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("stop"));
     assert!(stdout.contains("pull"));
     assert!(stdout.contains("list"));
+    assert!(stdout.contains("doctor"));
+    assert!(!stdout.contains("embed"));
+    assert!(!stdout.contains("transcribe"));
+    assert!(!stdout.contains("tts"));
 }
 
 #[test]
 fn subcommand_help_smoke() {
     let workspace = TempDirGuard::new("help-subcommands");
-    for sub in ["run", "embed", "serve", "pull", "list", "stop"] {
+    for sub in ["run", "embed", "serve", "pull", "list", "stop", "doctor"] {
         let mut cmd = base_cmd(workspace.path());
         cmd.arg(sub).arg("--help");
         let output = run(&mut cmd);

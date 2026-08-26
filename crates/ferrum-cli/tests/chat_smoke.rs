@@ -83,6 +83,7 @@ fn run_chat_full(
     cmd.args([
         "run",
         model,
+        "--disable-thinking",
         "--output-format",
         "jsonl",
         "--temperature",
@@ -122,6 +123,7 @@ fn run_chat_oneshot(model: &str, prompt: &str) -> Vec<ChatEvent> {
     cmd.args([
         "run",
         model,
+        "--disable-thinking",
         "--output-format",
         "jsonl",
         "--temperature",

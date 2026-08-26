@@ -16,7 +16,7 @@
       "temperature": 0.0,
       "expected": {
         "content": "2 + 3 = 5",
-        "finish_reason": "length",
+        "finish_reason": "stop",
         "completion_tokens": 8
       }
     },

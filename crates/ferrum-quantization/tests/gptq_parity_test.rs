@@ -19,8 +19,6 @@
 
 use ferrum_kernels::backend::cpu::CpuBackend;
 use ferrum_kernels::backend::Backend;
-#[cfg(feature = "cuda")]
-use ferrum_kernels::backend::BackendQuantMarlin;
 use ferrum_kernels::Linear;
 use ferrum_quantization::GptqLinear;
 
@@ -711,7 +709,7 @@ fn ferrum_env_value(key: &str) -> Option<String> {
 #[ignore]
 fn cuda_stacked_offset_vs_per_expert() {
     use ferrum_kernels::backend::cuda::CudaBackend;
-    use ferrum_kernels::backend::{Backend, BackendMoeFused, BackendPagedKv, BackendQuantMarlin};
+    use ferrum_kernels::backend::{Backend, BackendQuantMarlin};
 
     let k = 256;
     let n_per = 128;

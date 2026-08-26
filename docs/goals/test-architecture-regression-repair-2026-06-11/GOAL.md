@@ -2,8 +2,8 @@
 
 ## Status
 
-Drafted on 2026-06-11 from
-`docs/goals/test-architecture-2026-06-10/HANDOFF.md` at commit `ed4c8d87`.
+Drafted on 2026-06-11 from the historical test-architecture handoff at commit
+`ed4c8d87`. The process-only handoff was removed by the 2026-08-25 bounded cleanup.
 
 This goal exists because the previous test-architecture work claimed broad
 verification, but ad hoc product testing still found regressions. Completion is

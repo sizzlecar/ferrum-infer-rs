@@ -44,6 +44,7 @@ fn run_long_session(turns: usize, max_tokens: u32) -> Vec<Value> {
     cmd.args([
         "run",
         SMOKE_MODEL,
+        "--disable-thinking",
         "--output-format",
         "jsonl",
         "--temperature",
@@ -128,6 +129,7 @@ fn test_concurrent_three_instances() {
                     .args([
                         "run",
                         SMOKE_MODEL,
+                        "--disable-thinking",
                         "--output-format",
                         "jsonl",
                         "--temperature",

@@ -23,6 +23,12 @@ brew install ferrum
 brew install ferrum-cuda
 ```
 
+Inspect the installed binary before downloading weights:
+
+```bash
+ferrum doctor
+```
+
 Run a model directly:
 
 ```bash
@@ -32,6 +38,9 @@ ferrum run qwen3.5:4b-q4_k_m
 # Linux CUDA (safetensors)
 ferrum run qwen3.5:4b
 ```
+
+Ferrum does not silently select a model. `run` requires MODEL, and `serve`
+requires either `--model` or an intentional `default_model` in `ferrum.toml`.
 
 Serve the same model through an OpenAI-compatible API:
 
@@ -46,6 +55,14 @@ curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"ferrum","messages":[{"role":"user","content":"Hello"}]}'
 ```
+
+For a short direct answer from a model whose template enables reasoning by
+default, add `--disable-thinking` to `ferrum run` or `ferrum serve`. Omitting
+the flag preserves the model template's default; an HTTP request can override
+the server default with `chat_template_kwargs.enable_thinking`.
+
+`ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
+commands without downloading the model or starting an inference engine.
 
 ## Features
 

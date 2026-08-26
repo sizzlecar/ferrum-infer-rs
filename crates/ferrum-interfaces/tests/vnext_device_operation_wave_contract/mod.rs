@@ -1,3 +1,8 @@
+#![allow(
+    dead_code,
+    reason = "shared integration-test support is included by multiple focused test binaries"
+)]
+
 use super::vnext_device_operation_contract::*;
 
 pub(super) fn test_reusable_program(

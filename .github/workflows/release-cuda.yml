@@ -36,8 +36,10 @@ env:
   CUDA_HOME: /usr/local/cuda
   CUDA_ROOT: /usr/local/cuda
   CUDA_COMPUTE_CAP: 89
-  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/runtime-vnext-diagnostics-v1/native-operator-set-5503d913.tar.zst
-  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d229c130cbc6bbb3cac86137c29d2e458e8812420d4d57a0d18505c88ca5461e
+  # Build-time, content-addressed component. The staged ferrum binary links
+  # these operators statically and performs no runtime download.
+  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v1/native-operator-set-cuda12.4-sm89-v1.tar.zst
+  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: b450d93182112a57cb96e9a1dd14ec147c7fd549dc4bd3ed9648bfc67e17eb37
 
 jobs:
   linux-x86_64-cuda-sm89:
@@ -94,7 +96,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-5503d913.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v1.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -135,8 +137,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: stage-v0.8.0-linux-x86_64-cuda-sm89-cuda12.4-native-d229c130-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: stage-v0.8.0-linux-x86_64-cuda-sm89-cuda12.4-native-d229c130-cargo-
+          key: stage-v0.8.0-linux-x86_64-cuda-sm89-cuda12.4-native-b450d931-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.0-linux-x86_64-cuda-sm89-cuda12.4-native-b450d931-cargo-
 
       - name: Build release CUDA sm89 binary exactly once
         run: |

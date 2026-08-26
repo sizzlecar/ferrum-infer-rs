@@ -148,9 +148,9 @@ Validated submission evidence is therefore a shared immutable value with these r
    payloads.
 
 This amendment changes process-local ownership and the explicit batch fingerprint
-domain, not provider selection or model routing. The bounded CUDA checkpoint is
-recorded in `S1_STATUS_2026-07-17.md`; formal dispatch and event-sink overhead remain
-owned by the G01B proof plan.
+domain, not provider selection or model routing. The historical bounded CUDA checkpoint
+was summarized in the S1 status log removed by the 2026-08-25 bounded cleanup; formal
+dispatch and event-sink overhead remain owned by the G01B proof plan.
 
 ## Frozen Contract Rules
 

@@ -553,11 +553,9 @@ async fn collect_run_text_stream(
 
 #[derive(Args)]
 pub struct RunCommand {
-    /// Model name (alias like `qwen3:8b`, HF repo id, or path to a `.gguf` file).
-    /// When the argument is a `.gguf` path, ferrum routes to candle-transformers'
-    /// quantized loaders for the M1 Max bench path (Qwen3 / Qwen3-MoE / Llama).
-    #[arg(default_value = "tinyllama")]
-    pub model: String,
+    /// Model name (release alias, Hugging Face repository, local directory, or `.gguf` file).
+    #[arg(value_name = "MODEL")]
+    pub model: Option<String>,
 
     #[command(flatten)]
     pub product_sources: crate::source_resolver::ProductSourceArgs,
@@ -813,9 +811,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         );
         return Ok(());
     }
+    let model = cmd.model.as_deref().ok_or_else(|| {
+        FerrumError::config(crate::source_resolver::first_success_model_help("run"))
+    })?;
     let product_observability = crate::observability_product::ProductObservabilityConfig::new(
         ferrum_types::ProfileEntrypoint::Run,
-        &cmd.model,
+        model,
         cmd.profile_jsonl.as_ref(),
         cmd.profile_detail,
         cmd.memory_profile_jsonl.as_ref(),
@@ -905,7 +906,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // `WeightFormat::detect()` inside `LlmExecutorFactory`).
     let cache_dir = crate::source_resolver::hf_cache_dir(&config);
     let resolved = crate::source_resolver::resolve_model_source_with_product_sources(
-        &cmd.model,
+        model,
         &cache_dir,
         crate::source_resolver::DownloadPolicy::AutoDownload,
         autosize,
@@ -2665,7 +2666,7 @@ mod tests {
 
     fn test_run_cmd() -> RunCommand {
         RunCommand {
-            model: "tinyllama".to_string(),
+            model: Some("tinyllama".to_string()),
             product_sources: crate::source_resolver::ProductSourceArgs::default(),
             system: None,
             max_tokens: 4096,

@@ -34,9 +34,6 @@ mod synth {
         lo + u * (hi - lo)
     }
     pub struct SyntheticGptq {
-        pub k: usize,
-        pub n: usize,
-        pub group_size: usize,
         pub qweight: Vec<i32>,
         pub scales: Vec<f32>,
         pub qzeros: Vec<i32>,
@@ -64,9 +61,6 @@ mod synth {
             *qz = word as i32;
         }
         SyntheticGptq {
-            k,
-            n,
-            group_size: gs,
             qweight,
             scales,
             qzeros,
