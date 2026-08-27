@@ -13,20 +13,6 @@ as a complete staged rerun of every R2 cell.
 | M3 `Qwen/Qwen3-30B-A3B` | pinned Q4_K_M GGUF | pinned GPTQ Int4 | exact revision and file SHA lock | run, serve, stream, stateful, tools, schema, concurrency, performance |
 | Dense control `meta-llama/Llama-3.1-8B-Instruct` compatible weights | pinned Q4_K_M GGUF | pinned GPTQ Int4 | exact release-gate lock | run, serve, stream usage, correctness, performance |
 
-## Post-v0.8 source-qualified adoption
-
-This row is intentionally separate from the v0.8 release matrix and does not
-qualify a published tarball, Homebrew artifact, Metal path, or other
-compressed-tensors checkpoints.
-
-| Goal | Qualified backend | Exact weight contract | Measured product boundary |
-|---|---|---|---|
-| `cyankiwi/Qwen3.8-27B-AWQ-INT4@63768c10df38c0395e12ef49edac1bd539eaeeea` | CUDA text-only; exactly one sm89 RTX 4090 | `compressed-tensors` pack-quantized W4, group32, asymmetric, no activation quantization; mixed dense projections; full-F16 fallback forbidden | `run` known-answer/two-turn; `serve` non-stream/stream/required-tool/strict-schema; c=1 × 3 requests with usage token counts, ≥5 tok/s median output throughput and ≤30s p50 TTFT |
-
-The exact completion authority is the read-only
-`scripts/release/model_adoption_goal_gate.py` PASS artifact defined by the
-[Qwen3.8 adoption goal](../../../goals/model-adoption-2026-08-26/GOAL.md).
-
 ## Platform assets
 
 | Target | Asset | Contract |
