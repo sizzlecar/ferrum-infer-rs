@@ -288,6 +288,12 @@ pub enum PhysicalWeightLayout {
         packed_dimensions: Vec<u64>,
         scales: PhysicalWeightComponentBinding,
         zero_points: Option<PhysicalWeightComponentBinding>,
+        /// Optional packed storage shape for asymmetric zero points. When
+        /// absent, one dense zero-point scalar is stored per quantization
+        /// group. When present, it must contain exactly `bits_per_weight`
+        /// bits per group and the bound component dtype describes the packed
+        /// storage word (for example I32 words containing eight INT4 values).
+        zero_point_packed_dimensions: Option<Vec<u64>>,
         /// Per-coordinate group assignment. Its semantic shape is the one
         /// dimensional logical axis extent, not the multi-dimensional group
         /// tensor shape.

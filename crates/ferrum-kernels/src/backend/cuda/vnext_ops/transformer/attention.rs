@@ -6,6 +6,8 @@ use std::sync::Arc;
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
+#[cfg(feature = "vllm-marlin")]
+use ferrum_interfaces::vnext::PhysicalWeightLayout;
 use ferrum_interfaces::vnext::{
     gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
     CapabilityId, ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
@@ -32,8 +34,16 @@ use super::{
 #[cfg(feature = "vllm-marlin")]
 use super::{
     marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE},
+    moe_weights::{
+        resolve_compressed_tensors_marlin_layout, resolve_compressed_tensors_marlin_matrix_weight,
+        resolve_dense_f16_layout_region, COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID,
+        COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
+    },
     MarlinProjectionRuntime,
 };
+#[cfg(feature = "vllm-marlin")]
+use crate::backend::cuda::vllm_marlin::MarlinF16WeightType;
 use crate::backend::cuda::vnext_ops::{
     binding, contiguous_region, contiguous_token_region, contract_error,
     implementation_fingerprint, DENSE_SAFETENSORS_FORMAT_ID, THREADS_PER_BLOCK,
@@ -62,6 +72,8 @@ const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f3
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
+#[cfg(feature = "vllm-marlin")]
+const PROJECTION_STITCH_FUNCTION: &str = "projection_stitch_f16";
 
 const SCRATCH_ALIGNMENT: u64 = 16;
 const CONTROL_BASE_BYTES: u64 = 16;
@@ -87,6 +99,8 @@ struct AttentionFunctions {
     gated_norm: CudaFunction,
     f32_to_f16: CudaFunction,
     residual_add: CudaFunction,
+    #[cfg(feature = "vllm-marlin")]
+    projection_stitch: CudaFunction,
 }
 
 impl CudaGatedDeltaRecurrentAttentionProvider {
@@ -116,8 +130,10 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         #[cfg(feature = "vllm-marlin")]
         provider_fingerprint_parts.extend([
             include_str!("marlin_fp8_weights.rs").as_bytes(),
+            include_str!("moe_weights.rs").as_bytes(),
             include_str!("../../vllm_marlin.rs").as_bytes(),
             MARLIN_FP8_QUANTIZATION_FORMAT_ID.as_bytes(),
+            COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
         ]);
         let provider_fingerprint = implementation_fingerprint(&provider_fingerprint_parts);
         let estimator_fingerprint =
@@ -142,10 +158,31 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 ));
             }
             provider_capabilities.insert(marlin_capability);
+            let compressed_tensors_capability =
+                CapabilityId::new(COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID)
+                    .map_err(contract_error)?;
+            if !runtime
+                .descriptor()
+                .capabilities
+                .contains(&compressed_tensors_capability)
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA runtime does not advertise recurrent-attention compressed-tensors Marlin",
+                ));
+            }
+            provider_capabilities.insert(compressed_tensors_capability);
             accepted_weight_formats
                 .insert(WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?);
+            accepted_weight_formats.insert(
+                WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
             accepted_quantization_formats.insert(
                 QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
+            accepted_quantization_formats.insert(
+                QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
                     .map_err(contract_error)?,
             );
         }
@@ -212,6 +249,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 RESIDUAL_ADD_FUNCTION,
                 "attention residual",
             )?,
+            #[cfg(feature = "vllm-marlin")]
+            projection_stitch: load_function(
+                &linear_module,
+                PROJECTION_STITCH_FUNCTION,
+                "attention projection stitch",
+            )?,
         };
         Ok(Self {
             descriptor,
@@ -265,7 +308,16 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                     })
                     .map_err(invalid_plan)?,
                 shape.scratch_bytes_per_sequence().map_err(invalid_plan)?,
-                shape.scratch_bytes_per_token().map_err(invalid_plan)?,
+                shape
+                    .scratch_bytes_per_token()
+                    .and_then(|bytes| {
+                        bytes
+                            .checked_add(projection.staging_bytes_per_token(shape.qkvzba_features)?)
+                            .ok_or_else(|| {
+                                "attention projection staging estimate overflows".to_owned()
+                            })
+                    })
+                    .map_err(invalid_plan)?,
             )?,
             SCRATCH_ALIGNMENT,
             ProviderWorkspaceScope::Invocation,
@@ -647,6 +699,10 @@ enum AttentionProjection {
     MarlinFp8 {
         runtime: MarlinProjectionRuntime,
     },
+    #[cfg(feature = "vllm-marlin")]
+    CompressedTensorsMarlin {
+        runtime: MarlinProjectionRuntime,
+    },
 }
 
 impl AttentionProjection {
@@ -655,7 +711,8 @@ impl AttentionProjection {
         values: &[ResolvedValueBinding],
         runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
-        let mut uses_marlin = false;
+        let mut uses_fp8 = false;
+        let mut uses_compressed_tensors = false;
         for ordinal in [2, 7] {
             let binding = binding(values, ResolvedValueRole::Input, ordinal)?;
             let weight = binding.weight().ok_or_else(|| {
@@ -665,19 +722,34 @@ impl AttentionProjection {
             if quantization_formats.is_empty() {
                 continue;
             }
-            if quantization_formats.len() != 1
-                || !quantization_formats
-                    .iter()
-                    .any(|format| format.as_str() == MARLIN_FP8_QUANTIZATION_FORMAT_ID)
-            {
+            if quantization_formats.len() != 1 {
                 return Err(format!(
-                    "attention projection input {ordinal} is not exact Marlin FP8 W8A16"
+                    "attention projection input {ordinal} has more than one quantization format"
                 ));
             }
-            uses_marlin = true;
+            match quantization_formats
+                .iter()
+                .next()
+                .map(|format| format.as_str())
+            {
+                Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => uses_fp8 = true,
+                Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID) => {
+                    uses_compressed_tensors = true
+                }
+                _ => {
+                    return Err(format!(
+                        "attention projection input {ordinal} is not an admitted Marlin format"
+                    ))
+                }
+            }
         }
-        Ok(if uses_marlin {
+        if uses_fp8 && uses_compressed_tensors {
+            return Err("recurrent attention cannot mix FP8 and INT4 projection ABIs".to_owned());
+        }
+        Ok(if uses_fp8 {
             Self::MarlinFp8 { runtime }
+        } else if uses_compressed_tensors {
+            Self::CompressedTensorsMarlin { runtime }
         } else {
             Self::F16
         })
@@ -688,6 +760,20 @@ impl AttentionProjection {
             Self::F16 => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime } => runtime.workspace_bytes(),
+            #[cfg(feature = "vllm-marlin")]
+            Self::CompressedTensorsMarlin { runtime } => runtime.workspace_bytes(),
+        }
+    }
+
+    fn staging_bytes_per_token(self, qkvzba_features: u64) -> Result<u64, String> {
+        match self {
+            #[cfg(feature = "vllm-marlin")]
+            Self::CompressedTensorsMarlin { .. } => qkvzba_features
+                .checked_mul(ElementType::F16.size_bytes())
+                .ok_or_else(|| "attention projection staging size overflows".to_owned()),
+            Self::F16 => Ok(0),
+            #[cfg(feature = "vllm-marlin")]
+            Self::MarlinFp8 { .. } => Ok(0),
         }
     }
 
@@ -696,6 +782,8 @@ impl AttentionProjection {
             Self::F16 => "f16-cublas",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "mixed-marlin-fp8",
+            #[cfg(feature = "vllm-marlin")]
+            Self::CompressedTensorsMarlin { .. } => "mixed-compressed-tensors-marlin-u4-zp",
         }
     }
 }
@@ -708,6 +796,7 @@ struct ScratchLayout {
     token_seq_indices: u64,
     normalized: u64,
     qkvzba: u64,
+    projection_staging: Option<u64>,
     z_or_activation: u64,
     query: u64,
     key: u64,
@@ -763,6 +852,18 @@ impl ScratchLayout {
             ElementType::F16,
             total_tokens,
         )?;
+        let projection_staging_bytes_per_token =
+            projection.staging_bytes_per_token(shape.qkvzba_features)?;
+        let projection_staging = (projection_staging_bytes_per_token > 0)
+            .then(|| {
+                reserve_tokens(
+                    &mut offset,
+                    projection_staging_bytes_per_token / ElementType::F16.size_bytes(),
+                    ElementType::F16,
+                    total_tokens,
+                )
+            })
+            .transpose()?;
         let z_or_activation = reserve_tokens(
             &mut offset,
             shape.value_features,
@@ -822,6 +923,8 @@ impl ScratchLayout {
             .checked_add(
                 shape
                     .scratch_bytes_per_token()?
+                    .checked_add(projection_staging_bytes_per_token)
+                    .ok_or_else(|| "attention staging scratch size overflows".to_owned())?
                     .checked_mul(total_tokens)
                     .ok_or_else(|| "attention scratch size overflows".to_owned())?,
             )
@@ -836,6 +939,7 @@ impl ScratchLayout {
             token_seq_indices,
             normalized,
             qkvzba,
+            projection_staging,
             z_or_activation,
             query,
             key,
@@ -927,6 +1031,29 @@ enum SharedProjectionWeight {
         scales_region: usize,
         group_size: i32,
     },
+    #[cfg(feature = "vllm-marlin")]
+    CompressedTensorsMarlin {
+        parts: [Option<CompressedTensorsProjectionPart>; 4],
+        part_count: usize,
+    },
+}
+
+#[cfg(feature = "vllm-marlin")]
+#[derive(Debug, Clone, Copy)]
+enum CompressedTensorsProjectionPart {
+    F16 {
+        region: usize,
+        output_offset: i32,
+        output_features: i32,
+    },
+    Marlin {
+        packed_region: usize,
+        scales_region: usize,
+        zero_points_region: usize,
+        group_size: i32,
+        output_offset: i32,
+        output_features: i32,
+    },
 }
 
 impl SharedProjectionWeight {
@@ -935,6 +1062,12 @@ impl SharedProjectionWeight {
             Self::F16 { .. } => "f16",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "marlin-fp8",
+            #[cfg(feature = "vllm-marlin")]
+            Self::CompressedTensorsMarlin { part_count: 1, .. } => {
+                "compressed-tensors-marlin-direct"
+            }
+            #[cfg(feature = "vllm-marlin")]
+            Self::CompressedTensorsMarlin { .. } => "compressed-tensors-marlin-segmented",
         }
     }
 }
@@ -1599,6 +1732,8 @@ fn enqueue_attention(
         blas,
         projection,
         shared.qkvzba,
+        #[cfg(feature = "vllm-marlin")]
+        &functions.projection_stitch,
         normalized,
         qkvzba,
         scratch,
@@ -1703,6 +1838,8 @@ fn enqueue_attention(
         blas,
         projection,
         shared.output,
+        #[cfg(feature = "vllm-marlin")]
+        &functions.projection_stitch,
         z,
         projected,
         scratch,
@@ -1732,6 +1869,7 @@ fn launch_attention_projection(
     blas: &CudaBlas,
     projection: AttentionProjection,
     weight: SharedProjectionWeight,
+    #[cfg(feature = "vllm-marlin")] projection_stitch: &CudaFunction,
     input: u64,
     output: u64,
     scratch: &CudaBufferRegion,
@@ -1790,6 +1928,7 @@ fn launch_attention_projection(
                 input,
                 regions[packed_region].device_ptr(),
                 regions[scales_region].device_ptr(),
+                None,
                 output,
                 scratch_pointer(scratch.device_ptr(), workspace_offset)?,
                 workspace_bytes,
@@ -1800,7 +1939,218 @@ fn launch_attention_projection(
                 operation,
             )
         }
+        #[cfg(feature = "vllm-marlin")]
+        SharedProjectionWeight::CompressedTensorsMarlin { parts, part_count } => {
+            let AttentionProjection::CompressedTensorsMarlin { runtime } = projection else {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "{operation} has compressed-tensors weights without an admitted projection runtime"
+                )));
+            };
+            if part_count == 0 || part_count > parts.len() {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "{operation} has an invalid compressed-tensors part count"
+                )));
+            }
+            let workspace_offset = layout.projection_workspace.ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(format!(
+                    "{operation} lacks its admitted compressed-tensors Marlin workspace"
+                ))
+            })?;
+            let workspace_bytes = runtime
+                .workspace_bytes()
+                .map_err(CudaDeviceRuntimeError::contract)?;
+            let workspace_end = workspace_offset
+                .checked_add(workspace_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(format!(
+                        "{operation} compressed-tensors workspace range overflows"
+                    ))
+                })?;
+            if workspace_end > scratch.length_bytes() {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "{operation} compressed-tensors workspace exceeds attention scratch"
+                )));
+            }
+            let workspace = scratch_pointer(scratch.device_ptr(), workspace_offset)?;
+            let direct = part_count == 1;
+            let (staging_base, staging_capacity) = if direct {
+                (0, 0)
+            } else {
+                let staging_offset = layout.projection_staging.ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(format!(
+                        "{operation} lacks its admitted segmented projection staging"
+                    ))
+                })?;
+                let capacity = layout
+                    .z_or_activation
+                    .checked_sub(staging_offset)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(format!(
+                            "{operation} segmented projection staging range is invalid"
+                        ))
+                    })?;
+                (
+                    scratch_pointer(scratch.device_ptr(), staging_offset)?,
+                    capacity,
+                )
+            };
+            let mut staging_cursor = 0_u64;
+            for (part_index, part) in parts.into_iter().take(part_count).enumerate() {
+                let part = part.ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(format!(
+                        "{operation} compressed-tensors part {part_index} is absent"
+                    ))
+                })?;
+                let (output_offset, part_output_features) = match part {
+                    CompressedTensorsProjectionPart::F16 {
+                        output_offset,
+                        output_features,
+                        ..
+                    }
+                    | CompressedTensorsProjectionPart::Marlin {
+                        output_offset,
+                        output_features,
+                        ..
+                    } => (output_offset, output_features),
+                };
+                if output_offset < 0
+                    || part_output_features <= 0
+                    || output_offset
+                        .checked_add(part_output_features)
+                        .is_none_or(|end| end > output_features)
+                {
+                    return Err(CudaDeviceRuntimeError::contract(format!(
+                        "{operation} compressed-tensors part {part_index} exceeds the output width"
+                    )));
+                }
+                if direct && (output_offset != 0 || part_output_features != output_features) {
+                    return Err(CudaDeviceRuntimeError::contract(format!(
+                        "{operation} direct compressed-tensors part does not cover the output"
+                    )));
+                }
+                let part_bytes = u64::try_from(rows)
+                    .ok()
+                    .and_then(|rows| rows.checked_mul(part_output_features as u64))
+                    .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(format!(
+                            "{operation} compressed-tensors part staging size overflows"
+                        ))
+                    })?;
+                let destination = if direct {
+                    output
+                } else {
+                    let staging_end = staging_cursor.checked_add(part_bytes).ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(format!(
+                            "{operation} compressed-tensors staging range overflows"
+                        ))
+                    })?;
+                    if staging_end > staging_capacity {
+                        return Err(CudaDeviceRuntimeError::contract(format!(
+                            "{operation} compressed-tensors staging exceeds its admitted estimate"
+                        )));
+                    }
+                    scratch_pointer(staging_base, staging_cursor)?
+                };
+                match part {
+                    CompressedTensorsProjectionPart::F16 { region, .. } => launch_gemm_f16(
+                        blas,
+                        input,
+                        regions[region].device_ptr(),
+                        destination,
+                        rows,
+                        part_output_features,
+                        input_features,
+                        operation,
+                    )?,
+                    CompressedTensorsProjectionPart::Marlin {
+                        packed_region,
+                        scales_region,
+                        zero_points_region,
+                        group_size,
+                        ..
+                    } => runtime.launch(
+                        MarlinF16WeightType::U4,
+                        stream,
+                        input,
+                        regions[packed_region].device_ptr(),
+                        regions[scales_region].device_ptr(),
+                        Some(regions[zero_points_region].device_ptr()),
+                        destination,
+                        workspace,
+                        workspace_bytes,
+                        rows,
+                        part_output_features,
+                        input_features,
+                        group_size,
+                        operation,
+                    )?,
+                }
+                if !direct {
+                    launch_projection_stitch(
+                        stream,
+                        projection_stitch,
+                        destination,
+                        output,
+                        rows,
+                        part_output_features,
+                        output_features,
+                        output_offset,
+                        operation,
+                    )?;
+                    staging_cursor = staging_cursor.checked_add(part_bytes).ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(format!(
+                            "{operation} compressed-tensors staging cursor overflows"
+                        ))
+                    })?;
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+#[cfg(feature = "vllm-marlin")]
+#[allow(clippy::too_many_arguments)]
+fn launch_projection_stitch(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    source: u64,
+    destination: u64,
+    rows: i32,
+    source_width: i32,
+    destination_width: i32,
+    destination_offset: i32,
+    operation: &'static str,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let elements = u64::try_from(rows)
+        .ok()
+        .and_then(|rows| rows.checked_mul(source_width as u64))
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(format!(
+                "{operation} projection stitch size overflows"
+            ))
+        })?;
+    let mut builder = stream.launch_builder(function);
+    builder.arg(&source);
+    builder.arg(&destination);
+    builder.arg(&rows);
+    builder.arg(&source_width);
+    builder.arg(&destination_width);
+    builder.arg(&destination_offset);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (
+                checked_grid(elements, THREADS_PER_BLOCK, "attention projection stitch")?,
+                1,
+                1,
+            ),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| CudaDeviceRuntimeError::driver(operation, error))
 }
 
 #[derive(Clone, Copy)]
@@ -2283,6 +2633,210 @@ fn push_shared_weight(
     Ok(index)
 }
 
+#[cfg(feature = "vllm-marlin")]
+fn compressed_tensors_projection_layouts<'a>(
+    weight: &'a ferrum_interfaces::vnext::ResolvedWeightBinding,
+    logical_dimensions: &[u64],
+) -> Result<Vec<(&'a PhysicalWeightLayout, u64, u64)>, String> {
+    let [output_features, input_features] = logical_dimensions else {
+        return Err("compressed-tensors attention projection must be rank two".to_owned());
+    };
+    match weight.physical_layout() {
+        layout @ PhysicalWeightLayout::Quantized { .. } => Ok(vec![(layout, 0, *output_features)]),
+        PhysicalWeightLayout::Composite { parts } => {
+            if parts.is_empty() || parts.len() > 4 {
+                return Err(
+                    "compressed-tensors attention projection requires one to four parts".to_owned(),
+                );
+            }
+            let mut cursor = 0_u64;
+            let mut resolved = Vec::with_capacity(parts.len());
+            for part in parts {
+                if part.logical_offsets != [cursor, 0]
+                    || part.extents.len() != 2
+                    || part.extents[0] == 0
+                    || part.extents[1] != *input_features
+                {
+                    return Err(
+                        "compressed-tensors attention composite placement is not a contiguous output partition"
+                            .to_owned(),
+                    );
+                }
+                resolved.push((part.layout.as_ref(), cursor, part.extents[0]));
+                cursor = cursor
+                    .checked_add(part.extents[0])
+                    .ok_or_else(|| "attention projection part coverage overflows".to_owned())?;
+            }
+            if cursor != *output_features {
+                return Err(
+                    "compressed-tensors attention parts do not cover the output width".to_owned(),
+                );
+            }
+            Ok(resolved)
+        }
+        _ => {
+            Err("compressed-tensors attention projection must be quantized or composite".to_owned())
+        }
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn push_shared_compressed_tensors_projection(
+    regions: &mut Vec<CudaBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ordinal: u32,
+    logical_dimensions: &[u64],
+) -> Result<SharedProjectionWeight, String> {
+    let first_participant = &invocation.participants()[0];
+    let first_binding = binding(
+        first_participant.bindings(),
+        ResolvedValueRole::Input,
+        ordinal,
+    )?;
+    let first_weight = first_binding.weight().ok_or_else(|| {
+        format!("attention projection input {ordinal} lacks a physical weight layout")
+    })?;
+    let first_parts = compressed_tensors_projection_layouts(first_weight, logical_dimensions)?;
+    let mut encoded = [None; 4];
+
+    for (part_index, (first_layout, output_offset, output_features)) in
+        first_parts.iter().copied().enumerate()
+    {
+        let part_dimensions = [output_features, logical_dimensions[1]];
+        match first_layout {
+            PhysicalWeightLayout::Quantized { .. } => {
+                let first = resolve_compressed_tensors_marlin_layout(
+                    first_participant,
+                    first_binding,
+                    first_layout,
+                    &part_dimensions,
+                )?;
+                for participant in &invocation.participants()[1..] {
+                    let candidate_binding =
+                        binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+                    let candidate_weight = candidate_binding.weight().ok_or_else(|| {
+                        format!(
+                            "attention projection input {ordinal} lacks a candidate weight layout"
+                        )
+                    })?;
+                    let candidate_parts = compressed_tensors_projection_layouts(
+                        candidate_weight,
+                        logical_dimensions,
+                    )?;
+                    let (candidate_layout, candidate_offset, candidate_features) =
+                        candidate_parts.get(part_index).copied().ok_or_else(|| {
+                            "attention projection candidate part is absent".to_owned()
+                        })?;
+                    if candidate_offset != output_offset || candidate_features != output_features {
+                        return Err(
+                            "attention projection composite placement differs across participants"
+                                .to_owned(),
+                        );
+                    }
+                    let candidate = resolve_compressed_tensors_marlin_layout(
+                        participant,
+                        candidate_binding,
+                        candidate_layout,
+                        &part_dimensions,
+                    )?;
+                    if candidate.logical_dimensions() != first.logical_dimensions()
+                        || candidate.group_size() != first.group_size()
+                        || !super::same_physical_region(
+                            first.packed_region(),
+                            candidate.packed_region(),
+                        )
+                        || !super::same_physical_region(
+                            first.scales_region(),
+                            candidate.scales_region(),
+                        )
+                        || !super::same_physical_region(
+                            first.zero_points_region(),
+                            candidate.zero_points_region(),
+                        )
+                    {
+                        return Err(
+                            "compressed-tensors attention Marlin part is not shared by all participants"
+                                .to_owned(),
+                        );
+                    }
+                }
+                let group_size = i32::try_from(first.group_size())
+                    .map_err(|_| "attention Marlin group size exceeds i32".to_owned())?;
+                let [packed, scales, zero_points] = first.into_regions();
+                let packed_region = regions.len();
+                regions.push(packed);
+                let scales_region = regions.len();
+                regions.push(scales);
+                let zero_points_region = regions.len();
+                regions.push(zero_points);
+                encoded[part_index] = Some(CompressedTensorsProjectionPart::Marlin {
+                    packed_region,
+                    scales_region,
+                    zero_points_region,
+                    group_size,
+                    output_offset: checked_i32(output_offset, "attention output offset")?,
+                    output_features: checked_i32(output_features, "attention part width")?,
+                });
+            }
+            PhysicalWeightLayout::Dense { .. } | PhysicalWeightLayout::Stored { .. } => {
+                let first_region = resolve_dense_f16_layout_region(
+                    first_participant,
+                    first_binding,
+                    first_layout,
+                    &part_dimensions,
+                )?;
+                for participant in &invocation.participants()[1..] {
+                    let candidate_binding =
+                        binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+                    let candidate_weight = candidate_binding.weight().ok_or_else(|| {
+                        "attention dense projection candidate lacks a weight layout".to_owned()
+                    })?;
+                    let candidate_parts = compressed_tensors_projection_layouts(
+                        candidate_weight,
+                        logical_dimensions,
+                    )?;
+                    let (candidate_layout, candidate_offset, candidate_features) = candidate_parts
+                        .get(part_index)
+                        .copied()
+                        .ok_or_else(|| "attention dense candidate part is absent".to_owned())?;
+                    let candidate_region = resolve_dense_f16_layout_region(
+                        participant,
+                        candidate_binding,
+                        candidate_layout,
+                        &part_dimensions,
+                    )?;
+                    if candidate_offset != output_offset
+                        || candidate_features != output_features
+                        || !super::same_physical_region(&first_region, &candidate_region)
+                    {
+                        return Err(
+                            "attention dense projection part is not shared by all participants"
+                                .to_owned(),
+                        );
+                    }
+                }
+                let region = regions.len();
+                regions.push(first_region);
+                encoded[part_index] = Some(CompressedTensorsProjectionPart::F16 {
+                    region,
+                    output_offset: checked_i32(output_offset, "attention output offset")?,
+                    output_features: checked_i32(output_features, "attention part width")?,
+                });
+            }
+            _ => {
+                return Err(
+                    "compressed-tensors attention composite contains an unsupported layout"
+                        .to_owned(),
+                )
+            }
+        }
+    }
+    Ok(SharedProjectionWeight::CompressedTensorsMarlin {
+        parts: encoded,
+        part_count: first_parts.len(),
+    })
+}
+
 fn push_shared_projection_weight(
     regions: &mut Vec<CudaBufferRegion>,
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -2305,7 +2859,19 @@ fn push_shared_projection_weight(
         let first_layout = first_binding.weight().ok_or_else(|| {
             format!("attention projection input {ordinal} lacks its physical weight layout")
         })?;
-        if !first_layout.quantization_formats().is_empty() {
+        let quantization_formats = first_layout.quantization_formats();
+        if quantization_formats
+            .iter()
+            .any(|format| format.as_str() == COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
+        {
+            return push_shared_compressed_tensors_projection(
+                regions,
+                invocation,
+                ordinal,
+                logical_dimensions,
+            );
+        }
+        if !quantization_formats.is_empty() {
             let first =
                 resolve_marlin_fp8_weight(first_participant, first_binding, logical_dimensions)?;
             if first.output_features() != *expected_output_features

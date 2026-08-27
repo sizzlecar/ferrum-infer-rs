@@ -171,6 +171,9 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
             crate::marlin_fp8_materializer::MARLIN_FP8_CAPABILITY_ID,
         )?);
         capabilities.insert(CapabilityId::new(transformer::GPTQ_MARLIN_CAPABILITY_ID)?);
+        capabilities.insert(CapabilityId::new(
+            transformer::COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID,
+        )?);
         capabilities
     };
     #[cfg(feature = "vllm-paged-attn-v2")]

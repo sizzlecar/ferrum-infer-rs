@@ -17,8 +17,14 @@ use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
 pub(super) const GPTQ_MARLIN_WEIGHT_FORMAT_ID: &str = "weight-format.safetensors.gptq-marlin-int4";
 pub(super) const GPTQ_MARLIN_QUANTIZATION_FORMAT_ID: &str =
     "quantization.marlin.gptq-int4-symmetric";
+pub(super) const COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID: &str =
+    "weight-format.safetensors.compressed-tensors-marlin-int4";
+pub(super) const COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID: &str =
+    "quantization.marlin.compressed-tensors-int4-asymmetric";
 pub(in crate::backend::cuda::vnext_ops) const GPTQ_MARLIN_CAPABILITY_ID: &str =
     "capability.kernel.cuda.marlin.gptq-int4-w4a16";
+pub(in crate::backend::cuda::vnext_ops) const COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID: &str =
+    "capability.kernel.cuda.marlin.compressed-tensors-int4-asymmetric-w4a16";
 const MARLIN_REGION_ALIGNMENT_BYTES: u64 = 16;
 
 /// Retained, expert-major physical regions accepted by the CUDA Marlin-MoE
@@ -36,6 +42,59 @@ pub(super) struct CudaMarlinMoeWeight {
 }
 
 pub(super) type CudaMarlinGptqMatrixWeight = CudaMarlinMoeWeight;
+
+pub(super) struct CudaMarlinCompressedTensorsMatrixWeight {
+    packed_region: CudaBufferRegion,
+    scales_region: CudaBufferRegion,
+    zero_points_region: CudaBufferRegion,
+    logical_dimensions: Vec<u64>,
+    packed_physical_dimensions: Vec<u64>,
+    scales_physical_dimensions: Vec<u64>,
+    zero_points_physical_dimensions: Vec<u64>,
+    group_size: u32,
+}
+
+impl CudaMarlinCompressedTensorsMatrixWeight {
+    pub(super) fn packed_region(&self) -> &CudaBufferRegion {
+        &self.packed_region
+    }
+
+    pub(super) fn scales_region(&self) -> &CudaBufferRegion {
+        &self.scales_region
+    }
+
+    pub(super) fn zero_points_region(&self) -> &CudaBufferRegion {
+        &self.zero_points_region
+    }
+
+    pub(super) fn logical_dimensions(&self) -> &[u64] {
+        &self.logical_dimensions
+    }
+
+    pub(super) fn packed_physical_dimensions(&self) -> &[u64] {
+        &self.packed_physical_dimensions
+    }
+
+    pub(super) fn scales_physical_dimensions(&self) -> &[u64] {
+        &self.scales_physical_dimensions
+    }
+
+    pub(super) fn zero_points_physical_dimensions(&self) -> &[u64] {
+        &self.zero_points_physical_dimensions
+    }
+
+    pub(super) const fn group_size(&self) -> u32 {
+        self.group_size
+    }
+
+    pub(super) fn into_regions(self) -> [CudaBufferRegion; 3] {
+        [
+            self.packed_region,
+            self.scales_region,
+            self.zero_points_region,
+        ]
+    }
+}
 
 impl CudaMarlinMoeWeight {
     pub(super) fn packed_region(&self) -> &CudaBufferRegion {
@@ -139,6 +198,294 @@ pub(super) fn resolve_gptq_marlin_matrix_weight(
         "CUDA GPTQ-Marlin projection",
     )?;
     resolve_gptq_marlin_weight(participant, binding, logical_dimensions)
+}
+
+/// Resolve one exact rank-2 compressed-tensors asymmetric INT4 projection.
+pub(super) fn resolve_compressed_tensors_marlin_matrix_weight(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    logical_dimensions: &[u64],
+) -> Result<CudaMarlinCompressedTensorsMatrixWeight, String> {
+    let weight = binding.weight().ok_or_else(|| {
+        "CUDA compressed-tensors Marlin weight lacks its typed physical layout".to_owned()
+    })?;
+    resolve_compressed_tensors_marlin_layout(
+        participant,
+        binding,
+        weight.physical_layout(),
+        logical_dimensions,
+    )
+}
+
+/// Resolve a quantized leaf inside a composite projection. The full binding
+/// owns storage for every leaf; component identities keep the selection exact.
+pub(super) fn resolve_compressed_tensors_marlin_layout(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    layout: &PhysicalWeightLayout,
+    logical_dimensions: &[u64],
+) -> Result<CudaMarlinCompressedTensorsMatrixWeight, String> {
+    let [output_features, input_features] = logical_dimensions else {
+        return Err("CUDA compressed-tensors Marlin projection must have shape [N, K]".to_owned());
+    };
+    validate_marlin_thread_tile(
+        *output_features,
+        *input_features,
+        "CUDA compressed-tensors Marlin projection",
+    )?;
+    if binding.tensor().element_type() != ElementType::F16 {
+        return Err("CUDA compressed-tensors Marlin logical dtype must be F16".to_owned());
+    }
+    let PhysicalWeightLayout::Quantized {
+        packed_values,
+        packed_dimensions,
+        scales,
+        zero_points: Some(zero_points),
+        zero_point_packed_dimensions: Some(zero_point_dimensions),
+        axis_indices,
+        permutation,
+        codebook,
+        group_axis,
+        group_padding,
+    } = layout
+    else {
+        return Err(
+            "CUDA compressed-tensors Marlin requires a quantized layout with packed zero points"
+                .to_owned(),
+        );
+    };
+    if axis_indices.is_some() || permutation.is_some() || codebook.is_some() {
+        return Err(
+            "CUDA compressed-tensors Marlin forbids index, permutation, and codebook components"
+                .to_owned(),
+        );
+    }
+    if usize::try_from(*group_axis).ok() != packed_dimensions.len().checked_sub(1)
+        || !matches!(group_padding, PhysicalWeightPadding::Exact)
+    {
+        return Err(
+            "CUDA compressed-tensors Marlin requires exact grouping on the final matrix axis"
+                .to_owned(),
+        );
+    }
+    if !is_exact_contiguous(&packed_values.storage)
+        || !is_exact_contiguous(&scales.storage)
+        || !is_exact_contiguous(&zero_points.storage)
+    {
+        return Err(
+            "CUDA compressed-tensors Marlin components must use exact contiguous storage"
+                .to_owned(),
+        );
+    }
+    let mut component_by_id = BTreeMap::new();
+    for component in binding
+        .weight()
+        .expect("weight presence was checked")
+        .components()
+    {
+        component_by_id.insert(component.component_id().clone(), component);
+    }
+    let packed_component = required_component(
+        &component_by_id,
+        &packed_values.component_id,
+        WeightComponentRole::PackedValues,
+        "packed values",
+    )?;
+    let scales_component = required_component(
+        &component_by_id,
+        &scales.component_id,
+        WeightComponentRole::Scales,
+        "scales",
+    )?;
+    let zero_points_component = required_component(
+        &component_by_id,
+        &zero_points.component_id,
+        WeightComponentRole::ZeroPoints,
+        "zero points",
+    )?;
+    let WeightEncoding::Quantized(quantization) = packed_component.encoding() else {
+        return Err(
+            "CUDA compressed-tensors packed component lacks quantization metadata".to_owned(),
+        );
+    };
+    let group_size = quantization.grouping.fixed_size().ok_or_else(|| {
+        "CUDA compressed-tensors Marlin requires fixed quantization groups".to_owned()
+    })?;
+    if quantization.format_id.as_str() != COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID
+        || quantization.bits_per_weight != 4
+        || quantization.packing != QuantizationPacking::Tiled
+        || quantization.scale_type != ElementType::F16
+        || quantization.zero_point_type != Some(ElementType::I32)
+        || group_size != 32
+        || !matches!(
+            scales_component.encoding(),
+            WeightEncoding::Dense {
+                element_type: ElementType::F16
+            }
+        )
+        || !matches!(
+            zero_points_component.encoding(),
+            WeightEncoding::Dense {
+                element_type: ElementType::I32
+            }
+        )
+    {
+        return Err(
+            "CUDA compressed-tensors Marlin requires tiled asymmetric INT4/group32, F16 scales, and packed I32 zero points"
+                .to_owned(),
+        );
+    }
+    let packed_tail = [*output_features, *input_features / 2];
+    let scales_tail = [*output_features, *input_features / u64::from(group_size)];
+    let zero_points_tail = [
+        *input_features / u64::from(group_size),
+        *output_features / 8,
+    ];
+    if !has_unit_prefix_and_tail(packed_dimensions, &packed_tail)
+        || packed_component.physical_dimensions() != packed_dimensions
+        || !has_unit_prefix_and_tail(scales_component.physical_dimensions(), &scales_tail)
+        || !has_unit_prefix_and_tail(zero_point_dimensions, &zero_points_tail)
+        || zero_points_component.physical_dimensions() != zero_point_dimensions
+    {
+        return Err(format!(
+            "CUDA compressed-tensors Marlin physical shapes differ from [N={output_features}, K={input_features}]"
+        ));
+    }
+    let packed_bytes = checked_physical_bytes(packed_dimensions, 1, "packed")?;
+    let scales_bytes = checked_physical_bytes(
+        scales_component.physical_dimensions(),
+        ElementType::F16.size_bytes(),
+        "scales",
+    )?;
+    let zero_points_bytes = checked_physical_bytes(
+        zero_point_dimensions,
+        ElementType::I32.size_bytes(),
+        "zero points",
+    )?;
+    let stored_by_id = binding
+        .storage()
+        .components()
+        .iter()
+        .filter_map(|stored| stored.component_id().map(|id| (id.clone(), stored)))
+        .collect::<BTreeMap<_, _>>();
+    let packed_stored = stored_by_id
+        .get(&packed_values.component_id)
+        .ok_or_else(|| {
+            format!(
+                "CUDA compressed-tensors packed component `{}` has no storage",
+                packed_values.component_id
+            )
+        })?;
+    let scales_stored = stored_by_id.get(&scales.component_id).ok_or_else(|| {
+        format!(
+            "CUDA compressed-tensors scales component `{}` has no storage",
+            scales.component_id
+        )
+    })?;
+    let zero_points_stored = stored_by_id.get(&zero_points.component_id).ok_or_else(|| {
+        format!(
+            "CUDA compressed-tensors zero-point component `{}` has no storage",
+            zero_points.component_id
+        )
+    })?;
+    Ok(CudaMarlinCompressedTensorsMatrixWeight {
+        packed_region: retain_component_region(
+            participant,
+            &packed_values.component_id,
+            packed_stored,
+            ElementType::U8,
+            packed_bytes,
+            packed_bytes,
+        )?,
+        scales_region: retain_component_region(
+            participant,
+            &scales.component_id,
+            scales_stored,
+            ElementType::F16,
+            scales_bytes,
+            scales_bytes,
+        )?,
+        zero_points_region: retain_component_region(
+            participant,
+            &zero_points.component_id,
+            zero_points_stored,
+            ElementType::I32,
+            zero_points_bytes,
+            zero_points_bytes,
+        )?,
+        logical_dimensions: logical_dimensions.to_vec(),
+        packed_physical_dimensions: packed_dimensions.clone(),
+        scales_physical_dimensions: scales_component.physical_dimensions().to_vec(),
+        zero_points_physical_dimensions: zero_point_dimensions.clone(),
+        group_size,
+    })
+}
+
+fn has_unit_prefix_and_tail(dimensions: &[u64], tail: &[u64; 2]) -> bool {
+    dimensions.len() >= 2
+        && dimensions[dimensions.len() - 2..] == *tail
+        && dimensions[..dimensions.len() - 2]
+            .iter()
+            .all(|extent| *extent == 1)
+}
+
+pub(super) fn resolve_dense_f16_layout_region(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    layout: &PhysicalWeightLayout,
+    logical_dimensions: &[u64],
+) -> Result<CudaBufferRegion, String> {
+    let component_id = match layout {
+        PhysicalWeightLayout::Dense { component_id } => component_id,
+        PhysicalWeightLayout::Stored { component } if is_exact_contiguous(&component.storage) => {
+            &component.component_id
+        }
+        _ => {
+            return Err(
+                "CUDA segmented projection dense leaf must use exact contiguous storage".to_owned(),
+            )
+        }
+    };
+    let weight = binding
+        .weight()
+        .ok_or_else(|| "CUDA segmented projection lacks a physical weight binding".to_owned())?;
+    let component = weight
+        .components()
+        .iter()
+        .find(|component| component.component_id() == component_id)
+        .ok_or_else(|| format!("CUDA dense component `{component_id}` is absent"))?;
+    if component.role() != WeightComponentRole::Values
+        || !matches!(
+            component.encoding(),
+            WeightEncoding::Dense {
+                element_type: ElementType::F16
+            }
+        )
+        || component.physical_dimensions() != logical_dimensions
+    {
+        return Err(format!(
+            "CUDA dense component `{component_id}` differs from its F16 matrix contract"
+        ));
+    }
+    let stored = binding
+        .storage()
+        .components()
+        .iter()
+        .find(|stored| stored.component_id() == Some(component_id))
+        .ok_or_else(|| format!("CUDA dense component `{component_id}` has no storage"))?;
+    let bytes = checked_physical_bytes(
+        logical_dimensions,
+        ElementType::F16.size_bytes(),
+        "dense component",
+    )?;
+    retain_component_region(
+        participant,
+        component_id,
+        stored,
+        ElementType::F16,
+        bytes,
+        bytes,
+    )
 }
 
 fn resolve_gptq_marlin_weight(
@@ -252,6 +599,7 @@ fn validate_gptq_marlin_moe_contract(
         packed_dimensions,
         scales,
         zero_points,
+        zero_point_packed_dimensions,
         axis_indices,
         permutation,
         codebook,
@@ -264,6 +612,7 @@ fn validate_gptq_marlin_moe_contract(
         );
     };
     if zero_points.is_some()
+        || zero_point_packed_dimensions.is_some()
         || axis_indices.is_some()
         || permutation.is_some()
         || codebook.is_some()
@@ -656,6 +1005,7 @@ mod tests {
                     packed_dimensions: vec![2, 64, 64],
                     scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
                     zero_points: None,
+                    zero_point_packed_dimensions: None,
                     axis_indices: None,
                     permutation: None,
                     codebook: None,

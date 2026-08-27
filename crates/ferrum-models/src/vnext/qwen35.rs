@@ -31,7 +31,8 @@ use ferrum_interfaces::vnext::{
 };
 use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
 use ferrum_quantization::{
-    GgufWeightComponentSource, GptqMarlinSafetensorsSource, SafetensorsArchive,
+    CompressedTensorsMarlinSafetensorsSource, GgufWeightComponentSource,
+    GptqMarlinSafetensorsSource, SafetensorsArchive, COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID,
     GPTQ_MARLIN_INT4_FORMAT_ID,
 };
 use ferrum_types::DataType;
@@ -93,7 +94,8 @@ fn preflight_semantic_config(raw: &[u8]) -> Result<Qwen35TextConfig, String> {
         .map_err(|error| format!("parse semantic config.json: {error}"))?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
     if let Some(quantization) = &text.quantization {
-        validate_gptq_marlin_config(quantization).map_err(|error| error.to_string())?;
+        validate_safetensors_quantization_config(quantization)
+            .map_err(|error| error.to_string())?;
     }
     let text_value = hf_config.get("text_config").unwrap_or(&hf_config);
     required_u64(text_value, "vocab_size")?;
@@ -122,6 +124,23 @@ struct FamilyGptqTensor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamilyCompressedTensorsTensor {
+    external_name: String,
+    dimensions: Vec<u64>,
+    dtype: FamilyCompressedTensorsDtype,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FamilyCompressedTensorsDtype {
+    I32,
+    I64,
+    F16,
+    Bf16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum FamilyWeightSourceEncoding {
     Dense {
@@ -133,6 +152,12 @@ enum FamilyWeightSourceEncoding {
         qzeros: FamilyGptqTensor,
         g_idx: Option<FamilyGptqTensor>,
     },
+    CompressedTensors {
+        weight_packed: FamilyCompressedTensorsTensor,
+        weight_scale: FamilyCompressedTensorsTensor,
+        weight_zero_point: FamilyCompressedTensorsTensor,
+        weight_shape: FamilyCompressedTensorsTensor,
+    },
     BlockQuantized(BlockQuantizationSpec),
 }
 
@@ -141,6 +166,7 @@ enum FamilyWeightSourceEncoding {
 enum FamilyWeightFormat {
     SafetensorsDense,
     SafetensorsGptqMarlin,
+    SafetensorsCompressedTensorsMarlin,
     GgufNative,
 }
 
@@ -216,9 +242,9 @@ impl Qwen35OperationProfile {
 
     const fn for_weight_format(weight_format: FamilyWeightFormat) -> Self {
         match weight_format {
-            FamilyWeightFormat::SafetensorsDense | FamilyWeightFormat::SafetensorsGptqMarlin => {
-                Self::F16
-            }
+            FamilyWeightFormat::SafetensorsDense
+            | FamilyWeightFormat::SafetensorsGptqMarlin
+            | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => Self::F16,
             FamilyWeightFormat::GgufNative => Self::F32_MASTER,
         }
     }
@@ -268,6 +294,9 @@ impl Qwen35FamilyProvider {
             (FamilyWeightFormat::SafetensorsGptqMarlin, Some(quantization)) => {
                 validate_gptq_marlin_config(quantization)?;
             }
+            (FamilyWeightFormat::SafetensorsCompressedTensorsMarlin, Some(quantization)) => {
+                validate_compressed_tensors_marlin_config(quantization)?
+            }
             (FamilyWeightFormat::SafetensorsDense, Some(_)) => {
                 return Err(invalid_config(
                     "hf_config.quantization_config",
@@ -278,6 +307,12 @@ impl Qwen35FamilyProvider {
                 return Err(invalid_config(
                     "hf_config.quantization_config",
                     "the GPTQ Marlin source requires explicit Hugging Face quantization metadata",
+                ));
+            }
+            (FamilyWeightFormat::SafetensorsCompressedTensorsMarlin, None) => {
+                return Err(invalid_config(
+                    "hf_config.quantization_config",
+                    "the compressed-tensors Marlin source requires explicit Hugging Face quantization metadata",
                 ));
             }
             (FamilyWeightFormat::GgufNative, Some(_)) => {
@@ -411,6 +446,37 @@ impl Qwen35FamilyProvider {
                         }
                     }
                 }
+                FamilyWeightSourceEncoding::CompressedTensors {
+                    weight_packed,
+                    weight_scale,
+                    weight_zero_point,
+                    weight_shape,
+                } => {
+                    validate_compressed_tensors_weight_source(
+                        weight,
+                        weight_packed,
+                        weight_scale,
+                        weight_zero_point,
+                        weight_shape,
+                        text.quantization.as_ref().ok_or_else(|| {
+                            invalid_config(
+                                "hf_config.quantization_config",
+                                "compressed-tensors weight has no typed quantization metadata",
+                            )
+                        })?,
+                    )?;
+                    for source in [weight_packed, weight_scale, weight_zero_point, weight_shape] {
+                        if !external_names.insert(source.external_name.clone()) {
+                            return Err(invalid_config(
+                                "weights",
+                                format!(
+                                    "compressed-tensors sidecar {:?} is referenced more than once",
+                                    source.external_name
+                                ),
+                            ));
+                        }
+                    }
+                }
             }
             let expected_dimensions = expected_weight_dimensions(&text, config.vocab_size, weight)?;
             if !expected_dimensions.contains(&weight.dimensions) {
@@ -453,6 +519,21 @@ impl Qwen35FamilyProvider {
                 }
                 validate_safetensors_manifest(&text, config, "GPTQ")?;
                 validate_canonical_gptq_moe_representation(&text, config)?;
+            }
+            FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => {
+                if config.weights.iter().any(|weight| {
+                    matches!(
+                        weight.source_encoding,
+                        FamilyWeightSourceEncoding::BlockQuantized(_)
+                            | FamilyWeightSourceEncoding::Gptq { .. }
+                    )
+                }) {
+                    return Err(invalid_config(
+                        "weights.source_encoding",
+                        "compressed-tensors packages cannot contain GPTQ or GGUF components",
+                    ));
+                }
+                validate_safetensors_manifest(&text, config, "compressed-tensors")?;
             }
             FamilyWeightFormat::GgufNative => validate_gguf_manifest(&text, config)?,
         }
@@ -520,7 +601,10 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
     fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError> {
         match config.weight_format {
             FamilyWeightFormat::SafetensorsDense => safetensors_weight_schema(config),
-            FamilyWeightFormat::SafetensorsGptqMarlin => safetensors_gptq_weight_schema(config),
+            FamilyWeightFormat::SafetensorsGptqMarlin
+            | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => {
+                safetensors_gptq_weight_schema(config)
+            }
             FamilyWeightFormat::GgufNative => gguf_weight_schema(config),
         }
     }
@@ -676,7 +760,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     });
                     let (decay_parameterization, value_head_mapping) = match config.weight_format {
                         FamilyWeightFormat::SafetensorsDense
-                        | FamilyWeightFormat::SafetensorsGptqMarlin => (
+                        | FamilyWeightFormat::SafetensorsGptqMarlin
+                        | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => (
                             GatedDeltaDecayParameterization::LogRate,
                             GatedDeltaValueHeadMapping::GroupedByKeyHead,
                         ),
@@ -1125,12 +1210,20 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
     let quantization = text.quantization.as_ref().ok_or_else(|| {
         invalid_config(
             "hf_config.quantization_config",
-            "GPTQ Marlin schema requires typed quantization metadata",
+            "Marlin safetensors schema requires typed quantization metadata",
         )
     })?;
-    validate_gptq_marlin_config(quantization)?;
+    validate_safetensors_quantization_config(quantization)?;
+    let compressed_tensors =
+        config.weight_format == FamilyWeightFormat::SafetensorsCompressedTensorsMarlin;
+    if compressed_tensors && text.is_moe() {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "the fixed compressed-tensors adoption contract is dense-only",
+        ));
+    }
 
-    let mut components = Vec::with_capacity(config.weights.len() * 2);
+    let mut components = Vec::with_capacity(config.weights.len() * 3);
     let mut tensors = Vec::with_capacity(config.weights.len());
     for weight in &config.weights {
         if is_moe_source_role(&weight.role)
@@ -1272,13 +1365,21 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
         }
     }
     Ok(WeightSchema {
-        format_id: WeightFormatId::new("weight-format.safetensors.gptq-marlin-int4")?,
-        layout_id: WeightLayoutId::new(if text.is_moe() {
+        format_id: WeightFormatId::new(if compressed_tensors {
+            "weight-format.safetensors.compressed-tensors-marlin-int4"
+        } else {
+            "weight-format.safetensors.gptq-marlin-int4"
+        })?,
+        layout_id: WeightLayoutId::new(if compressed_tensors {
+            "weight-layout.qwen3_5.dense_hybrid.compressed_tensors_marlin_asymmetric.packed_gdn_qkvzba"
+        } else if text.is_moe() {
             "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_qkvzba"
         } else {
             "weight-layout.qwen3_5.dense_hybrid.gptq_marlin.packed_gdn_qkvzba"
         })?,
-        version: if text.is_moe() {
+        version: if compressed_tensors {
+            ContractVersion::new(1, 0)
+        } else if text.is_moe() {
             ContractVersion::new(3, 2)
         } else {
             ContractVersion::new(2, 2)
@@ -1380,11 +1481,109 @@ fn append_safetensors_source_layout(
                 packed_dimensions,
                 scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
                 zero_points: None,
+                zero_point_packed_dimensions: None,
                 axis_indices: None,
                 permutation: None,
                 codebook: None,
                 group_axis: u32::try_from(group_axis).map_err(|_| {
                     invalid_config("weights.dimensions", "GPTQ group axis exceeds u32")
+                })?,
+                group_padding: PhysicalWeightPadding::Exact,
+            })
+        }
+        FamilyWeightSourceEncoding::CompressedTensors {
+            weight_packed,
+            weight_scale,
+            weight_zero_point,
+            weight_shape,
+        } => {
+            validate_compressed_tensors_weight_source(
+                weight,
+                weight_packed,
+                weight_scale,
+                weight_zero_point,
+                weight_shape,
+                quantization,
+            )?;
+            if logical_dimensions.len() < 2
+                || logical_dimensions[logical_dimensions.len() - 2..] != weight.dimensions
+                || logical_dimensions[..logical_dimensions.len() - 2]
+                    .iter()
+                    .any(|extent| *extent != 1)
+            {
+                return Err(invalid_config(
+                    "weights.dimensions",
+                    format!(
+                        "compressed-tensors source role {:?} cannot represent logical shape {logical_dimensions:?}",
+                        weight.role
+                    ),
+                ));
+            }
+            let spec = compressed_tensors_marlin_quantization_spec(quantization)?;
+            let mut packed_dimensions = logical_dimensions.to_vec();
+            let packed_axis = packed_dimensions.len() - 1;
+            packed_dimensions[packed_axis] /= 2;
+            let mut scale_dimensions = logical_dimensions.to_vec();
+            let group_axis = scale_dimensions.len() - 1;
+            scale_dimensions[group_axis] /= quantization.group_size as u64;
+            let mut zero_point_dimensions =
+                logical_dimensions[..logical_dimensions.len() - 2].to_vec();
+            zero_point_dimensions.extend([
+                logical_dimensions[group_axis] / quantization.group_size as u64,
+                logical_dimensions[logical_dimensions.len() - 2] / 8,
+            ]);
+
+            let base = component_id(weight)?.to_string();
+            let packed_id = WeightId::new(format!("{base}.packed"))?;
+            let scales_id = WeightId::new(format!("{base}.scales"))?;
+            let zero_points_id = WeightId::new(format!("{base}.zero_points"))?;
+            components.push(WeightComponentSpec {
+                id: packed_id.clone(),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec![
+                    weight_packed.external_name.clone(),
+                    weight_shape.external_name.clone(),
+                ],
+                dimensions: packed_dimensions.clone(),
+                encoding: WeightEncoding::Quantized(spec),
+                required: true,
+            });
+            components.push(WeightComponentSpec {
+                id: scales_id.clone(),
+                role: WeightComponentRole::Scales,
+                external_names: vec![weight_scale.external_name.clone()],
+                dimensions: scale_dimensions,
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+                required: true,
+            });
+            components.push(WeightComponentSpec {
+                id: zero_points_id.clone(),
+                role: WeightComponentRole::ZeroPoints,
+                external_names: vec![weight_zero_point.external_name.clone()],
+                dimensions: zero_point_dimensions.clone(),
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::I32,
+                },
+                required: true,
+            });
+            Ok(PhysicalWeightLayout::Quantized {
+                packed_values: PhysicalWeightComponentBinding::exact_contiguous(packed_id),
+                packed_dimensions,
+                scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
+                zero_points: Some(PhysicalWeightComponentBinding::exact_contiguous(
+                    zero_points_id,
+                )),
+                zero_point_packed_dimensions: Some(zero_point_dimensions),
+                axis_indices: None,
+                permutation: None,
+                codebook: None,
+                group_axis: u32::try_from(group_axis).map_err(|_| {
+                    invalid_config(
+                        "weights.dimensions",
+                        "compressed-tensors group axis exceeds u32",
+                    )
                 })?,
                 group_padding: PhysicalWeightPadding::Exact,
             })
@@ -1627,6 +1826,7 @@ fn append_safetensors_gptq_expert_stack(
             packed_dimensions,
             scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
             zero_points: None,
+            zero_point_packed_dimensions: None,
             axis_indices: None,
             permutation: None,
             codebook: None,
@@ -1749,6 +1949,20 @@ fn gptq_marlin_quantization_spec(
         packing: QuantizationPacking::Tiled,
         scale_type: ElementType::F16,
         zero_point_type: None,
+    })
+}
+
+fn compressed_tensors_marlin_quantization_spec(
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<QuantizationSpec, VNextError> {
+    validate_compressed_tensors_marlin_config(quantization)?;
+    Ok(QuantizationSpec {
+        format_id: QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID)?,
+        bits_per_weight: 4,
+        grouping: QuantizationGrouping::fixed(32),
+        packing: QuantizationPacking::Tiled,
+        scale_type: ElementType::F16,
+        zero_point_type: Some(ElementType::I32),
     })
 }
 
@@ -2031,10 +2245,11 @@ fn gguf_component_spec(weight: &FamilyWeight) -> Result<WeightComponentSpec, VNe
                 WeightEncoding::BlockQuantized(spec.clone()),
             )
         }
-        FamilyWeightSourceEncoding::Gptq { .. } => {
+        FamilyWeightSourceEncoding::Gptq { .. }
+        | FamilyWeightSourceEncoding::CompressedTensors { .. } => {
             return Err(invalid_config(
                 "weights.source_encoding",
-                "GPTQ components cannot enter the GGUF schema",
+                "safetensors quantized components cannot enter the GGUF schema",
             ));
         }
     };
@@ -2090,9 +2305,10 @@ fn gguf_component_layout(
                 block_padding: PhysicalWeightPadding::Exact,
             })
         }
-        FamilyWeightSourceEncoding::Gptq { .. } => Err(invalid_config(
+        FamilyWeightSourceEncoding::Gptq { .. }
+        | FamilyWeightSourceEncoding::CompressedTensors { .. } => Err(invalid_config(
             "weights.source_encoding",
-            "GPTQ components cannot enter the GGUF schema",
+            "safetensors quantized components cannot enter the GGUF schema",
         )),
     }
 }
@@ -2111,10 +2327,21 @@ pub(super) fn prepare_from_sources(
             let weights = SafetensorsArchive::open(weight_root)?;
             let config = load_safetensors_family_config(&sources, &weights)
                 .map_err(ferrum_types::FerrumError::model)?;
-            if config.weight_format == FamilyWeightFormat::SafetensorsGptqMarlin {
-                finish_preparation(sources, GptqMarlinSafetensorsSource::new(weights), config)
-            } else {
-                finish_preparation(sources, weights, config)
+            match config.weight_format {
+                FamilyWeightFormat::SafetensorsGptqMarlin => {
+                    finish_preparation(sources, GptqMarlinSafetensorsSource::new(weights), config)
+                }
+                FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => finish_preparation(
+                    sources,
+                    CompressedTensorsMarlinSafetensorsSource::new(weights),
+                    config,
+                ),
+                FamilyWeightFormat::SafetensorsDense => {
+                    finish_preparation(sources, weights, config)
+                }
+                FamilyWeightFormat::GgufNative => Err(ferrum_types::FerrumError::internal(
+                    "GGUF format cannot be selected from a safetensors artifact",
+                )),
             }
         }
         ProductionWeightArtifact::GgufFile(path) => {
@@ -2200,7 +2427,8 @@ fn load_safetensors_family_config(
     let hf_config = compose_safetensors_hf_config(sources)?;
     let text = Qwen35TextConfig::from_hf_config_value(&hf_config)?;
     if let Some(quantization) = &text.quantization {
-        validate_gptq_marlin_config(quantization).map_err(|error| error.to_string())?;
+        validate_safetensors_quantization_config(quantization)
+            .map_err(|error| error.to_string())?;
     }
 
     let text_value = hf_config.get("text_config").unwrap_or(&hf_config);
@@ -2245,10 +2473,19 @@ fn load_safetensors_family_config(
         max_position_embeddings,
         rms_norm_epsilon,
         metadata,
-        weight_format: if text.quantization.is_some() {
-            FamilyWeightFormat::SafetensorsGptqMarlin
-        } else {
-            FamilyWeightFormat::SafetensorsDense
+        weight_format: match text
+            .quantization
+            .as_ref()
+            .map(|config| config.quant_method.as_str())
+        {
+            Some("gptq") => FamilyWeightFormat::SafetensorsGptqMarlin,
+            Some("compressed-tensors") => FamilyWeightFormat::SafetensorsCompressedTensorsMarlin,
+            Some(other) => {
+                return Err(format!(
+                    "unsupported safetensors quantization method {other:?}"
+                ))
+            }
+            None => FamilyWeightFormat::SafetensorsDense,
         },
         weights,
     })
@@ -2524,6 +2761,59 @@ fn append_resolved_weights(
                     },
                 )
             }
+            Qwen35ResolvedWeightSource::CompressedTensors {
+                weight_packed,
+                weight_scale,
+                weight_zero_point,
+                weight_shape,
+            } => {
+                let packed_source = family_compressed_tensors_tensor(weights, weight_packed)?;
+                let scale_source = family_compressed_tensors_tensor(weights, weight_scale)?;
+                let zero_point_source =
+                    family_compressed_tensors_tensor(weights, weight_zero_point)?;
+                let shape_source = family_compressed_tensors_tensor(weights, weight_shape)?;
+                let tensor = weights
+                    .tensor(weight_shape)
+                    .map_err(|error| error.to_string())?;
+                if tensor.dtype() != safetensors::Dtype::I64
+                    || tensor.shape() != [2]
+                    || tensor.bytes().len() != 16
+                {
+                    return Err(format!(
+                        "compressed-tensors shape metadata {weight_shape:?} must be I64[2]"
+                    ));
+                }
+                let dimensions = tensor
+                    .bytes()
+                    .chunks_exact(8)
+                    .map(|bytes| {
+                        let value = i64::from_le_bytes([
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                            bytes[7],
+                        ]);
+                        u64::try_from(value).map_err(|_| {
+                            format!(
+                                "compressed-tensors shape metadata {weight_shape:?} contains a non-positive extent"
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if dimensions.contains(&0) {
+                    return Err(format!(
+                        "compressed-tensors shape metadata {weight_shape:?} contains a zero extent"
+                    ));
+                }
+                (
+                    weight_packed.clone(),
+                    dimensions,
+                    FamilyWeightSourceEncoding::CompressedTensors {
+                        weight_packed: packed_source,
+                        weight_scale: scale_source,
+                        weight_zero_point: zero_point_source,
+                        weight_shape: shape_source,
+                    },
+                )
+            }
         };
         output.push(FamilyWeight {
             layer_index,
@@ -2554,6 +2844,29 @@ fn family_gptq_tensor(
         external_name: external_name.to_owned(),
         dimensions: tensor.shape().to_vec(),
         element_type,
+    })
+}
+
+fn family_compressed_tensors_tensor(
+    weights: &SafetensorsArchive,
+    external_name: &str,
+) -> Result<FamilyCompressedTensorsTensor, String> {
+    let tensor = weights
+        .tensor(external_name)
+        .map_err(|error| error.to_string())?;
+    let dtype = match tensor.dtype() {
+        safetensors::Dtype::I32 => FamilyCompressedTensorsDtype::I32,
+        safetensors::Dtype::I64 => FamilyCompressedTensorsDtype::I64,
+        safetensors::Dtype::F16 => FamilyCompressedTensorsDtype::F16,
+        safetensors::Dtype::BF16 => FamilyCompressedTensorsDtype::Bf16,
+        other => return Err(format!(
+            "resolved compressed-tensors tensor {external_name:?} has unsupported dtype {other:?}"
+        )),
+    };
+    Ok(FamilyCompressedTensorsTensor {
+        external_name: external_name.to_owned(),
+        dimensions: tensor.shape().to_vec(),
+        dtype,
     })
 }
 
@@ -2594,15 +2907,122 @@ fn resolved_weight_keys_from_config(
 
 fn validate_gptq_marlin_config(quantization: &Qwen35QuantizationConfig) -> Result<(), VNextError> {
     if quantization.quant_method != "gptq"
+        || quantization.format.is_some()
         || quantization.bits != 4
         || quantization.group_size == 0
         || !quantization.group_size.is_power_of_two()
         || quantization.desc_act
         || !quantization.sym
+        || quantization.weight_type.is_some()
+        || quantization.strategy.is_some()
+        || quantization.dynamic.is_some()
+        || !quantization.targets.is_empty()
+        || quantization.input_activations
+        || quantization.output_activations
     {
         return Err(invalid_config(
             "hf_config.quantization_config",
             "typed Marlin requires GPTQ INT4, power-of-two group_size, sym=true, and desc_act=false",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_safetensors_quantization_config(
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<(), VNextError> {
+    match quantization.quant_method.as_str() {
+        "gptq" => validate_gptq_marlin_config(quantization),
+        "compressed-tensors" => validate_compressed_tensors_marlin_config(quantization),
+        _ => Err(invalid_config(
+            "hf_config.quantization_config.quant_method",
+            format!(
+                "unsupported safetensors quantization method {:?}",
+                quantization.quant_method
+            ),
+        )),
+    }
+}
+
+fn validate_compressed_tensors_marlin_config(
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<(), VNextError> {
+    if quantization.quant_method != "compressed-tensors"
+        || quantization.format.as_deref() != Some("pack-quantized")
+        || quantization.bits != 4
+        || quantization.group_size != 32
+        || quantization.desc_act
+        || quantization.sym
+        || quantization.weight_type.as_deref() != Some("int")
+        || quantization.strategy.as_deref() != Some("group")
+        || quantization.dynamic != Some(false)
+        || quantization.targets != ["Linear"]
+        || quantization.input_activations
+        || quantization.output_activations
+    {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "typed compressed-tensors Marlin requires pack-quantized INT4, group_size=32, asymmetric static Linear weights, and no activation quantization",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_compressed_tensors_weight_source(
+    weight: &FamilyWeight,
+    weight_packed: &FamilyCompressedTensorsTensor,
+    weight_scale: &FamilyCompressedTensorsTensor,
+    weight_zero_point: &FamilyCompressedTensorsTensor,
+    weight_shape: &FamilyCompressedTensorsTensor,
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<(), VNextError> {
+    validate_compressed_tensors_marlin_config(quantization)?;
+    let stem = weight_packed
+        .external_name
+        .strip_suffix(".weight_packed")
+        .unwrap_or_default();
+    if weight.external_name != weight_packed.external_name
+        || stem.is_empty()
+        || weight_scale.external_name != format!("{stem}.weight_scale")
+        || weight_zero_point.external_name != format!("{stem}.weight_zero_point")
+        || weight_shape.external_name != format!("{stem}.weight_shape")
+        || weight_packed.dtype != FamilyCompressedTensorsDtype::I32
+        || !matches!(
+            weight_scale.dtype,
+            FamilyCompressedTensorsDtype::F16 | FamilyCompressedTensorsDtype::Bf16
+        )
+        || weight_zero_point.dtype != FamilyCompressedTensorsDtype::I32
+        || weight_shape.dtype != FamilyCompressedTensorsDtype::I64
+        || weight_shape.dimensions != [2]
+    {
+        return Err(invalid_config(
+            "weights.source_encoding",
+            format!(
+                "role {:?} has an invalid compressed-tensors sidecar identity or dtype",
+                weight.role
+            ),
+        ));
+    }
+    let [n, k] = weight.dimensions.as_slice() else {
+        return Err(invalid_config(
+            "weights.dimensions",
+            "compressed-tensors logical weight must have shape [N, K]",
+        ));
+    };
+    let group_size = quantization.group_size as u64;
+    if *n % 64 != 0
+        || *k % 16 != 0
+        || !k.is_multiple_of(group_size)
+        || weight_packed.dimensions != [*n, *k / 8]
+        || weight_scale.dimensions != [*n, *k / group_size]
+        || weight_zero_point.dimensions != [*n / 8, *k / group_size]
+    {
+        return Err(invalid_config(
+            "weights.source_encoding",
+            format!(
+                "role {:?} compressed-tensors headers do not form a group32 Marlin-aligned [N, K] matrix",
+                weight.role
+            ),
         ));
     }
     Ok(())
@@ -2696,6 +3116,15 @@ fn family_source_external_names(config: &Qwen35FamilyConfig) -> Vec<String> {
                 .chain(g_idx.iter())
                 .map(|source| source.external_name.clone())
                 .collect::<Vec<_>>(),
+            FamilyWeightSourceEncoding::CompressedTensors {
+                weight_packed,
+                weight_scale,
+                weight_zero_point,
+                weight_shape,
+            } => [weight_packed, weight_scale, weight_zero_point, weight_shape]
+                .into_iter()
+                .map(|source| source.external_name.clone())
+                .collect(),
             FamilyWeightSourceEncoding::Dense { .. }
             | FamilyWeightSourceEncoding::BlockQuantized(_) => {
                 vec![weight.external_name.clone()]

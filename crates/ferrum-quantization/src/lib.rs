@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod compressed_tensors_marlin_source;
 pub mod dense;
 pub mod gguf;
 pub mod gptq;
@@ -27,6 +28,9 @@ pub mod quant_linear;
 pub mod safetensors_archive;
 pub mod traits;
 
+pub use compressed_tensors_marlin_source::{
+    CompressedTensorsMarlinSafetensorsSource, COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID,
+};
 pub use dense::DenseLinear;
 pub use gguf::{GgufFile, GgufLinear, GgufLoader, GgufWeightComponentSource};
 pub use gptq::{GptqLinear, StackedExpertLinear};

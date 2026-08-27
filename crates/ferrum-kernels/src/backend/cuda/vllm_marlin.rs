@@ -14,11 +14,13 @@ use std::os::raw::{c_int, c_void};
 
 const FERRUM_MARLIN_ABI_VERSION: u32 = 1;
 const FERRUM_MARLIN_SCALAR_F16: i32 = 1;
+const FERRUM_MARLIN_SCALAR_U4: i32 = 4;
 const FERRUM_MARLIN_SCALAR_U4B8: i32 = 5;
 const FERRUM_MARLIN_SCALAR_FE4M3FN: i32 = 8;
 
 const FERRUM_MARLIN_HAS_ACT_ORDER: u32 = 1 << 1;
 const FERRUM_MARLIN_IS_K_FULL: u32 = 1 << 2;
+const FERRUM_MARLIN_HAS_ZERO_POINTS: u32 = 1 << 3;
 const FERRUM_MARLIN_USE_ATOMIC_ADD: u32 = 1 << 4;
 const FERRUM_MARLIN_USE_FP32_REDUCE: u32 = 1 << 5;
 
@@ -60,6 +62,7 @@ struct FerrumMarlinLaunch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MarlinF16WeightType {
+    U4,
     U4B8,
     E4M3Fn,
 }
@@ -67,6 +70,7 @@ pub enum MarlinF16WeightType {
 impl MarlinF16WeightType {
     const fn ffi_scalar_type(self) -> i32 {
         match self {
+            Self::U4 => FERRUM_MARLIN_SCALAR_U4,
             Self::U4B8 => FERRUM_MARLIN_SCALAR_U4B8,
             Self::E4M3Fn => FERRUM_MARLIN_SCALAR_FE4M3FN,
         }
@@ -81,6 +85,7 @@ pub struct MarlinMmBuffers {
     pub c_tmp: *mut c_void,
     pub a_scales: *mut c_void,
     pub b_scales: *mut c_void,
+    pub zero_points: *mut c_void,
     pub group_index: *mut c_void,
     pub permutation: *mut c_void,
     pub a_tmp: *mut c_void,
@@ -125,6 +130,9 @@ impl MarlinMmF16WeightRequest {
         if self.execution.is_k_full {
             flags |= FERRUM_MARLIN_IS_K_FULL;
         }
+        if !self.buffers.zero_points.is_null() {
+            flags |= FERRUM_MARLIN_HAS_ZERO_POINTS;
+        }
         if self.execution.use_atomic_add {
             flags |= FERRUM_MARLIN_USE_ATOMIC_ADD;
         }
@@ -143,7 +151,7 @@ impl MarlinMmF16WeightRequest {
             a_scales: self.buffers.a_scales,
             b_scales: self.buffers.b_scales,
             global_scale: std::ptr::null_mut(),
-            zero_points: std::ptr::null_mut(),
+            zero_points: self.buffers.zero_points,
             group_index: self.buffers.group_index,
             permutation: self.buffers.permutation,
             a_tmp: self.buffers.a_tmp,
@@ -251,6 +259,7 @@ pub unsafe fn launch_marlin_mm_f16_u4b8(
             c_tmp,
             a_scales: a_s,
             b_scales: b_s,
+            zero_points: std::ptr::null_mut(),
             group_index: g_idx,
             permutation: perm,
             a_tmp,
@@ -575,6 +584,7 @@ mod tests {
                 c_tmp: 4_usize as *mut _,
                 a_scales: 5_usize as *mut _,
                 b_scales: 6_usize as *mut _,
+                zero_points: std::ptr::null_mut(),
                 group_index: 7_usize as *mut _,
                 permutation: 8_usize as *mut _,
                 a_tmp: 9_usize as *mut _,

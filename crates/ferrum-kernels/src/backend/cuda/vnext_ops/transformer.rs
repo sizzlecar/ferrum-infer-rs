@@ -47,6 +47,12 @@ use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 use crate::marlin_fp8_materializer::{
     MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
+#[cfg(feature = "vllm-marlin")]
+use moe_weights::{
+    resolve_compressed_tensors_marlin_layout, resolve_compressed_tensors_marlin_matrix_weight,
+    COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
+};
 
 mod attention;
 mod causal_attention;
@@ -70,7 +76,7 @@ pub(super) use moe::CudaRoutedSharedSwiGluMoeProvider;
 #[cfg(feature = "vllm-moe-marlin")]
 pub(super) use moe_routed::CudaRoutedSwiGluMoeProvider;
 #[cfg(feature = "vllm-marlin")]
-pub(super) use moe_weights::GPTQ_MARLIN_CAPABILITY_ID;
+pub(super) use moe_weights::{COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, GPTQ_MARLIN_CAPABILITY_ID};
 
 const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
 const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";
@@ -88,6 +94,8 @@ const RESIDUAL_ADD_ESTIMATOR_ID: &str = "resource-estimator.cuda.residual_add.f1
 
 const RMS_NORM_FUNCTION_NAME: &str = "rms_norm_f16";
 const SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_interleaved_f16";
+#[cfg(feature = "vllm-marlin")]
+const PLANAR_SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_f16";
 const RESIDUAL_ADD_FUNCTION_NAME: &str = "residual_add_f16";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 static CUDA_GEMM_ALPHA_F32: f32 = 1.0;
@@ -410,11 +418,27 @@ impl OperationProvider<CudaDeviceRuntime> for CudaMarlinFp8DenseLinearProvider {
 pub(super) struct CudaDenseSwiGluProvider {
     descriptor: OperationProviderDescriptor,
     silu_mul: CudaFunction,
+    #[cfg(feature = "vllm-marlin")]
+    planar_silu_mul: CudaFunction,
+    #[cfg(feature = "vllm-marlin")]
+    projection_runtime: MarlinProjectionRuntime,
 }
 
 impl CudaDenseSwiGluProvider {
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = dense_swiglu_contract().map_err(contract_error)?;
+        let provider_fingerprint = implementation_fingerprint(&[
+            include_str!("transformer.rs").as_bytes(),
+            crate::ptx::FUSED_SILU_MUL.as_bytes(),
+            SILU_MUL_FUNCTION_NAME.as_bytes(),
+            #[cfg(feature = "vllm-marlin")]
+            PLANAR_SILU_MUL_FUNCTION_NAME.as_bytes(),
+            #[cfg(feature = "vllm-marlin")]
+            include_str!("transformer/moe_weights.rs").as_bytes(),
+            #[cfg(feature = "vllm-marlin")]
+            include_str!("../vllm_marlin.rs").as_bytes(),
+        ]);
+        #[cfg(not(feature = "vllm-marlin"))]
         let descriptor = provider_descriptor(
             runtime,
             &contract,
@@ -422,11 +446,13 @@ impl CudaDenseSwiGluProvider {
             DENSE_SWIGLU_F16_CAPABILITY_ID,
             DENSE_SWIGLU_ESTIMATOR_ID,
             contiguous_bindings(3),
-            implementation_fingerprint(&[
-                include_str!("transformer.rs").as_bytes(),
-                crate::ptx::FUSED_SILU_MUL.as_bytes(),
-                SILU_MUL_FUNCTION_NAME.as_bytes(),
-            ]),
+            provider_fingerprint,
+        )?;
+        #[cfg(feature = "vllm-marlin")]
+        let descriptor = compressed_tensors_swiglu_provider_descriptor(
+            runtime,
+            &contract,
+            provider_fingerprint,
         )?;
         let module = runtime
             .context()
@@ -435,9 +461,21 @@ impl CudaDenseSwiGluProvider {
         let silu_mul = module
             .load_function(SILU_MUL_FUNCTION_NAME)
             .map_err(|error| CudaDeviceRuntimeError::driver("SwiGLU function load", error))?;
+        #[cfg(feature = "vllm-marlin")]
+        let planar_silu_mul = module
+            .load_function(PLANAR_SILU_MUL_FUNCTION_NAME)
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("planar SwiGLU function load", error)
+            })?;
+        #[cfg(feature = "vllm-marlin")]
+        let projection_runtime = MarlinProjectionRuntime::query(runtime)?;
         Ok(Self {
             descriptor,
             silu_mul,
+            #[cfg(feature = "vllm-marlin")]
+            planar_silu_mul,
+            #[cfg(feature = "vllm-marlin")]
+            projection_runtime,
         })
     }
 }
@@ -458,8 +496,20 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
             .checked_mul(SWIGLU_SCRATCH_PARTS)
             .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
             .ok_or_else(|| invalid_plan("CUDA dense SwiGLU scratch size overflows"))?;
+        #[cfg(not(feature = "vllm-marlin"))]
+        let formula = ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?;
+        #[cfg(feature = "vllm-marlin")]
+        let formula = ProviderWorkspaceSizeFormula::affine(
+            self.projection_runtime
+                .workspace_bytes()
+                .map_err(invalid_plan)?
+                .checked_add(VALUE_ALIGNMENT_BYTES - 1)
+                .ok_or_else(|| invalid_plan("CUDA dense SwiGLU Marlin scratch overflows"))?,
+            0,
+            bytes_per_token,
+        )?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?,
+            formula,
             VALUE_ALIGNMENT_BYTES,
             ProviderWorkspaceScope::Invocation,
             ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
@@ -486,6 +536,30 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        #[cfg(feature = "vllm-marlin")]
+        let uses_compressed_tensors = invocation.participants()[0]
+            .bindings()
+            .iter()
+            .filter_map(ResolvedValueBinding::weight)
+            .flat_map(|weight| weight.quantization_formats())
+            .any(|format| format.as_str() == COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID);
+        #[cfg(feature = "vllm-marlin")]
+        if uses_compressed_tensors {
+            return encode_compressed_tensors_dense_swiglu(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.planar_silu_mul,
+                self.projection_runtime,
+                invocation,
+            )
+            .map(EncodedDeviceOperation::compute)
+            .map_err(|message| {
+                provider_failure(
+                    identity,
+                    "cuda.dense_swiglu.compressed_tensors.encode",
+                    message,
+                )
+            });
+        }
         encode_dense_swiglu(
             self.descriptor.provider_implementation_fingerprint(),
             &self.silu_mul,
@@ -604,6 +678,63 @@ pub(super) fn provider_descriptor(
         bindings,
         estimator_id,
         ContractVersion::new(1, 0),
+        estimator_fingerprint,
+    )
+    .map_err(contract_error)
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn compressed_tensors_swiglu_provider_descriptor(
+    runtime: &CudaDeviceRuntime,
+    contract: &dyn OperationContract,
+    provider_fingerprint: String,
+) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    let operation_capability =
+        CapabilityId::new(DENSE_SWIGLU_F16_CAPABILITY_ID).map_err(contract_error)?;
+    let marlin_capability =
+        CapabilityId::new(COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID).map_err(contract_error)?;
+    if !runtime
+        .descriptor()
+        .capabilities
+        .contains(&operation_capability)
+        || !runtime
+            .descriptor()
+            .capabilities
+            .contains(&marlin_capability)
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA runtime does not advertise dense-SwiGLU compressed-tensors Marlin capabilities",
+        ));
+    }
+    let estimator_fingerprint = implementation_fingerprint(&[
+        include_str!("transformer.rs").as_bytes(),
+        DENSE_SWIGLU_ESTIMATOR_ID.as_bytes(),
+        provider_fingerprint.as_bytes(),
+    ]);
+    OperationProviderDescriptor::new(
+        ProviderId::new(DENSE_SWIGLU_PROVIDER_ID).map_err(contract_error)?,
+        contract.descriptor().id.clone(),
+        contract
+            .descriptor()
+            .fingerprint()
+            .map_err(contract_error)?,
+        provider_fingerprint,
+        ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        contract.descriptor().version,
+        runtime.descriptor().id.clone(),
+        BTreeSet::from([operation_capability, marlin_capability]),
+        BTreeSet::from([
+            WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+            WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
+                .map_err(contract_error)?,
+        ]),
+        BTreeSet::from([QuantizationFormatId::new(
+            COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        )
+        .map_err(contract_error)?]),
+        contiguous_bindings(3),
+        DENSE_SWIGLU_ESTIMATOR_ID,
+        ContractVersion::new(2, 0),
         estimator_fingerprint,
     )
     .map_err(contract_error)
@@ -1092,6 +1223,7 @@ fn encode_marlin_fp8_dense_linear(
                     regions[launch.input_region].device_ptr(),
                     regions[0].device_ptr(),
                     regions[1].device_ptr(),
+                    None,
                     regions[launch.output_region].device_ptr(),
                     workspace.device_ptr(),
                     workspace.length_bytes(),
@@ -1159,6 +1291,7 @@ impl MarlinProjectionRuntime {
         input: u64,
         packed_weight: u64,
         scales: u64,
+        zero_points: Option<u64>,
         output: u64,
         workspace: u64,
         workspace_length_bytes: u64,
@@ -1198,6 +1331,8 @@ impl MarlinProjectionRuntime {
                     c_tmp: std::ptr::null_mut(),
                     a_scales: std::ptr::null_mut(),
                     b_scales: scales as *mut c_void,
+                    zero_points: zero_points
+                        .map_or(std::ptr::null_mut(), |pointer| pointer as *mut c_void),
                     group_index: std::ptr::null_mut(),
                     permutation: std::ptr::null_mut(),
                     a_tmp: std::ptr::null_mut(),
@@ -1208,7 +1343,11 @@ impl MarlinProjectionRuntime {
                     n: output_features,
                     k: input_features,
                     lda: input_features,
-                    num_groups: 1,
+                    num_groups: input_features.checked_div(group_size).ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(format!(
+                            "{operation} group size must be positive"
+                        ))
+                    })?,
                     group_size,
                 },
                 execution: MarlinMmExecution {
@@ -1224,6 +1363,299 @@ impl MarlinProjectionRuntime {
         }
         Ok(())
     }
+}
+
+#[cfg(feature = "vllm-marlin")]
+#[derive(Debug, Clone, Copy)]
+struct SharedCompressedTensorsWeight {
+    packed_region: usize,
+    scales_region: usize,
+    zero_points_region: usize,
+    group_size: i32,
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn push_shared_compressed_tensors_weight(
+    regions: &mut Vec<CudaBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ordinal: u32,
+    logical_dimensions: &[u64],
+    composite_partition: Option<usize>,
+) -> Result<SharedCompressedTensorsWeight, String> {
+    let resolve = |participant: &OperationInvocation<'_, CudaDeviceBuffer>| {
+        let value = binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+        if let Some(partition) = composite_partition {
+            let weight = value.weight().ok_or_else(|| {
+                format!("compressed-tensors SwiGLU input {ordinal} has no weight layout")
+            })?;
+            let ferrum_interfaces::vnext::PhysicalWeightLayout::Composite { parts } =
+                weight.physical_layout()
+            else {
+                return Err(format!(
+                    "compressed-tensors SwiGLU input {ordinal} must be a composite gate/up weight"
+                ));
+            };
+            let part = parts.get(partition).ok_or_else(|| {
+                format!("compressed-tensors SwiGLU gate/up partition {partition} is absent")
+            })?;
+            let [output_features, input_features] = logical_dimensions else {
+                return Err("compressed-tensors SwiGLU partition must be rank two".to_owned());
+            };
+            if part.logical_offsets != [partition as u64, 0, 0]
+                || part.extents != [1, *output_features, *input_features]
+            {
+                return Err(format!(
+                    "compressed-tensors SwiGLU partition {partition} has invalid placement"
+                ));
+            }
+            resolve_compressed_tensors_marlin_layout(
+                participant,
+                value,
+                part.layout.as_ref(),
+                logical_dimensions,
+            )
+        } else {
+            resolve_compressed_tensors_marlin_matrix_weight(participant, value, logical_dimensions)
+        }
+    };
+
+    let first = resolve(&invocation.participants()[0])?;
+    for participant in &invocation.participants()[1..] {
+        let candidate = resolve(participant)?;
+        if candidate.logical_dimensions() != first.logical_dimensions()
+            || candidate.packed_physical_dimensions() != first.packed_physical_dimensions()
+            || candidate.scales_physical_dimensions() != first.scales_physical_dimensions()
+            || candidate.zero_points_physical_dimensions()
+                != first.zero_points_physical_dimensions()
+            || candidate.group_size() != first.group_size()
+            || !same_physical_region(first.packed_region(), candidate.packed_region())
+            || !same_physical_region(first.scales_region(), candidate.scales_region())
+            || !same_physical_region(first.zero_points_region(), candidate.zero_points_region())
+        {
+            return Err(format!(
+                "compressed-tensors SwiGLU input {ordinal} is not shared by all participants"
+            ));
+        }
+    }
+    let group_size = i32::try_from(first.group_size())
+        .map_err(|_| "compressed-tensors SwiGLU group size exceeds i32".to_owned())?;
+    let [packed, scales, zero_points] = first.into_regions();
+    let packed_region = regions.len();
+    regions.push(packed);
+    let scales_region = regions.len();
+    regions.push(scales);
+    let zero_points_region = regions.len();
+    regions.push(zero_points);
+    Ok(SharedCompressedTensorsWeight {
+        packed_region,
+        scales_region,
+        zero_points_region,
+        group_size,
+    })
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn encode_compressed_tensors_dense_swiglu(
+    provider_fingerprint: &str,
+    planar_silu_mul: &CudaFunction,
+    projection_runtime: MarlinProjectionRuntime,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    ensure_invocation(&invocation, DENSE_SWIGLU_OPERATION_ID)?;
+    let first = &invocation.participants()[0];
+    let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
+    let intermediate_size = unsigned_attribute(first.attributes(), "intermediate_size")?;
+    for participant in invocation.participants() {
+        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
+            || unsigned_attribute(participant.attributes(), "intermediate_size")?
+                != intermediate_size
+        {
+            return Err(
+                "compressed-tensors dense SwiGLU participant attributes disagree".to_owned(),
+            );
+        }
+        validate_dense_swiglu(
+            binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 2)?,
+            binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+            hidden_size,
+            intermediate_size,
+        )?;
+    }
+
+    let tokens = invocation.work_shape().immediate_tokens();
+    let activation_elements = tokens
+        .checked_mul(intermediate_size)
+        .ok_or_else(|| "compressed-tensors SwiGLU activation size overflows".to_owned())?;
+    let activation_bytes = activation_elements
+        .checked_mul(ElementType::F16.size_bytes())
+        .ok_or_else(|| "compressed-tensors SwiGLU activation bytes overflow".to_owned())?;
+    let activation_scratch_bytes = activation_bytes
+        .checked_mul(3)
+        .ok_or_else(|| "compressed-tensors SwiGLU scratch bytes overflow".to_owned())?;
+    let workspace_offset = activation_scratch_bytes
+        .checked_add(VALUE_ALIGNMENT_BYTES - 1)
+        .map(|value| value / VALUE_ALIGNMENT_BYTES * VALUE_ALIGNMENT_BYTES)
+        .ok_or_else(|| "compressed-tensors SwiGLU workspace offset overflows".to_owned())?;
+    let workspace_bytes = projection_runtime.workspace_bytes()?;
+    let required_scratch_bytes = workspace_offset
+        .checked_add(workspace_bytes)
+        .ok_or_else(|| "compressed-tensors SwiGLU total scratch bytes overflow".to_owned())?;
+
+    let mut regions = Vec::new();
+    let gate = push_shared_compressed_tensors_weight(
+        &mut regions,
+        &invocation,
+        1,
+        &[intermediate_size, hidden_size],
+        Some(0),
+    )?;
+    let up = push_shared_compressed_tensors_weight(
+        &mut regions,
+        &invocation,
+        1,
+        &[intermediate_size, hidden_size],
+        Some(1),
+    )?;
+    let down = push_shared_compressed_tensors_weight(
+        &mut regions,
+        &invocation,
+        2,
+        &[hidden_size, intermediate_size],
+        None,
+    )?;
+    let input_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let output_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Output,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let scratch_region = regions.len();
+    regions.push(shared_scratch_region(&invocation, required_scratch_bytes)?);
+
+    let rows = checked_i32(tokens, "compressed-tensors SwiGLU token count")?;
+    let hidden = checked_i32(hidden_size, "compressed-tensors SwiGLU hidden width")?;
+    let intermediate = checked_i32(
+        intermediate_size,
+        "compressed-tensors SwiGLU intermediate width",
+    )?;
+    let planar_silu_mul = planar_silu_mul.clone();
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "compressed-tensors SwiGLU participant count",
+    )?;
+    let replay_key = CudaCommandReplayKeyBuilder::new(
+        provider_fingerprint,
+        "vnext_dense_swiglu_compressed_tensors_marlin",
+    )
+    .i32(rows)
+    .i32(hidden)
+    .i32(intermediate)
+    .u64(workspace_offset)
+    .u64(required_scratch_bytes)
+    .finish();
+    CudaDeviceCommand::replayable_operation_with_blas(
+        "vnext_dense_swiglu_compressed_tensors_marlin",
+        regions,
+        replay_key,
+        move |stream, blas, regions| {
+            let scratch = &regions[scratch_region];
+            if scratch.length_bytes() < required_scratch_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "compressed-tensors SwiGLU scratch is smaller than admitted",
+                ));
+            }
+            let gate_output = scratch.device_ptr();
+            let up_output = gate_output.checked_add(activation_bytes).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("compressed-tensors up pointer overflows")
+            })?;
+            let activation = up_output.checked_add(activation_bytes).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("compressed-tensors activation pointer overflows")
+            })?;
+            let workspace = scratch
+                .device_ptr()
+                .checked_add(workspace_offset)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "compressed-tensors workspace pointer overflows",
+                    )
+                })?;
+            for (weight, output, output_features, input_features, input) in [
+                (
+                    gate,
+                    gate_output,
+                    intermediate,
+                    hidden,
+                    regions[input_region].device_ptr(),
+                ),
+                (
+                    up,
+                    up_output,
+                    intermediate,
+                    hidden,
+                    regions[input_region].device_ptr(),
+                ),
+            ] {
+                projection_runtime.launch(
+                    MarlinF16WeightType::U4,
+                    stream,
+                    input,
+                    regions[weight.packed_region].device_ptr(),
+                    regions[weight.scales_region].device_ptr(),
+                    Some(regions[weight.zero_points_region].device_ptr()),
+                    output,
+                    workspace,
+                    workspace_bytes,
+                    rows,
+                    output_features,
+                    input_features,
+                    weight.group_size,
+                    "compressed-tensors SwiGLU gate/up projection",
+                )?;
+            }
+            launch_planar_silu_mul(
+                stream,
+                &planar_silu_mul,
+                gate_output,
+                up_output,
+                activation,
+                activation_elements,
+            )?;
+            projection_runtime.launch(
+                MarlinF16WeightType::U4,
+                stream,
+                activation,
+                regions[down.packed_region].device_ptr(),
+                regions[down.scales_region].device_ptr(),
+                Some(regions[down.zero_points_region].device_ptr()),
+                regions[output_region].device_ptr(),
+                workspace,
+                workspace_bytes,
+                rows,
+                hidden,
+                intermediate,
+                down.group_size,
+                "compressed-tensors SwiGLU down projection",
+            )?;
+            let _ = blas;
+            Ok(())
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 0)
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn encode_dense_swiglu(
@@ -1541,6 +1973,43 @@ fn launch_silu_mul(
     }
     .map(|_| ())
     .map_err(|error| CudaDeviceRuntimeError::driver("vNext SwiGLU activation launch", error))
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn launch_planar_silu_mul(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    gate: cudarc::driver::sys::CUdeviceptr,
+    up: cudarc::driver::sys::CUdeviceptr,
+    output: cudarc::driver::sys::CUdeviceptr,
+    activation_elements: u64,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let total = checked_i32_runtime(
+        activation_elements,
+        "compressed-tensors SwiGLU activation element count",
+    )?;
+    let grid_x = activation_elements
+        .div_ceil(u64::from(THREADS_PER_BLOCK))
+        .try_into()
+        .map_err(|_| {
+            CudaDeviceRuntimeError::contract("compressed-tensors SwiGLU launch grid exceeds u32")
+        })?;
+    let mut builder = stream.launch_builder(function);
+    builder.arg(&gate);
+    builder.arg(&up);
+    builder.arg(&output);
+    builder.arg(&total);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| {
+        CudaDeviceRuntimeError::driver("compressed-tensors SwiGLU activation launch", error)
+    })
 }
 
 fn validate_rms_norm(

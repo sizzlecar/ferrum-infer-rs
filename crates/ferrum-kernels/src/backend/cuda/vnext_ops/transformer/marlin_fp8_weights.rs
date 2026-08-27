@@ -426,6 +426,7 @@ mod tests {
                     packed_dimensions: vec![256, 128],
                     scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
                     zero_points: None,
+                    zero_point_packed_dimensions: None,
                     axis_indices: None,
                     permutation: None,
                     codebook: None,
