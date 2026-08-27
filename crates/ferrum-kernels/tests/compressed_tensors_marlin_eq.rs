@@ -186,50 +186,52 @@ fn run_fixture(context: &std::sync::Arc<CudaContext>, fixture: Fixture) -> (f64,
         .alloc_zeros(usize::try_from(sms).expect("positive SM count"))
         .expect("allocate workspace");
 
-    let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
-    let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
-    let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
-    let (zero_points_pointer, _zero_points_guard) = zero_points_device.device_ptr(&stream);
-    let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
-    let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
-    unsafe {
-        launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
-            weight_type: MarlinF16WeightType::U4,
-            buffers: MarlinMmBuffers {
-                a: input_pointer as *const c_void,
-                b: weight_pointer as *const c_void,
-                c: output_pointer as *mut c_void,
-                c_tmp: std::ptr::null_mut(),
-                a_scales: std::ptr::null_mut(),
-                b_scales: scales_pointer as *mut c_void,
-                zero_points: zero_points_pointer as *mut c_void,
-                group_index: std::ptr::null_mut(),
-                permutation: std::ptr::null_mut(),
-                a_tmp: std::ptr::null_mut(),
-                workspace: workspace_pointer as *mut c_void,
-            },
-            problem: MarlinMmProblem {
-                m: fixture.rows as i32,
-                n: n as i32,
-                k: k as i32,
-                lda: k as i32,
-                num_groups: groups as i32,
-                group_size: GROUP_SIZE as i32,
-            },
-            execution: MarlinMmExecution {
-                device: 0,
-                stream: stream.cu_stream(),
-                sms,
-                has_act_order: false,
-                is_k_full: true,
-                use_atomic_add: false,
-                use_fp32_reduce: false,
-            },
-        });
+    {
+        let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
+        let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
+        let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
+        let (zero_points_pointer, _zero_points_guard) = zero_points_device.device_ptr(&stream);
+        let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
+        let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+        unsafe {
+            launch_marlin_mm_f16_weight(MarlinMmF16WeightRequest {
+                weight_type: MarlinF16WeightType::U4,
+                buffers: MarlinMmBuffers {
+                    a: input_pointer as *const c_void,
+                    b: weight_pointer as *const c_void,
+                    c: output_pointer as *mut c_void,
+                    c_tmp: std::ptr::null_mut(),
+                    a_scales: std::ptr::null_mut(),
+                    b_scales: scales_pointer as *mut c_void,
+                    zero_points: zero_points_pointer as *mut c_void,
+                    group_index: std::ptr::null_mut(),
+                    permutation: std::ptr::null_mut(),
+                    a_tmp: std::ptr::null_mut(),
+                    workspace: workspace_pointer as *mut c_void,
+                },
+                problem: MarlinMmProblem {
+                    m: fixture.rows as i32,
+                    n: n as i32,
+                    k: k as i32,
+                    lda: k as i32,
+                    num_groups: groups as i32,
+                    group_size: GROUP_SIZE as i32,
+                },
+                execution: MarlinMmExecution {
+                    device: 0,
+                    stream: stream.cu_stream(),
+                    sms,
+                    has_act_order: false,
+                    is_k_full: true,
+                    use_atomic_add: false,
+                    use_fp32_reduce: false,
+                },
+            });
+        }
+        stream.synchronize().expect("Marlin synchronize");
     }
-    stream.synchronize().expect("Marlin synchronize");
     let actual = stream
-        .memcpy_dtov(&output_device)
+        .clone_dtoh(&output_device)
         .expect("download Marlin output");
 
     let mut reference_squared = 0.0_f64;
