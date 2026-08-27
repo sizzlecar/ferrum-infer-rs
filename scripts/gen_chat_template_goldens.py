@@ -25,10 +25,10 @@ The Rust side (`crates/ferrum-server/tests/chat_template_golden.rs`) renders
 the same cases through ferrum's renderer and asserts byte equality.
 """
 
+import argparse
 import json
 import re
 import shutil
-import sys
 from pathlib import Path
 
 DEFAULT_MODELS = [
@@ -112,23 +112,37 @@ CASES = {
     },
 }
 
+GOAL_CASES = {
+    "single_turn": CASES["single"],
+    "multi_turn": CASES["multi_turn"],
+    "thinking_off": {
+        "messages": [{"role": "user", "content": "Answer briefly: why is the sky blue?"}],
+        "render_kwargs": {"enable_thinking": False},
+    },
+    "tool_continuation": CASES["tool_result_history"],
+}
+
 
 def template_supports_tools(template: str) -> bool:
     return re.search(r"(?<![A-Za-z0-9_])tools(?![A-Za-z0-9_])", template) is not None
 
 
-def copy_hf_sidecars(model_id: str, out_dir: Path) -> dict[str, dict[str, object]]:
+def copy_hf_sidecars(
+    model_id: str, revision: str | None, out_dir: Path
+) -> dict[str, dict[str, object]]:
     from huggingface_hub import hf_hub_download
 
     sidecars: dict[str, dict[str, object]] = {}
     for filename in HF_SIDECARS:
         target = out_dir / filename
         try:
-            cached = Path(hf_hub_download(repo_id=model_id, filename=filename))
+            cached = Path(
+                hf_hub_download(repo_id=model_id, filename=filename, revision=revision)
+            )
             shutil.copyfile(cached, target)
             sidecars[filename] = {
                 "status": "copied",
-                "path": str(target),
+                "path": target.name,
                 "size_bytes": target.stat().st_size,
             }
             print(f"   sidecar {filename} ({target.stat().st_size} bytes)")
@@ -163,7 +177,7 @@ def write_tokenizer_special_tokens(tok, out_dir: Path) -> dict[str, object]:
     print(f"   sidecar {target.name} ({target.stat().st_size} bytes)")
     return {
         "status": "generated",
-        "path": str(target),
+        "path": target.name,
         "size_bytes": target.stat().st_size,
     }
 
@@ -196,13 +210,32 @@ def pin_strftime_now() -> str:
 def main() -> None:
     from transformers import AutoTokenizer
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument("model_ids", nargs="*")
+    parser.add_argument(
+        "--revision",
+        help="pin every requested model to one immutable Hugging Face revision",
+    )
+    parser.add_argument(
+        "--case",
+        action="append",
+        choices=sorted({*CASES, *GOAL_CASES}),
+        dest="case_names",
+        help="render only this named case; repeat for multiple cases",
+    )
+    args = parser.parse_args()
     pinned_now = pin_strftime_now()
-    models = sys.argv[1:] or DEFAULT_MODELS
+    models = args.model_ids or DEFAULT_MODELS
+    selected_cases = (
+        {name: (GOAL_CASES | CASES)[name] for name in args.case_names}
+        if args.case_names
+        else CASES
+    )
     for model_id in models:
         slug = model_id.replace("/", "__")
         out_dir = FIXTURE_ROOT / slug
         print(f"== {model_id} -> {out_dir}")
-        tok = AutoTokenizer.from_pretrained(model_id)
+        tok = AutoTokenizer.from_pretrained(model_id, revision=args.revision)
 
         template = tok.chat_template
         if template is None:
@@ -224,11 +257,11 @@ def main() -> None:
 
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "template.jinja").write_text(template, encoding="utf-8")
-        sidecars = copy_hf_sidecars(model_id, out_dir)
+        sidecars = copy_hf_sidecars(model_id, args.revision, out_dir)
         sidecars["tokenizer_special_tokens.json"] = write_tokenizer_special_tokens(tok, out_dir)
 
         cases_out = {}
-        for name, case in CASES.items():
+        for name, case in selected_cases.items():
             tools = case.get("tools")
             if tools and not template_supports_tools(template):
                 # tools-unaware templates take ferrum's injection path,
@@ -253,6 +286,7 @@ def main() -> None:
 
         meta = {
             "model_id": model_id,
+            "revision": args.revision,
             "bos_token": tok.bos_token,
             "eos_token": tok.eos_token,
             "render_kwargs": kwargs,

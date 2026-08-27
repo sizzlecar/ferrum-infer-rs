@@ -1,0 +1,7 @@
+<|im_start|>user
+Answer briefly: why is the sky blue?<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
