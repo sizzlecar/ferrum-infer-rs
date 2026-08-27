@@ -140,7 +140,6 @@ PY
     scripts/release/run_scenarios.py \
     scripts/release/runtime_vnext_crates_io_release.py \
     scripts/release/runtime_vnext_g0_llama_sampled_execution.py \
-    scripts/release/model_adoption_goal_gate.py \
     scripts/release/runtime_vnext_g08b_cuda_matrix_prepare.py \
     scripts/release/runtime_vnext_goal_gate.py \
     scripts/release/runtime_vnext_homebrew_release.py \
