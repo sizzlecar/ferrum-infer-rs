@@ -85,7 +85,7 @@ mean tok/s with the 95% confidence-interval half-width across three repeats.
 | Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |
 | Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |
 | Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |
-| [Qwen3.8 27B AWQ INT4](docs/goals/model-adoption-2026-08-26/GOAL.md) |  | c=1 · 35.15 (3 × 32/32) |
+| Qwen3.8 27B AWQ INT4 |  | c=1 · 35.15 |
 
 `c` is active server concurrency. The first three rows completed 100 requests ×
 3 repeats with zero errors. [Measurement details](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md).
