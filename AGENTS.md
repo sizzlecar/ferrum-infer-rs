@@ -330,6 +330,46 @@ Rules:
 - Prefer stopping a reusable Vast instance over destroying it when it contains model/build caches or unique artifacts. Destroy only when the instance has no useful cache/evidence, is misconfigured beyond repair, or the user explicitly asks for destruction.
 - Prefer CUDA smoke before CUDA full unless the task specifically requires full release evidence.
 
+## Local `panda-pad` WSL CUDA Development Host
+
+Host role and evidence scope:
+
+- `panda-pad` is the dedicated local CUDA compile and correctness-smoke host, reached over Tailscale. Do not install or retain unrelated services, source trees, or workloads on it.
+- The host GPU is an NVIDIA GeForce RTX 4050 Laptop GPU with 6 GiB VRAM. It is suitable for CUDA compilation and bounded small-model correctness tests; it is not valid hardware for official RTX 4090 release or performance evidence.
+- The current WSL baseline is Ubuntu 24.04 with CUDA Toolkit 12.6. Re-run `nvidia-smi` and `nvcc --version` and save their output before treating a run as evidence; do not assume the driver or toolkit version is unchanged.
+- The intended WSL resource allocation is 12 GiB memory, 16 processors, 16 GiB swap, GUI disabled, and no idle timeout. Check the effective WSL configuration before diagnosing build or runtime resource pressure.
+
+Connection and availability:
+
+- Resolve the current address from the Tailscale device named `panda-pad` with `tailscale status`; never write its Tailscale IP into the repository.
+- WSL SSH is exposed through the Windows host on TCP port `2222`. Use the locally configured SSH identity and WSL account; do not put usernames, passwords, private-key paths, key material, Tailscale account details, or addresses in repository files or artifacts.
+- Windows OpenSSH on port `22` is for host-level recovery/diagnostics. CUDA build and inference commands belong in WSL over port `2222`.
+- The Windows Tailscale service and the `Ferrum-WSL-Keeper` scheduled task are intended to start Tailscale, keep WSL alive, and restore the WSL SSH port forwarding after boot. Do not claim unattended availability until a cold reboot has been tested without interactive Windows login and port `2222` accepts key-only SSH.
+- WSL's NVIDIA utility lives under `/usr/lib/wsl/lib`; `/usr/local/bin/nvidia-smi` should resolve to that executable so non-interactive `ferrum doctor` checks see the GPU.
+
+Repository, cache, and artifact layout:
+
+- Repository: `$HOME/src/ferrum-infer-rs`.
+- Cargo build cache and binaries: `$HOME/src/ferrum-infer-rs/target`; preserve this directory between development runs unless cache invalidation is the diagnostic goal.
+- Model cache: `$HOME/.cache/huggingface`.
+- CUDA/native operator inputs: `$HOME/native-operators`; the SM89 native lock currently comes from the `cuda12.4-sm89-v1` operator set and must pass its preflight before a product CUDA build.
+- Evidence root: `$HOME/artifacts`. Every long build or inference run must use a new artifact directory with command, timestamps, deadline, progress signal, git SHA/dirty state, GPU/runtime details, logs, hashes when available, and a terminal PASS/REJECT line.
+
+Development workflow:
+
+- Transfer repository changes through GitHub with `git`/`gh`; do not use SCP or rsync as a source synchronization path. Keep credentials in the host's existing credential store and never record the authenticated GitHub account or token.
+- CUDA product build command:
+
+  ```bash
+  cargo build --release -p ferrum-cli --bin ferrum \
+    --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+  ```
+
+- Use the repository's `cuda-correctness` Cargo profile for shorter compile/test iterations when release LTO is not part of the question. Use the release command above when validating the shipped binary path.
+- For a bounded local correctness smoke, `qwen3:0.6b` is the established small model. Validate both `ferrum run` and `ferrum serve`, require a coherent non-empty answer, check streaming for exactly one `[DONE]` plus positive usage, and scan logs for panic, OOM, `<unk>`, `[PAD]`, invalid UTF-8, and CUDA errors.
+- Try direct Hugging Face access first. If it is unavailable or materially slow, use `HF_ENDPOINT=https://hf-mirror.com` for that download command only. Public models do not require `HF_TOKEN`; do not send a Hugging Face token to a third-party mirror or persist proxy/token values in shell profiles, command logs, or artifacts.
+- Keep worker and request concurrency independently bounded for this 6 GiB host. A local smoke result is correctness evidence only and must not be promoted into a release-throughput claim.
+
 ## Vast GPU Runner Policy
 
 Use Vast only after the paid GPU cost policy has been stated for the lane.
