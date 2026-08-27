@@ -74,6 +74,17 @@ commands without downloading the model or starting an inference engine.
 - v0.8 covers language-model inference only. Release scope: Qwen3.5 4B, Qwen3.5 35B-A3B,
   Qwen3 30B-A3B, and Llama 3.1 8B dense. [Support matrix](docs/release/runtime-vnext/0.8.0/SUPPORT_MATRIX.md).
 
+The post-v0.8 CUDA source tree also contains a narrowly qualified text-only
+adoption path for
+`cyankiwi/Qwen3.8-27B-AWQ-INT4@63768c10df38c0395e12ef49edac1bd539eaeeea`:
+`compressed-tensors` pack-quantized W4, group size 32, asymmetric zero point,
+on exactly one sm89 RTX 4090. Its qualification covers `ferrum run`,
+`ferrum serve`, streaming usage, required tools, strict JSON schema, and one
+c=1 three-request usability check. It is not a v0.8 release-asset, Metal,
+multimodal, or general compressed-tensors support claim; see the
+[model-adoption goal](docs/goals/model-adoption-2026-08-26/GOAL.md) for the
+exact evidence boundary.
+
 ## Performance Snapshot
 
 Latest R2 development `ferrum serve` checkpoint. Metal uses random 64-token
