@@ -60,6 +60,7 @@ pub(crate) enum MetalResolvedWeightLayout {
         packed_dimensions: Vec<u64>,
         scales: usize,
         zero_points: Option<usize>,
+        zero_point_packed_dimensions: Option<Vec<u64>>,
         axis_indices: Option<MetalResolvedAxisComponent>,
         permutation: Option<MetalResolvedAxisComponent>,
         codebook: Option<usize>,
@@ -283,6 +284,7 @@ fn resolve_layout_node(
             packed_dimensions,
             scales,
             zero_points,
+            zero_point_packed_dimensions,
             axis_indices,
             permutation,
             codebook,
@@ -296,6 +298,7 @@ fn resolve_layout_node(
                 .as_ref()
                 .map(|component| component_index(&component.component_id))
                 .transpose()?,
+            zero_point_packed_dimensions: zero_point_packed_dimensions.clone(),
             axis_indices: axis_indices.as_ref().map(axis_component).transpose()?,
             permutation: permutation.as_ref().map(axis_component).transpose()?,
             codebook: codebook
