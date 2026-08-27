@@ -903,6 +903,7 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                 packed_dimensions,
                 scales,
                 zero_points,
+                zero_point_packed_dimensions,
                 axis_indices,
                 permutation,
                 codebook,
@@ -970,8 +971,34 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                         self.invalid("scale component dtype differs from the quantization spec")
                     );
                 }
-                match (quantization.zero_point_type, zero_points) {
-                    (Some(expected_type), Some(binding)) => {
+                match (
+                    quantization.zero_point_type,
+                    zero_points,
+                    zero_point_packed_dimensions,
+                ) {
+                    (Some(expected_type), Some(binding), Some(packed_dimensions)) => {
+                        let expected_bytes = checked_elements(&group_shape)
+                            .and_then(|elements| {
+                                elements.checked_mul(u64::from(quantization.bits_per_weight))
+                            })
+                            .and_then(|bits| bits.checked_add(7))
+                            .map(|bits| bits / 8)
+                            .ok_or_else(|| self.invalid("packed zero-point size overflows u64"))?;
+                        let component = self.bind_component(
+                            binding,
+                            packed_dimensions,
+                            WeightComponentRole::ZeroPoints,
+                            depth,
+                        )?;
+                        if component.dense_element_type() != Some(expected_type)
+                            || component.physical_bytes()? != expected_bytes
+                        {
+                            return Err(self.invalid(
+                                "packed zero-point component differs from its quantization contract",
+                            ));
+                        }
+                    }
+                    (Some(expected_type), Some(binding), None) => {
                         let component = self.bind_component(
                             binding,
                             &group_shape,
@@ -984,7 +1011,7 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                             ));
                         }
                     }
-                    (None, None) => {}
+                    (None, None, None) => {}
                     _ => {
                         return Err(self.invalid(
                             "zero-point component presence differs from the quantization spec",

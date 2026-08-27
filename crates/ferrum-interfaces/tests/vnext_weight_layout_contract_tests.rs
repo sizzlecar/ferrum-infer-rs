@@ -88,6 +88,7 @@ fn grouped_quantized_axis_index_schema() -> WeightSchema {
                 packed_dimensions: vec![4, 8],
                 scales: exact_component("component.scales"),
                 zero_points: Some(exact_component("component.zeros")),
+                zero_point_packed_dimensions: None,
                 axis_indices: Some(AxisWeightComponent {
                     component: exact_component("component.axis-indices"),
                     axis: 1,
@@ -263,6 +264,7 @@ fn whole_axis_quantization_keeps_one_abi_across_matrix_shapes() {
                     packed_dimensions: vec![2, 4],
                     scales: PhysicalWeightComponentBinding::exact_contiguous(first_scales),
                     zero_points: None,
+                    zero_point_packed_dimensions: None,
                     axis_indices: None,
                     permutation: None,
                     codebook: None,
@@ -280,6 +282,7 @@ fn whole_axis_quantization_keeps_one_abi_across_matrix_shapes() {
                     packed_dimensions: vec![3, 8],
                     scales: PhysicalWeightComponentBinding::exact_contiguous(second_scales),
                     zero_points: None,
+                    zero_point_packed_dimensions: None,
                     axis_indices: None,
                     permutation: None,
                     codebook: None,
@@ -698,6 +701,7 @@ fn recursive_quantized_expert_schema() -> WeightSchema {
             zero_points: Some(PhysicalWeightComponentBinding::exact_contiguous(id(
                 zero_points,
             ))),
+            zero_point_packed_dimensions: None,
             axis_indices: None,
             permutation: None,
             codebook: None,

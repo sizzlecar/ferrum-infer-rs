@@ -458,6 +458,61 @@ pub fn repack_scales_to_marlin(
     result
 }
 
+/// Reorder compressed-tensors asymmetric INT4 zero points into Marlin's
+/// runtime zero-point ABI.
+///
+/// The checkpoint input is standard little-endian nibble packing with shape
+/// `[N/8, K/G]`. The returned I32 words have shape `[K/G, N/8]` after the
+/// same 64-channel permutation used by grouped Marlin scales and Marlin's
+/// eight-lane interleave.
+pub fn repack_compressed_tensors_zero_points_to_marlin(
+    packed_zero_points: &[i32],
+    group_count: usize,
+    n: usize,
+) -> Vec<i32> {
+    assert!(n.is_multiple_of(8));
+    assert_eq!(packed_zero_points.len(), (n / 8) * group_count);
+
+    let mut logical = vec![0_u8; group_count * n];
+    for packed_output in 0..n / 8 {
+        for group in 0..group_count {
+            let word = packed_zero_points[packed_output * group_count + group] as u32;
+            for lane in 0..8 {
+                logical[group * n + packed_output * 8 + lane] = ((word >> (lane * 4)) & 0x0f) as u8;
+            }
+        }
+    }
+
+    let scale_permutation = (0..8)
+        .flat_map(|row| (0..8).map(move |column| row + 8 * column))
+        .collect::<Vec<_>>();
+    let interleave = [0_usize, 2, 4, 6, 1, 3, 5, 7];
+    let mut result = vec![0_i32; group_count * n / 8];
+    for group in 0..group_count {
+        let source = &logical[group * n..(group + 1) * n];
+        let mut permuted = vec![0_u8; n];
+        let full = n / scale_permutation.len() * scale_permutation.len();
+        for chunk_start in (0..full).step_by(scale_permutation.len()) {
+            for (destination, source_offset) in scale_permutation.iter().copied().enumerate() {
+                permuted[chunk_start + destination] = source[chunk_start + source_offset];
+            }
+        }
+        permuted[full..].copy_from_slice(&source[full..]);
+        for packed_output in 0..n / 8 {
+            let base = packed_output * 8;
+            let word =
+                interleave
+                    .into_iter()
+                    .enumerate()
+                    .fold(0_u32, |word, (lane, source_lane)| {
+                        word | (u32::from(permuted[base + source_lane]) << (lane * 4))
+                    });
+            result[group * (n / 8) + packed_output] = word as i32;
+        }
+    }
+    result
+}
+
 fn marlin_weight_permutation() -> Vec<usize> {
     let mut permutation = Vec::with_capacity(1024);
     for index in 0..32 {
@@ -671,6 +726,54 @@ mod tests {
                 .into_iter()
                 .flat_map(i32::to_le_bytes)
                 .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compressed_tensors_zero_points_match_grouped_marlin_abi() {
+        let group_count = 4;
+        let n = 128;
+        let zero_point = |group: usize, output: usize| -> u8 {
+            ((group * 5 + output * 3 + output / 7) & 0x0f) as u8
+        };
+
+        // compressed-tensors stores `[N / 8, K / G]` words with output
+        // channels in little-endian nibble order.
+        let mut checkpoint = vec![0_i32; (n / 8) * group_count];
+        for packed_output in 0..n / 8 {
+            for group in 0..group_count {
+                checkpoint[packed_output * group_count + group] =
+                    (0..8).fold(0_u32, |word, lane| {
+                        word | (u32::from(zero_point(group, packed_output * 8 + lane))
+                            << (lane * 4))
+                    }) as i32;
+            }
+        }
+
+        // Derive the expected `[K / G, N / 8]` words directly from the
+        // Marlin fragment coordinates, independently of the implementation's
+        // unpack/permute/repack staging.
+        let interleave = [0_usize, 2, 4, 6, 1, 3, 5, 7];
+        let mut expected = vec![0_i32; group_count * n / 8];
+        for group in 0..group_count {
+            for packed_output in 0..n / 8 {
+                let chunk = (packed_output * 8 / 64) * 64;
+                let destination_base = packed_output * 8 % 64;
+                expected[group * (n / 8) + packed_output] =
+                    interleave
+                        .into_iter()
+                        .enumerate()
+                        .fold(0_u32, |word, (lane, fragment_lane)| {
+                            let destination = destination_base + fragment_lane;
+                            let source = chunk + destination / 8 + 8 * (destination % 8);
+                            word | (u32::from(zero_point(group, source)) << (lane * 4))
+                        }) as i32;
+            }
+        }
+
+        assert_eq!(
+            repack_compressed_tensors_zero_points_to_marlin(&checkpoint, group_count, n),
+            expected
         );
     }
 
