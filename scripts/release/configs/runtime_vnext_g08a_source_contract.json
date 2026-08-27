@@ -19,7 +19,7 @@
       "path": "crates/ferrum-models/src/qwen35_config.rs",
       "classification": "excluded-parser",
       "owner": "ferrum-models/qwen35_config",
-      "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+      "reviewed_at_git_sha": "501f85073ff03c33d10306fbcc97115eee57974c",
       "reason": "Typed external configuration parsing is excluded by the frozen G00 scaffolding definition."
     },
     {
@@ -33,14 +33,14 @@
       "path": "crates/ferrum-models/src/qwen35_weights.rs",
       "classification": "excluded-weights",
       "owner": "ferrum-models/qwen35_weights",
-      "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+      "reviewed_at_git_sha": "501f85073ff03c33d10306fbcc97115eee57974c",
       "reason": "Typed checkpoint inventory and weight declarations are excluded by the frozen G00 scaffolding definition."
     },
     {
       "path": "crates/ferrum-models/src/vnext/qwen35.rs",
       "classification": "reviewed-provider",
       "owner": "ferrum-models/vnext::qwen35",
-      "reviewed_at_git_sha": "db1137ee21f7b278c7bccd4cb1fd96da2d6ef252",
+      "reviewed_at_git_sha": "501f85073ff03c33d10306fbcc97115eee57974c",
       "reason": "The typed family provider is reviewed function by function below."
         }
     ],
@@ -64,7 +64,7 @@
 	    "provider_review": {
     "path": "crates/ferrum-models/src/vnext/qwen35.rs",
     "owner": "ferrum-models/vnext::qwen35",
-    "reviewed_at_git_sha": "db1137ee21f7b278c7bccd4cb1fd96da2d6ef252",
+    "reviewed_at_git_sha": "501f85073ff03c33d10306fbcc97115eee57974c",
 	        "classification_reasons": {
             "counted-execution-scaffolding": "Family-owned execution, scheduling, batching, state transition, or lifecycle code counts toward the frozen G00 scaffolding delta.",
             "counted-provider-glue": "Typed family identity, validation, preparation, and descriptor glue count toward the G08A provider limit.",
@@ -126,6 +126,7 @@
       "append_safetensors_direct_moe_weight",
       "append_safetensors_composite_moe_weight",
       "gptq_marlin_quantization_spec",
+      "compressed_tensors_marlin_quantization_spec",
       "gguf_weight_schema",
       "append_gguf_moe_weight_schema",
       "append_gguf_direct_logical_weight",
@@ -135,10 +136,14 @@
       "append_gguf_weights",
       "append_resolved_weights",
       "family_gptq_tensor",
+      "family_compressed_tensors_tensor",
       "resolved_weight_keys",
       "resolved_weight_keys_from_config",
+      "validate_safetensors_quantization_config",
       "validate_gptq_marlin_config",
+      "validate_compressed_tensors_marlin_config",
       "validate_gptq_weight_source",
+      "validate_compressed_tensors_weight_source",
       "family_source_external_names",
       "validate_safetensors_manifest",
       "validate_canonical_gptq_moe_representation",
@@ -186,7 +191,7 @@
         "path": "crates/ferrum-interfaces/src/vnext/model.rs",
         "name": "ModelFamilyProvider",
         "owner": "ferrum-interfaces/vnext-model-contract",
-        "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+        "reviewed_at_git_sha": "501f85073ff03c33d10306fbcc97115eee57974c",
     "required_methods": [
       "family_id",
       "external_metadata_ids",
