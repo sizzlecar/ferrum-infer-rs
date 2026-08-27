@@ -730,6 +730,54 @@ mod tests {
     }
 
     #[test]
+    fn compressed_tensors_zero_points_match_grouped_marlin_abi() {
+        let group_count = 4;
+        let n = 128;
+        let zero_point = |group: usize, output: usize| -> u8 {
+            ((group * 5 + output * 3 + output / 7) & 0x0f) as u8
+        };
+
+        // compressed-tensors stores `[N / 8, K / G]` words with output
+        // channels in little-endian nibble order.
+        let mut checkpoint = vec![0_i32; (n / 8) * group_count];
+        for packed_output in 0..n / 8 {
+            for group in 0..group_count {
+                checkpoint[packed_output * group_count + group] =
+                    (0..8).fold(0_u32, |word, lane| {
+                        word | (u32::from(zero_point(group, packed_output * 8 + lane))
+                            << (lane * 4))
+                    }) as i32;
+            }
+        }
+
+        // Derive the expected `[K / G, N / 8]` words directly from the
+        // Marlin fragment coordinates, independently of the implementation's
+        // unpack/permute/repack staging.
+        let interleave = [0_usize, 2, 4, 6, 1, 3, 5, 7];
+        let mut expected = vec![0_i32; group_count * n / 8];
+        for group in 0..group_count {
+            for packed_output in 0..n / 8 {
+                let chunk = (packed_output * 8 / 64) * 64;
+                let destination_base = packed_output * 8 % 64;
+                expected[group * (n / 8) + packed_output] =
+                    interleave
+                        .into_iter()
+                        .enumerate()
+                        .fold(0_u32, |word, (lane, fragment_lane)| {
+                            let destination = destination_base + fragment_lane;
+                            let source = chunk + destination / 8 + 8 * (destination % 8);
+                            word | (u32::from(zero_point(group, source)) << (lane * 4))
+                        }) as i32;
+            }
+        }
+
+        assert_eq!(
+            repack_compressed_tensors_zero_points_to_marlin(&checkpoint, group_count, n),
+            expected
+        );
+    }
+
+    #[test]
     fn fp8_marlin_prepare_matches_vllm_w8a16_tile_abi() {
         let n = 64_usize;
         let k = 128_usize;

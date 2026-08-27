@@ -554,15 +554,19 @@ mod tests {
     use super::{
         gptq_qzeros_are_symmetric_code7, repack_gptq_qzeros_to_marlin, FerrumMarlinLaunch,
         MarlinF16WeightType, MarlinMmBuffers, MarlinMmExecution, MarlinMmF16WeightRequest,
-        MarlinMmProblem, FERRUM_MARLIN_HAS_ACT_ORDER, FERRUM_MARLIN_IS_K_FULL,
-        FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4B8, FERRUM_MARLIN_USE_ATOMIC_ADD,
-        FERRUM_MARLIN_USE_FP32_REDUCE,
+        MarlinMmProblem, FERRUM_MARLIN_HAS_ACT_ORDER, FERRUM_MARLIN_HAS_ZERO_POINTS,
+        FERRUM_MARLIN_IS_K_FULL, FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4,
+        FERRUM_MARLIN_SCALAR_U4B8, FERRUM_MARLIN_USE_ATOMIC_ADD, FERRUM_MARLIN_USE_FP32_REDUCE,
     };
 
     #[test]
     fn marlin_launch_ffi_layout_and_weight_types_are_stable() {
         assert_eq!(std::mem::size_of::<FerrumMarlinLaunch>(), 184);
         assert_eq!(std::mem::align_of::<FerrumMarlinLaunch>(), 8);
+        assert_eq!(
+            MarlinF16WeightType::U4.ffi_scalar_type(),
+            FERRUM_MARLIN_SCALAR_U4
+        );
         assert_eq!(
             MarlinF16WeightType::U4B8.ffi_scalar_type(),
             FERRUM_MARLIN_SCALAR_U4B8
@@ -576,7 +580,7 @@ mod tests {
     #[test]
     fn typed_marlin_request_maps_to_versioned_ffi() {
         let request = MarlinMmF16WeightRequest {
-            weight_type: MarlinF16WeightType::E4M3Fn,
+            weight_type: MarlinF16WeightType::U4,
             buffers: MarlinMmBuffers {
                 a: 1_usize as *const _,
                 b: 2_usize as *const _,
@@ -584,7 +588,7 @@ mod tests {
                 c_tmp: 4_usize as *mut _,
                 a_scales: 5_usize as *mut _,
                 b_scales: 6_usize as *mut _,
-                zero_points: std::ptr::null_mut(),
+                zero_points: 20_usize as *mut _,
                 group_index: 7_usize as *mut _,
                 permutation: 8_usize as *mut _,
                 a_tmp: 9_usize as *mut _,
@@ -616,6 +620,7 @@ mod tests {
         assert_eq!(launch.c_tmp, request.buffers.c_tmp);
         assert_eq!(launch.a_scales, request.buffers.a_scales);
         assert_eq!(launch.b_scales, request.buffers.b_scales);
+        assert_eq!(launch.zero_points, request.buffers.zero_points);
         assert_eq!(launch.group_index, request.buffers.group_index);
         assert_eq!(launch.permutation, request.buffers.permutation);
         assert_eq!(launch.a_tmp, request.buffers.a_tmp);
@@ -632,6 +637,7 @@ mod tests {
             launch.flags,
             FERRUM_MARLIN_HAS_ACT_ORDER
                 | FERRUM_MARLIN_IS_K_FULL
+                | FERRUM_MARLIN_HAS_ZERO_POINTS
                 | FERRUM_MARLIN_USE_ATOMIC_ADD
                 | FERRUM_MARLIN_USE_FP32_REDUCE
         );
