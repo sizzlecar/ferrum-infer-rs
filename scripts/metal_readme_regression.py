@@ -54,6 +54,7 @@ class ModelCase:
     moe: bool
     cells: tuple[Cell, ...]
     default_min_max_seqs: int
+    source: str | None = None
     default_max_max_seqs: int | None = None
     serve_args: tuple[str, ...] = ()
     unsafe_batch_probe: Cell | None = None
@@ -92,6 +93,7 @@ CASES = (
         moe=True,
         cells=(Cell(concurrency=16, prompts=32, baseline_tps=72.5),),
         default_min_max_seqs=16,
+        source="qwen3:30b-a3b-q4_k_m",
     ),
 )
 
@@ -167,6 +169,8 @@ def start_server(
         "serve",
         "--model",
         str(model_path),
+        "--served-model-name",
+        case.label,
         "--host",
         "127.0.0.1",
         "--port",
@@ -265,6 +269,8 @@ def run_default_startup_probe(
         "serve",
         "--model",
         str(model_path),
+        "--served-model-name",
+        case.label,
         "--host",
         "127.0.0.1",
         "--port",
@@ -1221,7 +1227,7 @@ def main() -> int:
 
     selected = [case for case in CASES if not args.only or case.key in set(args.only)]
     for case in selected:
-        model_path = args.models_dir / case.gguf
+        model_path = Path(case.source) if case.source else args.models_dir / case.gguf
         model_report: dict[str, Any] = {
             "key": case.key,
             "label": case.label,
