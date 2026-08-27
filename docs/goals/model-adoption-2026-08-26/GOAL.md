@@ -2,7 +2,8 @@
 
 ## 状态与完成口径
 
-- 2026-08-26 提议；2026-08-27 按单人资源和 v0.8.0 复盘收敛。
+- 2026-08-26 提议；2026-08-27 按单人资源和 v0.8.0 复盘收敛，并修正为同架构小模型
+  优先验证。
 - 这是一个 **model-adoption source goal**，不是发布审计、性能竞赛或正式发布目标。
 - 文档合并、代码能编译、单元测试通过、模型开始输出，都不单独代表目标完成。
 - 本目标不授权创建 release、tag、Homebrew 更新或付费 GPU 实例。
@@ -116,7 +117,7 @@ stale。
 
 | 环境 | 固定职责 | 能证明 | 不能证明 |
 |---|---|---|---|
-| `panda-pad` WSL；RTX 4050 Laptop 6GiB；Ubuntu 24.04；CUDA Toolkit 12.6 | CUDA build、格式 fixture、Marlin 小张量 parity、`qwen3:0.6b` 双入口 smoke | 源码可编译、CUDA 小张量正确、产品公共路径未坏 | 27B 能装入、4090 性能、release-ready |
+| `panda-pad` WSL；RTX 4050 Laptop 6GiB；Ubuntu 24.04；CUDA Toolkit 12.6 | CUDA build、格式 fixture、Marlin 小张量 parity、固定 `Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17` 同架构双入口 smoke，以及 `qwen3:0.6b` 公共路径哨兵 | 源码可编译、CUDA 小张量正确、`qwen3_5_text` 混合执行图可走通、产品公共路径未坏 | 27B 能装入、真实 compressed-tensors 权重的完整模型组合、4090 性能、release-ready |
 | 单 RTX 4090 | 固定 Qwen3.8 checkpoint 的最终真模型 smoke 和最低可用性测量 | 本 goal 的模型产品闭环 | 其他 GPU/模型/格式的泛化支持 |
 
 源码只通过 GitHub `git`/`gh` 同步到 panda-pad 的仓库，不使用 SCP/rsync 传源码。artifact 可以
@@ -132,7 +133,7 @@ stale。
 | ID | 必须证明 | 精确 PASS 判据 | artifact |
 |---|---|---|---|
 | G1 | 源码合同正确 | 固定 repo/revision、config、weight index、shard 名称/大小被 lock；目标配置 1/1 识别为精确格式合同；错误 bits/group、activation quant、缺 tensor 三个 fixture 3/3 在 GPU 分配前返回 typed error；四个固定 fixture 4/4 覆盖 asymmetric packing、single projection、fused QKV/gate-up 和 mixed dense/linear-attention，CUDA 对 CPU reference `rel_err < 0.05` 且 NaN/Inf=0；官方 config fixture 1/1、四个 template golden 4/4；候选 SHA 上 `FERRUM GATE unit PASS` 1/1 | `source/model-lock.json`、`source/contract-tests.json`、`source/unit/` |
-| G2 | panda-pad CUDA 开发路径可复现 | exact release build exit=0；`qwen3:0.6b` 的 `run` 单轮/两轮 2/2 非空，`serve` non-stream/stream 2/2 成功；stream 恰好一个 `[DONE]` 且 usage output tokens >0；panic、OOM、`<unk>`、`[PAD]`、mojibake、空回答计数均为 0 | `panda-pad/host.json`、`panda-pad/build/`、`panda-pad/smoke/` |
+| G2 | panda-pad CUDA 开发路径可复现 | exact release build exit=0；固定 revision 的 `Qwen3.5-0.8B`（`qwen3_5_text`，24 层：18 linear attention + 6 full attention）完成 `run` 单轮/两轮 2/2 非空及 `serve` non-stream/stream 2/2 成功；`qwen3:0.6b` 只做 `run` 单轮和 `serve` non-stream 2/2 公共路径哨兵；stream 恰好一个 `[DONE]` 且 usage output tokens >0；panic、OOM、`<unk>`、`[PAD]`、mojibake、空回答计数均为 0 | `panda-pad/host.json`、`panda-pad/build/`、`panda-pad/smoke/` |
 | G3 | 4090 真模型可用 | 同一候选 SHA 和固定 revision：`run` known-answer/两轮 2/2；`serve` non-stream、stream、required tool、strict schema 4/4；stream 恰好一个 `[DONE]` 且 usage output tokens >0；上述错误计数均为 0。随后只跑 c=1、3 requests 的短测：completed=3、failed=0、服务端 usage 计数率=100%、median output throughput `>=5 tok/s`、p50 TTFT `<=30s` | `qwen38-4090/host.json`、`qwen38-4090/correctness/`、`qwen38-4090/usability/` |
 | G4 | 声明与证据一致 | README/支持矩阵只声明固定 checkpoint、CUDA、text-only 和实测边界；根 manifest 只引用 G1-G3 同一候选 SHA 的 receipts；薄 validator 最后一行精确打印目标 PASS | `goal.manifest.json`、`validator.log` |
 
@@ -169,7 +170,12 @@ Marlin ABI），停止扩大通用 compressed-tensors 支持面。
 - 用官方 config fixture 证明 Qwen3.5 text core 可复用；只补真实字段差异。
 - 四个 template golden 固定为 single-turn、multi-turn、thinking-off、tool continuation；模板错误
   必须显式失败，不得 fallback 到 builtin ChatML。
-- 在 panda-pad 完成 exact release build 和 G2 双入口 smoke。
+- 在 panda-pad 完成 exact release build；以固定 revision 的 `Qwen3.5-0.8B` 完成主要同架构
+  双入口 smoke，并以 `qwen3:0.6b` 各跑一个入口作为廉价公共路径哨兵。
+
+`Qwen3.5-0.8B` 只证明与目标相同的 `qwen3_5_text` 混合架构执行图，不证明目标
+compressed-tensors W4 合同。后者由 G1 四个精确 CUDA parity fixture 与 G3 固定 27B 真权重共同
+证明；不得用任一层证据替代另一层。
 
 最迟在累计第 4.5 个 active day 形成可在 4090 尝试的候选 SHA。未形成时输出 REJECT/剩余估算，
 不先写新的 gate 框架。
@@ -227,7 +233,8 @@ evidence、同一 SHA、计数和阈值，不运行 cargo、模型、HTTP client
 只有以下条件全部成立，validator 才能打印 PASS：
 
 - G1-G4 全部满足，且 required artifact 同属一个候选 SHA；
-- `run` 与 `serve` 都有 panda 小模型和 4090 真模型 evidence；
+- `run` 与 `serve` 都有 panda 同架构小模型和 4090 真模型 evidence，且另有 `qwen3:0.6b`
+  双入口公共路径哨兵；
 - 没有 hidden env、模型名 hack、输出过滤、完整 F16 fallback、waiver 或静默 feature fallback；
 - 文档只声明 artifact 实际证明的 checkpoint、格式、后端、模态和性能边界；
 - validator 最后一行精确为 `QWEN38 CUDA ADOPTION GOAL PASS: <out_dir>`。

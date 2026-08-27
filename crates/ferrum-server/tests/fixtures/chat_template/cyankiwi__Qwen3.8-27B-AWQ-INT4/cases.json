@@ -1,0 +1,69 @@
+{
+  "single_turn": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi"
+      }
+    ]
+  },
+  "multi_turn": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "A"
+      },
+      {
+        "role": "assistant",
+        "content": "B"
+      },
+      {
+        "role": "user",
+        "content": "C"
+      }
+    ]
+  },
+  "thinking_off": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Answer briefly: why is the sky blue?"
+      }
+    ],
+    "render_kwargs": {
+      "enable_thinking": false
+    }
+  },
+  "tool_continuation": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Use the calculator."
+      },
+      {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+              "name": "calculator",
+              "arguments": {
+                "expression": "7*3"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "21"
+      }
+    ],
+    "render_kwargs": {
+      "enable_thinking": true
+    }
+  }
+}
