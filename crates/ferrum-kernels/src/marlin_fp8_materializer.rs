@@ -190,6 +190,7 @@ impl WeightMaterializer for MarlinFp8WeightMaterializer {
                     candidate.scales_component.id.clone(),
                 ),
                 zero_points: None,
+                zero_point_packed_dimensions: None,
                 axis_indices: None,
                 permutation: None,
                 codebook: None,

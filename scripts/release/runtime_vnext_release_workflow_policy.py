@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the v0.8.0 build-once/stage-only release workflow contract."""
+"""Validate current staging workflows and the frozen v0.8.0 promotion path."""
 
 from __future__ import annotations
 
@@ -18,6 +18,9 @@ from typing import Any, Iterable
 PASS_PREFIX = "FERRUM RELEASE WORKFLOW POLICY PASS"
 SELFTEST_PASS_LINE = "FERRUM RELEASE WORKFLOW POLICY SELFTEST PASS"
 PREPROMOTION_READY_PREFIX = "FERRUM PREPROMOTION MANIFEST CONSUMPTION READY"
+STAGING_VERSION = "0.8.1"
+STAGING_RC_TAG = "v0.8.1-rc.1"
+STAGING_LABEL = "v0.8.1-rc"
 EXPECTED_VERSION = "0.8.0"
 EXPECTED_TAG = "v0.8.0"
 EXPECTED_RC_TAG = "v0.8.0-rc.1"
@@ -214,9 +217,9 @@ def _validate_staging_workflow(
         inputs,
         "release_candidate_tag",
         label,
-        default=EXPECTED_RC_TAG,
+        default=STAGING_RC_TAG,
     )
-    _require_dispatch_input(inputs, "staging_label", label, default="v0.8.0-rc")
+    _require_dispatch_input(inputs, "staging_label", label, default=STAGING_LABEL)
     _require_dispatch_input(inputs, "publish_release", label, default=False)
     _validate_permissions(document, {"contents": "read"}, label)
     jobs = workflow_jobs(document, label)
@@ -237,7 +240,7 @@ def _validate_staging_workflow(
         require('if [[ "${{ inputs.publish_release }}" != "false" ]]' in scripts, f"{context} does not fail closed when publish_release is true")
         require(scripts.count("cargo build") == 1, f"{context} must invoke cargo build exactly once")
         require(scripts.count("cargo build --release --locked -p ferrum-cli --bin ferrum") == 1, f"{context} must build the release binary exactly once with the canonical command")
-        require(f'test "$version" = "{EXPECTED_VERSION}"' in scripts, f"{context} does not lock workspace version {EXPECTED_VERSION}")
+        require(f'test "$version" = "{STAGING_VERSION}"' in scripts, f"{context} does not lock workspace version {STAGING_VERSION}")
         require(asset in scripts, f"{context} does not package expected asset {asset}")
         require(target in scripts, f"{context} does not record expected target triple {target}")
         require(f'BACKEND="{backend}"' in scripts, f"{context} does not record expected backend {backend}")
@@ -333,7 +336,7 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
         "release-cuda.yml must not restore target/ across CUDA/native-set identities",
     )
     cache_prefix = (
-        "stage-v0.8.0-linux-x86_64-cuda-sm89-"
+        "stage-v0.8.1-linux-x86_64-cuda-sm89-"
         "cuda12.4-native-b450d931-cargo-"
     )
     require(

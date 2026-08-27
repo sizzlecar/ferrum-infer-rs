@@ -152,6 +152,7 @@ fn validate_marlin_fp8_contract(
         packed_dimensions,
         scales,
         zero_points,
+        zero_point_packed_dimensions,
         axis_indices,
         permutation,
         codebook,
@@ -162,6 +163,7 @@ fn validate_marlin_fp8_contract(
         return Err("CUDA Marlin FP8 requires one whole quantized layout".to_owned());
     };
     if zero_points.is_some()
+        || zero_point_packed_dimensions.is_some()
         || axis_indices.is_some()
         || permutation.is_some()
         || codebook.is_some()
@@ -426,6 +428,7 @@ mod tests {
                     packed_dimensions: vec![256, 128],
                     scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
                     zero_points: None,
+                    zero_point_packed_dimensions: None,
                     axis_indices: None,
                     permutation: None,
                     codebook: None,
