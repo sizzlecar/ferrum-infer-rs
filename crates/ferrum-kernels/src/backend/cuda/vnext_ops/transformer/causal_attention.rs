@@ -28,11 +28,15 @@ use super::{attach_invocation_binding, ensure_estimator_request, estimate, launc
 #[cfg(feature = "vllm-marlin")]
 use super::{
     moe_weights::{
-        resolve_gptq_marlin_matrix_weight, GPTQ_MARLIN_CAPABILITY_ID,
+        resolve_compressed_tensors_marlin_matrix_weight, resolve_gptq_marlin_matrix_weight,
+        COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID, GPTQ_MARLIN_CAPABILITY_ID,
         GPTQ_MARLIN_QUANTIZATION_FORMAT_ID, GPTQ_MARLIN_WEIGHT_FORMAT_ID,
     },
     MarlinProjectionRuntime,
 };
+#[cfg(feature = "vllm-marlin")]
+use crate::backend::cuda::vllm_marlin::MarlinF16WeightType;
 #[cfg(feature = "vllm-paged-attn-v2")]
 use crate::backend::cuda::vllm_paged_attn::{
     dispatch_vnext_addressed_paged_attention_raw, VnextAddressedPagedAttentionKernel,
@@ -134,6 +138,7 @@ impl CudaCausalPagedAttentionProvider {
             include_str!("moe_weights.rs").as_bytes(),
             include_str!("../../vllm_marlin.rs").as_bytes(),
             GPTQ_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
+            COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
         ]);
         #[cfg(feature = "vllm-paged-attn-v2")]
         provider_sources.extend([
@@ -164,10 +169,31 @@ impl CudaCausalPagedAttentionProvider {
                 ));
             }
             provider_capabilities.insert(marlin_capability);
+            let compressed_tensors_capability =
+                CapabilityId::new(COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID)
+                    .map_err(contract_error)?;
+            if !runtime
+                .descriptor()
+                .capabilities
+                .contains(&compressed_tensors_capability)
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA runtime does not advertise causal-attention compressed-tensors Marlin",
+                ));
+            }
+            provider_capabilities.insert(compressed_tensors_capability);
             accepted_weight_formats
                 .insert(WeightFormatId::new(GPTQ_MARLIN_WEIGHT_FORMAT_ID).map_err(contract_error)?);
+            accepted_weight_formats.insert(
+                WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
             accepted_quantization_formats.insert(
                 QuantizationFormatId::new(GPTQ_MARLIN_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
+            accepted_quantization_formats.insert(
+                QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
                     .map_err(contract_error)?,
             );
         }
@@ -987,7 +1013,7 @@ struct CudaCausalAttentionShape {
 enum CausalProjection {
     F16,
     #[cfg(feature = "vllm-marlin")]
-    GptqMarlin {
+    Marlin {
         runtime: MarlinProjectionRuntime,
     },
 }
@@ -1011,18 +1037,22 @@ impl CausalProjection {
                 continue;
             }
             if quantization_formats.len() != 1
-                || !quantization_formats
-                    .iter()
-                    .any(|format| format.as_str() == GPTQ_MARLIN_QUANTIZATION_FORMAT_ID)
+                || !quantization_formats.iter().any(|format| {
+                    matches!(
+                        format.as_str(),
+                        GPTQ_MARLIN_QUANTIZATION_FORMAT_ID
+                            | COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID
+                    )
+                })
             {
                 return Err(format!(
-                    "causal attention projection input {ordinal} is not exact symmetric GPTQ-Marlin INT4"
+                    "causal attention projection input {ordinal} is not an admitted exact INT4 Marlin format"
                 ));
             }
             uses_marlin = true;
         }
         Ok(if uses_marlin {
-            Self::GptqMarlin { runtime }
+            Self::Marlin { runtime }
         } else {
             Self::F16
         })
@@ -1032,7 +1062,7 @@ impl CausalProjection {
         match self {
             Self::F16 => Ok(0),
             #[cfg(feature = "vllm-marlin")]
-            Self::GptqMarlin { runtime } => runtime.workspace_bytes(),
+            Self::Marlin { runtime } => runtime.workspace_bytes(),
         }
     }
 
@@ -1040,7 +1070,7 @@ impl CausalProjection {
         match self {
             Self::F16 => "f16-cublas",
             #[cfg(feature = "vllm-marlin")]
-            Self::GptqMarlin { .. } => "mixed-gptq-marlin-u4b8-f16-reduce",
+            Self::Marlin { .. } => "mixed-int4-marlin-f16-reduce",
         }
     }
 }
@@ -1204,10 +1234,12 @@ enum SharedProjectionWeight {
         region: usize,
     },
     #[cfg(feature = "vllm-marlin")]
-    GptqMarlin {
+    Marlin {
         packed_region: usize,
         scales_region: usize,
+        zero_points_region: Option<usize>,
         group_size: i32,
+        weight_type: MarlinF16WeightType,
     },
 }
 
@@ -1216,7 +1248,15 @@ impl SharedProjectionWeight {
         match self {
             Self::F16 { .. } => "f16",
             #[cfg(feature = "vllm-marlin")]
-            Self::GptqMarlin { .. } => "gptq-marlin-u4b8",
+            Self::Marlin {
+                zero_points_region: Some(_),
+                ..
+            } => "compressed-tensors-marlin-u4-zp",
+            #[cfg(feature = "vllm-marlin")]
+            Self::Marlin {
+                zero_points_region: None,
+                ..
+            } => "gptq-marlin-u4b8",
         }
     }
 }
@@ -2250,14 +2290,16 @@ fn launch_causal_projection(
             operation,
         ),
         #[cfg(feature = "vllm-marlin")]
-        SharedProjectionWeight::GptqMarlin {
+        SharedProjectionWeight::Marlin {
             packed_region,
             scales_region,
+            zero_points_region,
             group_size,
+            weight_type,
         } => {
-            let CausalProjection::GptqMarlin { runtime } = projection else {
+            let CausalProjection::Marlin { runtime } = projection else {
                 return Err(CudaDeviceRuntimeError::contract(format!(
-                    "{operation} has GPTQ-Marlin weights without an admitted projection runtime"
+                    "{operation} has Marlin weights without an admitted projection runtime"
                 )));
             };
             let workspace_offset = layout.projection_workspace.ok_or_else(|| {
@@ -2281,11 +2323,12 @@ fn launch_causal_projection(
                 )));
             }
             runtime.launch(
-                crate::backend::cuda::vllm_marlin::MarlinF16WeightType::U4B8,
+                weight_type,
                 stream,
                 input,
                 regions[packed_region].device_ptr(),
                 regions[scales_region].device_ptr(),
+                zero_points_region.map(|region| regions[region].device_ptr()),
                 output,
                 scratch_pointer(scratch.device_ptr(), workspace_offset)?,
                 workspace_bytes,
@@ -2924,7 +2967,65 @@ fn push_shared_projection_weight(
         let first_layout = first_binding.weight().ok_or_else(|| {
             format!("causal attention projection input {ordinal} lacks its physical weight layout")
         })?;
-        if !first_layout.quantization_formats().is_empty() {
+        let quantization_formats = first_layout.quantization_formats();
+        if quantization_formats
+            .iter()
+            .any(|format| format.as_str() == COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
+        {
+            let first = resolve_compressed_tensors_marlin_matrix_weight(
+                first_participant,
+                first_binding,
+                logical_dimensions,
+            )?;
+            for participant in &invocation.participants()[1..] {
+                let candidate = resolve_compressed_tensors_marlin_matrix_weight(
+                    participant,
+                    binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
+                    logical_dimensions,
+                )?;
+                if candidate.logical_dimensions() != first.logical_dimensions()
+                    || candidate.packed_physical_dimensions() != first.packed_physical_dimensions()
+                    || candidate.scales_physical_dimensions() != first.scales_physical_dimensions()
+                    || candidate.zero_points_physical_dimensions()
+                        != first.zero_points_physical_dimensions()
+                    || candidate.group_size() != first.group_size()
+                    || !super::same_physical_region(
+                        first.packed_region(),
+                        candidate.packed_region(),
+                    )
+                    || !super::same_physical_region(
+                        first.scales_region(),
+                        candidate.scales_region(),
+                    )
+                    || !super::same_physical_region(
+                        first.zero_points_region(),
+                        candidate.zero_points_region(),
+                    )
+                {
+                    return Err(format!(
+                        "causal attention projection input {ordinal} is not one shared compressed-tensors Marlin matrix"
+                    ));
+                }
+            }
+            let group_size = i32::try_from(first.group_size()).map_err(|_| {
+                format!("causal attention projection input {ordinal} group size exceeds i32")
+            })?;
+            let [packed, scales, zero_points] = first.into_regions();
+            let packed_region = regions.len();
+            regions.push(packed);
+            let scales_region = regions.len();
+            regions.push(scales);
+            let zero_points_region = regions.len();
+            regions.push(zero_points);
+            return Ok(SharedProjectionWeight::Marlin {
+                packed_region,
+                scales_region,
+                zero_points_region: Some(zero_points_region),
+                group_size,
+                weight_type: MarlinF16WeightType::U4,
+            });
+        }
+        if !quantization_formats.is_empty() {
             let first = resolve_gptq_marlin_matrix_weight(
                 first_participant,
                 first_binding,
@@ -2970,10 +3071,12 @@ fn push_shared_projection_weight(
             regions.push(packed);
             let scales_region = regions.len();
             regions.push(scales);
-            return Ok(SharedProjectionWeight::GptqMarlin {
+            return Ok(SharedProjectionWeight::Marlin {
                 packed_region,
                 scales_region,
+                zero_points_region: None,
                 group_size,
+                weight_type: MarlinF16WeightType::U4B8,
             });
         }
     }

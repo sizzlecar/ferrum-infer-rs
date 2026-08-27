@@ -83,10 +83,17 @@ pub struct Qwen35RopeParameters {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Qwen35QuantizationConfig {
     pub quant_method: String,
+    pub format: Option<String>,
     pub bits: usize,
     pub group_size: usize,
     pub desc_act: bool,
     pub sym: bool,
+    pub weight_type: Option<String>,
+    pub strategy: Option<String>,
+    pub dynamic: Option<bool>,
+    pub targets: Vec<String>,
+    pub input_activations: bool,
+    pub output_activations: bool,
 }
 
 /// Physical storage dtypes for the two independent Qwen3.5 recurrent-state
@@ -728,18 +735,94 @@ fn parse_quantization_config(
         .as_object()
         .ok_or_else(|| "quantization_config must be an object when present".to_string())?;
     let quant_method = required_string(quant, "quant_method")?;
-    if quant_method != "gptq" {
-        return Err(format!(
+    match quant_method.as_str() {
+        "gptq" => Ok(Some(Qwen35QuantizationConfig {
+            quant_method,
+            format: None,
+            bits: required_usize(quant, "bits")?,
+            group_size: required_usize(quant, "group_size")?,
+            desc_act: optional_bool(quant, "desc_act")?.unwrap_or(false),
+            sym: optional_bool(quant, "sym")?.unwrap_or(false),
+            weight_type: None,
+            strategy: None,
+            dynamic: None,
+            targets: Vec::new(),
+            input_activations: false,
+            output_activations: false,
+        })),
+        "compressed-tensors" => {
+            parse_compressed_tensors_quantization(quant, quant_method).map(Some)
+        }
+        _ => Err(format!(
             "unsupported Qwen3.5 quantization_config.quant_method {quant_method:?}"
+        )),
+    }
+}
+
+fn parse_compressed_tensors_quantization(
+    quant: &serde_json::Map<String, Value>,
+    quant_method: String,
+) -> Result<Qwen35QuantizationConfig, String> {
+    let format = required_string(quant, "format")?;
+    let groups = quant
+        .get("config_groups")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "compressed-tensors config_groups must be an object".to_string())?;
+    if groups.len() != 1 {
+        return Err(format!(
+            "compressed-tensors requires exactly one config group, got {}",
+            groups.len()
         ));
     }
-    Ok(Some(Qwen35QuantizationConfig {
+    let (_, group_value) = groups.iter().next().expect("one group was checked");
+    let group = group_value
+        .as_object()
+        .ok_or_else(|| "compressed-tensors config group must be an object".to_string())?;
+    let group_format = required_string(group, "format")?;
+    if group_format != format {
+        return Err(format!(
+            "compressed-tensors group format {group_format:?} differs from top-level format {format:?}"
+        ));
+    }
+    let targets = group
+        .get("targets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "compressed-tensors targets must be an array".to_string())?
+        .iter()
+        .map(|target| {
+            target
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| "compressed-tensors targets must contain strings".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let weights = group
+        .get("weights")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "compressed-tensors weights must be an object".to_string())?;
+    let actorder = group
+        .get("weights")
+        .and_then(Value::as_object)
+        .and_then(|weights| weights.get("actorder"));
+    Ok(Qwen35QuantizationConfig {
         quant_method,
-        bits: required_usize(quant, "bits")?,
-        group_size: required_usize(quant, "group_size")?,
-        desc_act: optional_bool(quant, "desc_act")?.unwrap_or(false),
-        sym: optional_bool(quant, "sym")?.unwrap_or(false),
-    }))
+        format: Some(format),
+        bits: required_usize(weights, "num_bits")?,
+        group_size: required_usize(weights, "group_size")?,
+        desc_act: actorder.is_some_and(|value| !value.is_null()),
+        sym: optional_bool(weights, "symmetric")?
+            .ok_or_else(|| "compressed-tensors weights.symmetric must be a boolean".to_string())?,
+        weight_type: Some(required_string(weights, "type")?),
+        strategy: Some(required_string(weights, "strategy")?),
+        dynamic: optional_bool(weights, "dynamic")?,
+        targets,
+        input_activations: group
+            .get("input_activations")
+            .is_some_and(|value| !value.is_null()),
+        output_activations: group
+            .get("output_activations")
+            .is_some_and(|value| !value.is_null()),
+    })
 }
 
 fn parse_usize_array(value: &Value) -> Result<Vec<usize>, String> {

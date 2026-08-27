@@ -58,6 +58,12 @@ pub enum Qwen35ResolvedWeightSource {
         qzeros: String,
         g_idx: Option<String>,
     },
+    CompressedTensors {
+        weight_packed: String,
+        weight_scale: String,
+        weight_zero_point: String,
+        weight_shape: String,
+    },
 }
 
 impl Qwen35ResolvedWeightSource {
@@ -65,6 +71,7 @@ impl Qwen35ResolvedWeightSource {
         match self {
             Self::Dense { values } => values,
             Self::Gptq { qweight, .. } => qweight,
+            Self::CompressedTensors { weight_packed, .. } => weight_packed,
         }
     }
 }
@@ -583,8 +590,8 @@ impl Qwen35WeightInventory {
                     return vec![(None, candidate)];
                 }
                 if role_accepts_quantized_linear_alias(&tensor.role) {
-                    if let Some(qweight) = self.quantized_linear_qweight_name(&candidate) {
-                        return vec![(None, qweight)];
+                    if let Some(primary) = self.quantized_linear_primary_name(&candidate) {
+                        return vec![(None, primary)];
                     }
                 }
             }
@@ -609,13 +616,23 @@ impl Qwen35WeightInventory {
             .collect()
     }
 
-    fn quantized_linear_qweight_name(&self, dense_weight_name: &str) -> Option<String> {
+    fn quantized_linear_primary_name(&self, dense_weight_name: &str) -> Option<String> {
         let module = dense_weight_name.strip_suffix(".weight")?;
         let qweight = format!("{module}.qweight");
         let scales = format!("{module}.scales");
         let qzeros = format!("{module}.qzeros");
-        (self.contains(&qweight) && self.contains(&scales) && self.contains(&qzeros))
-            .then_some(qweight)
+        if self.contains(&qweight) && self.contains(&scales) && self.contains(&qzeros) {
+            return Some(qweight);
+        }
+        let weight_packed = format!("{module}.weight_packed");
+        let weight_scale = format!("{module}.weight_scale");
+        let weight_zero_point = format!("{module}.weight_zero_point");
+        let weight_shape = format!("{module}.weight_shape");
+        (self.contains(&weight_packed)
+            && self.contains(&weight_scale)
+            && self.contains(&weight_zero_point)
+            && self.contains(&weight_shape))
+        .then_some(weight_packed)
     }
 
     fn resolve_weight_specs(
@@ -655,6 +672,28 @@ impl Qwen35WeightInventory {
     }
 
     fn resolved_source(&self, name: &str) -> Result<Qwen35ResolvedWeightSource, String> {
+        if let Some(module) = name.strip_suffix(".weight_packed") {
+            let weight_scale = format!("{module}.weight_scale");
+            let weight_zero_point = format!("{module}.weight_zero_point");
+            let weight_shape = format!("{module}.weight_shape");
+            let missing = [&weight_scale, &weight_zero_point, &weight_shape]
+                .into_iter()
+                .filter(|sidecar| !self.contains(sidecar))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                return Err(format!(
+                    "incomplete compressed-tensors source bundle for {name:?}; missing {}",
+                    missing.join(", ")
+                ));
+            }
+            return Ok(Qwen35ResolvedWeightSource::CompressedTensors {
+                weight_packed: name.to_owned(),
+                weight_scale,
+                weight_zero_point,
+                weight_shape,
+            });
+        }
         let Some(module) = name.strip_suffix(".qweight") else {
             return Ok(Qwen35ResolvedWeightSource::Dense {
                 values: name.to_owned(),
@@ -767,6 +806,7 @@ fn linear_module_name(tensor_name: &str) -> String {
     tensor_name
         .strip_suffix(".weight")
         .or_else(|| tensor_name.strip_suffix(".qweight"))
+        .or_else(|| tensor_name.strip_suffix(".weight_packed"))
         .unwrap_or(tensor_name)
         .to_string()
 }

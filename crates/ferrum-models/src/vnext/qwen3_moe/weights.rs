@@ -444,6 +444,7 @@ fn append_gptq_stack(
             packed_dimensions,
             scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
             zero_points: None,
+            zero_point_packed_dimensions: None,
             axis_indices: None,
             permutation: None,
             codebook: None,

@@ -1814,3 +1814,23 @@ extern "C" __global__ void gated_rms_norm_f16_z_f32_weight(
     const float eps) {
   gated_rms_norm_impl<__half, float>(core, z, weight, out, rows, dim, eps);
 }
+
+// Stitch one planar projection `[rows, source_width]` into a contiguous
+// feature slice of `[rows, destination_width]`. Compressed-tensors mixed
+// projections use this after independent Marlin/dense GEMMs.
+extern "C" __global__ void projection_stitch_f16(
+    const __half* __restrict__ source,
+    __half* __restrict__ destination,
+    const int rows,
+    const int source_width,
+    const int destination_width,
+    const int destination_offset) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = rows * source_width;
+  if (index < total) {
+    const int row = index / source_width;
+    const int column = index % source_width;
+    destination[row * destination_width + destination_offset + column] =
+        source[index];
+  }
+}
