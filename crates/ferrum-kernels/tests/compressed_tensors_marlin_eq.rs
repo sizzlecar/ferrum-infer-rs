@@ -150,7 +150,7 @@ fn cpu_reference(fixture: Fixture, host: &HostFixture) -> Vec<f16> {
     output
 }
 
-fn run_fixture(context: &CudaContext, fixture: Fixture) -> (f64, usize) {
+fn run_fixture(context: &std::sync::Arc<CudaContext>, fixture: Fixture) -> (f64, usize) {
     let stream = context.default_stream();
     let host = build_host_fixture(fixture);
     let reference = cpu_reference(fixture, &host);
