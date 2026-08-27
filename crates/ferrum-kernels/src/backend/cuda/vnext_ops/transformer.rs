@@ -50,8 +50,7 @@ use crate::marlin_fp8_materializer::{
 #[cfg(feature = "vllm-marlin")]
 use moe_weights::{
     resolve_compressed_tensors_marlin_layout, resolve_compressed_tensors_marlin_matrix_weight,
-    COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
-    COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID, COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
 };
 
 mod attention;
