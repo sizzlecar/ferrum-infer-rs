@@ -74,31 +74,21 @@ commands without downloading the model or starting an inference engine.
 - v0.8 covers language-model inference only. Release scope: Qwen3.5 4B, Qwen3.5 35B-A3B,
   Qwen3 30B-A3B, and Llama 3.1 8B dense. [Support matrix](docs/release/runtime-vnext/0.8.0/SUPPORT_MATRIX.md).
 
-The post-v0.8 CUDA source tree also contains a narrowly qualified text-only
-adoption path for
-`cyankiwi/Qwen3.8-27B-AWQ-INT4@63768c10df38c0395e12ef49edac1bd539eaeeea`:
-`compressed-tensors` pack-quantized W4, group size 32, asymmetric zero point,
-on exactly one sm89 RTX 4090. Its qualification covers `ferrum run`,
-`ferrum serve`, streaming usage, required tools, strict JSON schema, and one
-c=1 three-request usability check. It is not a v0.8 release-asset, Metal,
-multimodal, or general compressed-tensors support claim; see the
-[model-adoption goal](docs/goals/model-adoption-2026-08-26/GOAL.md) for the
-exact evidence boundary.
-
 ## Performance Snapshot
 
-Latest R2 development `ferrum serve` checkpoint. Metal uses random 64-token
-input / 128-token output; CUDA uses 256 / 128. Values are mean tok/s with the
-95% confidence-interval half-width across three repeats.
+Latest R2 development `ferrum serve` checkpoint. The first three rows use
+64-token input / 128-token output on Metal and 256 / 128 on CUDA. Values are
+mean tok/s with the 95% confidence-interval half-width across three repeats.
 
 | Model | M1 Max 32 GB Metal | RTX 4090 CUDA |
 |---|---:|---:|
 | Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |
 | Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |
 | Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |
+| [Qwen3.8 27B AWQ INT4](docs/goals/model-adoption-2026-08-26/GOAL.md) |  | c=1 · 35.15 (3 × 32/32) |
 
-`c` is active server concurrency. Every row completed 100 requests × 3 repeats
-with zero errors. [Measurement details](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md).
+`c` is active server concurrency. The first three rows completed 100 requests ×
+3 repeats with zero errors. [Measurement details](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md).
 
 ## OpenAI-Compatible API
 
@@ -144,10 +134,10 @@ Install from crates.io:
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.0 --locked --features metal
+cargo install ferrum-cli --version 0.8.1 --locked --features metal
 
 # NVIDIA CUDA
-cargo install ferrum-cli --version 0.8.0 --locked \
+cargo install ferrum-cli --version 0.8.1 --locked \
   --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 ```
 

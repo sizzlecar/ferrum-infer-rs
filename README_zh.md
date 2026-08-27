@@ -71,17 +71,18 @@ curl http://localhost:8000/v1/chat/completions \
 
 ## 性能快照
 
-最新 R2 development `ferrum serve` 测量。Metal 使用随机 64-token 输入、128-token
-输出，CUDA 使用 256 / 128。数值为 3 次 repeat 的平均 tok/s，`±` 为 95%
-置信区间半宽。
+最新 R2 development `ferrum serve` 测量。前三行在 Metal 使用随机 64-token 输入、
+128-token 输出，在 CUDA 使用 256 / 128。数值为 3 次 repeat 的平均 tok/s，`±` 为
+95% 置信区间半宽。
 
 | 模型 | M1 Max 32 GB Metal | RTX 4090 CUDA |
 |---|---:|---:|
 | Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |
 | Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |
 | Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |
+| [Qwen3.8 27B AWQ INT4](docs/goals/model-adoption-2026-08-26/GOAL.md) |  | c=1 · 35.15（3 × 32/32） |
 
-`c` 为服务端实际活跃并发。每行均完成 100 请求 × 3 repeats，错误数为零。
+`c` 为服务端实际活跃并发。前三行均完成 100 请求 × 3 repeats，错误数为零。
 [测量详情](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md)。
 
 ## OpenAI 兼容 API
@@ -127,10 +128,10 @@ curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/fe
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.0 --locked --features metal
+cargo install ferrum-cli --version 0.8.1 --locked --features metal
 
 # NVIDIA CUDA
-cargo install ferrum-cli --version 0.8.0 --locked \
+cargo install ferrum-cli --version 0.8.1 --locked \
   --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 ```
 
