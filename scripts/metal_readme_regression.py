@@ -73,6 +73,7 @@ CASES = (
             Cell(concurrency=16, prompts=32, baseline_tps=80.9),
         ),
         default_min_max_seqs=16,
+        source="llama3.1:8b-q4_k_m",
         serve_args=("--greedy-argmax",),
     ),
     ModelCase(
@@ -862,6 +863,7 @@ def run_quality_cell(
             "model": case.label,
             "temperature": 0,
             "max_tokens": 96,
+            "chat_template_kwargs": {"enable_thinking": False},
             "messages": [
                 {
                     "role": "user",
