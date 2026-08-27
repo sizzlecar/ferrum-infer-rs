@@ -2859,9 +2859,11 @@ fn family_compressed_tensors_tensor(
         safetensors::Dtype::I64 => FamilyCompressedTensorsDtype::I64,
         safetensors::Dtype::F16 => FamilyCompressedTensorsDtype::F16,
         safetensors::Dtype::BF16 => FamilyCompressedTensorsDtype::Bf16,
-        other => return Err(format!(
+        other => {
+            return Err(format!(
             "resolved compressed-tensors tensor {external_name:?} has unsupported dtype {other:?}"
-        )),
+        ))
+        }
     };
     Ok(FamilyCompressedTensorsTensor {
         external_name: external_name.to_owned(),
@@ -3788,6 +3790,81 @@ mod tests {
     };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+
+    const QWEN38_AWQ_INT4_CONFIG: &[u8] =
+        include_bytes!("../../tests/fixtures/qwen38_awq_int4_config.contract.json");
+
+    #[test]
+    fn accepts_fixed_qwen38_compressed_tensors_contract_fixture() {
+        let text = preflight_semantic_config(QWEN38_AWQ_INT4_CONFIG).unwrap();
+        assert_eq!(text.top_level_model_type.as_deref(), Some("qwen3_5"));
+        assert_eq!(text.text_model_type, "qwen3_5_text");
+        assert_eq!(text.hidden_size, 5120);
+        assert_eq!(text.num_hidden_layers, 64);
+        assert_eq!(text.linear_attention_layers(), 48);
+        assert_eq!(text.full_attention_layers(), 16);
+        assert_eq!(text.linear_attention.num_key_heads, 16);
+        assert_eq!(text.linear_attention.num_value_heads, 48);
+        assert_eq!(text.linear_attention.key_head_dim, 128);
+        assert_eq!(text.linear_attention.value_head_dim, 128);
+        assert_eq!(text.head_dim, 256);
+        assert_eq!(text.num_attention_heads, 24);
+        assert_eq!(text.num_key_value_heads, 4);
+        assert!(text.attn_output_gate);
+        assert!(!text.tie_word_embeddings);
+        assert_eq!(text.dense_intermediate_size, Some(17408));
+        assert_eq!(text.rope_parameters.rope_theta, 10_000_000.0);
+        assert_eq!(text.rope_parameters.partial_rotary_factor, 0.25);
+        assert!(text.rope_parameters.mrope_interleaved);
+        assert_eq!(text.rope_parameters.mrope_section, Some(vec![11, 11, 10]));
+
+        let quantization = text.quantization.as_ref().unwrap();
+        assert_eq!(quantization.quant_method, "compressed-tensors");
+        assert_eq!(quantization.format.as_deref(), Some("pack-quantized"));
+        assert_eq!(quantization.bits, 4);
+        assert_eq!(quantization.group_size, 32);
+        assert!(!quantization.sym);
+        assert!(!quantization.desc_act);
+        assert_eq!(quantization.weight_type.as_deref(), Some("int"));
+        assert_eq!(quantization.strategy.as_deref(), Some("group"));
+        assert_eq!(quantization.dynamic, Some(false));
+        assert_eq!(quantization.targets, ["Linear"]);
+        assert!(!quantization.input_activations);
+        assert!(!quantization.output_activations);
+    }
+
+    #[test]
+    fn rejects_three_out_of_contract_qwen38_quantization_fixtures_before_runtime() {
+        let fixture: Value = serde_json::from_slice(QWEN38_AWQ_INT4_CONFIG).unwrap();
+        let cases = [
+            (
+                "wrong-bits",
+                "/quantization_config/config_groups/group_0/weights/num_bits",
+                Value::from(8),
+            ),
+            (
+                "wrong-group-size",
+                "/quantization_config/config_groups/group_0/weights/group_size",
+                Value::from(64),
+            ),
+            (
+                "activation-quantization",
+                "/quantization_config/config_groups/group_0/input_activations",
+                serde_json::json!({"num_bits": 8, "type": "int"}),
+            ),
+        ];
+        for (label, pointer, replacement) in cases {
+            let mut candidate = fixture.clone();
+            *candidate.pointer_mut(pointer).unwrap() = replacement;
+            let bytes = serde_json::to_vec(&candidate).unwrap();
+            let error = preflight_semantic_config(&bytes)
+                .expect_err("out-of-contract quantization must fail before runtime allocation");
+            assert!(
+                error.contains("typed compressed-tensors Marlin requires"),
+                "{label}: {error}"
+            );
+        }
+    }
 
     fn source_bundle_with_weight_config(
         semantic_config: &serde_json::Value,

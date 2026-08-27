@@ -403,3 +403,223 @@ fn invalid_component(component: &WeightComponentSpec, reason: impl AsRef<str>) -
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ferrum_interfaces::vnext::{
+        QuantizationFormatId, QuantizationGrouping, QuantizationPacking, WeightId,
+    };
+    use half::bf16;
+    use safetensors::tensor::{serialize_to_file, TensorView};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    const STEM: &str = "model.layers.0.self_attn.q_proj";
+
+    struct Fixture {
+        directory: tempfile::TempDir,
+        packed: Vec<i32>,
+        scales: Vec<bf16>,
+        zero_points: Vec<i32>,
+        n: usize,
+        k: usize,
+        groups: usize,
+    }
+
+    fn write_fixture() -> Fixture {
+        let directory = tempdir().unwrap();
+        let n = 64_usize;
+        let k = 128_usize;
+        let groups = k / 32;
+        let packed = (0..n)
+            .flat_map(|output| {
+                (0..k / 8).map(move |packed_input| {
+                    (0..8).fold(0_u32, |word, lane| {
+                        let input = packed_input * 8 + lane;
+                        let value = ((output * 3 + input * 5 + 1) % 16) as u32;
+                        word | (value << (lane * 4))
+                    }) as i32
+                })
+            })
+            .collect::<Vec<_>>();
+        let scales = (0..n)
+            .flat_map(|output| {
+                (0..groups).map(move |group| {
+                    bf16::from_f32(0.015625 * (1 + (output + group * 7) % 11) as f32)
+                })
+            })
+            .collect::<Vec<_>>();
+        let zero_points = (0..n / 8)
+            .flat_map(|packed_output| {
+                (0..groups).map(move |group| {
+                    (0..8).fold(0_u32, |word, lane| {
+                        let output = packed_output * 8 + lane;
+                        let value = ((output + group * 3 + 2) % 15) as u32;
+                        word | (value << (lane * 4))
+                    }) as i32
+                })
+            })
+            .collect::<Vec<_>>();
+        let packed_bytes = packed
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let scale_bytes = scales
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let zero_point_bytes = zero_points
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let shape_bytes = [n as i64, k as i64]
+            .into_iter()
+            .flat_map(i64::to_le_bytes)
+            .collect::<Vec<_>>();
+        let views = BTreeMap::from([
+            (
+                format!("{STEM}.weight_packed"),
+                TensorView::new(Dtype::I32, vec![n, k / 8], &packed_bytes).unwrap(),
+            ),
+            (
+                format!("{STEM}.weight_scale"),
+                TensorView::new(Dtype::BF16, vec![n, groups], &scale_bytes).unwrap(),
+            ),
+            (
+                format!("{STEM}.weight_shape"),
+                TensorView::new(Dtype::I64, vec![2], &shape_bytes).unwrap(),
+            ),
+            (
+                format!("{STEM}.weight_zero_point"),
+                TensorView::new(Dtype::I32, vec![n / 8, groups], &zero_point_bytes).unwrap(),
+            ),
+        ]);
+        serialize_to_file(views, &None, &directory.path().join("model.safetensors")).unwrap();
+        Fixture {
+            directory,
+            packed,
+            scales,
+            zero_points,
+            n,
+            k,
+            groups,
+        }
+    }
+
+    fn quantization() -> QuantizationSpec {
+        QuantizationSpec {
+            format_id: QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID).unwrap(),
+            bits_per_weight: 4,
+            grouping: QuantizationGrouping::fixed(32),
+            packing: QuantizationPacking::Tiled,
+            scale_type: ElementType::F16,
+            zero_point_type: Some(ElementType::I32),
+        }
+    }
+
+    #[test]
+    fn repacks_all_compressed_tensors_sidecars_at_the_source_boundary() {
+        let fixture = write_fixture();
+        let source =
+            CompressedTensorsMarlinSafetensorsSource::open(fixture.directory.path()).unwrap();
+        let packed_component = WeightComponentSpec {
+            id: WeightId::new("component.q.packed").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec![
+                format!("{STEM}.weight_packed"),
+                format!("{STEM}.weight_shape"),
+            ],
+            dimensions: vec![1, fixture.n as u64, (fixture.k / 2) as u64],
+            encoding: WeightEncoding::Quantized(quantization()),
+            required: true,
+        };
+        let packed_payload = source.component(&packed_component).unwrap();
+        let mut gptq_words = vec![0_i32; fixture.packed.len()];
+        for output in 0..fixture.n {
+            for packed_input in 0..fixture.k / 8 {
+                gptq_words[packed_input * fixture.n + output] =
+                    fixture.packed[output * (fixture.k / 8) + packed_input];
+            }
+        }
+        let mut expected_packed = vec![0_u8; fixture.n * fixture.k / 2];
+        repack_gptq_to_marlin_bytes_into(&gptq_words, fixture.k, fixture.n, &mut expected_packed);
+        assert_eq!(packed_payload.bytes(), expected_packed);
+        assert_eq!(packed_payload.dimensions(), packed_component.dimensions);
+
+        let scales_component = WeightComponentSpec {
+            id: WeightId::new("component.q.scales").unwrap(),
+            role: WeightComponentRole::Scales,
+            external_names: vec![format!("{STEM}.weight_scale")],
+            dimensions: vec![1, fixture.n as u64, fixture.groups as u64],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+            required: true,
+        };
+        let scales_payload = source.component(&scales_component).unwrap();
+        let mut group_major = vec![f16::ZERO; fixture.scales.len()];
+        for output in 0..fixture.n {
+            for group in 0..fixture.groups {
+                group_major[group * fixture.n + output] =
+                    f16::from_f32(fixture.scales[output * fixture.groups + group].to_f32());
+            }
+        }
+        let expected_scales = encode_f16(repack_scales_to_marlin(
+            &group_major,
+            fixture.groups,
+            fixture.n,
+            1,
+        ));
+        assert_eq!(scales_payload.bytes(), expected_scales.as_ref());
+
+        let zero_points_component = WeightComponentSpec {
+            id: WeightId::new("component.q.zero_points").unwrap(),
+            role: WeightComponentRole::ZeroPoints,
+            external_names: vec![format!("{STEM}.weight_zero_point")],
+            dimensions: vec![1, fixture.groups as u64, (fixture.n / 8) as u64],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::I32,
+            },
+            required: true,
+        };
+        let zero_points_payload = source.component(&zero_points_component).unwrap();
+        let expected_zero_points = repack_compressed_tensors_zero_points_to_marlin(
+            &fixture.zero_points,
+            fixture.groups,
+            fixture.n,
+        )
+        .into_iter()
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+        assert_eq!(zero_points_payload.bytes(), expected_zero_points);
+    }
+
+    #[test]
+    fn rejects_shape_metadata_that_disagrees_with_the_packed_header() {
+        let fixture = write_fixture();
+        let source =
+            CompressedTensorsMarlinSafetensorsSource::open(fixture.directory.path()).unwrap();
+        let component = WeightComponentSpec {
+            id: WeightId::new("component.q.packed").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec![
+                format!("{STEM}.weight_packed"),
+                format!("{STEM}.weight_shape"),
+            ],
+            dimensions: vec![fixture.n as u64, (fixture.k / 2 + 1) as u64],
+            encoding: WeightEncoding::Quantized(quantization()),
+            required: true,
+        };
+        let error = match source.component(&component) {
+            Ok(_) => panic!("mismatched typed packed dimensions must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("packed component shape"),
+            "{error}"
+        );
+    }
+}

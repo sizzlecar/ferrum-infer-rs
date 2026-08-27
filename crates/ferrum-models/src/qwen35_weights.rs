@@ -628,11 +628,11 @@ impl Qwen35WeightInventory {
         let weight_scale = format!("{module}.weight_scale");
         let weight_zero_point = format!("{module}.weight_zero_point");
         let weight_shape = format!("{module}.weight_shape");
-        (self.contains(&weight_packed)
-            && self.contains(&weight_scale)
-            && self.contains(&weight_zero_point)
-            && self.contains(&weight_shape))
-        .then_some(weight_packed)
+        // Preserve an observed primary sidecar even when its bundle is
+        // incomplete. `resolved_source` can then report the exact missing
+        // compressed-tensors tensor instead of degrading to a generic
+        // missing dense-weight error.
+        self.contains(&weight_packed).then_some(weight_packed)
     }
 
     fn resolve_weight_specs(
@@ -1212,6 +1212,85 @@ mod tests {
             .expect_err("incomplete GPTQ q_proj alias must not satisfy manifest");
 
         assert!(err.contains("self_attn.q_proj.weight"), "{err}");
+    }
+
+    #[test]
+    fn resolves_complete_compressed_tensors_linear_alias() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let dense = "model.layers.3.self_attn.q_proj.weight";
+        let stem = dense.strip_suffix(".weight").unwrap();
+        names.retain(|name| name != dense);
+        names.extend([
+            format!("{stem}.weight_packed"),
+            format!("{stem}.weight_scale"),
+            format!("{stem}.weight_zero_point"),
+            format!("{stem}.weight_shape"),
+        ]);
+
+        let plan = Qwen35WeightInventory::from_names(names)
+            .detect_prefix_and_resolve(&config)
+            .unwrap();
+        let source = &plan.layer_tensor(3, "self_attn_q").unwrap().source;
+        assert!(matches!(
+            source,
+            Some(Qwen35ResolvedWeightSource::CompressedTensors {
+                weight_packed,
+                weight_scale,
+                weight_zero_point,
+                weight_shape,
+            }) if weight_packed == &format!("{stem}.weight_packed")
+                && weight_scale == &format!("{stem}.weight_scale")
+                && weight_zero_point == &format!("{stem}.weight_zero_point")
+                && weight_shape == &format!("{stem}.weight_shape")
+        ));
+    }
+
+    #[test]
+    fn rejects_incomplete_compressed_tensors_bundle_with_exact_missing_sidecar() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let dense = "model.layers.3.self_attn.q_proj.weight";
+        let stem = dense.strip_suffix(".weight").unwrap();
+        names.retain(|name| name != dense);
+        names.extend([
+            format!("{stem}.weight_packed"),
+            format!("{stem}.weight_scale"),
+            format!("{stem}.weight_zero_point"),
+        ]);
+
+        let error = Qwen35WeightInventory::from_names(names)
+            .detect_prefix_and_resolve(&config)
+            .expect_err("missing weight_shape must fail before weight allocation");
+        assert!(
+            error.contains("incomplete compressed-tensors source bundle"),
+            "{error}"
+        );
+        assert!(error.contains("weight_shape"), "{error}");
     }
 
     #[test]
