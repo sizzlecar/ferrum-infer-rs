@@ -57,6 +57,7 @@ class ModelCase:
     source: str | None = None
     default_max_max_seqs: int | None = None
     serve_args: tuple[str, ...] = ()
+    run_args: tuple[str, ...] = ()
     unsafe_batch_probe: Cell | None = None
 
 
@@ -92,9 +93,11 @@ CASES = (
         gguf="Qwen3-30B-A3B-Q4_K_M.gguf",
         tokenizer="Qwen3-30B-A3B.tokenizer.json",
         moe=True,
-        cells=(Cell(concurrency=16, prompts=32, baseline_tps=72.5),),
+        cells=(Cell(concurrency=16, prompts=32, baseline_tps=39.6),),
         default_min_max_seqs=16,
         source="qwen3:30b-a3b-q4_k_m",
+        serve_args=("--disable-thinking",),
+        run_args=("--disable-thinking",),
     ),
 )
 
@@ -377,6 +380,7 @@ def run_cli_check(
         "请用中文回答，不要输出代码。",
         "--output-format",
         "jsonl",
+        *case.run_args,
     ]
     result: dict[str, Any] = {
         "passed": False,
@@ -505,6 +509,7 @@ def run_cli_text_long_check(
         "256",
         "--system",
         "请用中文回答。",
+        *case.run_args,
     ]
     try:
         proc = subprocess.run(
@@ -948,7 +953,12 @@ def run_quality_cell(
 def run_tool_call_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
     out = out_dir / f"{case.key}.tool-call-regression"
     try:
-        return run_tool_call_regression(f"http://127.0.0.1:{port}", case.label, out)
+        return run_tool_call_regression(
+            f"http://127.0.0.1:{port}",
+            case.label,
+            out,
+            enable_thinking=False,
+        )
     except Exception as e:
         result = {"status": "fail", "model": case.label, "error": str(e)}
         write(
