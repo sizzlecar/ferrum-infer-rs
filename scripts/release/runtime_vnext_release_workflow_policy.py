@@ -18,9 +18,9 @@ from typing import Any, Iterable
 PASS_PREFIX = "FERRUM RELEASE WORKFLOW POLICY PASS"
 SELFTEST_PASS_LINE = "FERRUM RELEASE WORKFLOW POLICY SELFTEST PASS"
 PREPROMOTION_READY_PREFIX = "FERRUM PREPROMOTION MANIFEST CONSUMPTION READY"
-STAGING_VERSION = "0.8.2"
-STAGING_RC_TAG = "v0.8.2-rc.1"
-STAGING_LABEL = "v0.8.2-rc"
+STAGING_VERSION = "0.8.3"
+STAGING_RC_TAG = "v0.8.3-rc.1"
+STAGING_LABEL = "v0.8.3-rc"
 EXPECTED_VERSION = "0.8.0"
 EXPECTED_TAG = "v0.8.0"
 EXPECTED_RC_TAG = "v0.8.0-rc.1"
@@ -336,23 +336,23 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
         "release-cuda.yml must not restore target/ across CUDA/native-set identities",
     )
     cache_prefix = (
-        "stage-v0.8.2-linux-x86_64-cuda-sm89-"
-        "cuda12.4-native-b450d931-cargo-"
+        "stage-v0.8.3-linux-x86_64-cuda-sm89-"
+        "cuda12.4-native-765f845a-cargo-"
     )
     require(
         cache_with.get("key")
         == cache_prefix + "${{ hashFiles('**/Cargo.lock') }}"
         and cache_with.get("restore-keys") == cache_prefix,
-        "release-cuda.yml cache key must bind CUDA 12.4 and native set b450d931",
+        "release-cuda.yml cache key must bind CUDA 12.4 and native set 765f845a",
     )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_URL")
-        == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v1/native-operator-set-cuda12.4-sm89-v1.tar.zst",
+        == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v2/native-operator-set-cuda12.4-sm89-v2.tar.zst",
         "release-cuda.yml native operator set URL is not frozen",
     )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_SHA256")
-        == "b450d93182112a57cb96e9a1dd14ec147c7fd549dc4bd3ed9648bfc67e17eb37",
+        == "765f845ae20c305edc10b31650339f8a2782e9e56687c8bda3f8e843a50c636b",
         "release-cuda.yml native operator set SHA256 is not frozen",
     )
     scripts = "\n".join(
@@ -845,8 +845,8 @@ def run_selftest(texts: dict[str, str]) -> None:
     cuda_cache_mismatch = dict(texts)
     cuda_cache_mismatch["release-cuda.yml"] = _replace_once(
         cuda_cache_mismatch["release-cuda.yml"],
-        "cuda12.4-native-b450d931-cargo-${{ hashFiles('**/Cargo.lock') }}",
-        "cuda12.6-native-b450d931-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda12.4-native-765f845a-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda12.6-native-765f845a-cargo-${{ hashFiles('**/Cargo.lock') }}",
         "cuda-cache-toolchain-mismatch",
     )
     _expect_policy_failure(
