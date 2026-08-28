@@ -54,6 +54,8 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{debug, error, info, span, warn, Level};
 use uuid::Uuid;
 
+mod responses;
+
 const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
 const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 4096;
@@ -321,6 +323,7 @@ impl AxumServer {
         Router::new()
             // OpenAI API routes
             .route("/v1/chat/completions", post(chat_completions_handler))
+            .route("/v1/responses", post(responses::responses_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/embeddings", post(embeddings_handler))
             .route("/v1/audio/transcriptions", post(transcriptions_handler))
@@ -6579,6 +6582,204 @@ mod tests {
             obj.insert(k.clone(), v.clone());
         }
         serde_json::from_value(value).expect("chat request")
+    }
+
+    #[tokio::test]
+    async fn responses_route_returns_sync_text_and_usage() {
+        let response = post_json(
+            router_with_stub("hello from ferrum"),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "hello",
+                "store": false
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["content"][0]["text"], "hello from ferrum");
+        assert_eq!(body["usage"]["input_tokens"], 7);
+        assert_eq!(body["usage"]["output_tokens"], 2);
+        assert_eq!(body["usage"]["total_tokens"], 9);
+    }
+
+    #[tokio::test]
+    async fn responses_route_streams_ordered_text_events_once() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&["he", "llo"]),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": [{"role": "user", "content": "say hello"}],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        for event in [
+            "response.created",
+            "response.output_item.added",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.output_item.done",
+            "response.completed",
+        ] {
+            assert!(
+                body.contains(&format!("event: {event}")),
+                "missing {event}: {body}"
+            );
+        }
+        assert_eq!(
+            body.matches("event: response.completed").count(),
+            1,
+            "completed must be emitted exactly once: {body}"
+        );
+        assert!(
+            body.contains("\"delta\":\"he\""),
+            "missing first delta: {body}"
+        );
+        assert!(
+            body.contains("\"delta\":\"llo\""),
+            "missing second delta: {body}"
+        );
+        assert!(body.contains("\"input_tokens\":5"), "missing usage: {body}");
+        assert!(
+            !body.contains("[DONE]"),
+            "Responses streams do not use chat DONE: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_route_supports_stateless_function_round_trip() {
+        let tool = json!({
+            "type": "function",
+            "name": "weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+            }
+        });
+        let first = post_json(
+            router_with_stub_api_response("", weather_tool_api_response()),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "Use the weather tool",
+                "tools": [tool.clone()],
+                "tool_choice": "auto"
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), AxumStatusCode::OK);
+        let first_body = response_json(first).await;
+        let call = first_body["output"][0].clone();
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["call_id"], "call_1");
+        assert_eq!(call["name"], "weather");
+        assert_eq!(call["arguments"], "{\"city\":\"Paris\"}");
+
+        let second = post_json(
+            router_with_stub("weather received"),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": [
+                    {"role": "user", "content": "Use the weather tool"},
+                    call,
+                    {"type": "function_call_output", "call_id": "call_1", "output": "sunny"}
+                ],
+                "tools": [tool]
+            }),
+        )
+        .await;
+        assert_eq!(second.status(), AxumStatusCode::OK);
+        let second_body = response_json(second).await;
+        assert_eq!(
+            second_body["output"][0]["content"][0]["text"],
+            "weather received"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_route_streams_function_call_events() {
+        let response = post_json(
+            router_with_stub_api_response("", weather_tool_api_response()),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "Use the weather tool",
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "name": "weather",
+                    "parameters": {"type": "object"}
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("event: response.function_call_arguments.delta"),
+            "missing function delta: {body}"
+        );
+        assert!(
+            body.contains("event: response.function_call_arguments.done"),
+            "missing function done: {body}"
+        );
+        assert!(
+            body.contains("\"call_id\":\"call_1\""),
+            "missing call id: {body}"
+        );
+        assert_eq!(body.matches("event: response.completed").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn responses_route_rejects_state_and_non_function_tools() {
+        for (extra, param) in [
+            (json!({"store": true}), "store"),
+            (
+                json!({"previous_response_id": "resp_previous"}),
+                "previous_response_id",
+            ),
+            (
+                json!({"tools": [{"type": "mcp", "server_label": "docs"}]}),
+                "tools[0].type",
+            ),
+        ] {
+            let mut body = json!({"model": "stub-model", "input": "hello"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let response = post_json(router_with_stub("unused"), "/v1/responses", body).await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+            let error = response_json(response).await;
+            assert_eq!(error["error"]["param"], param, "error: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn responses_mvp_keeps_chat_completions_route_working() {
+        let response = post_json(
+            router_with_stub("chat still works"),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["message"]["content"], "chat still works");
     }
 
     #[test]
