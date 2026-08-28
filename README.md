@@ -67,7 +67,8 @@ commands without downloading the model or starting an inference engine.
 ## Features
 
 - `ferrum run` and `ferrum serve` in one Rust binary.
-- OpenAI-compatible chat completions, streaming, tools, and structured output.
+- OpenAI-compatible Chat Completions and stateless Responses APIs, streaming,
+  tools, and structured output.
 - Apple Silicon Metal and NVIDIA CUDA from the same runtime.
 - Continuous batching, paged KV cache, prefix cache, and typed admission control.
 - GGUF on Metal and GPTQ/safetensors on CUDA.
@@ -95,6 +96,7 @@ mean tok/s with the 95% confidence-interval half-width across three repeats.
 Ferrum supports:
 
 - chat completions and streaming usage
+- stateless Responses text, streaming, usage, and function tools
 - function tools with `auto`, `none`, `required`, or a named function
 - `json_object` and strict `json_schema` structured output
 - multi-turn sessions, prefix cache, and session cache
@@ -134,10 +136,10 @@ Install from crates.io:
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.1 --locked --features metal
+cargo install ferrum-cli --version 0.8.2 --locked --features metal
 
 # NVIDIA CUDA
-cargo install ferrum-cli --version 0.8.1 --locked \
+cargo install ferrum-cli --version 0.8.2 --locked \
   --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 ```
 

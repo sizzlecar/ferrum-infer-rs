@@ -18,9 +18,9 @@ from typing import Any, Iterable
 PASS_PREFIX = "FERRUM RELEASE WORKFLOW POLICY PASS"
 SELFTEST_PASS_LINE = "FERRUM RELEASE WORKFLOW POLICY SELFTEST PASS"
 PREPROMOTION_READY_PREFIX = "FERRUM PREPROMOTION MANIFEST CONSUMPTION READY"
-STAGING_VERSION = "0.8.1"
-STAGING_RC_TAG = "v0.8.1-rc.1"
-STAGING_LABEL = "v0.8.1-rc"
+STAGING_VERSION = "0.8.2"
+STAGING_RC_TAG = "v0.8.2-rc.1"
+STAGING_LABEL = "v0.8.2-rc"
 EXPECTED_VERSION = "0.8.0"
 EXPECTED_TAG = "v0.8.0"
 EXPECTED_RC_TAG = "v0.8.0-rc.1"
@@ -336,7 +336,7 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
         "release-cuda.yml must not restore target/ across CUDA/native-set identities",
     )
     cache_prefix = (
-        "stage-v0.8.1-linux-x86_64-cuda-sm89-"
+        "stage-v0.8.2-linux-x86_64-cuda-sm89-"
         "cuda12.4-native-b450d931-cargo-"
     )
     require(
