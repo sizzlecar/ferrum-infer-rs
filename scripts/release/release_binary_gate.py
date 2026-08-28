@@ -121,7 +121,7 @@ def cli_gate(bin_path: Path, model: str, out: Path) -> dict:
         "/bye",
         "",
     ])
-    p = run([str(bin_path), "run", model], input=text, timeout=180)
+    p = run([str(bin_path), "run", model, "--disable-thinking"], input=text, timeout=180)
     (out / "cli.stdout").write_text(p.stdout, errors="replace")
     (out / "cli.stderr").write_text(p.stderr, errors="replace")
     assert_no_bad_patterns("cli output", p.stdout + "\n" + p.stderr)
@@ -156,15 +156,35 @@ def wait_health(port: int) -> None:
 def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port: int, api_extra: bool) -> dict:
     log = out / "serve.log"
     with log.open("wb") as f:
-        proc = subprocess.Popen([str(bin_path), "serve", model_path, "--host", "127.0.0.1", "--port", str(port)], stdout=f, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(
+            [
+                str(bin_path),
+                "serve",
+                model_path,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--served-model-name",
+                model_name,
+                "--disable-thinking",
+                "--max-model-len",
+                "4096",
+            ],
+            stdout=f,
+            stderr=subprocess.STDOUT,
+        )
     try:
         wait_health(port)
         common = {"model": model_name, "temperature": 0}
         s1, b1 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "123+456 等于多少？只输出数字"}], "max_tokens": 256})
+        (out / "serve.math.response.json").write_text(b1, errors="replace")
         c1 = json.loads(b1)["choices"][0]["message"].get("content", "") if s1 == 200 else b1
         s2, b2 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "本轮短语是 ferrum-blue。只回答 OK"}, {"role": "assistant", "content": "OK"}, {"role": "user", "content": "第一条用户消息里的 ferrum 开头短语是什么？只输出短语，不要输出 OK"}], "max_tokens": 256})
+        (out / "serve.multiturn.response.json").write_text(b2, errors="replace")
         c2 = json.loads(b2)["choices"][0]["message"].get("content", "") if s2 == 200 else b2
         s3, b3 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "写一个一万字介绍"}], "max_tokens": 10240})
+        (out / "serve.boundary.response.json").write_text(b3, errors="replace")
         assert_no_bad_patterns("serve math response", c1)
         assert_no_bad_patterns("serve multiturn response", c2)
         assert_no_bad_patterns("serve boundary response", b3)
@@ -178,17 +198,20 @@ def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port
         if api_extra:
             schema = {"type": "json_schema", "json_schema": {"name": "Answer", "strict": True, "schema": {"type": "object", "additionalProperties": False, "properties": {"answer": {"type": "integer"}}, "required": ["answer"]}}}
             s4, b4 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "计算 123+456。最终答案必须只用 JSON 对象表示，格式为 {\"answer\":579}，不要 Markdown。"}], "response_format": schema, "max_tokens": 256})
+            (out / "serve.strict-json.response.json").write_text(b4, errors="replace")
             msg = json.loads(b4)["choices"][0]["message"].get("content", "") if s4 == 200 else b4
             assert_no_bad_patterns("serve strict-json response", msg)
             if s4 != 200 or json.loads(msg).get("answer") != 579:
                 raise RuntimeError("strict JSON gate failed")
             tools = [{"type": "function", "function": {"name": "calc", "description": "calculate expression", "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}}]
             s5, b5 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "调用工具 calc 计算 123+456"}], "tools": tools, "tool_choice": {"type": "function", "function": {"name": "calc"}}, "max_tokens": 256})
+            (out / "serve.tool-call.response.json").write_text(b5, errors="replace")
             choice = json.loads(b5)["choices"][0] if s5 == 200 else {}
             assert_no_bad_patterns("serve tool-call response", b5)
             if s5 != 200 or choice.get("finish_reason") != "tool_calls" or "123+456" not in json.dumps(choice, ensure_ascii=False):
                 raise RuntimeError("tool call gate failed")
             s6, b6 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "请用一句话解释 String::from"}], "stream": True, "max_tokens": 256})
+            (out / "serve.stream.response.sse").write_text(b6, errors="replace")
             assert_no_bad_patterns("serve stream response", b6)
             if s6 != 200 or b6.count("data: [DONE]") != 1 or '"content"' not in b6:
                 raise RuntimeError("stream gate failed")
