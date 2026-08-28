@@ -306,14 +306,50 @@ fn compiled_native_operator_bindings_accept_unrelated_catalog_provenance_change(
 }
 
 #[test]
-fn compiled_native_operator_bindings_reject_changed_bound_provider_identity() {
+fn compiled_native_operator_bindings_accept_implementation_provenance_change() {
     let catalog = live_provider_catalog();
     let mut stale_provider = compiled_provider(&catalog);
     stale_provider.operation_bindings[0].provider_implementation_fingerprint = digest('0');
+    validate_compiled_native_operator_provider_catalog(&catalog, &[stale_provider]).unwrap();
+}
+
+#[test]
+fn compiled_native_operator_bindings_accept_compatible_minor_versions() {
+    let mut catalog = live_provider_catalog();
+    let artifact = compiled_provider(&catalog);
+    catalog.providers[0].operation_contract_version.minor += 1;
+    catalog.providers[0].provider_version.minor += 1;
+    validate_compiled_native_operator_provider_catalog(&catalog, &[artifact]).unwrap();
+}
+
+#[test]
+fn compiled_native_operator_bindings_reject_incompatible_versioned_contract() {
+    let catalog = live_provider_catalog();
+
+    let mut stale_operation = compiled_provider(&catalog);
+    stale_operation.operation_bindings[0].operation_contract_version =
+        NativeOperatorContractVersion::new(9, 0);
+    assert!(
+        validate_compiled_native_operator_provider_catalog(&catalog, &[stale_operation])
+            .unwrap_err()
+            .contains("is incompatible with the live versioned contract")
+    );
+
+    let mut stale_provider = compiled_provider(&catalog);
+    stale_provider.operation_bindings[0].provider_version =
+        NativeOperatorContractVersion::new(9, 0);
     assert!(
         validate_compiled_native_operator_provider_catalog(&catalog, &[stale_provider])
             .unwrap_err()
-            .contains("differs from the live provider identity")
+            .contains("is incompatible with the live versioned contract")
+    );
+
+    let mut newer_provider = compiled_provider(&catalog);
+    newer_provider.operation_bindings[0].provider_version.minor += 1;
+    assert!(
+        validate_compiled_native_operator_provider_catalog(&catalog, &[newer_provider])
+            .unwrap_err()
+            .contains("is incompatible with the live versioned contract")
     );
 }
 

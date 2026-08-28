@@ -97,13 +97,13 @@ pub fn validate_compiled_native_operator_provider_catalog(
                         artifact.operator, binding.operation_id, binding.provider_id
                     )
                 })?;
-            if live.operation_contract_version != binding.operation_contract_version
-                || live.provider_version != binding.provider_version
-                || live.provider_implementation_fingerprint
-                    != binding.provider_implementation_fingerprint
+            if !contract_version_satisfies(
+                live.operation_contract_version,
+                binding.operation_contract_version,
+            ) || !contract_version_satisfies(live.provider_version, binding.provider_version)
             {
                 return Err(format!(
-                    "compiled native operator {} binding {}/{} differs from the live provider identity",
+                    "compiled native operator {} binding {}/{} is incompatible with the live versioned contract",
                     artifact.operator, binding.operation_id, binding.provider_id
                 ));
             }
@@ -128,6 +128,13 @@ pub fn validate_compiled_native_operator_provider_catalog(
         );
     }
     Ok(())
+}
+
+fn contract_version_satisfies(
+    available: ferrum_types::NativeOperatorContractVersion,
+    required: ferrum_types::NativeOperatorContractVersion,
+) -> bool {
+    available.major == required.major && available.minor >= required.minor
 }
 
 fn is_lowercase_sha256(value: &str) -> bool {
