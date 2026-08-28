@@ -62,7 +62,8 @@ curl http://localhost:8000/v1/chat/completions \
 ## 功能
 
 - 一个 Rust 二进制同时提供 `ferrum run` 和 `ferrum serve`。
-- 支持 OpenAI 兼容的对话、流式输出、tools 和 structured output。
+- 支持 OpenAI 兼容的 Chat Completions 与无状态 Responses API、流式输出、
+  tools 和 structured output。
 - 同一 runtime 覆盖 Apple Silicon Metal 与 NVIDIA CUDA。
 - 支持 continuous batching、paged KV cache、prefix cache 和 typed admission。
 - Metal 使用 GGUF，CUDA 使用 GPTQ/safetensors。
@@ -90,6 +91,7 @@ curl http://localhost:8000/v1/chat/completions \
 Ferrum 支持：
 
 - chat completions 与 streaming usage
+- 无状态 Responses 文本、流式输出、usage 与 function tools
 - `auto`、`none`、`required` 或指定函数的 function tools
 - `json_object` 与 strict `json_schema` structured output
 - 多轮会话、prefix cache 与 session cache
@@ -128,10 +130,10 @@ curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/fe
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.1 --locked --features metal
+cargo install ferrum-cli --version 0.8.2 --locked --features metal
 
 # NVIDIA CUDA
-cargo install ferrum-cli --version 0.8.1 --locked \
+cargo install ferrum-cli --version 0.8.2 --locked \
   --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 ```
 

@@ -13,6 +13,7 @@ support matrix and are hidden from the default CLI help.
 | Endpoint | Status | Notes |
 |---|---|---|
 | `POST /v1/chat/completions` | Supported | Non-streaming and streaming chat responses. |
+| `POST /v1/responses` | Supported, stateless | Text/message input, non-streaming and streaming text, usage, and caller-owned function-tool loops. |
 | `POST /v1/completions` | Supported | Non-streaming and streaming text completions with a single string `prompt`; prompt arrays/objects are rejected with `param=prompt`. |
 | `GET /v1/models` | Supported | Lists models known to the server. |
 | `POST /v1/embeddings` | Experimental / outside v0.8 release scope | Text and image embedding support depends on a specialized loaded model. |
@@ -59,6 +60,19 @@ support matrix and are hidden from the default CLI help.
 | `tool_choice=required` | Supported | Requires at least one function tool. Ferrum steers generation toward the first declared tool's argument schema and returns OpenAI-shaped `tool_calls`. If no valid tool call can be parsed, non-streaming requests return HTTP 400 with `param=tool_choice`; streaming requests emit an OpenAI-shaped SSE error and `[DONE]` without first leaking invalid content. |
 | legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape, including non-streaming responses and streaming deltas when engine output emits matching function-call JSON. |
 | specific legacy `function_call` | Supported | Named function-call selectors validate against declared legacy functions and constrain generated function-call JSON parsing to the selected function. Undeclared function names return HTTP 400 with `param=function_call`. |
+
+## Stateless Responses API
+
+`POST /v1/responses` reuses the same model, tokenizer, sampling, and function-call
+path as Chat Completions. It accepts string or message input, `instructions`,
+`max_output_tokens`, `temperature`, `top_p`, `stream`, function `tools`, and
+`tool_choice`. Streaming uses typed Responses SSE events and ends with exactly
+one `response.completed` event rather than a chat `[DONE]` sentinel.
+
+Ferrum does not store Response objects. Requests for `store=true`,
+`previous_response_id`, conversations, background execution, built-in tools, or
+remote MCP return HTTP 400 with the failing field in `param`. Function execution
+and resubmission of `function_call_output` remain caller-owned.
 
 ## Structured Output
 
