@@ -136,10 +136,10 @@ Install from crates.io:
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.2 --locked --features metal
+cargo install ferrum-cli --version 0.8.3 --locked --features metal
 
 # NVIDIA CUDA
-cargo install ferrum-cli --version 0.8.2 --locked \
+cargo install ferrum-cli --version 0.8.3 --locked \
   --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 ```
 

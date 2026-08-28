@@ -212,8 +212,8 @@ jobs:
       CUDA_COMPUTE_CAP: "89"
       # Build-time, content-addressed component. The resulting ferrum binary
       # links these operators statically and performs no runtime download.
-      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v1/native-operator-set-cuda12.4-sm89-v1.tar.zst
-      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: b450d93182112a57cb96e9a1dd14ec147c7fd549dc4bd3ed9648bfc67e17eb37
+      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v2/native-operator-set-cuda12.4-sm89-v2.tar.zst
+      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 765f845ae20c305edc10b31650339f8a2782e9e56687c8bda3f8e843a50c636b
     steps:
       - name: Install deps
         run: |
@@ -228,7 +228,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v1.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v2.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
