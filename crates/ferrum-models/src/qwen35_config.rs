@@ -5,6 +5,8 @@
 //! variants add routed experts plus a shared expert. This module keeps that
 //! shape explicit before the product loader/model path is wired.
 
+use std::collections::BTreeSet;
+
 use ferrum_interfaces::{RecurrentStateSpec, RecurrentStateTensorSpec};
 use ferrum_types::{DataType, Device, RequestId};
 use serde_json::Value;
@@ -81,19 +83,103 @@ pub struct Qwen35RopeParameters {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct Qwen35QuantizationConfig {
-    pub quant_method: String,
-    pub format: Option<String>,
+pub enum Qwen35QuantizationConfig {
+    Gptq(Qwen35GptqQuantizationRecipe),
+    CompressedTensors(Qwen35CompressedTensorsQuantizationRecipe),
+    Fp8(Qwen35Fp8QuantizationRecipe),
+}
+
+impl Qwen35QuantizationConfig {
+    pub const fn quant_method(&self) -> &'static str {
+        match self {
+            Self::Gptq(_) => "gptq",
+            Self::CompressedTensors(_) => "compressed-tensors",
+            Self::Fp8(_) => "fp8",
+        }
+    }
+
+    pub const fn as_gptq(&self) -> Option<&Qwen35GptqQuantizationRecipe> {
+        match self {
+            Self::Gptq(recipe) => Some(recipe),
+            Self::CompressedTensors(_) | Self::Fp8(_) => None,
+        }
+    }
+
+    pub const fn as_compressed_tensors(
+        &self,
+    ) -> Option<&Qwen35CompressedTensorsQuantizationRecipe> {
+        match self {
+            Self::CompressedTensors(recipe) => Some(recipe),
+            Self::Gptq(_) | Self::Fp8(_) => None,
+        }
+    }
+
+    pub const fn as_fp8(&self) -> Option<&Qwen35Fp8QuantizationRecipe> {
+        match self {
+            Self::Fp8(recipe) => Some(recipe),
+            Self::Gptq(_) | Self::CompressedTensors(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35GptqQuantizationRecipe {
     pub bits: usize,
     pub group_size: usize,
     pub desc_act: bool,
     pub sym: bool,
-    pub weight_type: Option<String>,
-    pub strategy: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35CompressedTensorsQuantizationRecipe {
+    pub format: String,
+    pub bits: usize,
+    pub group_size: usize,
+    pub desc_act: bool,
+    pub sym: bool,
+    pub weight_type: String,
+    pub strategy: String,
     pub dynamic: Option<bool>,
     pub targets: Vec<String>,
     pub input_activations: bool,
     pub output_activations: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Qwen35Fp8Format {
+    E4m3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Qwen35Fp8ActivationScheme {
+    Dynamic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35Fp8WeightBlockSize {
+    pub output_features: usize,
+    pub input_features: usize,
+}
+
+impl Qwen35Fp8WeightBlockSize {
+    pub const OFFICIAL_128X128: Self = Self {
+        output_features: 128,
+        input_features: 128,
+    };
+
+    pub const fn as_array(self) -> [usize; 2] {
+        [self.output_features, self.input_features]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35Fp8QuantizationRecipe {
+    pub format: Qwen35Fp8Format,
+    pub activation_scheme: Qwen35Fp8ActivationScheme,
+    pub weight_block_size: Qwen35Fp8WeightBlockSize,
+    pub modules_to_not_convert: Vec<String>,
 }
 
 /// Physical storage dtypes for the two independent Qwen3.5 recurrent-state
@@ -736,23 +822,16 @@ fn parse_quantization_config(
         .ok_or_else(|| "quantization_config must be an object when present".to_string())?;
     let quant_method = required_string(quant, "quant_method")?;
     match quant_method.as_str() {
-        "gptq" => Ok(Some(Qwen35QuantizationConfig {
-            quant_method,
-            format: None,
-            bits: required_usize(quant, "bits")?,
-            group_size: required_usize(quant, "group_size")?,
-            desc_act: optional_bool(quant, "desc_act")?.unwrap_or(false),
-            sym: optional_bool(quant, "sym")?.unwrap_or(false),
-            weight_type: None,
-            strategy: None,
-            dynamic: None,
-            targets: Vec::new(),
-            input_activations: false,
-            output_activations: false,
-        })),
-        "compressed-tensors" => {
-            parse_compressed_tensors_quantization(quant, quant_method).map(Some)
-        }
+        "gptq" => Ok(Some(Qwen35QuantizationConfig::Gptq(
+            Qwen35GptqQuantizationRecipe {
+                bits: required_usize(quant, "bits")?,
+                group_size: required_usize(quant, "group_size")?,
+                desc_act: optional_bool(quant, "desc_act")?.unwrap_or(false),
+                sym: optional_bool(quant, "sym")?.unwrap_or(false),
+            },
+        ))),
+        "compressed-tensors" => parse_compressed_tensors_quantization(quant).map(Some),
+        "fp8" => parse_fp8_quantization(quant).map(Some),
         _ => Err(format!(
             "unsupported Qwen3.5 quantization_config.quant_method {quant_method:?}"
         )),
@@ -761,7 +840,6 @@ fn parse_quantization_config(
 
 fn parse_compressed_tensors_quantization(
     quant: &serde_json::Map<String, Value>,
-    quant_method: String,
 ) -> Result<Qwen35QuantizationConfig, String> {
     let format = required_string(quant, "format")?;
     let groups = quant
@@ -804,25 +882,131 @@ fn parse_compressed_tensors_quantization(
         .get("weights")
         .and_then(Value::as_object)
         .and_then(|weights| weights.get("actorder"));
-    Ok(Qwen35QuantizationConfig {
-        quant_method,
-        format: Some(format),
-        bits: required_usize(weights, "num_bits")?,
-        group_size: required_usize(weights, "group_size")?,
-        desc_act: actorder.is_some_and(|value| !value.is_null()),
-        sym: optional_bool(weights, "symmetric")?
-            .ok_or_else(|| "compressed-tensors weights.symmetric must be a boolean".to_string())?,
-        weight_type: Some(required_string(weights, "type")?),
-        strategy: Some(required_string(weights, "strategy")?),
-        dynamic: optional_bool(weights, "dynamic")?,
-        targets,
-        input_activations: group
-            .get("input_activations")
-            .is_some_and(|value| !value.is_null()),
-        output_activations: group
-            .get("output_activations")
-            .is_some_and(|value| !value.is_null()),
-    })
+    Ok(Qwen35QuantizationConfig::CompressedTensors(
+        Qwen35CompressedTensorsQuantizationRecipe {
+            format,
+            bits: required_usize(weights, "num_bits")?,
+            group_size: required_usize(weights, "group_size")?,
+            desc_act: actorder.is_some_and(|value| !value.is_null()),
+            sym: optional_bool(weights, "symmetric")?.ok_or_else(|| {
+                "compressed-tensors weights.symmetric must be a boolean".to_string()
+            })?,
+            weight_type: required_string(weights, "type")?,
+            strategy: required_string(weights, "strategy")?,
+            dynamic: optional_bool(weights, "dynamic")?,
+            targets,
+            input_activations: group
+                .get("input_activations")
+                .is_some_and(|value| !value.is_null()),
+            output_activations: group
+                .get("output_activations")
+                .is_some_and(|value| !value.is_null()),
+        },
+    ))
+}
+
+fn parse_fp8_quantization(
+    quant: &serde_json::Map<String, Value>,
+) -> Result<Qwen35QuantizationConfig, String> {
+    const ALLOWED_FIELDS: &[&str] = &[
+        "activation_scheme",
+        "fmt",
+        "modules_to_not_convert",
+        "quant_method",
+        "weight_block_size",
+    ];
+    if let Some(field) = quant
+        .keys()
+        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+    {
+        return Err(format!(
+            "unsupported Qwen3.5 FP8 quantization_config field {field:?}"
+        ));
+    }
+
+    let format = match required_string(quant, "fmt")?.as_str() {
+        "e4m3" => Qwen35Fp8Format::E4m3,
+        other => return Err(format!("unsupported Qwen3.5 FP8 fmt {other:?}")),
+    };
+    let activation_scheme = match required_string(quant, "activation_scheme")?.as_str() {
+        "dynamic" => Qwen35Fp8ActivationScheme::Dynamic,
+        other => {
+            return Err(format!(
+                "unsupported Qwen3.5 FP8 activation_scheme {other:?}"
+            ))
+        }
+    };
+    let weight_block_size = parse_fp8_weight_block_size(
+        quant
+            .get("weight_block_size")
+            .ok_or_else(|| "weight_block_size must be an array".to_string())?,
+    )?;
+    let modules = quant
+        .get("modules_to_not_convert")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "modules_to_not_convert must be an array".to_string())?;
+    if modules.is_empty() {
+        return Err("modules_to_not_convert must not be empty for Qwen3.5 FP8".to_string());
+    }
+    let mut seen = BTreeSet::new();
+    let modules_to_not_convert = modules
+        .iter()
+        .map(|module| {
+            let module = module
+                .as_str()
+                .filter(|module| !module.is_empty())
+                .ok_or_else(|| {
+                    "modules_to_not_convert entries must be non-empty strings".to_string()
+                })?;
+            if !seen.insert(module.to_owned()) {
+                return Err(format!(
+                    "modules_to_not_convert contains duplicate module {module:?}"
+                ));
+            }
+            Ok(module.to_owned())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    Ok(Qwen35QuantizationConfig::Fp8(Qwen35Fp8QuantizationRecipe {
+        format,
+        activation_scheme,
+        weight_block_size,
+        modules_to_not_convert,
+    }))
+}
+
+fn parse_fp8_weight_block_size(value: &Value) -> Result<Qwen35Fp8WeightBlockSize, String> {
+    let dimensions = value
+        .as_array()
+        .ok_or_else(|| "weight_block_size must be an array".to_string())?;
+    if dimensions.len() != 2 {
+        return Err(format!(
+            "Qwen3.5 FP8 weight_block_size must contain exactly two dimensions, got {}",
+            dimensions.len()
+        ));
+    }
+    let parsed = dimensions
+        .iter()
+        .map(|dimension| {
+            dimension
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    "Qwen3.5 FP8 weight_block_size entries must be unsigned integers".to_string()
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let block_size = Qwen35Fp8WeightBlockSize {
+        output_features: parsed[0],
+        input_features: parsed[1],
+    };
+    if block_size != Qwen35Fp8WeightBlockSize::OFFICIAL_128X128 {
+        return Err(format!(
+            "unsupported Qwen3.5 FP8 weight_block_size {:?}; expected [128, 128]",
+            block_size.as_array()
+        ));
+    }
+    Ok(block_size)
 }
 
 fn parse_usize_array(value: &Value) -> Result<Vec<usize>, String> {

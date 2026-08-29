@@ -675,7 +675,14 @@ class Resolver:
         require(isinstance(value, str) and bool(value), f"{label} JSON pointer {pointer!r} must select a non-empty string")
         return value
 
-    def select_catalog_files(self, snapshot: Snapshot, specs_raw: Any, label: str) -> list[dict[str, Any]]:
+    def select_catalog_files(
+        self,
+        snapshot: Snapshot,
+        specs_raw: Any,
+        label: str,
+        *,
+        shard_naming_policy: str,
+    ) -> list[dict[str, Any]]:
         specs = require_list(specs_raw, f"{label}.files")
         selected: set[str] = set()
         conditional: list[tuple[str, dict[str, Any]]] = []
@@ -752,6 +759,7 @@ class Resolver:
                 index_paths[0],
                 set(safetensors),
                 label,
+                shard_naming_policy=shard_naming_policy,
             )
         else:
             require(
@@ -767,6 +775,8 @@ class Resolver:
         index_path: str,
         selected_shards: set[str],
         label: str,
+        *,
+        shard_naming_policy: str,
     ) -> None:
         content = self.safetensors_index_content(
             snapshot,
@@ -795,6 +805,8 @@ class Resolver:
             expected_shards == selected_shards,
             f"{label} safetensors index shard set differs from selected weight shards",
         )
+        if shard_naming_policy == "index_authoritative":
+            return
         numbered: list[tuple[int, int, int, int, str]] = []
         for shard in sorted(expected_shards):
             match = SAFETENSORS_SHARD_RE.search(shard)
@@ -871,8 +883,20 @@ class Resolver:
     def lane(self, lane_raw: Any, index: int) -> dict[str, Any]:
         lane = require_object(lane_raw, f"catalog.models[{index}]")
         lane_id = require_string(lane.get("id"), f"catalog.models[{index}].id")
+        shard_naming_policy = lane.get(
+            "safetensors_shard_naming", "canonical_numbered"
+        )
+        require(
+            shard_naming_policy in {"canonical_numbered", "index_authoritative"},
+            f"catalog lane {lane_id}.safetensors_shard_naming is invalid",
+        )
         weight = self.snapshot(lane.get("repo"), lane.get("revision"), f"catalog lane {lane_id}")
-        weight_files = self.select_catalog_files(weight, lane.get("files"), f"catalog lane {lane_id}")
+        weight_files = self.select_catalog_files(
+            weight,
+            lane.get("files"),
+            f"catalog lane {lane_id}",
+            shard_naming_policy=shard_naming_policy,
+        )
 
         reference = require_object(lane.get("reference"), f"catalog lane {lane_id}.reference")
         semantic_repo = require_repo(reference.get("semantic_repo"), f"catalog lane {lane_id}.reference.semantic_repo")
@@ -910,6 +934,7 @@ class Resolver:
             "model_id": require_string(lane.get("model_id"), f"catalog lane {lane_id}.model_id"),
             "backend": require_string(lane.get("backend"), f"catalog lane {lane_id}.backend"),
             "format": require_string(lane.get("format"), f"catalog lane {lane_id}.format"),
+            "safetensors_shard_naming": shard_naming_policy,
             "weight_source": self.source_json(weight, weight_files),
             "semantic_source": self.source_json(semantic, semantic_files),
         }
@@ -1854,6 +1879,39 @@ def run_selftest() -> None:
             root,
         )
 
+        index_authoritative_catalog = copy.deepcopy(catalog)
+        index_authoritative_catalog["models"][0][
+            "safetensors_shard_naming"
+        ] = "index_authoritative"
+        index_authoritative_catalog_path = root / "index-authoritative.catalog.json"
+        index_authoritative_fixture_path = root / "index-authoritative.fixture.json"
+        index_authoritative_catalog_path.write_text(
+            json.dumps(index_authoritative_catalog), encoding="utf-8"
+        )
+        index_authoritative_fixture_path.write_text(
+            json.dumps(mixed_total_width), encoding="utf-8"
+        )
+        index_authoritative_result = resolve_catalog(
+            index_authoritative_catalog_path,
+            FixtureTransport(index_authoritative_fixture_path),
+        )
+        require(
+            index_authoritative_result["lanes"][0][
+                "safetensors_shard_naming"
+            ]
+            == "index_authoritative",
+            "index-authoritative shard naming policy was not recorded",
+        )
+
+        invalid_shard_policy = copy.deepcopy(catalog)
+        invalid_shard_policy["models"][0]["safetensors_shard_naming"] = "guess"
+        expect_failure(
+            invalid_shard_policy,
+            fixture,
+            "safetensors_shard_naming is invalid",
+            root,
+        )
+
         mixed_number_width = copy.deepcopy(fixture)
         mixed_number_index_body = (
             json.dumps(
@@ -1981,6 +2039,12 @@ def run_selftest() -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--catalog",
+        type=Path,
+        default=CATALOG_PATH,
+        help=f"model catalog JSON (default: {CATALOG_PATH.relative_to(ROOT)})",
+    )
     parser.add_argument("--out", type=Path, help="artifact directory or JSON output path")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--timeout", type=float, default=45.0)
@@ -2003,7 +2067,7 @@ def main(argv: list[str] | None = None) -> int:
             print("RUNTIME VNEXT MODEL RESOLUTION SELFTEST PASS")
             return 0
         transport: Transport = NetworkTransport(timeout=args.timeout, retries=args.retries)
-        result = resolve_catalog(CATALOG_PATH, transport)
+        result = resolve_catalog(args.catalog.resolve(), transport)
         _, pass_path = write_output(args.out, result)
         print(f"RUNTIME VNEXT MODEL RESOLUTION PASS: {pass_path}")
         return 0

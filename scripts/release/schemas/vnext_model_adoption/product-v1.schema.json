@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "product-v1.schema.json",
+  "title": "Ferrum vNext model-adoption product receipt v1",
+  "allOf": [
+    {
+      "$ref": "common-envelope-v1.schema.json#/$defs/envelope"
+    },
+    {
+      "type": "object",
+      "required": [
+        "binary_sha256",
+        "hardware",
+        "effective_config",
+        "milestones",
+        "product_checks",
+        "usability"
+      ],
+      "properties": {
+        "artifact_type": {
+          "const": "product"
+        },
+        "binary_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "hardware": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "effective_config": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "milestones": {
+          "type": "object",
+          "required": [
+            "M4",
+            "M5"
+          ],
+          "properties": {
+            "M4": {
+              "$ref": "common-envelope-v1.schema.json#/$defs/stage_result"
+            },
+            "M5": {
+              "$ref": "common-envelope-v1.schema.json#/$defs/stage_result"
+            }
+          },
+          "additionalProperties": false
+        },
+        "product_checks": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "usability": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -1546,6 +1546,7 @@ dependencies = [
  "ferrum-testkit",
  "ferrum-types",
  "flate2",
+ "float8 0.7.0",
  "futures",
  "futures-util",
  "half",

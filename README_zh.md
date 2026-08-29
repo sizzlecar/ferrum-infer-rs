@@ -76,15 +76,21 @@ curl http://localhost:8000/v1/chat/completions \
 128-token 输出，在 CUDA 使用 256 / 128。数值为 3 次 repeat 的平均 tok/s，`±` 为
 95% 置信区间半宽。
 
-| 模型 | M1 Max 32 GB Metal | RTX 4090 CUDA |
-|---|---:|---:|
-| Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |
-| Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |
-| Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |
-| Qwen3.8 27B AWQ INT4 |  | c=1 · 35.15 |
+| 模型 | M1 Max 32 GB Metal | RTX 4090 CUDA | L40S 48 GB CUDA smoke |
+|---|---:|---:|---:|
+| Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |  |
+| Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |  |
+| Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |  |
+| Qwen3.8 27B AWQ INT4 |  | c=1 · 35.15 |  |
+| [Qwen3.8 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a) |  |  | ready 119.49 s · c=1 · 16.53 · c=2 · 24.33 |
 
 `c` 为服务端实际活跃并发。前三行均完成 100 请求 × 3 repeats，错误数为零。
 [测量详情](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md)。
+
+L40S block-FP8 行是 clean commit `ef8dbbee` 的开发 smoke：ready 为冷启动
+`serve` 到就绪的时间；c=1 使用 1 次 warmup 和 3 个实测 256-input/32-output-token
+请求，c=2 完成 4 个稳定性请求。数值为 usage 计数的聚合输出 tok/s，不是 RTX 4090
+release 吞吐。AWQ INT4 行使用不同 checkpoint 和量化路径。
 
 ## OpenAI 兼容 API
 

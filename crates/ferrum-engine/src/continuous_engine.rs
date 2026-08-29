@@ -3352,6 +3352,10 @@ impl InferenceEngine for ContinuousBatchEngine {
         }))
     }
 
+    fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
+        self.inner.model_executor.execution_attribution_snapshot()
+    }
+
     fn admission_snapshot(
         &self,
     ) -> ferrum_types::Result<Option<ferrum_types::ExecutorAdmissionSnapshot>> {

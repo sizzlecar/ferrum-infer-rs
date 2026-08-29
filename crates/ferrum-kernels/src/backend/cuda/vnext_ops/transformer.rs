@@ -12,6 +12,8 @@ use cudarc::cublas::{
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
+#[cfg(feature = "vllm-marlin")]
+use ferrum_interfaces::vnext::PhysicalWeightLayout;
 use ferrum_interfaces::vnext::{
     dense_linear_contract, dense_swiglu_contract, residual_add_contract, rms_norm_contract,
     AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceBatchingForm,
@@ -45,7 +47,8 @@ use crate::backend::cuda::vllm_marlin::{
 use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 #[cfg(feature = "vllm-marlin")]
 use crate::marlin_fp8_materializer::{
-    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
+    marlin_fp8_projection_shape_supported, MARLIN_FP8_CAPABILITY_ID,
+    MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 #[cfg(feature = "vllm-marlin")]
 use moe_weights::{
@@ -414,6 +417,75 @@ impl OperationProvider<CudaDeviceRuntime> for CudaMarlinFp8DenseLinearProvider {
     }
 }
 
+#[cfg(feature = "vllm-marlin")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseSwiGluProjection {
+    F16,
+    MarlinFp8,
+    CompressedTensorsMarlin,
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn dense_swiglu_projection_for_formats(
+    gate_up: &BTreeSet<QuantizationFormatId>,
+    down: &BTreeSet<QuantizationFormatId>,
+) -> Result<DenseSwiGluProjection, String> {
+    let classify = |label: &str, formats: &BTreeSet<QuantizationFormatId>| {
+        if formats.is_empty() {
+            return Ok(DenseSwiGluProjection::F16);
+        }
+        if formats.len() != 1 {
+            return Err(format!(
+                "dense SwiGLU {label} has more than one quantization format"
+            ));
+        }
+        match formats.iter().next().map(|format| format.as_str()) {
+            Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => Ok(DenseSwiGluProjection::MarlinFp8),
+            Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID) => {
+                Ok(DenseSwiGluProjection::CompressedTensorsMarlin)
+            }
+            Some(format) => Err(format!(
+                "dense SwiGLU {label} uses unsupported quantization format `{format}`"
+            )),
+            None => unreachable!("non-empty quantization set has one entry"),
+        }
+    };
+    let gate_up = classify("gate/up", gate_up)?;
+    let down = classify("down", down)?;
+    if gate_up != down {
+        return Err(format!(
+            "dense SwiGLU cannot mix {gate_up:?} gate/up with {down:?} down weights"
+        ));
+    }
+    Ok(gate_up)
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn participant_dense_swiglu_projection(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<DenseSwiGluProjection, String> {
+    let formats = |ordinal| {
+        binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?
+            .weight()
+            .map(|weight| weight.quantization_formats())
+            .ok_or_else(|| format!("dense SwiGLU input {ordinal} has no physical weight layout"))
+    };
+    dense_swiglu_projection_for_formats(&formats(1)?, &formats(2)?)
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn dense_swiglu_projection(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<DenseSwiGluProjection, String> {
+    let first = participant_dense_swiglu_projection(&invocation.participants()[0])?;
+    for participant in &invocation.participants()[1..] {
+        if participant_dense_swiglu_projection(participant)? != first {
+            return Err("dense SwiGLU participants disagree on their projection ABI".to_owned());
+        }
+    }
+    Ok(first)
+}
+
 pub(super) struct CudaDenseSwiGluProvider {
     descriptor: OperationProviderDescriptor,
     silu_mul: CudaFunction,
@@ -433,6 +505,8 @@ impl CudaDenseSwiGluProvider {
             #[cfg(feature = "vllm-marlin")]
             PLANAR_SILU_MUL_FUNCTION_NAME.as_bytes(),
             #[cfg(feature = "vllm-marlin")]
+            include_str!("transformer/marlin_fp8_weights.rs").as_bytes(),
+            #[cfg(feature = "vllm-marlin")]
             include_str!("transformer/moe_weights.rs").as_bytes(),
             #[cfg(feature = "vllm-marlin")]
             include_str!("../vllm_marlin.rs").as_bytes(),
@@ -448,11 +522,8 @@ impl CudaDenseSwiGluProvider {
             provider_fingerprint,
         )?;
         #[cfg(feature = "vllm-marlin")]
-        let descriptor = compressed_tensors_swiglu_provider_descriptor(
-            runtime,
-            &contract,
-            provider_fingerprint,
-        )?;
+        let descriptor =
+            marlin_swiglu_provider_descriptor(runtime, &contract, provider_fingerprint)?;
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
@@ -536,28 +607,41 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
         #[cfg(feature = "vllm-marlin")]
-        let uses_compressed_tensors = invocation.participants()[0]
-            .bindings()
-            .iter()
-            .filter_map(ResolvedValueBinding::weight)
-            .flat_map(|weight| weight.quantization_formats())
-            .any(|format| format.as_str() == COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID);
-        #[cfg(feature = "vllm-marlin")]
-        if uses_compressed_tensors {
-            return encode_compressed_tensors_dense_swiglu(
-                self.descriptor.provider_implementation_fingerprint(),
-                &self.planar_silu_mul,
-                self.projection_runtime,
-                invocation,
-            )
-            .map(EncodedDeviceOperation::compute)
-            .map_err(|message| {
-                provider_failure(
-                    identity,
-                    "cuda.dense_swiglu.compressed_tensors.encode",
-                    message,
-                )
-            });
+        {
+            let projection = dense_swiglu_projection(&invocation).map_err(|message| {
+                provider_failure(identity.clone(), "cuda.dense_swiglu.select", message)
+            })?;
+            match projection {
+                DenseSwiGluProjection::CompressedTensorsMarlin => {
+                    return encode_compressed_tensors_dense_swiglu(
+                        self.descriptor.provider_implementation_fingerprint(),
+                        &self.planar_silu_mul,
+                        self.projection_runtime,
+                        invocation,
+                    )
+                    .map(EncodedDeviceOperation::compute)
+                    .map_err(|message| {
+                        provider_failure(
+                            identity,
+                            "cuda.dense_swiglu.compressed_tensors.encode",
+                            message,
+                        )
+                    });
+                }
+                DenseSwiGluProjection::MarlinFp8 => {
+                    return encode_marlin_fp8_dense_swiglu(
+                        self.descriptor.provider_implementation_fingerprint(),
+                        &self.planar_silu_mul,
+                        self.projection_runtime,
+                        invocation,
+                    )
+                    .map(EncodedDeviceOperation::compute)
+                    .map_err(|message| {
+                        provider_failure(identity, "cuda.dense_swiglu.marlin_fp8.encode", message)
+                    });
+                }
+                DenseSwiGluProjection::F16 => {}
+            }
         }
         encode_dense_swiglu(
             self.descriptor.provider_implementation_fingerprint(),
@@ -683,7 +767,7 @@ pub(super) fn provider_descriptor(
 }
 
 #[cfg(feature = "vllm-marlin")]
-fn compressed_tensors_swiglu_provider_descriptor(
+fn marlin_swiglu_provider_descriptor(
     runtime: &CudaDeviceRuntime,
     contract: &dyn OperationContract,
     provider_fingerprint: String,
@@ -692,6 +776,8 @@ fn compressed_tensors_swiglu_provider_descriptor(
         CapabilityId::new(DENSE_SWIGLU_F16_CAPABILITY_ID).map_err(contract_error)?;
     let marlin_capability =
         CapabilityId::new(COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID).map_err(contract_error)?;
+    let marlin_fp8_capability =
+        CapabilityId::new(MARLIN_FP8_CAPABILITY_ID).map_err(contract_error)?;
     if !runtime
         .descriptor()
         .capabilities
@@ -700,9 +786,13 @@ fn compressed_tensors_swiglu_provider_descriptor(
             .descriptor()
             .capabilities
             .contains(&marlin_capability)
+        || !runtime
+            .descriptor()
+            .capabilities
+            .contains(&marlin_fp8_capability)
     {
         return Err(CudaDeviceRuntimeError::contract(
-            "CUDA runtime does not advertise dense-SwiGLU compressed-tensors Marlin capabilities",
+            "CUDA runtime does not advertise dense-SwiGLU Marlin capabilities",
         ));
     }
     let estimator_fingerprint = implementation_fingerprint(&[
@@ -721,16 +811,22 @@ fn compressed_tensors_swiglu_provider_descriptor(
         ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
         contract.descriptor().version,
         runtime.descriptor().id.clone(),
-        BTreeSet::from([operation_capability, marlin_capability]),
+        BTreeSet::from([
+            operation_capability,
+            marlin_capability,
+            marlin_fp8_capability,
+        ]),
         BTreeSet::from([
             WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
             WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
                 .map_err(contract_error)?,
+            WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?,
         ]),
-        BTreeSet::from([QuantizationFormatId::new(
-            COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
-        )
-        .map_err(contract_error)?]),
+        BTreeSet::from([
+            QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
+                .map_err(contract_error)?,
+            QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID).map_err(contract_error)?,
+        ]),
         contiguous_bindings(3),
         DENSE_SWIGLU_ESTIMATOR_ID,
         ContractVersion::new(2, 0),
@@ -1248,11 +1344,64 @@ fn encode_marlin_fp8_dense_linear(
     .map_err(|error| error.to_string())
 }
 
+pub(super) fn aligned_projection_workspace_bytes(
+    workspace_bytes: u64,
+    alignment: u64,
+    operation: &'static str,
+) -> Result<u64, String> {
+    if workspace_bytes == 0 {
+        return Ok(0);
+    }
+    if !alignment.is_power_of_two() {
+        return Err(format!(
+            "{operation} alignment {alignment} is not a non-zero power of two"
+        ));
+    }
+    workspace_bytes
+        .checked_add(alignment - 1)
+        .map(|bytes| bytes & !(alignment - 1))
+        .filter(|bytes| *bytes >= workspace_bytes)
+        .ok_or_else(|| format!("{operation} aligned size overflows"))
+}
+
 #[cfg(feature = "vllm-marlin")]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MarlinProjectionRuntime {
     multiprocessor_count: i32,
     device_ordinal: i32,
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn marlin_num_groups(
+    input_features: i32,
+    group_size: i32,
+    operation: &'static str,
+) -> Result<i32, CudaDeviceRuntimeError> {
+    if input_features <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} input width {input_features} must be positive"
+        )));
+    }
+    if group_size == -1 {
+        return Ok(1);
+    }
+    if group_size <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} group size {group_size} must be -1 for channelwise weights or positive"
+        )));
+    }
+    if input_features % group_size != 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} input width {input_features} is not divisible by group size {group_size}"
+        )));
+    }
+    let num_groups = input_features / group_size;
+    if num_groups <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} input width {input_features} and group size {group_size} produce non-positive group count {num_groups}"
+        )));
+    }
+    Ok(num_groups)
 }
 
 #[cfg(feature = "vllm-marlin")]
@@ -1300,6 +1449,24 @@ impl MarlinProjectionRuntime {
         group_size: i32,
         operation: &'static str,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        if weight_type == MarlinF16WeightType::E4M3Fn {
+            let output_features = usize::try_from(output_features).map_err(|_| {
+                CudaDeviceRuntimeError::contract(format!(
+                    "{operation} FP8 output width is not positive"
+                ))
+            })?;
+            let input_features = usize::try_from(input_features).map_err(|_| {
+                CudaDeviceRuntimeError::contract(format!(
+                    "{operation} FP8 input width is not positive"
+                ))
+            })?;
+            if !marlin_fp8_projection_shape_supported(output_features, input_features) {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "{operation} FP8 shape [{output_features}, {input_features}] is not supported by the shared execution provider"
+                )));
+            }
+        }
+        let num_groups = marlin_num_groups(input_features, group_size, operation)?;
         let required_workspace = self
             .workspace_bytes()
             .map_err(CudaDeviceRuntimeError::contract)?;
@@ -1342,11 +1509,7 @@ impl MarlinProjectionRuntime {
                     n: output_features,
                     k: input_features,
                     lda: input_features,
-                    num_groups: input_features.checked_div(group_size).ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(format!(
-                            "{operation} group size must be positive"
-                        ))
-                    })?,
+                    num_groups,
                     group_size,
                 },
                 execution: MarlinMmExecution {
@@ -1361,6 +1524,335 @@ impl MarlinProjectionRuntime {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "vllm-marlin"))]
+mod marlin_group_count_tests {
+    use super::{marlin_num_groups, CudaDeviceRuntimeError};
+
+    #[test]
+    fn channelwise_group_size_maps_to_one_native_group() {
+        assert!(matches!(marlin_num_groups(4096, -1, "test"), Ok(1)));
+        for input_features in [0, -1] {
+            assert!(matches!(
+                marlin_num_groups(input_features, -1, "test"),
+                Err(CudaDeviceRuntimeError::Contract(message))
+                    if message.contains("input width") && message.contains("must be positive")
+            ));
+        }
+    }
+
+    #[test]
+    fn positive_group_size_requires_exact_positive_groups() {
+        assert!(matches!(marlin_num_groups(4096, 128, "test"), Ok(32)));
+        assert!(matches!(
+            marlin_num_groups(4097, 128, "test"),
+            Err(CudaDeviceRuntimeError::Contract(message))
+                if message.contains("is not divisible")
+        ));
+        assert!(matches!(
+            marlin_num_groups(0, 128, "test"),
+            Err(CudaDeviceRuntimeError::Contract(message))
+                if message.contains("input width 0 must be positive")
+        ));
+    }
+
+    #[test]
+    fn zero_and_other_negative_group_sizes_are_typed_failures() {
+        for group_size in [0, -2, i32::MIN] {
+            assert!(matches!(
+                marlin_num_groups(4096, group_size, "test"),
+                Err(CudaDeviceRuntimeError::Contract(message))
+                    if message.contains("must be -1 for channelwise weights or positive")
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn marlin_fp8_swiglu_gate_up_layout(
+    layout: &PhysicalWeightLayout,
+    partition: usize,
+    intermediate_size: u64,
+    hidden_size: u64,
+) -> Result<&PhysicalWeightLayout, String> {
+    let PhysicalWeightLayout::Composite { parts } = layout else {
+        return Err("Marlin FP8 SwiGLU gate/up weight must be composite".to_owned());
+    };
+    if parts.len() != 2 {
+        return Err("Marlin FP8 SwiGLU gate/up weight must contain exactly two parts".to_owned());
+    }
+    for (index, part) in parts.iter().enumerate() {
+        if part.logical_offsets != [index as u64, 0, 0]
+            || part.extents != [1, intermediate_size, hidden_size]
+            || !matches!(part.layout.as_ref(), PhysicalWeightLayout::Quantized { .. })
+        {
+            return Err(format!(
+                "Marlin FP8 SwiGLU gate/up part {index} has invalid placement or layout"
+            ));
+        }
+    }
+    parts
+        .get(partition)
+        .map(|part| part.layout.as_ref())
+        .ok_or_else(|| format!("Marlin FP8 SwiGLU gate/up part {partition} is absent"))
+}
+
+#[cfg(feature = "vllm-marlin")]
+#[derive(Debug, Clone, Copy)]
+struct SharedMarlinFp8Weight {
+    packed_region: usize,
+    scales_region: usize,
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn push_shared_marlin_fp8_weight(
+    regions: &mut Vec<CudaBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ordinal: u32,
+    logical_dimensions: &[u64],
+    composite_partition: Option<usize>,
+) -> Result<SharedMarlinFp8Weight, String> {
+    use marlin_fp8_weights::{resolve_marlin_fp8_layout, resolve_marlin_fp8_weight};
+
+    let [output_features, input_features] = logical_dimensions else {
+        return Err("Marlin FP8 SwiGLU projection must have shape [N, K]".to_owned());
+    };
+    let resolve = |participant: &OperationInvocation<'_, CudaDeviceBuffer>| {
+        let value = binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+        if let Some(partition) = composite_partition {
+            let weight = value.weight().ok_or_else(|| {
+                format!("Marlin FP8 SwiGLU input {ordinal} has no physical weight layout")
+            })?;
+            let layout = marlin_fp8_swiglu_gate_up_layout(
+                weight.physical_layout(),
+                partition,
+                *output_features,
+                *input_features,
+            )?;
+            resolve_marlin_fp8_layout(participant, value, layout, logical_dimensions)
+        } else {
+            resolve_marlin_fp8_weight(participant, value, logical_dimensions)
+        }
+    };
+
+    let first = resolve(&invocation.participants()[0])?;
+    if first.output_features() != *output_features || first.input_features() != *input_features {
+        return Err(format!(
+            "Marlin FP8 SwiGLU input {ordinal} resolved inconsistent dimensions"
+        ));
+    }
+    for participant in &invocation.participants()[1..] {
+        let candidate = resolve(participant)?;
+        if candidate.output_features() != first.output_features()
+            || candidate.input_features() != first.input_features()
+            || !same_physical_region(first.packed_region(), candidate.packed_region())
+            || !same_physical_region(first.scales_region(), candidate.scales_region())
+        {
+            return Err(format!(
+                "Marlin FP8 SwiGLU input {ordinal} is not shared by all participants"
+            ));
+        }
+    }
+    let [packed, scales] = first.into_regions();
+    let packed_region = regions.len();
+    regions.push(packed);
+    let scales_region = regions.len();
+    regions.push(scales);
+    Ok(SharedMarlinFp8Weight {
+        packed_region,
+        scales_region,
+    })
+}
+
+#[cfg(feature = "vllm-marlin")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarlinSwiGluScratchLayout {
+    activation_elements: u64,
+    activation_bytes: u64,
+    workspace_offset: u64,
+    workspace_bytes: u64,
+    required_bytes: u64,
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn marlin_swiglu_scratch_layout(
+    tokens: u64,
+    intermediate_size: u64,
+    workspace_bytes: u64,
+) -> Result<MarlinSwiGluScratchLayout, String> {
+    let activation_elements = tokens
+        .checked_mul(intermediate_size)
+        .ok_or_else(|| "Marlin SwiGLU activation size overflows".to_owned())?;
+    let activation_bytes = activation_elements
+        .checked_mul(ElementType::F16.size_bytes())
+        .ok_or_else(|| "Marlin SwiGLU activation bytes overflow".to_owned())?;
+    let activation_scratch_bytes = activation_bytes
+        .checked_mul(SWIGLU_SCRATCH_PARTS)
+        .ok_or_else(|| "Marlin SwiGLU activation scratch bytes overflow".to_owned())?;
+    let workspace_offset = activation_scratch_bytes
+        .checked_add(VALUE_ALIGNMENT_BYTES - 1)
+        .map(|value| value / VALUE_ALIGNMENT_BYTES * VALUE_ALIGNMENT_BYTES)
+        .ok_or_else(|| "Marlin SwiGLU workspace offset overflows".to_owned())?;
+    let required_bytes = workspace_offset
+        .checked_add(workspace_bytes)
+        .ok_or_else(|| "Marlin SwiGLU total scratch bytes overflow".to_owned())?;
+    Ok(MarlinSwiGluScratchLayout {
+        activation_elements,
+        activation_bytes,
+        workspace_offset,
+        workspace_bytes,
+        required_bytes,
+    })
+}
+
+#[cfg(all(test, feature = "vllm-marlin"))]
+mod dense_swiglu_marlin_tests {
+    use super::{
+        dense_swiglu_projection_for_formats, marlin_fp8_swiglu_gate_up_layout,
+        marlin_swiglu_scratch_layout, DenseSwiGluProjection, PhysicalWeightLayout,
+        COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+    };
+    use ferrum_interfaces::vnext::{
+        CompositeWeightPart, PhysicalWeightComponentBinding, PhysicalWeightPadding,
+        QuantizationFormatId, WeightId,
+    };
+    use std::collections::BTreeSet;
+
+    fn formats(values: &[&str]) -> BTreeSet<QuantizationFormatId> {
+        values
+            .iter()
+            .map(|value| QuantizationFormatId::new(*value).unwrap())
+            .collect()
+    }
+
+    fn quantized_layout(label: &str) -> PhysicalWeightLayout {
+        PhysicalWeightLayout::Quantized {
+            packed_values: PhysicalWeightComponentBinding::exact_contiguous(
+                WeightId::new(format!("component.{label}.packed")).unwrap(),
+            ),
+            packed_dimensions: vec![1, 256, 128],
+            scales: PhysicalWeightComponentBinding::exact_contiguous(
+                WeightId::new(format!("component.{label}.scales")).unwrap(),
+            ),
+            zero_points: None,
+            zero_point_packed_dimensions: None,
+            axis_indices: None,
+            permutation: None,
+            codebook: None,
+            group_axis: 2,
+            group_padding: PhysicalWeightPadding::Exact,
+        }
+    }
+
+    fn gate_up_layout() -> PhysicalWeightLayout {
+        PhysicalWeightLayout::Composite {
+            parts: vec![
+                CompositeWeightPart {
+                    layout: Box::new(quantized_layout("gate")),
+                    logical_offsets: vec![0, 0, 0],
+                    extents: vec![1, 256, 128],
+                },
+                CompositeWeightPart {
+                    layout: Box::new(quantized_layout("up")),
+                    logical_offsets: vec![1, 0, 0],
+                    extents: vec![1, 256, 128],
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn dense_swiglu_projection_classification_is_exact() {
+        for (format, expected) in [
+            (None, DenseSwiGluProjection::F16),
+            (
+                Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID),
+                DenseSwiGluProjection::MarlinFp8,
+            ),
+            (
+                Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID),
+                DenseSwiGluProjection::CompressedTensorsMarlin,
+            ),
+        ] {
+            let formats = format.map_or_else(BTreeSet::new, |format| formats(&[format]));
+            assert_eq!(
+                dense_swiglu_projection_for_formats(&formats, &formats),
+                Ok(expected)
+            );
+        }
+
+        let fp8 = formats(&[MARLIN_FP8_QUANTIZATION_FORMAT_ID]);
+        let compressed = formats(&[COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID]);
+        let dense = BTreeSet::new();
+        let unknown = formats(&["quantization.test.unknown"]);
+        let multiple = formats(&[
+            MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+            COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        ]);
+        for (gate_up, down) in [
+            (&fp8, &compressed),
+            (&fp8, &dense),
+            (&unknown, &unknown),
+            (&multiple, &multiple),
+        ] {
+            assert!(dense_swiglu_projection_for_formats(gate_up, down).is_err());
+        }
+    }
+
+    #[test]
+    fn marlin_fp8_gate_up_requires_exact_two_part_placement() {
+        let layout = gate_up_layout();
+        assert!(marlin_fp8_swiglu_gate_up_layout(&layout, 0, 256, 128)
+            .is_ok_and(|layout| matches!(layout, PhysicalWeightLayout::Quantized { .. })));
+        assert!(marlin_fp8_swiglu_gate_up_layout(&layout, 1, 256, 128)
+            .is_ok_and(|layout| matches!(layout, PhysicalWeightLayout::Quantized { .. })));
+        assert!(marlin_fp8_swiglu_gate_up_layout(&layout, 2, 256, 128).is_err());
+
+        let mut bad_offset = gate_up_layout();
+        let PhysicalWeightLayout::Composite { parts } = &mut bad_offset else {
+            unreachable!();
+        };
+        parts[1].logical_offsets[0] = 2;
+        assert!(marlin_fp8_swiglu_gate_up_layout(&bad_offset, 0, 256, 128).is_err());
+
+        let mut bad_extent = gate_up_layout();
+        let PhysicalWeightLayout::Composite { parts } = &mut bad_extent else {
+            unreachable!();
+        };
+        parts[0].extents[0] = 2;
+        assert!(marlin_fp8_swiglu_gate_up_layout(&bad_extent, 0, 256, 128).is_err());
+
+        let mut missing_part = gate_up_layout();
+        let PhysicalWeightLayout::Composite { parts } = &mut missing_part else {
+            unreachable!();
+        };
+        parts.pop();
+        assert!(marlin_fp8_swiglu_gate_up_layout(&missing_part, 0, 256, 128).is_err());
+
+        let mut dense_part = gate_up_layout();
+        let PhysicalWeightLayout::Composite { parts } = &mut dense_part else {
+            unreachable!();
+        };
+        parts[1].layout = Box::new(PhysicalWeightLayout::Dense {
+            component_id: WeightId::new("component.up.dense").unwrap(),
+        });
+        assert!(marlin_fp8_swiglu_gate_up_layout(&dense_part, 0, 256, 128).is_err());
+    }
+
+    #[test]
+    fn marlin_swiglu_scratch_layout_is_aligned_and_overflow_checked() {
+        let layout = marlin_swiglu_scratch_layout(3, 5, 128).unwrap();
+        assert_eq!(layout.activation_elements, 15);
+        assert_eq!(layout.activation_bytes, 30);
+        assert_eq!(layout.workspace_offset, 96);
+        assert_eq!(layout.workspace_bytes, 128);
+        assert_eq!(layout.required_bytes, 224);
+
+        assert!(marlin_swiglu_scratch_layout(u64::MAX, 2, 0).is_err());
+        assert!(marlin_swiglu_scratch_layout(1, u64::MAX, 0).is_err());
+        assert!(marlin_swiglu_scratch_layout(1, 1, u64::MAX).is_err());
     }
 }
 
@@ -1484,23 +1976,17 @@ fn encode_compressed_tensors_dense_swiglu(
     }
 
     let tokens = invocation.work_shape().immediate_tokens();
-    let activation_elements = tokens
-        .checked_mul(intermediate_size)
-        .ok_or_else(|| "compressed-tensors SwiGLU activation size overflows".to_owned())?;
-    let activation_bytes = activation_elements
-        .checked_mul(ElementType::F16.size_bytes())
-        .ok_or_else(|| "compressed-tensors SwiGLU activation bytes overflow".to_owned())?;
-    let activation_scratch_bytes = activation_bytes
-        .checked_mul(3)
-        .ok_or_else(|| "compressed-tensors SwiGLU scratch bytes overflow".to_owned())?;
-    let workspace_offset = activation_scratch_bytes
-        .checked_add(VALUE_ALIGNMENT_BYTES - 1)
-        .map(|value| value / VALUE_ALIGNMENT_BYTES * VALUE_ALIGNMENT_BYTES)
-        .ok_or_else(|| "compressed-tensors SwiGLU workspace offset overflows".to_owned())?;
-    let workspace_bytes = projection_runtime.workspace_bytes()?;
-    let required_scratch_bytes = workspace_offset
-        .checked_add(workspace_bytes)
-        .ok_or_else(|| "compressed-tensors SwiGLU total scratch bytes overflow".to_owned())?;
+    let MarlinSwiGluScratchLayout {
+        activation_elements,
+        activation_bytes,
+        workspace_offset,
+        workspace_bytes,
+        required_bytes: required_scratch_bytes,
+    } = marlin_swiglu_scratch_layout(
+        tokens,
+        intermediate_size,
+        projection_runtime.workspace_bytes()?,
+    )?;
 
     let mut regions = Vec::new();
     let gate = push_shared_compressed_tensors_weight(
@@ -1648,6 +2134,186 @@ fn encode_compressed_tensors_dense_swiglu(
                 "compressed-tensors SwiGLU down projection",
             )?;
             let _ = blas;
+            Ok(())
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 0)
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn encode_marlin_fp8_dense_swiglu(
+    provider_fingerprint: &str,
+    planar_silu_mul: &CudaFunction,
+    projection_runtime: MarlinProjectionRuntime,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    use marlin_fp8_weights::MARLIN_FP8_CHANNELWISE_GROUP_SIZE;
+
+    ensure_invocation(&invocation, DENSE_SWIGLU_OPERATION_ID)?;
+    let first = &invocation.participants()[0];
+    let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
+    let intermediate_size = unsigned_attribute(first.attributes(), "intermediate_size")?;
+    for participant in invocation.participants() {
+        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
+            || unsigned_attribute(participant.attributes(), "intermediate_size")?
+                != intermediate_size
+        {
+            return Err("Marlin FP8 dense SwiGLU participant attributes disagree".to_owned());
+        }
+        validate_dense_swiglu(
+            binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 2)?,
+            binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+            hidden_size,
+            intermediate_size,
+        )?;
+    }
+
+    let tokens = invocation.work_shape().immediate_tokens();
+    let MarlinSwiGluScratchLayout {
+        activation_elements,
+        activation_bytes,
+        workspace_offset,
+        workspace_bytes,
+        required_bytes: required_scratch_bytes,
+    } = marlin_swiglu_scratch_layout(
+        tokens,
+        intermediate_size,
+        projection_runtime.workspace_bytes()?,
+    )?;
+    let mut regions = Vec::new();
+    let gate = push_shared_marlin_fp8_weight(
+        &mut regions,
+        &invocation,
+        1,
+        &[intermediate_size, hidden_size],
+        Some(0),
+    )?;
+    let up = push_shared_marlin_fp8_weight(
+        &mut regions,
+        &invocation,
+        1,
+        &[intermediate_size, hidden_size],
+        Some(1),
+    )?;
+    let down = push_shared_marlin_fp8_weight(
+        &mut regions,
+        &invocation,
+        2,
+        &[hidden_size, intermediate_size],
+        None,
+    )?;
+    let input_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let output_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Output,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let scratch_region = regions.len();
+    regions.push(shared_scratch_region(&invocation, required_scratch_bytes)?);
+
+    let rows = checked_i32(tokens, "Marlin FP8 SwiGLU token count")?;
+    let hidden = checked_i32(hidden_size, "Marlin FP8 SwiGLU hidden width")?;
+    let intermediate = checked_i32(intermediate_size, "Marlin FP8 SwiGLU intermediate width")?;
+    let group_size = MARLIN_FP8_CHANNELWISE_GROUP_SIZE;
+    let planar_silu_mul = planar_silu_mul.clone();
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "Marlin FP8 SwiGLU participant count",
+    )?;
+    let replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_swiglu_marlin_fp8")
+            .i32(projection_runtime.multiprocessor_count)
+            .i32(projection_runtime.device_ordinal)
+            .i32(group_size)
+            .i32(rows)
+            .i32(hidden)
+            .i32(intermediate)
+            .u64(workspace_offset)
+            .u64(required_scratch_bytes)
+            .finish();
+    CudaDeviceCommand::replayable_operation(
+        "vnext_dense_swiglu_marlin_fp8",
+        regions,
+        replay_key,
+        move |stream, regions| {
+            let scratch = &regions[scratch_region];
+            if scratch.length_bytes() < required_scratch_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "Marlin FP8 SwiGLU scratch is smaller than admitted",
+                ));
+            }
+            let gate_output = scratch.device_ptr();
+            let up_output = gate_output.checked_add(activation_bytes).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("Marlin FP8 SwiGLU up pointer overflows")
+            })?;
+            let activation = up_output.checked_add(activation_bytes).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract("Marlin FP8 SwiGLU activation pointer overflows")
+            })?;
+            let workspace = scratch
+                .device_ptr()
+                .checked_add(workspace_offset)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "Marlin FP8 SwiGLU workspace pointer overflows",
+                    )
+                })?;
+            for (weight, output) in [(gate, gate_output), (up, up_output)] {
+                projection_runtime.launch(
+                    MarlinF16WeightType::E4M3Fn,
+                    stream,
+                    regions[input_region].device_ptr(),
+                    regions[weight.packed_region].device_ptr(),
+                    regions[weight.scales_region].device_ptr(),
+                    None,
+                    output,
+                    workspace,
+                    workspace_bytes,
+                    rows,
+                    intermediate,
+                    hidden,
+                    group_size,
+                    "Marlin FP8 SwiGLU gate/up projection",
+                )?;
+            }
+            launch_planar_silu_mul(
+                stream,
+                &planar_silu_mul,
+                gate_output,
+                up_output,
+                activation,
+                activation_elements,
+            )?;
+            projection_runtime.launch(
+                MarlinF16WeightType::E4M3Fn,
+                stream,
+                activation,
+                regions[down.packed_region].device_ptr(),
+                regions[down.scales_region].device_ptr(),
+                None,
+                regions[output_region].device_ptr(),
+                workspace,
+                workspace_bytes,
+                rows,
+                hidden,
+                intermediate,
+                group_size,
+                "Marlin FP8 SwiGLU down projection",
+            )?;
             Ok(())
         },
     )
@@ -1985,14 +2651,12 @@ fn launch_planar_silu_mul(
 ) -> Result<(), CudaDeviceRuntimeError> {
     let total = checked_i32_runtime(
         activation_elements,
-        "compressed-tensors SwiGLU activation element count",
+        "Marlin SwiGLU activation element count",
     )?;
     let grid_x = activation_elements
         .div_ceil(u64::from(THREADS_PER_BLOCK))
         .try_into()
-        .map_err(|_| {
-            CudaDeviceRuntimeError::contract("compressed-tensors SwiGLU launch grid exceeds u32")
-        })?;
+        .map_err(|_| CudaDeviceRuntimeError::contract("Marlin SwiGLU launch grid exceeds u32"))?;
     let mut builder = stream.launch_builder(function);
     builder.arg(&gate);
     builder.arg(&up);
@@ -2006,9 +2670,7 @@ fn launch_planar_silu_mul(
         })
     }
     .map(|_| ())
-    .map_err(|error| {
-        CudaDeviceRuntimeError::driver("compressed-tensors SwiGLU activation launch", error)
-    })
+    .map_err(|error| CudaDeviceRuntimeError::driver("Marlin SwiGLU activation launch", error))
 }
 
 fn validate_rms_norm(

@@ -5,6 +5,7 @@
 //! executor allocates them.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,8 +16,9 @@ use ferrum_interfaces::vnext::{
     ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightComponentBinding,
     PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode,
     ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, QuantizationFormatId,
-    QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedTensorLayout,
-    SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec,
+    QuantizedProviderAttributionDenominator, ResolvedTensorLayout, SemanticValue,
+    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
     WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -31,16 +33,18 @@ use ferrum_interfaces::vnext::{
 };
 use ferrum_quantization::gguf::{block_quantization_format, ferrum_to_gguf_with_arch, GgmlDType};
 use ferrum_quantization::{
-    CompressedTensorsMarlinSafetensorsSource, GgufWeightComponentSource,
-    GptqMarlinSafetensorsSource, SafetensorsArchive, COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID,
-    GPTQ_MARLIN_INT4_FORMAT_ID,
+    BlockFp8SafetensorsSource, CompressedTensorsMarlinSafetensorsSource, GgufWeightComponentSource,
+    GptqMarlinSafetensorsSource, SafetensorsArchive, BLOCK_FP8_E4M3_SOURCE_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID, GPTQ_MARLIN_INT4_FORMAT_ID,
 };
 use ferrum_types::DataType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::qwen35_config::{
-    Qwen35LayerType, Qwen35QuantizationConfig, Qwen35TextConfig, Qwen35WeightSpec,
+    Qwen35CompressedTensorsQuantizationRecipe, Qwen35Fp8QuantizationRecipe,
+    Qwen35GptqQuantizationRecipe, Qwen35LayerType, Qwen35QuantizationConfig, Qwen35TextConfig,
+    Qwen35WeightSpec,
 };
 use crate::qwen35_weights::{
     Qwen35ResolvedWeightSource, Qwen35ResolvedWeightSpec, Qwen35WeightInventory,
@@ -65,6 +69,24 @@ const MOE_ROUTED_DOWN_ROLE: &str = "moe_routed_down";
 const MOE_SHARED_GATE_ROLE: &str = "moe_shared_gate";
 const MOE_SHARED_GATE_UP_ROLE: &str = "moe_shared_gate_up";
 const MOE_SHARED_DOWN_ROLE: &str = "moe_shared_down";
+// These are typed program roles backed by `Linear` projections in the dense
+// Qwen3.5 family. Whether an individual source stays dense is decided only by
+// the checkpoint's `modules_to_not_convert`, never by repository identity.
+const BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES: &[&str] = &[
+    "lm_head",
+    "linear_attn_qkv",
+    "linear_attn_z",
+    "linear_attn_b",
+    "linear_attn_a",
+    "linear_attn_out",
+    "self_attn_q",
+    "self_attn_k",
+    "self_attn_v",
+    "self_attn_o",
+    "mlp_gate",
+    "mlp_up",
+    "mlp_down",
+];
 
 pub(super) fn validate_semantic_config(
     expected_metadata_id: &ExternalModelMetadataId,
@@ -131,6 +153,21 @@ struct FamilyCompressedTensorsTensor {
     dtype: FamilyCompressedTensorsDtype,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FamilyBlockFp8Tensor {
+    external_name: String,
+    dimensions: Vec<u64>,
+    dtype: FamilyBlockFp8Dtype,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FamilyBlockFp8Dtype {
+    F8E4m3,
+    Bf16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum FamilyCompressedTensorsDtype {
@@ -158,6 +195,10 @@ enum FamilyWeightSourceEncoding {
         weight_zero_point: FamilyCompressedTensorsTensor,
         weight_shape: FamilyCompressedTensorsTensor,
     },
+    BlockFp8 {
+        values: FamilyBlockFp8Tensor,
+        scale_inv: FamilyBlockFp8Tensor,
+    },
     BlockQuantized(BlockQuantizationSpec),
 }
 
@@ -167,6 +208,7 @@ enum FamilyWeightFormat {
     SafetensorsDense,
     SafetensorsGptqMarlin,
     SafetensorsCompressedTensorsMarlin,
+    SafetensorsBlockFp8,
     GgufNative,
 }
 
@@ -244,7 +286,8 @@ impl Qwen35OperationProfile {
         match weight_format {
             FamilyWeightFormat::SafetensorsDense
             | FamilyWeightFormat::SafetensorsGptqMarlin
-            | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => Self::F16,
+            | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin
+            | FamilyWeightFormat::SafetensorsBlockFp8 => Self::F16,
             FamilyWeightFormat::GgufNative => Self::F32_MASTER,
         }
     }
@@ -295,7 +338,10 @@ impl Qwen35FamilyProvider {
                 validate_gptq_marlin_config(quantization)?;
             }
             (FamilyWeightFormat::SafetensorsCompressedTensorsMarlin, Some(quantization)) => {
-                validate_compressed_tensors_marlin_config(quantization)?
+                validate_compressed_tensors_marlin_config(quantization)?;
+            }
+            (FamilyWeightFormat::SafetensorsBlockFp8, Some(quantization)) => {
+                validate_block_fp8_config(quantization)?;
             }
             (FamilyWeightFormat::SafetensorsDense, Some(_)) => {
                 return Err(invalid_config(
@@ -313,6 +359,12 @@ impl Qwen35FamilyProvider {
                 return Err(invalid_config(
                     "hf_config.quantization_config",
                     "the compressed-tensors Marlin source requires explicit Hugging Face quantization metadata",
+                ));
+            }
+            (FamilyWeightFormat::SafetensorsBlockFp8, None) => {
+                return Err(invalid_config(
+                    "hf_config.quantization_config",
+                    "the block-FP8 source requires explicit Hugging Face quantization metadata",
                 ));
             }
             (FamilyWeightFormat::GgufNative, Some(_)) => {
@@ -477,6 +529,30 @@ impl Qwen35FamilyProvider {
                         }
                     }
                 }
+                FamilyWeightSourceEncoding::BlockFp8 { values, scale_inv } => {
+                    validate_block_fp8_weight_source(
+                        weight,
+                        values,
+                        scale_inv,
+                        text.quantization.as_ref().ok_or_else(|| {
+                            invalid_config(
+                                "hf_config.quantization_config",
+                                "block-FP8 weight has no typed quantization metadata",
+                            )
+                        })?,
+                    )?;
+                    for source in [values, scale_inv] {
+                        if !external_names.insert(source.external_name.clone()) {
+                            return Err(invalid_config(
+                                "weights",
+                                format!(
+                                    "block-FP8 source {:?} is referenced more than once",
+                                    source.external_name
+                                ),
+                            ));
+                        }
+                    }
+                }
             }
             let expected_dimensions = expected_weight_dimensions(&text, config.vocab_size, weight)?;
             if !expected_dimensions.contains(&weight.dimensions) {
@@ -510,6 +586,8 @@ impl Qwen35FamilyProvider {
                     matches!(
                         weight.source_encoding,
                         FamilyWeightSourceEncoding::BlockQuantized(_)
+                            | FamilyWeightSourceEncoding::CompressedTensors { .. }
+                            | FamilyWeightSourceEncoding::BlockFp8 { .. }
                     )
                 }) {
                     return Err(invalid_config(
@@ -526,6 +604,7 @@ impl Qwen35FamilyProvider {
                         weight.source_encoding,
                         FamilyWeightSourceEncoding::BlockQuantized(_)
                             | FamilyWeightSourceEncoding::Gptq { .. }
+                            | FamilyWeightSourceEncoding::BlockFp8 { .. }
                     )
                 }) {
                     return Err(invalid_config(
@@ -534,6 +613,31 @@ impl Qwen35FamilyProvider {
                     ));
                 }
                 validate_safetensors_manifest(&text, config, "compressed-tensors")?;
+            }
+            FamilyWeightFormat::SafetensorsBlockFp8 => {
+                if config.weights.iter().any(|weight| {
+                    matches!(
+                        weight.source_encoding,
+                        FamilyWeightSourceEncoding::BlockQuantized(_)
+                            | FamilyWeightSourceEncoding::Gptq { .. }
+                            | FamilyWeightSourceEncoding::CompressedTensors { .. }
+                    )
+                }) {
+                    return Err(invalid_config(
+                        "weights.source_encoding",
+                        "block-FP8 packages cannot contain GPTQ, compressed-tensors, or GGUF components",
+                    ));
+                }
+                validate_block_fp8_source_completeness(
+                    config,
+                    validate_block_fp8_config(text.quantization.as_ref().ok_or_else(|| {
+                        invalid_config(
+                            "hf_config.quantization_config",
+                            "the block-FP8 source requires explicit Hugging Face quantization metadata",
+                        )
+                    })?)?,
+                )?;
+                validate_safetensors_manifest(&text, config, "block-FP8")?;
             }
             FamilyWeightFormat::GgufNative => validate_gguf_manifest(&text, config)?,
         }
@@ -602,8 +706,9 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
         match config.weight_format {
             FamilyWeightFormat::SafetensorsDense => safetensors_weight_schema(config),
             FamilyWeightFormat::SafetensorsGptqMarlin
-            | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => {
-                safetensors_gptq_weight_schema(config)
+            | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin
+            | FamilyWeightFormat::SafetensorsBlockFp8 => {
+                safetensors_quantized_weight_schema(config)
             }
             FamilyWeightFormat::GgufNative => gguf_weight_schema(config),
         }
@@ -761,7 +866,8 @@ impl ModelFamilyProvider for Qwen35FamilyProvider {
                     let (decay_parameterization, value_head_mapping) = match config.weight_format {
                         FamilyWeightFormat::SafetensorsDense
                         | FamilyWeightFormat::SafetensorsGptqMarlin
-                        | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin => (
+                        | FamilyWeightFormat::SafetensorsCompressedTensorsMarlin
+                        | FamilyWeightFormat::SafetensorsBlockFp8 => (
                             GatedDeltaDecayParameterization::LogRate,
                             GatedDeltaValueHeadMapping::GroupedByKeyHead,
                         ),
@@ -1204,22 +1310,31 @@ fn safetensors_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema
     })
 }
 
-fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightSchema, VNextError> {
+fn safetensors_quantized_weight_schema(
+    config: &Qwen35FamilyConfig,
+) -> Result<WeightSchema, VNextError> {
     let text = Qwen35TextConfig::from_hf_config_value(&config.hf_config)
         .map_err(|reason| invalid_config("hf_config", reason))?;
     let quantization = text.quantization.as_ref().ok_or_else(|| {
         invalid_config(
             "hf_config.quantization_config",
-            "Marlin safetensors schema requires typed quantization metadata",
+            "quantized safetensors schema requires typed quantization metadata",
         )
     })?;
     validate_safetensors_quantization_config(quantization)?;
     let compressed_tensors =
         config.weight_format == FamilyWeightFormat::SafetensorsCompressedTensorsMarlin;
+    let block_fp8 = config.weight_format == FamilyWeightFormat::SafetensorsBlockFp8;
     if compressed_tensors && text.is_moe() {
         return Err(invalid_config(
             "hf_config.quantization_config",
             "the fixed compressed-tensors adoption contract is dense-only",
+        ));
+    }
+    if block_fp8 && text.is_moe() {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "the first block-FP8 adoption contract is dense-only",
         ));
     }
 
@@ -1365,19 +1480,23 @@ fn safetensors_gptq_weight_schema(config: &Qwen35FamilyConfig) -> Result<WeightS
         }
     }
     Ok(WeightSchema {
-        format_id: WeightFormatId::new(if compressed_tensors {
+        format_id: WeightFormatId::new(if block_fp8 {
+            "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
+        } else if compressed_tensors {
             "weight-format.safetensors.compressed-tensors-marlin-int4"
         } else {
             "weight-format.safetensors.gptq-marlin-int4"
         })?,
-        layout_id: WeightLayoutId::new(if compressed_tensors {
+        layout_id: WeightLayoutId::new(if block_fp8 {
+            "weight-layout.qwen3_5.dense_hybrid.fp8_block_grid.packed_gdn_qkvzba"
+        } else if compressed_tensors {
             "weight-layout.qwen3_5.dense_hybrid.compressed_tensors_marlin_asymmetric.packed_gdn_qkvzba"
         } else if text.is_moe() {
             "weight-layout.qwen3_5.hybrid_moe.gptq_marlin_expert_major.packed_gdn_qkvzba"
         } else {
             "weight-layout.qwen3_5.dense_hybrid.gptq_marlin.packed_gdn_qkvzba"
         })?,
-        version: if compressed_tensors {
+        version: if block_fp8 || compressed_tensors {
             ContractVersion::new(1, 0)
         } else if text.is_moe() {
             ContractVersion::new(3, 2)
@@ -1448,7 +1567,8 @@ fn append_safetensors_source_layout(
             packed_dimensions[packed_axis] /= 2;
             let mut scale_dimensions = logical_dimensions.to_vec();
             let group_axis = scale_dimensions.len() - 1;
-            scale_dimensions[group_axis] /= quantization.group_size as u64;
+            let group_size = validate_gptq_marlin_config(quantization)?.group_size as u64;
+            scale_dimensions[group_axis] /= group_size;
 
             let base = component_id(weight)?.to_string();
             let packed_id = WeightId::new(format!("{base}.packed"))?;
@@ -1525,11 +1645,13 @@ fn append_safetensors_source_layout(
             packed_dimensions[packed_axis] /= 2;
             let mut scale_dimensions = logical_dimensions.to_vec();
             let group_axis = scale_dimensions.len() - 1;
-            scale_dimensions[group_axis] /= quantization.group_size as u64;
+            let group_size =
+                validate_compressed_tensors_marlin_config(quantization)?.group_size as u64;
+            scale_dimensions[group_axis] /= group_size;
             let mut zero_point_dimensions =
                 logical_dimensions[..logical_dimensions.len() - 2].to_vec();
             zero_point_dimensions.extend([
-                logical_dimensions[group_axis] / quantization.group_size as u64,
+                logical_dimensions[group_axis] / group_size,
                 logical_dimensions[logical_dimensions.len() - 2] / 8,
             ]);
 
@@ -1588,9 +1710,72 @@ fn append_safetensors_source_layout(
                 group_padding: PhysicalWeightPadding::Exact,
             })
         }
+        FamilyWeightSourceEncoding::BlockFp8 { values, scale_inv } => {
+            validate_block_fp8_weight_source(weight, values, scale_inv, quantization)?;
+            if logical_dimensions.len() < 2
+                || logical_dimensions[logical_dimensions.len() - 2..] != weight.dimensions
+                || logical_dimensions[..logical_dimensions.len() - 2]
+                    .iter()
+                    .any(|extent| *extent != 1)
+            {
+                return Err(invalid_config(
+                    "weights.dimensions",
+                    format!(
+                        "block-FP8 source role {:?} cannot represent logical shape {logical_dimensions:?}",
+                        weight.role
+                    ),
+                ));
+            }
+            let spec = block_fp8_source_quantization_spec(quantization)?;
+            let packed_dimensions = logical_dimensions.to_vec();
+            let block_axes = [
+                u32::try_from(logical_dimensions.len() - 2).map_err(|_| {
+                    invalid_config("weights.dimensions", "FP8 output block axis exceeds u32")
+                })?,
+                u32::try_from(logical_dimensions.len() - 1).map_err(|_| {
+                    invalid_config("weights.dimensions", "FP8 input block axis exceeds u32")
+                })?,
+            ];
+            let mut scale_dimensions = logical_dimensions.to_vec();
+            let [output_block, input_block] = validate_block_fp8_config(quantization)?
+                .weight_block_size
+                .as_array();
+            scale_dimensions[block_axes[0] as usize] =
+                scale_dimensions[block_axes[0] as usize].div_ceil(output_block as u64);
+            scale_dimensions[block_axes[1] as usize] =
+                scale_dimensions[block_axes[1] as usize].div_ceil(input_block as u64);
+
+            let base = component_id(weight)?.to_string();
+            let packed_id = WeightId::new(format!("{base}.packed"))?;
+            let scales_id = WeightId::new(format!("{base}.inverse_scales"))?;
+            components.push(WeightComponentSpec {
+                id: packed_id.clone(),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec![values.external_name.clone()],
+                dimensions: packed_dimensions.clone(),
+                encoding: WeightEncoding::Quantized(spec),
+                required: true,
+            });
+            components.push(WeightComponentSpec {
+                id: scales_id.clone(),
+                role: WeightComponentRole::Scales,
+                external_names: vec![scale_inv.external_name.clone()],
+                dimensions: scale_dimensions,
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::Bf16,
+                },
+                required: true,
+            });
+            Ok(PhysicalWeightLayout::QuantizedBlockGrid {
+                packed_values: PhysicalWeightComponentBinding::exact_contiguous(packed_id),
+                packed_dimensions,
+                scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
+                block_axes,
+            })
+        }
         FamilyWeightSourceEncoding::BlockQuantized(_) => Err(invalid_config(
             "weights.source_encoding",
-            "GGUF block quantization cannot enter the safetensors GPTQ schema",
+            "GGUF block quantization cannot enter the safetensors quantized schema",
         )),
     }
 }
@@ -1787,7 +1972,7 @@ fn append_safetensors_gptq_expert_stack(
     packed_dimensions[packed_axis] /= 2;
     let mut scale_dimensions = logical_dimensions.clone();
     let group_axis = scale_dimensions.len() - 1;
-    let group_size = quantization.group_size as u64;
+    let group_size = validate_gptq_marlin_config(quantization)?.group_size as u64;
     if !scale_dimensions[group_axis].is_multiple_of(group_size) {
         return Err(invalid_config(
             "weights.dimensions",
@@ -1934,18 +2119,16 @@ fn append_safetensors_composite_moe_weight(
 fn gptq_marlin_quantization_spec(
     quantization: &Qwen35QuantizationConfig,
 ) -> Result<QuantizationSpec, VNextError> {
-    validate_gptq_marlin_config(quantization)?;
+    let recipe = validate_gptq_marlin_config(quantization)?;
     Ok(QuantizationSpec {
         format_id: QuantizationFormatId::new(GPTQ_MARLIN_INT4_FORMAT_ID)?,
         bits_per_weight: 4,
-        grouping: QuantizationGrouping::fixed(u32::try_from(quantization.group_size).map_err(
-            |_| {
-                invalid_config(
-                    "hf_config.quantization_config.group_size",
-                    "GPTQ group size exceeds u32",
-                )
-            },
-        )?),
+        grouping: QuantizationGrouping::fixed(u32::try_from(recipe.group_size).map_err(|_| {
+            invalid_config(
+                "hf_config.quantization_config.group_size",
+                "GPTQ group size exceeds u32",
+            )
+        })?),
         packing: QuantizationPacking::Tiled,
         scale_type: ElementType::F16,
         zero_point_type: None,
@@ -2246,7 +2429,8 @@ fn gguf_component_spec(weight: &FamilyWeight) -> Result<WeightComponentSpec, VNe
             )
         }
         FamilyWeightSourceEncoding::Gptq { .. }
-        | FamilyWeightSourceEncoding::CompressedTensors { .. } => {
+        | FamilyWeightSourceEncoding::CompressedTensors { .. }
+        | FamilyWeightSourceEncoding::BlockFp8 { .. } => {
             return Err(invalid_config(
                 "weights.source_encoding",
                 "safetensors quantized components cannot enter the GGUF schema",
@@ -2306,7 +2490,8 @@ fn gguf_component_layout(
             })
         }
         FamilyWeightSourceEncoding::Gptq { .. }
-        | FamilyWeightSourceEncoding::CompressedTensors { .. } => Err(invalid_config(
+        | FamilyWeightSourceEncoding::CompressedTensors { .. }
+        | FamilyWeightSourceEncoding::BlockFp8 { .. } => Err(invalid_config(
             "weights.source_encoding",
             "safetensors quantized components cannot enter the GGUF schema",
         )),
@@ -2336,6 +2521,9 @@ pub(super) fn prepare_from_sources(
                     CompressedTensorsMarlinSafetensorsSource::new(weights),
                     config,
                 ),
+                FamilyWeightFormat::SafetensorsBlockFp8 => {
+                    finish_preparation(sources, BlockFp8SafetensorsSource::new(weights), config)
+                }
                 FamilyWeightFormat::SafetensorsDense => {
                     finish_preparation(sources, weights, config)
                 }
@@ -2442,12 +2630,23 @@ fn load_safetensors_family_config(
 
     let inventory = Qwen35WeightInventory::from_names(archive.tensor_names());
     let plan = inventory.detect_prefix_and_resolve(&text)?;
+    if text
+        .quantization
+        .as_ref()
+        .and_then(Qwen35QuantizationConfig::as_fp8)
+        .is_some()
+    {
+        inventory
+            .partition_resolved_plan(&plan)?
+            .require_no_unknown()?;
+    }
     let mut weights = Vec::new();
     append_resolved_weights(
         &mut weights,
         &plan.global_tensors,
         None,
         text.tie_word_embeddings,
+        text.quantization.as_ref(),
         archive,
     )?;
     for layer in &plan.layers {
@@ -2456,6 +2655,7 @@ fn load_safetensors_family_config(
             &layer.tensors,
             Some(layer.layer_index as u32),
             text.tie_word_embeddings,
+            text.quantization.as_ref(),
             archive,
         )?;
     }
@@ -2476,10 +2676,11 @@ fn load_safetensors_family_config(
         weight_format: match text
             .quantization
             .as_ref()
-            .map(|config| config.quant_method.as_str())
+            .map(Qwen35QuantizationConfig::quant_method)
         {
             Some("gptq") => FamilyWeightFormat::SafetensorsGptqMarlin,
             Some("compressed-tensors") => FamilyWeightFormat::SafetensorsCompressedTensorsMarlin,
+            Some("fp8") => FamilyWeightFormat::SafetensorsBlockFp8,
             Some(other) => {
                 return Err(format!(
                     "unsupported safetensors quantization method {other:?}"
@@ -2692,6 +2893,7 @@ fn append_resolved_weights(
     resolved: &[Qwen35ResolvedWeightSpec],
     layer_index: Option<u32>,
     tied_embeddings: bool,
+    quantization: Option<&Qwen35QuantizationConfig>,
     weights: &SafetensorsArchive,
 ) -> Result<(), String> {
     for weight in resolved
@@ -2726,6 +2928,43 @@ fn append_resolved_weights(
                     tensor.shape().to_vec(),
                     FamilyWeightSourceEncoding::Dense {
                         element_type: source_element_type,
+                    },
+                )
+            }
+            Qwen35ResolvedWeightSource::BlockFp8 { values, scale_inv } => {
+                let recipe = quantization
+                    .and_then(Qwen35QuantizationConfig::as_fp8)
+                    .ok_or_else(|| {
+                        format!("resolved block-FP8 tensor {values:?} has no typed FP8 recipe")
+                    })?;
+                let values_source =
+                    family_block_fp8_tensor(weights, values, FamilyBlockFp8Dtype::F8E4m3)?;
+                let scale_source =
+                    family_block_fp8_tensor(weights, scale_inv, FamilyBlockFp8Dtype::Bf16)?;
+                let [n, k] = values_source.dimensions.as_slice() else {
+                    return Err(format!(
+                        "resolved block-FP8 values {values:?} must have shape [N, K]"
+                    ));
+                };
+                let block = recipe.weight_block_size;
+                let output_block = u64::try_from(block.output_features)
+                    .map_err(|_| "FP8 output block size exceeds u64".to_owned())?;
+                let input_block = u64::try_from(block.input_features)
+                    .map_err(|_| "FP8 input block size exceeds u64".to_owned())?;
+                let expected_scale_dimensions =
+                    vec![n.div_ceil(output_block), k.div_ceil(input_block)];
+                if scale_source.dimensions != expected_scale_dimensions {
+                    return Err(format!(
+                        "block-FP8 inverse-scale {scale_inv:?} shape {:?} differs from the typed grid {:?} for values [{n}, {k}]",
+                        scale_source.dimensions, expected_scale_dimensions
+                    ));
+                }
+                (
+                    values.clone(),
+                    values_source.dimensions.clone(),
+                    FamilyWeightSourceEncoding::BlockFp8 {
+                        values: values_source,
+                        scale_inv: scale_source,
                     },
                 )
             }
@@ -2872,6 +3111,35 @@ fn family_compressed_tensors_tensor(
     })
 }
 
+fn family_block_fp8_tensor(
+    weights: &SafetensorsArchive,
+    external_name: &str,
+    expected_dtype: FamilyBlockFp8Dtype,
+) -> Result<FamilyBlockFp8Tensor, String> {
+    let tensor = weights
+        .tensor(external_name)
+        .map_err(|error| error.to_string())?;
+    let dtype = match tensor.dtype() {
+        safetensors::Dtype::F8_E4M3 => FamilyBlockFp8Dtype::F8E4m3,
+        safetensors::Dtype::BF16 => FamilyBlockFp8Dtype::Bf16,
+        other => {
+            return Err(format!(
+                "resolved block-FP8 tensor {external_name:?} has unsupported dtype {other:?}"
+            ))
+        }
+    };
+    if dtype != expected_dtype {
+        return Err(format!(
+            "resolved block-FP8 tensor {external_name:?} has dtype {dtype:?}, expected {expected_dtype:?}"
+        ));
+    }
+    Ok(FamilyBlockFp8Tensor {
+        external_name: external_name.to_owned(),
+        dimensions: tensor.shape().to_vec(),
+        dtype,
+    })
+}
+
 fn resolved_weight_keys<'a>(
     resolved: &'a [Qwen35ResolvedWeightSpec],
     layer_index: Option<u32>,
@@ -2907,67 +3175,262 @@ fn resolved_weight_keys_from_config(
         .collect()
 }
 
-fn validate_gptq_marlin_config(quantization: &Qwen35QuantizationConfig) -> Result<(), VNextError> {
-    if quantization.quant_method != "gptq"
-        || quantization.format.is_some()
-        || quantization.bits != 4
-        || quantization.group_size == 0
-        || !quantization.group_size.is_power_of_two()
-        || quantization.desc_act
-        || !quantization.sym
-        || quantization.weight_type.is_some()
-        || quantization.strategy.is_some()
-        || quantization.dynamic.is_some()
-        || !quantization.targets.is_empty()
-        || quantization.input_activations
-        || quantization.output_activations
+fn validate_gptq_marlin_config(
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<&Qwen35GptqQuantizationRecipe, VNextError> {
+    let Qwen35QuantizationConfig::Gptq(recipe) = quantization else {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "typed Marlin requires GPTQ INT4, power-of-two group_size, sym=true, and desc_act=false",
+        ));
+    };
+    if recipe.bits != 4
+        || recipe.group_size == 0
+        || !recipe.group_size.is_power_of_two()
+        || recipe.desc_act
+        || !recipe.sym
     {
         return Err(invalid_config(
             "hf_config.quantization_config",
             "typed Marlin requires GPTQ INT4, power-of-two group_size, sym=true, and desc_act=false",
         ));
     }
-    Ok(())
+    Ok(recipe)
 }
 
 fn validate_safetensors_quantization_config(
     quantization: &Qwen35QuantizationConfig,
 ) -> Result<(), VNextError> {
-    match quantization.quant_method.as_str() {
-        "gptq" => validate_gptq_marlin_config(quantization),
-        "compressed-tensors" => validate_compressed_tensors_marlin_config(quantization),
-        _ => Err(invalid_config(
-            "hf_config.quantization_config.quant_method",
-            format!(
-                "unsupported safetensors quantization method {:?}",
-                quantization.quant_method
-            ),
-        )),
+    match quantization {
+        Qwen35QuantizationConfig::Gptq(_) => validate_gptq_marlin_config(quantization).map(|_| ()),
+        Qwen35QuantizationConfig::CompressedTensors(_) => {
+            validate_compressed_tensors_marlin_config(quantization).map(|_| ())
+        }
+        Qwen35QuantizationConfig::Fp8(_) => Ok(()),
     }
+}
+
+fn validate_block_fp8_config(
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<&Qwen35Fp8QuantizationRecipe, VNextError> {
+    let Qwen35QuantizationConfig::Fp8(recipe) = quantization else {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "typed block-FP8 requires official E4M3 dynamic-activation metadata with a 128x128 weight grid",
+        ));
+    };
+    if recipe.weight_block_size.as_array() != [128, 128] || recipe.modules_to_not_convert.is_empty()
+    {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "typed block-FP8 requires official E4M3 dynamic-activation metadata with a 128x128 weight grid and explicit dense exclusions",
+        ));
+    }
+    Ok(recipe)
+}
+
+fn block_fp8_source_quantization_spec(
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<QuantizationSpec, VNextError> {
+    let recipe = validate_block_fp8_config(quantization)?;
+    let [output_features, input_features] = recipe.weight_block_size.as_array();
+    let output_features = u32::try_from(output_features)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            invalid_config(
+                "hf_config.quantization_config.weight_block_size",
+                "FP8 output block size is zero or exceeds u32",
+            )
+        })?;
+    let input_features = u32::try_from(input_features)
+        .ok()
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            invalid_config(
+                "hf_config.quantization_config.weight_block_size",
+                "FP8 input block size is zero or exceeds u32",
+            )
+        })?;
+    Ok(QuantizationSpec {
+        format_id: QuantizationFormatId::new(BLOCK_FP8_E4M3_SOURCE_FORMAT_ID)?,
+        bits_per_weight: 8,
+        grouping: QuantizationGrouping::block_2d([output_features, input_features]),
+        packing: QuantizationPacking::Linear,
+        scale_type: ElementType::Bf16,
+        zero_point_type: None,
+    })
+}
+
+fn validate_block_fp8_source_completeness(
+    config: &Qwen35FamilyConfig,
+    recipe: &Qwen35Fp8QuantizationRecipe,
+) -> Result<(), VNextError> {
+    let exclusions = recipe
+        .modules_to_not_convert
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut execution_pair_count = 0_usize;
+
+    for weight in &config.weights {
+        let is_eligible_projection =
+            BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str());
+        let source_name = match &weight.source_encoding {
+            FamilyWeightSourceEncoding::Dense { .. } => weight.external_name.as_str(),
+            FamilyWeightSourceEncoding::BlockFp8 { values, .. } => values.external_name.as_str(),
+            FamilyWeightSourceEncoding::Gptq { .. }
+            | FamilyWeightSourceEncoding::CompressedTensors { .. }
+            | FamilyWeightSourceEncoding::BlockQuantized(_) => continue,
+        };
+
+        if !is_eligible_projection {
+            if matches!(
+                weight.source_encoding,
+                FamilyWeightSourceEncoding::BlockFp8 { .. }
+            ) {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "non-projection role {:?} must not carry a block-FP8 value/inverse-scale pair",
+                        weight.role
+                    ),
+                ));
+            }
+            continue;
+        }
+
+        let module = source_name.strip_suffix(".weight").ok_or_else(|| {
+            invalid_config(
+                "weights.source_encoding",
+                format!(
+                    "execution-eligible projection role {:?} source {source_name:?} does not identify a .weight tensor",
+                    weight.role
+                ),
+            )
+        })?;
+        let is_typed_dense_exclusion = exclusions.contains(module);
+        match (&weight.source_encoding, is_typed_dense_exclusion) {
+            (FamilyWeightSourceEncoding::BlockFp8 { .. }, false) => {
+                execution_pair_count = execution_pair_count.checked_add(1).ok_or_else(|| {
+                    invalid_config(
+                        "weights.source_encoding",
+                        "block-FP8 execution pair count overflows usize",
+                    )
+                })?;
+            }
+            (FamilyWeightSourceEncoding::Dense { .. }, true) => {}
+            (FamilyWeightSourceEncoding::Dense { .. }, false) => {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "execution-eligible projection {module:?} is not listed in modules_to_not_convert and must provide a complete E4M3 .weight plus BF16 .weight_scale_inv pair"
+                    ),
+                ));
+            }
+            (FamilyWeightSourceEncoding::BlockFp8 { .. }, true) => {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "typed dense exclusion {module:?} must not provide a block-FP8 value/inverse-scale pair"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "execution-eligible projection {module:?} has an unsupported source bundle"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if execution_pair_count == 0 {
+        return Err(invalid_config(
+            "weights.source_encoding",
+            "block-FP8 package contains no execution-eligible E4M3 value/BF16 inverse-scale pair",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_block_fp8_weight_source(
+    weight: &FamilyWeight,
+    values: &FamilyBlockFp8Tensor,
+    scale_inv: &FamilyBlockFp8Tensor,
+    quantization: &Qwen35QuantizationConfig,
+) -> Result<(), VNextError> {
+    let recipe = validate_block_fp8_config(quantization)?;
+    let stem = values
+        .external_name
+        .strip_suffix(".weight")
+        .unwrap_or_default();
+    if weight.external_name != values.external_name
+        || stem.is_empty()
+        || scale_inv.external_name != format!("{stem}.weight_scale_inv")
+        || values.dtype != FamilyBlockFp8Dtype::F8E4m3
+        || scale_inv.dtype != FamilyBlockFp8Dtype::Bf16
+        || weight.dimensions != values.dimensions
+    {
+        return Err(invalid_config(
+            "weights.source_encoding",
+            format!(
+                "role {:?} has an invalid block-FP8 value/inverse-scale identity or dtype",
+                weight.role
+            ),
+        ));
+    }
+    let [n, k] = weight.dimensions.as_slice() else {
+        return Err(invalid_config(
+            "weights.dimensions",
+            "block-FP8 logical weight must have shape [N, K]",
+        ));
+    };
+    let [output_block, input_block] = recipe.weight_block_size.as_array();
+    let output_block = output_block as u64;
+    let input_block = input_block as u64;
+    let expected_scale_dimensions = [n.div_ceil(output_block), k.div_ceil(input_block)];
+    if scale_inv.dimensions != expected_scale_dimensions {
+        return Err(invalid_config(
+            "weights.source_encoding.scale_inv.dimensions",
+            format!(
+                "role {:?} inverse-scale shape {:?} differs from the block grid {expected_scale_dimensions:?}",
+                weight.role, scale_inv.dimensions
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_compressed_tensors_marlin_config(
     quantization: &Qwen35QuantizationConfig,
-) -> Result<(), VNextError> {
-    if quantization.quant_method != "compressed-tensors"
-        || quantization.format.as_deref() != Some("pack-quantized")
-        || quantization.bits != 4
-        || quantization.group_size != 32
-        || quantization.desc_act
-        || quantization.sym
-        || quantization.weight_type.as_deref() != Some("int")
-        || quantization.strategy.as_deref() != Some("group")
-        || quantization.dynamic != Some(false)
-        || quantization.targets != ["Linear"]
-        || quantization.input_activations
-        || quantization.output_activations
+) -> Result<&Qwen35CompressedTensorsQuantizationRecipe, VNextError> {
+    let Qwen35QuantizationConfig::CompressedTensors(recipe) = quantization else {
+        return Err(invalid_config(
+            "hf_config.quantization_config",
+            "typed compressed-tensors Marlin requires pack-quantized INT4, group_size=32, asymmetric static Linear weights, and no activation quantization",
+        ));
+    };
+    if recipe.format != "pack-quantized"
+        || recipe.bits != 4
+        || recipe.group_size != 32
+        || recipe.desc_act
+        || recipe.sym
+        || recipe.weight_type != "int"
+        || recipe.strategy != "group"
+        || recipe.dynamic != Some(false)
+        || recipe.targets != ["Linear"]
+        || recipe.input_activations
+        || recipe.output_activations
     {
         return Err(invalid_config(
             "hf_config.quantization_config",
             "typed compressed-tensors Marlin requires pack-quantized INT4, group_size=32, asymmetric static Linear weights, and no activation quantization",
         ));
     }
-    Ok(())
+    Ok(recipe)
 }
 
 fn validate_compressed_tensors_weight_source(
@@ -2978,7 +3441,7 @@ fn validate_compressed_tensors_weight_source(
     weight_shape: &FamilyCompressedTensorsTensor,
     quantization: &Qwen35QuantizationConfig,
 ) -> Result<(), VNextError> {
-    validate_compressed_tensors_marlin_config(quantization)?;
+    let recipe = validate_compressed_tensors_marlin_config(quantization)?;
     let stem = weight_packed
         .external_name
         .strip_suffix(".weight_packed")
@@ -3011,7 +3474,7 @@ fn validate_compressed_tensors_weight_source(
             "compressed-tensors logical weight must have shape [N, K]",
         ));
     };
-    let group_size = quantization.group_size as u64;
+    let group_size = recipe.group_size as u64;
     if *n % 64 != 0
         || *k % 16 != 0
         || !k.is_multiple_of(group_size)
@@ -3038,7 +3501,7 @@ fn validate_gptq_weight_source(
     g_idx: Option<&FamilyGptqTensor>,
     quantization: &Qwen35QuantizationConfig,
 ) -> Result<(), VNextError> {
-    validate_gptq_marlin_config(quantization)?;
+    let recipe = validate_gptq_marlin_config(quantization)?;
     let qweight_stem = qweight
         .external_name
         .strip_suffix(".qweight")
@@ -3072,7 +3535,7 @@ fn validate_gptq_weight_source(
     let k = packed_k
         .checked_mul(8)
         .ok_or_else(|| invalid_config("weights.dimensions", "GPTQ K dimension overflows"))?;
-    let group_size = quantization.group_size as u64;
+    let group_size = recipe.group_size as u64;
     if k % 16 != 0
         || *n % 16 != 0
         || !k.is_multiple_of(group_size)
@@ -3127,6 +3590,12 @@ fn family_source_external_names(config: &Qwen35FamilyConfig) -> Vec<String> {
                 .into_iter()
                 .map(|source| source.external_name.clone())
                 .collect(),
+            FamilyWeightSourceEncoding::BlockFp8 { values, scale_inv } => {
+                vec![
+                    values.external_name.clone(),
+                    scale_inv.external_name.clone(),
+                ]
+            }
             FamilyWeightSourceEncoding::Dense { .. }
             | FamilyWeightSourceEncoding::BlockQuantized(_) => {
                 vec![weight.external_name.clone()]
@@ -3781,18 +4250,909 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::ops::Range;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use ferrum_interfaces::vnext::{
-        gated_delta_recurrent_attention_contract, routed_shared_swiglu_moe_contract,
+        causal_paged_attention_contract, dense_swiglu_contract,
+        gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
+        routed_shared_swiglu_moe_contract, DeviceClass, DeviceDescriptor, DeviceId,
+        DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
         ModelArtifactSourceRole, ModelSourceKind, OperationContract, OriginalModelSource,
         OriginalModelSources, PhysicalStorageLayout, PhysicalWeightComponentBinding,
-        WeightComponentSource,
+        WeightComponentSource, WeightMaterializationFidelity,
     };
-    use half::f16;
-    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use ferrum_kernels::marlin_fp8_materializer::{
+        block_fp8_to_marlin_fp8_weight_materializer, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+    };
+    use ferrum_quantization::SafetensorsTensor;
+    use half::{bf16, f16};
+    use memmap2::Mmap;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView, View};
+    use safetensors::SafeTensors;
 
     const QWEN38_AWQ_INT4_CONFIG: &[u8] =
         include_bytes!("../../tests/fixtures/qwen38_awq_int4_config.contract.json");
+    const QWEN38_FP8_CONFIG: &[u8] =
+        include_bytes!("../../tests/fixtures/qwen38_fp8_config.contract.json");
+    const QWEN38_FP8_BAD_RECIPE: &[u8] =
+        include_bytes!("../../tests/fixtures/qwen38_fp8_config.bad-recipe.json");
+    const QWEN35_08B_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
+    const QWEN35_08B_CACHE_REPO_DIR: &str = "models--Qwen--Qwen3.5-0.8B";
+    const QWEN35_08B_SOURCE_TENSOR_COUNT: usize = 488;
+    const QWEN35_08B_SOURCE_PAYLOAD_BYTES: u64 = 1_746_882_752;
+    const QWEN35_08B_DERIVED_FP8_PAIR_COUNT: usize = 150;
+    const QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT: usize = 37;
+    const BLOCK_FP8_OUTPUT_BLOCK: usize = 128;
+    const BLOCK_FP8_INPUT_BLOCK: usize = 128;
+    const BLOCK_FP8_MAX_FINITE: f32 = 448.0;
+    const DERIVED_DENSE_PROJECTION_ROLES: &[&str] = &["lm_head", "linear_attn_b", "linear_attn_a"];
+
+    fn fixed_qwen35_08b_snapshot_dir() -> PathBuf {
+        hf_hub::Cache::default()
+            .path()
+            .join(QWEN35_08B_CACHE_REPO_DIR)
+            .join("snapshots")
+            .join(QWEN35_08B_REVISION)
+    }
+
+    enum DerivedSafetensorsView<'archive> {
+        Borrowed {
+            source: SafetensorsTensor<'archive>,
+            shape: Vec<usize>,
+        },
+        BlockFp8Values {
+            source: SafetensorsTensor<'archive>,
+            shape: Vec<usize>,
+            scales_bf16_le: Arc<[u8]>,
+        },
+        BlockFp8Scales {
+            shape: Vec<usize>,
+            scales_bf16_le: Arc<[u8]>,
+        },
+    }
+
+    impl View for DerivedSafetensorsView<'_> {
+        fn dtype(&self) -> Dtype {
+            match self {
+                Self::Borrowed { source, .. } => source.dtype(),
+                Self::BlockFp8Values { .. } => Dtype::F8_E4M3,
+                Self::BlockFp8Scales { .. } => Dtype::BF16,
+            }
+        }
+
+        fn shape(&self) -> &[usize] {
+            match self {
+                Self::Borrowed { shape, .. }
+                | Self::BlockFp8Values { shape, .. }
+                | Self::BlockFp8Scales { shape, .. } => shape,
+            }
+        }
+
+        fn data(&self) -> Cow<'_, [u8]> {
+            match self {
+                Self::Borrowed { source, .. } => Cow::Borrowed(source.bytes()),
+                Self::BlockFp8Values {
+                    source,
+                    shape,
+                    scales_bf16_le,
+                } => {
+                    let [n, k] = shape.as_slice() else {
+                        unreachable!("block-FP8 source shape was preflighted as [N, K]")
+                    };
+                    Cow::Owned(
+                        quantize_bf16_matrix_to_block_fp8(source.bytes(), *n, *k, scales_bf16_le)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "lazy block-FP8 encode failed for {:?}: {error}",
+                                    source.external_name()
+                                )
+                            }),
+                    )
+                }
+                Self::BlockFp8Scales { scales_bf16_le, .. } => Cow::Borrowed(scales_bf16_le),
+            }
+        }
+
+        fn data_len(&self) -> usize {
+            match self {
+                Self::Borrowed { source, .. } => source.bytes().len(),
+                Self::BlockFp8Values { shape, .. } => shape
+                    .iter()
+                    .copied()
+                    .try_fold(1_usize, usize::checked_mul)
+                    .expect("preflighted block-FP8 element count"),
+                Self::BlockFp8Scales { scales_bf16_le, .. } => scales_bf16_le.len(),
+            }
+        }
+    }
+
+    fn usize_shape(shape: &[u64], tensor_name: &str) -> Result<Vec<usize>, String> {
+        shape
+            .iter()
+            .map(|extent| {
+                usize::try_from(*extent).map_err(|_| {
+                    format!("tensor {tensor_name:?} extent {extent} exceeds host usize")
+                })
+            })
+            .collect()
+    }
+
+    fn bounded_worker_count(work_items: usize) -> usize {
+        std::thread::available_parallelism()
+            .map_or(1, |parallelism| parallelism.get())
+            .min(8)
+            .min(work_items.max(1))
+    }
+
+    fn fill_bounded_ranges(
+        total_units: usize,
+        bytes_per_unit: usize,
+        output: &mut [u8],
+        thread_name: &str,
+        fill: impl Fn(Range<usize>, &mut [u8]) -> Result<(), String> + Sync,
+    ) -> Result<(), String> {
+        let expected_bytes = total_units
+            .checked_mul(bytes_per_unit)
+            .ok_or_else(|| format!("{thread_name} output byte count overflows usize"))?;
+        if total_units == 0 || bytes_per_unit == 0 || output.len() != expected_bytes {
+            return Err(format!(
+                "{thread_name} received invalid bounded range: units={total_units} bytes_per_unit={bytes_per_unit} output_bytes={}",
+                output.len()
+            ));
+        }
+        let workers = bounded_worker_count(total_units);
+        let units_per_worker = total_units.div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut remaining = output;
+            let mut handles = Vec::with_capacity(workers);
+            let mut spawn_error = None;
+            for worker in 0..workers {
+                let start = worker * units_per_worker;
+                let end = (start + units_per_worker).min(total_units);
+                if start == end {
+                    break;
+                }
+                let chunk_bytes = (end - start)
+                    .checked_mul(bytes_per_unit)
+                    .expect("bounded chunk byte count was preflighted");
+                let (chunk, tail) = remaining.split_at_mut(chunk_bytes);
+                remaining = tail;
+                let fill = &fill;
+                match std::thread::Builder::new()
+                    .name(format!("{thread_name}-{worker}"))
+                    .spawn_scoped(scope, move || fill(start..end, chunk))
+                {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        spawn_error = Some(format!(
+                            "spawn {thread_name} worker {worker}/{workers}: {error}"
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            let mut first_error = spawn_error;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(payload) => {
+                        if first_error.is_none() {
+                            let reason = payload
+                                .downcast_ref::<&str>()
+                                .map(|value| (*value).to_owned())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic payload".to_owned());
+                            first_error = Some(format!("{thread_name} worker panicked: {reason}"));
+                        }
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })
+    }
+
+    fn source_bf16_at(source_bf16_le: &[u8], index: usize) -> bf16 {
+        let offset = index * 2;
+        bf16::from_bits(u16::from_le_bytes([
+            source_bf16_le[offset],
+            source_bf16_le[offset + 1],
+        ]))
+    }
+
+    fn stored_bf16_inverse_scale(maximum: f32) -> Result<bf16, String> {
+        if maximum == 0.0 {
+            return Ok(bf16::from_f32(1.0));
+        }
+        if !maximum.is_finite() || maximum < 0.0 {
+            return Err(format!("invalid block maximum {maximum}"));
+        }
+        let required = f64::from(maximum) / f64::from(BLOCK_FP8_MAX_FINITE);
+        let mut bits = bf16::from_f32(required as f32).to_bits();
+        loop {
+            let stored = bf16::from_bits(bits);
+            let stored_f64 = f64::from(stored.to_f32());
+            if stored.is_finite() && stored > bf16::ZERO && stored_f64 >= required {
+                return Ok(stored);
+            }
+            bits = bits
+                .checked_add(1)
+                .ok_or_else(|| format!("BF16 inverse scale overflows for maximum {maximum}"))?;
+        }
+    }
+
+    fn derive_block_fp8_scales(
+        source_bf16_le: &[u8],
+        n: usize,
+        k: usize,
+        tensor_name: &str,
+    ) -> Result<Arc<[u8]>, String> {
+        let source_elements = n
+            .checked_mul(k)
+            .ok_or_else(|| format!("tensor {tensor_name:?} element count overflows usize"))?;
+        let expected_source_bytes = source_elements
+            .checked_mul(2)
+            .ok_or_else(|| format!("tensor {tensor_name:?} BF16 byte count overflows usize"))?;
+        if n == 0 || k == 0 || source_bf16_le.len() != expected_source_bytes {
+            return Err(format!(
+                "tensor {tensor_name:?} has invalid BF16 matrix storage: shape=[{n}, {k}] bytes={} expected={expected_source_bytes}",
+                source_bf16_le.len()
+            ));
+        }
+        let block_rows = n.div_ceil(BLOCK_FP8_OUTPUT_BLOCK);
+        let block_columns = k.div_ceil(BLOCK_FP8_INPUT_BLOCK);
+        let scale_row_bytes = block_columns
+            .checked_mul(2)
+            .ok_or_else(|| format!("tensor {tensor_name:?} scale row overflows usize"))?;
+        let scale_bytes = block_rows
+            .checked_mul(scale_row_bytes)
+            .ok_or_else(|| format!("tensor {tensor_name:?} scale grid overflows usize"))?;
+        let mut output = vec![0_u8; scale_bytes];
+        fill_bounded_ranges(
+            block_rows,
+            scale_row_bytes,
+            &mut output,
+            "qwen35-fp8-scale",
+            |range, destination| {
+                for block_output in range.clone() {
+                    let row_start = block_output * BLOCK_FP8_OUTPUT_BLOCK;
+                    let row_end = (row_start + BLOCK_FP8_OUTPUT_BLOCK).min(n);
+                    for block_input in 0..block_columns {
+                        let input_start = block_input * BLOCK_FP8_INPUT_BLOCK;
+                        let input_end = (input_start + BLOCK_FP8_INPUT_BLOCK).min(k);
+                        let mut maximum = 0.0_f32;
+                        for output_feature in row_start..row_end {
+                            for input_feature in input_start..input_end {
+                                let source_index = output_feature * k + input_feature;
+                                let value = source_bf16_at(source_bf16_le, source_index).to_f32();
+                                if !value.is_finite() {
+                                    return Err(format!(
+                                        "tensor {tensor_name:?} contains non-finite BF16 at [{output_feature}, {input_feature}]"
+                                    ));
+                                }
+                                maximum = maximum.max(value.abs());
+                            }
+                        }
+                        let scale = stored_bf16_inverse_scale(maximum)?;
+                        let local_block_output = block_output - range.start;
+                        let offset = (local_block_output * block_columns + block_input) * 2;
+                        destination[offset..offset + 2]
+                            .copy_from_slice(&scale.to_bits().to_le_bytes());
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(output.into())
+    }
+
+    fn quantize_bf16_matrix_to_block_fp8(
+        source_bf16_le: &[u8],
+        n: usize,
+        k: usize,
+        scales_bf16_le: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let value_count = n
+            .checked_mul(k)
+            .ok_or_else(|| "block-FP8 value count overflows usize".to_owned())?;
+        let expected_source_bytes = value_count
+            .checked_mul(2)
+            .ok_or_else(|| "block-FP8 BF16 byte count overflows usize".to_owned())?;
+        let block_rows = n.div_ceil(BLOCK_FP8_OUTPUT_BLOCK);
+        let block_columns = k.div_ceil(BLOCK_FP8_INPUT_BLOCK);
+        let expected_scale_bytes = block_rows
+            .checked_mul(block_columns)
+            .and_then(|count| count.checked_mul(2))
+            .ok_or_else(|| "block-FP8 scale grid byte count overflows usize".to_owned())?;
+        if n == 0
+            || k == 0
+            || source_bf16_le.len() != expected_source_bytes
+            || scales_bf16_le.len() != expected_scale_bytes
+        {
+            return Err(format!(
+                "invalid block-FP8 input lengths for [{n}, {k}]: source={} expected_source={expected_source_bytes} scales={} expected_scales={expected_scale_bytes}",
+                source_bf16_le.len(),
+                scales_bf16_le.len()
+            ));
+        }
+
+        let mut output = vec![0_u8; value_count];
+        fill_bounded_ranges(
+            n,
+            k,
+            &mut output,
+            "qwen35-fp8-values",
+            |range, destination| {
+                for output_feature in range.clone() {
+                    let local_output = output_feature - range.start;
+                    for input_feature in 0..k {
+                        let source_index = output_feature * k + input_feature;
+                        let value = source_bf16_at(source_bf16_le, source_index).to_f32();
+                        if !value.is_finite() {
+                            return Err(format!(
+                                "non-finite BF16 source at [{output_feature}, {input_feature}]"
+                            ));
+                        }
+                        let scale_index = ((output_feature / BLOCK_FP8_OUTPUT_BLOCK)
+                            * block_columns
+                            + input_feature / BLOCK_FP8_INPUT_BLOCK)
+                            * 2;
+                        let scale = bf16::from_bits(u16::from_le_bytes([
+                            scales_bf16_le[scale_index],
+                            scales_bf16_le[scale_index + 1],
+                        ]))
+                        .to_f32();
+                        if !scale.is_finite() || !(scale > 0.0) {
+                            return Err(format!(
+                                "invalid stored BF16 inverse scale at [{output_feature}, {input_feature}]"
+                            ));
+                        }
+                        let normalized = value / scale;
+                        if !normalized.is_finite() || normalized.abs() > BLOCK_FP8_MAX_FINITE {
+                            return Err(format!(
+                                "stored BF16 scale would clip source [{output_feature}, {input_feature}]: value={value} scale={scale} normalized={normalized}"
+                            ));
+                        }
+                        let bits = float8::F8E4M3::from_f32(normalized).to_bits();
+                        if bits & 0x7f == 0x7f {
+                            return Err(format!(
+                                "E4M3 encoder produced non-finite bits 0x{bits:02x} at [{output_feature}, {input_feature}]"
+                            ));
+                        }
+                        destination[local_output * k + input_feature] = bits;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(output)
+    }
+
+    fn block_fp8_derived_quantizes_role(role: &str) -> bool {
+        BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&role)
+            && !DERIVED_DENSE_PROJECTION_ROLES.contains(&role)
+    }
+
+    fn safetensors_file_metadata(path: &Path) -> Result<Option<HashMap<String, String>>, String> {
+        let file = File::open(path).map_err(|error| format!("open {path:?}: {error}"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("stat opened {path:?}: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!("opened safetensors source {path:?} is not a file"));
+        }
+        let mmap = unsafe { Mmap::map(&file).map_err(|error| format!("mmap {path:?}: {error}"))? };
+        let (_, metadata) = SafeTensors::read_metadata(&mmap)
+            .map_err(|error| format!("read safetensors metadata {path:?}: {error}"))?;
+        Ok(metadata.metadata().clone())
+    }
+
+    fn create_unique_derived_model_dir() -> Result<PathBuf, String> {
+        let temporary_root = std::env::temp_dir();
+        if !temporary_root.is_dir() {
+            return Err(format!(
+                "TMPDIR root {temporary_root:?} is not an existing directory"
+            ));
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock precedes UNIX epoch: {error}"))?
+            .as_nanos();
+        for attempt in 0..100_u32 {
+            let path = temporary_root.join(format!(
+                "ferrum-qwen35-08b-block-fp8-{}-{nonce}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create derived model dir {path:?}: {error}")),
+            }
+        }
+        Err("could not allocate a unique derived model directory under TMPDIR".to_owned())
+    }
+
+    fn copy_snapshot_metadata_files(source: &Path, destination: &Path) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(source)
+            .map_err(|error| format!("read source snapshot {source:?}: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("list source snapshot {source:?}: {error}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let source_path = entry.path();
+            let file_name = entry.file_name();
+            let file_name_text = file_name.to_string_lossy();
+            if file_name_text == "config.json"
+                || file_name_text == "model.safetensors.index.json"
+                || file_name_text.ends_with(".safetensors")
+            {
+                continue;
+            }
+            let followed = std::fs::metadata(&source_path)
+                .map_err(|error| format!("follow snapshot entry {source_path:?}: {error}"))?;
+            if !followed.is_file() {
+                return Err(format!(
+                    "snapshot entry {source_path:?} is not a regular file (symlink-to-directory is forbidden)"
+                ));
+            }
+            let mut source_file = File::open(&source_path)
+                .map_err(|error| format!("open {source_path:?}: {error}"))?;
+            if !source_file
+                .metadata()
+                .map_err(|error| format!("stat opened {source_path:?}: {error}"))?
+                .is_file()
+            {
+                return Err(format!(
+                    "opened snapshot entry {source_path:?} is not a file"
+                ));
+            }
+            let destination_path = destination.join(&file_name);
+            let mut destination_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination_path)
+                .map_err(|error| format!("create {destination_path:?}: {error}"))?;
+            std::io::copy(&mut source_file, &mut destination_file).map_err(|error| {
+                format!(
+                    "materialize snapshot file {source_path:?} -> {destination_path:?}: {error}"
+                )
+            })?;
+            destination_file
+                .flush()
+                .map_err(|error| format!("flush {destination_path:?}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!("create {path:?}: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write {path:?}: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("flush {path:?}: {error}"))
+    }
+
+    #[test]
+    fn derived_block_fp8_quantization_uses_stored_bf16_scale_without_clipping() {
+        assert_eq!(float8::F8E4M3::from_f32(448.0).to_bits(), 0x7e);
+        assert_eq!(float8::F8E4M3::from_bits(0x7e).to_f32(), 448.0);
+
+        let (n, k) = (130_usize, 129_usize);
+        let mut source = Vec::with_capacity(n * k * 2);
+        for index in 0..n * k {
+            let value = match index {
+                0 => bf16::MAX,
+                1 => -bf16::MAX,
+                _ if index % 17 == 0 => bf16::ZERO,
+                _ => bf16::from_f32(((index % 257) as f32 - 128.0) / 13.0),
+            };
+            source.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let scales = derive_block_fp8_scales(&source, n, k, "synthetic.weight").unwrap();
+        assert_eq!(scales.len(), n.div_ceil(128) * k.div_ceil(128) * 2);
+        let quantized = quantize_bf16_matrix_to_block_fp8(&source, n, k, scales.as_ref()).unwrap();
+        assert_eq!(quantized.len(), n * k);
+        assert!(quantized.iter().all(|bits| bits & 0x7f != 0x7f));
+        assert!(quantized
+            .iter()
+            .all(|bits| float8::F8E4M3::from_bits(*bits).to_f32().is_finite()));
+
+        let zero_source = vec![0_u8; 128 * 128 * 2];
+        let zero_scale = derive_block_fp8_scales(&zero_source, 128, 128, "zero.weight").unwrap();
+        assert_eq!(
+            bf16::from_bits(u16::from_le_bytes([zero_scale[0], zero_scale[1]])),
+            bf16::from_f32(1.0)
+        );
+        assert!(
+            quantize_bf16_matrix_to_block_fp8(&zero_source, 128, 128, &zero_scale)
+                .unwrap()
+                .iter()
+                .all(|bits| *bits == 0)
+        );
+
+        let mut non_finite = zero_source;
+        non_finite[..2].copy_from_slice(&bf16::NAN.to_bits().to_le_bytes());
+        assert!(derive_block_fp8_scales(&non_finite, 128, 128, "nan.weight")
+            .unwrap_err()
+            .contains("non-finite BF16"));
+    }
+
+    #[test]
+    #[ignore = "requires fixed Qwen/Qwen3.5-0.8B BF16 snapshot; writes derived model under TMPDIR"]
+    fn derives_fixed_qwen35_08b_block_fp8_snapshot_for_cuda_e2e() {
+        let source_input = fixed_qwen35_08b_snapshot_dir();
+        let source_dir = std::fs::canonicalize(&source_input).unwrap_or_else(|error| {
+            panic!(
+                "fixed Qwen/Qwen3.5-0.8B@{QWEN35_08B_REVISION} snapshot is absent at \
+                     {source_input:?}; populate the standard Hugging Face cache first: {error}"
+            )
+        });
+        assert!(
+            source_dir.is_dir(),
+            "source is not a directory: {source_dir:?}"
+        );
+        assert!(
+            source_dir
+                .components()
+                .any(|component| component.as_os_str() == QWEN35_08B_REVISION),
+            "source path must bind fixed revision {QWEN35_08B_REVISION}: {source_dir:?}"
+        );
+
+        let source_config_bytes = std::fs::read(source_dir.join("config.json"))
+            .unwrap_or_else(|error| panic!("read source config.json: {error}"));
+        let mut derived_config: Value = serde_json::from_slice(&source_config_bytes)
+            .unwrap_or_else(|error| panic!("parse source config.json: {error}"));
+        assert!(
+            derived_config
+                .get("quantization_config")
+                .is_none_or(Value::is_null),
+            "fixed source top-level quantization_config must be absent or null"
+        );
+        assert!(
+            derived_config
+                .get("text_config")
+                .and_then(|text| text.get("quantization_config"))
+                .is_none_or(Value::is_null),
+            "fixed source nested quantization_config must be absent or null"
+        );
+        let source_text = Qwen35TextConfig::from_hf_config_value(&derived_config).unwrap();
+        assert!(!source_text.is_moe());
+        assert_eq!(source_text.hidden_size, 1024);
+        assert_eq!(source_text.num_hidden_layers, 24);
+        assert_eq!(source_text.linear_attention_layers(), 18);
+        assert_eq!(source_text.full_attention_layers(), 6);
+        assert!(source_text.tie_word_embeddings);
+        assert!(source_text.quantization.is_none());
+
+        let source_archive = SafetensorsArchive::open(&source_dir).unwrap();
+        assert_eq!(
+            source_archive.tensor_count(),
+            QWEN35_08B_SOURCE_TENSOR_COUNT
+        );
+        let source_payload_bytes = source_archive
+            .tensor_names()
+            .try_fold(0_u64, |total, name| {
+                let bytes = source_archive.tensor(name).unwrap().bytes().len();
+                total.checked_add(u64::try_from(bytes).unwrap())
+            })
+            .expect("source payload byte total does not overflow");
+        assert_eq!(
+            source_payload_bytes, QWEN35_08B_SOURCE_PAYLOAD_BYTES,
+            "fixed source payload identity drifted"
+        );
+        if source_dir.join("model.safetensors.index.json").is_file() {
+            let index: Value = serde_json::from_slice(
+                &std::fs::read(source_dir.join("model.safetensors.index.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                index["metadata"]["total_size"].as_u64(),
+                Some(source_payload_bytes),
+                "source index total_size must equal tensor payload bytes"
+            );
+        }
+
+        let source_inventory = Qwen35WeightInventory::from_names(source_archive.tensor_names());
+        let source_plan = source_inventory
+            .detect_prefix_and_resolve(&source_text)
+            .unwrap();
+        source_inventory
+            .partition_resolved_plan(&source_plan)
+            .unwrap()
+            .require_no_unknown()
+            .unwrap();
+
+        let resolved = source_plan.global_tensors.iter().chain(
+            source_plan
+                .layers
+                .iter()
+                .flat_map(|layer| layer.tensors.iter()),
+        );
+        let mut role_by_source = BTreeMap::<String, String>::new();
+        let mut quantized_sources = BTreeSet::<String>::new();
+        let mut dense_exclusions = BTreeSet::from(["lm_head".to_owned()]);
+        for weight in resolved.filter(|weight| weight.present) {
+            let Qwen35ResolvedWeightSource::Dense { values } = weight
+                .source
+                .as_ref()
+                .expect("present source has a typed bundle")
+            else {
+                panic!(
+                    "fixed BF16 source unexpectedly contains quantized role {:?}",
+                    weight.role
+                );
+            };
+            assert!(
+                role_by_source
+                    .insert(values.clone(), weight.role.clone())
+                    .is_none(),
+                "typed source {values:?} is referenced by more than one role"
+            );
+            if block_fp8_derived_quantizes_role(&weight.role) {
+                let tensor = source_archive.tensor(values).unwrap();
+                assert_eq!(tensor.dtype(), Dtype::BF16, "projection {values:?}");
+                assert_eq!(tensor.shape().len(), 2, "projection {values:?}");
+                assert!(values.ends_with(".weight"), "projection {values:?}");
+                assert!(quantized_sources.insert(values.clone()));
+            } else if BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str()) {
+                let module = values
+                    .strip_suffix(".weight")
+                    .unwrap_or_else(|| panic!("dense projection {values:?} lacks .weight suffix"));
+                dense_exclusions.insert(module.to_owned());
+            }
+        }
+        assert_eq!(quantized_sources.len(), QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
+        assert_eq!(
+            dense_exclusions.len(),
+            QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT
+        );
+
+        let mut derived_scales = BTreeMap::<String, Arc<[u8]>>::new();
+        for values in &quantized_sources {
+            let scale_name = format!(
+                "{}.weight_scale_inv",
+                values.strip_suffix(".weight").unwrap()
+            );
+            assert!(
+                !source_archive.contains(&scale_name),
+                "derived sidecar would collide with source tensor {scale_name:?}"
+            );
+            let tensor = source_archive.tensor(values).unwrap();
+            let [n, k] = tensor.shape() else {
+                unreachable!("quantized source rank was preflighted")
+            };
+            let n = usize::try_from(*n).expect("N fits usize");
+            let k = usize::try_from(*k).expect("K fits usize");
+            let scales = derive_block_fp8_scales(tensor.bytes(), n, k, values).unwrap();
+            assert!(derived_scales.insert(values.clone(), scales).is_none());
+        }
+
+        let source_shards = source_archive
+            .tensor_names()
+            .map(|name| {
+                source_archive
+                    .tensor(name)
+                    .unwrap()
+                    .source_file()
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(source_shards.len(), 1, "fixed source must use one shard");
+        let source_shard = source_dir.join(source_shards.iter().next().unwrap());
+        let source_header_metadata = safetensors_file_metadata(&source_shard).unwrap();
+
+        let quantization_config = serde_json::json!({
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "modules_to_not_convert": dense_exclusions,
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        });
+        assert_eq!(quantization_config.as_object().unwrap().len(), 5);
+        let root = derived_config
+            .as_object_mut()
+            .expect("fixed source config root is an object");
+        let nested = root
+            .get_mut("text_config")
+            .and_then(Value::as_object_mut)
+            .expect("fixed source has text_config object");
+        assert!(
+            nested
+                .remove("quantization_config")
+                .is_none_or(|value| value.is_null()),
+            "fixed source nested quantization_config must be absent or null"
+        );
+        root.insert(
+            "quantization_config".to_owned(),
+            quantization_config.clone(),
+        );
+        assert_eq!(
+            Qwen35TextConfig::from_hf_config_value(&derived_config)
+                .unwrap()
+                .quantization
+                .as_ref()
+                .and_then(Qwen35QuantizationConfig::as_fp8)
+                .unwrap()
+                .modules_to_not_convert
+                .len(),
+            QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT
+        );
+
+        let output_dir = create_unique_derived_model_dir().unwrap();
+        assert_ne!(output_dir, source_dir);
+        copy_snapshot_metadata_files(&source_dir, &output_dir).unwrap();
+        let mut config_bytes = serde_json::to_vec_pretty(&derived_config).unwrap();
+        config_bytes.push(b'\n');
+        write_new_file(&output_dir.join("config.json"), &config_bytes).unwrap();
+
+        let mut views = Vec::<(String, DerivedSafetensorsView<'_>)>::new();
+        let mut output_weight_map = BTreeMap::<String, String>::new();
+        const OUTPUT_SHARD: &str = "model-00001-of-00001.safetensors";
+        for name in source_archive.tensor_names() {
+            let source = source_archive.tensor(name).unwrap();
+            let shape = usize_shape(source.shape(), name).unwrap();
+            if let Some(scales_bf16_le) = derived_scales.get(name) {
+                let scale_name =
+                    format!("{}.weight_scale_inv", name.strip_suffix(".weight").unwrap());
+                let [n, k] = shape.as_slice() else {
+                    unreachable!("quantized source rank was preflighted")
+                };
+                let (n, k) = (*n, *k);
+                views.push((
+                    name.to_owned(),
+                    DerivedSafetensorsView::BlockFp8Values {
+                        source,
+                        shape,
+                        scales_bf16_le: Arc::clone(scales_bf16_le),
+                    },
+                ));
+                views.push((
+                    scale_name.clone(),
+                    DerivedSafetensorsView::BlockFp8Scales {
+                        shape: vec![n.div_ceil(128), k.div_ceil(128)],
+                        scales_bf16_le: Arc::clone(scales_bf16_le),
+                    },
+                ));
+                assert!(output_weight_map
+                    .insert(name.to_owned(), OUTPUT_SHARD.to_owned())
+                    .is_none());
+                assert!(output_weight_map
+                    .insert(scale_name, OUTPUT_SHARD.to_owned())
+                    .is_none());
+            } else {
+                views.push((
+                    name.to_owned(),
+                    DerivedSafetensorsView::Borrowed { source, shape },
+                ));
+                assert!(output_weight_map
+                    .insert(name.to_owned(), OUTPUT_SHARD.to_owned())
+                    .is_none());
+            }
+        }
+        assert_eq!(
+            views.len(),
+            QWEN35_08B_SOURCE_TENSOR_COUNT + QWEN35_08B_DERIVED_FP8_PAIR_COUNT
+        );
+        let output_payload_bytes = views
+            .iter()
+            .try_fold(0_u64, |total, (_, view)| {
+                total.checked_add(u64::try_from(view.data_len()).unwrap())
+            })
+            .expect("derived payload byte total does not overflow");
+        let output_shard = output_dir.join(OUTPUT_SHARD);
+        assert!(!output_shard.exists());
+        serialize_to_file(views, &source_header_metadata, &output_shard).unwrap();
+        drop(derived_scales);
+        drop(source_archive);
+
+        let index = serde_json::json!({
+            "metadata": {"total_size": output_payload_bytes},
+            "weight_map": output_weight_map
+        });
+        let mut index_bytes = serde_json::to_vec_pretty(&index).unwrap();
+        index_bytes.push(b'\n');
+        write_new_file(
+            &output_dir.join("model.safetensors.index.json"),
+            &index_bytes,
+        )
+        .unwrap();
+
+        for entry in std::fs::read_dir(&output_dir).unwrap() {
+            let path = entry.unwrap().path();
+            assert!(
+                !std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "derived output must materialize symlink {path:?}"
+            );
+        }
+        assert_eq!(
+            safetensors_file_metadata(&output_shard).unwrap(),
+            source_header_metadata
+        );
+        let output_archive = SafetensorsArchive::open(&output_dir).unwrap();
+        assert_eq!(output_archive.tensor_count(), output_weight_map.len());
+        let reopened_payload_bytes = output_archive
+            .tensor_names()
+            .try_fold(0_u64, |total, name| {
+                total.checked_add(
+                    u64::try_from(output_archive.tensor(name).unwrap().bytes().len()).unwrap(),
+                )
+            })
+            .unwrap();
+        assert_eq!(reopened_payload_bytes, output_payload_bytes);
+        assert_eq!(
+            index["metadata"]["total_size"].as_u64(),
+            Some(output_payload_bytes)
+        );
+
+        let output_config: Value =
+            serde_json::from_slice(&std::fs::read(output_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert!(output_config["text_config"]
+            .get("quantization_config")
+            .is_none());
+        assert_eq!(output_config["quantization_config"], quantization_config);
+        let output_text = Qwen35TextConfig::from_hf_config_value(&output_config).unwrap();
+        let output_inventory = Qwen35WeightInventory::from_names(output_archive.tensor_names());
+        let output_plan = output_inventory
+            .detect_prefix_and_resolve(&output_text)
+            .unwrap();
+        output_inventory
+            .partition_resolved_plan(&output_plan)
+            .unwrap()
+            .require_no_unknown()
+            .unwrap();
+        let output_resolved = output_plan.global_tensors.iter().chain(
+            output_plan
+                .layers
+                .iter()
+                .flat_map(|layer| layer.tensors.iter()),
+        );
+        let output_pair_count = output_resolved
+            .filter(|weight| {
+                matches!(
+                    weight.source,
+                    Some(Qwen35ResolvedWeightSource::BlockFp8 { .. })
+                )
+            })
+            .count();
+        assert_eq!(output_pair_count, QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
+
+        let prepared = prepare_from_model_dir(&output_dir).unwrap();
+        assert_eq!(
+            prepared.family().weight_schema().format_id.as_str(),
+            "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
+        );
+        let mut prepared_pairs = Vec::new();
+        for tensor in &prepared.family().weight_schema().tensors {
+            collect_block_fp8_source_pairs(&tensor.physical_layout, &mut prepared_pairs);
+        }
+        assert_eq!(prepared_pairs.len(), QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
+
+        println!(
+            "FERRUM QWEN35 0.8B BLOCK-FP8 DERIVED SNAPSHOT PASS: {}",
+            output_dir.display()
+        );
+    }
 
     #[test]
     fn accepts_fixed_qwen38_compressed_tensors_contract_fixture() {
@@ -3819,18 +5179,564 @@ mod tests {
         assert_eq!(text.rope_parameters.mrope_section, Some(vec![11, 11, 10]));
 
         let quantization = text.quantization.as_ref().unwrap();
-        assert_eq!(quantization.quant_method, "compressed-tensors");
-        assert_eq!(quantization.format.as_deref(), Some("pack-quantized"));
-        assert_eq!(quantization.bits, 4);
-        assert_eq!(quantization.group_size, 32);
-        assert!(!quantization.sym);
-        assert!(!quantization.desc_act);
-        assert_eq!(quantization.weight_type.as_deref(), Some("int"));
-        assert_eq!(quantization.strategy.as_deref(), Some("group"));
-        assert_eq!(quantization.dynamic, Some(false));
-        assert_eq!(quantization.targets, ["Linear"]);
-        assert!(!quantization.input_activations);
-        assert!(!quantization.output_activations);
+        let recipe = quantization
+            .as_compressed_tensors()
+            .expect("typed compressed-tensors recipe");
+        assert_eq!(quantization.quant_method(), "compressed-tensors");
+        assert_eq!(recipe.format, "pack-quantized");
+        assert_eq!(recipe.bits, 4);
+        assert_eq!(recipe.group_size, 32);
+        assert!(!recipe.sym);
+        assert!(!recipe.desc_act);
+        assert_eq!(recipe.weight_type, "int");
+        assert_eq!(recipe.strategy, "group");
+        assert_eq!(recipe.dynamic, Some(false));
+        assert_eq!(recipe.targets, ["Linear"]);
+        assert!(!recipe.input_activations);
+        assert!(!recipe.output_activations);
+    }
+
+    #[test]
+    fn accepts_fixed_qwen38_fp8_metadata_before_source_layout_selection() {
+        let text = preflight_semantic_config(QWEN38_FP8_CONFIG).unwrap();
+        let quantization = text.quantization.as_ref().unwrap();
+        let recipe = quantization.as_fp8().expect("typed block-FP8 recipe");
+
+        assert_eq!(quantization.quant_method(), "fp8");
+        assert_eq!(recipe.weight_block_size.as_array(), [128, 128]);
+        assert_eq!(recipe.modules_to_not_convert.len(), 10);
+    }
+
+    #[test]
+    fn compiles_block_fp8_source_grid_into_independent_composite_leaves() {
+        let config = test_block_fp8_config();
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .unwrap();
+        let schema = prepared.weight_schema();
+
+        assert_eq!(
+            schema.format_id.as_str(),
+            "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
+        );
+        assert_eq!(
+            schema.quantization_formats(),
+            BTreeSet::from([QuantizationFormatId::new(BLOCK_FP8_E4M3_SOURCE_FORMAT_ID).unwrap()])
+        );
+
+        let gate_up = schema
+            .tensor(&packed_gate_up_weight_id(0).unwrap())
+            .expect("packed gate/up logical weight");
+        let PhysicalWeightLayout::Composite { parts } = &gate_up.physical_layout else {
+            panic!("block-FP8 gate/up must preserve two independent source leaves")
+        };
+        assert_eq!(parts.len(), 2);
+        for part in parts {
+            let PhysicalWeightLayout::QuantizedBlockGrid { block_axes, .. } = part.layout.as_ref()
+            else {
+                panic!("each gate/up partition must retain its block grid")
+            };
+            assert_eq!(*block_axes, [1, 2]);
+        }
+
+        let packed_attention = schema
+            .tensor(&packed_linear_attention_weight_id(0, PACKED_LINEAR_ATTN_QKVZBA_ROLE).unwrap())
+            .expect("packed linear-attention logical weight");
+        let PhysicalWeightLayout::Composite { parts } = &packed_attention.physical_layout else {
+            panic!("block-FP8 qkv/z with dense b/a must preserve four source leaves")
+        };
+        assert_eq!(parts.len(), 4);
+        for part in &parts[..2] {
+            let PhysicalWeightLayout::QuantizedBlockGrid { block_axes, .. } = part.layout.as_ref()
+            else {
+                panic!("qkv and z projections must retain independent block grids")
+            };
+            assert_eq!(*block_axes, [0, 1]);
+        }
+        assert!(matches!(
+            parts[2].layout.as_ref(),
+            PhysicalWeightLayout::Dense { .. }
+        ));
+        assert!(matches!(
+            parts[3].layout.as_ref(),
+            PhysicalWeightLayout::Dense { .. }
+        ));
+    }
+
+    #[test]
+    fn materializes_real_qwen35_dense_block_fp8_family_into_marlin_fp8_schema() {
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(test_official_marlin_block_fp8_config()).unwrap())
+            .unwrap();
+        let source_schema = prepared.weight_schema();
+        let denominator = QuantizedProviderAttributionDenominator::from_prepared_family(&prepared)
+            .unwrap()
+            .expect("official block-FP8 family has a quantized attribution denominator");
+        assert_eq!(denominator.quant_tensor_count(), 400);
+        assert_eq!(denominator.operation_count(), 3);
+        assert_eq!(denominator.item_count(), 403);
+        assert_eq!(
+            denominator.sha256(),
+            "5e366997e15e1a94d90b1ae07281269e8a46f75904306564d56354c8ebea2e4e"
+        );
+        let materializer = block_fp8_to_marlin_fp8_weight_materializer().unwrap();
+        assert_eq!(
+            materializer.descriptor().fidelity(),
+            WeightMaterializationFidelity::Approximate
+        );
+        let device = DeviceDescriptor {
+            id: DeviceId::new("device.test.qwen35-block-fp8-marlin").unwrap(),
+            class: DeviceClass::Accelerator,
+            ordinal: 0,
+            total_memory_bytes: 1 << 30,
+            runtime_implementation_fingerprint: "0".repeat(64),
+            capabilities: BTreeSet::new(),
+            dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
+                DynamicStorageAllocator::LinearArena,
+                DynamicStorageView::Contiguous,
+            )
+            .unwrap()]),
+        };
+        device.validate().unwrap();
+        let execution_schema = materializer.execution_schema(&prepared, &device).unwrap();
+        execution_schema.validate(prepared.family_id()).unwrap();
+
+        let mut source_pairs = Vec::new();
+        for tensor in &source_schema.tensors {
+            collect_block_fp8_source_pairs(&tensor.physical_layout, &mut source_pairs);
+        }
+        let source_pairs = source_pairs.into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(
+            source_pairs.len(),
+            400,
+            "official dense family FP8 leaf count"
+        );
+
+        let mut execution_leaves = Vec::new();
+        let mut residual_block_grid_count = 0;
+        for tensor in &execution_schema.tensors {
+            collect_marlin_fp8_execution_leaves(
+                &tensor.physical_layout,
+                &mut execution_leaves,
+                &mut residual_block_grid_count,
+            );
+        }
+        assert_eq!(residual_block_grid_count, 0);
+        assert_eq!(execution_leaves.len(), 400);
+        assert_eq!(
+            execution_leaves
+                .iter()
+                .filter(|(_, _, group_axis)| *group_axis == 2)
+                .count(),
+            128,
+            "64 gate/up composites each retain two rank-three leaves"
+        );
+        assert_eq!(
+            source_pairs
+                .iter()
+                .filter(|(values, _)| values.as_str().contains(".linear_attn_"))
+                .count(),
+            144,
+            "48 GDA layers each expose qkv, z, and output FP8 leaves"
+        );
+        assert_eq!(
+            source_pairs
+                .iter()
+                .filter(|(values, _)| values.as_str().contains(".self_attn_"))
+                .count(),
+            64,
+            "16 causal-attention layers each expose q, k, v, and o FP8 leaves"
+        );
+        assert_eq!(
+            source_pairs
+                .iter()
+                .filter(|(values, _)| values.as_str().contains(".mlp_"))
+                .count(),
+            192,
+            "64 SwiGLU layers each expose gate, up, and down FP8 leaves"
+        );
+
+        for (packed_id, scales_id, _) in &execution_leaves {
+            let packed = execution_schema
+                .components
+                .iter()
+                .find(|component| component.id == *packed_id)
+                .expect("Marlin packed component exists");
+            let WeightEncoding::Quantized(quantization) = &packed.encoding else {
+                panic!("Marlin packed component must remain explicitly quantized")
+            };
+            assert_eq!(
+                quantization.format_id.as_str(),
+                MARLIN_FP8_QUANTIZATION_FORMAT_ID
+            );
+            let scales = execution_schema
+                .components
+                .iter()
+                .find(|component| component.id == *scales_id)
+                .expect("Marlin scales component exists");
+            assert_eq!(
+                scales.encoding,
+                WeightEncoding::Dense {
+                    element_type: ElementType::F16
+                }
+            );
+        }
+
+        for layer_index in 0..64 {
+            let weight_id = packed_gate_up_weight_id(layer_index).unwrap();
+            let tensor = execution_schema
+                .tensor(&weight_id)
+                .expect("packed gate/up execution tensor");
+            let PhysicalWeightLayout::Composite { parts } = &tensor.physical_layout else {
+                panic!("gate/up execution weight must stay composite")
+            };
+            assert_eq!(parts.len(), 2);
+            assert!(parts.iter().all(|part| matches!(
+                part.layout.as_ref(),
+                PhysicalWeightLayout::Quantized { group_axis: 2, .. }
+            )));
+        }
+
+        for layer_index in (0..64).filter(|layer_index| layer_index % 4 != 3) {
+            let weight_id =
+                packed_linear_attention_weight_id(layer_index, PACKED_LINEAR_ATTN_QKVZBA_ROLE)
+                    .unwrap();
+            let source = source_schema
+                .tensor(&weight_id)
+                .expect("source GDA packed projection");
+            let execution = execution_schema
+                .tensor(&weight_id)
+                .expect("execution GDA packed projection");
+            let PhysicalWeightLayout::Composite {
+                parts: source_parts,
+            } = &source.physical_layout
+            else {
+                panic!("source GDA projection must be composite")
+            };
+            let PhysicalWeightLayout::Composite {
+                parts: execution_parts,
+            } = &execution.physical_layout
+            else {
+                panic!("execution GDA projection must stay composite")
+            };
+            assert_eq!(source_parts.len(), 4);
+            assert_eq!(execution_parts.len(), 4);
+            for (source_part, execution_part) in source_parts.iter().zip(execution_parts) {
+                assert_eq!(execution_part.logical_offsets, source_part.logical_offsets);
+                assert_eq!(execution_part.extents, source_part.extents);
+            }
+            for index in 0..2 {
+                assert!(matches!(
+                    execution_parts[index].layout.as_ref(),
+                    PhysicalWeightLayout::Quantized { group_axis: 1, .. }
+                ));
+            }
+            for index in 2..4 {
+                assert_eq!(execution_parts[index].layout, source_parts[index].layout);
+                assert!(matches!(
+                    execution_parts[index].layout.as_ref(),
+                    PhysicalWeightLayout::Dense { .. }
+                ));
+            }
+        }
+
+        let component_sources = materializer
+            .component_sources(&prepared, &execution_schema)
+            .unwrap();
+        let execution_component_ids = execution_schema
+            .components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            component_sources.keys().cloned().collect::<BTreeSet<_>>(),
+            execution_component_ids,
+            "every execution component must have exactly one provenance-map entry"
+        );
+        assert!(source_pairs.iter().all(|(values, inverse_scales)| {
+            !execution_component_ids.contains(values)
+                && !execution_component_ids.contains(inverse_scales)
+        }));
+        let mapped_source_pairs = execution_leaves
+            .iter()
+            .map(|(packed_id, scales_id, _)| {
+                let packed_sources = component_sources
+                    .get(packed_id)
+                    .expect("packed component has declared provenance");
+                let scales_sources = component_sources
+                    .get(scales_id)
+                    .expect("scales component has declared provenance");
+                assert_eq!(packed_sources, scales_sources);
+                let [values, inverse_scales] = packed_sources.as_slice() else {
+                    panic!("block-FP8 derived components must consume one ordered source pair")
+                };
+                (values.clone(), inverse_scales.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(mapped_source_pairs, source_pairs);
+    }
+
+    #[test]
+    fn qwen38_block_fp8_program_matches_standard_operation_contracts() {
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(test_block_fp8_config()).unwrap())
+            .unwrap();
+        let program = prepared.program();
+        let contracts = [
+            (
+                GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+                ContractVersion::new(6, 0),
+                ContractVersion::new(6, 0),
+                gated_delta_recurrent_attention_contract().unwrap(),
+                3,
+            ),
+            (
+                CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+                ContractVersion::new(2, 0),
+                ContractVersion::new(2, 0),
+                causal_paged_attention_contract().unwrap(),
+                1,
+            ),
+            (
+                DENSE_SWIGLU_OPERATION_ID,
+                ContractVersion::new(1, 0),
+                ContractVersion::new(1, 0),
+                dense_swiglu_contract().unwrap(),
+                4,
+            ),
+            (
+                LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+                ContractVersion::new(1, 0),
+                ContractVersion::new(1, 1),
+                last_token_dense_linear_contract().unwrap(),
+                1,
+            ),
+        ];
+        for (
+            operation_id,
+            required_version,
+            standard_contract_version,
+            contract,
+            expected_node_count,
+        ) in contracts
+        {
+            let matching_nodes = program
+                .blocks()
+                .iter()
+                .flat_map(|block| &block.nodes)
+                .filter(|node| node.operation_id.as_str() == operation_id)
+                .collect::<Vec<_>>();
+            assert_eq!(matching_nodes.len(), expected_node_count);
+            assert!(
+                matching_nodes
+                    .iter()
+                    .all(|node| node.required_version == required_version),
+                "prepared Qwen3.8 block-FP8 program has a mixed or stale {operation_id} version"
+            );
+
+            let descriptor = contract.descriptor();
+            assert_eq!(descriptor.id.as_str(), operation_id);
+            assert_eq!(descriptor.version, standard_contract_version);
+            assert_eq!(
+                descriptor.provider.minimum_version,
+                standard_contract_version
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_block_fp8_inverse_scale_grid_drift_before_runtime() {
+        let mut config = test_block_fp8_config();
+        let weight = config
+            .weights
+            .iter_mut()
+            .find(|weight| weight.role == "linear_attn_qkv")
+            .expect("test contains a block-FP8 qkv weight");
+        let FamilyWeightSourceEncoding::BlockFp8 { scale_inv, .. } = &mut weight.source_encoding
+        else {
+            panic!("linear-attention qkv must use block-FP8 in the test contract")
+        };
+        let [n, k] = weight.dimensions.as_slice() else {
+            panic!("linear-attention qkv must be a matrix")
+        };
+        assert_eq!(scale_inv.dimensions, [n.div_ceil(128), k.div_ceil(128)]);
+        scale_inv.dimensions[1] += 1;
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("mismatched block-FP8 scale grid must fail before runtime");
+        let VNextError::InvalidModelConfig {
+            family_id,
+            field,
+            reason,
+        } = error
+        else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(family_id, FAMILY_ID);
+        assert_eq!(field, "weights.source_encoding.scale_inv.dimensions");
+        assert!(reason.contains("inverse-scale shape"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_missing_block_fp8_sidecar_for_non_excluded_projection_before_allocation() {
+        let mut config = test_block_fp8_config();
+        let weight = config
+            .weights
+            .iter_mut()
+            .find(|weight| weight.role == "linear_attn_qkv")
+            .expect("test contains a block-FP8 qkv projection");
+        weight.source_encoding = FamilyWeightSourceEncoding::Dense {
+            element_type: ElementType::Bf16,
+        };
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("a non-excluded projection without its FP8 sidecar must fail closed");
+        let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(field, "weights.source_encoding");
+        assert!(reason.contains("execution-eligible projection"), "{reason}");
+        assert!(reason.contains("weight_scale_inv"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_extra_block_fp8_pair_for_typed_dense_exclusion_before_allocation() {
+        let mut config = test_block_fp8_config();
+        let weight = config
+            .weights
+            .iter_mut()
+            .find(|weight| weight.role == "linear_attn_b")
+            .expect("test contains a dense-excluded recurrent b projection");
+        let values_name = weight.external_name.clone();
+        let dimensions = weight.dimensions.clone();
+        let [n, k] = dimensions.as_slice() else {
+            panic!("test recurrent b projection is a matrix")
+        };
+        weight.source_encoding = FamilyWeightSourceEncoding::BlockFp8 {
+            values: FamilyBlockFp8Tensor {
+                external_name: values_name.clone(),
+                dimensions: dimensions.clone(),
+                dtype: FamilyBlockFp8Dtype::F8E4m3,
+            },
+            scale_inv: FamilyBlockFp8Tensor {
+                external_name: format!(
+                    "{}.weight_scale_inv",
+                    values_name.strip_suffix(".weight").unwrap()
+                ),
+                dimensions: vec![n.div_ceil(128), k.div_ceil(128)],
+                dtype: FamilyBlockFp8Dtype::Bf16,
+            },
+        };
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("a typed dense exclusion must reject an extra FP8 source pair");
+        let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(field, "weights.source_encoding");
+        assert!(reason.contains("typed dense exclusion"), "{reason}");
+        assert!(reason.contains("in_proj_b"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_block_fp8_recipe_without_any_execution_pair_before_allocation() {
+        let mut config = test_block_fp8_config();
+        for weight in &mut config.weights {
+            if matches!(
+                weight.source_encoding,
+                FamilyWeightSourceEncoding::BlockFp8 { .. }
+            ) {
+                weight.source_encoding = FamilyWeightSourceEncoding::Dense {
+                    element_type: ElementType::Bf16,
+                };
+            }
+        }
+        synchronize_test_block_fp8_exclusions(&mut config);
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("a block-FP8 recipe without an execution pair must fail closed");
+        let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(field, "weights.source_encoding");
+        assert!(reason.contains("no execution-eligible"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_block_fp8_value_or_inverse_scale_dtype_drift_before_allocation() {
+        for drift in ["values", "scale_inv"] {
+            let mut config = test_block_fp8_config();
+            let weight = config
+                .weights
+                .iter_mut()
+                .find(|weight| weight.role == "linear_attn_qkv")
+                .expect("test contains a block-FP8 qkv projection");
+            let FamilyWeightSourceEncoding::BlockFp8 { values, scale_inv } =
+                &mut weight.source_encoding
+            else {
+                panic!("test qkv projection is block-FP8")
+            };
+            match drift {
+                "values" => values.dtype = FamilyBlockFp8Dtype::Bf16,
+                "scale_inv" => scale_inv.dtype = FamilyBlockFp8Dtype::F8E4m3,
+                _ => unreachable!(),
+            }
+
+            let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+                .prepare(&serde_json::to_value(config).unwrap())
+                .expect_err("FP8 value/scale dtype drift must fail closed");
+            let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+                panic!("expected typed invalid-model-config rejection, got {error}")
+            };
+            assert_eq!(field, "weights.source_encoding", "{drift}: {reason}");
+            assert!(reason.contains("identity or dtype"), "{drift}: {reason}");
+        }
+    }
+
+    #[test]
+    fn rejects_block_fp8_metadata_recipe_drift_with_typed_error_before_runtime() {
+        let fixture: Value = serde_json::from_slice(QWEN38_FP8_BAD_RECIPE).unwrap();
+        assert_eq!(
+            fixture["base_fixture"],
+            Value::String("qwen38_fp8_config.contract.json".to_owned())
+        );
+        assert_eq!(
+            fixture["case"],
+            Value::String("qwen38-fp8-wrong-format".to_owned())
+        );
+        let pointer = fixture["pointer"]
+            .as_str()
+            .expect("bad-recipe JSON pointer");
+        let replacement = fixture["replacement"].clone();
+        let expected_error = fixture["expected_error"]
+            .as_str()
+            .expect("bad-recipe expected error");
+
+        let mut config = test_block_fp8_config();
+        config.hf_config = serde_json::from_slice(QWEN38_FP8_CONFIG).unwrap();
+        *config
+            .hf_config
+            .pointer_mut(pointer)
+            .expect("bad-recipe pointer exists in the fixed base fixture") = replacement;
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("mismatched block-FP8 metadata must fail before runtime");
+        let VNextError::InvalidModelConfig {
+            family_id,
+            field,
+            reason,
+        } = error
+        else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(family_id, FAMILY_ID);
+        assert_eq!(field, "hf_config");
+        assert!(reason.contains(expected_error), "{reason}");
     }
 
     #[test]
@@ -4009,7 +5915,11 @@ mod tests {
             .contains("values differ"));
     }
 
-    fn test_weight_dimensions(text: &Qwen35TextConfig, weight: &FamilyWeight) -> Vec<u64> {
+    fn test_weight_dimensions(
+        text: &Qwen35TextConfig,
+        vocab_size: u64,
+        weight: &FamilyWeight,
+    ) -> Vec<u64> {
         let hidden = text.hidden_size as u64;
         let qk = text.linear_qk_total_dim() as u64;
         let value = text.linear_value_total_dim() as u64;
@@ -4018,10 +5928,20 @@ mod tests {
         let full_query_projection = text.full_attention_q_proj_total_dim() as u64;
         let full_kv = text.full_attention_kv_total_dim() as u64;
         match weight.role.as_str() {
-            "embed_tokens" | "lm_head" => vec![32, 16],
-            "final_norm" | "input_layernorm" | "post_attention_layernorm" => vec![16],
-            "mlp_gate" | "mlp_up" => vec![32, 16],
-            "mlp_down" => vec![16, 32],
+            "embed_tokens" | "lm_head" => vec![vocab_size, hidden],
+            "final_norm" | "input_layernorm" | "post_attention_layernorm" => vec![hidden],
+            "mlp_gate" | "mlp_up" => vec![
+                text.dense_intermediate_size
+                    .expect("dense Qwen3.5 test config has intermediate_size")
+                    as u64,
+                hidden,
+            ],
+            "mlp_down" => vec![
+                hidden,
+                text.dense_intermediate_size
+                    .expect("dense Qwen3.5 test config has intermediate_size")
+                    as u64,
+            ],
             "linear_attn_qkv" => vec![qkv, hidden],
             "linear_attn_z" => vec![value, hidden],
             "linear_attn_a" | "linear_attn_b" => {
@@ -4114,7 +6034,7 @@ mod tests {
                     element_type: ElementType::F32,
                 },
             };
-            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weight.dimensions = test_weight_dimensions(&text, 32, &weight);
             weights.push(weight);
         }
         for layer in &manifest.layers {
@@ -4129,7 +6049,7 @@ mod tests {
                         element_type: ElementType::F32,
                     },
                 };
-                weight.dimensions = test_weight_dimensions(&text, &weight);
+                weight.dimensions = test_weight_dimensions(&text, 32, &weight);
                 weights.push(weight);
             }
         }
@@ -4150,6 +6070,252 @@ mod tests {
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsDense,
             weights,
+        }
+    }
+
+    fn test_block_fp8_config() -> Qwen35FamilyConfig {
+        let mut config = test_config();
+        config.hf_config["quantization_config"] = serde_json::json!({
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "modules_to_not_convert": [
+                "model.embed_tokens",
+                "lm_head",
+                "model.layers.0.input_layernorm"
+            ],
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        });
+        for weight in &mut config.weights {
+            if !matches!(
+                weight.role.as_str(),
+                "linear_attn_qkv"
+                    | "linear_attn_z"
+                    | "linear_attn_out"
+                    | "self_attn_q"
+                    | "self_attn_k"
+                    | "self_attn_v"
+                    | "self_attn_o"
+                    | "mlp_gate"
+                    | "mlp_up"
+                    | "mlp_down"
+            ) {
+                continue;
+            }
+            let scale_name = format!(
+                "{}.weight_scale_inv",
+                weight
+                    .external_name
+                    .strip_suffix(".weight")
+                    .expect("test linear source ends with .weight")
+            );
+            let [n, k] = weight.dimensions.as_slice() else {
+                panic!("test block-FP8 source must be a matrix")
+            };
+            weight.source_encoding = FamilyWeightSourceEncoding::BlockFp8 {
+                values: FamilyBlockFp8Tensor {
+                    external_name: weight.external_name.clone(),
+                    dimensions: weight.dimensions.clone(),
+                    dtype: FamilyBlockFp8Dtype::F8E4m3,
+                },
+                scale_inv: FamilyBlockFp8Tensor {
+                    external_name: scale_name,
+                    dimensions: vec![n.div_ceil(128), k.div_ceil(128)],
+                    dtype: FamilyBlockFp8Dtype::Bf16,
+                },
+            };
+        }
+        synchronize_test_block_fp8_exclusions(&mut config);
+        config.weight_format = FamilyWeightFormat::SafetensorsBlockFp8;
+        config
+    }
+
+    fn test_official_marlin_block_fp8_config() -> Qwen35FamilyConfig {
+        let hf_config: Value = serde_json::from_slice(QWEN38_FP8_CONFIG).unwrap();
+        let text = Qwen35TextConfig::from_hf_config_value(&hf_config).unwrap();
+        let vocab_size = hf_config["text_config"]["vocab_size"].as_u64().unwrap();
+        let max_position_embeddings = hf_config["text_config"]["max_position_embeddings"]
+            .as_u64()
+            .unwrap();
+        let manifest = text.weight_manifest("model.language_model").unwrap();
+        let mut weights = Vec::new();
+        for (layer_index, spec) in manifest
+            .global_tensors
+            .iter()
+            .map(|spec| (None, spec))
+            .chain(manifest.layers.iter().flat_map(|layer| {
+                layer
+                    .tensors
+                    .iter()
+                    .map(move |spec| (Some(layer.layer_index as u32), spec))
+            }))
+            .filter(|(_, spec)| spec.required)
+        {
+            let mut weight = FamilyWeight {
+                layer_index,
+                expert_index: None,
+                role: spec.role.clone(),
+                external_name: spec.name.clone(),
+                dimensions: vec![1],
+                source_encoding: FamilyWeightSourceEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+            };
+            weight.dimensions = test_weight_dimensions(&text, vocab_size, &weight);
+            if matches!(
+                weight.role.as_str(),
+                "linear_attn_qkv"
+                    | "linear_attn_z"
+                    | "linear_attn_out"
+                    | "self_attn_q"
+                    | "self_attn_k"
+                    | "self_attn_v"
+                    | "self_attn_o"
+                    | "mlp_gate"
+                    | "mlp_up"
+                    | "mlp_down"
+            ) {
+                let [n, k] = weight.dimensions.as_slice() else {
+                    panic!("official block-FP8 projection must be a matrix")
+                };
+                let scale_name = format!(
+                    "{}.weight_scale_inv",
+                    weight.external_name.strip_suffix(".weight").unwrap()
+                );
+                weight.source_encoding = FamilyWeightSourceEncoding::BlockFp8 {
+                    values: FamilyBlockFp8Tensor {
+                        external_name: weight.external_name.clone(),
+                        dimensions: weight.dimensions.clone(),
+                        dtype: FamilyBlockFp8Dtype::F8E4m3,
+                    },
+                    scale_inv: FamilyBlockFp8Tensor {
+                        external_name: scale_name,
+                        dimensions: vec![n.div_ceil(128), k.div_ceil(128)],
+                        dtype: FamilyBlockFp8Dtype::Bf16,
+                    },
+                };
+            }
+            weights.push(weight);
+        }
+        weights.sort_by(|left, right| {
+            (left.layer_index, left.role.as_str()).cmp(&(right.layer_index, right.role.as_str()))
+        });
+        let tokenizer_config = br#"{
+            "chat_template": "{{ messages }}",
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "pad_token_id": 0
+        }"#;
+        let mut config = Qwen35FamilyConfig {
+            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
+            hf_config,
+            vocab_size,
+            max_position_embeddings,
+            rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
+            weight_format: FamilyWeightFormat::SafetensorsBlockFp8,
+            weights,
+        };
+        synchronize_test_block_fp8_exclusions(&mut config);
+        config
+    }
+
+    fn synchronize_test_block_fp8_exclusions(config: &mut Qwen35FamilyConfig) {
+        let dense_projection_modules = config
+            .weights
+            .iter()
+            .filter(|weight| {
+                BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str())
+                    && matches!(
+                        weight.source_encoding,
+                        FamilyWeightSourceEncoding::Dense { .. }
+                    )
+            })
+            .map(|weight| {
+                weight
+                    .external_name
+                    .strip_suffix(".weight")
+                    .expect("test projection source ends with .weight")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let modules = config.hf_config["quantization_config"]["modules_to_not_convert"]
+            .as_array_mut()
+            .expect("test block-FP8 recipe has typed exclusions");
+        for module in dense_projection_modules {
+            if !modules.iter().any(|value| value.as_str() == Some(&module)) {
+                modules.push(Value::String(module));
+            }
+        }
+    }
+
+    fn collect_block_fp8_source_pairs(
+        layout: &PhysicalWeightLayout,
+        pairs: &mut Vec<(WeightId, WeightId)>,
+    ) {
+        match layout {
+            PhysicalWeightLayout::QuantizedBlockGrid {
+                packed_values,
+                scales,
+                ..
+            } => pairs.push((
+                packed_values.component_id.clone(),
+                scales.component_id.clone(),
+            )),
+            PhysicalWeightLayout::Composite { parts } => {
+                for part in parts {
+                    collect_block_fp8_source_pairs(&part.layout, pairs);
+                }
+            }
+            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            | PhysicalWeightLayout::Indexed { values, .. } => {
+                collect_block_fp8_source_pairs(values, pairs);
+            }
+            PhysicalWeightLayout::ExpertStack { experts, .. } => {
+                for expert in experts {
+                    collect_block_fp8_source_pairs(expert, pairs);
+                }
+            }
+            PhysicalWeightLayout::Dense { .. }
+            | PhysicalWeightLayout::Stored { .. }
+            | PhysicalWeightLayout::Quantized { .. }
+            | PhysicalWeightLayout::BlockQuantized { .. } => {}
+        }
+    }
+
+    fn collect_marlin_fp8_execution_leaves(
+        layout: &PhysicalWeightLayout,
+        leaves: &mut Vec<(WeightId, WeightId, u32)>,
+        block_grid_count: &mut usize,
+    ) {
+        match layout {
+            PhysicalWeightLayout::Quantized {
+                packed_values,
+                scales,
+                group_axis,
+                ..
+            } => leaves.push((
+                packed_values.component_id.clone(),
+                scales.component_id.clone(),
+                *group_axis,
+            )),
+            PhysicalWeightLayout::QuantizedBlockGrid { .. } => *block_grid_count += 1,
+            PhysicalWeightLayout::Composite { parts } => {
+                for part in parts {
+                    collect_marlin_fp8_execution_leaves(&part.layout, leaves, block_grid_count);
+                }
+            }
+            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            | PhysicalWeightLayout::Indexed { values, .. } => {
+                collect_marlin_fp8_execution_leaves(values, leaves, block_grid_count);
+            }
+            PhysicalWeightLayout::ExpertStack { experts, .. } => {
+                for expert in experts {
+                    collect_marlin_fp8_execution_leaves(expert, leaves, block_grid_count);
+                }
+            }
+            PhysicalWeightLayout::Dense { .. }
+            | PhysicalWeightLayout::Stored { .. }
+            | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
     }
 
@@ -4221,7 +6387,7 @@ mod tests {
                     element_type: ElementType::F16,
                 },
             };
-            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weight.dimensions = test_weight_dimensions(&text, 32, &weight);
             weights.push(weight);
         }
         for layer in &manifest.layers {
@@ -4237,7 +6403,7 @@ mod tests {
                         element_type: ElementType::F16,
                     },
                 };
-                weight.dimensions = test_weight_dimensions(&text, &weight);
+                weight.dimensions = test_weight_dimensions(&text, 32, &weight);
                 weights.push(weight);
             }
         }
@@ -4309,7 +6475,7 @@ mod tests {
                     element_type: ElementType::F16,
                 },
             };
-            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weight.dimensions = test_weight_dimensions(&text, 32, &weight);
             weights.push(weight);
         }
         for layer in &manifest.layers {
@@ -4333,7 +6499,7 @@ mod tests {
                             element_type: ElementType::F16,
                         },
                     };
-                    weight.dimensions = test_weight_dimensions(&text, &weight);
+                    weight.dimensions = test_weight_dimensions(&text, 32, &weight);
                     let [n, k] = weight.dimensions.as_slice() else {
                         panic!("test GPTQ expert source must be a matrix")
                     };

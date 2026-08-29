@@ -3389,6 +3389,13 @@ pub trait ModelExecutor: Send + Sync {
         None
     }
 
+    /// Optional compact provider-attribution witness emitted by executors
+    /// whose immutable plan can bind quantized source tensors to selected
+    /// operation providers without exposing per-tensor logs.
+    fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Optional LoRA runtime metrics.
     fn lora_metrics_snapshot(&self) -> Option<serde_json::Value> {
         None

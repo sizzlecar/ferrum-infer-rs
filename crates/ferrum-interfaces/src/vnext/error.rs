@@ -583,6 +583,8 @@ pub enum VNextError {
     },
     #[error("invalid execution plan: {reason}")]
     InvalidExecutionPlan { reason: String },
+    #[error("weight materializer `{materializer_id}` requires typed numerical-quality approval")]
+    WeightMaterializerQualityApprovalRequired { materializer_id: String },
     #[error("dynamic admission {kind:?}: {reason}")]
     DynamicAdmissionContract {
         kind: DynamicAdmissionFaultKind,
