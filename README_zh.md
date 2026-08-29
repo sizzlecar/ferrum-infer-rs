@@ -59,6 +59,32 @@ curl http://localhost:8000/v1/chat/completions \
 `ferrum doctor <MODEL>` 只解析模型来源并打印下一条 `run`、`serve` 命令，
 不会下载模型或启动推理 engine。
 
+### CUDA 上的 Qwen3.8 27B block-FP8
+
+当前源码版本支持固定的官方
+[`Qwen/Qwen3.8-27B-FP8@017b9c7`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a)
+checkpoint，并将本地 Hugging Face snapshot 用作模型目录。使用
+`cuda,vllm-moe-marlin,vllm-paged-attn-v2` 构建 Ferrum 后，同一 snapshot
+可以用于两个产品入口：
+
+```bash
+MODEL=/path/to/Qwen3.8-27B-FP8
+
+ferrum run "$MODEL" \
+  --backend cuda --gpu-devices 0 --disable-thinking \
+  --max-model-len 512 --max-num-seqs 1 \
+  --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90
+
+ferrum serve --model "$MODEL" \
+  --served-model-name qwen38-27b-fp8 \
+  --backend cuda --gpu-devices 0 --disable-thinking \
+  --max-model-len 512 --max-num-seqs 2 \
+  --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90
+```
+
+以上有界配置已在单张 48 GB 级 CUDA GPU 上验证；本次模型接入门禁不覆盖
+更小显存的设备。
+
 ## 功能
 
 - 一个 Rust 二进制同时提供 `ferrum run` 和 `ferrum serve`。
@@ -85,6 +111,9 @@ curl http://localhost:8000/v1/chat/completions \
 
 `c` 为服务端实际活跃并发。前三行均完成 100 请求 × 3 repeats，错误数为零。
 [测量详情](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md)。
+
+性能表中的 Qwen3.8 27B AWQ INT4 使用不同 checkpoint 和量化路径，不是上文的
+官方 block-FP8 模型。
 
 ## OpenAI 兼容 API
 
