@@ -4285,6 +4285,7 @@ mod tests {
     const QWEN38_FP8_BAD_RECIPE: &[u8] =
         include_bytes!("../../tests/fixtures/qwen38_fp8_config.bad-recipe.json");
     const QWEN35_08B_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
+    const QWEN35_08B_CACHE_REPO_DIR: &str = "models--Qwen--Qwen3.5-0.8B";
     const QWEN35_08B_SOURCE_TENSOR_COUNT: usize = 488;
     const QWEN35_08B_SOURCE_PAYLOAD_BYTES: u64 = 1_746_882_752;
     const QWEN35_08B_DERIVED_FP8_PAIR_COUNT: usize = 150;
@@ -4293,6 +4294,14 @@ mod tests {
     const BLOCK_FP8_INPUT_BLOCK: usize = 128;
     const BLOCK_FP8_MAX_FINITE: f32 = 448.0;
     const DERIVED_DENSE_PROJECTION_ROLES: &[&str] = &["lm_head", "linear_attn_b", "linear_attn_a"];
+
+    fn fixed_qwen35_08b_snapshot_dir() -> PathBuf {
+        hf_hub::Cache::default()
+            .path()
+            .join(QWEN35_08B_CACHE_REPO_DIR)
+            .join("snapshots")
+            .join(QWEN35_08B_REVISION)
+    }
 
     enum DerivedSafetensorsView<'archive> {
         Borrowed {
@@ -4788,10 +4797,13 @@ mod tests {
     #[test]
     #[ignore = "requires fixed Qwen/Qwen3.5-0.8B BF16 snapshot; writes derived model under TMPDIR"]
     fn derives_fixed_qwen35_08b_block_fp8_snapshot_for_cuda_e2e() {
-        let source_input = std::env::var("FERRUM_TEST_QWEN35_DENSE_MODEL_DIR")
-            .expect("FERRUM_TEST_QWEN35_DENSE_MODEL_DIR must name the fixed 0.8B snapshot");
-        let source_dir = std::fs::canonicalize(&source_input)
-            .unwrap_or_else(|error| panic!("canonicalize source {source_input:?}: {error}"));
+        let source_input = fixed_qwen35_08b_snapshot_dir();
+        let source_dir = std::fs::canonicalize(&source_input).unwrap_or_else(|error| {
+            panic!(
+                "fixed Qwen/Qwen3.5-0.8B@{QWEN35_08B_REVISION} snapshot is absent at \
+                     {source_input:?}; populate the standard Hugging Face cache first: {error}"
+            )
+        });
         assert!(
             source_dir.is_dir(),
             "source is not a directory: {source_dir:?}"
