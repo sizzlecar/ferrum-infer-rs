@@ -4249,6 +4249,15 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::fs::{File, OpenOptions};
+    use std::io::{Read, Write};
+    use std::ops::Range;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use ferrum_interfaces::vnext::{
         causal_paged_attention_contract, dense_swiglu_contract,
@@ -4262,8 +4271,11 @@ mod tests {
     use ferrum_kernels::marlin_fp8_materializer::{
         block_fp8_to_marlin_fp8_weight_materializer, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
     };
-    use half::f16;
-    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use ferrum_quantization::SafetensorsTensor;
+    use half::{bf16, f16};
+    use memmap2::Mmap;
+    use safetensors::tensor::{serialize_to_file, Dtype, TensorView, View};
+    use safetensors::SafeTensors;
 
     const QWEN38_AWQ_INT4_CONFIG: &[u8] =
         include_bytes!("../../tests/fixtures/qwen38_awq_int4_config.contract.json");
@@ -4271,6 +4283,865 @@ mod tests {
         include_bytes!("../../tests/fixtures/qwen38_fp8_config.contract.json");
     const QWEN38_FP8_BAD_RECIPE: &[u8] =
         include_bytes!("../../tests/fixtures/qwen38_fp8_config.bad-recipe.json");
+    const QWEN35_08B_REVISION: &str = "2fc06364715b967f1860aea9cf38778875588b17";
+    const QWEN35_08B_SOURCE_TENSOR_COUNT: usize = 488;
+    const QWEN35_08B_SOURCE_PAYLOAD_BYTES: u64 = 1_746_882_752;
+    const QWEN35_08B_DERIVED_FP8_PAIR_COUNT: usize = 150;
+    const QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT: usize = 37;
+    const BLOCK_FP8_OUTPUT_BLOCK: usize = 128;
+    const BLOCK_FP8_INPUT_BLOCK: usize = 128;
+    const BLOCK_FP8_MAX_FINITE: f32 = 448.0;
+    const DERIVED_DENSE_PROJECTION_ROLES: &[&str] = &["lm_head", "linear_attn_b", "linear_attn_a"];
+
+    enum DerivedSafetensorsView<'archive> {
+        Borrowed {
+            source: SafetensorsTensor<'archive>,
+            shape: Vec<usize>,
+        },
+        BlockFp8Values {
+            source: SafetensorsTensor<'archive>,
+            shape: Vec<usize>,
+            scales_bf16_le: Arc<[u8]>,
+        },
+        BlockFp8Scales {
+            shape: Vec<usize>,
+            scales_bf16_le: Arc<[u8]>,
+        },
+    }
+
+    impl View for DerivedSafetensorsView<'_> {
+        fn dtype(&self) -> Dtype {
+            match self {
+                Self::Borrowed { source, .. } => source.dtype(),
+                Self::BlockFp8Values { .. } => Dtype::F8_E4M3,
+                Self::BlockFp8Scales { .. } => Dtype::BF16,
+            }
+        }
+
+        fn shape(&self) -> &[usize] {
+            match self {
+                Self::Borrowed { shape, .. }
+                | Self::BlockFp8Values { shape, .. }
+                | Self::BlockFp8Scales { shape, .. } => shape,
+            }
+        }
+
+        fn data(&self) -> Cow<'_, [u8]> {
+            match self {
+                Self::Borrowed { source, .. } => Cow::Borrowed(source.bytes()),
+                Self::BlockFp8Values {
+                    source,
+                    shape,
+                    scales_bf16_le,
+                } => {
+                    let [n, k] = shape.as_slice() else {
+                        unreachable!("block-FP8 source shape was preflighted as [N, K]")
+                    };
+                    Cow::Owned(
+                        quantize_bf16_matrix_to_block_fp8(source.bytes(), *n, *k, scales_bf16_le)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "lazy block-FP8 encode failed for {:?}: {error}",
+                                    source.external_name()
+                                )
+                            }),
+                    )
+                }
+                Self::BlockFp8Scales { scales_bf16_le, .. } => Cow::Borrowed(scales_bf16_le),
+            }
+        }
+
+        fn data_len(&self) -> usize {
+            match self {
+                Self::Borrowed { source, .. } => source.bytes().len(),
+                Self::BlockFp8Values { shape, .. } => shape
+                    .iter()
+                    .copied()
+                    .try_fold(1_usize, usize::checked_mul)
+                    .expect("preflighted block-FP8 element count"),
+                Self::BlockFp8Scales { scales_bf16_le, .. } => scales_bf16_le.len(),
+            }
+        }
+    }
+
+    fn usize_shape(shape: &[u64], tensor_name: &str) -> Result<Vec<usize>, String> {
+        shape
+            .iter()
+            .map(|extent| {
+                usize::try_from(*extent).map_err(|_| {
+                    format!("tensor {tensor_name:?} extent {extent} exceeds host usize")
+                })
+            })
+            .collect()
+    }
+
+    fn bounded_worker_count(work_items: usize) -> usize {
+        std::thread::available_parallelism()
+            .map_or(1, |parallelism| parallelism.get())
+            .min(8)
+            .min(work_items.max(1))
+    }
+
+    fn fill_bounded_ranges(
+        total_units: usize,
+        bytes_per_unit: usize,
+        output: &mut [u8],
+        thread_name: &str,
+        fill: impl Fn(Range<usize>, &mut [u8]) -> Result<(), String> + Sync,
+    ) -> Result<(), String> {
+        let expected_bytes = total_units
+            .checked_mul(bytes_per_unit)
+            .ok_or_else(|| format!("{thread_name} output byte count overflows usize"))?;
+        if total_units == 0 || bytes_per_unit == 0 || output.len() != expected_bytes {
+            return Err(format!(
+                "{thread_name} received invalid bounded range: units={total_units} bytes_per_unit={bytes_per_unit} output_bytes={}",
+                output.len()
+            ));
+        }
+        let workers = bounded_worker_count(total_units);
+        let units_per_worker = total_units.div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut remaining = output;
+            let mut handles = Vec::with_capacity(workers);
+            let mut spawn_error = None;
+            for worker in 0..workers {
+                let start = worker * units_per_worker;
+                let end = (start + units_per_worker).min(total_units);
+                if start == end {
+                    break;
+                }
+                let chunk_bytes = (end - start)
+                    .checked_mul(bytes_per_unit)
+                    .expect("bounded chunk byte count was preflighted");
+                let (chunk, tail) = remaining.split_at_mut(chunk_bytes);
+                remaining = tail;
+                let fill = &fill;
+                match std::thread::Builder::new()
+                    .name(format!("{thread_name}-{worker}"))
+                    .spawn_scoped(scope, move || fill(start..end, chunk))
+                {
+                    Ok(handle) => handles.push(handle),
+                    Err(error) => {
+                        spawn_error = Some(format!(
+                            "spawn {thread_name} worker {worker}/{workers}: {error}"
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            let mut first_error = spawn_error;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                    Err(payload) => {
+                        if first_error.is_none() {
+                            let reason = payload
+                                .downcast_ref::<&str>()
+                                .map(|value| (*value).to_owned())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic payload".to_owned());
+                            first_error = Some(format!("{thread_name} worker panicked: {reason}"));
+                        }
+                    }
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })
+    }
+
+    fn source_bf16_at(source_bf16_le: &[u8], index: usize) -> bf16 {
+        let offset = index * 2;
+        bf16::from_bits(u16::from_le_bytes([
+            source_bf16_le[offset],
+            source_bf16_le[offset + 1],
+        ]))
+    }
+
+    fn stored_bf16_inverse_scale(maximum: f32) -> Result<bf16, String> {
+        if maximum == 0.0 {
+            return Ok(bf16::from_f32(1.0));
+        }
+        if !maximum.is_finite() || maximum < 0.0 {
+            return Err(format!("invalid block maximum {maximum}"));
+        }
+        let required = f64::from(maximum) / f64::from(BLOCK_FP8_MAX_FINITE);
+        let mut bits = bf16::from_f32(required as f32).to_bits();
+        loop {
+            let stored = bf16::from_bits(bits);
+            let stored_f64 = f64::from(stored.to_f32());
+            if stored.is_finite() && stored > bf16::ZERO && stored_f64 >= required {
+                return Ok(stored);
+            }
+            bits = bits
+                .checked_add(1)
+                .ok_or_else(|| format!("BF16 inverse scale overflows for maximum {maximum}"))?;
+        }
+    }
+
+    fn derive_block_fp8_scales(
+        source_bf16_le: &[u8],
+        n: usize,
+        k: usize,
+        tensor_name: &str,
+    ) -> Result<Arc<[u8]>, String> {
+        let source_elements = n
+            .checked_mul(k)
+            .ok_or_else(|| format!("tensor {tensor_name:?} element count overflows usize"))?;
+        let expected_source_bytes = source_elements
+            .checked_mul(2)
+            .ok_or_else(|| format!("tensor {tensor_name:?} BF16 byte count overflows usize"))?;
+        if n == 0 || k == 0 || source_bf16_le.len() != expected_source_bytes {
+            return Err(format!(
+                "tensor {tensor_name:?} has invalid BF16 matrix storage: shape=[{n}, {k}] bytes={} expected={expected_source_bytes}",
+                source_bf16_le.len()
+            ));
+        }
+        let block_rows = n.div_ceil(BLOCK_FP8_OUTPUT_BLOCK);
+        let block_columns = k.div_ceil(BLOCK_FP8_INPUT_BLOCK);
+        let scale_row_bytes = block_columns
+            .checked_mul(2)
+            .ok_or_else(|| format!("tensor {tensor_name:?} scale row overflows usize"))?;
+        let scale_bytes = block_rows
+            .checked_mul(scale_row_bytes)
+            .ok_or_else(|| format!("tensor {tensor_name:?} scale grid overflows usize"))?;
+        let mut output = vec![0_u8; scale_bytes];
+        fill_bounded_ranges(
+            block_rows,
+            scale_row_bytes,
+            &mut output,
+            "qwen35-fp8-scale",
+            |range, destination| {
+                for block_output in range.clone() {
+                    let row_start = block_output * BLOCK_FP8_OUTPUT_BLOCK;
+                    let row_end = (row_start + BLOCK_FP8_OUTPUT_BLOCK).min(n);
+                    for block_input in 0..block_columns {
+                        let input_start = block_input * BLOCK_FP8_INPUT_BLOCK;
+                        let input_end = (input_start + BLOCK_FP8_INPUT_BLOCK).min(k);
+                        let mut maximum = 0.0_f32;
+                        for output_feature in row_start..row_end {
+                            for input_feature in input_start..input_end {
+                                let source_index = output_feature * k + input_feature;
+                                let value = source_bf16_at(source_bf16_le, source_index).to_f32();
+                                if !value.is_finite() {
+                                    return Err(format!(
+                                        "tensor {tensor_name:?} contains non-finite BF16 at [{output_feature}, {input_feature}]"
+                                    ));
+                                }
+                                maximum = maximum.max(value.abs());
+                            }
+                        }
+                        let scale = stored_bf16_inverse_scale(maximum)?;
+                        let local_block_output = block_output - range.start;
+                        let offset = (local_block_output * block_columns + block_input) * 2;
+                        destination[offset..offset + 2]
+                            .copy_from_slice(&scale.to_bits().to_le_bytes());
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(output.into())
+    }
+
+    fn quantize_bf16_matrix_to_block_fp8(
+        source_bf16_le: &[u8],
+        n: usize,
+        k: usize,
+        scales_bf16_le: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let value_count = n
+            .checked_mul(k)
+            .ok_or_else(|| "block-FP8 value count overflows usize".to_owned())?;
+        let expected_source_bytes = value_count
+            .checked_mul(2)
+            .ok_or_else(|| "block-FP8 BF16 byte count overflows usize".to_owned())?;
+        let block_rows = n.div_ceil(BLOCK_FP8_OUTPUT_BLOCK);
+        let block_columns = k.div_ceil(BLOCK_FP8_INPUT_BLOCK);
+        let expected_scale_bytes = block_rows
+            .checked_mul(block_columns)
+            .and_then(|count| count.checked_mul(2))
+            .ok_or_else(|| "block-FP8 scale grid byte count overflows usize".to_owned())?;
+        if n == 0
+            || k == 0
+            || source_bf16_le.len() != expected_source_bytes
+            || scales_bf16_le.len() != expected_scale_bytes
+        {
+            return Err(format!(
+                "invalid block-FP8 input lengths for [{n}, {k}]: source={} expected_source={expected_source_bytes} scales={} expected_scales={expected_scale_bytes}",
+                source_bf16_le.len(),
+                scales_bf16_le.len()
+            ));
+        }
+
+        let mut output = vec![0_u8; value_count];
+        fill_bounded_ranges(
+            n,
+            k,
+            &mut output,
+            "qwen35-fp8-values",
+            |range, destination| {
+                for output_feature in range.clone() {
+                    let local_output = output_feature - range.start;
+                    for input_feature in 0..k {
+                        let source_index = output_feature * k + input_feature;
+                        let value = source_bf16_at(source_bf16_le, source_index).to_f32();
+                        if !value.is_finite() {
+                            return Err(format!(
+                                "non-finite BF16 source at [{output_feature}, {input_feature}]"
+                            ));
+                        }
+                        let scale_index = ((output_feature / BLOCK_FP8_OUTPUT_BLOCK)
+                            * block_columns
+                            + input_feature / BLOCK_FP8_INPUT_BLOCK)
+                            * 2;
+                        let scale = bf16::from_bits(u16::from_le_bytes([
+                            scales_bf16_le[scale_index],
+                            scales_bf16_le[scale_index + 1],
+                        ]))
+                        .to_f32();
+                        if !scale.is_finite() || !(scale > 0.0) {
+                            return Err(format!(
+                                "invalid stored BF16 inverse scale at [{output_feature}, {input_feature}]"
+                            ));
+                        }
+                        let normalized = value / scale;
+                        if !normalized.is_finite() || normalized.abs() > BLOCK_FP8_MAX_FINITE {
+                            return Err(format!(
+                                "stored BF16 scale would clip source [{output_feature}, {input_feature}]: value={value} scale={scale} normalized={normalized}"
+                            ));
+                        }
+                        let bits = float8::F8E4M3::from_f32(normalized).to_bits();
+                        if bits & 0x7f == 0x7f {
+                            return Err(format!(
+                                "E4M3 encoder produced non-finite bits 0x{bits:02x} at [{output_feature}, {input_feature}]"
+                            ));
+                        }
+                        destination[local_output * k + input_feature] = bits;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(output)
+    }
+
+    fn block_fp8_derived_quantizes_role(role: &str) -> bool {
+        BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&role)
+            && !DERIVED_DENSE_PROJECTION_ROLES.contains(&role)
+    }
+
+    fn safetensors_file_metadata(path: &Path) -> Result<Option<HashMap<String, String>>, String> {
+        let file = File::open(path).map_err(|error| format!("open {path:?}: {error}"))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("stat opened {path:?}: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!("opened safetensors source {path:?} is not a file"));
+        }
+        let mmap = unsafe { Mmap::map(&file).map_err(|error| format!("mmap {path:?}: {error}"))? };
+        let (_, metadata) = SafeTensors::read_metadata(&mmap)
+            .map_err(|error| format!("read safetensors metadata {path:?}: {error}"))?;
+        Ok(metadata.metadata().clone())
+    }
+
+    fn create_unique_derived_model_dir() -> Result<PathBuf, String> {
+        let temporary_root = std::env::temp_dir();
+        if !temporary_root.is_dir() {
+            return Err(format!(
+                "TMPDIR root {temporary_root:?} is not an existing directory"
+            ));
+        }
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock precedes UNIX epoch: {error}"))?
+            .as_nanos();
+        for attempt in 0..100_u32 {
+            let path = temporary_root.join(format!(
+                "ferrum-qwen35-08b-block-fp8-{}-{nonce}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(format!("create derived model dir {path:?}: {error}")),
+            }
+        }
+        Err("could not allocate a unique derived model directory under TMPDIR".to_owned())
+    }
+
+    fn copy_snapshot_metadata_files(source: &Path, destination: &Path) -> Result<(), String> {
+        let mut entries = std::fs::read_dir(source)
+            .map_err(|error| format!("read source snapshot {source:?}: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("list source snapshot {source:?}: {error}"))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let source_path = entry.path();
+            let file_name = entry.file_name();
+            let file_name_text = file_name.to_string_lossy();
+            if file_name_text == "config.json"
+                || file_name_text == "model.safetensors.index.json"
+                || file_name_text.ends_with(".safetensors")
+            {
+                continue;
+            }
+            let followed = std::fs::metadata(&source_path)
+                .map_err(|error| format!("follow snapshot entry {source_path:?}: {error}"))?;
+            if !followed.is_file() {
+                return Err(format!(
+                    "snapshot entry {source_path:?} is not a regular file (symlink-to-directory is forbidden)"
+                ));
+            }
+            let mut source_file = File::open(&source_path)
+                .map_err(|error| format!("open {source_path:?}: {error}"))?;
+            if !source_file
+                .metadata()
+                .map_err(|error| format!("stat opened {source_path:?}: {error}"))?
+                .is_file()
+            {
+                return Err(format!(
+                    "opened snapshot entry {source_path:?} is not a file"
+                ));
+            }
+            let destination_path = destination.join(&file_name);
+            let mut destination_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination_path)
+                .map_err(|error| format!("create {destination_path:?}: {error}"))?;
+            std::io::copy(&mut source_file, &mut destination_file).map_err(|error| {
+                format!(
+                    "materialize snapshot file {source_path:?} -> {destination_path:?}: {error}"
+                )
+            })?;
+            destination_file
+                .flush()
+                .map_err(|error| format!("flush {destination_path:?}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!("create {path:?}: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("write {path:?}: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("flush {path:?}: {error}"))
+    }
+
+    #[test]
+    fn derived_block_fp8_quantization_uses_stored_bf16_scale_without_clipping() {
+        assert_eq!(float8::F8E4M3::from_f32(448.0).to_bits(), 0x7e);
+        assert_eq!(float8::F8E4M3::from_bits(0x7e).to_f32(), 448.0);
+
+        let (n, k) = (130_usize, 129_usize);
+        let mut source = Vec::with_capacity(n * k * 2);
+        for index in 0..n * k {
+            let value = match index {
+                0 => bf16::MAX,
+                1 => -bf16::MAX,
+                _ if index % 17 == 0 => bf16::ZERO,
+                _ => bf16::from_f32(((index % 257) as f32 - 128.0) / 13.0),
+            };
+            source.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let scales = derive_block_fp8_scales(&source, n, k, "synthetic.weight").unwrap();
+        assert_eq!(scales.len(), n.div_ceil(128) * k.div_ceil(128) * 2);
+        let quantized = quantize_bf16_matrix_to_block_fp8(&source, n, k, scales.as_ref()).unwrap();
+        assert_eq!(quantized.len(), n * k);
+        assert!(quantized.iter().all(|bits| bits & 0x7f != 0x7f));
+        assert!(quantized
+            .iter()
+            .all(|bits| float8::F8E4M3::from_bits(*bits).to_f32().is_finite()));
+
+        let zero_source = vec![0_u8; 128 * 128 * 2];
+        let zero_scale = derive_block_fp8_scales(&zero_source, 128, 128, "zero.weight").unwrap();
+        assert_eq!(
+            bf16::from_bits(u16::from_le_bytes([zero_scale[0], zero_scale[1]])),
+            bf16::from_f32(1.0)
+        );
+        assert!(
+            quantize_bf16_matrix_to_block_fp8(&zero_source, 128, 128, &zero_scale)
+                .unwrap()
+                .iter()
+                .all(|bits| *bits == 0)
+        );
+
+        let mut non_finite = zero_source;
+        non_finite[..2].copy_from_slice(&bf16::NAN.to_bits().to_le_bytes());
+        assert!(derive_block_fp8_scales(&non_finite, 128, 128, "nan.weight")
+            .unwrap_err()
+            .contains("non-finite BF16"));
+    }
+
+    #[test]
+    #[ignore = "requires fixed Qwen/Qwen3.5-0.8B BF16 snapshot; writes derived model under TMPDIR"]
+    fn derives_fixed_qwen35_08b_block_fp8_snapshot_for_cuda_e2e() {
+        let source_input = std::env::var("FERRUM_TEST_QWEN35_DENSE_MODEL_DIR")
+            .expect("FERRUM_TEST_QWEN35_DENSE_MODEL_DIR must name the fixed 0.8B snapshot");
+        let source_dir = std::fs::canonicalize(&source_input)
+            .unwrap_or_else(|error| panic!("canonicalize source {source_input:?}: {error}"));
+        assert!(
+            source_dir.is_dir(),
+            "source is not a directory: {source_dir:?}"
+        );
+        assert!(
+            source_dir
+                .components()
+                .any(|component| component.as_os_str() == QWEN35_08B_REVISION),
+            "source path must bind fixed revision {QWEN35_08B_REVISION}: {source_dir:?}"
+        );
+
+        let source_config_bytes = std::fs::read(source_dir.join("config.json"))
+            .unwrap_or_else(|error| panic!("read source config.json: {error}"));
+        let mut derived_config: Value = serde_json::from_slice(&source_config_bytes)
+            .unwrap_or_else(|error| panic!("parse source config.json: {error}"));
+        assert!(
+            derived_config
+                .get("quantization_config")
+                .is_some_and(Value::is_null),
+            "fixed source top-level quantization_config must be null"
+        );
+        assert!(
+            derived_config
+                .get("text_config")
+                .and_then(|text| text.get("quantization_config"))
+                .is_some_and(Value::is_null),
+            "fixed source nested quantization_config must be null"
+        );
+        let source_text = Qwen35TextConfig::from_hf_config_value(&derived_config).unwrap();
+        assert!(!source_text.is_moe());
+        assert_eq!(source_text.hidden_size, 1024);
+        assert_eq!(source_text.num_hidden_layers, 24);
+        assert_eq!(source_text.linear_attention_layers(), 18);
+        assert_eq!(source_text.full_attention_layers(), 6);
+        assert!(source_text.tie_word_embeddings);
+        assert!(source_text.quantization.is_none());
+
+        let source_archive = SafetensorsArchive::open(&source_dir).unwrap();
+        assert_eq!(
+            source_archive.tensor_count(),
+            QWEN35_08B_SOURCE_TENSOR_COUNT
+        );
+        let source_payload_bytes = source_archive
+            .tensor_names()
+            .try_fold(0_u64, |total, name| {
+                let bytes = source_archive.tensor(name).unwrap().bytes().len();
+                total.checked_add(u64::try_from(bytes).unwrap())
+            })
+            .expect("source payload byte total does not overflow");
+        assert_eq!(
+            source_payload_bytes, QWEN35_08B_SOURCE_PAYLOAD_BYTES,
+            "fixed source payload identity drifted"
+        );
+        if source_dir.join("model.safetensors.index.json").is_file() {
+            let index: Value = serde_json::from_slice(
+                &std::fs::read(source_dir.join("model.safetensors.index.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                index["metadata"]["total_size"].as_u64(),
+                Some(source_payload_bytes),
+                "source index total_size must equal tensor payload bytes"
+            );
+        }
+
+        let source_inventory = Qwen35WeightInventory::from_names(source_archive.tensor_names());
+        let source_plan = source_inventory
+            .detect_prefix_and_resolve(&source_text)
+            .unwrap();
+        source_inventory
+            .partition_resolved_plan(&source_plan)
+            .unwrap()
+            .require_no_unknown()
+            .unwrap();
+
+        let resolved = source_plan.global_tensors.iter().chain(
+            source_plan
+                .layers
+                .iter()
+                .flat_map(|layer| layer.tensors.iter()),
+        );
+        let mut role_by_source = BTreeMap::<String, String>::new();
+        let mut quantized_sources = BTreeSet::<String>::new();
+        let mut dense_exclusions = BTreeSet::from(["lm_head".to_owned()]);
+        for weight in resolved.filter(|weight| weight.present) {
+            let Qwen35ResolvedWeightSource::Dense { values } = weight
+                .source
+                .as_ref()
+                .expect("present source has a typed bundle")
+            else {
+                panic!(
+                    "fixed BF16 source unexpectedly contains quantized role {:?}",
+                    weight.role
+                );
+            };
+            assert!(
+                role_by_source
+                    .insert(values.clone(), weight.role.clone())
+                    .is_none(),
+                "typed source {values:?} is referenced by more than one role"
+            );
+            if block_fp8_derived_quantizes_role(&weight.role) {
+                let tensor = source_archive.tensor(values).unwrap();
+                assert_eq!(tensor.dtype(), Dtype::BF16, "projection {values:?}");
+                assert_eq!(tensor.shape().len(), 2, "projection {values:?}");
+                assert!(values.ends_with(".weight"), "projection {values:?}");
+                assert!(quantized_sources.insert(values.clone()));
+            } else if BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str()) {
+                let module = values
+                    .strip_suffix(".weight")
+                    .unwrap_or_else(|| panic!("dense projection {values:?} lacks .weight suffix"));
+                dense_exclusions.insert(module.to_owned());
+            }
+        }
+        assert_eq!(quantized_sources.len(), QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
+        assert_eq!(
+            dense_exclusions.len(),
+            QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT
+        );
+
+        let mut derived_scales = BTreeMap::<String, Arc<[u8]>>::new();
+        for values in &quantized_sources {
+            let scale_name = format!(
+                "{}.weight_scale_inv",
+                values.strip_suffix(".weight").unwrap()
+            );
+            assert!(
+                !source_archive.contains(&scale_name),
+                "derived sidecar would collide with source tensor {scale_name:?}"
+            );
+            let tensor = source_archive.tensor(values).unwrap();
+            let [n, k] = tensor.shape() else {
+                unreachable!("quantized source rank was preflighted")
+            };
+            let n = usize::try_from(*n).expect("N fits usize");
+            let k = usize::try_from(*k).expect("K fits usize");
+            let scales = derive_block_fp8_scales(tensor.bytes(), n, k, values).unwrap();
+            assert!(derived_scales.insert(values.clone(), scales).is_none());
+        }
+
+        let source_shards = source_archive
+            .tensor_names()
+            .map(|name| {
+                source_archive
+                    .tensor(name)
+                    .unwrap()
+                    .source_file()
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(source_shards.len(), 1, "fixed source must use one shard");
+        let source_shard = source_dir.join(source_shards.iter().next().unwrap());
+        let source_header_metadata = safetensors_file_metadata(&source_shard).unwrap();
+        assert_eq!(
+            source_header_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("format"))
+                .map(String::as_str),
+            Some("pt")
+        );
+
+        let quantization_config = serde_json::json!({
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "modules_to_not_convert": dense_exclusions,
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        });
+        assert_eq!(quantization_config.as_object().unwrap().len(), 5);
+        let root = derived_config
+            .as_object_mut()
+            .expect("fixed source config root is an object");
+        let nested = root
+            .get_mut("text_config")
+            .and_then(Value::as_object_mut)
+            .expect("fixed source has text_config object");
+        assert_eq!(nested.remove("quantization_config"), Some(Value::Null));
+        root.insert(
+            "quantization_config".to_owned(),
+            quantization_config.clone(),
+        );
+        assert_eq!(
+            Qwen35TextConfig::from_hf_config_value(&derived_config)
+                .unwrap()
+                .quantization
+                .as_ref()
+                .and_then(Qwen35QuantizationConfig::as_fp8)
+                .unwrap()
+                .modules_to_not_convert
+                .len(),
+            QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT
+        );
+
+        let output_dir = create_unique_derived_model_dir().unwrap();
+        assert_ne!(output_dir, source_dir);
+        copy_snapshot_metadata_files(&source_dir, &output_dir).unwrap();
+        let mut config_bytes = serde_json::to_vec_pretty(&derived_config).unwrap();
+        config_bytes.push(b'\n');
+        write_new_file(&output_dir.join("config.json"), &config_bytes).unwrap();
+
+        let mut views = Vec::<(String, DerivedSafetensorsView<'_>)>::new();
+        let mut output_weight_map = BTreeMap::<String, String>::new();
+        const OUTPUT_SHARD: &str = "model-00001-of-00001.safetensors";
+        for name in source_archive.tensor_names() {
+            let source = source_archive.tensor(name).unwrap();
+            let shape = usize_shape(source.shape(), name).unwrap();
+            if let Some(scales_bf16_le) = derived_scales.get(name) {
+                let scale_name =
+                    format!("{}.weight_scale_inv", name.strip_suffix(".weight").unwrap());
+                let [n, k] = shape.as_slice() else {
+                    unreachable!("quantized source rank was preflighted")
+                };
+                let (n, k) = (*n, *k);
+                views.push((
+                    name.to_owned(),
+                    DerivedSafetensorsView::BlockFp8Values {
+                        source,
+                        shape,
+                        scales_bf16_le: Arc::clone(scales_bf16_le),
+                    },
+                ));
+                views.push((
+                    scale_name.clone(),
+                    DerivedSafetensorsView::BlockFp8Scales {
+                        shape: vec![n.div_ceil(128), k.div_ceil(128)],
+                        scales_bf16_le: Arc::clone(scales_bf16_le),
+                    },
+                ));
+                assert!(output_weight_map
+                    .insert(name.to_owned(), OUTPUT_SHARD.to_owned())
+                    .is_none());
+                assert!(output_weight_map
+                    .insert(scale_name, OUTPUT_SHARD.to_owned())
+                    .is_none());
+            } else {
+                views.push((
+                    name.to_owned(),
+                    DerivedSafetensorsView::Borrowed { source, shape },
+                ));
+                assert!(output_weight_map
+                    .insert(name.to_owned(), OUTPUT_SHARD.to_owned())
+                    .is_none());
+            }
+        }
+        assert_eq!(
+            views.len(),
+            QWEN35_08B_SOURCE_TENSOR_COUNT + QWEN35_08B_DERIVED_FP8_PAIR_COUNT
+        );
+        let output_payload_bytes = views
+            .iter()
+            .try_fold(0_u64, |total, (_, view)| {
+                total.checked_add(u64::try_from(view.data_len()).unwrap())
+            })
+            .expect("derived payload byte total does not overflow");
+        let output_shard = output_dir.join(OUTPUT_SHARD);
+        assert!(!output_shard.exists());
+        serialize_to_file(views, &source_header_metadata, &output_shard).unwrap();
+        drop(derived_scales);
+        drop(source_archive);
+
+        let index = serde_json::json!({
+            "metadata": {"total_size": output_payload_bytes},
+            "weight_map": output_weight_map
+        });
+        let mut index_bytes = serde_json::to_vec_pretty(&index).unwrap();
+        index_bytes.push(b'\n');
+        write_new_file(
+            &output_dir.join("model.safetensors.index.json"),
+            &index_bytes,
+        )
+        .unwrap();
+
+        for entry in std::fs::read_dir(&output_dir).unwrap() {
+            let path = entry.unwrap().path();
+            assert!(
+                !std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "derived output must materialize symlink {path:?}"
+            );
+        }
+        assert_eq!(
+            safetensors_file_metadata(&output_shard).unwrap(),
+            source_header_metadata
+        );
+        let output_archive = SafetensorsArchive::open(&output_dir).unwrap();
+        assert_eq!(output_archive.tensor_count(), output_weight_map.len());
+        let reopened_payload_bytes = output_archive
+            .tensor_names()
+            .try_fold(0_u64, |total, name| {
+                total.checked_add(
+                    u64::try_from(output_archive.tensor(name).unwrap().bytes().len()).unwrap(),
+                )
+            })
+            .unwrap();
+        assert_eq!(reopened_payload_bytes, output_payload_bytes);
+        assert_eq!(
+            index["metadata"]["total_size"].as_u64(),
+            Some(output_payload_bytes)
+        );
+
+        let output_config: Value =
+            serde_json::from_slice(&std::fs::read(output_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert!(output_config["text_config"]
+            .get("quantization_config")
+            .is_none());
+        assert_eq!(output_config["quantization_config"], quantization_config);
+        let output_text = Qwen35TextConfig::from_hf_config_value(&output_config).unwrap();
+        let output_inventory = Qwen35WeightInventory::from_names(output_archive.tensor_names());
+        let output_plan = output_inventory
+            .detect_prefix_and_resolve(&output_text)
+            .unwrap();
+        output_inventory
+            .partition_resolved_plan(&output_plan)
+            .unwrap()
+            .require_no_unknown()
+            .unwrap();
+        let output_resolved = output_plan.global_tensors.iter().chain(
+            output_plan
+                .layers
+                .iter()
+                .flat_map(|layer| layer.tensors.iter()),
+        );
+        let output_pair_count = output_resolved
+            .filter(|weight| {
+                matches!(
+                    weight.source,
+                    Some(Qwen35ResolvedWeightSource::BlockFp8 { .. })
+                )
+            })
+            .count();
+        assert_eq!(output_pair_count, QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
+
+        let prepared = prepare_from_model_dir(&output_dir).unwrap();
+        assert_eq!(
+            prepared.family().weight_schema().format_id.as_str(),
+            "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
+        );
+        let mut prepared_pairs = Vec::new();
+        for tensor in &prepared.family().weight_schema().tensors {
+            collect_block_fp8_source_pairs(&tensor.physical_layout, &mut prepared_pairs);
+        }
+        assert_eq!(prepared_pairs.len(), QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
+
+        println!(
+            "FERRUM QWEN35 0.8B BLOCK-FP8 DERIVED SNAPSHOT PASS: {}",
+            output_dir.display()
+        );
+    }
 
     #[test]
     fn accepts_fixed_qwen38_compressed_tensors_contract_fixture() {

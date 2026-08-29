@@ -83,6 +83,7 @@ audioadapter-buffers = "3.0.0"
 tokio-test = "0.4"
 tempfile = "3.8"
 ferrum-testkit = { workspace = true }
+float8 = { workspace = true }
 
 [features]
 default = []
