@@ -374,7 +374,7 @@ manifest = {
     "env_overrides": {
         "PYTHONDONTWRITEBYTECODE": "1",
         "CARGO_BUILD_JOBS": "8",
-        "RUST_TEST_THREADS": "1",
+        "RUST_TEST_THREADS": "8",
     },
     "receipt_schema": "ferrum.bounded-command-receipt.v1",
     "limits": expected_limits,
