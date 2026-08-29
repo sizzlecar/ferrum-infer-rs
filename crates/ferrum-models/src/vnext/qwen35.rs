@@ -4130,10 +4130,11 @@ fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> VNextE
 mod tests {
     use super::*;
     use ferrum_interfaces::vnext::{
-        gated_delta_recurrent_attention_contract, routed_shared_swiglu_moe_contract,
-        ModelArtifactSourceRole, ModelSourceKind, OperationContract, OriginalModelSource,
-        OriginalModelSources, PhysicalStorageLayout, PhysicalWeightComponentBinding,
-        WeightComponentSource,
+        causal_paged_attention_contract, dense_swiglu_contract,
+        gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
+        routed_shared_swiglu_moe_contract, ModelArtifactSourceRole, ModelSourceKind,
+        OperationContract, OriginalModelSource, OriginalModelSources, PhysicalStorageLayout,
+        PhysicalWeightComponentBinding, WeightComponentSource,
     };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -4142,6 +4143,8 @@ mod tests {
         include_bytes!("../../tests/fixtures/qwen38_awq_int4_config.contract.json");
     const QWEN38_FP8_CONFIG: &[u8] =
         include_bytes!("../../tests/fixtures/qwen38_fp8_config.contract.json");
+    const QWEN38_FP8_BAD_RECIPE: &[u8] =
+        include_bytes!("../../tests/fixtures/qwen38_fp8_config.bad-recipe.json");
 
     #[test]
     fn accepts_fixed_qwen38_compressed_tensors_contract_fixture() {
@@ -4232,15 +4235,91 @@ mod tests {
             .tensor(&packed_linear_attention_weight_id(0, PACKED_LINEAR_ATTN_QKVZBA_ROLE).unwrap())
             .expect("packed linear-attention logical weight");
         let PhysicalWeightLayout::Composite { parts } = &packed_attention.physical_layout else {
-            panic!("block-FP8 qkv/z/b/a must preserve four independent source leaves")
+            panic!("block-FP8 qkv/z with dense b/a must preserve four source leaves")
         };
         assert_eq!(parts.len(), 4);
-        for part in parts {
+        for part in &parts[..2] {
             let PhysicalWeightLayout::QuantizedBlockGrid { block_axes, .. } = part.layout.as_ref()
             else {
-                panic!("each attention projection must retain its block grid")
+                panic!("qkv and z projections must retain independent block grids")
             };
             assert_eq!(*block_axes, [0, 1]);
+        }
+        assert!(matches!(
+            parts[2].layout.as_ref(),
+            PhysicalWeightLayout::Dense { .. }
+        ));
+        assert!(matches!(
+            parts[3].layout.as_ref(),
+            PhysicalWeightLayout::Dense { .. }
+        ));
+    }
+
+    #[test]
+    fn qwen38_block_fp8_program_matches_standard_operation_contracts() {
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(test_block_fp8_config()).unwrap())
+            .unwrap();
+        let program = prepared.program();
+        let contracts = [
+            (
+                GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+                ContractVersion::new(6, 0),
+                ContractVersion::new(6, 0),
+                gated_delta_recurrent_attention_contract().unwrap(),
+                3,
+            ),
+            (
+                CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+                ContractVersion::new(2, 0),
+                ContractVersion::new(2, 0),
+                causal_paged_attention_contract().unwrap(),
+                1,
+            ),
+            (
+                DENSE_SWIGLU_OPERATION_ID,
+                ContractVersion::new(1, 0),
+                ContractVersion::new(1, 0),
+                dense_swiglu_contract().unwrap(),
+                4,
+            ),
+            (
+                LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+                ContractVersion::new(1, 0),
+                ContractVersion::new(1, 1),
+                last_token_dense_linear_contract().unwrap(),
+                1,
+            ),
+        ];
+        for (
+            operation_id,
+            required_version,
+            standard_contract_version,
+            contract,
+            expected_node_count,
+        ) in contracts
+        {
+            let matching_nodes = program
+                .blocks()
+                .iter()
+                .flat_map(|block| &block.nodes)
+                .filter(|node| node.operation_id.as_str() == operation_id)
+                .collect::<Vec<_>>();
+            assert_eq!(matching_nodes.len(), expected_node_count);
+            assert!(
+                matching_nodes
+                    .iter()
+                    .all(|node| node.required_version == required_version),
+                "prepared Qwen3.8 block-FP8 program has a mixed or stale {operation_id} version"
+            );
+
+            let descriptor = contract.descriptor();
+            assert_eq!(descriptor.id.as_str(), operation_id);
+            assert_eq!(descriptor.version, standard_contract_version);
+            assert_eq!(
+                descriptor.provider.minimum_version,
+                standard_contract_version
+            );
         }
     }
 
@@ -4250,23 +4329,74 @@ mod tests {
         let weight = config
             .weights
             .iter_mut()
-            .find(|weight| {
-                matches!(
-                    weight.source_encoding,
-                    FamilyWeightSourceEncoding::BlockFp8 { .. }
-                )
-            })
-            .expect("test contains a block-FP8 weight");
+            .find(|weight| weight.role == "linear_attn_qkv")
+            .expect("test contains a block-FP8 qkv weight");
         let FamilyWeightSourceEncoding::BlockFp8 { scale_inv, .. } = &mut weight.source_encoding
         else {
-            unreachable!()
+            panic!("linear-attention qkv must use block-FP8 in the test contract")
         };
+        let [n, k] = weight.dimensions.as_slice() else {
+            panic!("linear-attention qkv must be a matrix")
+        };
+        assert_eq!(scale_inv.dimensions, [n.div_ceil(128), k.div_ceil(128)]);
         scale_inv.dimensions[1] += 1;
 
         let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&serde_json::to_value(config).unwrap())
             .expect_err("mismatched block-FP8 scale grid must fail before runtime");
-        assert!(error.to_string().contains("inverse-scale shape"), "{error}");
+        let VNextError::InvalidModelConfig {
+            family_id,
+            field,
+            reason,
+        } = error
+        else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(family_id, FAMILY_ID);
+        assert_eq!(field, "weights.source_encoding.scale_inv.dimensions");
+        assert!(reason.contains("inverse-scale shape"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_block_fp8_metadata_recipe_drift_with_typed_error_before_runtime() {
+        let fixture: Value = serde_json::from_slice(QWEN38_FP8_BAD_RECIPE).unwrap();
+        assert_eq!(
+            fixture["base_fixture"],
+            Value::String("qwen38_fp8_config.contract.json".to_owned())
+        );
+        assert_eq!(
+            fixture["case"],
+            Value::String("qwen38-fp8-wrong-format".to_owned())
+        );
+        let pointer = fixture["pointer"]
+            .as_str()
+            .expect("bad-recipe JSON pointer");
+        let replacement = fixture["replacement"].clone();
+        let expected_error = fixture["expected_error"]
+            .as_str()
+            .expect("bad-recipe expected error");
+
+        let mut config = test_block_fp8_config();
+        config.hf_config = serde_json::from_slice(QWEN38_FP8_CONFIG).unwrap();
+        *config
+            .hf_config
+            .pointer_mut(pointer)
+            .expect("bad-recipe pointer exists in the fixed base fixture") = replacement;
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("mismatched block-FP8 metadata must fail before runtime");
+        let VNextError::InvalidModelConfig {
+            family_id,
+            field,
+            reason,
+        } = error
+        else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(family_id, FAMILY_ID);
+        assert_eq!(field, "hf_config");
+        assert!(reason.contains(expected_error), "{reason}");
     }
 
     #[test]
@@ -4607,8 +4737,6 @@ mod tests {
                 weight.role.as_str(),
                 "linear_attn_qkv"
                     | "linear_attn_z"
-                    | "linear_attn_b"
-                    | "linear_attn_a"
                     | "linear_attn_out"
                     | "self_attn_q"
                     | "self_attn_k"

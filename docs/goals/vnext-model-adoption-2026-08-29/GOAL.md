@@ -3,7 +3,9 @@
 ## 状态、用途与完成权威
 
 - 创建日期：2026-08-29。
-- 状态：Active；2026-08-29 已激活 A1，本地实现已开始；尚未授权启动付费 GPU。
+- 状态：Active；2026-08-29 已激活 A1，本地实现已开始；用户已授权由执行者自行决策最终门禁所需
+  的付费 GPU，但付费容量只允许在同架构小模型的 4050 完整 E2E 和其他本地 correctness 门禁通过后
+  启动，不得用于开发迭代。
 - 仓库内本文是目标执行与 amendment 的权威副本；外部草稿不再随执行状态更新。
 - 这是一个 **model-adoption portfolio goal**：固定多个热门 checkpoint，按顺序逐个接入；不是把
   多个模型绑成一次性大版本，也不是 v0.8.x release-ready 审计。
@@ -136,6 +138,11 @@ ProductionModelSourceBundle
     tensor/op 集合及 catalog coverage matrix；缺失的共享二维 block layout、materializer、
     operation provider 或 compiler quality-approval authority 都是 A1 明示交付物，不能用现有
     F16 -> channelwise FP8 路径代替。
+11. 每个 checkpoint 都先选择可在本地 RTX 4050 6GB 上运行的同架构官方小模型，完成共享
+    `ferrum run`、`ferrum serve`、stream 和 provider attribution E2E；若官方小模型的权重格式不同，
+    再从该固定小模型确定性地产生同架构、目标量化布局的开发派生件以覆盖 ingestion/materializer。
+    小模型及派生件只形成 correctness canary，不替代目标 checkpoint 的最终 receipt；付费 GPU 只运行
+    已经通过本地门禁的官方目标 checkpoint 最终测试。
 
 本文区分四类 digest：`checkpoint_content_digest` 锁定 checkpoint 文件内容，
 `source_schema_fingerprint` 锁定 typed source tensor/layout，`execution_contract_fingerprint` 锁定
@@ -153,7 +160,7 @@ checkpoint 重新锁定，不能复用别的 checkpoint 的结果。
 |---|---|---|
 | M0 source lock | checkpoint 没有靠猜测接入 | model、完整 revision、license、config、tokenizer/template、index/shard 清单 1/1 锁定；checkpoint 全部 tensors 100% 划分为 execution-eligible、typed non-executed 或 rejected，unknown=0；从 manifest 推导 expected execution quant tensor/op 精确集合、数量和 catalog coverage matrix；锁定 quality-vector generator/input/reference 语义及四类 digest；峰值 host/device memory 有书面估算 |
 | M1 fail closed | 错格式不会跑到 GPU 后才暴露 | 两个代表性坏合同 2/2 在 GPU allocation 前 typed-reject：一个 metadata/recipe 不匹配，一个 tensor dtype/shape/sidecar 不匹配 |
-| M2 local path | 4050/普通开发机能完成日常迭代 | exact CUDA release build exit=0；family/source、weight/materializer、plan/provider、run/serve shared identity 四组 affected commands 4/4 exit=0；候选 SHA 冻结后 `run_gate.py unit` 1/1 PASS |
+| M2 local path | 4050/普通开发机能完成日常迭代 | exact CUDA release build exit=0；family/source、weight/materializer、plan/provider、run/serve shared identity 四组 affected commands 4/4 exit=0；固定同架构小模型的 `run`、`serve` non-stream、stream E2E 全过，目标量化格式不同时再跑确定性派生件 ingestion/materializer canary；候选 SHA 冻结后 `run_gate.py unit` 1/1 PASS |
 | M3 numeric | 新量化执行不是未验证黑盒 | 对 M0 锁定的 quality vector/reference 跑 2 个 weight shape x 2 个 activation batch，共 4/4 CUDA case；reference 固定为“source quantized values 按锁定 scales/layout 解码后”的 matmul 输出；relative L2 `<=0.05`；NaN=0、Inf=0；通过绑定 `quality_vector_digest` 的 typed approval 后 compiler 才能选择 approximate materializer；reuse 完全相同 provider 时只重验 source/layout 和一个 canary，不重复整套矩阵 |
 | M4 product | 用户入口真的可用 | 预缓存权重后 load-to-ready `<=600s`；`run` 1/1、`serve` non-stream 1/1、stream 1/1；c2 固定短稳定性 4/4，每请求 output tokens `>=16`；HTTP 500、panic、OOM、CUDA error、invalid UTF-8、raw control/special token leakage 均为 0 |
 | M5 usability | 没有退化成无意义慢路或 fallback | 使用 canonical `ferrum bench-serve --fail-on-error --seed 9271 --n-repeats 1` 跑三个固定 c1 短请求，median output throughput `>=5 tok/s`，p50 TTFT `<=60s`；attribution 分母是 M0 在全量 partition 后锁定的 execution-eligible quant tensor/op 集合且必须为 100%，typed non-executed tensors 仍须入 inventory 但不进入执行 attribution；silent/dense/legacy fallback=0 |
@@ -227,8 +234,12 @@ SHA256 与 terminal line。三种终态都必须生成完整四份 JSON；未执
 
 ## 时间盒、硬件与预算
 
-RTX 4050 Laptop 6GB 负责 workspace 编译、affected tests、metadata fixture 和小张量 CUDA parity；
-它不承担真模型能否装入的验收。所有真模型只租 **一张卡**，本目标不引入多卡执行。
+RTX 4050 Laptop 6GB 负责 workspace 编译、affected tests、metadata fixture、小张量 CUDA parity，
+并负责同架构官方小模型及必要量化派生件的完整 `run`/`serve` E2E；它不承担官方目标 checkpoint
+容量或性能验收。所有官方目标模型最终测试只租 **一张卡**，本目标不引入多卡执行。A1 的固定
+本地 canary 是
+`Qwen/Qwen3.5-0.8B@2fc06364715b967f1860aea9cf38778875588b17`；其官方 BF16 权重验证共享架构，
+确定性 block-FP8 派生件验证 A1 权重路径，二者都不能替代 27B FP8 receipt。
 
 | lane | active developer-days 上限 | 付费 GPU 上限 | 推荐单卡 | 超限结果 |
 |---|---:|---:|---|---|
@@ -239,9 +250,10 @@ RTX 4050 Laptop 6GB 负责 workspace 编译、affected tests、metadata fixture 
 | C Gemma 4 W4A16 | 8 天 | 4 小时且 `<= USD 8` | 16GB 以上 CUDA，优先 24GB | `BLOCKED`，不回退到 Gemma 3 legacy |
 | D GLM watch | 1 天 M0 spike | `USD 0` | 无 | 输出 GO/DEFER/REJECT，不进入实现 |
 
-每次租卡前必须先得到用户批准，并写清：复用哪台实例、预计时长/成本、correctness command、
-product command、停止条件和 artifact 目录。下载模型和编译应尽量在计费前完成；失败后先复制证据并
-停机，不能让实例空转等待下一次尝试。
+用户已为本目标的最终门禁授予付费 GPU 自主决策权。每次实际启动前仍必须先核对现有实例 inventory，
+并公开写清：复用哪台实例或为何新租、预计时长/成本、correctness command、product command、
+停止条件和 artifact 目录。只有本地 M0-M3、同架构小模型 E2E 和目标格式派生 canary 已通过时才可
+启动；下载模型和编译应尽量在计费前完成，失败后先复制证据并停机，不能让实例空转等待下一次尝试。
 
 ## 各 lane 的特殊边界
 

@@ -24,7 +24,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_DIR = REPO_ROOT / "scripts/release/schemas/vnext_model_adoption"
 SCHEMA_VERSION = 1
-VALIDATOR_VERSION = "1.0.0"
+VALIDATOR_VERSION = "1.1.0"
 RECEIPT_SCHEMAS = {
     "model-lock.json": "model-lock-v1.schema.json",
     "validation.json": "validation-v1.schema.json",
@@ -84,6 +84,19 @@ PRODUCT_ERROR_KEYS = {
     "raw_control_or_special_token",
 }
 FALLBACK_KEYS = {"silent", "dense", "legacy"}
+BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
+M1_RUST_CONTRACTS = {
+    "qwen38-27b-fp8": {
+        "qwen38-fp8-wrong-format": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_metadata_recipe_drift_with_typed_error_before_runtime"
+        ),
+        "qwen38-fp8-scale-grid-drift": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_inverse_scale_grid_drift_before_runtime"
+        ),
+    }
+}
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SECRET_KEY = re.compile(r"(?:api[_-]?key|token|password|secret|authorization)", re.I)
 
@@ -408,6 +421,18 @@ def validate_sha(value: Any, label: str) -> str:
     return digest
 
 
+def validate_version(value: Any, label: str) -> tuple[int, int]:
+    version = as_object(value, label)
+    require(set(version) == {"major", "minor"}, f"{label} field set mismatch")
+    major = positive_int(version["major"], f"{label}.major")
+    minor = version["minor"]
+    require(
+        isinstance(minor, int) and not isinstance(minor, bool) and minor >= 0,
+        f"{label}.minor must be a non-negative integer",
+    )
+    return major, minor
+
+
 def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) -> dict[str, Any]:
     lock = as_object(source_lock, "model-lock.json.source_lock")
     required_keys(
@@ -565,15 +590,56 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
     coverage_pairs: set[tuple[str, str]] = set()
     for index, raw in enumerate(coverage):
         cell = as_object(raw, f"source_lock.coverage_matrix[{index}]")
-        required_keys(cell, {"operation_id", "provider_id", "covered"}, "coverage cell")
+        require(
+            set(cell)
+            == {
+                "operation_id",
+                "operation_version",
+                "provider_id",
+                "provider_version",
+                "source_fp8_pair_count",
+                "existing_execution_provider_acceptance",
+                "covered",
+                "missing_boundaries",
+            },
+            f"source_lock.coverage_matrix[{index}] field set mismatch",
+        )
         operation_id = non_empty_string(cell["operation_id"], "coverage operation id")
         require(operation_id in operation_ids, f"coverage has unexpected operation {operation_id}")
         coverage_ops.append(operation_id)
+        validate_version(cell["operation_version"], f"coverage {operation_id}.operation_version")
         provider_id = non_empty_string(cell["provider_id"], "coverage provider id")
+        validate_version(cell["provider_version"], f"coverage {operation_id}.provider_version")
         pair = (operation_id, provider_id)
         require(pair not in coverage_pairs, f"duplicate coverage cell {pair}")
         coverage_pairs.add(pair)
+        pair_count = cell["source_fp8_pair_count"]
+        require(
+            isinstance(pair_count, int)
+            and not isinstance(pair_count, bool)
+            and pair_count >= 0,
+            f"coverage {operation_id}.source_fp8_pair_count must be a non-negative integer",
+        )
+        require(
+            isinstance(cell["existing_execution_provider_acceptance"], bool),
+            f"coverage {operation_id}.existing_execution_provider_acceptance must be boolean",
+        )
         require(isinstance(cell["covered"], bool), "coverage covered must be boolean")
+        missing_boundaries = as_list(
+            cell["missing_boundaries"], f"coverage {operation_id}.missing_boundaries"
+        )
+        require(
+            all(isinstance(item, str) and item for item in missing_boundaries),
+            f"coverage {operation_id}.missing_boundaries is invalid",
+        )
+        require(
+            len(missing_boundaries) == len(set(missing_boundaries)),
+            f"coverage {operation_id} has duplicate missing boundaries",
+        )
+        require(
+            bool(missing_boundaries) is not cell["covered"],
+            f"coverage {operation_id} covered state and missing boundaries disagree",
+        )
         if cell["covered"]:
             covered_ops.add(operation_id)
     require(set(coverage_ops) == operation_ids, "coverage matrix is incomplete")
@@ -607,27 +673,158 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
     }
 
 
-def validate_m1(value: Any) -> None:
+def validate_m1_toolchain(value: Any) -> dict[str, Path]:
+    toolchain = as_object(value, "validation.json.fail_closed.toolchain")
+    require(
+        set(toolchain) == {"cargo", "rustc", "forbidden_environment_present"},
+        "M1 toolchain field set mismatch",
+    )
+    require(
+        toolchain["forbidden_environment_present"] == [],
+        "M1 toolchain was influenced by a forbidden wrapper/config environment",
+    )
+    resolved: dict[str, Path] = {}
+    for name in ["cargo", "rustc"]:
+        item = as_object(toolchain[name], f"M1 toolchain.{name}")
+        require(
+            set(item) == {"path", "size_bytes", "sha256", "version"},
+            f"M1 toolchain.{name} field set mismatch",
+        )
+        path = Path(non_empty_string(item["path"], f"M1 toolchain.{name}.path"))
+        require(path.is_absolute(), f"M1 toolchain.{name}.path must be absolute")
+        positive_int(item["size_bytes"], f"M1 toolchain.{name}.size_bytes")
+        validate_sha(item["sha256"], f"M1 toolchain.{name}.sha256")
+        version = non_empty_string(item["version"], f"M1 toolchain.{name}.version")
+        require(version.startswith(f"{name} "), f"M1 toolchain.{name}.version is invalid")
+        resolved[name] = path
+    return resolved
+
+
+def validate_m1_bounded_receipt(
+    case: dict[str, Any],
+    rust_test_id: str,
+    toolchain: dict[str, Path],
+    out_dir: Path,
+) -> None:
+    case_id = case["case_id"]
+    receipt_path = verify_reference(case["bounded_receipt"], f"M1 {case_id} receipt", out_dir)
+    stdout_path = verify_reference(case["stdout_log"], f"M1 {case_id} stdout", out_dir)
+    stderr_path = verify_reference(case["stderr_log"], f"M1 {case_id} stderr", out_dir)
+    receipt = as_object(load_json(receipt_path), f"M1 {case_id} bounded receipt")
+    require(receipt.get("schema") == BOUNDED_RECEIPT_SCHEMA, f"M1 {case_id} receipt schema mismatch")
+    require(
+        receipt.get("status") == "pass"
+        and receipt.get("rc") == 0
+        and receipt.get("reason") == "command_completed"
+        and receipt.get("violation") is None,
+        f"M1 {case_id} bounded command did not pass cleanly",
+    )
+    require(receipt.get("sampling_error_count") == 0, f"M1 {case_id} had sampling errors")
+    require(
+        receipt.get("cleanup") == {"process_group_gone": True},
+        f"M1 {case_id} did not clean its process group",
+    )
+    limits = as_object(receipt.get("limits"), f"M1 {case_id} receipt.limits")
+    peaks = as_object(receipt.get("peaks"), f"M1 {case_id} receipt.peaks")
+    bounds = {
+        "max_processes": 16,
+        "max_group_threads": 32,
+        "max_per_process_threads": 16,
+    }
+    for limit_name, maximum in bounds.items():
+        limit = positive_int(limits.get(limit_name), f"M1 {case_id}.{limit_name}")
+        require(limit <= maximum, f"M1 {case_id} {limit_name} exceeds the source bound")
+    require(
+        finite_number(limits.get("wall_timeout_seconds"), f"M1 {case_id}.wall_timeout_seconds")
+        <= 390.0,
+        f"M1 {case_id} wall timeout exceeds 390 seconds",
+    )
+    for peak_name, limit_name in [
+        ("processes", "max_processes"),
+        ("group_threads", "max_group_threads"),
+        ("per_process_threads", "max_per_process_threads"),
+    ]:
+        peak = positive_int(peaks.get(peak_name), f"M1 {case_id}.peaks.{peak_name}")
+        require(peak <= limits[limit_name], f"M1 {case_id} exceeded {limit_name}")
+
+    expected_command = [
+        "env",
+        "-u",
+        "RUSTC_WRAPPER",
+        "-u",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "-u",
+        "RUSTFLAGS",
+        "-u",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_JOBS=2",
+        "RUST_TEST_THREADS=1",
+        f"RUSTC={toolchain['rustc']}",
+        str(toolchain["cargo"]),
+        "test",
+        "--locked",
+        "-p",
+        "ferrum-models",
+        "--lib",
+        rust_test_id,
+        "--",
+        "--exact",
+        "--test-threads=1",
+        "--nocapture",
+    ]
+    require(receipt.get("command") == expected_command, f"M1 {case_id} Rust command mismatch")
+    require(
+        Path(non_empty_string(receipt.get("cwd"), f"M1 {case_id}.cwd")).is_absolute(),
+        f"M1 {case_id} cwd must be absolute",
+    )
+    for stream_name, expected_path in [("stdout", stdout_path), ("stderr", stderr_path)]:
+        stream = as_object(receipt.get(stream_name), f"M1 {case_id}.{stream_name}")
+        observed_path = Path(non_empty_string(stream.get("path"), f"M1 {case_id}.{stream_name}.path"))
+        require(observed_path.resolve() == expected_path.resolve(), f"M1 {case_id} {stream_name} path mismatch")
+        require(stream.get("size_bytes") == expected_path.stat().st_size, f"M1 {case_id} {stream_name} size mismatch")
+        require(stream.get("sha256") == sha256_file(expected_path), f"M1 {case_id} {stream_name} digest mismatch")
+
+    require(stdout_path.stat().st_size <= 1024 * 1024, f"M1 {case_id} stdout exceeds 1 MiB")
+    try:
+        stdout = stdout_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise GateError(f"M1 {case_id} stdout is not UTF-8") from exc
+    require(
+        f"test {rust_test_id}" in stdout,
+        f"M1 {case_id} stdout lacks the exact Rust test identity",
+    )
+    require(
+        re.search(
+            r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out",
+            stdout,
+        )
+        is not None,
+        f"M1 {case_id} did not produce an exact 1/1 libtest PASS summary",
+    )
+
+
+def validate_m1(value: Any, checkpoint_id: str, out_dir: Path) -> None:
     section = as_object(value, "validation.json.fail_closed")
+    require(set(section) == {"toolchain", "cases"}, "M1 fail_closed field set mismatch")
+    toolchain = validate_m1_toolchain(section["toolchain"])
     cases = as_list(section.get("cases"), "validation.json.fail_closed.cases")
     require(len(cases) == 2, "M1 requires exactly two bad-contract cases")
-    kinds: set[str] = set()
+    contracts = M1_RUST_CONTRACTS.get(checkpoint_id)
+    require(contracts is not None, f"M1 Rust contract is not locked for {checkpoint_id}")
     ids: set[str] = set()
     for index, raw in enumerate(cases):
         case = as_object(raw, f"M1 case[{index}]")
-        required_keys(
-            case,
-            {"case_id", "kind", "typed_error_code", "rejected_before_gpu_allocation", "gpu_allocations"},
-            f"M1 case[{index}]",
+        require(
+            set(case)
+            == {"case_id", "bounded_receipt", "stdout_log", "stderr_log"},
+            f"M1 case[{index}] field set mismatch",
         )
         case_id = non_empty_string(case["case_id"], f"M1 case[{index}].case_id")
         require(case_id not in ids, f"duplicate M1 case id {case_id}")
+        require(case_id in contracts, f"unexpected M1 case id {case_id}")
         ids.add(case_id)
-        kinds.add(non_empty_string(case["kind"], f"M1 case[{index}].kind"))
-        non_empty_string(case["typed_error_code"], f"M1 case[{index}].typed_error_code")
-        require(case["rejected_before_gpu_allocation"] is True, "M1 rejection was not pre-GPU")
-        require(case["gpu_allocations"] == 0, "M1 bad-contract case allocated GPU memory")
-    require(kinds == {"metadata_recipe_mismatch", "tensor_layout_mismatch"}, "M1 case kinds mismatch")
+        validate_m1_bounded_receipt(case, contracts[case_id], toolchain, out_dir)
+    require(ids == set(contracts), "M1 required Rust case set mismatch")
 
 
 def command_argv(value: Any, label: str) -> list[str]:
@@ -1004,7 +1201,7 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
             require_covered=final_status == "PASS",
         )
     if stages["M1"]["status"] == "pass":
-        validate_m1(receipts["validation.json"]["fail_closed"])
+        validate_m1(receipts["validation.json"]["fail_closed"], checkpoint_id, out_dir)
     if stages["M2"]["status"] == "pass":
         validate_m2(receipts["validation.json"]["local_path"], out_dir)
     if stages["M3"]["status"] == "pass":
@@ -1177,8 +1374,26 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
             "expected_quant_tensors": expected_tensors,
             "expected_operations": expected_operations,
             "coverage_matrix": [
-                {"operation_id": "op.q_proj", "provider_id": "provider.cuda.fp8", "covered": True},
-                {"operation_id": "op.o_proj", "provider_id": "provider.cuda.fp8", "covered": True},
+                {
+                    "operation_id": "op.q_proj",
+                    "operation_version": {"major": 1, "minor": 0},
+                    "provider_id": "provider.cuda.fp8",
+                    "provider_version": {"major": 1, "minor": 0},
+                    "source_fp8_pair_count": 1,
+                    "existing_execution_provider_acceptance": True,
+                    "covered": True,
+                    "missing_boundaries": [],
+                },
+                {
+                    "operation_id": "op.o_proj",
+                    "operation_version": {"major": 1, "minor": 0},
+                    "provider_id": "provider.cuda.fp8",
+                    "provider_version": {"major": 1, "minor": 0},
+                    "source_fp8_pair_count": 1,
+                    "existing_execution_provider_acceptance": True,
+                    "covered": True,
+                    "missing_boundaries": [],
+                },
             ],
             "quality_vector": {
                 "generator_semantics": "seeded exact source block-FP8 fixtures",
@@ -1193,27 +1408,107 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
             },
         },
     }
+    m1_root = out_dir.parent / f"{out_dir.name}-upstream" / "m1"
+    m1_root.mkdir(parents=True, exist_ok=True)
+    cargo_path = (m1_root / "cargo").resolve()
+    rustc_path = (m1_root / "rustc").resolve()
+    cargo_path.write_bytes(b"synthetic cargo\n")
+    rustc_path.write_bytes(b"synthetic rustc\n")
+    toolchain = {
+        "cargo": {**reference_for(cargo_path), "version": "cargo 1.0.0 (synthetic)"},
+        "rustc": {**reference_for(rustc_path), "version": "rustc 1.0.0 (synthetic)"},
+        "forbidden_environment_present": [],
+    }
+    m1_cases = []
+    m1_references = []
+    for case_id, rust_test_id in M1_RUST_CONTRACTS["qwen38-27b-fp8"].items():
+        case_root = m1_root / case_id
+        case_root.mkdir(parents=True, exist_ok=True)
+        stdout_path = (case_root / "stdout.log").resolve()
+        stderr_path = (case_root / "stderr.log").resolve()
+        receipt_path = (case_root / "bounded-command.json").resolve()
+        stdout_path.write_text(
+            f"running 1 test\ntest {rust_test_id} ... ok\n\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; "
+            "99 filtered out; finished in 0.01s\n",
+            encoding="utf-8",
+        )
+        stderr_path.write_bytes(b"")
+        command = [
+            "env",
+            "-u",
+            "RUSTC_WRAPPER",
+            "-u",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "-u",
+            "RUSTFLAGS",
+            "-u",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_JOBS=2",
+            "RUST_TEST_THREADS=1",
+            f"RUSTC={rustc_path}",
+            str(cargo_path),
+            "test",
+            "--locked",
+            "-p",
+            "ferrum-models",
+            "--lib",
+            rust_test_id,
+            "--",
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+        ]
+        write_json(
+            receipt_path,
+            {
+                "schema": BOUNDED_RECEIPT_SCHEMA,
+                "status": "pass",
+                "rc": 0,
+                "reason": "command_completed",
+                "violation": None,
+                "command": command,
+                "cwd": str(REPO_ROOT),
+                "limits": {
+                    "max_processes": 16,
+                    "max_group_threads": 32,
+                    "max_per_process_threads": 16,
+                    "wall_timeout_seconds": 390.0,
+                },
+                "peaks": {
+                    "processes": 1,
+                    "group_threads": 1,
+                    "per_process_threads": 1,
+                },
+                "sampling_error_count": 0,
+                "cleanup": {"process_group_gone": True},
+                "stdout": reference_for(stdout_path),
+                "stderr": reference_for(stderr_path),
+            },
+        )
+        m1_cases.append(
+            {
+                "case_id": case_id,
+                "bounded_receipt": reference_for(receipt_path),
+                "stdout_log": reference_for(stdout_path),
+                "stderr_log": reference_for(stderr_path),
+            }
+        )
+        m1_references.extend(
+            [
+                reference_for(receipt_path),
+                reference_for(stdout_path),
+                reference_for(stderr_path),
+            ]
+        )
+
     validation = {
         **synthetic_envelope("validation"),
         "binary_sha256": "e" * 64,
         "milestones": {stage: {"status": "pass"} for stage in ["M1", "M2", "M3", "M6"]},
         "fail_closed": {
-            "cases": [
-                {
-                    "case_id": "bad-recipe",
-                    "kind": "metadata_recipe_mismatch",
-                    "typed_error_code": "quantization.recipe_mismatch",
-                    "rejected_before_gpu_allocation": True,
-                    "gpu_allocations": 0,
-                },
-                {
-                    "case_id": "bad-layout",
-                    "kind": "tensor_layout_mismatch",
-                    "typed_error_code": "weight.sidecar_shape_mismatch",
-                    "rejected_before_gpu_allocation": True,
-                    "gpu_allocations": 0,
-                },
-            ]
+            "toolchain": toolchain,
+            "cases": m1_cases,
         },
         "local_path": {
             "candidate_frozen": True,
@@ -1274,7 +1569,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
             "schemas": sorted(RECEIPT_SCHEMAS.values()),
         },
     }
-    validation["references"] = [reference_for(unit_manifest)]
+    validation["references"] = [reference_for(unit_manifest), *m1_references]
     product = {
         **synthetic_envelope("product"),
         "binary_sha256": "e" * 64,
@@ -1459,6 +1754,59 @@ def run_self_test() -> None:
             "checkpoint revision",
             lambda: validate_package("qwen38-27b-fp8", revision, write_log=False),
             "checkpoint revision mismatch",
+        )
+
+        provider_version = root / "missing-provider-version"
+        provider_version_docs = synthetic_pass_documents(provider_version)
+        del provider_version_docs["model-lock.json"]["source_lock"]["coverage_matrix"][0][
+            "provider_version"
+        ]
+        write_synthetic_package(provider_version, provider_version_docs)
+        expect_failure(
+            "coverage provider version",
+            lambda: validate_package(
+                "qwen38-27b-fp8", provider_version, write_log=False
+            ),
+            "coverage_matrix[0] field set mismatch",
+        )
+
+        m1_projection = root / "m1-projection-bypass"
+        m1_projection_docs = synthetic_pass_documents(m1_projection)
+        m1_projection_docs["validation.json"]["fail_closed"] = {
+            "cases": [
+                {
+                    "case_id": "qwen38-fp8-wrong-format",
+                    "kind": "metadata_recipe_mismatch",
+                    "typed_error_code": "forged",
+                    "rejected_before_gpu_allocation": True,
+                    "gpu_allocations": 0,
+                },
+                {
+                    "case_id": "qwen38-fp8-scale-grid-drift",
+                    "kind": "tensor_layout_mismatch",
+                    "typed_error_code": "forged",
+                    "rejected_before_gpu_allocation": True,
+                    "gpu_allocations": 0,
+                },
+            ]
+        }
+        write_synthetic_package(m1_projection, m1_projection_docs)
+        expect_failure(
+            "M1 projection bypass",
+            lambda: validate_package("qwen38-27b-fp8", m1_projection, write_log=False),
+            "M1 fail_closed field set mismatch",
+        )
+
+        m1_swapped = root / "m1-swapped-rust-receipt"
+        m1_swapped_docs = synthetic_pass_documents(m1_swapped)
+        m1_cases = m1_swapped_docs["validation.json"]["fail_closed"]["cases"]
+        for key in ["bounded_receipt", "stdout_log", "stderr_log"]:
+            m1_cases[0][key] = m1_cases[1][key]
+        write_synthetic_package(m1_swapped, m1_swapped_docs)
+        expect_failure(
+            "M1 swapped Rust receipt",
+            lambda: validate_package("qwen38-27b-fp8", m1_swapped, write_log=False),
+            "Rust command mismatch",
         )
 
         blocked = root / "blocked"

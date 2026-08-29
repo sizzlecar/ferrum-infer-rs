@@ -78,6 +78,18 @@ impl PaddedDenseMaterializer {
     }
 }
 
+fn test_approximate_quality_contract() -> ApproximateWeightQualityContract {
+    ApproximateWeightQualityContract::new(
+        sha('a'),
+        sha('b'),
+        4,
+        CanonicalRational::new(1, 20).unwrap(),
+        0,
+        0,
+    )
+    .unwrap()
+}
+
 impl WeightMaterializer for PaddedDenseMaterializer {
     fn descriptor(&self) -> &WeightMaterializerDescriptor {
         &self.descriptor
@@ -265,10 +277,19 @@ fn semantic_program_compiles_through_the_registered_provider_authority() {
 fn approximate_materializer_is_not_authorized_by_capability_registration() {
     let family = TestRegistry::new().prepare();
     let materializer_id: WeightMaterializerId = id("weight-materializer.test.padded-dense");
-    let materializers = WeightMaterializerRegistry::new(vec![Box::new(
-        PaddedDenseMaterializer::with_fidelity('9', WeightMaterializationFidelity::Approximate),
-    )])
+    let descriptor = WeightMaterializerDescriptor::new(
+        id("weight-materializer.test.padded-dense"),
+        ContractVersion::new(1, 0),
+        sha('9'),
+        WeightMaterializationFidelity::Approximate,
+        BTreeSet::from([id("capability.compute")]),
+    )
+    .unwrap()
+    .with_approximate_quality_contract(test_approximate_quality_contract())
     .unwrap();
+    let materializers =
+        WeightMaterializerRegistry::new(vec![Box::new(PaddedDenseMaterializer { descriptor })])
+            .unwrap();
     let catalog = materializers.augment_catalog(catalog()).unwrap();
     let registry = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);
     let mut options = compile_options();
@@ -281,6 +302,11 @@ fn approximate_materializer_is_not_authorized_by_capability_registration() {
             .fidelity(),
         WeightMaterializationFidelity::Approximate
     );
+    assert!(catalog
+        .weight_materializer(&materializer_id)
+        .unwrap()
+        .approximate_quality_contract()
+        .is_some());
     assert_eq!(
         serde_json::to_value(catalog.weight_materializer(&materializer_id).unwrap()).unwrap()
             ["fidelity"],
@@ -295,11 +321,78 @@ fn approximate_materializer_is_not_authorized_by_capability_registration() {
         &options,
     )
     .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("requires explicit numerical-quality approval"),
-        "{error}"
+    assert!(matches!(
+        error,
+        VNextError::WeightMaterializerQualityApprovalRequired { materializer_id }
+            if materializer_id == "weight-materializer.test.padded-dense"
+    ));
+}
+
+#[test]
+fn approximate_quality_contract_is_policy_metadata_not_an_approval() {
+    let contract = test_approximate_quality_contract();
+    assert_eq!(contract.execution_contract_fingerprint(), sha('a'));
+    assert_eq!(contract.quality_vector_digest(), sha('b'));
+    assert_eq!(contract.required_case_count(), 4);
+    assert_eq!(
+        contract.relative_l2_max(),
+        CanonicalRational::new(1, 20).unwrap()
+    );
+    assert_eq!(contract.nan_count_max(), 0);
+    assert_eq!(contract.inf_count_max(), 0);
+
+    let exact = WeightMaterializerDescriptor::new(
+        id("weight-materializer.test.exact"),
+        ContractVersion::new(1, 0),
+        sha('c'),
+        WeightMaterializationFidelity::Exact,
+        BTreeSet::new(),
+    )
+    .unwrap();
+    assert!(exact
+        .with_approximate_quality_contract(contract.clone())
+        .is_err());
+    assert!(ApproximateWeightQualityContract::new(
+        "not-a-digest",
+        sha('b'),
+        4,
+        CanonicalRational::new(1, 20).unwrap(),
+        0,
+        0,
+    )
+    .is_err());
+    assert!(ApproximateWeightQualityContract::new(
+        sha('a'),
+        sha('b'),
+        0,
+        CanonicalRational::new(1, 20).unwrap(),
+        0,
+        0,
+    )
+    .is_err());
+}
+
+#[test]
+fn exact_materializer_descriptor_keeps_legacy_wire_and_fingerprint() {
+    const LEGACY_JSON: &str = r#"{"fidelity":"exact","id":"weight-materializer.test.padded-dense","implementation_fingerprint":"9999999999999999999999999999999999999999999999999999999999999999","required_capabilities":["capability.compute"],"version":{"major":1,"minor":0}}"#;
+    const LEGACY_FINGERPRINT: &str =
+        "667790b7aded7556b9a628eadc203737f350c8d6fd642f5fa4a26706ecf723b4";
+
+    let materializers =
+        WeightMaterializerRegistry::new(vec![Box::new(PaddedDenseMaterializer::new())]).unwrap();
+    let catalog = materializers.augment_catalog(catalog()).unwrap();
+    let descriptor = catalog
+        .weight_materializer(&id("weight-materializer.test.padded-dense"))
+        .unwrap();
+    assert!(descriptor.approximate_quality_contract().is_none());
+    assert_eq!(
+        serde_json::to_value(descriptor).unwrap(),
+        serde_json::from_str::<serde_json::Value>(LEGACY_JSON).unwrap()
+    );
+    assert_eq!(descriptor.fingerprint().unwrap(), LEGACY_FINGERPRINT);
+    assert_eq!(
+        serde_json::from_str::<WeightMaterializerDescriptor>(LEGACY_JSON).unwrap(),
+        *descriptor
     );
 }
 

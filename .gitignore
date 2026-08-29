@@ -51,3 +51,7 @@ docs/goals/test-architecture-2026-06-10/evidence/l1-metal-run/*.log
 
 # Large per-layer diagnostic dumps; keep summarized json/log artifacts instead.
 docs/goals/model-coverage-2026-06-12/artifacts/**/*.bin
+
+# vNext adoption receipts are local gate outputs; only the four-receipt final
+# package is referenced externally and generated artifacts are never source.
+docs/goals/vnext-model-adoption-2026-08-29/artifacts/

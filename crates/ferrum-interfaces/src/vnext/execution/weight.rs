@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-use crate::vnext::{WeightComponentPayload, WeightComponentSource, WeightComponentSpec};
+use crate::vnext::{
+    CanonicalRational, WeightComponentPayload, WeightComponentSource, WeightComponentSpec,
+};
 
 use super::{
     canonical_fingerprint, invalid_plan, is_canonical_sha256, CapabilityCatalog, CapabilityId,
@@ -24,6 +26,81 @@ pub const MAX_WEIGHT_MATERIALIZERS: usize = 64;
 pub enum WeightMaterializationFidelity {
     Exact,
     Approximate,
+}
+
+/// Checked-in numerical policy for an approximate materializer.
+///
+/// This is not an approval record. The public compiler remains exact-only;
+/// M3 must add a crate-owned verifier that consumes real numeric artifact
+/// bytes before an approximate materializer can be selected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApproximateWeightQualityContract {
+    execution_contract_fingerprint: String,
+    quality_vector_digest: String,
+    required_case_count: u32,
+    relative_l2_max: CanonicalRational,
+    nan_count_max: u64,
+    inf_count_max: u64,
+}
+
+impl ApproximateWeightQualityContract {
+    pub fn new(
+        execution_contract_fingerprint: impl Into<String>,
+        quality_vector_digest: impl Into<String>,
+        required_case_count: u32,
+        relative_l2_max: CanonicalRational,
+        nan_count_max: u64,
+        inf_count_max: u64,
+    ) -> Result<Self, VNextError> {
+        let contract = Self {
+            execution_contract_fingerprint: execution_contract_fingerprint.into(),
+            quality_vector_digest: quality_vector_digest.into(),
+            required_case_count,
+            relative_l2_max,
+            nan_count_max,
+            inf_count_max,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    pub fn execution_contract_fingerprint(&self) -> &str {
+        &self.execution_contract_fingerprint
+    }
+
+    pub fn quality_vector_digest(&self) -> &str {
+        &self.quality_vector_digest
+    }
+
+    pub const fn required_case_count(&self) -> u32 {
+        self.required_case_count
+    }
+
+    pub const fn relative_l2_max(&self) -> CanonicalRational {
+        self.relative_l2_max
+    }
+
+    pub const fn nan_count_max(&self) -> u64 {
+        self.nan_count_max
+    }
+
+    pub const fn inf_count_max(&self) -> u64 {
+        self.inf_count_max
+    }
+
+    fn validate(&self) -> Result<(), VNextError> {
+        if !is_canonical_sha256(&self.execution_contract_fingerprint)
+            || !is_canonical_sha256(&self.quality_vector_digest)
+            || self.required_case_count == 0
+            || self.relative_l2_max.numerator() <= 0
+        {
+            return Err(invalid_plan(
+                "approximate weight quality contract has invalid digests, case count, or threshold",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize)]
@@ -57,6 +134,8 @@ pub struct WeightMaterializerDescriptor {
     implementation_fingerprint: String,
     fidelity: WeightMaterializationFidelity,
     required_capabilities: BTreeSet<CapabilityId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approximate_quality_contract: Option<ApproximateWeightQualityContract>,
 }
 
 impl WeightMaterializerDescriptor {
@@ -73,6 +152,7 @@ impl WeightMaterializerDescriptor {
             implementation_fingerprint: implementation_fingerprint.into(),
             fidelity,
             required_capabilities,
+            approximate_quality_contract: None,
         };
         descriptor.validate_structure()?;
         Ok(descriptor)
@@ -108,6 +188,25 @@ impl WeightMaterializerDescriptor {
         &self.required_capabilities
     }
 
+    pub fn with_approximate_quality_contract(
+        mut self,
+        contract: ApproximateWeightQualityContract,
+    ) -> Result<Self, VNextError> {
+        if self.fidelity != WeightMaterializationFidelity::Approximate {
+            return Err(invalid_plan(format!(
+                "exact weight materializer `{}` cannot carry an approximate quality contract",
+                self.id
+            )));
+        }
+        contract.validate()?;
+        self.approximate_quality_contract = Some(contract);
+        Ok(self)
+    }
+
+    pub fn approximate_quality_contract(&self) -> Option<&ApproximateWeightQualityContract> {
+        self.approximate_quality_contract.as_ref()
+    }
+
     pub fn fingerprint(&self) -> Result<String, VNextError> {
         canonical_fingerprint(self, "fingerprint weight materializer descriptor")
     }
@@ -129,6 +228,15 @@ impl WeightMaterializerDescriptor {
                 "weight materializer descriptor `{}` has invalid version or implementation identity",
                 self.id
             )));
+        }
+        if let Some(contract) = &self.approximate_quality_contract {
+            contract.validate()?;
+            if self.fidelity != WeightMaterializationFidelity::Approximate {
+                return Err(invalid_plan(format!(
+                    "exact weight materializer `{}` cannot carry an approximate quality contract",
+                    self.id
+                )));
+            }
         }
         Ok(())
     }
@@ -340,9 +448,9 @@ impl WeightMaterializerRegistry {
             )));
         }
         if descriptor.fidelity() != WeightMaterializationFidelity::Exact {
-            return Err(invalid_plan(format!(
-                "weight materializer `{materializer_id}` is approximate and requires explicit numerical-quality approval"
-            )));
+            return Err(VNextError::WeightMaterializerQualityApprovalRequired {
+                materializer_id: materializer_id.to_string(),
+            });
         }
         descriptor.validate_for_device(catalog.device())?;
         let mut schema = materializer.execution_schema(family, catalog.device())?;
