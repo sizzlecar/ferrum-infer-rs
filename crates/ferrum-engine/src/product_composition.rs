@@ -13,8 +13,8 @@ use ferrum_interfaces::vnext::{
     ResolutionSourceEvidence, ResolutionSourceProvenance, ResolvedModelPlan,
     ResolvedModelPlanInputs, ResolvedPlanValidationContext, ResolvedRuntimePolicy, SamplingPolicy,
     SpecialTokenRole, StopPolicy, StopTokenCollisionPolicy, StructuredOutputPolicy,
-    TokenizerDescriptor, TokenizerId, TriStatePolicy, WeightMaterializerId,
-    WeightMaterializerRegistry, JSON_RESOLUTION_SOURCE_PARSER,
+    TokenizerDescriptor, TokenizerId, TriStatePolicy, WeightMaterializerRegistry,
+    WeightMaterializerSelection, JSON_RESOLUTION_SOURCE_PARSER,
 };
 use ferrum_models::vnext::{PreparedProductionModel, ProductionModelFamilyRegistry};
 use ferrum_models::{VNextExecutorConfig, VNextModelExecutor};
@@ -33,7 +33,7 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
     runtime: Arc<R>,
     operation_registry: OperationRuntimeRegistry<R>,
     weight_materializers: WeightMaterializerRegistry,
-    weight_materializer_id: WeightMaterializerId,
+    weight_materializer_selection: WeightMaterializerSelection,
     catalog: CapabilityCatalog,
 ) -> Result<VNextModelExecutor<R>> {
     VNextModelExecutor::from_runtime_composition(
@@ -43,7 +43,7 @@ pub(crate) fn create_vnext_executor<R: DeviceRuntime>(
         runtime,
         operation_registry,
         weight_materializers,
-        weight_materializer_id,
+        weight_materializer_selection,
         catalog,
         |prepared, runtime, catalog, compilation| {
             resolve_model_plan(engine, prepared, catalog, runtime, compilation)
@@ -60,7 +60,7 @@ pub(crate) fn create_vnext_executor_with_config<R: DeviceRuntime>(
     runtime: Arc<R>,
     operation_registry: OperationRuntimeRegistry<R>,
     weight_materializers: WeightMaterializerRegistry,
-    weight_materializer_id: WeightMaterializerId,
+    weight_materializer_selection: WeightMaterializerSelection,
     catalog: CapabilityCatalog,
 ) -> Result<VNextModelExecutor<R>> {
     VNextModelExecutor::from_runtime_composition_with_config(
@@ -71,7 +71,7 @@ pub(crate) fn create_vnext_executor_with_config<R: DeviceRuntime>(
         runtime,
         operation_registry,
         weight_materializers,
-        weight_materializer_id,
+        weight_materializer_selection,
         catalog,
         |prepared, runtime, catalog, compilation| {
             resolve_model_plan(engine, prepared, catalog, runtime, compilation)

@@ -4535,7 +4535,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         runtime: Arc<R>,
         registry: OperationRuntimeRegistry<R>,
         weight_materializers: WeightMaterializerRegistry,
-        weight_materializer_id: WeightMaterializerId,
+        weight_materializer_selection: WeightMaterializerSelection,
         catalog: CapabilityCatalog,
         resolve_plan: F,
     ) -> Result<Self>
@@ -4557,7 +4557,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             runtime,
             registry,
             weight_materializers,
-            weight_materializer_id,
+            weight_materializer_selection,
             catalog,
             resolve_plan,
         )
@@ -4572,7 +4572,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         runtime: Arc<R>,
         registry: OperationRuntimeRegistry<R>,
         weight_materializers: WeightMaterializerRegistry,
-        weight_materializer_id: WeightMaterializerId,
+        weight_materializer_selection: WeightMaterializerSelection,
         catalog: CapabilityCatalog,
         resolve_plan: F,
     ) -> Result<Self>
@@ -4645,7 +4645,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut compile_options);
         }
-        compile_options.require_weight_materializer(weight_materializer_id);
+        compile_options.require_weight_materializer_selection(weight_materializer_selection);
         let compile_phase = StartupPhaseTimer::start("plan_compile");
         let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             family,

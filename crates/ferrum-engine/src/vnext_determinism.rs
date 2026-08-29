@@ -57,9 +57,10 @@ pub fn create_cuda_vnext_determinism_collector(
         ordinal,
         device_id,
         engine.runtime.attention_execution_policy,
+        prepared.family(),
     )
     .map_err(|error| FerrumError::device(format!("create vNext CUDA runtime: {error}")))?;
-    let (runtime, operation_registry, weight_materializers, weight_materializer_id, catalog) =
+    let (runtime, operation_registry, weight_materializers, weight_materializer_selection, catalog) =
         composition.into_parts();
     let executor_config =
         VNextExecutorConfig::for_determinism_collection(engine, &model_info, runtime.as_ref())?;
@@ -71,7 +72,7 @@ pub fn create_cuda_vnext_determinism_collector(
         runtime,
         operation_registry,
         weight_materializers,
-        weight_materializer_id,
+        weight_materializer_selection,
         catalog,
     )?;
     Ok(CudaVNextDeterminismCollector::new(executor))

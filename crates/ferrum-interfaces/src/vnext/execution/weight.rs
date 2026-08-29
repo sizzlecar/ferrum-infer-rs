@@ -2,19 +2,113 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
+
 use crate::vnext::{
-    CanonicalRational, WeightComponentPayload, WeightComponentSource, WeightComponentSpec,
+    CanonicalRational, QuantizationFormatId, WeightComponentPayload, WeightComponentSource,
+    WeightComponentSpec, WeightFormatId, WeightLayoutId,
 };
 
 use super::{
-    canonical_fingerprint, invalid_plan, is_canonical_sha256, CapabilityCatalog, CapabilityId,
-    ContractVersion, Deserialize, DeviceDescriptor, ModelFamilyId, PreparedModelFamily, Serialize,
-    VNextError, WeightId, WeightMaterializerId, WeightSchema,
+    canonical_fingerprint, canonical_json, invalid_plan, is_canonical_sha256, CapabilityCatalog,
+    CapabilityId, ContractVersion, Deserialize, DeviceDescriptor, ModelFamilyId,
+    PreparedModelFamily, Serialize, VNextError, WeightId, WeightMaterializerId, WeightSchema,
 };
 
 pub const IDENTITY_WEIGHT_MATERIALIZER_ID: &str = "weight-materializer.identity";
 const IDENTITY_MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(2, 0);
 pub const MAX_WEIGHT_MATERIALIZERS: usize = 64;
+pub const NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID: &str =
+    "quality-approval.weight-materializer.numeric.v1";
+pub const NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID: &str = "quality-approval-authority.ferrum.numeric";
+pub const MAX_APPROXIMATE_WEIGHT_QUALITY_ARTIFACT_BYTES: usize = 64 * 1024;
+
+const NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES: usize = 4;
+const MAX_NUMERIC_WEIGHT_QUALITY_VALUES_PER_CASE: usize = 8 * 1024;
+const MAX_NUMERIC_WEIGHT_QUALITY_VALUES: usize = 16 * 1024;
+
+#[derive(Serialize)]
+struct NumericWeightQualityAuthorityFingerprint<'a> {
+    id: &'a str,
+    version: ContractVersion,
+    artifact_schema_id: &'a str,
+    actual_encoding: &'a str,
+    reference_encoding: &'a str,
+    metric: &'a str,
+    verification_contract: &'a str,
+    artifact_max_bytes: usize,
+    required_cases: usize,
+    maximum_values_per_case: usize,
+    maximum_total_values: usize,
+}
+
+/// Canonical identity of the crate-owned numeric-artifact verification
+/// contract. It changes only when the parser, encodings, metric, or containment
+/// limits change; it is not a digest of a compiler binary or candidate SHA.
+pub fn numeric_weight_quality_authority_implementation_fingerprint() -> Result<String, VNextError> {
+    canonical_fingerprint(
+        &NumericWeightQualityAuthorityFingerprint {
+            id: NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID,
+            version: NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION,
+            artifact_schema_id: NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID,
+            actual_encoding: "ieee754-binary16-little-endian-bits",
+            reference_encoding: "ieee754-binary32-little-endian-bits",
+            metric: "norm(actual-reference)_2/max(norm(reference)_2,1e-6)",
+            verification_contract: "strict-canonical-json+locked-vector-payload-sha256+case-reference-sha256+raw-vector-sha256+recomputed-nonfinite-and-relative-l2+live-schema-binding",
+            artifact_max_bytes: MAX_APPROXIMATE_WEIGHT_QUALITY_ARTIFACT_BYTES,
+            required_cases: REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES,
+            maximum_values_per_case: MAX_NUMERIC_WEIGHT_QUALITY_VALUES_PER_CASE,
+            maximum_total_values: MAX_NUMERIC_WEIGHT_QUALITY_VALUES,
+        },
+        "fingerprint approximate weight numeric quality authority",
+    )
+}
+
+/// Typed compiler selection for one weight materializer.
+///
+/// Artifact bytes remain inert until the process-local registry verifies them
+/// against the selected implementation, its checked-in quality contract, and
+/// the live source and execution schemas. The bytes therefore cannot act as a
+/// global precision override.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightMaterializerSelection {
+    materializer_id: WeightMaterializerId,
+    numeric_quality_artifact: Option<Arc<[u8]>>,
+}
+
+impl WeightMaterializerSelection {
+    pub fn exact(materializer_id: WeightMaterializerId) -> Self {
+        Self {
+            materializer_id,
+            numeric_quality_artifact: None,
+        }
+    }
+
+    pub fn numeric_quality_artifact(
+        materializer_id: WeightMaterializerId,
+        artifact_bytes: impl Into<Vec<u8>>,
+    ) -> Result<Self, VNextError> {
+        let artifact_bytes = artifact_bytes.into();
+        decode_numeric_weight_quality_artifact(&artifact_bytes)?;
+        Ok(Self {
+            materializer_id,
+            numeric_quality_artifact: Some(Arc::from(artifact_bytes)),
+        })
+    }
+
+    pub fn materializer_id(&self) -> &WeightMaterializerId {
+        &self.materializer_id
+    }
+
+    pub fn has_numeric_quality_artifact(&self) -> bool {
+        self.numeric_quality_artifact.is_some()
+    }
+
+    fn numeric_quality_artifact_bytes(&self) -> Option<&[u8]> {
+        self.numeric_quality_artifact.as_deref()
+    }
+}
 
 /// Whether a physical weight transformation preserves source values.
 ///
@@ -101,6 +195,672 @@ impl ApproximateWeightQualityContract {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifact {
+    schema_id: String,
+    authority: NumericWeightQualityArtifactAuthority,
+    checkpoint: NumericWeightQualityArtifactCheckpoint,
+    materializer: NumericWeightQualityArtifactMaterializer,
+    source: NumericWeightQualityArtifactSource,
+    execution: NumericWeightQualityArtifactExecution,
+    contract: NumericWeightQualityArtifactContract,
+    quality_vector_payload: serde_json::Value,
+    cases: Vec<NumericWeightQualityArtifactCase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifactAuthority {
+    id: String,
+    version: ContractVersion,
+    implementation_fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifactCheckpoint {
+    id: String,
+    repository: String,
+    revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifactMaterializer {
+    id: WeightMaterializerId,
+    version: ContractVersion,
+    implementation_fingerprint: String,
+    fidelity: WeightMaterializationFidelity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifactSource {
+    weight_format_id: WeightFormatId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifactExecution {
+    weight_format_id: WeightFormatId,
+    weight_layout_id: WeightLayoutId,
+    quantization_format_ids: BTreeSet<QuantizationFormatId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifactContract {
+    execution_contract_fingerprint: String,
+    quality_vector_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericWeightQualityArtifactCase {
+    case_id: String,
+    actual_f16le_sha256: String,
+    actual_f16_bits: Vec<u16>,
+    reference_f32le_sha256: String,
+    reference_f32_bits: Vec<u32>,
+    relative_l2_upper_bound: CanonicalRational,
+    nan_count: u64,
+    inf_count: u64,
+}
+
+/// Serializable receipt embedded into an approximate execution-weight plan.
+///
+/// This record is evidence, not authority: only the non-serializable
+/// [`TrustedExecutionWeightPlan`] produced by the process-local registry can
+/// carry it into an executable plan. It binds reusable numeric evidence to the
+/// exact live source and execution schema fingerprints selected for this plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApproximateWeightQualityApprovalRecord {
+    authority_id: String,
+    authority_version: ContractVersion,
+    authority_implementation_fingerprint: String,
+    artifact_sha256: String,
+    source_schema_fingerprint: String,
+    execution_schema_fingerprint: String,
+    execution_contract_fingerprint: String,
+    quality_vector_digest: String,
+    completed_case_count: u32,
+    relative_l2_max_observed: CanonicalRational,
+    nan_count: u64,
+    inf_count: u64,
+}
+
+impl ApproximateWeightQualityApprovalRecord {
+    pub fn authority_id(&self) -> &str {
+        &self.authority_id
+    }
+
+    pub const fn authority_version(&self) -> ContractVersion {
+        self.authority_version
+    }
+
+    pub fn authority_implementation_fingerprint(&self) -> &str {
+        &self.authority_implementation_fingerprint
+    }
+
+    pub fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+
+    pub fn source_schema_fingerprint(&self) -> &str {
+        &self.source_schema_fingerprint
+    }
+
+    pub fn execution_schema_fingerprint(&self) -> &str {
+        &self.execution_schema_fingerprint
+    }
+
+    pub fn execution_contract_fingerprint(&self) -> &str {
+        &self.execution_contract_fingerprint
+    }
+
+    pub fn quality_vector_digest(&self) -> &str {
+        &self.quality_vector_digest
+    }
+
+    pub const fn completed_case_count(&self) -> u32 {
+        self.completed_case_count
+    }
+
+    pub const fn relative_l2_max_observed(&self) -> CanonicalRational {
+        self.relative_l2_max_observed
+    }
+
+    pub const fn nan_count(&self) -> u64 {
+        self.nan_count
+    }
+
+    pub const fn inf_count(&self) -> u64 {
+        self.inf_count
+    }
+
+    fn validate_structure(&self) -> Result<(), VNextError> {
+        if self.authority_id != NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID
+            || self.authority_version != NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION
+            || self.authority_implementation_fingerprint
+                != numeric_weight_quality_authority_implementation_fingerprint()?
+            || !is_canonical_sha256(&self.artifact_sha256)
+            || !is_canonical_sha256(&self.source_schema_fingerprint)
+            || !is_canonical_sha256(&self.execution_schema_fingerprint)
+            || !is_canonical_sha256(&self.execution_contract_fingerprint)
+            || !is_canonical_sha256(&self.quality_vector_digest)
+            || self.completed_case_count != REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES as u32
+            || self.relative_l2_max_observed.numerator() < 0
+        {
+            return Err(invalid_plan(
+                "approximate weight quality approval record is structurally invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_against(
+        &self,
+        source_schema_fingerprint: &str,
+        execution_schema_fingerprint: &str,
+        quality_contract: &ApproximateWeightQualityContract,
+    ) -> Result<(), VNextError> {
+        self.validate_structure()?;
+        if self.source_schema_fingerprint != source_schema_fingerprint
+            || self.execution_schema_fingerprint != execution_schema_fingerprint
+            || self.execution_contract_fingerprint
+                != quality_contract.execution_contract_fingerprint()
+            || self.quality_vector_digest != quality_contract.quality_vector_digest()
+            || self.completed_case_count != quality_contract.required_case_count()
+            || !nonnegative_rational_le(
+                self.relative_l2_max_observed,
+                quality_contract.relative_l2_max(),
+            )
+            || self.nan_count > quality_contract.nan_count_max()
+            || self.inf_count > quality_contract.inf_count_max()
+        {
+            return Err(invalid_plan(
+                "approximate weight quality approval differs from the live materializer or schema contract",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn decode_numeric_weight_quality_artifact(
+    artifact_bytes: &[u8],
+) -> Result<NumericWeightQualityArtifact, VNextError> {
+    if artifact_bytes.is_empty()
+        || artifact_bytes.len() > MAX_APPROXIMATE_WEIGHT_QUALITY_ARTIFACT_BYTES
+    {
+        return Err(invalid_plan(format!(
+            "approximate weight quality artifact must contain 1..={MAX_APPROXIMATE_WEIGHT_QUALITY_ARTIFACT_BYTES} bytes"
+        )));
+    }
+    let artifact: NumericWeightQualityArtifact =
+        serde_json::from_slice(artifact_bytes).map_err(|error| {
+            invalid_plan(format!(
+                "approximate weight quality artifact is not strict schema-valid JSON: {error}"
+            ))
+        })?;
+    let canonical_bytes = serde_json::to_value(&artifact)
+        .map(canonical_json)
+        .and_then(|value| serde_json::to_vec(&value))
+        .map_err(|error| VNextError::Serialization {
+            context: "canonicalize approximate weight quality artifact",
+            message: error.to_string(),
+        })?;
+    if canonical_bytes != artifact_bytes {
+        return Err(invalid_plan(
+            "approximate weight quality artifact is not canonical compact JSON",
+        ));
+    }
+    if artifact.schema_id != NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID
+        || artifact.authority.id != NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID
+        || artifact.authority.version != NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION
+        || artifact.authority.implementation_fingerprint
+            != numeric_weight_quality_authority_implementation_fingerprint()?
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact names a different verification authority",
+        ));
+    }
+    if !portable_artifact_text(&artifact.checkpoint.id)
+        || !portable_artifact_text(&artifact.checkpoint.repository)
+        || !canonical_revision(&artifact.checkpoint.revision)
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact checkpoint identity is invalid",
+        ));
+    }
+    if artifact.materializer.version.major == 0
+        || !is_canonical_sha256(&artifact.materializer.implementation_fingerprint)
+        || artifact.materializer.fidelity != WeightMaterializationFidelity::Approximate
+        || !is_canonical_sha256(&artifact.contract.execution_contract_fingerprint)
+        || !is_canonical_sha256(&artifact.contract.quality_vector_digest)
+        || artifact.cases.len() != REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact has invalid materializer, contract, or case structure",
+        ));
+    }
+    let quality_vector_bytes = serde_json::to_vec(&canonical_json(
+        artifact.quality_vector_payload.clone(),
+    ))
+    .map_err(|error| VNextError::Serialization {
+        context: "canonicalize approximate weight quality vector payload",
+        message: error.to_string(),
+    })?;
+    if format!("{:x}", Sha256::digest(&quality_vector_bytes))
+        != artifact.contract.quality_vector_digest
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact does not contain the locked quality vector payload",
+        ));
+    }
+    let vector_references =
+        quality_vector_references(&artifact.quality_vector_payload, &artifact.checkpoint)?;
+    let mut case_ids = BTreeSet::new();
+    let mut total_values = 0_usize;
+    for case in &artifact.cases {
+        let value_count = case.actual_f16_bits.len();
+        if !portable_artifact_text(&case.case_id)
+            || !case_ids.insert(case.case_id.clone())
+            || value_count == 0
+            || value_count != case.reference_f32_bits.len()
+            || value_count > MAX_NUMERIC_WEIGHT_QUALITY_VALUES_PER_CASE
+            || !is_canonical_sha256(&case.actual_f16le_sha256)
+            || !is_canonical_sha256(&case.reference_f32le_sha256)
+            || case.relative_l2_upper_bound.numerator() < 0
+        {
+            return Err(invalid_plan(
+                "approximate weight quality artifact has an invalid case identity, vector, digest, or metric structure",
+            ));
+        }
+        if vector_references.get(&case.case_id) != Some(&case.reference_f32le_sha256) {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact case `{}` reference differs from the locked quality vector",
+                case.case_id
+            )));
+        }
+        total_values = total_values.checked_add(value_count).ok_or_else(|| {
+            invalid_plan("approximate weight quality artifact value count overflows usize")
+        })?;
+        if total_values > MAX_NUMERIC_WEIGHT_QUALITY_VALUES {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact exceeds {MAX_NUMERIC_WEIGHT_QUALITY_VALUES} total values"
+            )));
+        }
+    }
+    if case_ids != vector_references.keys().cloned().collect() {
+        return Err(invalid_plan(
+            "approximate weight quality artifact cases differ from the locked quality vector",
+        ));
+    }
+    Ok(artifact)
+}
+
+fn verify_numeric_weight_quality_artifact(
+    artifact_bytes: &[u8],
+    descriptor: &WeightMaterializerDescriptor,
+    family: &PreparedModelFamily,
+    execution_schema: &WeightSchema,
+) -> Result<ApproximateWeightQualityApprovalRecord, VNextError> {
+    let artifact = decode_numeric_weight_quality_artifact(artifact_bytes)?;
+    let quality_contract = descriptor.approximate_quality_contract().ok_or_else(|| {
+        invalid_plan(format!(
+            "approximate weight materializer `{}` has no numerical quality contract",
+            descriptor.id()
+        ))
+    })?;
+    if artifact.materializer.id != *descriptor.id()
+        || artifact.materializer.version != descriptor.version()
+        || artifact.materializer.implementation_fingerprint
+            != descriptor.implementation_fingerprint()
+        || artifact.materializer.fidelity != descriptor.fidelity()
+        || descriptor.fidelity() != WeightMaterializationFidelity::Approximate
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact differs from the selected materializer",
+        ));
+    }
+    if artifact.source.weight_format_id != family.weight_schema().format_id
+        || artifact.execution.weight_format_id != execution_schema.format_id
+        || artifact.execution.weight_layout_id != execution_schema.layout_id
+        || artifact.execution.quantization_format_ids != execution_schema.quantization_formats()
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact differs from the live source or execution format contract",
+        ));
+    }
+    if artifact.contract.execution_contract_fingerprint
+        != quality_contract.execution_contract_fingerprint()
+        || artifact.contract.quality_vector_digest != quality_contract.quality_vector_digest()
+        || quality_contract.required_case_count() as usize != REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES
+        || artifact.cases.len() != REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact differs from the checked-in quality contract",
+        ));
+    }
+    let quality_vector_bytes = serde_json::to_vec(&canonical_json(
+        artifact.quality_vector_payload.clone(),
+    ))
+    .map_err(|error| VNextError::Serialization {
+        context: "canonicalize approximate weight quality vector payload",
+        message: error.to_string(),
+    })?;
+    if format!("{:x}", Sha256::digest(&quality_vector_bytes))
+        != quality_contract.quality_vector_digest()
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact does not contain the locked quality vector payload",
+        ));
+    }
+    let vector_references =
+        quality_vector_references(&artifact.quality_vector_payload, &artifact.checkpoint)?;
+
+    let mut case_ids = BTreeSet::new();
+    let mut total_values = 0_usize;
+    let mut total_nan_count = 0_u64;
+    let mut total_inf_count = 0_u64;
+    let mut maximum_upper_bound = CanonicalRational::new(0, 1)?;
+    for case in &artifact.cases {
+        let value_count = case.actual_f16_bits.len();
+        if !portable_artifact_text(&case.case_id)
+            || !case_ids.insert(case.case_id.clone())
+            || value_count == 0
+            || value_count != case.reference_f32_bits.len()
+            || value_count > MAX_NUMERIC_WEIGHT_QUALITY_VALUES_PER_CASE
+        {
+            return Err(invalid_plan(
+                "approximate weight quality artifact has an invalid case identity or vector size",
+            ));
+        }
+        if vector_references.get(&case.case_id) != Some(&case.reference_f32le_sha256) {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact case `{}` reference differs from the locked quality vector",
+                case.case_id
+            )));
+        }
+        total_values = total_values.checked_add(value_count).ok_or_else(|| {
+            invalid_plan("approximate weight quality artifact value count overflows usize")
+        })?;
+        if total_values > MAX_NUMERIC_WEIGHT_QUALITY_VALUES {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact exceeds {MAX_NUMERIC_WEIGHT_QUALITY_VALUES} total values"
+            )));
+        }
+        if digest_little_endian_u16(&case.actual_f16_bits) != case.actual_f16le_sha256
+            || digest_little_endian_u32(&case.reference_f32_bits) != case.reference_f32le_sha256
+        {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact case `{}` raw-vector digest differs",
+                case.case_id
+            )));
+        }
+
+        let (relative_l2, nan_count, inf_count) = recompute_relative_l2(case)?;
+        if nan_count != case.nan_count || inf_count != case.inf_count {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact case `{}` reports incorrect NaN or Inf counts",
+                case.case_id
+            )));
+        }
+        total_nan_count = total_nan_count.checked_add(nan_count).ok_or_else(|| {
+            invalid_plan("approximate weight quality artifact NaN count overflows u64")
+        })?;
+        total_inf_count = total_inf_count.checked_add(inf_count).ok_or_else(|| {
+            invalid_plan("approximate weight quality artifact Inf count overflows u64")
+        })?;
+        if case.relative_l2_upper_bound.numerator() < 0
+            || relative_l2 > rational_as_f64(case.relative_l2_upper_bound)
+            || !nonnegative_rational_le(
+                case.relative_l2_upper_bound,
+                quality_contract.relative_l2_max(),
+            )
+        {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact case `{}` exceeds or understates its relative-L2 contract",
+                case.case_id
+            )));
+        }
+        if nonnegative_rational_le(maximum_upper_bound, case.relative_l2_upper_bound) {
+            maximum_upper_bound = case.relative_l2_upper_bound;
+        }
+    }
+    if case_ids != vector_references.keys().cloned().collect() {
+        return Err(invalid_plan(
+            "approximate weight quality artifact cases differ from the locked quality vector",
+        ));
+    }
+    if total_nan_count > quality_contract.nan_count_max()
+        || total_inf_count > quality_contract.inf_count_max()
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact exceeds its non-finite output contract",
+        ));
+    }
+
+    let record = ApproximateWeightQualityApprovalRecord {
+        authority_id: NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID.to_owned(),
+        authority_version: NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION,
+        authority_implementation_fingerprint:
+            numeric_weight_quality_authority_implementation_fingerprint()?,
+        artifact_sha256: format!("{:x}", Sha256::digest(artifact_bytes)),
+        source_schema_fingerprint: family.weight_schema().fingerprint()?,
+        execution_schema_fingerprint: execution_schema.fingerprint()?,
+        execution_contract_fingerprint: quality_contract
+            .execution_contract_fingerprint()
+            .to_owned(),
+        quality_vector_digest: quality_contract.quality_vector_digest().to_owned(),
+        completed_case_count: u32::try_from(artifact.cases.len()).map_err(|_| {
+            invalid_plan("approximate weight quality artifact case count exceeds u32")
+        })?,
+        relative_l2_max_observed: maximum_upper_bound,
+        nan_count: total_nan_count,
+        inf_count: total_inf_count,
+    };
+    record.validate_against(
+        &family.weight_schema().fingerprint()?,
+        &execution_schema.fingerprint()?,
+        quality_contract,
+    )?;
+    Ok(record)
+}
+
+fn quality_vector_references(
+    payload: &serde_json::Value,
+    checkpoint: &NumericWeightQualityArtifactCheckpoint,
+) -> Result<BTreeMap<String, String>, VNextError> {
+    const ROOT_KEYS: [&str; 10] = [
+        "activation_batches",
+        "activation_contract",
+        "cases",
+        "checkpoint",
+        "fixture_id",
+        "generator",
+        "reference_contract",
+        "schema_version",
+        "source_contract",
+        "weight_shapes",
+    ];
+    let root = payload.as_object().ok_or_else(|| {
+        invalid_plan("approximate weight quality vector payload must be an object")
+    })?;
+    if root.keys().map(String::as_str).collect::<BTreeSet<_>>() != ROOT_KEYS.into_iter().collect() {
+        return Err(invalid_plan(
+            "approximate weight quality vector payload has unexpected root fields",
+        ));
+    }
+    let payload_checkpoint = root
+        .get("checkpoint")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            invalid_plan("approximate weight quality vector checkpoint must be an object")
+        })?;
+    if payload_checkpoint
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        != Some(checkpoint.id.as_str())
+        || payload_checkpoint
+            .get("repository")
+            .and_then(serde_json::Value::as_str)
+            != Some(checkpoint.repository.as_str())
+        || payload_checkpoint
+            .get("revision")
+            .and_then(serde_json::Value::as_str)
+            != Some(checkpoint.revision.as_str())
+    {
+        return Err(invalid_plan(
+            "approximate weight quality artifact checkpoint differs from its locked vector",
+        ));
+    }
+    let cases = root
+        .get("cases")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| invalid_plan("approximate weight quality vector cases must be an array"))?;
+    if cases.len() != REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES {
+        return Err(invalid_plan(
+            "approximate weight quality vector must contain exactly four cases",
+        ));
+    }
+    let mut references = BTreeMap::new();
+    for case in cases {
+        let case = case.as_object().ok_or_else(|| {
+            invalid_plan("approximate weight quality vector case must be an object")
+        })?;
+        let case_id = case
+            .get("case_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| portable_artifact_text(value))
+            .ok_or_else(|| {
+                invalid_plan("approximate weight quality vector case identity is invalid")
+            })?;
+        let reference = case
+            .get("reference_f32le_sha256")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| is_canonical_sha256(value))
+            .ok_or_else(|| {
+                invalid_plan("approximate weight quality vector reference digest is invalid")
+            })?;
+        if references
+            .insert(case_id.to_owned(), reference.to_owned())
+            .is_some()
+        {
+            return Err(invalid_plan(
+                "approximate weight quality vector has duplicate case identities",
+            ));
+        }
+    }
+    Ok(references)
+}
+
+fn portable_artifact_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 160
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/')
+        })
+}
+
+fn canonical_revision(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn digest_little_endian_u16(values: &[u16]) -> String {
+    let mut digest = Sha256::new();
+    for value in values {
+        digest.update(value.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn digest_little_endian_u32(values: &[u32]) -> String {
+    let mut digest = Sha256::new();
+    for value in values {
+        digest.update(value.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn recompute_relative_l2(
+    case: &NumericWeightQualityArtifactCase,
+) -> Result<(f64, u64, u64), VNextError> {
+    let mut error_squared = 0_f64;
+    let mut reference_squared = 0_f64;
+    let mut nan_count = 0_u64;
+    let mut inf_count = 0_u64;
+    for (&actual_bits, &reference_bits) in case.actual_f16_bits.iter().zip(&case.reference_f32_bits)
+    {
+        let actual = binary16_as_f32(actual_bits);
+        if actual.is_nan() {
+            nan_count += 1;
+            continue;
+        }
+        if actual.is_infinite() {
+            inf_count += 1;
+            continue;
+        }
+        let reference = f32::from_bits(reference_bits);
+        if !reference.is_finite() {
+            return Err(invalid_plan(format!(
+                "approximate weight quality artifact case `{}` has a non-finite reference",
+                case.case_id
+            )));
+        }
+        let error = f64::from(actual - reference);
+        error_squared += error * error;
+        let reference = f64::from(reference);
+        reference_squared += reference * reference;
+    }
+    if nan_count != 0 || inf_count != 0 {
+        return Ok((f64::INFINITY, nan_count, inf_count));
+    }
+    let relative_l2 = error_squared.sqrt() / reference_squared.sqrt().max(1.0e-6);
+    if !relative_l2.is_finite() {
+        return Err(invalid_plan(format!(
+            "approximate weight quality artifact case `{}` produced a non-finite relative L2",
+            case.case_id
+        )));
+    }
+    Ok((relative_l2, nan_count, inf_count))
+}
+
+fn binary16_as_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 {
+        1.0_f32
+    } else {
+        -1.0_f32
+    };
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let fraction = u32::from(bits & 0x03ff);
+    match (exponent, fraction) {
+        (0, 0) => sign * 0.0,
+        (0, fraction) => sign * fraction as f32 * 2_f32.powi(-24),
+        (0x1f, 0) => sign * f32::INFINITY,
+        (0x1f, _) => f32::NAN,
+        (exponent, fraction) => {
+            sign * (1.0 + fraction as f32 / 1024.0) * 2_f32.powi(exponent as i32 - 15)
+        }
+    }
+}
+
+fn rational_as_f64(value: CanonicalRational) -> f64 {
+    value.numerator() as f64 / value.denominator() as f64
+}
+
+fn nonnegative_rational_le(left: CanonicalRational, right: CanonicalRational) -> bool {
+    left.numerator() >= 0
+        && right.numerator() >= 0
+        && i128::from(left.numerator()) * i128::from(right.denominator())
+            <= i128::from(right.numerator()) * i128::from(left.denominator())
 }
 
 #[derive(Serialize)]
@@ -435,18 +1195,8 @@ impl WeightMaterializerRegistry {
         catalog: &CapabilityCatalog,
         materializer_id: &WeightMaterializerId,
     ) -> Result<TrustedExecutionWeightPlan, VNextError> {
-        let materializer = self.materializers.get(materializer_id).ok_or_else(|| {
-            invalid_plan(format!(
-                "weight materializer `{materializer_id}` is not registered"
-            ))
-        })?;
+        let materializer = self.registered_materializer(catalog, materializer_id)?;
         let descriptor = materializer.descriptor();
-        let catalog_descriptor = catalog.weight_materializer(materializer_id)?;
-        if descriptor != catalog_descriptor {
-            return Err(invalid_plan(format!(
-                "weight materializer `{materializer_id}` differs from its capability catalog descriptor"
-            )));
-        }
         if descriptor.fidelity() != WeightMaterializationFidelity::Exact {
             return Err(VNextError::WeightMaterializerQualityApprovalRequired {
                 materializer_id: materializer_id.to_string(),
@@ -463,6 +1213,77 @@ impl WeightMaterializerRegistry {
             descriptor: descriptor.clone(),
             materializer: Arc::clone(materializer),
         })
+    }
+
+    /// Selects either an exact materializer or an approximate materializer
+    /// carrying strict, crate-verified numeric artifact bytes.
+    pub fn select(
+        &self,
+        family: &PreparedModelFamily,
+        catalog: &CapabilityCatalog,
+        selection: &WeightMaterializerSelection,
+    ) -> Result<TrustedExecutionWeightPlan, VNextError> {
+        let Some(artifact_bytes) = selection.numeric_quality_artifact_bytes() else {
+            return self.select_exact(family, catalog, selection.materializer_id());
+        };
+        self.select_with_numeric_quality_artifact(
+            family,
+            catalog,
+            selection.materializer_id(),
+            artifact_bytes,
+        )
+    }
+
+    pub fn select_with_numeric_quality_artifact(
+        &self,
+        family: &PreparedModelFamily,
+        catalog: &CapabilityCatalog,
+        materializer_id: &WeightMaterializerId,
+        artifact_bytes: &[u8],
+    ) -> Result<TrustedExecutionWeightPlan, VNextError> {
+        let materializer = self.registered_materializer(catalog, materializer_id)?;
+        let descriptor = materializer.descriptor();
+        if descriptor.fidelity() != WeightMaterializationFidelity::Approximate {
+            return Err(invalid_plan(format!(
+                "exact weight materializer `{materializer_id}` cannot consume an approximate quality artifact"
+            )));
+        }
+        descriptor.validate_for_device(catalog.device())?;
+        let mut schema = materializer.execution_schema(family, catalog.device())?;
+        schema.normalize();
+        let approval =
+            verify_numeric_weight_quality_artifact(artifact_bytes, descriptor, family, &schema)?;
+        let component_sources = materializer.component_sources(family, &schema)?;
+        let plan = ExecutionWeightPlan::from_materializer_with_approval(
+            family,
+            descriptor,
+            schema,
+            component_sources,
+            Some(approval),
+        )?;
+        Ok(TrustedExecutionWeightPlan {
+            plan,
+            descriptor: descriptor.clone(),
+            materializer: Arc::clone(materializer),
+        })
+    }
+
+    fn registered_materializer<'registry>(
+        &'registry self,
+        catalog: &CapabilityCatalog,
+        materializer_id: &WeightMaterializerId,
+    ) -> Result<&'registry Arc<dyn WeightMaterializer>, VNextError> {
+        let materializer = self.materializers.get(materializer_id).ok_or_else(|| {
+            invalid_plan(format!(
+                "weight materializer `{materializer_id}` is not registered"
+            ))
+        })?;
+        if materializer.descriptor() != catalog.weight_materializer(materializer_id)? {
+            return Err(invalid_plan(format!(
+                "weight materializer `{materializer_id}` differs from its capability catalog descriptor"
+            )));
+        }
+        Ok(materializer)
     }
 
     pub fn descriptors(&self) -> BTreeMap<WeightMaterializerId, WeightMaterializerDescriptor> {
@@ -664,6 +1485,8 @@ pub struct ExecutionWeightPlan {
     materializer_id: WeightMaterializerId,
     materializer_version: ContractVersion,
     materializer_implementation_fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approximate_quality_approval: Option<ApproximateWeightQualityApprovalRecord>,
     component_sources: BTreeMap<WeightId, Vec<WeightId>>,
     schema: WeightSchema,
 }
@@ -682,6 +1505,16 @@ impl ExecutionWeightPlan {
         schema: WeightSchema,
         component_sources: BTreeMap<WeightId, Vec<WeightId>>,
     ) -> Result<Self, VNextError> {
+        Self::from_materializer_with_approval(family, descriptor, schema, component_sources, None)
+    }
+
+    fn from_materializer_with_approval(
+        family: &PreparedModelFamily,
+        descriptor: &WeightMaterializerDescriptor,
+        schema: WeightSchema,
+        component_sources: BTreeMap<WeightId, Vec<WeightId>>,
+        approximate_quality_approval: Option<ApproximateWeightQualityApprovalRecord>,
+    ) -> Result<Self, VNextError> {
         let plan = Self {
             source_schema_fingerprint: family.weight_schema().fingerprint()?,
             materializer_id: descriptor.id().clone(),
@@ -689,6 +1522,7 @@ impl ExecutionWeightPlan {
             materializer_implementation_fingerprint: descriptor
                 .implementation_fingerprint()
                 .to_owned(),
+            approximate_quality_approval,
             component_sources,
             schema,
         };
@@ -712,6 +1546,10 @@ impl ExecutionWeightPlan {
         &self.materializer_implementation_fingerprint
     }
 
+    pub fn approximate_quality_approval(&self) -> Option<&ApproximateWeightQualityApprovalRecord> {
+        self.approximate_quality_approval.as_ref()
+    }
+
     pub fn schema(&self) -> &WeightSchema {
         &self.schema
     }
@@ -732,6 +1570,9 @@ impl ExecutionWeightPlan {
             return Err(VNextError::InvalidExecutionPlan {
                 reason: "execution weight plan provenance is invalid".to_owned(),
             });
+        }
+        if let Some(approval) = &self.approximate_quality_approval {
+            approval.validate_structure()?;
         }
         self.schema.validate(family_id)?;
         let execution_component_ids = self
@@ -835,6 +1676,27 @@ impl ExecutionWeightPlan {
             return Err(invalid_plan(
                 "execution weight plan differs from its trusted materializer descriptor",
             ));
+        }
+        match (
+            descriptor.fidelity(),
+            descriptor.approximate_quality_contract(),
+            &self.approximate_quality_approval,
+        ) {
+            (WeightMaterializationFidelity::Exact, None, None) => {}
+            (
+                WeightMaterializationFidelity::Approximate,
+                Some(quality_contract),
+                Some(approval),
+            ) => approval.validate_against(
+                &self.source_schema_fingerprint,
+                &self.schema.fingerprint()?,
+                quality_contract,
+            )?,
+            _ => {
+                return Err(invalid_plan(
+                    "execution weight plan fidelity differs from its numerical quality approval",
+                ));
+            }
         }
         Ok(())
     }

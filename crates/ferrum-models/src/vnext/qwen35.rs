@@ -68,6 +68,24 @@ const MOE_ROUTED_DOWN_ROLE: &str = "moe_routed_down";
 const MOE_SHARED_GATE_ROLE: &str = "moe_shared_gate";
 const MOE_SHARED_GATE_UP_ROLE: &str = "moe_shared_gate_up";
 const MOE_SHARED_DOWN_ROLE: &str = "moe_shared_down";
+// These are typed program roles backed by `Linear` projections in the dense
+// Qwen3.5 family. Whether an individual source stays dense is decided only by
+// the checkpoint's `modules_to_not_convert`, never by repository identity.
+const BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES: &[&str] = &[
+    "lm_head",
+    "linear_attn_qkv",
+    "linear_attn_z",
+    "linear_attn_b",
+    "linear_attn_a",
+    "linear_attn_out",
+    "self_attn_q",
+    "self_attn_k",
+    "self_attn_v",
+    "self_attn_o",
+    "mlp_gate",
+    "mlp_up",
+    "mlp_down",
+];
 
 pub(super) fn validate_semantic_config(
     expected_metadata_id: &ExternalModelMetadataId,
@@ -609,6 +627,15 @@ impl Qwen35FamilyProvider {
                         "block-FP8 packages cannot contain GPTQ, compressed-tensors, or GGUF components",
                     ));
                 }
+                validate_block_fp8_source_completeness(
+                    config,
+                    validate_block_fp8_config(text.quantization.as_ref().ok_or_else(|| {
+                        invalid_config(
+                            "hf_config.quantization_config",
+                            "the block-FP8 source requires explicit Hugging Face quantization metadata",
+                        )
+                    })?)?,
+                )?;
                 validate_safetensors_manifest(&text, config, "block-FP8")?;
             }
             FamilyWeightFormat::GgufNative => validate_gguf_manifest(&text, config)?,
@@ -3234,6 +3261,100 @@ fn block_fp8_source_quantization_spec(
     })
 }
 
+fn validate_block_fp8_source_completeness(
+    config: &Qwen35FamilyConfig,
+    recipe: &Qwen35Fp8QuantizationRecipe,
+) -> Result<(), VNextError> {
+    let exclusions = recipe
+        .modules_to_not_convert
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut execution_pair_count = 0_usize;
+
+    for weight in &config.weights {
+        let is_eligible_projection =
+            BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str());
+        let source_name = match &weight.source_encoding {
+            FamilyWeightSourceEncoding::Dense { .. } => weight.external_name.as_str(),
+            FamilyWeightSourceEncoding::BlockFp8 { values, .. } => values.external_name.as_str(),
+            FamilyWeightSourceEncoding::Gptq { .. }
+            | FamilyWeightSourceEncoding::CompressedTensors { .. }
+            | FamilyWeightSourceEncoding::BlockQuantized(_) => continue,
+        };
+
+        if !is_eligible_projection {
+            if matches!(
+                weight.source_encoding,
+                FamilyWeightSourceEncoding::BlockFp8 { .. }
+            ) {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "non-projection role {:?} must not carry a block-FP8 value/inverse-scale pair",
+                        weight.role
+                    ),
+                ));
+            }
+            continue;
+        }
+
+        let module = source_name.strip_suffix(".weight").ok_or_else(|| {
+            invalid_config(
+                "weights.source_encoding",
+                format!(
+                    "execution-eligible projection role {:?} source {source_name:?} does not identify a .weight tensor",
+                    weight.role
+                ),
+            )
+        })?;
+        let is_typed_dense_exclusion = exclusions.contains(module);
+        match (&weight.source_encoding, is_typed_dense_exclusion) {
+            (FamilyWeightSourceEncoding::BlockFp8 { .. }, false) => {
+                execution_pair_count = execution_pair_count.checked_add(1).ok_or_else(|| {
+                    invalid_config(
+                        "weights.source_encoding",
+                        "block-FP8 execution pair count overflows usize",
+                    )
+                })?;
+            }
+            (FamilyWeightSourceEncoding::Dense { .. }, true) => {}
+            (FamilyWeightSourceEncoding::Dense { .. }, false) => {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "execution-eligible projection {module:?} is not listed in modules_to_not_convert and must provide a complete E4M3 .weight plus BF16 .weight_scale_inv pair"
+                    ),
+                ));
+            }
+            (FamilyWeightSourceEncoding::BlockFp8 { .. }, true) => {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "typed dense exclusion {module:?} must not provide a block-FP8 value/inverse-scale pair"
+                    ),
+                ));
+            }
+            _ => {
+                return Err(invalid_config(
+                    "weights.source_encoding",
+                    format!(
+                        "execution-eligible projection {module:?} has an unsupported source bundle"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if execution_pair_count == 0 {
+        return Err(invalid_config(
+            "weights.source_encoding",
+            "block-FP8 package contains no execution-eligible E4M3 value/BF16 inverse-scale pair",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_block_fp8_weight_source(
     weight: &FamilyWeight,
     values: &FamilyBlockFp8Tensor,
@@ -4566,6 +4687,125 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_block_fp8_sidecar_for_non_excluded_projection_before_allocation() {
+        let mut config = test_block_fp8_config();
+        let weight = config
+            .weights
+            .iter_mut()
+            .find(|weight| weight.role == "linear_attn_qkv")
+            .expect("test contains a block-FP8 qkv projection");
+        weight.source_encoding = FamilyWeightSourceEncoding::Dense {
+            element_type: ElementType::Bf16,
+        };
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("a non-excluded projection without its FP8 sidecar must fail closed");
+        let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(field, "weights.source_encoding");
+        assert!(reason.contains("execution-eligible projection"), "{reason}");
+        assert!(reason.contains("weight_scale_inv"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_extra_block_fp8_pair_for_typed_dense_exclusion_before_allocation() {
+        let mut config = test_block_fp8_config();
+        let weight = config
+            .weights
+            .iter_mut()
+            .find(|weight| weight.role == "linear_attn_b")
+            .expect("test contains a dense-excluded recurrent b projection");
+        let values_name = weight.external_name.clone();
+        let dimensions = weight.dimensions.clone();
+        let [n, k] = dimensions.as_slice() else {
+            panic!("test recurrent b projection is a matrix")
+        };
+        weight.source_encoding = FamilyWeightSourceEncoding::BlockFp8 {
+            values: FamilyBlockFp8Tensor {
+                external_name: values_name.clone(),
+                dimensions: dimensions.clone(),
+                dtype: FamilyBlockFp8Dtype::F8E4m3,
+            },
+            scale_inv: FamilyBlockFp8Tensor {
+                external_name: format!(
+                    "{}.weight_scale_inv",
+                    values_name.strip_suffix(".weight").unwrap()
+                ),
+                dimensions: vec![n.div_ceil(128), k.div_ceil(128)],
+                dtype: FamilyBlockFp8Dtype::Bf16,
+            },
+        };
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("a typed dense exclusion must reject an extra FP8 source pair");
+        let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(field, "weights.source_encoding");
+        assert!(reason.contains("typed dense exclusion"), "{reason}");
+        assert!(reason.contains("in_proj_b"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_block_fp8_recipe_without_any_execution_pair_before_allocation() {
+        let mut config = test_block_fp8_config();
+        for weight in &mut config.weights {
+            if matches!(
+                weight.source_encoding,
+                FamilyWeightSourceEncoding::BlockFp8 { .. }
+            ) {
+                weight.source_encoding = FamilyWeightSourceEncoding::Dense {
+                    element_type: ElementType::Bf16,
+                };
+            }
+        }
+        synchronize_test_block_fp8_exclusions(&mut config);
+
+        let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(config).unwrap())
+            .expect_err("a block-FP8 recipe without an execution pair must fail closed");
+        let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+            panic!("expected typed invalid-model-config rejection, got {error}")
+        };
+        assert_eq!(field, "weights.source_encoding");
+        assert!(reason.contains("no execution-eligible"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_block_fp8_value_or_inverse_scale_dtype_drift_before_allocation() {
+        for drift in ["values", "scale_inv"] {
+            let mut config = test_block_fp8_config();
+            let weight = config
+                .weights
+                .iter_mut()
+                .find(|weight| weight.role == "linear_attn_qkv")
+                .expect("test contains a block-FP8 qkv projection");
+            let FamilyWeightSourceEncoding::BlockFp8 { values, scale_inv } =
+                &mut weight.source_encoding
+            else {
+                panic!("test qkv projection is block-FP8")
+            };
+            match drift {
+                "values" => values.dtype = FamilyBlockFp8Dtype::Bf16,
+                "scale_inv" => scale_inv.dtype = FamilyBlockFp8Dtype::F8E4m3,
+                _ => unreachable!(),
+            }
+
+            let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+                .prepare(&serde_json::to_value(config).unwrap())
+                .expect_err("FP8 value/scale dtype drift must fail closed");
+            let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+                panic!("expected typed invalid-model-config rejection, got {error}")
+            };
+            assert_eq!(field, "weights.source_encoding", "{drift}: {reason}");
+            assert!(reason.contains("identity or dtype"), "{drift}: {reason}");
+        }
+    }
+
+    #[test]
     fn rejects_block_fp8_metadata_recipe_drift_with_typed_error_before_runtime() {
         let fixture: Value = serde_json::from_slice(QWEN38_FP8_BAD_RECIPE).unwrap();
         assert_eq!(
@@ -4993,6 +5233,7 @@ mod tests {
                 },
             };
         }
+        synchronize_test_block_fp8_exclusions(&mut config);
         config.weight_format = FamilyWeightFormat::SafetensorsBlockFp8;
         config
     }
@@ -5073,7 +5314,7 @@ mod tests {
             "eos_token_id": 2,
             "pad_token_id": 0
         }"#;
-        Qwen35FamilyConfig {
+        let mut config = Qwen35FamilyConfig {
             metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
             hf_config,
             vocab_size,
@@ -5081,6 +5322,37 @@ mod tests {
             rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
             weight_format: FamilyWeightFormat::SafetensorsBlockFp8,
             weights,
+        };
+        synchronize_test_block_fp8_exclusions(&mut config);
+        config
+    }
+
+    fn synchronize_test_block_fp8_exclusions(config: &mut Qwen35FamilyConfig) {
+        let dense_projection_modules = config
+            .weights
+            .iter()
+            .filter(|weight| {
+                BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str())
+                    && matches!(
+                        weight.source_encoding,
+                        FamilyWeightSourceEncoding::Dense { .. }
+                    )
+            })
+            .map(|weight| {
+                weight
+                    .external_name
+                    .strip_suffix(".weight")
+                    .expect("test projection source ends with .weight")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        let modules = config.hf_config["quantization_config"]["modules_to_not_convert"]
+            .as_array_mut()
+            .expect("test block-FP8 recipe has typed exclusions");
+        for module in dense_projection_modules {
+            if !modules.iter().any(|value| value.as_str() == Some(&module)) {
+                modules.push(Value::String(module));
+            }
         }
     }
 

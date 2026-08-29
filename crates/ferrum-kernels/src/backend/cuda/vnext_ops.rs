@@ -16,11 +16,12 @@ use ferrum_interfaces::vnext::{
     EncodedDeviceOperation, EngineProviderDescriptor, OperationContract, OperationFailure,
     OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, OperationRuntimeRegistry,
-    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
-    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, SemanticValue, VNextError, WeightFormatId,
-    WeightMaterializerId, WeightMaterializerRegistry, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+    PreparedModelFamily, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
+    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
+    ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
+    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest, SemanticValue,
+    VNextError, WeightFormatId, WeightMaterializerId, WeightMaterializerRegistry,
+    WeightMaterializerSelection, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
     DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
     GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
@@ -58,6 +59,16 @@ const LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID: &str =
     "resource-estimator.cuda.last_token_masked_argmax.f16";
 const CUDA_ENGINE_PROVIDER_ID: &str = "provider.engine.cuda.vnext";
 const DENSE_SAFETENSORS_FORMAT_ID: &str = "weight-format.safetensors.dense";
+const BLOCK_FP8_SAFETENSORS_FORMAT_ID: &str =
+    "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale";
+const BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID: &str =
+    "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale";
+// Replaced only after the exact checked-in body has been emitted by the four-case
+// sm89 Rust fixture and accepted by the crate-owned verifier. An empty object is
+// deliberately invalid, so a source-format match cannot silently authorize the
+// approximate materializer while the M3 evidence is still being assembled.
+#[cfg(feature = "vllm-marlin")]
+const BLOCK_FP8_NUMERIC_QUALITY_ARTIFACT: &[u8] = br#"{}"#;
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
 const MASKED_ARGMAX_PRESERVING_LOGITS_FUNCTION_NAME: &str =
     "last_token_masked_argmax_preserving_logits_f16";
@@ -187,6 +198,50 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     Ok(capabilities)
 }
 
+fn cuda_weight_materializer_selection(
+    family: &PreparedModelFamily,
+) -> Result<WeightMaterializerSelection, VNextError> {
+    let block_fp8_weight_format = WeightFormatId::new(BLOCK_FP8_SAFETENSORS_FORMAT_ID)?;
+    let block_fp8_quantization =
+        QuantizationFormatId::new(BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID)?;
+    let quantization_formats = family.weight_schema().quantization_formats();
+    let has_block_fp8_quantization = quantization_formats.contains(&block_fp8_quantization);
+    let has_block_fp8_weight_format = family.weight_schema().format_id == block_fp8_weight_format;
+
+    if has_block_fp8_weight_format != has_block_fp8_quantization
+        || (has_block_fp8_weight_format
+            && quantization_formats != BTreeSet::from([block_fp8_quantization]))
+    {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: "CUDA block-FP8 source format and typed quantization schema disagree"
+                .to_owned(),
+        });
+    }
+
+    if !has_block_fp8_weight_format {
+        return Ok(WeightMaterializerSelection::exact(
+            WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
+        ));
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    {
+        WeightMaterializerSelection::numeric_quality_artifact(
+            WeightMaterializerId::new(
+                crate::marlin_fp8_materializer::BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
+            )?,
+            BLOCK_FP8_NUMERIC_QUALITY_ARTIFACT.to_vec(),
+        )
+    }
+    #[cfg(not(feature = "vllm-marlin"))]
+    {
+        Err(VNextError::InvalidExecutionPlan {
+            reason: "CUDA block-FP8 source requires the compiled vllm-marlin materializer"
+                .to_owned(),
+        })
+    }
+}
+
 /// Build the exact composition root used for both planning and dispatch.
 pub fn cuda_vnext_operation_registry(
     runtime: &CudaDeviceRuntime,
@@ -258,7 +313,7 @@ pub struct CudaVNextComposition {
     runtime: Arc<CudaDeviceRuntime>,
     registry: OperationRuntimeRegistry<CudaDeviceRuntime>,
     weight_materializers: WeightMaterializerRegistry,
-    weight_materializer_id: WeightMaterializerId,
+    weight_materializer_selection: WeightMaterializerSelection,
     catalog: CapabilityCatalog,
 }
 
@@ -267,7 +322,15 @@ impl CudaVNextComposition {
         ordinal: usize,
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
+        family: Option<&PreparedModelFamily>,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        let weight_materializer_selection = match family {
+            Some(family) => cuda_weight_materializer_selection(family).map_err(contract_error)?,
+            None => WeightMaterializerSelection::exact(
+                WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)
+                    .map_err(contract_error)?,
+            ),
+        };
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
         let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
@@ -283,8 +346,6 @@ impl CudaVNextComposition {
         #[cfg(not(feature = "vllm-marlin"))]
         let weight_materializers =
             WeightMaterializerRegistry::identity_only().map_err(contract_error)?;
-        let weight_materializer_id =
-            WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID).map_err(contract_error)?;
         let engine = EngineProviderDescriptor::new(
             ProviderId::new(CUDA_ENGINE_PROVIDER_ID).map_err(contract_error)?,
             ContractVersion::new(1, 0),
@@ -307,7 +368,7 @@ impl CudaVNextComposition {
             runtime,
             registry,
             weight_materializers,
-            weight_materializer_id,
+            weight_materializer_selection,
             catalog,
         })
     }
@@ -316,8 +377,10 @@ impl CudaVNextComposition {
         ordinal: usize,
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
+        family: &PreparedModelFamily,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let composition = Self::prepare(ordinal, device_id, requested_attention_policy)?;
+        let composition =
+            Self::prepare(ordinal, device_id, requested_attention_policy, Some(family))?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
     }
@@ -352,14 +415,14 @@ impl CudaVNextComposition {
         Arc<CudaDeviceRuntime>,
         OperationRuntimeRegistry<CudaDeviceRuntime>,
         WeightMaterializerRegistry,
-        WeightMaterializerId,
+        WeightMaterializerSelection,
         CapabilityCatalog,
     ) {
         (
             self.runtime,
             self.registry,
             self.weight_materializers,
-            self.weight_materializer_id,
+            self.weight_materializer_selection,
             self.catalog,
         )
     }
@@ -386,16 +449,9 @@ impl CudaNativeOperatorCatalogInput {
     }
 }
 
-/// Capture the exact provider identities needed to package a new native
-/// artifact set. Product composition still uses [`CudaVNextComposition::create`]
-/// and cannot bypass compiled-artifact validation.
-pub fn cuda_native_operator_catalog_input(
-    ordinal: usize,
-    device_id: DeviceId,
-    requested_attention_policy: AttentionExecutionPolicy,
+fn cuda_native_operator_catalog_input_from_composition(
+    composition: CudaVNextComposition,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
-    let composition =
-        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy)?;
     let provider_catalog = composition
         .catalog
         .native_operator_provider_catalog(NativeOperatorBackend::Cuda)
@@ -404,6 +460,32 @@ pub fn cuda_native_operator_catalog_input(
         provider_catalog,
         capability_catalog: composition.catalog,
     })
+}
+
+/// Capture the exact provider identities and validate the installed native
+/// artifact set without exposing an executable family-less composition.
+pub fn cuda_validated_native_operator_catalog_input(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    let composition =
+        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy, None)?;
+    composition.validate_compiled_native_operators()?;
+    cuda_native_operator_catalog_input_from_composition(composition)
+}
+
+/// Capture the exact provider identities needed to package a new native
+/// artifact set. Product composition uses [`CudaVNextComposition::create`]
+/// with a typed model family and cannot bypass compiled-artifact validation.
+pub fn cuda_native_operator_catalog_input(
+    ordinal: usize,
+    device_id: DeviceId,
+    requested_attention_policy: AttentionExecutionPolicy,
+) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
+    let composition =
+        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy, None)?;
+    cuda_native_operator_catalog_input_from_composition(composition)
 }
 
 pub struct CudaTokenEmbeddingProvider {

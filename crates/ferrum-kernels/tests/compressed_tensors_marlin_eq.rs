@@ -9,6 +9,15 @@
 
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
+use ferrum_interfaces::vnext::{
+    numeric_weight_quality_authority_implementation_fingerprint, CanonicalRational,
+    ContractVersion, WeightMaterializationFidelity, WeightMaterializerSelection,
+    NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID, NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID,
+};
+use ferrum_kernels::marlin_fp8_materializer::{
+    block_fp8_to_marlin_fp8_weight_materializer, BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
+    MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID, MARLIN_FP8_WEIGHT_LAYOUT_ID,
+};
 use ferrum_kernels::marlin_repack::{
     prepare_block_fp8_weight_for_fp8_marlin, repack_compressed_tensors_zero_points_to_marlin,
     repack_gptq_to_marlin, repack_scales_to_marlin,
@@ -18,8 +27,163 @@ use ferrum_kernels::vllm_marlin::{
     MarlinMmF16WeightRequest, MarlinMmProblem,
 };
 use half::{bf16, f16};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::os::raw::c_void;
+
+const BLOCK_FP8_SOURCE_WEIGHT_FORMAT_ID: &str =
+    "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale";
+const RELATIVE_L2_REPORT_DENOMINATOR: u64 = 100_000_000;
+const LOCKED_QUALITY_VECTOR_JSON: &str = include_str!(
+    "../../../scripts/release/configs/vnext_model_adoption/qwen38_27b_fp8_m3_quality_vector.json"
+);
+const QUALITY_VECTOR_PAYLOAD_KEYS: [&str; 10] = [
+    "schema_version",
+    "fixture_id",
+    "checkpoint",
+    "generator",
+    "source_contract",
+    "activation_contract",
+    "reference_contract",
+    "weight_shapes",
+    "activation_batches",
+    "cases",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericArtifactAuthority {
+    id: String,
+    implementation_fingerprint: String,
+    version: ContractVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericArtifactMaterializer {
+    fidelity: WeightMaterializationFidelity,
+    id: String,
+    implementation_fingerprint: String,
+    version: ContractVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericArtifactCheckpoint {
+    id: String,
+    repository: String,
+    revision: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericArtifactSource {
+    weight_format_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericArtifactExecution {
+    quantization_format_ids: Vec<String>,
+    weight_format_id: String,
+    weight_layout_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericArtifactContract {
+    execution_contract_fingerprint: String,
+    quality_vector_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericArtifactCase {
+    actual_f16_bits: Vec<u16>,
+    actual_f16le_sha256: String,
+    case_id: String,
+    inf_count: u64,
+    nan_count: u64,
+    reference_f32_bits: Vec<u32>,
+    reference_f32le_sha256: String,
+    relative_l2_upper_bound: CanonicalRational,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NumericQualityArtifactV1 {
+    authority: NumericArtifactAuthority,
+    cases: Vec<NumericArtifactCase>,
+    checkpoint: NumericArtifactCheckpoint,
+    contract: NumericArtifactContract,
+    execution: NumericArtifactExecution,
+    materializer: NumericArtifactMaterializer,
+    quality_vector_payload: Value,
+    schema_id: String,
+    source: NumericArtifactSource,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn conservative_relative_l2_upper_bound(relative_l2: f64) -> CanonicalRational {
+    assert!(
+        relative_l2.is_finite() && relative_l2 >= 0.0,
+        "relative L2 must be finite and non-negative"
+    );
+    let mut numerator = (relative_l2 * RELATIVE_L2_REPORT_DENOMINATOR as f64).ceil() as i64;
+    while numerator as f64 / (RELATIVE_L2_REPORT_DENOMINATOR as f64) < relative_l2 {
+        numerator += 1;
+    }
+    CanonicalRational::new(numerator, RELATIVE_L2_REPORT_DENOMINATOR)
+        .expect("canonical relative L2 upper bound")
+}
+
+fn recursively_sort_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(recursively_sort_json).collect())
+        }
+        Value::Object(values) => {
+            let mut entries = values.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, recursively_sort_json(value)))
+                    .collect(),
+            )
+        }
+        scalar => scalar,
+    }
+}
+
+fn canonical_json_bytes<T: Serialize>(value: &T) -> Vec<u8> {
+    let value = serde_json::to_value(value).expect("serialize numeric artifact value");
+    serde_json::to_vec(&recursively_sort_json(value)).expect("serialize canonical numeric artifact")
+}
+
+fn locked_quality_vector_payload() -> Value {
+    let document: Value =
+        serde_json::from_str(LOCKED_QUALITY_VECTOR_JSON).expect("parse locked quality vector");
+    let root = document
+        .as_object()
+        .expect("locked quality vector root is an object");
+    let payload = QUALITY_VECTOR_PAYLOAD_KEYS
+        .into_iter()
+        .map(|key| {
+            (
+                key.to_owned(),
+                root.get(key)
+                    .unwrap_or_else(|| panic!("locked quality vector is missing `{key}`"))
+                    .clone(),
+            )
+        })
+        .collect();
+    recursively_sort_json(Value::Object(payload))
+}
 
 #[derive(Clone, Copy)]
 struct Fixture {
@@ -349,10 +513,19 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             ^ stream_xor;
         next(&mut state)
     };
-    let sha256 = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
-
+    let materializer = block_fp8_to_marlin_fp8_weight_materializer()
+        .expect("construct block-FP8 Marlin materializer");
+    let descriptor = materializer.descriptor();
+    assert_eq!(
+        descriptor.id().as_str(),
+        BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID
+    );
+    let quality_contract = descriptor
+        .approximate_quality_contract()
+        .expect("block-FP8 materializer quality contract");
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
+    let mut artifact_cases = Vec::with_capacity(CASES.len());
     for (
         case_id,
         shape_index,
@@ -401,13 +574,17 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
                 }
             })
             .collect::<Vec<_>>();
-        assert_eq!(sha256(&source_values), expected_values_sha, "{case_id}");
+        assert_eq!(sha256_hex(&source_values), expected_values_sha, "{case_id}");
         assert_eq!(
-            sha256(&inverse_scale_bytes),
+            sha256_hex(&inverse_scale_bytes),
             expected_scales_sha,
             "{case_id}"
         );
-        assert_eq!(sha256(&input_bytes), expected_activations_sha, "{case_id}");
+        assert_eq!(
+            sha256_hex(&input_bytes),
+            expected_activations_sha,
+            "{case_id}"
+        );
 
         let mut reference = vec![0.0_f32; batch * n];
         for row in 0..batch {
@@ -431,7 +608,7 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             .flat_map(|value| value.to_le_bytes())
             .collect::<Vec<_>>();
         assert_eq!(
-            sha256(&reference_bytes),
+            sha256_hex(&reference_bytes),
             expected_reference_sha,
             "{case_id}"
         );
@@ -624,5 +801,94 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             relative_l2 <= 0.05,
             "{case_id} rel_err={relative_l2:.8} exceeds 0.05"
         );
+
+        let actual_bytes = actual
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        artifact_cases.push(NumericArtifactCase {
+            actual_f16_bits: actual.iter().map(|value| value.to_bits()).collect(),
+            actual_f16le_sha256: sha256_hex(&actual_bytes),
+            case_id: case_id.to_owned(),
+            inf_count: u64::try_from(infinity_count).expect("Inf count fits u64"),
+            nan_count: u64::try_from(nan_count).expect("NaN count fits u64"),
+            reference_f32_bits: reference.iter().map(|value| value.to_bits()).collect(),
+            reference_f32le_sha256: sha256_hex(&reference_bytes),
+            relative_l2_upper_bound: conservative_relative_l2_upper_bound(relative_l2),
+        });
     }
+
+    assert_eq!(
+        artifact_cases.len(),
+        usize::try_from(quality_contract.required_case_count()).expect("case count fits usize")
+    );
+    let quality_vector_payload = locked_quality_vector_payload();
+    assert_eq!(
+        sha256_hex(&canonical_json_bytes(&quality_vector_payload)),
+        quality_contract.quality_vector_digest(),
+        "locked quality vector payload digest drifted"
+    );
+    let artifact = NumericQualityArtifactV1 {
+        authority: NumericArtifactAuthority {
+            id: NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID.to_owned(),
+            implementation_fingerprint:
+                numeric_weight_quality_authority_implementation_fingerprint()
+                    .expect("numeric quality authority implementation fingerprint"),
+            version: ContractVersion::new(1, 0),
+        },
+        cases: artifact_cases,
+        checkpoint: NumericArtifactCheckpoint {
+            id: "qwen38-27b-fp8".to_owned(),
+            repository: "Qwen/Qwen3.8-27B-FP8".to_owned(),
+            revision: "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a".to_owned(),
+        },
+        contract: NumericArtifactContract {
+            execution_contract_fingerprint: quality_contract
+                .execution_contract_fingerprint()
+                .to_owned(),
+            quality_vector_digest: quality_contract.quality_vector_digest().to_owned(),
+        },
+        execution: NumericArtifactExecution {
+            quantization_format_ids: vec![MARLIN_FP8_QUANTIZATION_FORMAT_ID.to_owned()],
+            weight_format_id: MARLIN_FP8_WEIGHT_FORMAT_ID.to_owned(),
+            weight_layout_id: MARLIN_FP8_WEIGHT_LAYOUT_ID.to_owned(),
+        },
+        materializer: NumericArtifactMaterializer {
+            fidelity: descriptor.fidelity(),
+            id: descriptor.id().as_str().to_owned(),
+            implementation_fingerprint: descriptor.implementation_fingerprint().to_owned(),
+            version: descriptor.version(),
+        },
+        quality_vector_payload,
+        schema_id: NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID.to_owned(),
+        source: NumericArtifactSource {
+            weight_format_id: BLOCK_FP8_SOURCE_WEIGHT_FORMAT_ID.to_owned(),
+        },
+    };
+    let canonical_json = canonical_json_bytes(&artifact);
+    let decoded: NumericQualityArtifactV1 =
+        serde_json::from_slice(&canonical_json).expect("parse canonical numeric artifact");
+    assert_eq!(
+        decoded, artifact,
+        "numeric artifact typed roundtrip drifted"
+    );
+    assert_eq!(
+        canonical_json_bytes(&decoded),
+        canonical_json,
+        "numeric artifact canonical JSON drifted after roundtrip"
+    );
+    let selection = WeightMaterializerSelection::numeric_quality_artifact(
+        descriptor.id().clone(),
+        canonical_json.clone(),
+    )
+    .expect("typed numeric quality artifact selection");
+    assert_eq!(selection.materializer_id(), descriptor.id());
+    assert!(selection.has_numeric_quality_artifact());
+    let artifact_sha256 = sha256_hex(&canonical_json);
+    let artifact_bytes = canonical_json.len();
+    let artifact_json =
+        std::str::from_utf8(&canonical_json).expect("canonical artifact is valid UTF-8");
+    eprintln!(
+        "QWEN38_BLOCK_FP8_NUMERIC_ARTIFACT_V1 sha256={artifact_sha256} bytes={artifact_bytes} json={artifact_json}"
+    );
 }
