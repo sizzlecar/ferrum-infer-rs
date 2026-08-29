@@ -64,32 +64,6 @@ the server default with `chat_template_kwargs.enable_thinking`.
 `ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
 commands without downloading the model or starting an inference engine.
 
-### Qwen3.8 27B block-FP8 on CUDA
-
-Current source builds support the pinned official
-[`Qwen/Qwen3.8-27B-FP8@017b9c7`](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a)
-checkpoint as a local Hugging Face snapshot. Build Ferrum with
-`cuda,vllm-moe-marlin,vllm-paged-attn-v2`, then use the same snapshot for both
-product entrypoints:
-
-```bash
-MODEL=/path/to/Qwen3.8-27B-FP8
-
-ferrum run "$MODEL" \
-  --backend cuda --gpu-devices 0 --disable-thinking \
-  --max-model-len 512 --max-num-seqs 1 \
-  --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90
-
-ferrum serve --model "$MODEL" \
-  --served-model-name qwen38-27b-fp8 \
-  --backend cuda --gpu-devices 0 --disable-thinking \
-  --max-model-len 512 --max-num-seqs 2 \
-  --max-num-batched-tokens 1024 --gpu-memory-utilization 0.90
-```
-
-These bounded settings were validated on a single 48 GB-class CUDA GPU. The
-adoption gate does not cover lower-memory devices.
-
 ## Features
 
 - `ferrum run` and `ferrum serve` in one Rust binary.
@@ -107,18 +81,22 @@ Latest R2 development `ferrum serve` checkpoint. The first three rows use
 64-token input / 128-token output on Metal and 256 / 128 on CUDA. Values are
 mean tok/s with the 95% confidence-interval half-width across three repeats.
 
-| Model | M1 Max 32 GB Metal | RTX 4090 CUDA |
-|---|---:|---:|
-| Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |
-| Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |
-| Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |
-| Qwen3.8 27B AWQ INT4 |  | c=4 · 78.19 ± 0.04 · c=16 · 115.12 ± 1.18 · c=32 · 115.18 ± 0.97 |
+| Model | M1 Max 32 GB Metal | RTX 4090 CUDA | L40S 48 GB CUDA smoke |
+|---|---:|---:|---:|
+| Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |  |
+| Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |  |
+| Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |  |
+| Qwen3.8 27B AWQ INT4 |  | c=4 · 78.19 ± 0.04 · c=16 · 115.12 ± 1.18 · c=32 · 115.18 ± 0.97 |  |
+| [Qwen3.8 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a) |  |  | ready 119.49 s · c=1 · 16.53 · c=2 · 24.33 |
 
 `c` is active server concurrency. The first three rows completed 100 requests ×
 3 repeats with zero errors. [Measurement details](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md).
 
-The Qwen3.8 27B AWQ INT4 row uses a different checkpoint and quantization path
-from the official block-FP8 model described above.
+The L40S block-FP8 row is a development smoke at clean commit `ef8dbbee`: ready
+is cold `serve` start-to-ready time; c=1 used one warmup plus three measured
+256-input/32-output-token requests, while c=2 completed four stability requests.
+Its values are usage-counted aggregate output tok/s, not RTX 4090 release
+throughput. The AWQ INT4 row uses a different checkpoint and quantization path.
 
 ## OpenAI-Compatible API
 
