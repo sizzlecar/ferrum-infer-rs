@@ -4132,9 +4132,14 @@ mod tests {
     use ferrum_interfaces::vnext::{
         causal_paged_attention_contract, dense_swiglu_contract,
         gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
-        routed_shared_swiglu_moe_contract, ModelArtifactSourceRole, ModelSourceKind,
-        OperationContract, OriginalModelSource, OriginalModelSources, PhysicalStorageLayout,
-        PhysicalWeightComponentBinding, WeightComponentSource,
+        routed_shared_swiglu_moe_contract, DeviceClass, DeviceDescriptor, DeviceId,
+        DynamicStorageAllocator, DynamicStorageProfile, DynamicStorageView,
+        ModelArtifactSourceRole, ModelSourceKind, OperationContract, OriginalModelSource,
+        OriginalModelSources, PhysicalStorageLayout, PhysicalWeightComponentBinding,
+        WeightComponentSource, WeightMaterializationFidelity,
+    };
+    use ferrum_kernels::marlin_fp8_materializer::{
+        block_fp8_to_marlin_fp8_weight_materializer, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
     };
     use half::f16;
     use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
@@ -4253,6 +4258,209 @@ mod tests {
             parts[3].layout.as_ref(),
             PhysicalWeightLayout::Dense { .. }
         ));
+    }
+
+    #[test]
+    fn materializes_real_qwen35_dense_block_fp8_family_into_marlin_fp8_schema() {
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(test_official_marlin_block_fp8_config()).unwrap())
+            .unwrap();
+        let source_schema = prepared.weight_schema();
+        let materializer = block_fp8_to_marlin_fp8_weight_materializer().unwrap();
+        assert_eq!(
+            materializer.descriptor().fidelity(),
+            WeightMaterializationFidelity::Approximate
+        );
+        let device = DeviceDescriptor {
+            id: DeviceId::new("device.test.qwen35-block-fp8-marlin").unwrap(),
+            class: DeviceClass::Accelerator,
+            ordinal: 0,
+            total_memory_bytes: 1 << 30,
+            runtime_implementation_fingerprint: "0".repeat(64),
+            capabilities: BTreeSet::new(),
+            dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
+                DynamicStorageAllocator::LinearArena,
+                DynamicStorageView::Contiguous,
+            )
+            .unwrap()]),
+        };
+        device.validate().unwrap();
+        let execution_schema = materializer.execution_schema(&prepared, &device).unwrap();
+        execution_schema.validate(prepared.family_id()).unwrap();
+
+        let mut source_pairs = Vec::new();
+        for tensor in &source_schema.tensors {
+            collect_block_fp8_source_pairs(&tensor.physical_layout, &mut source_pairs);
+        }
+        let source_pairs = source_pairs.into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(
+            source_pairs.len(),
+            400,
+            "official dense family FP8 leaf count"
+        );
+
+        let mut execution_leaves = Vec::new();
+        let mut residual_block_grid_count = 0;
+        for tensor in &execution_schema.tensors {
+            collect_marlin_fp8_execution_leaves(
+                &tensor.physical_layout,
+                &mut execution_leaves,
+                &mut residual_block_grid_count,
+            );
+        }
+        assert_eq!(residual_block_grid_count, 0);
+        assert_eq!(execution_leaves.len(), 400);
+        assert_eq!(
+            execution_leaves
+                .iter()
+                .filter(|(_, _, group_axis)| *group_axis == 2)
+                .count(),
+            128,
+            "64 gate/up composites each retain two rank-three leaves"
+        );
+        assert_eq!(
+            source_pairs
+                .iter()
+                .filter(|(values, _)| values.as_str().contains(".linear_attn_"))
+                .count(),
+            144,
+            "48 GDA layers each expose qkv, z, and output FP8 leaves"
+        );
+        assert_eq!(
+            source_pairs
+                .iter()
+                .filter(|(values, _)| values.as_str().contains(".self_attn_"))
+                .count(),
+            64,
+            "16 causal-attention layers each expose q, k, v, and o FP8 leaves"
+        );
+        assert_eq!(
+            source_pairs
+                .iter()
+                .filter(|(values, _)| values.as_str().contains(".mlp_"))
+                .count(),
+            192,
+            "64 SwiGLU layers each expose gate, up, and down FP8 leaves"
+        );
+
+        for (packed_id, scales_id, _) in &execution_leaves {
+            let packed = execution_schema
+                .components
+                .iter()
+                .find(|component| component.id == *packed_id)
+                .expect("Marlin packed component exists");
+            let WeightEncoding::Quantized(quantization) = &packed.encoding else {
+                panic!("Marlin packed component must remain explicitly quantized")
+            };
+            assert_eq!(
+                quantization.format_id.as_str(),
+                MARLIN_FP8_QUANTIZATION_FORMAT_ID
+            );
+            let scales = execution_schema
+                .components
+                .iter()
+                .find(|component| component.id == *scales_id)
+                .expect("Marlin scales component exists");
+            assert_eq!(
+                scales.encoding,
+                WeightEncoding::Dense {
+                    element_type: ElementType::F16
+                }
+            );
+        }
+
+        for layer_index in 0..64 {
+            let weight_id = packed_gate_up_weight_id(layer_index).unwrap();
+            let tensor = execution_schema
+                .tensor(&weight_id)
+                .expect("packed gate/up execution tensor");
+            let PhysicalWeightLayout::Composite { parts } = &tensor.physical_layout else {
+                panic!("gate/up execution weight must stay composite")
+            };
+            assert_eq!(parts.len(), 2);
+            assert!(parts.iter().all(|part| matches!(
+                part.layout.as_ref(),
+                PhysicalWeightLayout::Quantized { group_axis: 2, .. }
+            )));
+        }
+
+        for layer_index in (0..64).filter(|layer_index| layer_index % 4 != 3) {
+            let weight_id =
+                packed_linear_attention_weight_id(layer_index, PACKED_LINEAR_ATTN_QKVZBA_ROLE)
+                    .unwrap();
+            let source = source_schema
+                .tensor(&weight_id)
+                .expect("source GDA packed projection");
+            let execution = execution_schema
+                .tensor(&weight_id)
+                .expect("execution GDA packed projection");
+            let PhysicalWeightLayout::Composite {
+                parts: source_parts,
+            } = &source.physical_layout
+            else {
+                panic!("source GDA projection must be composite")
+            };
+            let PhysicalWeightLayout::Composite {
+                parts: execution_parts,
+            } = &execution.physical_layout
+            else {
+                panic!("execution GDA projection must stay composite")
+            };
+            assert_eq!(source_parts.len(), 4);
+            assert_eq!(execution_parts.len(), 4);
+            for (source_part, execution_part) in source_parts.iter().zip(execution_parts) {
+                assert_eq!(execution_part.logical_offsets, source_part.logical_offsets);
+                assert_eq!(execution_part.extents, source_part.extents);
+            }
+            for index in 0..2 {
+                assert!(matches!(
+                    execution_parts[index].layout.as_ref(),
+                    PhysicalWeightLayout::Quantized { group_axis: 1, .. }
+                ));
+            }
+            for index in 2..4 {
+                assert_eq!(execution_parts[index].layout, source_parts[index].layout);
+                assert!(matches!(
+                    execution_parts[index].layout.as_ref(),
+                    PhysicalWeightLayout::Dense { .. }
+                ));
+            }
+        }
+
+        let component_sources = materializer
+            .component_sources(&prepared, &execution_schema)
+            .unwrap();
+        let execution_component_ids = execution_schema
+            .components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            component_sources.keys().cloned().collect::<BTreeSet<_>>(),
+            execution_component_ids,
+            "every execution component must have exactly one provenance-map entry"
+        );
+        assert!(source_pairs.iter().all(|(values, inverse_scales)| {
+            !execution_component_ids.contains(values)
+                && !execution_component_ids.contains(inverse_scales)
+        }));
+        let mapped_source_pairs = execution_leaves
+            .iter()
+            .map(|(packed_id, scales_id, _)| {
+                let packed_sources = component_sources
+                    .get(packed_id)
+                    .expect("packed component has declared provenance");
+                let scales_sources = component_sources
+                    .get(scales_id)
+                    .expect("scales component has declared provenance");
+                assert_eq!(packed_sources, scales_sources);
+                let [values, inverse_scales] = packed_sources.as_slice() else {
+                    panic!("block-FP8 derived components must consume one ordered source pair")
+                };
+                (values.clone(), inverse_scales.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(mapped_source_pairs, source_pairs);
     }
 
     #[test]
@@ -4575,7 +4783,11 @@ mod tests {
             .contains("values differ"));
     }
 
-    fn test_weight_dimensions(text: &Qwen35TextConfig, weight: &FamilyWeight) -> Vec<u64> {
+    fn test_weight_dimensions(
+        text: &Qwen35TextConfig,
+        vocab_size: u64,
+        weight: &FamilyWeight,
+    ) -> Vec<u64> {
         let hidden = text.hidden_size as u64;
         let qk = text.linear_qk_total_dim() as u64;
         let value = text.linear_value_total_dim() as u64;
@@ -4584,10 +4796,20 @@ mod tests {
         let full_query_projection = text.full_attention_q_proj_total_dim() as u64;
         let full_kv = text.full_attention_kv_total_dim() as u64;
         match weight.role.as_str() {
-            "embed_tokens" | "lm_head" => vec![32, 16],
-            "final_norm" | "input_layernorm" | "post_attention_layernorm" => vec![16],
-            "mlp_gate" | "mlp_up" => vec![32, 16],
-            "mlp_down" => vec![16, 32],
+            "embed_tokens" | "lm_head" => vec![vocab_size, hidden],
+            "final_norm" | "input_layernorm" | "post_attention_layernorm" => vec![hidden],
+            "mlp_gate" | "mlp_up" => vec![
+                text.dense_intermediate_size
+                    .expect("dense Qwen3.5 test config has intermediate_size")
+                    as u64,
+                hidden,
+            ],
+            "mlp_down" => vec![
+                hidden,
+                text.dense_intermediate_size
+                    .expect("dense Qwen3.5 test config has intermediate_size")
+                    as u64,
+            ],
             "linear_attn_qkv" => vec![qkv, hidden],
             "linear_attn_z" => vec![value, hidden],
             "linear_attn_a" | "linear_attn_b" => {
@@ -4680,7 +4902,7 @@ mod tests {
                     element_type: ElementType::F32,
                 },
             };
-            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weight.dimensions = test_weight_dimensions(&text, 32, &weight);
             weights.push(weight);
         }
         for layer in &manifest.layers {
@@ -4695,7 +4917,7 @@ mod tests {
                         element_type: ElementType::F32,
                     },
                 };
-                weight.dimensions = test_weight_dimensions(&text, &weight);
+                weight.dimensions = test_weight_dimensions(&text, 32, &weight);
                 weights.push(weight);
             }
         }
@@ -4775,6 +4997,164 @@ mod tests {
         config
     }
 
+    fn test_official_marlin_block_fp8_config() -> Qwen35FamilyConfig {
+        let hf_config: Value = serde_json::from_slice(QWEN38_FP8_CONFIG).unwrap();
+        let text = Qwen35TextConfig::from_hf_config_value(&hf_config).unwrap();
+        let vocab_size = hf_config["text_config"]["vocab_size"].as_u64().unwrap();
+        let max_position_embeddings = hf_config["text_config"]["max_position_embeddings"]
+            .as_u64()
+            .unwrap();
+        let manifest = text.weight_manifest("model.language_model").unwrap();
+        let mut weights = Vec::new();
+        for (layer_index, spec) in manifest
+            .global_tensors
+            .iter()
+            .map(|spec| (None, spec))
+            .chain(manifest.layers.iter().flat_map(|layer| {
+                layer
+                    .tensors
+                    .iter()
+                    .map(move |spec| (Some(layer.layer_index as u32), spec))
+            }))
+            .filter(|(_, spec)| spec.required)
+        {
+            let mut weight = FamilyWeight {
+                layer_index,
+                expert_index: None,
+                role: spec.role.clone(),
+                external_name: spec.name.clone(),
+                dimensions: vec![1],
+                source_encoding: FamilyWeightSourceEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+            };
+            weight.dimensions = test_weight_dimensions(&text, vocab_size, &weight);
+            if matches!(
+                weight.role.as_str(),
+                "linear_attn_qkv"
+                    | "linear_attn_z"
+                    | "linear_attn_out"
+                    | "self_attn_q"
+                    | "self_attn_k"
+                    | "self_attn_v"
+                    | "self_attn_o"
+                    | "mlp_gate"
+                    | "mlp_up"
+                    | "mlp_down"
+            ) {
+                let [n, k] = weight.dimensions.as_slice() else {
+                    panic!("official block-FP8 projection must be a matrix")
+                };
+                let scale_name = format!(
+                    "{}.weight_scale_inv",
+                    weight.external_name.strip_suffix(".weight").unwrap()
+                );
+                weight.source_encoding = FamilyWeightSourceEncoding::BlockFp8 {
+                    values: FamilyBlockFp8Tensor {
+                        external_name: weight.external_name.clone(),
+                        dimensions: weight.dimensions.clone(),
+                        dtype: FamilyBlockFp8Dtype::F8E4m3,
+                    },
+                    scale_inv: FamilyBlockFp8Tensor {
+                        external_name: scale_name,
+                        dimensions: vec![n.div_ceil(128), k.div_ceil(128)],
+                        dtype: FamilyBlockFp8Dtype::Bf16,
+                    },
+                };
+            }
+            weights.push(weight);
+        }
+        weights.sort_by(|left, right| {
+            (left.layer_index, left.role.as_str()).cmp(&(right.layer_index, right.role.as_str()))
+        });
+        let tokenizer_config = br#"{
+            "chat_template": "{{ messages }}",
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "pad_token_id": 0
+        }"#;
+        Qwen35FamilyConfig {
+            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
+            hf_config,
+            vocab_size,
+            max_position_embeddings,
+            rms_norm_epsilon: CanonicalRational::new(1, 1_000_000).unwrap(),
+            weight_format: FamilyWeightFormat::SafetensorsBlockFp8,
+            weights,
+        }
+    }
+
+    fn collect_block_fp8_source_pairs(
+        layout: &PhysicalWeightLayout,
+        pairs: &mut Vec<(WeightId, WeightId)>,
+    ) {
+        match layout {
+            PhysicalWeightLayout::QuantizedBlockGrid {
+                packed_values,
+                scales,
+                ..
+            } => pairs.push((
+                packed_values.component_id.clone(),
+                scales.component_id.clone(),
+            )),
+            PhysicalWeightLayout::Composite { parts } => {
+                for part in parts {
+                    collect_block_fp8_source_pairs(&part.layout, pairs);
+                }
+            }
+            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            | PhysicalWeightLayout::Indexed { values, .. } => {
+                collect_block_fp8_source_pairs(values, pairs);
+            }
+            PhysicalWeightLayout::ExpertStack { experts, .. } => {
+                for expert in experts {
+                    collect_block_fp8_source_pairs(expert, pairs);
+                }
+            }
+            PhysicalWeightLayout::Dense { .. }
+            | PhysicalWeightLayout::Stored { .. }
+            | PhysicalWeightLayout::Quantized { .. }
+            | PhysicalWeightLayout::BlockQuantized { .. } => {}
+        }
+    }
+
+    fn collect_marlin_fp8_execution_leaves(
+        layout: &PhysicalWeightLayout,
+        leaves: &mut Vec<(WeightId, WeightId, u32)>,
+        block_grid_count: &mut usize,
+    ) {
+        match layout {
+            PhysicalWeightLayout::Quantized {
+                packed_values,
+                scales,
+                group_axis,
+                ..
+            } => leaves.push((
+                packed_values.component_id.clone(),
+                scales.component_id.clone(),
+                *group_axis,
+            )),
+            PhysicalWeightLayout::QuantizedBlockGrid { .. } => *block_grid_count += 1,
+            PhysicalWeightLayout::Composite { parts } => {
+                for part in parts {
+                    collect_marlin_fp8_execution_leaves(&part.layout, leaves, block_grid_count);
+                }
+            }
+            PhysicalWeightLayout::AxisReshapePermutation { values, .. }
+            | PhysicalWeightLayout::Indexed { values, .. } => {
+                collect_marlin_fp8_execution_leaves(values, leaves, block_grid_count);
+            }
+            PhysicalWeightLayout::ExpertStack { experts, .. } => {
+                for expert in experts {
+                    collect_marlin_fp8_execution_leaves(expert, leaves, block_grid_count);
+                }
+            }
+            PhysicalWeightLayout::Dense { .. }
+            | PhysicalWeightLayout::Stored { .. }
+            | PhysicalWeightLayout::BlockQuantized { .. } => {}
+        }
+    }
+
     fn test_dense_gguf_config() -> Qwen35FamilyConfig {
         let mut config = test_config();
         for weight in &mut config.weights {
@@ -4843,7 +5223,7 @@ mod tests {
                     element_type: ElementType::F16,
                 },
             };
-            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weight.dimensions = test_weight_dimensions(&text, 32, &weight);
             weights.push(weight);
         }
         for layer in &manifest.layers {
@@ -4859,7 +5239,7 @@ mod tests {
                         element_type: ElementType::F16,
                     },
                 };
-                weight.dimensions = test_weight_dimensions(&text, &weight);
+                weight.dimensions = test_weight_dimensions(&text, 32, &weight);
                 weights.push(weight);
             }
         }
@@ -4931,7 +5311,7 @@ mod tests {
                     element_type: ElementType::F16,
                 },
             };
-            weight.dimensions = test_weight_dimensions(&text, &weight);
+            weight.dimensions = test_weight_dimensions(&text, 32, &weight);
             weights.push(weight);
         }
         for layer in &manifest.layers {
@@ -4955,7 +5335,7 @@ mod tests {
                             element_type: ElementType::F16,
                         },
                     };
-                    weight.dimensions = test_weight_dimensions(&text, &weight);
+                    weight.dimensions = test_weight_dimensions(&text, 32, &weight);
                     let [n, k] = weight.dimensions.as_slice() else {
                         panic!("test GPTQ expert source must be a matrix")
                     };

@@ -1256,6 +1256,39 @@ pub(super) struct MarlinProjectionRuntime {
 }
 
 #[cfg(feature = "vllm-marlin")]
+fn marlin_num_groups(
+    input_features: i32,
+    group_size: i32,
+    operation: &'static str,
+) -> Result<i32, CudaDeviceRuntimeError> {
+    if input_features <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} input width {input_features} must be positive"
+        )));
+    }
+    if group_size == -1 {
+        return Ok(1);
+    }
+    if group_size <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} group size {group_size} must be -1 for channelwise weights or positive"
+        )));
+    }
+    if input_features % group_size != 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} input width {input_features} is not divisible by group size {group_size}"
+        )));
+    }
+    let num_groups = input_features / group_size;
+    if num_groups <= 0 {
+        return Err(CudaDeviceRuntimeError::contract(format!(
+            "{operation} input width {input_features} and group size {group_size} produce non-positive group count {num_groups}"
+        )));
+    }
+    Ok(num_groups)
+}
+
+#[cfg(feature = "vllm-marlin")]
 impl MarlinProjectionRuntime {
     pub(super) fn query(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
         let multiprocessor_count = runtime
@@ -1300,6 +1333,7 @@ impl MarlinProjectionRuntime {
         group_size: i32,
         operation: &'static str,
     ) -> Result<(), CudaDeviceRuntimeError> {
+        let num_groups = marlin_num_groups(input_features, group_size, operation)?;
         let required_workspace = self
             .workspace_bytes()
             .map_err(CudaDeviceRuntimeError::contract)?;
@@ -1342,11 +1376,7 @@ impl MarlinProjectionRuntime {
                     n: output_features,
                     k: input_features,
                     lda: input_features,
-                    num_groups: input_features.checked_div(group_size).ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(format!(
-                            "{operation} group size must be positive"
-                        ))
-                    })?,
+                    num_groups,
                     group_size,
                 },
                 execution: MarlinMmExecution {
@@ -1361,6 +1391,49 @@ impl MarlinProjectionRuntime {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "vllm-marlin"))]
+mod marlin_group_count_tests {
+    use super::{marlin_num_groups, CudaDeviceRuntimeError};
+
+    #[test]
+    fn channelwise_group_size_maps_to_one_native_group() {
+        assert!(matches!(marlin_num_groups(4096, -1, "test"), Ok(1)));
+        for input_features in [0, -1] {
+            assert!(matches!(
+                marlin_num_groups(input_features, -1, "test"),
+                Err(CudaDeviceRuntimeError::Contract(message))
+                    if message.contains("input width") && message.contains("must be positive")
+            ));
+        }
+    }
+
+    #[test]
+    fn positive_group_size_requires_exact_positive_groups() {
+        assert!(matches!(marlin_num_groups(4096, 128, "test"), Ok(32)));
+        assert!(matches!(
+            marlin_num_groups(4097, 128, "test"),
+            Err(CudaDeviceRuntimeError::Contract(message))
+                if message.contains("is not divisible")
+        ));
+        assert!(matches!(
+            marlin_num_groups(0, 128, "test"),
+            Err(CudaDeviceRuntimeError::Contract(message))
+                if message.contains("input width 0 must be positive")
+        ));
+    }
+
+    #[test]
+    fn zero_and_other_negative_group_sizes_are_typed_failures() {
+        for group_size in [0, -2, i32::MIN] {
+            assert!(matches!(
+                marlin_num_groups(4096, group_size, "test"),
+                Err(CudaDeviceRuntimeError::Contract(message))
+                    if message.contains("must be -1 for channelwise weights or positive")
+            ));
+        }
     }
 }
 

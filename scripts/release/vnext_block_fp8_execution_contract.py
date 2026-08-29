@@ -33,7 +33,7 @@ CHECKPOINT = {
     "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
 }
 SOURCE_FORMAT_ID = "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale"
-QUALITY_VECTOR_DIGEST = "3204716462bf30614d217bec0222fb12c949c8965d70fc6167cb92e7a97880f1"
+QUALITY_VECTOR_DIGEST = "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51"
 MATERIALIZER_ID = "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16"
 MATERIALIZER_VERSION = {"major": 1, "minor": 0}
 EXECUTION_WEIGHT_FORMAT_ID = "weight-format.execution.cuda.marlin-fp8-w8a16-mixed"
@@ -42,7 +42,7 @@ EXECUTION_QUANTIZATION_FORMAT_ID = "quantization.marlin.fp8-e4m3fn-channelwise"
 MARLIN_CAPABILITY_ID = "capability.kernel.cuda.marlin.fp8-w8a16"
 
 EXPECTED_EXECUTION_CONTRACT_FINGERPRINT = (
-    "9251a1fd749087810e8a32e87e25afe08de349b5515431d3ad476e7855bdf2f6"
+    "882bc49ca312875a12a5290319f6c8294386a5960c2065cbda3f3dff2d55598e"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 

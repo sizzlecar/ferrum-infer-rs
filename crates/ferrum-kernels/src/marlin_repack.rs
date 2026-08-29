@@ -40,9 +40,54 @@ impl Fp8MarlinWeight {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fp8MarlinPrepareError {
-    UnsupportedShape { n: usize, k: usize },
-    SourceLength { actual: usize, expected: usize },
-    NonFiniteWeight { output: usize, input: usize },
+    UnsupportedShape {
+        n: usize,
+        k: usize,
+    },
+    UnsupportedBlockShape {
+        n: usize,
+        k: usize,
+    },
+    SourceLength {
+        actual: usize,
+        expected: usize,
+    },
+    BlockFp8ValueLength {
+        actual: usize,
+        expected: usize,
+    },
+    BlockFp8ScaleLength {
+        actual: usize,
+        expected: usize,
+    },
+    AllocationFailed {
+        buffer: &'static str,
+        elements: usize,
+    },
+    NonFiniteWeight {
+        output: usize,
+        input: usize,
+    },
+    NonFiniteBlockFp8Value {
+        output: usize,
+        input: usize,
+        bits: u8,
+    },
+    NonFiniteBlockFp8Scale {
+        block_output: usize,
+        block_input: usize,
+    },
+    NonPositiveBlockFp8Scale {
+        block_output: usize,
+        block_input: usize,
+    },
+    NonFiniteDecodedBlockFp8Weight {
+        output: usize,
+        input: usize,
+    },
+    UnrepresentableMarlinScale {
+        output: usize,
+    },
 }
 
 impl fmt::Display for Fp8MarlinPrepareError {
@@ -52,13 +97,59 @@ impl fmt::Display for Fp8MarlinPrepareError {
                 formatter,
                 "Marlin W8A16 shape [N={n}, K={k}] does not fit a supported thread-tile family"
             ),
+            Self::UnsupportedBlockShape { n, k } => write!(
+                formatter,
+                "block-FP8 shape [N={n}, K={k}] must have non-zero block extents"
+            ),
             Self::SourceLength { actual, expected } => write!(
                 formatter,
                 "F16 source has {actual} bytes, expected {expected}"
             ),
+            Self::BlockFp8ValueLength { actual, expected } => write!(
+                formatter,
+                "block-FP8 values source has {actual} bytes, expected {expected}"
+            ),
+            Self::BlockFp8ScaleLength { actual, expected } => write!(
+                formatter,
+                "block-FP8 inverse-scale source has {actual} bytes, expected {expected}"
+            ),
+            Self::AllocationFailed { buffer, elements } => write!(
+                formatter,
+                "could not reserve {elements} elements for block-FP8 {buffer}"
+            ),
             Self::NonFiniteWeight { output, input } => write!(
                 formatter,
                 "F16 source contains a non-finite value at [N={output}, K={input}]"
+            ),
+            Self::NonFiniteBlockFp8Value {
+                output,
+                input,
+                bits,
+            } => write!(
+                formatter,
+                "block-FP8 source contains non-finite E4M3 bits 0x{bits:02x} at [N={output}, K={input}]"
+            ),
+            Self::NonFiniteBlockFp8Scale {
+                block_output,
+                block_input,
+            } => write!(
+                formatter,
+                "block-FP8 source contains a non-finite BF16 inverse scale at block [N={block_output}, K={block_input}]"
+            ),
+            Self::NonPositiveBlockFp8Scale {
+                block_output,
+                block_input,
+            } => write!(
+                formatter,
+                "block-FP8 source contains a non-positive BF16 inverse scale at block [N={block_output}, K={block_input}]"
+            ),
+            Self::NonFiniteDecodedBlockFp8Weight { output, input } => write!(
+                formatter,
+                "block-FP8 source decodes to a non-finite value at [N={output}, K={input}]"
+            ),
+            Self::UnrepresentableMarlinScale { output } => write!(
+                formatter,
+                "block-FP8 output channel {output} requires a scale not representable by the Marlin F16 ABI"
             ),
         }
     }
@@ -167,6 +258,213 @@ pub fn prepare_f16_weight_for_fp8_marlin(
     })
 }
 
+/// Convert block-scaled E4M3 checkpoint storage directly into the Marlin
+/// channel-wise E4M3 W8A16 ABI.
+///
+/// `source_fp8_e4m3` is a row-major logical `[N, K]` byte matrix. The BF16
+/// inverse-scale grid is row-major `[ceil(N / block_n), ceil(K / block_k)]` and
+/// decodes each source value as `E4M3(value) * inverse_scale[block]`. The
+/// conversion scans the source twice and never allocates a dense `[N, K]`
+/// intermediate.
+pub fn prepare_block_fp8_weight_for_fp8_marlin(
+    source_fp8_e4m3: &[u8],
+    source_inverse_scales_bf16_le: &[u8],
+    n: usize,
+    k: usize,
+    block_shape: [usize; 2],
+) -> Result<Fp8MarlinWeight, Fp8MarlinPrepareError> {
+    if !fp8_marlin_shape_supported(n, k) {
+        return Err(Fp8MarlinPrepareError::UnsupportedShape { n, k });
+    }
+    let [block_n, block_k] = block_shape;
+    if block_n == 0 || block_k == 0 {
+        return Err(Fp8MarlinPrepareError::UnsupportedBlockShape {
+            n: block_n,
+            k: block_k,
+        });
+    }
+
+    let value_count = n
+        .checked_mul(k)
+        .ok_or(Fp8MarlinPrepareError::BlockFp8ValueLength {
+            actual: source_fp8_e4m3.len(),
+            expected: usize::MAX,
+        })?;
+    if source_fp8_e4m3.len() != value_count {
+        return Err(Fp8MarlinPrepareError::BlockFp8ValueLength {
+            actual: source_fp8_e4m3.len(),
+            expected: value_count,
+        });
+    }
+
+    let block_rows = n.div_ceil(block_n);
+    let block_columns = k.div_ceil(block_k);
+    let scale_count = block_rows.checked_mul(block_columns).ok_or(
+        Fp8MarlinPrepareError::BlockFp8ScaleLength {
+            actual: source_inverse_scales_bf16_le.len(),
+            expected: usize::MAX,
+        },
+    )?;
+    let expected_scale_bytes =
+        scale_count
+            .checked_mul(2)
+            .ok_or(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+                actual: source_inverse_scales_bf16_le.len(),
+                expected: usize::MAX,
+            })?;
+    if source_inverse_scales_bf16_le.len() != expected_scale_bytes {
+        return Err(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+            actual: source_inverse_scales_bf16_le.len(),
+            expected: expected_scale_bytes,
+        });
+    }
+
+    let mut inverse_scales = Vec::new();
+    inverse_scales.try_reserve_exact(scale_count).map_err(|_| {
+        Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "inverse-scale grid",
+            elements: scale_count,
+        }
+    })?;
+    for block_output in 0..block_rows {
+        for block_input in 0..block_columns {
+            let scale_index = block_output * block_columns + block_input;
+            let offset = scale_index * 2;
+            let scale = half::bf16::from_le_bytes([
+                source_inverse_scales_bf16_le[offset],
+                source_inverse_scales_bf16_le[offset + 1],
+            ])
+            .to_f32();
+            if !scale.is_finite() {
+                return Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Scale {
+                    block_output,
+                    block_input,
+                });
+            }
+            if !(scale > 0.0) {
+                return Err(Fp8MarlinPrepareError::NonPositiveBlockFp8Scale {
+                    block_output,
+                    block_input,
+                });
+            }
+            inverse_scales.push(scale);
+        }
+    }
+
+    let mut raw_scales = Vec::new();
+    raw_scales
+        .try_reserve_exact(n)
+        .map_err(|_| Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "channel scales",
+            elements: n,
+        })?;
+    for output in 0..n {
+        let mut maximum = 0.0_f32;
+        for input in 0..k {
+            let bits = source_fp8_e4m3[output * k + input];
+            let source_value = float8::F8E4M3::from_bits(bits).to_f32();
+            if !source_value.is_finite() {
+                return Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
+                    output,
+                    input,
+                    bits,
+                });
+            }
+            let inverse_scale =
+                inverse_scales[(output / block_n) * block_columns + input / block_k];
+            let decoded = source_value * inverse_scale;
+            if !decoded.is_finite() {
+                return Err(Fp8MarlinPrepareError::NonFiniteDecodedBlockFp8Weight {
+                    output,
+                    input,
+                });
+            }
+            maximum = maximum.max(decoded.abs());
+        }
+        let raw_scale = maximum / FP8_E4M3_MAX;
+        if maximum > 0.0 && raw_scale == 0.0 {
+            return Err(Fp8MarlinPrepareError::UnrepresentableMarlinScale { output });
+        }
+        raw_scales.push(raw_scale);
+    }
+
+    const CHANNEL_SCALE_PERMUTATION: [usize; 32] = [
+        0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6,
+        7, 14, 15, 22, 23, 30, 31,
+    ];
+    let mut scales = Vec::new();
+    scales
+        .try_reserve_exact(n)
+        .map_err(|_| Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "Marlin scales",
+            elements: n,
+        })?;
+    scales.resize(n, half::f16::ZERO);
+    for chunk_start in (0..n).step_by(CHANNEL_SCALE_PERMUTATION.len()) {
+        for (destination, source) in CHANNEL_SCALE_PERMUTATION.iter().copied().enumerate() {
+            let output = chunk_start + source;
+            let raw_scale = raw_scales[output];
+            let scale = half::f16::from_f32(raw_scale * FP8_F16_EXPONENT_BIAS_SCALE);
+            if !scale.is_finite() || (raw_scale != 0.0 && scale == half::f16::ZERO) {
+                return Err(Fp8MarlinPrepareError::UnrepresentableMarlinScale { output });
+            }
+            scales[chunk_start + destination] = scale;
+        }
+    }
+
+    let mut packed_values = Vec::new();
+    packed_values.try_reserve_exact(value_count).map_err(|_| {
+        Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "packed values",
+            elements: value_count,
+        }
+    })?;
+    packed_values.resize(value_count, 0_u8);
+    let n_tiles = n / 64;
+    for (tile_index, tile) in packed_values.chunks_mut(16 * 64).enumerate() {
+        let k_tile = tile_index / n_tiles;
+        let n_tile = tile_index % n_tiles;
+        for thread in 0..32 {
+            let tensor_core_column = thread / 4;
+            let tensor_core_row = (thread % 4) * 2;
+            for warp in 0..4 {
+                let column = n_tile * 64 + warp * 16 + tensor_core_column;
+                let first = block_fp8_marlin_word(
+                    source_fp8_e4m3,
+                    &inverse_scales,
+                    &raw_scales,
+                    k,
+                    block_shape,
+                    block_columns,
+                    k_tile,
+                    tensor_core_row,
+                    column,
+                );
+                let second = block_fp8_marlin_word(
+                    source_fp8_e4m3,
+                    &inverse_scales,
+                    &raw_scales,
+                    k,
+                    block_shape,
+                    block_columns,
+                    k_tile,
+                    tensor_core_row,
+                    column + 8,
+                );
+                let output_word = thread * 8 + warp * 2;
+                tile[output_word * 4..output_word * 4 + 4].copy_from_slice(&first.to_le_bytes());
+                tile[(output_word + 1) * 4..(output_word + 1) * 4 + 4]
+                    .copy_from_slice(&second.to_le_bytes());
+            }
+        }
+    }
+
+    Ok(Fp8MarlinWeight {
+        packed_values,
+        scales,
+    })
+}
+
 #[inline]
 fn read_f16_le(bytes: &[u8], element: usize) -> f32 {
     let offset = element * 2;
@@ -204,6 +502,40 @@ fn fp8_marlin_word(
             let input = k_tile * 16 + row;
             let value = read_f16_le(source_f16_le, output * k + input);
             word | (u32::from(quantized_fp8_bits(value, scales[output])) << (byte * 8))
+        })
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn block_fp8_marlin_word(
+    source_fp8_e4m3: &[u8],
+    inverse_scales: &[f32],
+    scales: &[f32],
+    k: usize,
+    block_shape: [usize; 2],
+    block_columns: usize,
+    k_tile: usize,
+    tensor_core_row: usize,
+    column: usize,
+) -> u32 {
+    let [block_n, block_k] = block_shape;
+    let rows = [
+        tensor_core_row,
+        tensor_core_row + 8,
+        tensor_core_row + 1,
+        tensor_core_row + 9,
+    ];
+    rows.into_iter()
+        .enumerate()
+        .fold(0_u32, |word, (byte, row)| {
+            let output = column;
+            let input = k_tile * 16 + row;
+            let source_value =
+                float8::F8E4M3::from_bits(source_fp8_e4m3[output * k + input]).to_f32();
+            let inverse_scale =
+                inverse_scales[(output / block_n) * block_columns + input / block_k];
+            let decoded = source_value * inverse_scale;
+            word | (u32::from(quantized_fp8_bits(decoded, scales[output])) << (byte * 8))
         })
 }
 
@@ -896,6 +1228,189 @@ mod tests {
                 output: 0,
                 input: 0,
             })
+        );
+    }
+
+    #[test]
+    fn block_fp8_marlin_prepare_matches_dense_reference_without_dense_staging() {
+        let n = 256;
+        let k = 256;
+        let block_shape = [128, 128];
+        let inverse_scales = [0.5_f32, 2.0, 1.0, 4.0];
+        let inverse_scale_bytes = inverse_scales
+            .into_iter()
+            .flat_map(|scale| half::bf16::from_f32(scale).to_le_bytes())
+            .collect::<Vec<_>>();
+        let source = (0..n * k)
+            .map(|index| {
+                let centered = ((index * 17 + index / 257) % 31) as f32 - 15.0;
+                float8::F8E4M3::from_f32(centered / 2.0).to_bits()
+            })
+            .collect::<Vec<_>>();
+        let dense_reference = f16_bytes((0..n).flat_map(|output| {
+            let source = &source;
+            let inverse_scales = &inverse_scales;
+            (0..k).map(move |input| {
+                let block =
+                    (output / block_shape[0]) * (k / block_shape[1]) + input / block_shape[1];
+                float8::F8E4M3::from_bits(source[output * k + input]).to_f32()
+                    * inverse_scales[block]
+            })
+        }));
+
+        let direct = prepare_block_fp8_weight_for_fp8_marlin(
+            &source,
+            &inverse_scale_bytes,
+            n,
+            k,
+            block_shape,
+        )
+        .unwrap();
+        let reference = prepare_f16_weight_for_fp8_marlin(&dense_reference, n, k).unwrap();
+
+        assert_eq!(direct.packed_values(), reference.packed_values());
+        assert_eq!(direct.scales(), reference.scales());
+    }
+
+    #[test]
+    fn block_fp8_marlin_prepare_keeps_zero_channels_finite() {
+        let n = 64;
+        let k = 128;
+        let inverse_scale = half::bf16::from_f32(2.0).to_le_bytes();
+        let prepared = prepare_block_fp8_weight_for_fp8_marlin(
+            &vec![0_u8; n * k],
+            &inverse_scale,
+            n,
+            k,
+            [128, 128],
+        )
+        .unwrap();
+
+        assert!(prepared.packed_values().iter().all(|byte| *byte == 0));
+        assert!(prepared
+            .scales()
+            .iter()
+            .all(|scale| *scale == half::f16::ZERO));
+    }
+
+    #[test]
+    fn block_fp8_marlin_prepare_rejects_invalid_source_contracts() {
+        let n = 64;
+        let k = 128;
+        let values = vec![0_u8; n * k];
+        let one_scale = half::bf16::ONE.to_le_bytes();
+
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(&[], &[], 63, k, [128, 128]),
+            Err(Fp8MarlinPrepareError::UnsupportedShape { n: 63, k })
+        );
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(&values, &one_scale, n, k, [0, 128]),
+            Err(Fp8MarlinPrepareError::UnsupportedBlockShape { n: 0, k: 128 })
+        );
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(&[], &one_scale, n, k, [128, 128]),
+            Err(Fp8MarlinPrepareError::BlockFp8ValueLength {
+                actual: 0,
+                expected: n * k,
+            })
+        );
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(&values, &[], n, k, [128, 128]),
+            Err(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+                actual: 0,
+                expected: 2,
+            })
+        );
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(
+                &values,
+                &half::bf16::NAN.to_le_bytes(),
+                n,
+                k,
+                [128, 128],
+            ),
+            Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Scale {
+                block_output: 0,
+                block_input: 0,
+            })
+        );
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(
+                &values,
+                &half::bf16::from_f32(-1.0).to_le_bytes(),
+                n,
+                k,
+                [128, 128],
+            ),
+            Err(Fp8MarlinPrepareError::NonPositiveBlockFp8Scale {
+                block_output: 0,
+                block_input: 0,
+            })
+        );
+        for zero in [half::bf16::ZERO, half::bf16::NEG_ZERO] {
+            assert_eq!(
+                prepare_block_fp8_weight_for_fp8_marlin(
+                    &values,
+                    &zero.to_le_bytes(),
+                    n,
+                    k,
+                    [128, 128],
+                ),
+                Err(Fp8MarlinPrepareError::NonPositiveBlockFp8Scale {
+                    block_output: 0,
+                    block_input: 0,
+                })
+            );
+        }
+
+        let mut non_finite = values;
+        non_finite[0] = 0x7f;
+        assert_eq!(float8::F8E4M3::from_bits(0x7e).to_f32(), 448.0);
+        assert_eq!(float8::F8E4M3::from_bits(0xfe).to_f32(), -448.0);
+        assert!(!float8::F8E4M3::from_bits(non_finite[0])
+            .to_f32()
+            .is_finite());
+        assert!(!float8::F8E4M3::from_bits(0xff).to_f32().is_finite());
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(&non_finite, &one_scale, n, k, [128, 128],),
+            Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
+                output: 0,
+                input: 0,
+                bits: 0x7f,
+            })
+        );
+        non_finite[0] = 0xff;
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(&non_finite, &one_scale, n, k, [128, 128],),
+            Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
+                output: 0,
+                input: 0,
+                bits: 0xff,
+            })
+        );
+
+        let tiny_values = vec![0x01_u8; n * k];
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(
+                &tiny_values,
+                &half::bf16::MIN_POSITIVE.to_le_bytes(),
+                n,
+                k,
+                [128, 128],
+            ),
+            Err(Fp8MarlinPrepareError::UnrepresentableMarlinScale { output: 0 })
+        );
+        let unit_values = vec![float8::F8E4M3::from_f32(1.0).to_bits(); n * k];
+        assert_eq!(
+            prepare_block_fp8_weight_for_fp8_marlin(
+                &unit_values,
+                &half::bf16::MAX.to_le_bytes(),
+                n,
+                k,
+                [128, 128],
+            ),
+            Err(Fp8MarlinPrepareError::UnrepresentableMarlinScale { output: 0 })
         );
     }
 }

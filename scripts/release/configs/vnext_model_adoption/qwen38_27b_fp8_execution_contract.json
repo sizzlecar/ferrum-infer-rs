@@ -82,7 +82,7 @@
   "quality_approval": {
     "status": "authority_not_implemented",
     "witness_schema_id": "quality-approval.weight-materializer.numeric.v1",
-    "quality_vector_digest": "3204716462bf30614d217bec0222fb12c949c8965d70fc6167cb92e7a97880f1",
+    "quality_vector_digest": "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51",
     "current_witness": null,
     "compiler_selection_authorized": false,
     "required_witness_fields": {
@@ -112,5 +112,5 @@
       "global_boolean_or_environment_override_forbidden": true
     }
   },
-  "execution_contract_fingerprint": "9251a1fd749087810e8a32e87e25afe08de349b5515431d3ad476e7855bdf2f6"
+  "execution_contract_fingerprint": "882bc49ca312875a12a5290319f6c8294386a5960c2065cbda3f3dff2d55598e"
 }

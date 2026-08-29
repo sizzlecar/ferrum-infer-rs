@@ -201,7 +201,10 @@ def derive_shape_stream_seed(shape_index: int, stream_xor: int) -> int:
     return Lcg64(mixed).next_u64()
 
 
-def generate_values(shape_index: int, element_count: int) -> bytes:
+def generate_values(
+    shape_index: int, output_features: int, input_features: int
+) -> bytes:
+    element_count = output_features * input_features
     require(
         0 < element_count <= MAX_WEIGHT_ELEMENTS,
         "weight allocation exceeds the independent small-tensor bound",
@@ -213,7 +216,12 @@ def generate_values(shape_index: int, element_count: int) -> bytes:
         if (word & 0x0F) == 0:
             values[index] = 0
             continue
-        magnitude = 0x20 + ((word >> 9) & 0x1F)
+        output_channel = index // input_features
+        # Four exact power-of-two magnitude tiers repeat every eight output
+        # channels.  Marlin's 32-channel scale permutation does not preserve
+        # this pattern, so an accidental identity scale layout is observable.
+        exponent_tier = (output_channel % 8) // 2
+        magnitude = 0x20 + (exponent_tier << 3) + ((word >> 9) & 0x07)
         sign = (word >> 31) & 0x80
         values[index] = magnitude | sign
     return bytes(values)
@@ -307,12 +315,11 @@ def expected_case_specs() -> list[CaseSpec]:
 def generate_case(spec: CaseSpec) -> GeneratedCase:
     shape_index = WEIGHT_SHAPES.index(spec.weight_shape)
     output_features, input_features = spec.weight_shape
-    weight_elements = output_features * input_features
     scale_shape = (
         (output_features + BLOCK_SHAPE[0] - 1) // BLOCK_SHAPE[0],
         (input_features + BLOCK_SHAPE[1] - 1) // BLOCK_SHAPE[1],
     )
-    values = generate_values(shape_index, weight_elements)
+    values = generate_values(shape_index, output_features, input_features)
     scales = generate_scales(shape_index, scale_shape[0] * scale_shape[1])
     activations = generate_activations(
         shape_index, spec.activation_batch, input_features

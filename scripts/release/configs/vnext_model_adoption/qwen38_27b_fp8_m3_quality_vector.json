@@ -48,43 +48,43 @@
       "weight_shape": [256, 128],
       "scale_shape": [2, 1],
       "activation_batch": 1,
-      "values_f8e4m3_sha256": "700881d4c97600aa95139e38283a438a9de9a50e0bf014e446e7d1744cf5d41b",
+      "values_f8e4m3_sha256": "bad109739a3d2cc2f6ef463fb2d28adace77215b57c1c7ea121e7e897301154e",
       "scales_bf16le_sha256": "1bf6bf27cbd8c14186b0cda8f5a8ed5093e65dafaf9362936f68283332992f85",
       "activations_f16le_sha256": "72d95dc1e2393a03a975d51e3f04cb6059fc8fa7fafa5b7f5285bee77f9dac1d",
-      "reference_f32le_sha256": "cdf0647f3f1b74b60ba5281ba62c3d4e62df9ca4a71d1019b45105603124aef6"
+      "reference_f32le_sha256": "7c9ce69dd6365a3f04122ba9d718586ddfd1a5d8a1bc88f50d116741041c748c"
     },
     {
       "case_id": "weight-256x128-batch-4",
       "weight_shape": [256, 128],
       "scale_shape": [2, 1],
       "activation_batch": 4,
-      "values_f8e4m3_sha256": "700881d4c97600aa95139e38283a438a9de9a50e0bf014e446e7d1744cf5d41b",
+      "values_f8e4m3_sha256": "bad109739a3d2cc2f6ef463fb2d28adace77215b57c1c7ea121e7e897301154e",
       "scales_bf16le_sha256": "1bf6bf27cbd8c14186b0cda8f5a8ed5093e65dafaf9362936f68283332992f85",
       "activations_f16le_sha256": "330473b51568e047fb583cdc94db872ac7ad308ccb807fb1f8deb099bc006056",
-      "reference_f32le_sha256": "1c384682c59233492bfc92e18cf5e53560071df8f809f6259d389f26abef528a"
+      "reference_f32le_sha256": "a81ae3c8aec953fe4254623a8adb48e2fb06ad754b87eb926299eab91f1fea47"
     },
     {
       "case_id": "weight-256x256-batch-1",
       "weight_shape": [256, 256],
       "scale_shape": [2, 2],
       "activation_batch": 1,
-      "values_f8e4m3_sha256": "b15aa7e9a08d61577d6b1ca97d1d632c77c1be404f506e9bbc9345030a68b818",
+      "values_f8e4m3_sha256": "2d134465e4591910d21b7b3a8674fbe2b56c3b0c98b184e0d289b98e071d8f92",
       "scales_bf16le_sha256": "8d9dcc1756740e90089dd2a7191653d7b4bd97013fcc999a71402f28897cb6b7",
       "activations_f16le_sha256": "3034df7557de9898996f9a480964b86b0b788db52a1d19ff1ca838b29232baa9",
-      "reference_f32le_sha256": "79ab7ee90c7ffba06df18731217063699c9f595c100138d4b3baeba96ee1321f"
+      "reference_f32le_sha256": "d6b7eac6e8c85e42bcf198eee9aed09b3435a0ca94d39484c89406c739db8492"
     },
     {
       "case_id": "weight-256x256-batch-4",
       "weight_shape": [256, 256],
       "scale_shape": [2, 2],
       "activation_batch": 4,
-      "values_f8e4m3_sha256": "b15aa7e9a08d61577d6b1ca97d1d632c77c1be404f506e9bbc9345030a68b818",
+      "values_f8e4m3_sha256": "2d134465e4591910d21b7b3a8674fbe2b56c3b0c98b184e0d289b98e071d8f92",
       "scales_bf16le_sha256": "8d9dcc1756740e90089dd2a7191653d7b4bd97013fcc999a71402f28897cb6b7",
       "activations_f16le_sha256": "e34838c39c331fcd8137ecf1d49c36f9ec7773aafef032cb6992f17885ff6926",
-      "reference_f32le_sha256": "24a382e770d7a6b284ea85406c823f23e63630192ffe69b806eba7e6be8fec39"
+      "reference_f32le_sha256": "1adb773fe9ac46786102e92c40bb84abaace5e4dd1f314c02ddebcdd22d0b24b"
     }
   ],
-  "quality_vector_digest": "3204716462bf30614d217bec0222fb12c949c8965d70fc6167cb92e7a97880f1",
+  "quality_vector_digest": "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51",
   "cuda_execution": {
     "status": "not_run",
     "required_case_count": 4,

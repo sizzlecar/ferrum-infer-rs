@@ -276,6 +276,8 @@ impl CudaVNextComposition {
         let weight_materializers = WeightMaterializerRegistry::new(vec![
             crate::marlin_fp8_materializer::marlin_fp8_weight_materializer()
                 .map_err(contract_error)?,
+            crate::marlin_fp8_materializer::block_fp8_to_marlin_fp8_weight_materializer()
+                .map_err(contract_error)?,
         ])
         .map_err(contract_error)?;
         #[cfg(not(feature = "vllm-marlin"))]
