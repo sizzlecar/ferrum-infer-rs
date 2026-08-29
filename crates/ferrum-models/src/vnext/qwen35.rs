@@ -5477,6 +5477,73 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_27b_reuses_the_qwen35_block_fp8_execution_contract() {
+        let mut qwen38_config = test_official_marlin_block_fp8_config();
+        qwen38_config.hf_config["transformers_version"] = Value::String("5.8.0.dev0".to_owned());
+        let mut qwen36_config = qwen38_config.clone();
+        qwen36_config.hf_config["transformers_version"] = Value::String("4.57.1".to_owned());
+        assert_ne!(qwen38_config.hf_config, qwen36_config.hf_config);
+
+        let qwen38_text = Qwen35TextConfig::from_hf_config_value(&qwen38_config.hf_config).unwrap();
+        let qwen36_text = Qwen35TextConfig::from_hf_config_value(&qwen36_config.hf_config).unwrap();
+        assert_eq!(qwen38_text, qwen36_text);
+
+        let qwen38 = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(qwen38_config).unwrap())
+            .unwrap();
+        let qwen36 = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(qwen36_config).unwrap())
+            .unwrap();
+        assert_eq!(
+            qwen38.weight_schema().fingerprint().unwrap(),
+            qwen36.weight_schema().fingerprint().unwrap()
+        );
+        assert_eq!(
+            qwen38.program().fingerprint().unwrap(),
+            qwen36.program().fingerprint().unwrap()
+        );
+
+        let qwen38_denominator =
+            QuantizedProviderAttributionDenominator::from_prepared_family(&qwen38)
+                .unwrap()
+                .unwrap();
+        let qwen36_denominator =
+            QuantizedProviderAttributionDenominator::from_prepared_family(&qwen36)
+                .unwrap()
+                .unwrap();
+        assert_eq!(qwen38_denominator, qwen36_denominator);
+        assert_eq!(qwen36_denominator.quant_tensor_count(), 400);
+        assert_eq!(qwen36_denominator.operation_count(), 3);
+        assert_eq!(qwen36_denominator.item_count(), 403);
+        assert_eq!(
+            qwen36_denominator.sha256(),
+            "5e366997e15e1a94d90b1ae07281269e8a46f75904306564d56354c8ebea2e4e"
+        );
+
+        let device = DeviceDescriptor {
+            id: DeviceId::new("device.test.qwen36-block-fp8-marlin").unwrap(),
+            class: DeviceClass::Accelerator,
+            ordinal: 0,
+            total_memory_bytes: 1 << 30,
+            runtime_implementation_fingerprint: "0".repeat(64),
+            capabilities: BTreeSet::new(),
+            dynamic_storage_profiles: BTreeSet::from([DynamicStorageProfile::new(
+                DynamicStorageAllocator::LinearArena,
+                DynamicStorageView::Contiguous,
+            )
+            .unwrap()]),
+        };
+        device.validate().unwrap();
+        let materializer = block_fp8_to_marlin_fp8_weight_materializer().unwrap();
+        let qwen38_execution = materializer.execution_schema(&qwen38, &device).unwrap();
+        let qwen36_execution = materializer.execution_schema(&qwen36, &device).unwrap();
+        assert_eq!(
+            qwen38_execution.fingerprint().unwrap(),
+            qwen36_execution.fingerprint().unwrap()
+        );
+    }
+
+    #[test]
     fn qwen38_block_fp8_program_matches_standard_operation_contracts() {
         let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
             .prepare(&serde_json::to_value(test_block_fp8_config()).unwrap())
