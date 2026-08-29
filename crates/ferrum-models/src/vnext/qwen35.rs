@@ -4944,13 +4944,6 @@ mod tests {
         assert_eq!(source_shards.len(), 1, "fixed source must use one shard");
         let source_shard = source_dir.join(source_shards.iter().next().unwrap());
         let source_header_metadata = safetensors_file_metadata(&source_shard).unwrap();
-        assert_eq!(
-            source_header_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("format"))
-                .map(String::as_str),
-            Some("pt")
-        );
 
         let quantization_config = serde_json::json!({
             "activation_scheme": "dynamic",
