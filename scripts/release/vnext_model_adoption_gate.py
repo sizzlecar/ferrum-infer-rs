@@ -758,7 +758,7 @@ def validate_m1_bounded_receipt(
         "-u",
         "CARGO_ENCODED_RUSTFLAGS",
         "CARGO_BUILD_JOBS=8",
-        "RUST_TEST_THREADS=1",
+        "RUST_TEST_THREADS=8",
         f"RUSTC={toolchain['rustc']}",
         str(toolchain["cargo"]),
         "test",
@@ -769,7 +769,7 @@ def validate_m1_bounded_receipt(
         rust_test_id,
         "--",
         "--exact",
-        "--test-threads=1",
+        "--test-threads=8",
         "--nocapture",
     ]
     require(receipt.get("command") == expected_command, f"M1 {case_id} Rust command mismatch")
@@ -1445,7 +1445,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
             "-u",
             "CARGO_ENCODED_RUSTFLAGS",
             "CARGO_BUILD_JOBS=8",
-            "RUST_TEST_THREADS=1",
+            "RUST_TEST_THREADS=8",
             f"RUSTC={rustc_path}",
             str(cargo_path),
             "test",
@@ -1456,7 +1456,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
             rust_test_id,
             "--",
             "--exact",
-            "--test-threads=1",
+            "--test-threads=8",
             "--nocapture",
         ]
         write_json(
