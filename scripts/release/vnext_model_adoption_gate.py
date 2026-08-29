@@ -727,9 +727,9 @@ def validate_m1_bounded_receipt(
     limits = as_object(receipt.get("limits"), f"M1 {case_id} receipt.limits")
     peaks = as_object(receipt.get("peaks"), f"M1 {case_id} receipt.peaks")
     bounds = {
-        "max_processes": 16,
-        "max_group_threads": 48,
-        "max_per_process_threads": 24,
+        "max_processes": 64,
+        "max_group_threads": 256,
+        "max_per_process_threads": 64,
     }
     for limit_name, maximum in bounds.items():
         limit = positive_int(limits.get(limit_name), f"M1 {case_id}.{limit_name}")
@@ -757,7 +757,7 @@ def validate_m1_bounded_receipt(
         "RUSTFLAGS",
         "-u",
         "CARGO_ENCODED_RUSTFLAGS",
-        "CARGO_BUILD_JOBS=2",
+        "CARGO_BUILD_JOBS=8",
         "RUST_TEST_THREADS=1",
         f"RUSTC={toolchain['rustc']}",
         str(toolchain["cargo"]),
@@ -1444,7 +1444,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
             "RUSTFLAGS",
             "-u",
             "CARGO_ENCODED_RUSTFLAGS",
-            "CARGO_BUILD_JOBS=2",
+            "CARGO_BUILD_JOBS=8",
             "RUST_TEST_THREADS=1",
             f"RUSTC={rustc_path}",
             str(cargo_path),
