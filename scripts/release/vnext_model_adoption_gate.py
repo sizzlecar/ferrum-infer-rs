@@ -95,7 +95,17 @@ M1_RUST_CONTRACTS = {
             "vnext::qwen35::tests::"
             "rejects_block_fp8_inverse_scale_grid_drift_before_runtime"
         ),
-    }
+    },
+    "qwen36-27b-fp8": {
+        "qwen36-fp8-wrong-format": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_metadata_recipe_drift_with_typed_error_before_runtime"
+        ),
+        "qwen36-fp8-scale-grid-drift": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_inverse_scale_grid_drift_before_runtime"
+        ),
+    },
 }
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SECRET_KEY = re.compile(r"(?:api[_-]?key|token|password|secret|authorization)", re.I)

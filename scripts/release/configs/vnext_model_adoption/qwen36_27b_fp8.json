@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "catalog_id": "vnext-model-adoption-qwen36-27b-fp8",
+  "description": "Pinned source catalog for the A2 Qwen3.6 27B official block-FP8 qualification lane.",
+  "models": [
+    {
+      "id": "qwen36-27b-fp8",
+      "model_id": "qwen36-27b-fp8",
+      "role": "a2_official_dense_block_fp8",
+      "backend": "cuda",
+      "repo": "Qwen/Qwen3.6-27B-FP8",
+      "revision": {
+        "status": "pinned",
+        "value": "e89b16ebf1988b3d6befa7de50abc2d76f26eb09",
+        "evidence": "docs/goals/vnext-model-adoption-2026-08-29/GOAL.md"
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "required": true
+        },
+        {
+          "path": "LICENSE",
+          "required": true
+        },
+        {
+          "path": "chat_template.jinja",
+          "required": true
+        },
+        {
+          "path": "config.json",
+          "required": true
+        },
+        {
+          "path": "generation_config.json",
+          "required": true
+        },
+        {
+          "path": "tokenizer_config.json",
+          "required": true
+        },
+        {
+          "path": "tokenizer.json",
+          "required": true
+        },
+        {
+          "glob": "*.safetensors",
+          "required": true
+        },
+        {
+          "path": "model.safetensors.index.json",
+          "required_if_sharded": true
+        }
+      ],
+      "format": "safetensors_fp8_e4m3_dynamic_block_128x128",
+      "safetensors_shard_naming": "index_authoritative",
+      "reference": {
+        "semantic_repo": "Qwen/Qwen3.6-27B-FP8",
+        "semantic_revision": {
+          "status": "same_as_weight_revision"
+        },
+        "required_semantic_files": [
+          "README.md",
+          "chat_template.jinja",
+          "config.json",
+          "generation_config.json",
+          "tokenizer_config.json",
+          "tokenizer.json"
+        ],
+        "semantic_file_sha256": {
+          "README.md": "1d812aa4505b65e4893130b61d8e60498f15f751ed180e60dab0650823f2dced",
+          "chat_template.jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+          "config.json": "885e6830f8d6883fefd63e3608c267452da2e6ce353a3494f42a7aa3d70c8434",
+          "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+          "tokenizer_config.json": "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b",
+          "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"
+        },
+        "generation_config_source": {
+          "source": "semantic_source",
+          "path": "generation_config.json",
+          "policy": "required",
+          "content_sha256": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"
+        },
+        "chat_template_source": {
+          "source": "semantic_source",
+          "path": "tokenizer_config.json",
+          "json_pointer": "/chat_template",
+          "container_sha256": "5186f0defcd7f232382c7f0aebcd2252d073bb921ab240e407b7ae8745d2b29b",
+          "content_sha256": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259"
+        }
+      }
+    }
+  ]
+}

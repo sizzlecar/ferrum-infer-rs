@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Build a metadata-only source lock for the fixed Qwen3.8 block-FP8 checkpoint.
+"""Build a metadata-only source lock for a fixed Qwen block-FP8 checkpoint.
 
 The tool consumes the immutable output of ``runtime_vnext_model_resolver.py``.
 It fetches the already-locked config and safetensors index as bounded metadata,
 then reads only each shard's eight-byte safetensors prefix and JSON header with
 strict HTTP Range requests. Tensor payload bytes are never requested.
 
-The result is diagnostic input for A1 M0. It is deliberately not a final
+The result is diagnostic input for the selected checkpoint's M0. It is deliberately not a final
 ``model-lock.json`` receipt: execution and quality approval identities remain
 null until their respective implementation and CUDA evidence exist.
 """
@@ -35,12 +35,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_NAME = "block-fp8-source-header-lock.json"
 
-CHECKPOINT_ID = "qwen38-27b-fp8"
-CHECKPOINT_REPO = "Qwen/Qwen3.8-27B-FP8"
-CHECKPOINT_REVISION = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
-CHECKPOINT_LICENSE = "apache-2.0"
-CHECKPOINT_ARCHITECTURE = "Qwen3_5ForConditionalGeneration"
-CHECKPOINT_MODEL_TYPE = "qwen3_5"
+DEFAULT_CHECKPOINT_ID = "qwen38-27b-fp8"
 CHECKPOINT_FORMAT = "safetensors_fp8_e4m3_dynamic_block_128x128"
 INDEX_PATH = "model.safetensors.index.json"
 CONFIG_PATH = "config.json"
@@ -167,10 +162,10 @@ def utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def stable_file_url(path: str) -> str:
+def stable_file_url(repository: str, revision: str, path: str) -> str:
     require_safe_repo_path(path, "checkpoint file path")
-    repo = urllib.parse.quote(CHECKPOINT_REPO, safe="/")
-    revision = urllib.parse.quote(CHECKPOINT_REVISION, safe="")
+    repo = urllib.parse.quote(repository, safe="/")
+    revision = urllib.parse.quote(revision, safe="")
     encoded_path = urllib.parse.quote(path, safe="/")
     return f"https://huggingface.co/{repo}/resolve/{revision}/{encoded_path}"
 
@@ -238,9 +233,18 @@ class Transport:
 class NetworkTransport(Transport):
     provenance = "huggingface_https_range_without_credentials"
 
-    def __init__(self, *, timeout_seconds: float, retries: int) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float,
+        retries: int,
+        repository: str,
+        revision: str,
+    ) -> None:
         self.timeout_seconds = timeout_seconds
         self.retries = retries
+        self.repository = repository
+        self.revision = revision
 
     def _open_once(self, request: urllib.request.Request) -> Any:
         opener = urllib.request.build_opener(SafeHttpsRedirectHandler())
@@ -273,7 +277,7 @@ class NetworkTransport(Transport):
     def fetch_metadata(self, path: str, expected_size: int, expected_sha256: str) -> bytes:
         require(expected_size <= MAX_METADATA_BYTES, f"{path} exceeds metadata byte limit")
         request = urllib.request.Request(
-            stable_file_url(path),
+            stable_file_url(self.repository, self.revision, path),
             headers={
                 "Accept": "application/octet-stream",
                 "Accept-Encoding": "identity",
@@ -309,7 +313,7 @@ class NetworkTransport(Transport):
         requested = end - start + 1
         require(requested <= MAX_HEADER_BYTES, f"range response limit exceeded for {path}")
         request = urllib.request.Request(
-            stable_file_url(path),
+            stable_file_url(self.repository, self.revision, path),
             headers={
                 "Accept": "application/octet-stream",
                 "Accept-Encoding": "identity",
@@ -385,6 +389,43 @@ PRODUCTION_PROFILE = ExpectedProfile(
 
 
 @dataclass(frozen=True)
+class CheckpointProfile:
+    checkpoint_id: str
+    repository: str
+    revision: str
+    license_id: str
+    architecture: str
+    model_type: str
+    format_id: str
+    expected: ExpectedProfile
+
+
+CHECKPOINT_PROFILES = {
+    "qwen38-27b-fp8": CheckpointProfile(
+        checkpoint_id="qwen38-27b-fp8",
+        repository="Qwen/Qwen3.8-27B-FP8",
+        revision="017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+        license_id="apache-2.0",
+        architecture="Qwen3_5ForConditionalGeneration",
+        model_type="qwen3_5",
+        format_id=CHECKPOINT_FORMAT,
+        expected=PRODUCTION_PROFILE,
+    ),
+    "qwen36-27b-fp8": CheckpointProfile(
+        checkpoint_id="qwen36-27b-fp8",
+        repository="Qwen/Qwen3.6-27B-FP8",
+        revision="e89b16ebf1988b3d6befa7de50abc2d76f26eb09",
+        license_id="apache-2.0",
+        architecture="Qwen3_5ForConditionalGeneration",
+        model_type="qwen3_5",
+        format_id=CHECKPOINT_FORMAT,
+        expected=PRODUCTION_PROFILE,
+    ),
+}
+DEFAULT_CHECKPOINT = CHECKPOINT_PROFILES[DEFAULT_CHECKPOINT_ID]
+
+
+@dataclass(frozen=True)
 class ResolutionInput:
     document: dict[str, Any]
     lane: dict[str, Any]
@@ -408,7 +449,7 @@ def validate_locked_file(row_raw: Any, label: str) -> dict[str, Any]:
     return result
 
 
-def load_resolution(path: Path, profile: ExpectedProfile = PRODUCTION_PROFILE) -> ResolutionInput:
+def load_resolution(path: Path, checkpoint: CheckpointProfile = DEFAULT_CHECKPOINT) -> ResolutionInput:
     try:
         raw = path.read_bytes()
     except OSError as exc:
@@ -422,25 +463,25 @@ def load_resolution(path: Path, profile: ExpectedProfile = PRODUCTION_PROFILE) -
     lanes = as_list(document.get("lanes"), "source resolution.lanes")
     require(len(lanes) == 1, "source resolution must contain exactly one lane")
     lane = as_object(lanes[0], "source resolution.lanes[0]")
-    require(lane.get("catalog_lane_id") == CHECKPOINT_ID, "source resolution lane id differs")
-    require(lane.get("model_id") == CHECKPOINT_ID, "source resolution model id differs")
+    require(lane.get("catalog_lane_id") == checkpoint.checkpoint_id, "source resolution lane id differs")
+    require(lane.get("model_id") == checkpoint.checkpoint_id, "source resolution model id differs")
     require(lane.get("backend") == "cuda", "source resolution backend differs")
-    require(lane.get("format") == CHECKPOINT_FORMAT, "source resolution format differs")
+    require(lane.get("format") == checkpoint.format_id, "source resolution format differs")
     require(
         lane.get("safetensors_shard_naming") == "index_authoritative",
         "source resolution must use index-authoritative shard naming",
     )
     source = as_object(lane.get("weight_source"), "source resolution weight_source")
-    require(source.get("repo") == CHECKPOINT_REPO, "source resolution repo differs")
-    require(source.get("revision") == CHECKPOINT_REVISION, "source resolution revision differs")
-    require(GIT_SHA_RE.fullmatch(CHECKPOINT_REVISION) is not None, "checkpoint revision is not full")
-    require(source.get("gated") in {False, None}, "fixed A1 checkpoint must remain public")
+    require(source.get("repo") == checkpoint.repository, "source resolution repo differs")
+    require(source.get("revision") == checkpoint.revision, "source resolution revision differs")
+    require(GIT_SHA_RE.fullmatch(checkpoint.revision) is not None, "checkpoint revision is not full")
+    require(source.get("gated") in {False, None}, "fixed checkpoint must remain public")
     license_lock = as_object(source.get("license"), "source resolution license")
     license_id = as_string(
         license_lock.get("hugging_face_id"),
         "source resolution license.hugging_face_id",
     ).lower()
-    require(license_id == CHECKPOINT_LICENSE, "source resolution license differs")
+    require(license_id == checkpoint.license_id, "source resolution license differs")
 
     rows = as_list(source.get("files"), "source resolution weight_source.files")
     files: dict[str, dict[str, Any]] = {}
@@ -449,7 +490,10 @@ def load_resolution(path: Path, profile: ExpectedProfile = PRODUCTION_PROFILE) -
         require(row["path"] not in files, f"duplicate locked file {row['path']}")
         content_url = row.get("content_request_url")
         if content_url is not None:
-            require(content_url == stable_file_url(row["path"]), f"stable URL differs for {row['path']}")
+            require(
+                content_url == stable_file_url(checkpoint.repository, checkpoint.revision, row["path"]),
+                f"stable URL differs for {row['path']}",
+            )
         files[row["path"]] = row
     require(CONFIG_PATH in files, "source resolution lacks config.json")
     require(INDEX_PATH in files, "source resolution lacks safetensors index")
@@ -458,7 +502,7 @@ def load_resolution(path: Path, profile: ExpectedProfile = PRODUCTION_PROFILE) -
         (row for row in files.values() if row["path"].endswith(".safetensors")),
         key=lambda row: row["path"],
     )
-    require(len(shards) == profile.shard_count, "source resolution shard count differs")
+    require(len(shards) == checkpoint.expected.shard_count, "source resolution shard count differs")
     for shard in shards:
         require(shard.get("sha256_source") == "hugging_face_lfs_oid", f"{shard['path']} is not LFS-locked")
         lfs_oid = as_string(shard.get("lfs_oid"), f"{shard['path']}.lfs_oid").lower()
@@ -487,11 +531,11 @@ def metadata_file(transport: Transport, row: dict[str, Any], label: str) -> byte
     return transport.fetch_metadata(row["path"], row["size_bytes"], row["sha256"])
 
 
-def parse_recipe(config_body: bytes) -> dict[str, Any]:
+def parse_recipe(config_body: bytes, checkpoint: CheckpointProfile = DEFAULT_CHECKPOINT) -> dict[str, Any]:
     config = as_object(strict_json_loads(config_body, CONFIG_PATH), CONFIG_PATH)
     architectures = as_list(config.get("architectures"), "config.architectures")
-    require(architectures == [CHECKPOINT_ARCHITECTURE], "config architecture differs")
-    require(config.get("model_type") == CHECKPOINT_MODEL_TYPE, "config model_type differs")
+    require(architectures == [checkpoint.architecture], "config architecture differs")
+    require(config.get("model_type") == checkpoint.model_type, "config model_type differs")
     require(config.get("language_model_only") is False, "config language_model_only differs")
     quant = as_object(config.get("quantization_config"), "config.quantization_config")
     require(set(quant) == {
@@ -532,7 +576,7 @@ def parse_index(index_body: bytes, expected_shards: set[str]) -> dict[str, str]:
     index = as_object(strict_json_loads(index_body, INDEX_PATH), INDEX_PATH)
     require(set(index).issubset({"metadata", "weight_map"}), "safetensors index has unknown fields")
     metadata = as_object(index.get("metadata"), "safetensors index.metadata")
-    require(not metadata, "fixed A1 safetensors index metadata must remain empty")
+    require(not metadata, "fixed safetensors index metadata must remain empty")
     weight_map_raw = as_object(index.get("weight_map"), "safetensors index.weight_map")
     require(weight_map_raw, "safetensors index weight_map is empty")
     weight_map: dict[str, str] = {}
@@ -805,17 +849,19 @@ def build_lock(
     resolution: ResolutionInput,
     transport: Transport,
     *,
-    profile: ExpectedProfile = PRODUCTION_PROFILE,
+    checkpoint: CheckpointProfile = DEFAULT_CHECKPOINT,
+    profile: ExpectedProfile | None = None,
     emit_progress: bool = True,
     shard_workers: int = 1,
 ) -> dict[str, Any]:
+    profile = checkpoint.expected if profile is None else profile
     require(
         1 <= shard_workers <= MAX_SHARD_WORKERS,
         f"shard_workers must be between one and {MAX_SHARD_WORKERS}",
     )
     config_body = metadata_file(transport, resolution.files[CONFIG_PATH], CONFIG_PATH)
     index_body = metadata_file(transport, resolution.files[INDEX_PATH], INDEX_PATH)
-    recipe = parse_recipe(config_body)
+    recipe = parse_recipe(config_body, checkpoint)
     weight_map = parse_index(index_body, {row["path"] for row in resolution.shards})
 
     def scan_shard(
@@ -887,8 +933,8 @@ def build_lock(
 
     files = [locked_file_identity(row) for row in sorted(resolution.files.values(), key=lambda row: row["path"])]
     checkpoint_content_document = {
-        "repository": CHECKPOINT_REPO,
-        "revision": CHECKPOINT_REVISION,
+        "repository": checkpoint.repository,
+        "revision": checkpoint.revision,
         "files": files,
     }
     checkpoint_content_digest = canonical_sha256(checkpoint_content_document)
@@ -913,15 +959,15 @@ def build_lock(
         "artifact_type": "vnext_block_fp8_source_header_lock_diagnostic",
         "generated_at": utc_now(),
         "checkpoint": {
-            "id": CHECKPOINT_ID,
-            "repository": CHECKPOINT_REPO,
-            "revision": CHECKPOINT_REVISION,
-            "license": CHECKPOINT_LICENSE,
-            "architecture": CHECKPOINT_ARCHITECTURE,
-            "model_type": CHECKPOINT_MODEL_TYPE,
+            "id": checkpoint.checkpoint_id,
+            "repository": checkpoint.repository,
+            "revision": checkpoint.revision,
+            "license": checkpoint.license_id,
+            "architecture": checkpoint.architecture,
+            "model_type": checkpoint.model_type,
             "language_model_only": False,
             "backend": "cuda",
-            "format": CHECKPOINT_FORMAT,
+            "format": checkpoint.format_id,
         },
         "input_resolution": {
             "path": resolution.resolution_path,
@@ -1044,9 +1090,9 @@ def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, Expect
     require(case in {"good", "bad_scale", "unknown_namespace", "orphan_sidecar"}, "bad fixture case")
     config = canonical_json_bytes(
         {
-            "architectures": [CHECKPOINT_ARCHITECTURE],
+            "architectures": [DEFAULT_CHECKPOINT.architecture],
             "language_model_only": False,
-            "model_type": CHECKPOINT_MODEL_TYPE,
+            "model_type": DEFAULT_CHECKPOINT.model_type,
             "quantization_config": {
                 "activation_scheme": "dynamic",
                 "fmt": "e4m3",
@@ -1102,7 +1148,11 @@ def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, Expect
                 "size_bytes": len(body),
                 "sha256": sha256_bytes(body),
                 "sha256_source": "downloaded_content",
-                "content_request_url": stable_file_url(path),
+                "content_request_url": stable_file_url(
+                    DEFAULT_CHECKPOINT.repository,
+                    DEFAULT_CHECKPOINT.revision,
+                    path,
+                ),
             }
         )
     for index_number, (path, body) in enumerate(shards.items(), start=1):
@@ -1123,19 +1173,22 @@ def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, Expect
         "resolver": {"path": "fixture", "sha256": "f" * 64},
         "lanes": [
             {
-                "catalog_lane_id": CHECKPOINT_ID,
-                "model_id": CHECKPOINT_ID,
+                "catalog_lane_id": DEFAULT_CHECKPOINT.checkpoint_id,
+                "model_id": DEFAULT_CHECKPOINT.checkpoint_id,
                 "backend": "cuda",
-                "format": CHECKPOINT_FORMAT,
+                "format": DEFAULT_CHECKPOINT.format_id,
                 "safetensors_shard_naming": "index_authoritative",
                 "weight_source": {
-                    "repo": CHECKPOINT_REPO,
-                    "revision": CHECKPOINT_REVISION,
+                    "repo": DEFAULT_CHECKPOINT.repository,
+                    "revision": DEFAULT_CHECKPOINT.revision,
                     "gated": False,
-                    "license": {"hugging_face_id": CHECKPOINT_LICENSE, "files": []},
+                    "license": {"hugging_face_id": DEFAULT_CHECKPOINT.license_id, "files": []},
                     "files": file_rows,
                 },
-                "semantic_source": {"repo": CHECKPOINT_REPO, "revision": CHECKPOINT_REVISION},
+                "semantic_source": {
+                    "repo": DEFAULT_CHECKPOINT.repository,
+                    "revision": DEFAULT_CHECKPOINT.revision,
+                },
                 "chat_template": {
                     "content_sha256": "a" * 64,
                     "container_sha256": "b" * 64,
@@ -1218,7 +1271,12 @@ def run_selftest() -> None:
 
     class ReadTimeoutThenSuccessTransport(NetworkTransport):
         def __init__(self) -> None:
-            super().__init__(timeout_seconds=1.0, retries=1)
+            super().__init__(
+                timeout_seconds=1.0,
+                retries=1,
+                repository=DEFAULT_CHECKPOINT.repository,
+                revision=DEFAULT_CHECKPOINT.revision,
+            )
             self.attempts = 0
 
         def _open_once(self, _request: urllib.request.Request) -> FakeRangeHandle:
@@ -1279,6 +1337,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--resolution", type=Path, help="runtime_vnext_model_resolver.py output")
     parser.add_argument("--out", type=Path, help="output JSON path or artifact directory")
+    parser.add_argument(
+        "--checkpoint-id",
+        choices=sorted(CHECKPOINT_PROFILES),
+        default=DEFAULT_CHECKPOINT_ID,
+    )
     parser.add_argument("--timeout-seconds", type=float, default=45.0)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--shard-workers", type=int, default=MAX_SHARD_WORKERS)
@@ -1307,14 +1370,18 @@ def main(argv: list[str] | None = None) -> int:
         resolution_path = args.resolution
         if not resolution_path.is_absolute():
             resolution_path = ROOT / resolution_path
-        resolution = load_resolution(resolution_path)
+        checkpoint = CHECKPOINT_PROFILES[args.checkpoint_id]
+        resolution = load_resolution(resolution_path, checkpoint)
         transport = NetworkTransport(
             timeout_seconds=args.timeout_seconds,
             retries=args.retries,
+            repository=checkpoint.repository,
+            revision=checkpoint.revision,
         )
         document = build_lock(
             resolution,
             transport,
+            checkpoint=checkpoint,
             shard_workers=args.shard_workers,
         )
         output = write_output(args.out, document)
