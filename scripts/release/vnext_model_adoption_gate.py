@@ -728,8 +728,8 @@ def validate_m1_bounded_receipt(
     peaks = as_object(receipt.get("peaks"), f"M1 {case_id} receipt.peaks")
     bounds = {
         "max_processes": 16,
-        "max_group_threads": 32,
-        "max_per_process_threads": 16,
+        "max_group_threads": 48,
+        "max_per_process_threads": 24,
     }
     for limit_name, maximum in bounds.items():
         limit = positive_int(limits.get(limit_name), f"M1 {case_id}.{limit_name}")
