@@ -1344,6 +1344,26 @@ fn encode_marlin_fp8_dense_linear(
     .map_err(|error| error.to_string())
 }
 
+pub(super) fn aligned_projection_workspace_bytes(
+    workspace_bytes: u64,
+    alignment: u64,
+    operation: &'static str,
+) -> Result<u64, String> {
+    if workspace_bytes == 0 {
+        return Ok(0);
+    }
+    if !alignment.is_power_of_two() {
+        return Err(format!(
+            "{operation} alignment {alignment} is not a non-zero power of two"
+        ));
+    }
+    workspace_bytes
+        .checked_add(alignment - 1)
+        .map(|bytes| bytes & !(alignment - 1))
+        .filter(|bytes| *bytes >= workspace_bytes)
+        .ok_or_else(|| format!("{operation} aligned size overflows"))
+}
+
 #[cfg(feature = "vllm-marlin")]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct MarlinProjectionRuntime {

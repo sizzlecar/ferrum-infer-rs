@@ -304,7 +304,7 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                     .fixed_scratch_bytes()
                     .and_then(|bytes| {
                         bytes
-                            .checked_add(projection.workspace_bytes()?)
+                            .checked_add(projection.workspace_reservation_bytes()?)
                             .ok_or_else(|| "attention fixed scratch size overflows".to_owned())
                     })
                     .map_err(invalid_plan)?,
@@ -784,6 +784,14 @@ impl AttentionProjection {
         }
     }
 
+    fn workspace_reservation_bytes(self) -> Result<u64, String> {
+        super::aligned_projection_workspace_bytes(
+            self.workspace_bytes()?,
+            SCRATCH_ALIGNMENT,
+            "attention projection workspace",
+        )
+    }
+
     fn staging_bytes_per_token(self, qkvzba_features: u64) -> Result<u64, String> {
         match self {
             #[cfg(feature = "vllm-marlin")]
@@ -870,6 +878,7 @@ impl ScratchLayout {
             )
             .ok_or_else(|| "attention convolution state scratch overflows".to_owned())?;
         let projection_workspace_bytes = projection.workspace_bytes()?;
+        let projection_workspace_reservation_bytes = projection.workspace_reservation_bytes()?;
         let projection_workspace = (projection_workspace_bytes > 0)
             .then(|| reserve_fixed(&mut offset, projection_workspace_bytes, ElementType::U8))
             .transpose()?;
@@ -945,7 +954,7 @@ impl ScratchLayout {
         )?;
         let expected = shape
             .fixed_scratch_bytes()?
-            .checked_add(projection_workspace_bytes)
+            .checked_add(projection_workspace_reservation_bytes)
             .ok_or_else(|| "attention fixed scratch size overflows".to_owned())?
             .checked_add(
                 shape
@@ -3645,6 +3654,42 @@ mod tests {
         assert_eq!(shape.projection_staging_features(), shape.qkvzba_features);
         shape.hidden_size = shape.qkvzba_features + 1;
         assert_eq!(shape.projection_staging_features(), shape.hidden_size);
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    #[test]
+    fn l40s_marlin_workspace_keeps_recurrent_scratch_estimator_and_layout_identical() {
+        let shape = test_shape();
+        let runtime = MarlinProjectionRuntime {
+            multiprocessor_count: 142,
+            device_ordinal: 0,
+        };
+        let raw_workspace_bytes = runtime.workspace_bytes().unwrap();
+        assert_eq!(raw_workspace_bytes, 568);
+        let reserved_workspace_bytes = aligned_bytes(raw_workspace_bytes, 1).unwrap();
+        assert_eq!(reserved_workspace_bytes, 576);
+
+        let projection = AttentionProjection::MarlinFp8 {
+            runtime,
+            segmented: true,
+        };
+        assert_eq!(
+            projection.workspace_reservation_bytes().unwrap(),
+            reserved_workspace_bytes
+        );
+        let total_tokens = 1;
+        let participant_count = 1;
+        let layout =
+            ScratchLayout::new(shape, total_tokens, participant_count, projection).unwrap();
+        let expected = shape.fixed_scratch_bytes().unwrap()
+            + reserved_workspace_bytes
+            + shape.scratch_bytes_per_sequence().unwrap() * participant_count as u64
+            + (shape.scratch_bytes_per_token().unwrap()
+                + projection
+                    .staging_bytes_per_token(shape.projection_staging_features())
+                    .unwrap())
+                * total_tokens;
+        assert_eq!(layout.required_bytes, expected);
     }
 
     #[test]

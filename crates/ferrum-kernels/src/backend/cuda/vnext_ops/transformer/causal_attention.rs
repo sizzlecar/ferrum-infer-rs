@@ -385,7 +385,7 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
                     .attention_policy_scratch_bytes(self.attention_policy)
                     .and_then(|bytes| {
                         bytes
-                            .checked_add(projection.workspace_bytes()?)
+                            .checked_add(projection.workspace_reservation_bytes()?)
                             .ok_or_else(|| {
                                 "causal attention fixed scratch size overflows".to_owned()
                             })
@@ -1150,6 +1150,14 @@ impl CausalProjection {
         }
     }
 
+    fn workspace_reservation_bytes(self) -> Result<u64, String> {
+        super::aligned_projection_workspace_bytes(
+            self.workspace_bytes()?,
+            SCRATCH_ALIGNMENT,
+            "causal attention projection workspace",
+        )
+    }
+
     fn replay_tag(self) -> &'static str {
         match self {
             Self::F16 => "f16-cublas",
@@ -1194,6 +1202,7 @@ impl ScratchLayout {
         }
         let mut offset = 0;
         let projection_workspace_bytes = projection.workspace_bytes()?;
+        let projection_workspace_reservation_bytes = projection.workspace_reservation_bytes()?;
         let projection_workspace = (projection_workspace_bytes > 0)
             .then(|| reserve_elements(&mut offset, projection_workspace_bytes, 1))
             .transpose()?;
@@ -1235,7 +1244,7 @@ impl ScratchLayout {
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         let expected = token_bytes
             .checked_add(attention_policy_scratch_bytes)
-            .and_then(|bytes| bytes.checked_add(projection_workspace_bytes))
+            .and_then(|bytes| bytes.checked_add(projection_workspace_reservation_bytes))
             .ok_or_else(|| "causal attention scratch size overflows".to_owned())?;
         if offset != expected {
             return Err("causal attention scratch layout differs from its estimate".to_owned());
@@ -3594,6 +3603,37 @@ mod tests {
             2 * shape.binding_slot_bytes().unwrap()
         );
         assert_eq!(shape.maximum_pages().unwrap(), 64);
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    #[test]
+    fn l40s_marlin_workspace_keeps_causal_scratch_estimator_and_layout_identical() {
+        let shape = CausalAttentionShape::from_attributes(&attributes(true)).unwrap();
+        let runtime = MarlinProjectionRuntime {
+            multiprocessor_count: 142,
+            device_ordinal: 0,
+        };
+        let raw_workspace_bytes = runtime.workspace_bytes().unwrap();
+        assert_eq!(raw_workspace_bytes, 568);
+        let reserved_workspace_bytes = aligned_bytes(raw_workspace_bytes, 1).unwrap();
+        assert_eq!(reserved_workspace_bytes, 576);
+
+        let projection = CausalProjection::MarlinFp8 { runtime };
+        assert_eq!(
+            projection.workspace_reservation_bytes().unwrap(),
+            reserved_workspace_bytes
+        );
+        let total_tokens = 1;
+        let layout = ScratchLayout::new(
+            shape,
+            total_tokens,
+            projection,
+            AttentionExecutionPolicy::Portable,
+        )
+        .unwrap();
+        let expected =
+            reserved_workspace_bytes + shape.scratch_bytes_per_token().unwrap() * total_tokens;
+        assert_eq!(layout.required_bytes, expected);
     }
 
     #[test]
