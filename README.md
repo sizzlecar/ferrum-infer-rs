@@ -88,15 +88,10 @@ mean tok/s with the 95% confidence-interval half-width across three repeats.
 | Qwen3 30B-A3B | c=16 · 39.6 ± 1.2 | c=32 · 214.9 ± 2.7 |  |
 | Qwen3.8 27B AWQ INT4 |  | c=4 · 78.19 ± 0.04 · c=16 · 115.12 ± 1.18 · c=32 · 115.18 ± 0.97 |  |
 | [Qwen3.8 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a) |  |  | ready 119.49 s · c=1 · 16.53 · c=2 · 24.33 |
+| [Qwen3.6 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8/tree/e89b16ebf1988b3d6befa7de50abc2d76f26eb09) |  |  | ready 162.23 s · c=1 · 16.36 · c=2 · 20.33 |
 
 `c` is active server concurrency. The first three rows completed 100 requests ×
 3 repeats with zero errors. [Measurement details](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md).
-
-The L40S block-FP8 row is a development smoke at clean commit `ef8dbbee`: ready
-is cold `serve` start-to-ready time; c=1 used one warmup plus three measured
-256-input/32-output-token requests, while c=2 completed four stability requests.
-Its values are usage-counted aggregate output tok/s, not RTX 4090 release
-throughput. The AWQ INT4 row uses a different checkpoint and quantization path.
 
 ## OpenAI-Compatible API
 
