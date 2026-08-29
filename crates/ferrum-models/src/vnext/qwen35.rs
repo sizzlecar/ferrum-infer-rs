@@ -16,8 +16,9 @@ use ferrum_interfaces::vnext::{
     ModelProgram, ModelSemanticMetadata, NodeId, OperationId, PhysicalWeightComponentBinding,
     PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, ProgramBlock, ProgramNode,
     ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, QuantizationFormatId,
-    QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedTensorLayout,
-    SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec,
+    QuantizedProviderAttributionDenominator, ResolvedTensorLayout, SemanticValue,
+    StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
     TypedFamilyRegistration, VNextError, WeightComponentRole, WeightComponentSource,
     WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightReference,
     WeightSchema, WeightTensorSpec, CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID,
@@ -5256,6 +5257,16 @@ mod tests {
             .prepare(&serde_json::to_value(test_official_marlin_block_fp8_config()).unwrap())
             .unwrap();
         let source_schema = prepared.weight_schema();
+        let denominator = QuantizedProviderAttributionDenominator::from_prepared_family(&prepared)
+            .unwrap()
+            .expect("official block-FP8 family has a quantized attribution denominator");
+        assert_eq!(denominator.quant_tensor_count(), 400);
+        assert_eq!(denominator.operation_count(), 3);
+        assert_eq!(denominator.item_count(), 403);
+        assert_eq!(
+            denominator.sha256(),
+            "5e366997e15e1a94d90b1ae07281269e8a46f75904306564d56354c8ebea2e4e"
+        );
         let materializer = block_fp8_to_marlin_fp8_weight_materializer().unwrap();
         assert_eq!(
             materializer.descriptor().fidelity(),

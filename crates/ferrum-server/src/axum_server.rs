@@ -5029,6 +5029,10 @@ async fn health_handler(
         .llm
         .as_ref()
         .and_then(|engine| engine.cache_metrics_snapshot());
+    let execution_attribution = state
+        .llm
+        .as_ref()
+        .and_then(|engine| engine.execution_attribution_snapshot());
     let engine_lora = state
         .llm
         .as_ref()
@@ -5076,6 +5080,7 @@ async fn health_handler(
         "auto_config": auto_config,
         "admission": admission,
         "cache": state.cache.health_json(&cache_policy, engine_cache.as_ref()),
+        "execution_attribution": execution_attribution,
         "lora": engine_lora.unwrap_or_else(|| serde_json::json!({
             "enabled": state.served_model_registry.adapter_count() > 0,
             "adapter_count": state.served_model_registry.adapter_count() as u64,
@@ -5364,6 +5369,7 @@ mod tests {
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
         finish_reason: FinishReason,
+        execution_attribution: Option<Value>,
         lora_metrics: Option<Value>,
         pending_stream_drop_notify: Option<Arc<Notify>>,
         shutdown_count: AtomicUsize,
@@ -5381,6 +5387,7 @@ mod tests {
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
                 finish_reason: FinishReason::Stop,
+                execution_attribution: None,
                 lora_metrics: None,
                 pending_stream_drop_notify: None,
                 shutdown_count: AtomicUsize::new(0),
@@ -5435,6 +5442,13 @@ mod tests {
         fn with_lora_metrics(text: &str, lora_metrics: Value) -> Self {
             Self {
                 lora_metrics: Some(lora_metrics),
+                ..Self::new(text)
+            }
+        }
+
+        fn with_execution_attribution(text: &str, execution_attribution: Value) -> Self {
+            Self {
+                execution_attribution: Some(execution_attribution),
                 ..Self::new(text)
             }
         }
@@ -5613,6 +5627,10 @@ mod tests {
 
         async fn health_check(&self) -> EngineHealthStatus {
             EngineHealthStatus::healthy()
+        }
+
+        fn execution_attribution_snapshot(&self) -> Option<Value> {
+            self.execution_attribution.clone()
         }
 
         fn lora_metrics_snapshot(&self) -> Option<Value> {
@@ -6994,6 +7012,44 @@ mod tests {
         assert_eq!(body["lora"]["projection_applications"], 7);
         assert_eq!(body["lora"]["position"], "real-inference");
         assert_eq!(body["lora"]["source"], "test-lora");
+    }
+
+    #[tokio::test]
+    async fn route_health_includes_engine_execution_attribution_snapshot() {
+        let router = AxumServer::from_llm(Arc::new(StubLlm::with_execution_attribution(
+            "ok",
+            json!({
+                "schema": "ferrum.vnext.provider-attribution.v1",
+                "attribution_basis": "resolved_plan_and_completed_static_initialization",
+                "provider_attribution": {
+                    "expected_quant_tensor_count": 400,
+                    "attributed_quant_tensor_count": 400,
+                    "expected_operation_count": 3,
+                    "attributed_operation_count": 3,
+                    "expected_item_count": 403,
+                    "attributed_item_count": 403,
+                    "percent": 100.0,
+                    "denominator_sha256": "5e366997e15e1a94d90b1ae07281269e8a46f75904306564d56354c8ebea2e4e"
+                },
+                "fallback_counts": {"silent": 0, "dense": 0, "legacy": 0}
+            }),
+        )))
+        .build_router();
+        let response = get(router, "/health").await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["execution_attribution"]["provider_attribution"]["expected_item_count"],
+            403
+        );
+        assert_eq!(
+            body["execution_attribution"]["provider_attribution"]["denominator_sha256"],
+            "5e366997e15e1a94d90b1ae07281269e8a46f75904306564d56354c8ebea2e4e"
+        );
+        assert_eq!(
+            body["execution_attribution"]["fallback_counts"],
+            json!({"silent": 0, "dense": 0, "legacy": 0})
+        );
     }
 
     #[tokio::test]
