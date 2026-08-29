@@ -417,7 +417,7 @@ fn marlin_fp8_quantization_spec() -> Result<QuantizationSpec, VNextError> {
 /// configuration rejects them once the row count grows beyond the narrow-tile
 /// path. Keep those projections in F16 until the execution plan can represent
 /// an explicit row-chunking strategy.
-const fn marlin_fp8_projection_shape_supported(n: usize, k: usize) -> bool {
+pub(crate) const fn marlin_fp8_projection_shape_supported(n: usize, k: usize) -> bool {
     fp8_marlin_shape_supported(n, k) && n.is_multiple_of(256)
 }
 

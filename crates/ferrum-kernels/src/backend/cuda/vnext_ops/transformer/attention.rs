@@ -33,11 +33,12 @@ use super::{
 };
 #[cfg(feature = "vllm-marlin")]
 use super::{
-    marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE},
+    marlin_fp8_weights::{
+        resolve_marlin_fp8_layout, resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
+    },
     moe_weights::{
-        resolve_compressed_tensors_marlin_layout, resolve_compressed_tensors_marlin_matrix_weight,
-        resolve_dense_f16_layout_region, COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID,
-        COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        resolve_compressed_tensors_marlin_layout, resolve_dense_f16_layout_region,
+        COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
         COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
     },
     MarlinProjectionRuntime,
@@ -312,7 +313,10 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
                     .scratch_bytes_per_token()
                     .and_then(|bytes| {
                         bytes
-                            .checked_add(projection.staging_bytes_per_token(shape.qkvzba_features)?)
+                            .checked_add(
+                                projection
+                                    .staging_bytes_per_token(shape.projection_staging_features())?,
+                            )
                             .ok_or_else(|| {
                                 "attention projection staging estimate overflows".to_owned()
                             })
@@ -615,6 +619,10 @@ impl AttentionShape {
         })
     }
 
+    fn projection_staging_features(self) -> u64 {
+        self.qkvzba_features.max(self.hidden_size)
+    }
+
     fn cuda_shape(self) -> Result<CudaAttentionShape, String> {
         Ok(CudaAttentionShape {
             hidden_size: checked_i32(self.hidden_size, "attention hidden size")?,
@@ -698,6 +706,7 @@ enum AttentionProjection {
     #[cfg(feature = "vllm-marlin")]
     MarlinFp8 {
         runtime: MarlinProjectionRuntime,
+        segmented: bool,
     },
     #[cfg(feature = "vllm-marlin")]
     CompressedTensorsMarlin {
@@ -712,6 +721,7 @@ impl AttentionProjection {
         runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
         let mut uses_fp8 = false;
+        let mut uses_segmented_fp8 = false;
         let mut uses_compressed_tensors = false;
         for ordinal in [2, 7] {
             let binding = binding(values, ResolvedValueRole::Input, ordinal)?;
@@ -732,7 +742,13 @@ impl AttentionProjection {
                 .next()
                 .map(|format| format.as_str())
             {
-                Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => uses_fp8 = true,
+                Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => {
+                    uses_fp8 = true;
+                    uses_segmented_fp8 |= matches!(
+                        weight.physical_layout(),
+                        PhysicalWeightLayout::Composite { .. }
+                    );
+                }
                 Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID) => {
                     uses_compressed_tensors = true
                 }
@@ -747,7 +763,10 @@ impl AttentionProjection {
             return Err("recurrent attention cannot mix FP8 and INT4 projection ABIs".to_owned());
         }
         Ok(if uses_fp8 {
-            Self::MarlinFp8 { runtime }
+            Self::MarlinFp8 {
+                runtime,
+                segmented: uses_segmented_fp8,
+            }
         } else if uses_compressed_tensors {
             Self::CompressedTensorsMarlin { runtime }
         } else {
@@ -759,7 +778,7 @@ impl AttentionProjection {
         match self {
             Self::F16 => Ok(0),
             #[cfg(feature = "vllm-marlin")]
-            Self::MarlinFp8 { runtime } => runtime.workspace_bytes(),
+            Self::MarlinFp8 { runtime, .. } => runtime.workspace_bytes(),
             #[cfg(feature = "vllm-marlin")]
             Self::CompressedTensorsMarlin { runtime } => runtime.workspace_bytes(),
         }
@@ -768,12 +787,15 @@ impl AttentionProjection {
     fn staging_bytes_per_token(self, qkvzba_features: u64) -> Result<u64, String> {
         match self {
             #[cfg(feature = "vllm-marlin")]
-            Self::CompressedTensorsMarlin { .. } => qkvzba_features
-                .checked_mul(ElementType::F16.size_bytes())
-                .ok_or_else(|| "attention projection staging size overflows".to_owned()),
+            Self::CompressedTensorsMarlin { .. }
+            | Self::MarlinFp8 {
+                segmented: true, ..
+            } => segmented_projection_staging_bytes_per_token(qkvzba_features),
             Self::F16 => Ok(0),
             #[cfg(feature = "vllm-marlin")]
-            Self::MarlinFp8 { .. } => Ok(0),
+            Self::MarlinFp8 {
+                segmented: false, ..
+            } => Ok(0),
         }
     }
 
@@ -781,11 +803,24 @@ impl AttentionProjection {
         match self {
             Self::F16 => "f16-cublas",
             #[cfg(feature = "vllm-marlin")]
-            Self::MarlinFp8 { .. } => "mixed-marlin-fp8",
+            Self::MarlinFp8 {
+                segmented: false, ..
+            } => "marlin-fp8-direct",
+            #[cfg(feature = "vllm-marlin")]
+            Self::MarlinFp8 {
+                segmented: true, ..
+            } => "mixed-marlin-fp8-segmented",
             #[cfg(feature = "vllm-marlin")]
             Self::CompressedTensorsMarlin { .. } => "mixed-compressed-tensors-marlin-u4-zp",
         }
     }
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn segmented_projection_staging_bytes_per_token(output_features: u64) -> Result<u64, String> {
+    output_features
+        .checked_mul(ElementType::F16.size_bytes())
+        .ok_or_else(|| "attention projection staging size overflows".to_owned())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -853,7 +888,7 @@ impl ScratchLayout {
             total_tokens,
         )?;
         let projection_staging_bytes_per_token =
-            projection.staging_bytes_per_token(shape.qkvzba_features)?;
+            projection.staging_bytes_per_token(shape.projection_staging_features())?;
         let projection_staging = (projection_staging_bytes_per_token > 0)
             .then(|| {
                 reserve_tokens(
@@ -1032,21 +1067,28 @@ enum SharedProjectionWeight {
         group_size: i32,
     },
     #[cfg(feature = "vllm-marlin")]
-    CompressedTensorsMarlin {
-        parts: [Option<CompressedTensorsProjectionPart>; 4],
+    SegmentedMarlin {
+        parts: [Option<SegmentedProjectionPart>; 4],
         part_count: usize,
     },
 }
 
 #[cfg(feature = "vllm-marlin")]
 #[derive(Debug, Clone, Copy)]
-enum CompressedTensorsProjectionPart {
+enum SegmentedProjectionPart {
     F16 {
         region: usize,
         output_offset: i32,
         output_features: i32,
     },
-    Marlin {
+    MarlinFp8 {
+        packed_region: usize,
+        scales_region: usize,
+        group_size: i32,
+        output_offset: i32,
+        output_features: i32,
+    },
+    CompressedTensorsMarlin {
         packed_region: usize,
         scales_region: usize,
         zero_points_region: usize,
@@ -1063,13 +1105,137 @@ impl SharedProjectionWeight {
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "marlin-fp8",
             #[cfg(feature = "vllm-marlin")]
-            Self::CompressedTensorsMarlin { part_count: 1, .. } => {
-                "compressed-tensors-marlin-direct"
-            }
+            Self::SegmentedMarlin { part_count: 1, .. } => "segmented-marlin-direct",
             #[cfg(feature = "vllm-marlin")]
-            Self::CompressedTensorsMarlin { .. } => "compressed-tensors-marlin-segmented",
+            Self::SegmentedMarlin { .. } => "segmented-marlin",
         }
     }
+
+    fn dispatch_count(self) -> Result<u64, String> {
+        match self {
+            Self::F16 { .. } => Ok(1),
+            #[cfg(feature = "vllm-marlin")]
+            Self::MarlinFp8 { .. } => Ok(1),
+            #[cfg(feature = "vllm-marlin")]
+            Self::SegmentedMarlin { parts, part_count } => {
+                if part_count == 0
+                    || part_count > parts.len()
+                    || parts
+                        .into_iter()
+                        .take(part_count)
+                        .any(|part| part.is_none())
+                {
+                    return Err("attention segmented projection has an invalid part set".to_owned());
+                }
+                let launches_per_part = if part_count == 1 { 1 } else { 2 };
+                u64::try_from(part_count)
+                    .ok()
+                    .and_then(|count| count.checked_mul(launches_per_part))
+                    .ok_or_else(|| "attention segmented dispatch count overflows".to_owned())
+            }
+        }
+    }
+
+    fn marlin_workspace_zero_count(self) -> Result<u64, String> {
+        match self {
+            Self::F16 { .. } => Ok(0),
+            #[cfg(feature = "vllm-marlin")]
+            Self::MarlinFp8 { .. } => Ok(1),
+            #[cfg(feature = "vllm-marlin")]
+            Self::SegmentedMarlin { parts, part_count } => {
+                if part_count == 0 || part_count > parts.len() {
+                    return Err("attention segmented projection has an invalid part set".to_owned());
+                }
+                parts
+                    .into_iter()
+                    .take(part_count)
+                    .try_fold(0_u64, |count, part| match part {
+                        Some(SegmentedProjectionPart::F16 { .. }) => Ok(count),
+                        Some(SegmentedProjectionPart::MarlinFp8 { .. })
+                        | Some(SegmentedProjectionPart::CompressedTensorsMarlin { .. }) => {
+                            count.checked_add(1).ok_or_else(|| {
+                                "attention Marlin workspace-zero count overflows".to_owned()
+                            })
+                        }
+                        None => Err("attention segmented projection has an absent part".to_owned()),
+                    })
+            }
+        }
+    }
+
+    fn bind_replay_topology(
+        self,
+        mut replay_key: CudaCommandReplayKeyBuilder,
+    ) -> CudaCommandReplayKeyBuilder {
+        replay_key = replay_key.bytes(self.replay_tag().as_bytes());
+        match self {
+            Self::F16 { .. } => replay_key,
+            #[cfg(feature = "vllm-marlin")]
+            Self::MarlinFp8 { group_size, .. } => replay_key.i32(group_size),
+            #[cfg(feature = "vllm-marlin")]
+            Self::SegmentedMarlin { parts, part_count } => {
+                replay_key = replay_key.u64(part_count as u64);
+                for part in parts.into_iter().take(part_count) {
+                    replay_key = match part {
+                        Some(SegmentedProjectionPart::F16 {
+                            output_offset,
+                            output_features,
+                            ..
+                        }) => replay_key
+                            .bytes(b"f16")
+                            .i32(output_offset)
+                            .i32(output_features),
+                        Some(SegmentedProjectionPart::MarlinFp8 {
+                            group_size,
+                            output_offset,
+                            output_features,
+                            ..
+                        }) => replay_key
+                            .bytes(b"marlin-fp8")
+                            .i32(group_size)
+                            .i32(output_offset)
+                            .i32(output_features),
+                        Some(SegmentedProjectionPart::CompressedTensorsMarlin {
+                            group_size,
+                            output_offset,
+                            output_features,
+                            ..
+                        }) => replay_key
+                            .bytes(b"compressed-tensors-marlin")
+                            .i32(group_size)
+                            .i32(output_offset)
+                            .i32(output_features),
+                        None => replay_key.bytes(b"absent"),
+                    };
+                }
+                replay_key
+            }
+        }
+    }
+}
+
+fn attention_dispatches_per_launch(
+    qkvzba: SharedProjectionWeight,
+    output: SharedProjectionWeight,
+) -> Result<u64, String> {
+    let qkvzba = qkvzba.dispatch_count()?;
+    let output = output.dispatch_count()?;
+    8_u64
+        .checked_add(qkvzba)
+        .and_then(|count| count.checked_add(output))
+        .ok_or_else(|| "attention dispatch count overflows".to_owned())
+}
+
+fn attention_transfers_per_launch(
+    qkvzba: SharedProjectionWeight,
+    output: SharedProjectionWeight,
+) -> Result<u64, String> {
+    let qkvzba = qkvzba.marlin_workspace_zero_count()?;
+    let output = output.marlin_workspace_zero_count()?;
+    2_u64
+        .checked_add(qkvzba)
+        .and_then(|count| count.checked_add(output))
+        .ok_or_else(|| "attention transfer attribution overflows".to_owned())
 }
 
 fn encode_attention(
@@ -1322,13 +1488,13 @@ fn encode_attention(
     }
 
     let functions = functions.clone();
+    let dispatches_per_launch = attention_dispatches_per_launch(shared.qkvzba, shared.output)?;
+    let transfers_per_launch = attention_transfers_per_launch(shared.qkvzba, shared.output)?;
     let mut replay_key = CudaCommandReplayKeyBuilder::new(
         provider_fingerprint,
         "vnext_gated_delta_recurrent_attention",
     )
     .bytes(projection.replay_tag().as_bytes())
-    .bytes(shared.qkvzba.replay_tag().as_bytes())
-    .bytes(shared.output.replay_tag().as_bytes())
     .u64(shape.hidden_size)
     .u64(shape.key_heads)
     .u64(shape.value_heads)
@@ -1348,6 +1514,8 @@ fn encode_attention(
     .u64(STATE_BINDING_SLOT_BYTES)
     .boolean(use_packed)
     .u64(launches.len() as u64);
+    replay_key = shared.qkvzba.bind_replay_topology(replay_key);
+    replay_key = shared.output.bind_replay_topology(replay_key);
     for tokens in &participant_token_counts {
         replay_key = replay_key.u64(*tokens);
     }
@@ -1369,6 +1537,20 @@ fn encode_attention(
     }
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA recurrent attention participant count exceeds u32".to_owned())?;
+    let attributed_launches = if use_packed {
+        1
+    } else {
+        u64::from(participant_count)
+    };
+    if u64::try_from(launches.len()).ok() != Some(attributed_launches) {
+        return Err("CUDA recurrent attention launch attribution is inconsistent".to_owned());
+    }
+    let logical_compute_dispatches = attributed_launches
+        .checked_mul(dispatches_per_launch)
+        .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())?;
+    let physical_transfer_commands = attributed_launches
+        .checked_mul(transfers_per_launch)
+        .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())?;
     let (binding_command, has_compiled_program_slot) =
         if let Some(program_binding) = program_binding {
             let mut regions = binding_regions.into_iter();
@@ -1458,11 +1640,6 @@ fn encode_attention(
             },
         )
         .and_then(|command| {
-            let physical_transfer_commands = if use_packed {
-                2
-            } else {
-                u64::from(participant_count) * 2
-            };
             command.with_work_attribution(
                 if use_packed {
                     DeviceBatchingForm::Packed
@@ -1471,11 +1648,7 @@ fn encode_attention(
                 },
                 participant_count,
                 total_tokens,
-                (if use_packed {
-                    1
-                } else {
-                    u64::from(participant_count)
-                }) * 10,
+                logical_compute_dispatches,
                 physical_transfer_commands,
             )
         })
@@ -1897,7 +2070,7 @@ fn launch_attention_projection(
             scales_region,
             group_size,
         } => {
-            let AttentionProjection::MarlinFp8 { runtime } = projection else {
+            let AttentionProjection::MarlinFp8 { runtime, .. } = projection else {
                 return Err(CudaDeviceRuntimeError::contract(format!(
                     "{operation} has Marlin FP8 weights without an admitted projection runtime"
                 )));
@@ -1940,20 +2113,27 @@ fn launch_attention_projection(
             )
         }
         #[cfg(feature = "vllm-marlin")]
-        SharedProjectionWeight::CompressedTensorsMarlin { parts, part_count } => {
-            let AttentionProjection::CompressedTensorsMarlin { runtime } = projection else {
-                return Err(CudaDeviceRuntimeError::contract(format!(
-                    "{operation} has compressed-tensors weights without an admitted projection runtime"
-                )));
+        SharedProjectionWeight::SegmentedMarlin { parts, part_count } => {
+            let runtime = match projection {
+                AttentionProjection::MarlinFp8 {
+                    runtime,
+                    segmented: true,
+                }
+                | AttentionProjection::CompressedTensorsMarlin { runtime } => runtime,
+                _ => {
+                    return Err(CudaDeviceRuntimeError::contract(format!(
+                        "{operation} has segmented Marlin weights without an admitted projection runtime"
+                    )))
+                }
             };
             if part_count == 0 || part_count > parts.len() {
                 return Err(CudaDeviceRuntimeError::contract(format!(
-                    "{operation} has an invalid compressed-tensors part count"
+                    "{operation} has an invalid segmented Marlin part count"
                 )));
             }
             let workspace_offset = layout.projection_workspace.ok_or_else(|| {
                 CudaDeviceRuntimeError::contract(format!(
-                    "{operation} lacks its admitted compressed-tensors Marlin workspace"
+                    "{operation} lacks its admitted segmented Marlin workspace"
                 ))
             })?;
             let workspace_bytes = runtime
@@ -1963,12 +2143,12 @@ fn launch_attention_projection(
                 .checked_add(workspace_bytes)
                 .ok_or_else(|| {
                     CudaDeviceRuntimeError::contract(format!(
-                        "{operation} compressed-tensors workspace range overflows"
+                        "{operation} segmented Marlin workspace range overflows"
                     ))
                 })?;
             if workspace_end > scratch.length_bytes() {
                 return Err(CudaDeviceRuntimeError::contract(format!(
-                    "{operation} compressed-tensors workspace exceeds attention scratch"
+                    "{operation} segmented Marlin workspace exceeds attention scratch"
                 )));
             }
             let workspace = scratch_pointer(scratch.device_ptr(), workspace_offset)?;
@@ -1998,16 +2178,21 @@ fn launch_attention_projection(
             for (part_index, part) in parts.into_iter().take(part_count).enumerate() {
                 let part = part.ok_or_else(|| {
                     CudaDeviceRuntimeError::contract(format!(
-                        "{operation} compressed-tensors part {part_index} is absent"
+                        "{operation} segmented Marlin part {part_index} is absent"
                     ))
                 })?;
                 let (output_offset, part_output_features) = match part {
-                    CompressedTensorsProjectionPart::F16 {
+                    SegmentedProjectionPart::F16 {
                         output_offset,
                         output_features,
                         ..
                     }
-                    | CompressedTensorsProjectionPart::Marlin {
+                    | SegmentedProjectionPart::MarlinFp8 {
+                        output_offset,
+                        output_features,
+                        ..
+                    }
+                    | SegmentedProjectionPart::CompressedTensorsMarlin {
                         output_offset,
                         output_features,
                         ..
@@ -2020,12 +2205,12 @@ fn launch_attention_projection(
                         .is_none_or(|end| end > output_features)
                 {
                     return Err(CudaDeviceRuntimeError::contract(format!(
-                        "{operation} compressed-tensors part {part_index} exceeds the output width"
+                        "{operation} segmented Marlin part {part_index} exceeds the output width"
                     )));
                 }
                 if direct && (output_offset != 0 || part_output_features != output_features) {
                     return Err(CudaDeviceRuntimeError::contract(format!(
-                        "{operation} direct compressed-tensors part does not cover the output"
+                        "{operation} direct segmented Marlin part does not cover the output"
                     )));
                 }
                 let part_bytes = u64::try_from(rows)
@@ -2034,7 +2219,7 @@ fn launch_attention_projection(
                     .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(format!(
-                            "{operation} compressed-tensors part staging size overflows"
+                            "{operation} segmented Marlin part staging size overflows"
                         ))
                     })?;
                 let destination = if direct {
@@ -2042,18 +2227,18 @@ fn launch_attention_projection(
                 } else {
                     let staging_end = staging_cursor.checked_add(part_bytes).ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(format!(
-                            "{operation} compressed-tensors staging range overflows"
+                            "{operation} segmented Marlin staging range overflows"
                         ))
                     })?;
                     if staging_end > staging_capacity {
                         return Err(CudaDeviceRuntimeError::contract(format!(
-                            "{operation} compressed-tensors staging exceeds its admitted estimate"
+                            "{operation} segmented Marlin staging exceeds its admitted estimate"
                         )));
                     }
                     scratch_pointer(staging_base, staging_cursor)?
                 };
                 match part {
-                    CompressedTensorsProjectionPart::F16 { region, .. } => launch_gemm_f16(
+                    SegmentedProjectionPart::F16 { region, .. } => launch_gemm_f16(
                         blas,
                         input,
                         regions[region].device_ptr(),
@@ -2063,28 +2248,66 @@ fn launch_attention_projection(
                         input_features,
                         operation,
                     )?,
-                    CompressedTensorsProjectionPart::Marlin {
+                    SegmentedProjectionPart::MarlinFp8 {
+                        packed_region,
+                        scales_region,
+                        group_size,
+                        ..
+                    } => {
+                        if !matches!(projection, AttentionProjection::MarlinFp8 { .. }) {
+                            return Err(CudaDeviceRuntimeError::contract(format!(
+                                "{operation} contains an FP8 segment under another Marlin ABI"
+                            )));
+                        }
+                        runtime.launch(
+                            MarlinF16WeightType::E4M3Fn,
+                            stream,
+                            input,
+                            regions[packed_region].device_ptr(),
+                            regions[scales_region].device_ptr(),
+                            None,
+                            destination,
+                            workspace,
+                            workspace_bytes,
+                            rows,
+                            part_output_features,
+                            input_features,
+                            group_size,
+                            operation,
+                        )?;
+                    }
+                    SegmentedProjectionPart::CompressedTensorsMarlin {
                         packed_region,
                         scales_region,
                         zero_points_region,
                         group_size,
                         ..
-                    } => runtime.launch(
-                        MarlinF16WeightType::U4,
-                        stream,
-                        input,
-                        regions[packed_region].device_ptr(),
-                        regions[scales_region].device_ptr(),
-                        Some(regions[zero_points_region].device_ptr()),
-                        destination,
-                        workspace,
-                        workspace_bytes,
-                        rows,
-                        part_output_features,
-                        input_features,
-                        group_size,
-                        operation,
-                    )?,
+                    } => {
+                        if !matches!(
+                            projection,
+                            AttentionProjection::CompressedTensorsMarlin { .. }
+                        ) {
+                            return Err(CudaDeviceRuntimeError::contract(format!(
+                                "{operation} contains a compressed-tensors segment under another Marlin ABI"
+                            )));
+                        }
+                        runtime.launch(
+                            MarlinF16WeightType::U4,
+                            stream,
+                            input,
+                            regions[packed_region].device_ptr(),
+                            regions[scales_region].device_ptr(),
+                            Some(regions[zero_points_region].device_ptr()),
+                            destination,
+                            workspace,
+                            workspace_bytes,
+                            rows,
+                            part_output_features,
+                            input_features,
+                            group_size,
+                            operation,
+                        )?;
+                    }
                 }
                 if !direct {
                     launch_projection_stitch(
@@ -2100,7 +2323,7 @@ fn launch_attention_projection(
                     )?;
                     staging_cursor = staging_cursor.checked_add(part_bytes).ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(format!(
-                            "{operation} compressed-tensors staging cursor overflows"
+                            "{operation} segmented Marlin staging cursor overflows"
                         ))
                     })?;
                 }
@@ -2634,20 +2857,18 @@ fn push_shared_weight(
 }
 
 #[cfg(feature = "vllm-marlin")]
-fn compressed_tensors_projection_layouts<'a>(
-    weight: &'a ferrum_interfaces::vnext::ResolvedWeightBinding,
+fn projection_output_parts<'a>(
+    layout: &'a PhysicalWeightLayout,
     logical_dimensions: &[u64],
 ) -> Result<Vec<(&'a PhysicalWeightLayout, u64, u64)>, String> {
     let [output_features, input_features] = logical_dimensions else {
-        return Err("compressed-tensors attention projection must be rank two".to_owned());
+        return Err("segmented attention projection must be rank two".to_owned());
     };
-    match weight.physical_layout() {
+    match layout {
         layout @ PhysicalWeightLayout::Quantized { .. } => Ok(vec![(layout, 0, *output_features)]),
         PhysicalWeightLayout::Composite { parts } => {
             if parts.is_empty() || parts.len() > 4 {
-                return Err(
-                    "compressed-tensors attention projection requires one to four parts".to_owned(),
-                );
+                return Err("segmented attention projection requires one to four parts".to_owned());
             }
             let mut cursor = 0_u64;
             let mut resolved = Vec::with_capacity(parts.len());
@@ -2656,9 +2877,15 @@ fn compressed_tensors_projection_layouts<'a>(
                     || part.extents.len() != 2
                     || part.extents[0] == 0
                     || part.extents[1] != *input_features
+                    || !matches!(
+                        part.layout.as_ref(),
+                        PhysicalWeightLayout::Quantized { .. }
+                            | PhysicalWeightLayout::Dense { .. }
+                            | PhysicalWeightLayout::Stored { .. }
+                    )
                 {
                     return Err(
-                        "compressed-tensors attention composite placement is not a contiguous output partition"
+                        "segmented attention composite is not a flat contiguous output partition"
                             .to_owned(),
                     );
                 }
@@ -2668,15 +2895,11 @@ fn compressed_tensors_projection_layouts<'a>(
                     .ok_or_else(|| "attention projection part coverage overflows".to_owned())?;
             }
             if cursor != *output_features {
-                return Err(
-                    "compressed-tensors attention parts do not cover the output width".to_owned(),
-                );
+                return Err("segmented attention parts do not cover the output width".to_owned());
             }
             Ok(resolved)
         }
-        _ => {
-            Err("compressed-tensors attention projection must be quantized or composite".to_owned())
-        }
+        _ => Err("segmented attention projection must be quantized or composite".to_owned()),
     }
 }
 
@@ -2696,7 +2919,7 @@ fn push_shared_compressed_tensors_projection(
     let first_weight = first_binding.weight().ok_or_else(|| {
         format!("attention projection input {ordinal} lacks a physical weight layout")
     })?;
-    let first_parts = compressed_tensors_projection_layouts(first_weight, logical_dimensions)?;
+    let first_parts = projection_output_parts(first_weight.physical_layout(), logical_dimensions)?;
     let mut encoded = [None; 4];
 
     for (part_index, (first_layout, output_offset, output_features)) in
@@ -2719,10 +2942,16 @@ fn push_shared_compressed_tensors_projection(
                             "attention projection input {ordinal} lacks a candidate weight layout"
                         )
                     })?;
-                    let candidate_parts = compressed_tensors_projection_layouts(
-                        candidate_weight,
+                    let candidate_parts = projection_output_parts(
+                        candidate_weight.physical_layout(),
                         logical_dimensions,
                     )?;
+                    if candidate_parts.len() != first_parts.len() {
+                        return Err(
+                            "compressed-tensors attention part count differs across participants"
+                                .to_owned(),
+                        );
+                    }
                     let (candidate_layout, candidate_offset, candidate_features) =
                         candidate_parts.get(part_index).copied().ok_or_else(|| {
                             "attention projection candidate part is absent".to_owned()
@@ -2769,7 +2998,7 @@ fn push_shared_compressed_tensors_projection(
                 regions.push(scales);
                 let zero_points_region = regions.len();
                 regions.push(zero_points);
-                encoded[part_index] = Some(CompressedTensorsProjectionPart::Marlin {
+                encoded[part_index] = Some(SegmentedProjectionPart::CompressedTensorsMarlin {
                     packed_region,
                     scales_region,
                     zero_points_region,
@@ -2791,10 +3020,16 @@ fn push_shared_compressed_tensors_projection(
                     let candidate_weight = candidate_binding.weight().ok_or_else(|| {
                         "attention dense projection candidate lacks a weight layout".to_owned()
                     })?;
-                    let candidate_parts = compressed_tensors_projection_layouts(
-                        candidate_weight,
+                    let candidate_parts = projection_output_parts(
+                        candidate_weight.physical_layout(),
                         logical_dimensions,
                     )?;
+                    if candidate_parts.len() != first_parts.len() {
+                        return Err(
+                            "compressed-tensors attention part count differs across participants"
+                                .to_owned(),
+                        );
+                    }
                     let (candidate_layout, candidate_offset, candidate_features) = candidate_parts
                         .get(part_index)
                         .copied()
@@ -2817,7 +3052,7 @@ fn push_shared_compressed_tensors_projection(
                 }
                 let region = regions.len();
                 regions.push(first_region);
-                encoded[part_index] = Some(CompressedTensorsProjectionPart::F16 {
+                encoded[part_index] = Some(SegmentedProjectionPart::F16 {
                     region,
                     output_offset: checked_i32(output_offset, "attention output offset")?,
                     output_features: checked_i32(output_features, "attention part width")?,
@@ -2831,7 +3066,173 @@ fn push_shared_compressed_tensors_projection(
             }
         }
     }
-    Ok(SharedProjectionWeight::CompressedTensorsMarlin {
+    Ok(SharedProjectionWeight::SegmentedMarlin {
+        parts: encoded,
+        part_count: first_parts.len(),
+    })
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn push_shared_marlin_fp8_projection(
+    regions: &mut Vec<CudaBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ordinal: u32,
+    logical_dimensions: &[u64],
+) -> Result<SharedProjectionWeight, String> {
+    let first_participant = &invocation.participants()[0];
+    let first_binding = binding(
+        first_participant.bindings(),
+        ResolvedValueRole::Input,
+        ordinal,
+    )?;
+    let first_weight = first_binding.weight().ok_or_else(|| {
+        format!("attention projection input {ordinal} lacks a physical weight layout")
+    })?;
+    let first_parts = projection_output_parts(first_weight.physical_layout(), logical_dimensions)?;
+    let mut encoded = [None; 4];
+
+    for (part_index, (first_layout, output_offset, output_features)) in
+        first_parts.iter().copied().enumerate()
+    {
+        let part_dimensions = [output_features, logical_dimensions[1]];
+        match first_layout {
+            PhysicalWeightLayout::Quantized { .. } => {
+                let first = resolve_marlin_fp8_layout(
+                    first_participant,
+                    first_binding,
+                    first_layout,
+                    &part_dimensions,
+                )?;
+                if first.output_features() != output_features
+                    || first.input_features() != logical_dimensions[1]
+                {
+                    return Err(format!(
+                        "attention projection input {ordinal} FP8 part {part_index} resolved inconsistent dimensions"
+                    ));
+                }
+                for participant in &invocation.participants()[1..] {
+                    let candidate_binding =
+                        binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+                    let candidate_weight = candidate_binding.weight().ok_or_else(|| {
+                        format!(
+                            "attention projection input {ordinal} lacks a candidate weight layout"
+                        )
+                    })?;
+                    let candidate_parts = projection_output_parts(
+                        candidate_weight.physical_layout(),
+                        logical_dimensions,
+                    )?;
+                    if candidate_parts.len() != first_parts.len() {
+                        return Err(
+                            "attention FP8 projection part count differs across participants"
+                                .to_owned(),
+                        );
+                    }
+                    let (candidate_layout, candidate_offset, candidate_features) =
+                        candidate_parts.get(part_index).copied().ok_or_else(|| {
+                            "attention FP8 projection candidate part is absent".to_owned()
+                        })?;
+                    if candidate_offset != output_offset || candidate_features != output_features {
+                        return Err(
+                            "attention FP8 projection placement differs across participants"
+                                .to_owned(),
+                        );
+                    }
+                    let candidate = resolve_marlin_fp8_layout(
+                        participant,
+                        candidate_binding,
+                        candidate_layout,
+                        &part_dimensions,
+                    )?;
+                    if candidate.output_features() != first.output_features()
+                        || candidate.input_features() != first.input_features()
+                        || !super::same_physical_region(
+                            first.packed_region(),
+                            candidate.packed_region(),
+                        )
+                        || !super::same_physical_region(
+                            first.scales_region(),
+                            candidate.scales_region(),
+                        )
+                    {
+                        return Err(
+                            "attention FP8 Marlin part is not shared by all participants"
+                                .to_owned(),
+                        );
+                    }
+                }
+                let [packed, scales] = first.into_regions();
+                let packed_region = regions.len();
+                regions.push(packed);
+                let scales_region = regions.len();
+                regions.push(scales);
+                encoded[part_index] = Some(SegmentedProjectionPart::MarlinFp8 {
+                    packed_region,
+                    scales_region,
+                    group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
+                    output_offset: checked_i32(output_offset, "attention output offset")?,
+                    output_features: checked_i32(output_features, "attention part width")?,
+                });
+            }
+            PhysicalWeightLayout::Dense { .. } | PhysicalWeightLayout::Stored { .. } => {
+                let first_region = resolve_dense_f16_layout_region(
+                    first_participant,
+                    first_binding,
+                    first_layout,
+                    &part_dimensions,
+                )?;
+                for participant in &invocation.participants()[1..] {
+                    let candidate_binding =
+                        binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+                    let candidate_weight = candidate_binding.weight().ok_or_else(|| {
+                        "attention FP8 dense candidate lacks a weight layout".to_owned()
+                    })?;
+                    let candidate_parts = projection_output_parts(
+                        candidate_weight.physical_layout(),
+                        logical_dimensions,
+                    )?;
+                    if candidate_parts.len() != first_parts.len() {
+                        return Err(
+                            "attention FP8 projection part count differs across participants"
+                                .to_owned(),
+                        );
+                    }
+                    let (candidate_layout, candidate_offset, candidate_features) = candidate_parts
+                        .get(part_index)
+                        .copied()
+                        .ok_or_else(|| "attention FP8 dense candidate part is absent".to_owned())?;
+                    let candidate_region = resolve_dense_f16_layout_region(
+                        participant,
+                        candidate_binding,
+                        candidate_layout,
+                        &part_dimensions,
+                    )?;
+                    if candidate_offset != output_offset
+                        || candidate_features != output_features
+                        || !super::same_physical_region(&first_region, &candidate_region)
+                    {
+                        return Err(
+                            "attention FP8 dense part is not shared by all participants".to_owned()
+                        );
+                    }
+                }
+                let region = regions.len();
+                regions.push(first_region);
+                encoded[part_index] = Some(SegmentedProjectionPart::F16 {
+                    region,
+                    output_offset: checked_i32(output_offset, "attention output offset")?,
+                    output_features: checked_i32(output_features, "attention part width")?,
+                });
+            }
+            _ => {
+                return Err(
+                    "attention FP8 composite contains an unsupported physical layout".to_owned(),
+                )
+            }
+        }
+    }
+
+    Ok(SharedProjectionWeight::SegmentedMarlin {
         parts: encoded,
         part_count: first_parts.len(),
     })
@@ -2860,18 +3261,50 @@ fn push_shared_projection_weight(
             format!("attention projection input {ordinal} lacks its physical weight layout")
         })?;
         let quantization_formats = first_layout.quantization_formats();
-        if quantization_formats
-            .iter()
-            .any(|format| format.as_str() == COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
-        {
-            return push_shared_compressed_tensors_projection(
-                regions,
-                invocation,
-                ordinal,
-                logical_dimensions,
-            );
+        if quantization_formats.len() > 1 {
+            return Err(format!(
+                "attention projection input {ordinal} has more than one quantization format"
+            ));
         }
-        if !quantization_formats.is_empty() {
+        match quantization_formats
+            .iter()
+            .next()
+            .map(|format| format.as_str())
+        {
+            Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID) => {
+                return push_shared_compressed_tensors_projection(
+                    regions,
+                    invocation,
+                    ordinal,
+                    logical_dimensions,
+                );
+            }
+            Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                if matches!(
+                    first_layout.physical_layout(),
+                    PhysicalWeightLayout::Composite { .. }
+                ) =>
+            {
+                return push_shared_marlin_fp8_projection(
+                    regions,
+                    invocation,
+                    ordinal,
+                    logical_dimensions,
+                );
+            }
+            Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => {}
+            Some(other) => {
+                return Err(format!(
+                    "attention projection input {ordinal} has unsupported quantization format {other:?}"
+                ));
+            }
+            None => {
+                return Ok(SharedProjectionWeight::F16 {
+                    region: push_shared_weight(regions, invocation, ordinal, ElementType::F16)?,
+                });
+            }
+        }
+        {
             let first =
                 resolve_marlin_fp8_weight(first_participant, first_binding, logical_dimensions)?;
             if first.output_features() != *expected_output_features
@@ -3162,6 +3595,8 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "vllm-marlin")]
+    use ferrum_interfaces::vnext::{CompositeWeightPart, WeightId};
 
     fn test_shape() -> AttentionShape {
         AttentionShape {
@@ -3203,6 +3638,14 @@ mod tests {
     }
 
     #[test]
+    fn projection_staging_covers_the_wider_projection_output() {
+        let mut shape = test_shape();
+        assert_eq!(shape.projection_staging_features(), shape.qkvzba_features);
+        shape.hidden_size = shape.qkvzba_features + 1;
+        assert_eq!(shape.projection_staging_features(), shape.hidden_size);
+    }
+
+    #[test]
     fn reusable_topology_binds_participant_token_distribution() {
         let capabilities = GatedDeltaExecutionCapabilities::recurrent_only();
         let one_three =
@@ -3239,5 +3682,140 @@ mod tests {
             buffers.kernel_arguments(),
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    fn dense_projection_part(
+        index: usize,
+        output_offset: u64,
+        output_features: u64,
+        input_features: u64,
+    ) -> CompositeWeightPart {
+        CompositeWeightPart {
+            layout: Box::new(PhysicalWeightLayout::Dense {
+                component_id: WeightId::new(format!("component.test.{index}"))
+                    .expect("static test component id"),
+            }),
+            logical_offsets: vec![output_offset, 0],
+            extents: vec![output_features, input_features],
+        }
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    fn qwen38_qkvzba_projection_layout() -> PhysicalWeightLayout {
+        let input_features = 5_120;
+        PhysicalWeightLayout::Composite {
+            parts: vec![
+                dense_projection_part(0, 0, 10_240, input_features),
+                dense_projection_part(1, 10_240, 6_144, input_features),
+                dense_projection_part(2, 16_384, 48, input_features),
+                dense_projection_part(3, 16_432, 48, input_features),
+            ],
+        }
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    #[test]
+    fn qwen38_segmented_projection_topology_is_exact_and_fail_closed() {
+        let layout = qwen38_qkvzba_projection_layout();
+        let resolved = projection_output_parts(&layout, &[16_480, 5_120]).unwrap();
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|(_, offset, width)| (*offset, *width))
+                .collect::<Vec<_>>(),
+            vec![(0, 10_240), (10_240, 6_144), (16_384, 48), (16_432, 48)]
+        );
+
+        let mut gap = layout.clone();
+        let PhysicalWeightLayout::Composite { parts } = &mut gap else {
+            unreachable!()
+        };
+        parts[1].logical_offsets[0] += 1;
+        assert!(projection_output_parts(&gap, &[16_480, 5_120])
+            .unwrap_err()
+            .contains("flat contiguous output partition"));
+
+        let mut column_slice = layout.clone();
+        let PhysicalWeightLayout::Composite { parts } = &mut column_slice else {
+            unreachable!()
+        };
+        parts[2].extents[1] -= 1;
+        assert!(projection_output_parts(&column_slice, &[16_480, 5_120])
+            .unwrap_err()
+            .contains("flat contiguous output partition"));
+
+        let mut nested = layout;
+        let PhysicalWeightLayout::Composite { parts } = &mut nested else {
+            unreachable!()
+        };
+        parts[0].layout = Box::new(PhysicalWeightLayout::Composite {
+            parts: vec![dense_projection_part(9, 0, 10_240, 5_120)],
+        });
+        assert!(projection_output_parts(&nested, &[16_480, 5_120])
+            .unwrap_err()
+            .contains("flat contiguous output partition"));
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    #[test]
+    fn segmented_fp8_staging_dispatch_and_replay_topology_are_bound() {
+        assert_eq!(
+            segmented_projection_staging_bytes_per_token(16_480).unwrap(),
+            32_960
+        );
+        assert!(segmented_projection_staging_bytes_per_token(u64::MAX).is_err());
+
+        let dense_part = |region, output_offset, output_features| {
+            Some(SegmentedProjectionPart::F16 {
+                region,
+                output_offset,
+                output_features,
+            })
+        };
+        let fp8_part = |packed_region, scales_region, output_offset, output_features| {
+            Some(SegmentedProjectionPart::MarlinFp8 {
+                packed_region,
+                scales_region,
+                group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
+                output_offset,
+                output_features,
+            })
+        };
+        let qkvzba = SharedProjectionWeight::SegmentedMarlin {
+            parts: [
+                fp8_part(0, 1, 0, 10_240),
+                fp8_part(2, 3, 10_240, 6_144),
+                dense_part(4, 16_384, 48),
+                dense_part(5, 16_432, 48),
+            ],
+            part_count: 4,
+        };
+        let output = SharedProjectionWeight::MarlinFp8 {
+            packed_region: 6,
+            scales_region: 7,
+            group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
+        };
+        assert_eq!(qkvzba.dispatch_count().unwrap(), 8);
+        assert_eq!(attention_dispatches_per_launch(qkvzba, output).unwrap(), 17);
+        assert_eq!(qkvzba.marlin_workspace_zero_count().unwrap(), 2);
+        assert_eq!(output.marlin_workspace_zero_count().unwrap(), 1);
+        assert_eq!(attention_transfers_per_launch(qkvzba, output).unwrap(), 5);
+
+        let canonical = qkvzba
+            .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))
+            .finish();
+        let changed = SharedProjectionWeight::SegmentedMarlin {
+            parts: [
+                fp8_part(0, 1, 0, 10_240),
+                fp8_part(2, 3, 10_240, 6_144),
+                dense_part(4, 16_384, 47),
+                dense_part(5, 16_431, 49),
+            ],
+            part_count: 4,
+        }
+        .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))
+        .finish();
+        assert!(canonical != changed);
     }
 }
