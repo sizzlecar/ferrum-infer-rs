@@ -40,7 +40,7 @@
       "path": "crates/ferrum-models/src/vnext/qwen35.rs",
       "classification": "reviewed-provider",
       "owner": "ferrum-models/vnext::qwen35",
-      "reviewed_at_git_sha": "4e946f5cbcc19ee65420d5da1026f2c4aaa25b33",
+      "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
       "reason": "The typed family provider is reviewed function by function below."
         }
     ],
@@ -64,7 +64,7 @@
 	    "provider_review": {
     "path": "crates/ferrum-models/src/vnext/qwen35.rs",
     "owner": "ferrum-models/vnext::qwen35",
-    "reviewed_at_git_sha": "4e946f5cbcc19ee65420d5da1026f2c4aaa25b33",
+    "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
 	        "classification_reasons": {
             "counted-execution-scaffolding": "Family-owned execution, scheduling, batching, state transition, or lifecycle code counts toward the frozen G00 scaffolding delta.",
             "counted-provider-glue": "Typed family identity, validation, preparation, and descriptor glue count toward the G08A provider limit.",
@@ -148,6 +148,7 @@
       "validate_gptq_weight_source",
       "validate_compressed_tensors_weight_source",
       "validate_block_fp8_weight_source",
+      "validate_block_fp8_source_completeness",
       "family_source_external_names",
       "validate_safetensors_manifest",
       "validate_canonical_gptq_moe_representation",
@@ -248,7 +249,7 @@
 	            "symbol": "create",
 	            "line_hint": 1352,
 	            "owner": "ferrum-engine/llm-executor-factory",
-	            "reviewed_at_git_sha": "086759e5edd0e4ad9b4ea4d7d655bf19f48c2bda",
+	            "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
 	            "required_fragments": [
 	                "resolve_registered_model_from_sources",
 	                "resolve_registered_model_from_dir",
@@ -261,7 +262,7 @@
             "symbol": "create_vnext_executor",
             "line_hint": 29,
             "owner": "ferrum-engine/product-composition",
-            "reviewed_at_git_sha": "5fd1297c4f0971cf304188471c2e876ef390a1f3",
+            "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
             "required_fragments": [
                 "PreparedProductionModel",
                 "VNextModelExecutor::from_runtime_composition"
@@ -272,7 +273,7 @@
             "symbol": "create_registered_vnext_executor",
             "line_hint": 1159,
             "owner": "ferrum-engine/registered-vnext-selection",
-            "reviewed_at_git_sha": "086759e5edd0e4ad9b4ea4d7d655bf19f48c2bda",
+            "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
 	            "required_fragments": [
 	                "ProductionExecutionKind::CausalLanguage",
 	                "CudaVNextComposition::create",
