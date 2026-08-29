@@ -19,7 +19,7 @@
       "path": "crates/ferrum-models/src/qwen35_config.rs",
       "classification": "excluded-parser",
       "owner": "ferrum-models/qwen35_config",
-      "reviewed_at_git_sha": "4e946f5cbcc19ee65420d5da1026f2c4aaa25b33",
+      "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
       "reason": "Typed external configuration parsing is excluded by the frozen G00 scaffolding definition."
     },
     {
@@ -33,14 +33,14 @@
       "path": "crates/ferrum-models/src/qwen35_weights.rs",
       "classification": "excluded-weights",
       "owner": "ferrum-models/qwen35_weights",
-      "reviewed_at_git_sha": "4e946f5cbcc19ee65420d5da1026f2c4aaa25b33",
+      "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
       "reason": "Typed checkpoint inventory and weight declarations are excluded by the frozen G00 scaffolding definition."
     },
     {
       "path": "crates/ferrum-models/src/vnext/qwen35.rs",
       "classification": "reviewed-provider",
       "owner": "ferrum-models/vnext::qwen35",
-      "reviewed_at_git_sha": "e55a1c93f0ef23447919b91dce428cd52bd30025",
+      "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
       "reason": "The typed family provider is reviewed function by function below."
         }
     ],
@@ -64,7 +64,7 @@
 	    "provider_review": {
     "path": "crates/ferrum-models/src/vnext/qwen35.rs",
     "owner": "ferrum-models/vnext::qwen35",
-    "reviewed_at_git_sha": "e55a1c93f0ef23447919b91dce428cd52bd30025",
+    "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
 	        "classification_reasons": {
             "counted-execution-scaffolding": "Family-owned execution, scheduling, batching, state transition, or lifecycle code counts toward the frozen G00 scaffolding delta.",
             "counted-provider-glue": "Typed family identity, validation, preparation, and descriptor glue count toward the G08A provider limit.",
@@ -196,7 +196,7 @@
         "path": "crates/ferrum-interfaces/src/vnext/model.rs",
         "name": "ModelFamilyProvider",
         "owner": "ferrum-interfaces/vnext-model-contract",
-        "reviewed_at_git_sha": "4e946f5cbcc19ee65420d5da1026f2c4aaa25b33",
+        "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
     "required_methods": [
       "family_id",
       "external_metadata_ids",
@@ -249,7 +249,7 @@
 	            "symbol": "create",
 	            "line_hint": 1352,
 	            "owner": "ferrum-engine/llm-executor-factory",
-	            "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
+	            "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
 	            "required_fragments": [
 	                "resolve_registered_model_from_sources",
 	                "resolve_registered_model_from_dir",
@@ -262,7 +262,7 @@
             "symbol": "create_vnext_executor",
             "line_hint": 29,
             "owner": "ferrum-engine/product-composition",
-            "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
+            "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
             "required_fragments": [
                 "PreparedProductionModel",
                 "VNextModelExecutor::from_runtime_composition"
@@ -273,7 +273,7 @@
             "symbol": "create_registered_vnext_executor",
             "line_hint": 1159,
             "owner": "ferrum-engine/registered-vnext-selection",
-            "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
+            "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
 	            "required_fragments": [
 	                "ProductionExecutionKind::CausalLanguage",
 	                "CudaVNextComposition::create",
