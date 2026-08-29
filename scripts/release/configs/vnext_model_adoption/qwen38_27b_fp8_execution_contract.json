@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
+  "execution_semantics_version": 1,
   "contract_id": "qwen38-27b-fp8-a1-execution-coverage-v1",
-  "status": "diagnostic_not_implemented",
+  "status": "implemented",
   "checkpoint": {
     "id": "qwen38-27b-fp8",
     "repository": "Qwen/Qwen3.8-27B-FP8",
@@ -21,54 +22,47 @@
       "operation_version": {"major": 6, "minor": 0},
       "source_fp8_pair_count": 144,
       "count_derivation": "48 linear-attention layers x 3 FP8 projection pairs",
+      "execution_semantics": "GDA segmented mixed FP8/FP8/F16/F16 qkvzba projection execution",
       "existing_execution_provider_acceptance": true,
-      "current_static_coverage": false,
-      "missing_boundaries": [
-        "source-block-fp8-to-existing-marlin-fp8-materializer",
-        "typed-compiler-quality-approval-authority"
-      ]
+      "current_static_coverage": true,
+      "missing_boundaries": []
     },
     {
       "operation_id": "operation.causal_paged_attention",
       "operation_version": {"major": 2, "minor": 0},
       "source_fp8_pair_count": 64,
       "count_derivation": "16 full-attention layers x 4 FP8 projection pairs",
-      "existing_execution_provider_acceptance": false,
-      "current_static_coverage": false,
-      "missing_boundaries": [
-        "causal-paged-attention-provider-existing-marlin-fp8-acceptance",
-        "source-block-fp8-to-existing-marlin-fp8-materializer",
-        "typed-compiler-quality-approval-authority"
-      ]
+      "execution_semantics": "causal paged attention FP8 q/k/v/o projection execution",
+      "existing_execution_provider_acceptance": true,
+      "current_static_coverage": true,
+      "missing_boundaries": []
     },
     {
       "operation_id": "operation.dense_swiglu",
       "operation_version": {"major": 1, "minor": 0},
       "source_fp8_pair_count": 192,
       "count_derivation": "64 decoder layers x 3 FP8 projection pairs",
-      "existing_execution_provider_acceptance": false,
-      "current_static_coverage": false,
-      "missing_boundaries": [
-        "dense-swiglu-provider-existing-marlin-fp8-acceptance",
-        "source-block-fp8-to-existing-marlin-fp8-materializer",
-        "typed-compiler-quality-approval-authority"
-      ]
+      "execution_semantics": "dense SwiGLU FP8 gate/up/down projection execution",
+      "existing_execution_provider_acceptance": true,
+      "current_static_coverage": true,
+      "missing_boundaries": []
     },
     {
       "operation_id": "operation.last_token_dense_linear",
       "operation_version": {"major": 1, "minor": 0},
       "source_fp8_pair_count": 0,
       "count_derivation": "lm_head is an official dense exclusion; no source FP8 pair enters logits",
+      "execution_semantics": "logits/lm_head dense exact exclusion",
       "existing_execution_provider_acceptance": true,
       "current_static_coverage": true,
       "missing_boundaries": []
     }
   ],
   "planned_materializer": {
-    "status": "not_implemented",
+    "status": "implemented",
     "id": "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16",
     "version": {"major": 1, "minor": 0},
-    "implementation_fingerprint": null,
+    "implementation_fingerprint": "554bbf6801cc3153755d6c6761bc43b1b0e28c68ec2c47ddba3fb4f64cc98e53",
     "fidelity": "approximate",
     "fidelity_enum": "WeightMaterializationFidelity::Approximate",
     "source_format_id": "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale",
@@ -80,21 +74,65 @@
     "transient_policy": "one bounded source component group at a time; no persistent dense checkpoint copy"
   },
   "quality_approval": {
-    "status": "authority_not_implemented",
+    "status": "implemented",
     "witness_schema_id": "quality-approval.weight-materializer.numeric.v1",
     "quality_vector_digest": "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51",
-    "current_witness": null,
-    "compiler_selection_authorized": false,
+    "current_witness": {
+      "approval_authority": {
+        "id": "quality-approval-authority.ferrum.numeric",
+        "version": {"major": 1, "minor": 0},
+        "implementation_fingerprint": "b6f4f723a7266750f526674b96c35c302eba68b4008fa3d1257b0fc9a10ebfa8"
+      },
+      "checkpoint": {
+        "id": "qwen38-27b-fp8",
+        "repository": "Qwen/Qwen3.8-27B-FP8",
+        "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+      },
+      "materializer": {
+        "id": "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16",
+        "version": {"major": 1, "minor": 0},
+        "implementation_fingerprint": "554bbf6801cc3153755d6c6761bc43b1b0e28c68ec2c47ddba3fb4f64cc98e53",
+        "fidelity": "approximate"
+      },
+      "source": {
+        "weight_format_id": "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
+      },
+      "execution_schema": {
+        "weight_format_id": "weight-format.execution.cuda.marlin-fp8-w8a16-mixed",
+        "weight_layout_id": "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed",
+        "quantization_format_ids": ["quantization.marlin.fp8-e4m3fn-channelwise"]
+      },
+      "contract": {
+        "execution_contract_fingerprint": "882bc49ca312875a12a5290319f6c8294386a5960c2065cbda3f3dff2d55598e",
+        "quality_vector_digest": "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51"
+      },
+      "numeric_evidence": {
+        "artifact_schema_id": "quality-approval.weight-materializer.numeric.v1",
+        "artifact_sha256": "1f3c021b0e676f9badd6ecaea16f07a32bd5d09603e2d40ba81f7ffffa81f7cd",
+        "artifact_bytes": 48067,
+        "required_case_count": 4,
+        "completed_case_count": 4,
+        "relative_l2_max_observed": {"numerator": 2547279, "denominator": 100000000},
+        "nan_count": 0,
+        "inf_count": 0
+      },
+      "artifact_scope": {
+        "source_schema_fingerprint_bound_live": true,
+        "execution_schema_fingerprint_bound_live": true,
+        "git_sha_bound": false,
+        "binary_sha256_bound": false
+      }
+    },
+    "compiler_selection_authorized": true,
     "required_witness_fields": {
       "approval_authority": ["id", "version", "implementation_fingerprint"],
-      "candidate": ["git_sha", "dirty", "binary_sha256"],
-      "checkpoint": ["id", "revision"],
+      "checkpoint": ["id", "repository", "revision"],
       "materializer": ["id", "version", "implementation_fingerprint", "fidelity"],
-      "source": ["format_id", "source_schema_fingerprint"],
-      "execution_schema": ["weight_format_id", "weight_layout_id", "quantization_format_id", "fingerprint"],
+      "source": ["weight_format_id"],
+      "execution_schema": ["weight_format_id", "weight_layout_id", "quantization_format_ids"],
       "contract": ["execution_contract_fingerprint", "quality_vector_digest"],
-      "numeric_evidence": ["artifact_sha256", "required_case_count", "completed_case_count", "relative_l2_max_observed", "nan_count", "inf_count"],
-      "decision": ["approved", "approved_at_utc"]
+      "numeric_evidence": ["artifact_schema_id", "artifact_sha256", "artifact_bytes", "required_case_count", "completed_case_count", "relative_l2_max_observed", "nan_count", "inf_count"],
+      "artifact_scope": ["source_schema_fingerprint_bound_live", "execution_schema_fingerprint_bound_live", "git_sha_bound", "binary_sha256_bound"]
     },
     "selection_requirements": {
       "all_bound_identities_must_match": true,
