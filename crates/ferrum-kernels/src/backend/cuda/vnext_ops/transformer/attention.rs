@@ -818,9 +818,8 @@ impl AttentionProjection {
 
 #[cfg(feature = "vllm-marlin")]
 fn segmented_projection_staging_bytes_per_token(output_features: u64) -> Result<u64, String> {
-    output_features
-        .checked_mul(ElementType::F16.size_bytes())
-        .ok_or_else(|| "attention projection staging size overflows".to_owned())
+    aligned_bytes(output_features, ElementType::F16.size_bytes())
+        .map_err(|_| "attention projection staging size overflows".to_owned())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3344,9 +3343,12 @@ fn push_shared_projection_weight(
         }
     }
 
-    Ok(SharedProjectionWeight::F16 {
-        region: push_shared_weight(regions, invocation, ordinal, ElementType::F16)?,
-    })
+    #[cfg(not(feature = "vllm-marlin"))]
+    {
+        Ok(SharedProjectionWeight::F16 {
+            region: push_shared_weight(regions, invocation, ordinal, ElementType::F16)?,
+        })
+    }
 }
 
 fn shared_scratch_region(
@@ -3764,6 +3766,7 @@ mod tests {
             segmented_projection_staging_bytes_per_token(16_480).unwrap(),
             32_960
         );
+        assert_eq!(segmented_projection_staging_bytes_per_token(3).unwrap(), 16);
         assert!(segmented_projection_staging_bytes_per_token(u64::MAX).is_err());
 
         let dense_part = |region, output_offset, output_features| {
