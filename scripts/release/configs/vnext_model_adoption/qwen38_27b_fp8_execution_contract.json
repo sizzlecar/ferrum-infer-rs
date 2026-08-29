@@ -1,0 +1,116 @@
+{
+  "schema_version": 1,
+  "contract_id": "qwen38-27b-fp8-a1-execution-coverage-v1",
+  "status": "diagnostic_not_implemented",
+  "checkpoint": {
+    "id": "qwen38-27b-fp8",
+    "repository": "Qwen/Qwen3.8-27B-FP8",
+    "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
+  },
+  "source_contract": {
+    "format_id": "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale",
+    "values_dtype": "F8_E4M3",
+    "scales_dtype": "BF16",
+    "scale_kind": "inverse_scale",
+    "block_shape": [128, 128],
+    "execution_pair_count": 400
+  },
+  "operation_coverage": [
+    {
+      "operation_id": "operation.gated_delta_recurrent_attention",
+      "operation_version": {"major": 6, "minor": 0},
+      "source_fp8_pair_count": 144,
+      "count_derivation": "48 linear-attention layers x 3 FP8 projection pairs",
+      "existing_execution_provider_acceptance": true,
+      "current_static_coverage": false,
+      "missing_boundaries": [
+        "source-block-fp8-to-existing-marlin-fp8-materializer",
+        "typed-compiler-quality-approval-authority"
+      ]
+    },
+    {
+      "operation_id": "operation.causal_paged_attention",
+      "operation_version": {"major": 2, "minor": 0},
+      "source_fp8_pair_count": 64,
+      "count_derivation": "16 full-attention layers x 4 FP8 projection pairs",
+      "existing_execution_provider_acceptance": false,
+      "current_static_coverage": false,
+      "missing_boundaries": [
+        "causal-paged-attention-provider-existing-marlin-fp8-acceptance",
+        "source-block-fp8-to-existing-marlin-fp8-materializer",
+        "typed-compiler-quality-approval-authority"
+      ]
+    },
+    {
+      "operation_id": "operation.dense_swiglu",
+      "operation_version": {"major": 1, "minor": 0},
+      "source_fp8_pair_count": 192,
+      "count_derivation": "64 decoder layers x 3 FP8 projection pairs",
+      "existing_execution_provider_acceptance": false,
+      "current_static_coverage": false,
+      "missing_boundaries": [
+        "dense-swiglu-provider-existing-marlin-fp8-acceptance",
+        "source-block-fp8-to-existing-marlin-fp8-materializer",
+        "typed-compiler-quality-approval-authority"
+      ]
+    },
+    {
+      "operation_id": "operation.last_token_dense_linear",
+      "operation_version": {"major": 1, "minor": 0},
+      "source_fp8_pair_count": 0,
+      "count_derivation": "lm_head is an official dense exclusion; no source FP8 pair enters logits",
+      "existing_execution_provider_acceptance": true,
+      "current_static_coverage": true,
+      "missing_boundaries": []
+    }
+  ],
+  "planned_materializer": {
+    "status": "not_implemented",
+    "id": "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16",
+    "version": {"major": 1, "minor": 0},
+    "implementation_fingerprint": null,
+    "fidelity": "approximate",
+    "fidelity_enum": "WeightMaterializationFidelity::Approximate",
+    "source_format_id": "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale",
+    "execution_weight_format_id": "weight-format.execution.cuda.marlin-fp8-w8a16-mixed",
+    "execution_weight_layout_id": "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed",
+    "execution_quantization_format_id": "quantization.marlin.fp8-e4m3fn-channelwise",
+    "required_capability_id": "capability.kernel.cuda.marlin.fp8-w8a16",
+    "conversion_semantics": "cold-path decode of source E4M3 values with BF16 128x128 inverse scales followed by channelwise E4M3FN quantization and existing tiled Marlin packing",
+    "transient_policy": "one bounded source component group at a time; no persistent dense checkpoint copy"
+  },
+  "quality_approval": {
+    "status": "authority_not_implemented",
+    "witness_schema_id": "quality-approval.weight-materializer.numeric.v1",
+    "quality_vector_digest": "3204716462bf30614d217bec0222fb12c949c8965d70fc6167cb92e7a97880f1",
+    "current_witness": null,
+    "compiler_selection_authorized": false,
+    "required_witness_fields": {
+      "approval_authority": ["id", "version", "implementation_fingerprint"],
+      "candidate": ["git_sha", "dirty", "binary_sha256"],
+      "checkpoint": ["id", "revision"],
+      "materializer": ["id", "version", "implementation_fingerprint", "fidelity"],
+      "source": ["format_id", "source_schema_fingerprint"],
+      "execution_schema": ["weight_format_id", "weight_layout_id", "quantization_format_id", "fingerprint"],
+      "contract": ["execution_contract_fingerprint", "quality_vector_digest"],
+      "numeric_evidence": ["artifact_sha256", "required_case_count", "completed_case_count", "relative_l2_max_observed", "nan_count", "inf_count"],
+      "decision": ["approved", "approved_at_utc"]
+    },
+    "selection_requirements": {
+      "all_bound_identities_must_match": true,
+      "implementation_fingerprints_required": true,
+      "source_schema_fingerprint_required": true,
+      "execution_schema_fingerprint_required": true,
+      "execution_contract_fingerprint_required": true,
+      "checked_in_quality_vector_digest_required": true,
+      "required_case_count": 4,
+      "completed_case_count": 4,
+      "relative_l2_max": 0.05,
+      "nan_count_max": 0,
+      "inf_count_max": 0,
+      "artifact_sha256_required": true,
+      "global_boolean_or_environment_override_forbidden": true
+    }
+  },
+  "execution_contract_fingerprint": "9251a1fd749087810e8a32e87e25afe08de349b5515431d3ad476e7855bdf2f6"
+}

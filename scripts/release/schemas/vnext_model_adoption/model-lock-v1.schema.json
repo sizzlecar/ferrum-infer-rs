@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "model-lock-v1.schema.json",
+  "title": "Ferrum vNext model-adoption model lock receipt v1",
+  "allOf": [
+    {
+      "$ref": "common-envelope-v1.schema.json#/$defs/envelope"
+    },
+    {
+      "type": "object",
+      "required": [
+        "milestones",
+        "source_lock"
+      ],
+      "properties": {
+        "artifact_type": {
+          "const": "model-lock"
+        },
+        "milestones": {
+          "type": "object",
+          "required": [
+            "M0"
+          ],
+          "properties": {
+            "M0": {
+              "$ref": "common-envelope-v1.schema.json#/$defs/stage_result"
+            }
+          },
+          "additionalProperties": false
+        },
+        "source_lock": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      }
+    }
+  ]
+}

@@ -35,6 +35,36 @@ pub struct Qwen35WeightValidation {
     pub missing_optional: Vec<String>,
 }
 
+/// Complete, pre-allocation classification of every tensor advertised by a
+/// Qwen3.5-family checkpoint.  Production block-quantized sources use this
+/// partition to prove that text-only execution did not silently ignore an
+/// archive member.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Qwen35TensorPartition {
+    pub execution: Vec<String>,
+    pub vision_non_executed: Vec<String>,
+    pub mtp_non_executed: Vec<String>,
+    pub unknown: Vec<String>,
+}
+
+impl Qwen35TensorPartition {
+    pub fn require_no_unknown(&self) -> Result<(), String> {
+        if self.unknown.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "Qwen3.5 checkpoint tensor partition contains {} unknown tensors; first: {}",
+            self.unknown.len(),
+            self.unknown
+                .iter()
+                .take(12)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen35ResolvedWeightSpec {
     pub role: String,
@@ -51,6 +81,10 @@ pub struct Qwen35ResolvedWeightSpec {
 pub enum Qwen35ResolvedWeightSource {
     Dense {
         values: String,
+    },
+    BlockFp8 {
+        values: String,
+        scale_inv: String,
     },
     Gptq {
         qweight: String,
@@ -70,8 +104,32 @@ impl Qwen35ResolvedWeightSource {
     pub fn primary_name(&self) -> &str {
         match self {
             Self::Dense { values } => values,
+            Self::BlockFp8 { values, .. } => values,
             Self::Gptq { qweight, .. } => qweight,
             Self::CompressedTensors { weight_packed, .. } => weight_packed,
+        }
+    }
+
+    pub fn component_names(&self) -> Vec<&str> {
+        match self {
+            Self::Dense { values } => vec![values],
+            Self::BlockFp8 { values, scale_inv } => vec![values, scale_inv],
+            Self::Gptq {
+                qweight,
+                scales,
+                qzeros,
+                g_idx,
+            } => {
+                let mut names = vec![qweight.as_str(), scales.as_str(), qzeros.as_str()];
+                names.extend(g_idx.as_deref());
+                names
+            }
+            Self::CompressedTensors {
+                weight_packed,
+                weight_scale,
+                weight_zero_point,
+                weight_shape,
+            } => vec![weight_packed, weight_scale, weight_zero_point, weight_shape],
         }
     }
 }
@@ -466,6 +524,53 @@ impl Qwen35WeightInventory {
         ))
     }
 
+    /// Partitions the *entire* archive inventory after a manifest has been
+    /// resolved. This intentionally does not infer text-only support from a
+    /// repository id or from missing shards: only the two explicit Qwen3.5
+    /// auxiliary namespaces are accepted as typed, non-executed components.
+    /// Everything else must already be referenced by the resolved execution
+    /// plan or remains unknown and therefore fail-closed.
+    pub fn partition_resolved_plan(
+        &self,
+        plan: &Qwen35ResolvedWeightPlan,
+    ) -> Result<Qwen35TensorPartition, String> {
+        let validation = plan.validation();
+        if !validation.is_pass() {
+            return Err(format!(
+                "cannot partition unresolved Qwen3.5 plan for prefix {:?}: {} required tensors are missing",
+                plan.prefix,
+                validation.missing_required.len()
+            ));
+        }
+
+        let execution_names = plan
+            .global_tensors
+            .iter()
+            .chain(plan.layers.iter().flat_map(|layer| layer.tensors.iter()))
+            .filter(|tensor| tensor.present)
+            .filter_map(|tensor| tensor.source.as_ref())
+            .flat_map(Qwen35ResolvedWeightSource::component_names)
+            .collect::<BTreeSet<_>>();
+        let mut partition = Qwen35TensorPartition {
+            execution: Vec::new(),
+            vision_non_executed: Vec::new(),
+            mtp_non_executed: Vec::new(),
+            unknown: Vec::new(),
+        };
+        for name in &self.names {
+            if execution_names.contains(name.as_str()) {
+                partition.execution.push(name.clone());
+            } else if name.starts_with("model.visual.") {
+                partition.vision_non_executed.push(name.clone());
+            } else if name.starts_with("mtp.") {
+                partition.mtp_non_executed.push(name.clone());
+            } else {
+                partition.unknown.push(name.clone());
+            }
+        }
+        Ok(partition)
+    }
+
     fn from_safetensors_files(files: impl IntoIterator<Item = PathBuf>) -> Result<Self, String> {
         let mut names = BTreeSet::new();
         for path in files {
@@ -693,6 +798,15 @@ impl Qwen35WeightInventory {
                 weight_zero_point,
                 weight_shape,
             });
+        }
+        if let Some(module) = name.strip_suffix(".weight") {
+            let scale_inv = format!("{module}.weight_scale_inv");
+            if self.contains(&scale_inv) {
+                return Ok(Qwen35ResolvedWeightSource::BlockFp8 {
+                    values: name.to_owned(),
+                    scale_inv,
+                });
+            }
         }
         let Some(module) = name.strip_suffix(".qweight") else {
             return Ok(Qwen35ResolvedWeightSource::Dense {
@@ -1548,6 +1662,141 @@ mod tests {
                 "model.layers.0.linear_attn.in_proj_ba".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn partitions_complete_checkpoint_inventory_without_ignoring_auxiliary_tensors() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model.language_model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        names.extend([
+            "model.visual.blocks.0.attn.qkv.weight".to_string(),
+            "model.visual.patch_embed.proj.weight".to_string(),
+            "mtp.layers.0.self_attn.q_proj.weight".to_string(),
+            "mtp.layers.0.self_attn.q_proj.weight_scale_inv".to_string(),
+        ]);
+        let inventory = Qwen35WeightInventory::from_names(names);
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+
+        let partition = inventory.partition_resolved_plan(&plan).unwrap();
+
+        partition.require_no_unknown().unwrap();
+        assert_eq!(partition.vision_non_executed.len(), 2);
+        assert_eq!(partition.mtp_non_executed.len(), 2);
+        assert!(!partition.execution.is_empty());
+        assert_eq!(
+            partition.execution.len()
+                + partition.vision_non_executed.len()
+                + partition.mtp_non_executed.len(),
+            inventory.tensor_names().count()
+        );
+    }
+
+    #[test]
+    fn rejects_unclassified_checkpoint_tensor_before_execution() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        names.push("model.language_model.unexpected.weight".to_string());
+        names.push("model.visuality.looks_like_vision.weight".to_string());
+        let inventory = Qwen35WeightInventory::from_names(names);
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+
+        let partition = inventory.partition_resolved_plan(&plan).unwrap();
+        let error = partition
+            .require_no_unknown()
+            .expect_err("unknown archive members must fail closed");
+
+        assert_eq!(partition.unknown.len(), 2);
+        assert!(error.contains("2 unknown tensors"), "{error}");
+        assert!(error.contains("unexpected.weight"), "{error}");
+    }
+
+    #[test]
+    fn partition_counts_all_quantized_sidecars_as_execution_components() {
+        let config = dense_config();
+        let names = required_names_with_gptq_linear_aliases(&config, "model");
+        let inventory = Qwen35WeightInventory::from_names(names);
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+
+        let partition = inventory.partition_resolved_plan(&plan).unwrap();
+
+        partition.require_no_unknown().unwrap();
+        assert!(partition
+            .execution
+            .iter()
+            .any(|name| name.ends_with(".qweight")));
+        assert!(partition
+            .execution
+            .iter()
+            .any(|name| name.ends_with(".scales")));
+        assert!(partition
+            .execution
+            .iter()
+            .any(|name| name.ends_with(".qzeros")));
+        assert_eq!(partition.execution.len(), inventory.tensor_names().count());
+    }
+
+    #[test]
+    fn resolves_and_partitions_block_fp8_value_scale_pairs() {
+        let config = dense_config();
+        let manifest = config.weight_manifest("model").unwrap();
+        let mut names = manifest
+            .global_tensors
+            .iter()
+            .chain(
+                manifest
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|tensor| tensor.required)
+            .map(|tensor| tensor.name.clone())
+            .collect::<Vec<_>>();
+        let values = "model.layers.0.linear_attn.in_proj_qkv.weight";
+        let scale_inv = "model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv";
+        names.push(scale_inv.to_owned());
+        let inventory = Qwen35WeightInventory::from_names(names);
+        let plan = inventory.detect_prefix_and_resolve(&config).unwrap();
+
+        let source = plan
+            .layer_tensor(0, "linear_attn_qkv")
+            .and_then(|tensor| tensor.source.as_ref())
+            .expect("typed block-FP8 source");
+        assert_eq!(
+            source,
+            &Qwen35ResolvedWeightSource::BlockFp8 {
+                values: values.to_owned(),
+                scale_inv: scale_inv.to_owned(),
+            }
+        );
+
+        let partition = inventory.partition_resolved_plan(&plan).unwrap();
+        partition.require_no_unknown().unwrap();
+        assert!(partition.execution.contains(&values.to_owned()));
+        assert!(partition.execution.contains(&scale_inv.to_owned()));
     }
 
     #[test]

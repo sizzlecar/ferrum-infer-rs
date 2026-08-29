@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "manifest-v1.schema.json",
+  "title": "Ferrum vNext model-adoption manifest receipt v1",
+  "allOf": [
+    {
+      "$ref": "common-envelope-v1.schema.json#/$defs/envelope"
+    },
+    {
+      "type": "object",
+      "required": [
+        "validator_version",
+        "final_status",
+        "terminal_reason",
+        "terminal_line",
+        "receipts"
+      ],
+      "properties": {
+        "artifact_type": {
+          "const": "manifest"
+        },
+        "validator_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "final_status": {
+          "enum": [
+            "PASS",
+            "BLOCKED",
+            "REJECT"
+          ]
+        },
+        "terminal_reason": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "terminal_line": {
+          "type": "string",
+          "minLength": 1
+        },
+        "receipts": {
+          "type": "object",
+          "required": [
+            "model-lock.json",
+            "validation.json",
+            "product.json"
+          ],
+          "properties": {
+            "model-lock.json": {
+              "$ref": "common-envelope-v1.schema.json#/$defs/artifact_reference"
+            },
+            "validation.json": {
+              "$ref": "common-envelope-v1.schema.json#/$defs/artifact_reference"
+            },
+            "product.json": {
+              "$ref": "common-envelope-v1.schema.json#/$defs/artifact_reference"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

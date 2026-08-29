@@ -934,6 +934,11 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                 let group_size = quantization
                     .grouping
                     .resolved_size(semantic_dimensions[axis]);
+                if group_size == 0 {
+                    return Err(self.invalid(
+                        "two-dimensional block grouping requires a block-grid quantized layout",
+                    ));
+                }
                 let grouped_dimensions =
                     self.grouped_dimensions(semantic_dimensions, group_padding, axis, group_size)?;
                 let packed_bytes = checked_elements(&grouped_dimensions)
@@ -1053,6 +1058,93 @@ impl<'schema, 'references> PhysicalLayoutValidator<'schema, 'references> {
                             self.invalid("codebook dtype differs from the logical tensor dtype")
                         );
                     }
+                }
+            }
+            PhysicalWeightLayout::QuantizedBlockGrid {
+                packed_values,
+                packed_dimensions,
+                scales,
+                block_axes,
+            } => {
+                if !matches!(
+                    logical_element_type,
+                    ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                ) {
+                    return Err(self.invalid(
+                        "block-grid quantized logical weight dtype must be floating point",
+                    ));
+                }
+                let axes = [block_axes[0] as usize, block_axes[1] as usize];
+                if axes[0] >= axes[1] || axes[1] >= semantic_dimensions.len() {
+                    return Err(self.invalid(
+                        "block-grid quantization axes must be distinct, in range, and ascending",
+                    ));
+                }
+                let quantization = {
+                    let component = self.component(&packed_values.component_id)?;
+                    let WeightEncoding::Quantized(spec) = &component.encoding else {
+                        return Err(self.invalid(
+                            "block-grid packed-values component does not carry a quantization spec",
+                        ));
+                    };
+                    spec.clone()
+                };
+                let block_shape = quantization.grouping.block_shape_2d().ok_or_else(|| {
+                    self.invalid(
+                        "block-grid packed-values quantization spec must carry a two-dimensional block shape",
+                    )
+                })?;
+                if quantization.zero_point_type.is_some() {
+                    return Err(self.invalid(
+                        "block-grid quantization does not support an implicit zero-point component",
+                    ));
+                }
+
+                let packed_bytes = checked_elements(semantic_dimensions)
+                    .and_then(|elements| {
+                        elements.checked_mul(u64::from(quantization.bits_per_weight))
+                    })
+                    .and_then(|bits| bits.checked_add(7))
+                    .map(|bits| bits / 8)
+                    .ok_or_else(|| self.invalid("block-grid packed-values size overflows u64"))?;
+                if packed_dimensions.is_empty()
+                    || checked_elements(packed_dimensions) != Some(packed_bytes)
+                {
+                    return Err(self.invalid(format!(
+                        "block-grid packed-values semantic shape contains {} storage bytes, expected {packed_bytes}",
+                        checked_elements(packed_dimensions).map_or_else(
+                            || "an invalid or overflowing number of".to_owned(),
+                            |value| value.to_string(),
+                        )
+                    )));
+                }
+                let packed = self.bind_component(
+                    packed_values,
+                    packed_dimensions,
+                    WeightComponentRole::PackedValues,
+                    depth,
+                )?;
+                if packed.encoding != WeightEncoding::Quantized(quantization.clone()) {
+                    return Err(self.invalid(
+                        "packed-values encoding changed while validating the block-grid tree",
+                    ));
+                }
+
+                let mut scale_dimensions = semantic_dimensions.to_vec();
+                for (axis, block_size) in axes.into_iter().zip(block_shape) {
+                    scale_dimensions[axis] =
+                        semantic_dimensions[axis].div_ceil(u64::from(block_size.get()));
+                }
+                let scales_component = self.bind_component(
+                    scales,
+                    &scale_dimensions,
+                    WeightComponentRole::Scales,
+                    depth,
+                )?;
+                if scales_component.dense_element_type() != Some(quantization.scale_type) {
+                    return Err(self.invalid(
+                        "block-grid scale component dtype differs from the quantization spec",
+                    ));
                 }
             }
             PhysicalWeightLayout::BlockQuantized {
