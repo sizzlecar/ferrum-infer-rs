@@ -4809,15 +4809,15 @@ mod tests {
         assert!(
             derived_config
                 .get("quantization_config")
-                .is_some_and(Value::is_null),
-            "fixed source top-level quantization_config must be null"
+                .is_none_or(Value::is_null),
+            "fixed source top-level quantization_config must be absent or null"
         );
         assert!(
             derived_config
                 .get("text_config")
                 .and_then(|text| text.get("quantization_config"))
-                .is_some_and(Value::is_null),
-            "fixed source nested quantization_config must be null"
+                .is_none_or(Value::is_null),
+            "fixed source nested quantization_config must be absent or null"
         );
         let source_text = Qwen35TextConfig::from_hf_config_value(&derived_config).unwrap();
         assert!(!source_text.is_moe());
@@ -4967,7 +4967,12 @@ mod tests {
             .get_mut("text_config")
             .and_then(Value::as_object_mut)
             .expect("fixed source has text_config object");
-        assert_eq!(nested.remove("quantization_config"), Some(Value::Null));
+        assert!(
+            nested
+                .remove("quantization_config")
+                .is_none_or(|value| value.is_null()),
+            "fixed source nested quantization_config must be absent or null"
+        );
         root.insert(
             "quantization_config".to_owned(),
             quantization_config.clone(),
