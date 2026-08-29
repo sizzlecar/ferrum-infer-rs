@@ -161,15 +161,6 @@ fn validate_marlin_fp8_layout_contract(
                 .to_owned(),
         );
     }
-    let output_features_usize = usize::try_from(output_features)
-        .map_err(|_| "CUDA Marlin FP8 output width exceeds usize".to_owned())?;
-    let input_features_usize = usize::try_from(input_features)
-        .map_err(|_| "CUDA Marlin FP8 input width exceeds usize".to_owned())?;
-    if !marlin_fp8_projection_shape_supported(output_features_usize, input_features_usize) {
-        return Err(format!(
-            "CUDA Marlin FP8 projection shape [{output_features}, {input_features}] is not supported by the shared execution provider"
-        ));
-    }
     let PhysicalWeightLayout::Quantized {
         packed_values,
         packed_dimensions,
@@ -185,6 +176,15 @@ fn validate_marlin_fp8_layout_contract(
     else {
         return Err("CUDA Marlin FP8 requires a quantized leaf layout".to_owned());
     };
+    let output_features_usize = usize::try_from(output_features)
+        .map_err(|_| "CUDA Marlin FP8 output width exceeds usize".to_owned())?;
+    let input_features_usize = usize::try_from(input_features)
+        .map_err(|_| "CUDA Marlin FP8 input width exceeds usize".to_owned())?;
+    if !marlin_fp8_projection_shape_supported(output_features_usize, input_features_usize) {
+        return Err(format!(
+            "CUDA Marlin FP8 projection shape [{output_features}, {input_features}] is not supported by the shared execution provider"
+        ));
+    }
     if zero_points.is_some()
         || zero_point_packed_dimensions.is_some()
         || axis_indices.is_some()
