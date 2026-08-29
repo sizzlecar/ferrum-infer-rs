@@ -40,7 +40,7 @@
       "path": "crates/ferrum-models/src/vnext/qwen35.rs",
       "classification": "reviewed-provider",
       "owner": "ferrum-models/vnext::qwen35",
-      "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
+      "reviewed_at_git_sha": "e55a1c93f0ef23447919b91dce428cd52bd30025",
       "reason": "The typed family provider is reviewed function by function below."
         }
     ],
@@ -64,7 +64,7 @@
 	    "provider_review": {
     "path": "crates/ferrum-models/src/vnext/qwen35.rs",
     "owner": "ferrum-models/vnext::qwen35",
-    "reviewed_at_git_sha": "fd1c0eb4114b3468bd8585a1bc84c04b65e1aee2",
+    "reviewed_at_git_sha": "e55a1c93f0ef23447919b91dce428cd52bd30025",
 	        "classification_reasons": {
             "counted-execution-scaffolding": "Family-owned execution, scheduling, batching, state transition, or lifecycle code counts toward the frozen G00 scaffolding delta.",
             "counted-provider-glue": "Typed family identity, validation, preparation, and descriptor glue count toward the G08A provider limit.",
