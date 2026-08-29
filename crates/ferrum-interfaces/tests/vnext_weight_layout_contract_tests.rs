@@ -1,5 +1,7 @@
 mod vnext_core_contract;
 
+use std::num::NonZeroU32;
+
 use vnext_core_contract::*;
 
 fn exact_component(component_id: &str) -> PhysicalWeightComponentBinding {
@@ -297,6 +299,178 @@ fn whole_axis_quantization_keeps_one_abi_across_matrix_shapes() {
     schema
         .validate(&id("family.channelwise-two-shapes"))
         .unwrap();
+}
+
+fn block_grid_quantized_schema() -> WeightSchema {
+    let quantization = QuantizationSpec {
+        format_id: id("quantization.fp8-e4m3.block-grid"),
+        bits_per_weight: 8,
+        grouping: QuantizationGrouping::block_2d([
+            NonZeroU32::new(128).unwrap(),
+            NonZeroU32::new(128).unwrap(),
+        ]),
+        packing: QuantizationPacking::Linear,
+        scale_type: ElementType::Bf16,
+        zero_point_type: None,
+    };
+    WeightSchema {
+        format_id: id("weight-format.fp8-block-grid"),
+        layout_id: id("weight-layout.fp8-block-grid"),
+        version: ContractVersion::new(1, 0),
+        components: vec![
+            WeightComponentSpec {
+                id: id("component.fp8-values"),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec!["model.layers.0.mlp.gate_proj.weight".to_owned()],
+                dimensions: vec![130, 257],
+                encoding: WeightEncoding::Quantized(quantization),
+                required: true,
+            },
+            WeightComponentSpec {
+                id: id("component.fp8-scale-inv"),
+                role: WeightComponentRole::Scales,
+                external_names: vec!["model.layers.0.mlp.gate_proj.weight_scale_inv".to_owned()],
+                dimensions: vec![2, 3],
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::Bf16,
+                },
+                required: true,
+            },
+        ],
+        tensors: vec![WeightTensorSpec {
+            id: id("weight.mlp-gate"),
+            dimensions: vec![130, 257],
+            logical_element_type: ElementType::Bf16,
+            physical_layout: PhysicalWeightLayout::QuantizedBlockGrid {
+                packed_values: exact_component("component.fp8-values"),
+                packed_dimensions: vec![130, 257],
+                scales: exact_component("component.fp8-scale-inv"),
+                block_axes: [0, 1],
+            },
+            required: true,
+        }],
+    }
+}
+
+#[test]
+fn block_grid_quantization_validates_rectangular_scale_grid_with_partial_edges() {
+    let schema = block_grid_quantized_schema();
+    schema.validate(&id("family.fp8-block-grid")).unwrap();
+    assert_eq!(
+        schema.physical_bytes(&id("weight.mlp-gate")).unwrap(),
+        130 * 257 + 2 * 3 * 2
+    );
+    assert_eq!(
+        schema.quantization_formats(),
+        BTreeSet::from([id("quantization.fp8-e4m3.block-grid")])
+    );
+
+    let wire = serde_json::to_value(&schema).unwrap();
+    assert_eq!(
+        wire["components"][0]["encoding"]["quantized"]["grouping"],
+        json!({"kind": "block2d", "block_shape": [128, 128]})
+    );
+    let restored: WeightSchema = serde_json::from_value(wire).unwrap();
+    restored
+        .validate(&id("family.fp8-block-grid-wire"))
+        .unwrap();
+    assert_eq!(restored, schema);
+
+    let resolved = ResolvedWeightBinding::from_schema(&schema, &id("weight.mlp-gate")).unwrap();
+    resolved
+        .validate_logical(&[130, 257], ElementType::Bf16)
+        .unwrap();
+    let scales = resolved
+        .components()
+        .iter()
+        .find(|component| component.component_id() == &id("component.fp8-scale-inv"))
+        .unwrap();
+    assert_eq!(scales.physical_dimensions(), [2, 3]);
+}
+
+#[test]
+fn block_grid_quantization_rejects_axis_block_and_component_shape_drift() {
+    let mut reversed_axes = block_grid_quantized_schema();
+    let PhysicalWeightLayout::QuantizedBlockGrid { block_axes, .. } =
+        &mut reversed_axes.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *block_axes = [1, 0];
+    assert!(reversed_axes
+        .validate(&id("family.fp8-reversed-block-axes"))
+        .unwrap_err()
+        .to_string()
+        .contains("distinct, in range, and ascending"));
+
+    let mut duplicate_axes = block_grid_quantized_schema();
+    let PhysicalWeightLayout::QuantizedBlockGrid { block_axes, .. } =
+        &mut duplicate_axes.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *block_axes = [0, 0];
+    assert!(duplicate_axes
+        .validate(&id("family.fp8-duplicate-block-axes"))
+        .is_err());
+
+    let mut out_of_range_axis = block_grid_quantized_schema();
+    let PhysicalWeightLayout::QuantizedBlockGrid { block_axes, .. } =
+        &mut out_of_range_axis.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *block_axes = [0, 2];
+    assert!(out_of_range_axis
+        .validate(&id("family.fp8-out-of-range-block-axis"))
+        .is_err());
+
+    let mut wrong_block_shape = block_grid_quantized_schema();
+    let WeightEncoding::Quantized(spec) = &mut wrong_block_shape.components[0].encoding else {
+        unreachable!();
+    };
+    spec.grouping = QuantizationGrouping::block_2d([
+        NonZeroU32::new(64).unwrap(),
+        NonZeroU32::new(128).unwrap(),
+    ]);
+    assert!(wrong_block_shape
+        .validate(&id("family.fp8-wrong-block-shape"))
+        .unwrap_err()
+        .to_string()
+        .contains("contiguous shape"));
+
+    let mut legacy_grouping = block_grid_quantized_schema();
+    let WeightEncoding::Quantized(spec) = &mut legacy_grouping.components[0].encoding else {
+        unreachable!();
+    };
+    spec.grouping = QuantizationGrouping::fixed(128);
+    assert!(legacy_grouping
+        .validate(&id("family.fp8-single-axis-grouping"))
+        .unwrap_err()
+        .to_string()
+        .contains("two-dimensional block shape"));
+
+    let mut wrong_scale_shape = block_grid_quantized_schema();
+    wrong_scale_shape.components[1].dimensions = vec![2, 2];
+    assert!(wrong_scale_shape
+        .validate(&id("family.fp8-wrong-scale-shape"))
+        .unwrap_err()
+        .to_string()
+        .contains("contiguous shape"));
+
+    let mut wrong_packed_shape = block_grid_quantized_schema();
+    let PhysicalWeightLayout::QuantizedBlockGrid {
+        packed_dimensions, ..
+    } = &mut wrong_packed_shape.tensors[0].physical_layout
+    else {
+        unreachable!();
+    };
+    *packed_dimensions = vec![130, 256];
+    assert!(wrong_packed_shape
+        .validate(&id("family.fp8-wrong-packed-shape"))
+        .unwrap_err()
+        .to_string()
+        .contains("expected 33410"));
 }
 
 fn block_quantization(format_id: &str, bytes_per_block: u32) -> BlockQuantizationSpec {

@@ -22,6 +22,9 @@ use super::{
 mod foundation;
 use foundation::*;
 
+mod attribution;
+pub use attribution::*;
+
 mod binding;
 pub(crate) use binding::*;
 

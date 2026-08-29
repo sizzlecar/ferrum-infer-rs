@@ -392,7 +392,7 @@ EXPECTED_MODEL_IDENTITY_CASES = 5
 EXPECTED_DYNAMIC_ADMISSION_CASES = 40
 EXPECTED_TRYBUILD_PASS_CASES = 2
 EXPECTED_TRYBUILD_FAIL_CASES = 78
-TEST_THREADS_ARG = "--test-threads=1"
+TEST_THREADS_ARG = "--test-threads=8"
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
 BOUNDED_TEST_COMMAND_COUNT = 60
 BOUNDED_TEST_ENV_OVERRIDES = {
@@ -3429,7 +3429,7 @@ impl OperationDispatch {
         lambda: validate_command_execution(
             missing_test_threads, "self-test missing test threads"
         ),
-        "must contain exactly one --test-threads=1",
+        "must contain exactly one --test-threads=8",
     )
     validate_test_driver_set(set(REQUIRED_TEST_DRIVERS))
     expect_rejected(

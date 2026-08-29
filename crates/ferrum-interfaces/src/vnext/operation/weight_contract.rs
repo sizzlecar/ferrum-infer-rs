@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -16,16 +17,19 @@ pub enum QuantizationPacking {
     Tiled,
 }
 
-/// How values are partitioned along a quantized layout's `group_axis`.
+/// How values are partitioned by a quantized physical layout.
 ///
 /// `WholeAxis` is shape-relative by design: all values on the group axis
 /// share one scale. This represents channelwise quantization without making a
 /// matrix dimension part of the otherwise stable quantization-format ABI.
+/// `Block2d` carries the exact rectangular source block shape; the physical
+/// layout separately binds its two dimensions to ordered logical axes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum QuantizationGrouping {
     Fixed { size: u32 },
     WholeAxis,
+    Block2d { block_shape: [NonZeroU32; 2] },
 }
 
 impl QuantizationGrouping {
@@ -36,7 +40,18 @@ impl QuantizationGrouping {
     pub const fn fixed_size(self) -> Option<u32> {
         match self {
             Self::Fixed { size } => Some(size),
-            Self::WholeAxis => None,
+            Self::WholeAxis | Self::Block2d { .. } => None,
+        }
+    }
+
+    pub const fn block_2d(block_shape: [NonZeroU32; 2]) -> Self {
+        Self::Block2d { block_shape }
+    }
+
+    pub const fn block_shape_2d(self) -> Option<[NonZeroU32; 2]> {
+        match self {
+            Self::Block2d { block_shape } => Some(block_shape),
+            Self::Fixed { .. } | Self::WholeAxis => None,
         }
     }
 
@@ -44,6 +59,10 @@ impl QuantizationGrouping {
         match self {
             Self::Fixed { size } => size as u64,
             Self::WholeAxis => axis_extent,
+            // Multidimensional grouping has no meaningful single-axis size.
+            // Zero makes accidental use by a legacy single-axis validator
+            // fail closed instead of silently choosing one block dimension.
+            Self::Block2d { .. } => 0,
         }
     }
 
@@ -51,6 +70,9 @@ impl QuantizationGrouping {
         match self {
             Self::Fixed { size } => size != 0 && size.is_power_of_two(),
             Self::WholeAxis => true,
+            Self::Block2d { block_shape } => {
+                block_shape[0].get().is_power_of_two() && block_shape[1].get().is_power_of_two()
+            }
         }
     }
 }
@@ -303,6 +325,19 @@ pub enum PhysicalWeightLayout {
         group_axis: u32,
         group_padding: PhysicalWeightPadding,
     },
+    /// Separate-scale quantization over a rectangular two-dimensional block
+    /// grid. `block_axes` are ordered and canonical; the corresponding block
+    /// sizes live losslessly in [`QuantizationGrouping::Block2d`]. Boundary
+    /// blocks may be partial, so scale extents use ceiling division without
+    /// implying padded packed-value storage.
+    QuantizedBlockGrid {
+        packed_values: PhysicalWeightComponentBinding,
+        /// Semantic packed-storage shape. Its element product must equal the
+        /// exact byte count implied by the unpadded logical tensor.
+        packed_dimensions: Vec<u64>,
+        scales: PhysicalWeightComponentBinding,
+        block_axes: [u32; 2],
+    },
     /// One opaque, self-contained quantization block represents a fixed
     /// number of logical values along `block_axis`. The bound component shape
     /// is the padded logical shape with that axis divided by the block width.
@@ -365,6 +400,7 @@ impl PhysicalWeightLayout {
             Self::Dense { .. }
             | Self::Stored { .. }
             | Self::Quantized { .. }
+            | Self::QuantizedBlockGrid { .. }
             | Self::BlockQuantized { .. } => {}
         }
     }
@@ -631,6 +667,7 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
                     + usize::from(permutation.is_some())
                     + usize::from(codebook.is_some())
             }
+            PhysicalWeightLayout::QuantizedBlockGrid { .. } => 2,
             PhysicalWeightLayout::BlockQuantized { .. } => 1,
             PhysicalWeightLayout::AxisReshapePermutation { .. } => 0,
             PhysicalWeightLayout::Indexed { .. } => 1,
@@ -665,6 +702,7 @@ pub(crate) fn validate_physical_layout_budget(layout: &PhysicalWeightLayout) -> 
             PhysicalWeightLayout::Dense { .. }
             | PhysicalWeightLayout::Stored { .. }
             | PhysicalWeightLayout::Quantized { .. }
+            | PhysicalWeightLayout::QuantizedBlockGrid { .. }
             | PhysicalWeightLayout::BlockQuantized { .. } => {}
         }
     }
@@ -712,6 +750,14 @@ pub(crate) fn physical_component_ids(
                 if let Some(binding) = codebook {
                     insert_binding(binding);
                 }
+            }
+            PhysicalWeightLayout::QuantizedBlockGrid {
+                packed_values,
+                scales,
+                ..
+            } => {
+                insert_binding(packed_values);
+                insert_binding(scales);
             }
             PhysicalWeightLayout::BlockQuantized { blocks, .. } => insert_binding(blocks),
             PhysicalWeightLayout::AxisReshapePermutation { values, .. } => stack.push(values),

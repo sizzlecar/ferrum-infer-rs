@@ -9,7 +9,7 @@ use super::{
     ResolvedStorageComponent, ResolvedTensorLayout, ResolvedTensorSpec, ResolvedValueBinding,
     ResolvedValueRole, ResolvedValueStorage, ResolvedWeightBinding, ResourceId, RuntimePolicy,
     StrideConstraint, TensorContract, TrustedExecutionWeightPlan, VNextError, WeightId,
-    WeightMaterializerId, WeightMaterializerRegistry, WeightSchema,
+    WeightMaterializerId, WeightMaterializerRegistry, WeightMaterializerSelection, WeightSchema,
     IDENTITY_WEIGHT_MATERIALIZER_ID,
 };
 
@@ -23,7 +23,7 @@ pub struct ProgramPlanCompileOptions {
     required_capabilities: BTreeMap<NodeId, BTreeSet<CapabilityId>>,
     preferred_providers: BTreeMap<NodeId, ProviderId>,
     completion_retention: CompletionRetentionSpec,
-    weight_materializer_id: WeightMaterializerId,
+    weight_materializer_selection: WeightMaterializerSelection,
 }
 
 impl ProgramPlanCompileOptions {
@@ -38,7 +38,9 @@ impl ProgramPlanCompileOptions {
             required_capabilities: BTreeMap::new(),
             preferred_providers: BTreeMap::new(),
             completion_retention: CompletionRetentionSpec::default(),
-            weight_materializer_id: WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
+            weight_materializer_selection: WeightMaterializerSelection::exact(
+                WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
+            ),
         })
     }
 
@@ -90,11 +92,32 @@ impl ProgramPlanCompileOptions {
     }
 
     pub fn require_weight_materializer(&mut self, materializer_id: WeightMaterializerId) {
-        self.weight_materializer_id = materializer_id;
+        self.weight_materializer_selection = WeightMaterializerSelection::exact(materializer_id);
+    }
+
+    pub fn require_weight_materializer_selection(
+        &mut self,
+        selection: WeightMaterializerSelection,
+    ) {
+        self.weight_materializer_selection = selection;
+    }
+
+    pub fn require_weight_materializer_with_numeric_quality_artifact(
+        &mut self,
+        materializer_id: WeightMaterializerId,
+        artifact_bytes: impl Into<Vec<u8>>,
+    ) -> Result<(), VNextError> {
+        self.weight_materializer_selection =
+            WeightMaterializerSelection::numeric_quality_artifact(materializer_id, artifact_bytes)?;
+        Ok(())
     }
 
     pub fn weight_materializer_id(&self) -> &WeightMaterializerId {
-        &self.weight_materializer_id
+        self.weight_materializer_selection.materializer_id()
+    }
+
+    pub fn weight_materializer_selection(&self) -> &WeightMaterializerSelection {
+        &self.weight_materializer_selection
     }
 }
 
@@ -178,7 +201,7 @@ impl ProgramPlanCompiler {
         options: &ProgramPlanCompileOptions,
     ) -> Result<ProgramPlanCompilation, VNextError> {
         let execution_weights =
-            materializers.select_exact(family, catalog, options.weight_materializer_id())?;
+            materializers.select(family, catalog, options.weight_materializer_selection())?;
         Self::compile_with_execution_weights(
             family,
             catalog,

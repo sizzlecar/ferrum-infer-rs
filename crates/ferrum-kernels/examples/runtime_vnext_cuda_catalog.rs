@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::DeviceId;
-use ferrum_kernels::backend::cuda::vnext_ops::CudaVNextComposition;
+use ferrum_kernels::backend::cuda::vnext_ops::cuda_validated_native_operator_catalog_input;
 use ferrum_types::{AttentionExecutionPolicy, NativeOperatorBackend};
 use serde::Serialize;
 
@@ -22,9 +22,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let provider_catalog_path = Path::new(&arguments[3]);
     let capability_catalog_path = Path::new(&arguments[4]);
     let compiled_native_operators_path = Path::new(&arguments[5]);
-    let composition =
-        CudaVNextComposition::create(ordinal, DeviceId::new(format!("cuda:{ordinal}"))?, policy)?;
-    let capability_catalog = composition.catalog();
+    let catalog_input = cuda_validated_native_operator_catalog_input(
+        ordinal,
+        DeviceId::new(format!("cuda:{ordinal}"))?,
+        policy,
+    )?;
+    let capability_catalog = catalog_input.capability_catalog();
     let provider_catalog =
         capability_catalog.native_operator_provider_catalog(NativeOperatorBackend::Cuda)?;
     let compiled_native_operators =

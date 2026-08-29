@@ -4293,6 +4293,7 @@ pub struct VNextModelExecutor<R: DeviceRuntime> {
     run_id: RunId,
     family_fingerprint: String,
     program_fingerprint: String,
+    static_provider_attribution: Option<StaticProviderAttributionWitness>,
     checkpoint_capture: Option<VNextCheckpointCapture>,
     static_bytes: u64,
     device_reusable_execution_enabled: bool,
@@ -4535,7 +4536,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         runtime: Arc<R>,
         registry: OperationRuntimeRegistry<R>,
         weight_materializers: WeightMaterializerRegistry,
-        weight_materializer_id: WeightMaterializerId,
+        weight_materializer_selection: WeightMaterializerSelection,
         catalog: CapabilityCatalog,
         resolve_plan: F,
     ) -> Result<Self>
@@ -4557,7 +4558,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             runtime,
             registry,
             weight_materializers,
-            weight_materializer_id,
+            weight_materializer_selection,
             catalog,
             resolve_plan,
         )
@@ -4572,7 +4573,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         runtime: Arc<R>,
         registry: OperationRuntimeRegistry<R>,
         weight_materializers: WeightMaterializerRegistry,
-        weight_materializer_id: WeightMaterializerId,
+        weight_materializer_selection: WeightMaterializerSelection,
         catalog: CapabilityCatalog,
         resolve_plan: F,
     ) -> Result<Self>
@@ -4645,7 +4646,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
         if let Some(selection) = &checkpoint_selection {
             selection.retain_in(&mut compile_options);
         }
-        compile_options.require_weight_materializer(weight_materializer_id);
+        compile_options.require_weight_materializer_selection(weight_materializer_selection);
         let compile_phase = StartupPhaseTimer::start("plan_compile");
         let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
             family,
@@ -4700,8 +4701,8 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             .provision_static(Arc::clone(&runtime), provision_request)
             .map_err(|error| FerrumError::device(format!("vNext static provision: {error}")))?;
         provision_phase.finish();
-        let plan_resources = match provisioned.into_provisioning() {
-            StaticProvisioning::NoStatic(no_static) => no_static.into_plan_runtime(),
+        let (plan_resources, static_provider_attribution) = match provisioned.into_provisioning() {
+            StaticProvisioning::NoStatic(no_static) => (no_static.into_plan_runtime(), None),
             StaticProvisioning::Required(permit) => {
                 let identity = ResourceTransactionIdentity::for_admission(
                     permit.binding(),
@@ -4765,11 +4766,21 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     }
                 };
                 log_static_initialization_receipt(initialized.receipt());
+                let provider_attribution =
+                    StaticProviderAttributionWitness::from_completed_static_initialization(
+                        &resolved_plan,
+                        initialized.receipt(),
+                    )
+                    .map_err(|error| {
+                        FerrumError::model(format!(
+                            "vNext static provider attribution failed: {error}"
+                        ))
+                    })?;
                 let handoff_phase = StartupPhaseTimer::start("runtime_handoff");
                 match initialized.into_plan_runtime() {
                     Ok(resources) => {
                         handoff_phase.finish();
-                        resources
+                        (resources, provider_attribution)
                     }
                     Err(error) => {
                         let message = error.error().to_string();
@@ -4868,6 +4879,7 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             run_id,
             family_fingerprint,
             program_fingerprint,
+            static_provider_attribution,
             checkpoint_capture,
             static_bytes,
             device_reusable_execution_enabled: config.device_reusable_execution_enabled,
@@ -10127,6 +10139,12 @@ impl<R: DeviceRuntime> ModelExecutor for VNextModelExecutor<R> {
 
     fn cache_metrics_snapshot(&self) -> Option<serde_json::Value> {
         Some(self.metrics_snapshot())
+    }
+
+    fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
+        self.static_provider_attribution
+            .as_ref()
+            .and_then(|witness| serde_json::to_value(witness).ok())
     }
 }
 

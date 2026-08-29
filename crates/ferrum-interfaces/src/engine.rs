@@ -45,6 +45,12 @@ pub trait InferenceEngine: Send + Sync {
         None
     }
 
+    /// Optional compact provider-attribution witness from the active model
+    /// executor. The default keeps non-vNext engines source-compatible.
+    fn execution_attribution_snapshot(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Runtime-authoritative admission state. Startup sizing estimates are
     /// intentionally not accepted through this method.
     fn admission_snapshot(&self) -> Result<Option<ExecutorAdmissionSnapshot>> {

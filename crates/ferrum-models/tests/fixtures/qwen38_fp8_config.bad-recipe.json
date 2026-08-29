@@ -1,0 +1,7 @@
+{
+  "case": "qwen38-fp8-wrong-format",
+  "base_fixture": "qwen38_fp8_config.contract.json",
+  "pointer": "/quantization_config/fmt",
+  "replacement": "e5m2",
+  "expected_error": "unsupported Qwen3.5 FP8 fmt"
+}

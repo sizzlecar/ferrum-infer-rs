@@ -677,7 +677,7 @@ VNEXT_G01A_EXPECTED_MODEL_IDENTITY_CASES = 5
 VNEXT_G01A_EXPECTED_DYNAMIC_ADMISSION_CASES = 40
 VNEXT_G01A_EXPECTED_TRYBUILD_PASS_CASES = 2
 VNEXT_G01A_EXPECTED_TRYBUILD_FAIL_CASES = 78
-VNEXT_G01A_TEST_THREADS_ARG = "--test-threads=1"
+VNEXT_G01A_TEST_THREADS_ARG = "--test-threads=8"
 VNEXT_G01A_BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
 VNEXT_G01A_BOUNDED_TEST_COMMAND_COUNT = 60
 VNEXT_G01A_BOUNDED_TEST_ENV_OVERRIDES = {
@@ -731,7 +731,7 @@ G0_UNIT_BOUNDED_COMMAND = [
     "env",
     "PYTHONDONTWRITEBYTECODE=1",
     "CARGO_BUILD_JOBS=8",
-    "RUST_TEST_THREADS=1",
+    "RUST_TEST_THREADS=8",
     "cargo",
     "test",
     "--workspace",
@@ -740,7 +740,7 @@ G0_UNIT_BOUNDED_COMMAND = [
 G0_UNIT_BOUNDED_ENV_OVERRIDES = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "CARGO_BUILD_JOBS": "8",
-    "RUST_TEST_THREADS": "1",
+    "RUST_TEST_THREADS": "8",
 }
 G0_UNIT_BENCH_CASES = (
     "single_request/tokens/1",
@@ -8919,14 +8919,14 @@ def self_test() -> int:
     )
     shell_command = (
         "    -- env PYTHONDONTWRITEBYTECODE=1 CARGO_BUILD_JOBS=8 "
-        "RUST_TEST_THREADS=1 \\\n"
+        "RUST_TEST_THREADS=8 \\\n"
         "      cargo test --workspace --all-targets"
     )
     shell_expected_command = """expected_command = [
     "env",
     "PYTHONDONTWRITEBYTECODE=1",
     "CARGO_BUILD_JOBS=8",
-    "RUST_TEST_THREADS=1",
+    "RUST_TEST_THREADS=8",
     "cargo",
     "test",
     "--workspace",
@@ -8935,7 +8935,7 @@ def self_test() -> int:
     require_selftest(
         source_gate_text.count(shell_command) == 1
         and source_gate_text.count(shell_expected_command) == 1
-        and "-- --test-threads=1" not in source_gate_text,
+        and "-- --test-threads=8" not in source_gate_text,
         "g0 source shell bounded command policy drift",
     )
     g01b_selftest = run_selftest_command(
@@ -9330,7 +9330,7 @@ def self_test() -> int:
     expect_bounded_selftest_reject(
         "missing test threads",
         missing_threads,
-        "must contain exactly one --test-threads=1",
+        "must contain exactly one --test-threads=8",
     )
     require_selftest(
         validate_safetensors_shard_paths(
@@ -10497,7 +10497,7 @@ def self_test() -> int:
             "--workspace",
             "--all-targets",
             "--",
-            "--test-threads=1",
+            "--test-threads=8",
         ]
         expect_unit_manifest_reject(
             "legacy trailing libtest argument",
@@ -10530,7 +10530,7 @@ def self_test() -> int:
         )
 
         missing_receipt_env = copy.deepcopy(unit_receipt)
-        missing_receipt_env["command"].remove("RUST_TEST_THREADS=1")
+        missing_receipt_env["command"].remove("RUST_TEST_THREADS=8")
         try:
             validate_bounded_command_receipt(
                 missing_receipt_env,

@@ -308,6 +308,9 @@ fn resolve_layout_node(
             group_axis: *group_axis,
             group_padding: group_padding.clone(),
         }),
+        PhysicalWeightLayout::QuantizedBlockGrid { .. } => {
+            Err("Metal does not support quantized block-grid physical weight layouts".to_owned())
+        }
         PhysicalWeightLayout::BlockQuantized {
             blocks,
             block_axis,
@@ -367,12 +370,14 @@ fn resolve_layout_node(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
+
     use super::*;
     use ferrum_interfaces::vnext::{
         BlockQuantizationSpec, CompositeWeightPart, ContractVersion, ModelFamilyId,
         PhysicalStorageLayout, PhysicalWeightComponentBinding, QuantizationFormatId,
-        WeightComponentRole, WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema,
-        WeightTensorSpec,
+        QuantizationGrouping, QuantizationPacking, QuantizationSpec, WeightComponentRole,
+        WeightComponentSpec, WeightFormatId, WeightLayoutId, WeightSchema, WeightTensorSpec,
     };
 
     fn id(value: &str) -> WeightId {
@@ -471,5 +476,74 @@ mod tests {
         assert_eq!(parts[1].logical_offsets, [1, 0, 0]);
         assert_eq!(weight.components()[first].component_id(), &gate);
         assert_eq!(weight.components()[second].component_id(), &up);
+    }
+
+    #[test]
+    fn quantized_block_grid_fails_closed_until_metal_supports_its_abi() {
+        let values = id("component.fp8-values");
+        let scales = id("component.fp8-scales");
+        let quantization = QuantizationSpec {
+            format_id: QuantizationFormatId::new("quantization.fp8-e4m3.block-grid").unwrap(),
+            bits_per_weight: 8,
+            grouping: QuantizationGrouping::block_2d([
+                NonZeroU32::new(128).unwrap(),
+                NonZeroU32::new(128).unwrap(),
+            ]),
+            packing: QuantizationPacking::Linear,
+            scale_type: ElementType::Bf16,
+            zero_point_type: None,
+        };
+        let schema = WeightSchema {
+            format_id: WeightFormatId::new("weight-format.fp8-block-grid").unwrap(),
+            layout_id: WeightLayoutId::new("weight-layout.fp8-block-grid").unwrap(),
+            version: ContractVersion::new(1, 0),
+            components: vec![
+                WeightComponentSpec {
+                    id: values.clone(),
+                    role: WeightComponentRole::PackedValues,
+                    external_names: vec!["weight".to_owned()],
+                    dimensions: vec![130, 257],
+                    encoding: WeightEncoding::Quantized(quantization),
+                    required: true,
+                },
+                WeightComponentSpec {
+                    id: scales.clone(),
+                    role: WeightComponentRole::Scales,
+                    external_names: vec!["weight_scale_inv".to_owned()],
+                    dimensions: vec![2, 3],
+                    encoding: WeightEncoding::Dense {
+                        element_type: ElementType::Bf16,
+                    },
+                    required: true,
+                },
+            ],
+            tensors: vec![WeightTensorSpec {
+                id: id("weight.projection"),
+                dimensions: vec![130, 257],
+                logical_element_type: ElementType::Bf16,
+                physical_layout: PhysicalWeightLayout::QuantizedBlockGrid {
+                    packed_values: PhysicalWeightComponentBinding::exact_contiguous(values),
+                    packed_dimensions: vec![130, 257],
+                    scales: PhysicalWeightComponentBinding::exact_contiguous(scales),
+                    block_axes: [0, 1],
+                },
+                required: true,
+            }],
+        };
+        schema
+            .validate(&ModelFamilyId::new("family.test").unwrap())
+            .unwrap();
+        let weight = ResolvedWeightBinding::from_schema(&schema, &id("weight.projection")).unwrap();
+        let indexes = weight
+            .components()
+            .iter()
+            .enumerate()
+            .map(|(index, component)| (component.component_id().clone(), index))
+            .collect();
+
+        assert_eq!(
+            resolve_layout(&weight, &indexes).unwrap_err(),
+            "Metal does not support quantized block-grid physical weight layouts"
+        );
     }
 }

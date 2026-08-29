@@ -1,6 +1,6 @@
 use ferrum_models::qwen35_config::{
-    Qwen35LayerType, Qwen35MlpKind, Qwen35TextConfig, QWEN35_CONV_STATE_NAME,
-    QWEN35_DELTA_STATE_NAME,
+    Qwen35Fp8ActivationScheme, Qwen35Fp8Format, Qwen35Fp8WeightBlockSize, Qwen35LayerType,
+    Qwen35MlpKind, Qwen35TextConfig, QWEN35_CONV_STATE_NAME, QWEN35_DELTA_STATE_NAME,
 };
 use ferrum_types::{DataType, Device, RequestId};
 
@@ -9,6 +9,9 @@ const ARTIFACT_ROOT: &str = concat!(
     "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
     "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
 );
+
+const QWEN38_FP8_CONFIG: &str = include_str!("fixtures/qwen38_fp8_config.contract.json");
+const QWEN38_FP8_BAD_RECIPE: &str = include_str!("fixtures/qwen38_fp8_config.bad-recipe.json");
 
 fn read_artifact(name: &str) -> String {
     std::fs::read_to_string(format!("{ARTIFACT_ROOT}/{name}")).unwrap()
@@ -291,12 +294,89 @@ fn parses_qwen35_moe_gptq_quantization_config() {
         .quantization
         .as_ref()
         .expect("GPTQ quantization_config should be preserved");
+    let recipe = quant.as_gptq().expect("typed GPTQ recipe");
 
-    assert_eq!(quant.quant_method, "gptq");
-    assert_eq!(quant.bits, 4);
-    assert_eq!(quant.group_size, 128);
-    assert!(!quant.desc_act);
-    assert!(quant.sym);
+    assert_eq!(quant.quant_method(), "gptq");
+    assert_eq!(recipe.bits, 4);
+    assert_eq!(recipe.group_size, 128);
+    assert!(!recipe.desc_act);
+    assert!(recipe.sym);
+}
+
+#[test]
+fn parses_fixed_qwen38_official_block_fp8_recipe_without_legacy_placeholders() {
+    let cfg = Qwen35TextConfig::from_hf_config_str(QWEN38_FP8_CONFIG).unwrap();
+    let quantization = cfg.quantization.as_ref().expect("typed FP8 metadata");
+    let recipe = quantization.as_fp8().expect("official block-FP8 recipe");
+
+    assert_eq!(quantization.quant_method(), "fp8");
+    assert_eq!(recipe.format, Qwen35Fp8Format::E4m3);
+    assert_eq!(recipe.activation_scheme, Qwen35Fp8ActivationScheme::Dynamic);
+    assert_eq!(
+        recipe.weight_block_size,
+        Qwen35Fp8WeightBlockSize::OFFICIAL_128X128
+    );
+    assert_eq!(recipe.weight_block_size.as_array(), [128, 128]);
+    assert_eq!(recipe.modules_to_not_convert.len(), 10);
+    assert!(recipe
+        .modules_to_not_convert
+        .contains(&"model.visual.blocks.0.attn.proj".to_string()));
+    assert!(recipe
+        .modules_to_not_convert
+        .contains(&"model.language_model.layers.0.linear_attn.conv1d".to_string()));
+    assert!(recipe
+        .modules_to_not_convert
+        .contains(&"mtp.pre_fc_norm_hidden".to_string()));
+}
+
+#[test]
+fn rejects_qwen38_fp8_metadata_mismatch_fixture_before_source_loading() {
+    let mutation: serde_json::Value = serde_json::from_str(QWEN38_FP8_BAD_RECIPE).unwrap();
+    let mut candidate: serde_json::Value = serde_json::from_str(QWEN38_FP8_CONFIG).unwrap();
+    let pointer = mutation["pointer"].as_str().unwrap();
+    *candidate.pointer_mut(pointer).unwrap() = mutation["replacement"].clone();
+
+    let error = Qwen35TextConfig::from_hf_config_value(&candidate)
+        .expect_err("mismatched FP8 format must fail before source loading");
+    assert!(
+        error.contains(mutation["expected_error"].as_str().unwrap()),
+        "{error}"
+    );
+}
+
+#[test]
+fn rejects_missing_unknown_and_wrong_block_fp8_recipe_fields() {
+    let fixture: serde_json::Value = serde_json::from_str(QWEN38_FP8_CONFIG).unwrap();
+
+    let mut missing = fixture.clone();
+    missing["quantization_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("activation_scheme");
+    let error = Qwen35TextConfig::from_hf_config_value(&missing)
+        .expect_err("missing FP8 activation scheme must fail closed");
+    assert!(
+        error.contains("activation_scheme must be a string"),
+        "{error}"
+    );
+
+    let mut unknown = fixture.clone();
+    unknown["quantization_config"]["checkpoint_format"] = serde_json::json!("fp8");
+    let error = Qwen35TextConfig::from_hf_config_value(&unknown)
+        .expect_err("unknown FP8 metadata must fail closed");
+    assert!(
+        error.contains("unsupported Qwen3.5 FP8 quantization_config field"),
+        "{error}"
+    );
+
+    let mut wrong_block = fixture;
+    wrong_block["quantization_config"]["weight_block_size"] = serde_json::json!([64, 128]);
+    let error = Qwen35TextConfig::from_hf_config_value(&wrong_block)
+        .expect_err("unsupported FP8 block shape must fail closed");
+    assert!(
+        error.contains("unsupported Qwen3.5 FP8 weight_block_size"),
+        "{error}"
+    );
 }
 
 #[test]
