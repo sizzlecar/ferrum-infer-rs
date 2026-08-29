@@ -37,7 +37,7 @@ QUALITY_VECTOR_DIGEST = "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7
 MATERIALIZER_ID = "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16"
 MATERIALIZER_VERSION = {"major": 1, "minor": 0}
 MATERIALIZER_IMPLEMENTATION_FINGERPRINT = (
-    "554bbf6801cc3153755d6c6761bc43b1b0e28c68ec2c47ddba3fb4f64cc98e53"
+    "fc1191a77acbeb7ee225699cfd3cde57a8cb92d3dd9660fababfbba1ca9da58b"
 )
 EXECUTION_WEIGHT_FORMAT_ID = "weight-format.execution.cuda.marlin-fp8-w8a16-mixed"
 EXECUTION_WEIGHT_LAYOUT_ID = "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed"
@@ -50,7 +50,7 @@ QUALITY_AUTHORITY_IMPLEMENTATION_FINGERPRINT = (
 )
 NUMERIC_ARTIFACT_SCHEMA_ID = "quality-approval.weight-materializer.numeric.v1"
 NUMERIC_ARTIFACT_SHA256 = (
-    "1f3c021b0e676f9badd6ecaea16f07a32bd5d09603e2d40ba81f7ffffa81f7cd"
+    "e192f5c20893fa18648490c56fa891979d1f889670f24f7ad0c902feba0b11eb"
 )
 NUMERIC_ARTIFACT_BYTES = 48_067
 MAX_RELATIVE_L2_OBSERVED = {"numerator": 2_547_279, "denominator": 100_000_000}
