@@ -9,9 +9,11 @@
 use rayon::prelude::*;
 use std::error::Error;
 use std::fmt;
+use std::ops::Range;
 
 const FP8_E4M3_MAX: f32 = 448.0;
 const FP8_F16_EXPONENT_BIAS_SCALE: f32 = 256.0;
+const MAX_BLOCK_FP8_PREPARE_WORKERS: usize = 8;
 
 /// Host-prepared Marlin W8A16 storage for one logical `[N, K]` F16 matrix.
 ///
@@ -88,6 +90,23 @@ pub enum Fp8MarlinPrepareError {
     UnrepresentableMarlinScale {
         output: usize,
     },
+    InvalidBoundedWorkerPartition {
+        phase: &'static str,
+        work_units: usize,
+        elements_per_unit: usize,
+        output_elements: usize,
+    },
+    BoundedWorkerSpawnFailed {
+        phase: &'static str,
+        worker: usize,
+        worker_count: usize,
+        reason: String,
+    },
+    BoundedWorkerPanicked {
+        phase: &'static str,
+        worker: usize,
+        reason: String,
+    },
 }
 
 impl fmt::Display for Fp8MarlinPrepareError {
@@ -151,11 +170,127 @@ impl fmt::Display for Fp8MarlinPrepareError {
                 formatter,
                 "block-FP8 output channel {output} requires a scale not representable by the Marlin F16 ABI"
             ),
+            Self::InvalidBoundedWorkerPartition {
+                phase,
+                work_units,
+                elements_per_unit,
+                output_elements,
+            } => write!(
+                formatter,
+                "block-FP8 {phase} worker partition is invalid: work_units={work_units}, elements_per_unit={elements_per_unit}, output_elements={output_elements}"
+            ),
+            Self::BoundedWorkerSpawnFailed {
+                phase,
+                worker,
+                worker_count,
+                reason,
+            } => write!(
+                formatter,
+                "block-FP8 {phase} worker {worker}/{worker_count} could not start: {reason}"
+            ),
+            Self::BoundedWorkerPanicked {
+                phase,
+                worker,
+                reason,
+            } => write!(
+                formatter,
+                "block-FP8 {phase} worker {worker} panicked: {reason}"
+            ),
         }
     }
 }
 
 impl Error for Fp8MarlinPrepareError {}
+
+fn bounded_block_fp8_worker_count(work_units: usize, available_parallelism: usize) -> usize {
+    available_parallelism
+        .max(1)
+        .min(MAX_BLOCK_FP8_PREPARE_WORKERS)
+        .min(work_units.max(1))
+}
+
+fn block_fp8_available_parallelism() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+}
+
+fn bounded_worker_panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|reason| (*reason).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_owned())
+}
+
+fn fill_bounded_block_fp8_ranges<T: Send>(
+    phase: &'static str,
+    work_units: usize,
+    elements_per_unit: usize,
+    available_parallelism: usize,
+    output: &mut [T],
+    fill: impl Fn(Range<usize>, &mut [T]) -> Result<(), Fp8MarlinPrepareError> + Sync,
+) -> Result<(), Fp8MarlinPrepareError> {
+    let expected_elements = work_units.checked_mul(elements_per_unit);
+    if work_units == 0 || elements_per_unit == 0 || expected_elements != Some(output.len()) {
+        return Err(Fp8MarlinPrepareError::InvalidBoundedWorkerPartition {
+            phase,
+            work_units,
+            elements_per_unit,
+            output_elements: output.len(),
+        });
+    }
+    let worker_count = bounded_block_fp8_worker_count(work_units, available_parallelism);
+    let units_per_worker = work_units.div_ceil(worker_count);
+    std::thread::scope(|scope| {
+        let mut remaining = output;
+        let mut handles = Vec::with_capacity(worker_count);
+        let mut spawn_error = None;
+        for worker in 0..worker_count {
+            let start = worker * units_per_worker;
+            let end = (start + units_per_worker).min(work_units);
+            if start == end {
+                break;
+            }
+            let chunk_elements = (end - start)
+                .checked_mul(elements_per_unit)
+                .expect("bounded block-FP8 chunk was preflighted");
+            let (chunk, tail) = remaining.split_at_mut(chunk_elements);
+            remaining = tail;
+            let fill = &fill;
+            let range = start..end;
+            match std::thread::Builder::new()
+                .name(format!("block-fp8-{phase}-{worker}"))
+                .spawn_scoped(scope, move || fill(range, chunk))
+            {
+                Ok(handle) => handles.push((worker, handle)),
+                Err(error) => {
+                    spawn_error = Some(Fp8MarlinPrepareError::BoundedWorkerSpawnFailed {
+                        phase,
+                        worker,
+                        worker_count,
+                        reason: error.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+
+        let mut first_worker_error = None;
+        for (worker, handle) in handles {
+            let result = match handle.join() {
+                Ok(result) => result,
+                Err(payload) => Err(Fp8MarlinPrepareError::BoundedWorkerPanicked {
+                    phase,
+                    worker,
+                    reason: bounded_worker_panic_reason(payload),
+                }),
+            };
+            if first_worker_error.is_none() {
+                first_worker_error = result.err();
+            }
+        }
+        first_worker_error.or(spawn_error).map_or(Ok(()), Err)
+    })
+}
 
 /// Whether `[N, K]` can be dispatched by an unpadded Marlin W8A16 kernel.
 pub const fn fp8_marlin_shape_supported(n: usize, k: usize) -> bool {
@@ -273,6 +408,24 @@ pub fn prepare_block_fp8_weight_for_fp8_marlin(
     k: usize,
     block_shape: [usize; 2],
 ) -> Result<Fp8MarlinWeight, Fp8MarlinPrepareError> {
+    prepare_block_fp8_weight_for_fp8_marlin_with_parallelism(
+        source_fp8_e4m3,
+        source_inverse_scales_bf16_le,
+        n,
+        k,
+        block_shape,
+        block_fp8_available_parallelism(),
+    )
+}
+
+fn prepare_block_fp8_weight_for_fp8_marlin_with_parallelism(
+    source_fp8_e4m3: &[u8],
+    source_inverse_scales_bf16_le: &[u8],
+    n: usize,
+    k: usize,
+    block_shape: [usize; 2],
+    available_parallelism: usize,
+) -> Result<Fp8MarlinWeight, Fp8MarlinPrepareError> {
     if !fp8_marlin_shape_supported(n, k) {
         return Err(Fp8MarlinPrepareError::UnsupportedShape { n, k });
     }
@@ -358,35 +511,46 @@ pub fn prepare_block_fp8_weight_for_fp8_marlin(
             buffer: "channel scales",
             elements: n,
         })?;
-    for output in 0..n {
-        let mut maximum = 0.0_f32;
-        for input in 0..k {
-            let bits = source_fp8_e4m3[output * k + input];
-            let source_value = float8::F8E4M3::from_bits(bits).to_f32();
-            if !source_value.is_finite() {
-                return Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
-                    output,
-                    input,
-                    bits,
-                });
+    raw_scales.resize(n, 0.0);
+    fill_bounded_block_fp8_ranges(
+        "channel-scales",
+        n,
+        1,
+        available_parallelism,
+        &mut raw_scales,
+        |outputs, destination| {
+            for (output, raw_scale_slot) in outputs.zip(destination.iter_mut()) {
+                let mut maximum = 0.0_f32;
+                for input in 0..k {
+                    let bits = source_fp8_e4m3[output * k + input];
+                    let source_value = float8::F8E4M3::from_bits(bits).to_f32();
+                    if !source_value.is_finite() {
+                        return Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
+                            output,
+                            input,
+                            bits,
+                        });
+                    }
+                    let inverse_scale =
+                        inverse_scales[(output / block_n) * block_columns + input / block_k];
+                    let decoded = source_value * inverse_scale;
+                    if !decoded.is_finite() {
+                        return Err(Fp8MarlinPrepareError::NonFiniteDecodedBlockFp8Weight {
+                            output,
+                            input,
+                        });
+                    }
+                    maximum = maximum.max(decoded.abs());
+                }
+                let raw_scale = maximum / FP8_E4M3_MAX;
+                if maximum > 0.0 && raw_scale == 0.0 {
+                    return Err(Fp8MarlinPrepareError::UnrepresentableMarlinScale { output });
+                }
+                *raw_scale_slot = raw_scale;
             }
-            let inverse_scale =
-                inverse_scales[(output / block_n) * block_columns + input / block_k];
-            let decoded = source_value * inverse_scale;
-            if !decoded.is_finite() {
-                return Err(Fp8MarlinPrepareError::NonFiniteDecodedBlockFp8Weight {
-                    output,
-                    input,
-                });
-            }
-            maximum = maximum.max(decoded.abs());
-        }
-        let raw_scale = maximum / FP8_E4M3_MAX;
-        if maximum > 0.0 && raw_scale == 0.0 {
-            return Err(Fp8MarlinPrepareError::UnrepresentableMarlinScale { output });
-        }
-        raw_scales.push(raw_scale);
-    }
+            Ok(())
+        },
+    )?;
 
     const CHANNEL_SCALE_PERMUTATION: [usize; 32] = [
         0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6,
@@ -420,44 +584,61 @@ pub fn prepare_block_fp8_weight_for_fp8_marlin(
         }
     })?;
     packed_values.resize(value_count, 0_u8);
+    const MARLIN_TILE_ELEMENTS: usize = 16 * 64;
     let n_tiles = n / 64;
-    for (tile_index, tile) in packed_values.chunks_mut(16 * 64).enumerate() {
-        let k_tile = tile_index / n_tiles;
-        let n_tile = tile_index % n_tiles;
-        for thread in 0..32 {
-            let tensor_core_column = thread / 4;
-            let tensor_core_row = (thread % 4) * 2;
-            for warp in 0..4 {
-                let column = n_tile * 64 + warp * 16 + tensor_core_column;
-                let first = block_fp8_marlin_word(
-                    source_fp8_e4m3,
-                    &inverse_scales,
-                    &raw_scales,
-                    k,
-                    block_shape,
-                    block_columns,
-                    k_tile,
-                    tensor_core_row,
-                    column,
-                );
-                let second = block_fp8_marlin_word(
-                    source_fp8_e4m3,
-                    &inverse_scales,
-                    &raw_scales,
-                    k,
-                    block_shape,
-                    block_columns,
-                    k_tile,
-                    tensor_core_row,
-                    column + 8,
-                );
-                let output_word = thread * 8 + warp * 2;
-                tile[output_word * 4..output_word * 4 + 4].copy_from_slice(&first.to_le_bytes());
-                tile[(output_word + 1) * 4..(output_word + 1) * 4 + 4]
-                    .copy_from_slice(&second.to_le_bytes());
+    let tile_count = value_count / MARLIN_TILE_ELEMENTS;
+    fill_bounded_block_fp8_ranges(
+        "marlin-tiles",
+        tile_count,
+        MARLIN_TILE_ELEMENTS,
+        available_parallelism,
+        &mut packed_values,
+        |tiles, destination| {
+            for (local_tile, tile) in destination
+                .chunks_exact_mut(MARLIN_TILE_ELEMENTS)
+                .enumerate()
+            {
+                let tile_index = tiles.start + local_tile;
+                let k_tile = tile_index / n_tiles;
+                let n_tile = tile_index % n_tiles;
+                for thread in 0..32 {
+                    let tensor_core_column = thread / 4;
+                    let tensor_core_row = (thread % 4) * 2;
+                    for warp in 0..4 {
+                        let column = n_tile * 64 + warp * 16 + tensor_core_column;
+                        let first = block_fp8_marlin_word(
+                            source_fp8_e4m3,
+                            &inverse_scales,
+                            &raw_scales,
+                            k,
+                            block_shape,
+                            block_columns,
+                            k_tile,
+                            tensor_core_row,
+                            column,
+                        );
+                        let second = block_fp8_marlin_word(
+                            source_fp8_e4m3,
+                            &inverse_scales,
+                            &raw_scales,
+                            k,
+                            block_shape,
+                            block_columns,
+                            k_tile,
+                            tensor_core_row,
+                            column + 8,
+                        );
+                        let output_word = thread * 8 + warp * 2;
+                        tile[output_word * 4..output_word * 4 + 4]
+                            .copy_from_slice(&first.to_le_bytes());
+                        tile[(output_word + 1) * 4..(output_word + 1) * 4 + 4]
+                            .copy_from_slice(&second.to_le_bytes());
+                    }
+                }
             }
-        }
-    }
+            Ok(())
+        },
+    )?;
 
     Ok(Fp8MarlinWeight {
         packed_values,
@@ -879,6 +1060,21 @@ fn marlin_weight_permutation() -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ActiveWorker<'a>(&'a AtomicUsize);
+
+    impl Drop for ActiveWorker<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn enter_worker<'a>(active: &'a AtomicUsize, peak: &AtomicUsize) -> ActiveWorker<'a> {
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(current, Ordering::SeqCst);
+        ActiveWorker(active)
+    }
 
     fn f16_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
         values
@@ -1270,6 +1466,154 @@ mod tests {
 
         assert_eq!(direct.packed_values(), reference.packed_values());
         assert_eq!(direct.scales(), reference.scales());
+    }
+
+    #[test]
+    fn block_fp8_bounded_prepare_matches_one_worker_for_both_tile_families() {
+        for (n, k) in [(64_usize, 128_usize), (128, 64)] {
+            let block_shape = [32, 32];
+            let source = (0..n * k)
+                .map(|index| {
+                    let value = ((index * 17 + index / 67) % 63) as f32 - 31.0;
+                    float8::F8E4M3::from_f32(value / 4.0).to_bits()
+                })
+                .collect::<Vec<_>>();
+            let scale_count = n.div_ceil(block_shape[0]) * k.div_ceil(block_shape[1]);
+            let inverse_scale_bytes = (0..scale_count)
+                .flat_map(|index| half::bf16::from_f32((index % 7 + 1) as f32 / 4.0).to_le_bytes())
+                .collect::<Vec<_>>();
+
+            let one = prepare_block_fp8_weight_for_fp8_marlin_with_parallelism(
+                &source,
+                &inverse_scale_bytes,
+                n,
+                k,
+                block_shape,
+                1,
+            )
+            .unwrap();
+            let eight = prepare_block_fp8_weight_for_fp8_marlin_with_parallelism(
+                &source,
+                &inverse_scale_bytes,
+                n,
+                k,
+                block_shape,
+                8,
+            )
+            .unwrap();
+
+            assert_eq!(eight.packed_values(), one.packed_values(), "[N={n}, K={k}]");
+            assert_eq!(eight.scales(), one.scales(), "[N={n}, K={k}]");
+        }
+    }
+
+    #[test]
+    fn block_fp8_bounded_prepare_reports_earliest_row_major_source_error() {
+        let n = 64;
+        let k = 128;
+        let mut source = vec![float8::F8E4M3::from_f32(1.0).to_bits(); n * k];
+        source[12 * k + 17] = 0x7f;
+        source[12 * k + 100] = 0xff;
+        source[20 * k + 2] = 0xff;
+        let inverse_scale_bytes = half::bf16::ONE.to_le_bytes();
+        let expected = Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
+            output: 12,
+            input: 17,
+            bits: 0x7f,
+        };
+
+        for available_parallelism in [1, 8] {
+            assert_eq!(
+                prepare_block_fp8_weight_for_fp8_marlin_with_parallelism(
+                    &source,
+                    &inverse_scale_bytes,
+                    n,
+                    k,
+                    [128, 128],
+                    available_parallelism,
+                ),
+                Err(expected.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn block_fp8_bounded_worker_count_has_independent_hard_cap() {
+        assert_eq!(bounded_block_fp8_worker_count(usize::MAX, usize::MAX), 8);
+        assert_eq!(bounded_block_fp8_worker_count(3, usize::MAX), 3);
+        assert_eq!(bounded_block_fp8_worker_count(64, 4), 4);
+        assert_eq!(bounded_block_fp8_worker_count(64, 0), 1);
+    }
+
+    #[test]
+    fn block_fp8_bounded_workers_join_after_error_and_panic() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let started = AtomicUsize::new(0);
+        let mut error_output = [0_u8; 64];
+        let error = fill_bounded_block_fp8_ranges(
+            "error-fixture",
+            error_output.len(),
+            1,
+            usize::MAX,
+            &mut error_output,
+            |range, _| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _active_worker = enter_worker(&active, &peak);
+                if range.start == 16 {
+                    return Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
+                        output: range.start,
+                        input: 0,
+                        bits: 0x7f,
+                    });
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Fp8MarlinPrepareError::NonFiniteBlockFp8Value {
+                output: 16,
+                input: 0,
+                bits: 0x7f,
+            }
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 8);
+        assert!(peak.load(Ordering::SeqCst) <= 8);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+
+        active.store(0, Ordering::SeqCst);
+        peak.store(0, Ordering::SeqCst);
+        started.store(0, Ordering::SeqCst);
+        let mut panic_output = [0_u8; 64];
+        let error = fill_bounded_block_fp8_ranges(
+            "panic-fixture",
+            panic_output.len(),
+            1,
+            usize::MAX,
+            &mut panic_output,
+            |range, _| {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _active_worker = enter_worker(&active, &peak);
+                if range.start == 24 {
+                    panic!("bounded worker panic fixture");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Fp8MarlinPrepareError::BoundedWorkerPanicked {
+                phase: "panic-fixture",
+                worker: 3,
+                reason,
+            } if reason.contains("bounded worker panic fixture")
+        ));
+        assert_eq!(started.load(Ordering::SeqCst), 8);
+        assert!(peak.load(Ordering::SeqCst) <= 8);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[test]
