@@ -8,21 +8,22 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ferrum_interfaces::vnext::{
-    ApproximateWeightQualityContract, CanonicalRational, CapabilityId, ContractVersion,
-    DeviceDescriptor, ElementType, PhysicalStorageLayout, PhysicalWeightComponentBinding,
-    PhysicalWeightLayout, PhysicalWeightPadding, PreparedModelFamily, QuantizationFormatId,
-    QuantizationGrouping, QuantizationPacking, QuantizationSpec, VNextError,
-    WeightComponentPayload, WeightComponentRole, WeightComponentSource, WeightComponentSpec,
-    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightMaterializationFidelity,
-    WeightMaterializer, WeightMaterializerDescriptor, WeightMaterializerId, WeightSchema,
+    CapabilityId, ContractVersion, DeviceDescriptor, ElementType, PhysicalStorageLayout,
+    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding,
+    PreparedModelFamily, QuantizationFormatId, QuantizationGrouping, QuantizationPacking,
+    QuantizationSpec, StaticWeightTransformPlan, VNextError, WeightComponentPayload,
+    WeightComponentRole, WeightComponentSource, WeightComponentSpec, WeightEncoding,
+    WeightFormatId, WeightId, WeightLayoutId, WeightMaterializationFidelity, WeightMaterializer,
+    WeightMaterializerDescriptor, WeightMaterializerId, WeightSchema,
     CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
     GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use crate::marlin_repack::prepare_block_fp8_weight_for_fp8_marlin;
 use crate::marlin_repack::{
-    fp8_marlin_shape_supported, prepare_block_fp8_weight_for_fp8_marlin,
-    prepare_f16_weight_for_fp8_marlin, Fp8MarlinWeight,
+    fp8_marlin_shape_supported, prepare_f16_weight_for_fp8_marlin, Fp8MarlinWeight,
 };
 
 pub const MARLIN_FP8_WEIGHT_MATERIALIZER_ID: &str = "weight-materializer.cuda.marlin-fp8-w8a16";
@@ -32,17 +33,20 @@ pub const MARLIN_FP8_CAPABILITY_ID: &str = "capability.kernel.cuda.marlin.fp8-w8
 pub const MARLIN_FP8_WEIGHT_FORMAT_ID: &str = "weight-format.execution.cuda.marlin-fp8-w8a16-mixed";
 pub const MARLIN_FP8_WEIGHT_LAYOUT_ID: &str = "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed";
 pub const MARLIN_FP8_QUANTIZATION_FORMAT_ID: &str = "quantization.marlin.fp8-e4m3fn-channelwise";
+pub const MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID: &str =
+    "weight-format.execution.cuda.marlin-fp8-w8a16-group128-mixed";
+pub const MARLIN_FP8_GROUP128_WEIGHT_LAYOUT_ID: &str =
+    "weight-layout.execution.cuda.marlin-fp8-w8a16-group128-mixed";
+pub const MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID: &str =
+    "quantization.marlin.fp8-e4m3fn-group128";
 
 const MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(2, 0);
-const BLOCK_FP8_MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const BLOCK_FP8_MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(2, 0);
 const DERIVED_COMPONENT_PREFIX: &str = "component.execution.marlin-fp8";
-const BLOCK_FP8_DERIVED_COMPONENT_PREFIX: &str = "component.execution.block-fp8-marlin-fp8";
+const BLOCK_FP8_DERIVED_COMPONENT_PREFIX: &str =
+    "component.execution.block-fp8-marlin-fp8-group128";
 const BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID: &str =
     "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale";
-const BLOCK_FP8_EXECUTION_CONTRACT_FINGERPRINT: &str =
-    "882bc49ca312875a12a5290319f6c8294386a5960c2065cbda3f3dff2d55598e";
-const BLOCK_FP8_QUALITY_VECTOR_DIGEST: &str =
-    "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51";
 const BLOCK_FP8_BLOCK_SHAPE: [usize; 2] = [128, 128];
 
 pub fn marlin_fp8_weight_materializer() -> Result<Box<dyn WeightMaterializer>, VNextError> {
@@ -411,6 +415,17 @@ fn marlin_fp8_quantization_spec() -> Result<QuantizationSpec, VNextError> {
     })
 }
 
+fn marlin_fp8_group128_quantization_spec() -> Result<QuantizationSpec, VNextError> {
+    Ok(QuantizationSpec {
+        format_id: QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)?,
+        bits_per_weight: 8,
+        grouping: QuantizationGrouping::fixed(128),
+        packing: QuantizationPacking::Tiled,
+        scale_type: ElementType::F16,
+        zero_point_type: None,
+    })
+}
+
 /// The shared execution provider must support every admitted token count.
 ///
 /// Marlin accepts narrower output tiles for small row counts, but its automatic
@@ -515,22 +530,13 @@ impl BlockFp8ToMarlinFp8WeightMaterializer {
             include_str!("marlin_repack.rs").as_bytes(),
             BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID.as_bytes(),
         ]);
-        let quality_contract = ApproximateWeightQualityContract::new(
-            BLOCK_FP8_EXECUTION_CONTRACT_FINGERPRINT,
-            BLOCK_FP8_QUALITY_VECTOR_DIGEST,
-            4,
-            CanonicalRational::new(1, 20)?,
-            0,
-            0,
-        )?;
         let descriptor = WeightMaterializerDescriptor::new(
             WeightMaterializerId::new(BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID)?,
             BLOCK_FP8_MATERIALIZER_VERSION,
             fingerprint,
-            WeightMaterializationFidelity::Approximate,
+            WeightMaterializationFidelity::Exact,
             BTreeSet::from([CapabilityId::new(MARLIN_FP8_CAPABILITY_ID)?]),
-        )?
-        .with_approximate_quality_contract(quality_contract)?;
+        )?;
         Ok(Self { descriptor })
     }
 
@@ -539,6 +545,64 @@ impl BlockFp8ToMarlinFp8WeightMaterializer {
     }
 
     fn materialize_group<'source>(
+        &self,
+        source: &'source dyn WeightComponentSource,
+        source_components: &[&WeightComponentSpec],
+        execution_components: &[&WeightComponentSpec],
+    ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
+        if let ([source_component], [execution_component]) =
+            (source_components, execution_components)
+        {
+            if *source_component == *execution_component {
+                return source
+                    .component(source_component)
+                    .map(|payload| vec![payload]);
+            }
+        }
+
+        let [source_values, source_scales] = source_components else {
+            return Err(invalid_plan(
+                "block-FP8 to Marlin FP8 materialization requires ordered values and inverse-scale source components",
+            ));
+        };
+        if execution_components.is_empty() || execution_components.len() > 2 {
+            return Err(invalid_plan(
+                "block-FP8 to Marlin FP8 materialization requires one or both derived components",
+            ));
+        }
+        let logical_dimensions =
+            block_fp8_source_component_dimensions(source_values, source_scales).ok_or_else(
+                || {
+                    invalid_plan(format!(
+                "source components `{}` and `{}` are not an eligible 128x128 block-FP8 pair",
+                source_values.id, source_scales.id
+            ))
+                },
+            )?;
+        let (expected_packed, expected_scales) =
+            block_fp8_derived_components(source_values, source_scales, &logical_dimensions)?;
+        let mut requested = BTreeSet::new();
+        for component in execution_components {
+            if !requested.insert(component.id.clone())
+                || (**component != expected_packed && **component != expected_scales)
+            {
+                return Err(invalid_plan(format!(
+                    "execution component `{}` is not derived from block-FP8 source pair `{}`, `{}`",
+                    component.id, source_values.id, source_scales.id
+                )));
+            }
+        }
+        Err(invalid_plan(format!(
+            "block-FP8 execution components derived from `{}` and `{}` require the planned group-128 static device transform; host materialization is forbidden",
+            source_values.id, source_scales.id
+        )))
+    }
+
+    /// Legacy channelwise conversion retained only as a numerical reference
+    /// for focused tests. Product initialization must use the exact required
+    /// device transform declared by `static_weight_transforms`.
+    #[cfg(test)]
+    fn materialize_group_reference<'source>(
         &self,
         source: &'source dyn WeightComponentSource,
         source_components: &[&WeightComponentSpec],
@@ -760,8 +824,8 @@ impl WeightMaterializer for BlockFp8ToMarlinFp8WeightMaterializer {
         }
 
         let mut schema = family.weight_schema().clone();
-        schema.format_id = WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID)?;
-        schema.layout_id = WeightLayoutId::new(MARLIN_FP8_WEIGHT_LAYOUT_ID)?;
+        schema.format_id = WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID)?;
+        schema.layout_id = WeightLayoutId::new(MARLIN_FP8_GROUP128_WEIGHT_LAYOUT_ID)?;
         let candidate_by_source = candidates
             .iter()
             .map(|candidate| (candidate.source_values_id.clone(), candidate))
@@ -816,6 +880,32 @@ impl WeightMaterializer for BlockFp8ToMarlinFp8WeightMaterializer {
             .collect()
     }
 
+    fn static_weight_transforms(
+        &self,
+        family: &PreparedModelFamily,
+        execution_schema: &WeightSchema,
+    ) -> Result<Vec<StaticWeightTransformPlan>, VNextError> {
+        let execution_component_ids = execution_schema
+            .components
+            .iter()
+            .map(|component| &component.id)
+            .collect::<BTreeSet<_>>();
+        Self::candidates(family)?
+            .into_iter()
+            .map(|candidate| {
+                if !execution_component_ids.contains(&candidate.packed_component.id)
+                    || !execution_component_ids.contains(&candidate.scales_component.id)
+                {
+                    return Err(invalid_plan(format!(
+                        "block-FP8 static transform outputs `{}` and `{}` are absent from the execution schema",
+                        candidate.packed_component.id, candidate.scales_component.id
+                    )));
+                }
+                Ok(candidate.static_transform_plan())
+            })
+            .collect()
+    }
+
     fn materialize_component<'source>(
         &self,
         source: &'source dyn WeightComponentSource,
@@ -846,6 +936,25 @@ struct BlockFp8Candidate {
 }
 
 impl BlockFp8Candidate {
+    fn matrices_per_output(&self) -> u32 {
+        if matches!(self.logical_dimensions.as_slice(), [_, 2, _, _]) {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn static_transform_plan(&self) -> StaticWeightTransformPlan {
+        StaticWeightTransformPlan::BlockFp8ToMarlinFp8Group128 {
+            source_values_id: self.source_values_id.clone(),
+            source_scales_id: self.source_scales_id.clone(),
+            packed_values_id: self.packed_component.id.clone(),
+            scales_id: self.scales_component.id.clone(),
+            logical_dimensions: self.logical_dimensions.clone(),
+            matrices_per_output: self.matrices_per_output(),
+        }
+    }
+
     fn execution_layout(&self) -> PhysicalWeightLayout {
         PhysicalWeightLayout::Quantized {
             packed_values: PhysicalWeightComponentBinding::exact_contiguous(
@@ -1101,13 +1210,16 @@ fn block_fp8_source_component_dimensions(
     }
     let n = usize::try_from(dimensions[dimensions.len() - 2]).ok()?;
     let k = usize::try_from(dimensions[dimensions.len() - 1]).ok()?;
-    if !marlin_fp8_projection_shape_supported(n, k) {
+    if !marlin_fp8_projection_shape_supported(n, k)
+        || !n.is_multiple_of(BLOCK_FP8_BLOCK_SHAPE[0])
+        || !k.is_multiple_of(BLOCK_FP8_BLOCK_SHAPE[1])
+    {
         return None;
     }
     let mut expected_scale_dimensions = dimensions.clone();
     let rank = expected_scale_dimensions.len();
-    expected_scale_dimensions[rank - 2] = expected_scale_dimensions[rank - 2].div_ceil(128);
-    expected_scale_dimensions[rank - 1] = expected_scale_dimensions[rank - 1].div_ceil(128);
+    expected_scale_dimensions[rank - 2] /= BLOCK_FP8_BLOCK_SHAPE[0] as u64;
+    expected_scale_dimensions[rank - 1] /= BLOCK_FP8_BLOCK_SHAPE[1] as u64;
     (scales.dimensions == expected_scale_dimensions).then(|| dimensions.clone())
 }
 
@@ -1164,9 +1276,15 @@ fn block_fp8_derived_components(
         .len()
         .checked_sub(1)
         .ok_or_else(|| invalid_plan("block-FP8 logical shape is empty"))?;
-    scales_dimensions[group_axis] = 1;
+    let group_extent = scales_dimensions[group_axis];
+    if !group_extent.is_multiple_of(BLOCK_FP8_BLOCK_SHAPE[1] as u64) {
+        return Err(invalid_plan(
+            "block-FP8 group-128 scale shape is not divisible by 128",
+        ));
+    }
+    scales_dimensions[group_axis] = group_extent / BLOCK_FP8_BLOCK_SHAPE[1] as u64;
     let required = source_values.required && source_scales.required;
-    let quantization = marlin_fp8_quantization_spec()?;
+    let quantization = marlin_fp8_group128_quantization_spec()?;
     quantization.validate()?;
     let derived_source_count = source_values
         .external_names
@@ -1227,7 +1345,7 @@ fn block_fp8_derived_external_names(
     (0..source_count)
         .map(|index| {
             format!(
-                "execution.block-fp8-marlin-fp8.{digest}.{}.{index}",
+                "execution.block-fp8-marlin-fp8-group128.{digest}.{}.{index}",
                 kind.as_str()
             )
         })
@@ -1448,6 +1566,20 @@ mod tests {
     }
 
     #[test]
+    fn group128_quantization_abi_is_distinct_and_shape_invariant() {
+        let channelwise = marlin_fp8_quantization_spec().unwrap();
+        let group128 = marlin_fp8_group128_quantization_spec().unwrap();
+
+        assert_ne!(group128.format_id, channelwise.format_id);
+        assert_eq!(group128.grouping, QuantizationGrouping::fixed(128));
+        assert_eq!(group128.grouping.resolved_size(2_048), 128);
+        assert_eq!(group128.grouping.resolved_size(4_096), 128);
+        assert_eq!(group128.packing, QuantizationPacking::Tiled);
+        assert_eq!(group128.scale_type, ElementType::F16);
+        group128.validate().unwrap();
+    }
+
+    #[test]
     fn unchanged_components_borrow_their_source_payload() {
         let component = WeightComponentSpec {
             id: WeightId::new("component.global.embed_tokens").unwrap(),
@@ -1470,40 +1602,20 @@ mod tests {
     }
 
     #[test]
-    fn block_fp8_descriptor_carries_fixed_quality_contract() {
+    fn block_fp8_descriptor_is_exact_and_has_no_quality_override() {
         let materializer = BlockFp8ToMarlinFp8WeightMaterializer::new().unwrap();
         let descriptor = materializer.descriptor();
         assert_eq!(
             descriptor.id().as_str(),
             BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID
         );
-        assert_eq!(descriptor.version(), ContractVersion::new(1, 0));
-        assert_eq!(
-            descriptor.fidelity(),
-            WeightMaterializationFidelity::Approximate
-        );
+        assert_eq!(descriptor.version(), ContractVersion::new(2, 0));
+        assert_eq!(descriptor.fidelity(), WeightMaterializationFidelity::Exact);
         assert_eq!(
             descriptor.required_capabilities(),
             &BTreeSet::from([CapabilityId::new(MARLIN_FP8_CAPABILITY_ID).unwrap()])
         );
-        let quality = descriptor
-            .approximate_quality_contract()
-            .expect("approximate materializer quality contract");
-        assert_eq!(
-            quality.execution_contract_fingerprint(),
-            BLOCK_FP8_EXECUTION_CONTRACT_FINGERPRINT
-        );
-        assert_eq!(
-            quality.quality_vector_digest(),
-            BLOCK_FP8_QUALITY_VECTOR_DIGEST
-        );
-        assert_eq!(quality.required_case_count(), 4);
-        assert_eq!(
-            quality.relative_l2_max(),
-            CanonicalRational::new(1, 20).unwrap()
-        );
-        assert_eq!(quality.nan_count_max(), 0);
-        assert_eq!(quality.inf_count_max(), 0);
+        assert!(descriptor.approximate_quality_contract().is_none());
     }
 
     #[test]
@@ -1579,6 +1691,14 @@ mod tests {
         .unwrap();
         assert_eq!(packed.dimensions, [2, 2, 256, 128]);
         assert_eq!(scales.dimensions, [2, 2, 256, 1]);
+        let WeightEncoding::Quantized(group128) = &packed.encoding else {
+            panic!("derived packed values must remain quantized")
+        };
+        assert_eq!(
+            group128.format_id.as_str(),
+            MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID
+        );
+        assert_eq!(group128.grouping, QuantizationGrouping::fixed(128));
         assert_eq!(packed.external_names.len(), 8);
         assert_eq!(scales.external_names.len(), 8);
         let candidate = BlockFp8Candidate {
@@ -1593,6 +1713,18 @@ mod tests {
             panic!("rank-four source must produce one quantized execution layout")
         };
         assert_eq!(group_axis, 3);
+
+        let (mut wide_values, mut wide_scales) = test_block_fp8_components();
+        wide_values.dimensions = vec![256, 256];
+        wide_scales.dimensions = vec![2, 2];
+        assert_eq!(
+            block_fp8_source_component_dimensions(&wide_values, &wide_scales),
+            Some(vec![256, 256])
+        );
+        let (_, wide_execution_scales) =
+            block_fp8_derived_components(&wide_values, &wide_scales, &wide_values.dimensions)
+                .unwrap();
+        assert_eq!(wide_execution_scales.dimensions, [256, 2]);
 
         let mut missing_name = stacked_values.clone();
         missing_name.external_names.pop();
@@ -1609,7 +1741,42 @@ mod tests {
     }
 
     #[test]
-    fn block_fp8_materialization_preserves_rank_three_and_four_matrix_order() {
+    fn block_fp8_static_transform_plan_is_per_pair_and_bounds_one_fused_matrix() {
+        for (prefix, expected_matrices_per_output) in [(vec![2], 1_u32), (vec![3, 2], 2)] {
+            let (values, inverse_scales) = stacked_block_fp8_components(&prefix);
+            let (packed_component, scales_component) =
+                block_fp8_derived_components(&values, &inverse_scales, &values.dimensions).unwrap();
+            let candidate = BlockFp8Candidate {
+                source_values_id: values.id.clone(),
+                source_scales_id: inverse_scales.id.clone(),
+                logical_dimensions: values.dimensions.clone(),
+                packed_component: packed_component.clone(),
+                scales_component: scales_component.clone(),
+            };
+            let transform = candidate.static_transform_plan();
+
+            assert_eq!(
+                transform.source_component_ids(),
+                [&values.id, &inverse_scales.id]
+            );
+            assert_eq!(
+                transform.execution_component_ids(),
+                [&packed_component.id, &scales_component.id]
+            );
+            assert_eq!(transform.logical_dimensions(), values.dimensions);
+            assert_eq!(
+                transform.matrices_per_output(),
+                expected_matrices_per_output
+            );
+            assert_eq!(
+                transform.scratch_bytes().unwrap(),
+                256 * 128 * u64::from(expected_matrices_per_output)
+            );
+        }
+    }
+
+    #[test]
+    fn block_fp8_reference_materialization_preserves_rank_three_and_four_matrix_order() {
         for prefix in [vec![2], vec![2, 2]] {
             let (values, inverse_scales) = stacked_block_fp8_components(&prefix);
             let source_matrix_count = block_fp8_matrix_count(&values.dimensions).unwrap();
@@ -1634,7 +1801,11 @@ mod tests {
             };
             let materializer = BlockFp8ToMarlinFp8WeightMaterializer::new().unwrap();
             let payloads = materializer
-                .materialize_components(&source, &[&values, &inverse_scales], &[&packed, &scales])
+                .materialize_group_reference(
+                    &source,
+                    &[&values, &inverse_scales],
+                    &[&packed, &scales],
+                )
                 .unwrap();
 
             assert_eq!(
@@ -1679,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn block_fp8_materialization_consumes_ordered_pair_once_for_both_outputs() {
+    fn block_fp8_derived_host_materialization_fails_closed() {
         let (values, inverse_scales) = test_block_fp8_components();
         let (packed, scales) =
             block_fp8_derived_components(&values, &inverse_scales, &values.dimensions).unwrap();
@@ -1692,28 +1863,21 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(synthetic_names.len(), 4);
 
-        let source = BlockFp8TestSource {
-            values_id: values.id.clone(),
-            scales_id: inverse_scales.id.clone(),
-            values: vec![0_u8; 256 * 128],
-            scales: [half::bf16::from_f32(1.0).to_le_bytes(); 2].concat(),
-        };
         let materializer = BlockFp8ToMarlinFp8WeightMaterializer::new().unwrap();
-        let payloads = materializer
-            .materialize_components(&source, &[&values, &inverse_scales], &[&packed, &scales])
-            .unwrap();
-
-        assert_eq!(payloads.len(), 2);
-        assert_eq!(payloads[0].component_id(), &packed.id);
-        assert_eq!(payloads[0].bytes().len(), 256 * 128);
-        assert_eq!(payloads[1].component_id(), &scales.id);
-        assert_eq!(payloads[1].bytes().len(), 256 * 2);
-        for payload in payloads {
-            assert_eq!(
-                payload.source_files(),
-                ["values.safetensors", "scales.safetensors"]
-            );
-        }
+        let error = match materializer.materialize_components(
+            &ZeroWeightSource,
+            &[&values, &inverse_scales],
+            &[&packed, &scales],
+        ) {
+            Ok(_) => panic!("required static transform must not fall back to host conversion"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("require the planned group-128 static device transform"));
+        assert!(error
+            .to_string()
+            .contains("host materialization is forbidden"));
     }
 
     #[test]

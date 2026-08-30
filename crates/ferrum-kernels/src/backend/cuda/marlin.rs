@@ -407,7 +407,7 @@ extern "C" {
         prob_m: i32,
         prob_n: i32,
         prob_k: i32,
-        group_size: i32, // always -1 for channelwise E4M3
+        group_size: i32, // -1 for channelwise or 128 for block-grouped E4M3
         has_zp: i32,     // always 0 for E4M3
         dev: i32,
         stream: cudarc::driver::sys::CUstream,
@@ -1175,18 +1175,36 @@ impl MarlinMoeRawLaunchArgs {
                 self.prob_k
             )));
         }
-        if self.group_size != -1 {
-            if self.group_size <= 0 || self.group_size % 16 != 0 {
-                return Err(invalid_marlin_moe_args(format!(
-                    "group_size must be -1 or a positive multiple of 16, got {}",
-                    self.group_size
-                )));
+        match self.weight_type {
+            MarlinMoeF16WeightType::U4B8 => {
+                if self.group_size != -1 {
+                    if self.group_size <= 0 || self.group_size % 16 != 0 {
+                        return Err(invalid_marlin_moe_args(format!(
+                            "group_size must be -1 or a positive multiple of 16, got {}",
+                            self.group_size
+                        )));
+                    }
+                    if self.prob_k % self.group_size != 0 {
+                        return Err(invalid_marlin_moe_args(format!(
+                            "prob_k {} must be divisible by group_size {}",
+                            self.prob_k, self.group_size
+                        )));
+                    }
+                }
             }
-            if self.prob_k % self.group_size != 0 {
-                return Err(invalid_marlin_moe_args(format!(
-                    "prob_k {} must be divisible by group_size {}",
-                    self.prob_k, self.group_size
-                )));
+            MarlinMoeF16WeightType::E4M3 => {
+                if !matches!(self.group_size, -1 | 128) {
+                    return Err(invalid_marlin_moe_args(format!(
+                        "E4M3 group_size must be -1 or 128, got {}",
+                        self.group_size
+                    )));
+                }
+                if self.group_size == 128 && self.prob_k % 128 != 0 {
+                    return Err(invalid_marlin_moe_args(format!(
+                        "E4M3 prob_k {} must be divisible by group_size 128",
+                        self.prob_k
+                    )));
+                }
             }
         }
         if self.device_ordinal < 0 {
@@ -1201,11 +1219,9 @@ impl MarlinMoeRawLaunchArgs {
             ));
         }
         if self.weight_type == MarlinMoeF16WeightType::E4M3
-            && (self.group_size != -1 || self.has_zero_points || self.zero_points.is_some())
+            && (self.has_zero_points || self.zero_points.is_some())
         {
-            return Err(invalid_marlin_moe_args(
-                "E4M3 requires channelwise group_size=-1 and forbids zero points",
-            ));
+            return Err(invalid_marlin_moe_args("E4M3 forbids zero points"));
         }
         if self.mul_topk_weights && self.topk_weights.is_none() {
             return Err(invalid_marlin_moe_args(
@@ -1306,7 +1322,7 @@ pub(crate) fn launch_marlin_moe_vllm_raw(
                     args.prob_m,
                     args.prob_n,
                     args.prob_k,
-                    -1,
+                    args.group_size,
                     0,
                     args.device_ordinal,
                     stream.cu_stream(),
@@ -1571,6 +1587,11 @@ mod tests {
         fp8.weight_type = MarlinMoeF16WeightType::E4M3;
         fp8.group_size = -1;
         fp8.validate().unwrap();
+
+        let mut fp8_group128 = valid_marlin_moe_raw_args();
+        fp8_group128.weight_type = MarlinMoeF16WeightType::E4M3;
+        fp8_group128.group_size = 128;
+        fp8_group128.validate().unwrap();
     }
 
     #[test]
@@ -1650,16 +1671,24 @@ mod tests {
         args.c_tmp = Some(0x9000);
         assert_invalid_marlin_moe_args(args, "use_fp32_reduce must exactly match");
 
+        for group_size in [0, 16, 64, 256] {
+            let mut args = valid_marlin_moe_raw_args();
+            args.weight_type = MarlinMoeF16WeightType::E4M3;
+            args.group_size = group_size;
+            assert_invalid_marlin_moe_args(args, "E4M3 group_size must be -1 or 128");
+        }
+
         let mut args = valid_marlin_moe_raw_args();
         args.weight_type = MarlinMoeF16WeightType::E4M3;
-        assert_invalid_marlin_moe_args(args, "E4M3 requires channelwise");
+        args.prob_k = 192;
+        assert_invalid_marlin_moe_args(args, "must be divisible by group_size 128");
 
         let mut args = valid_marlin_moe_raw_args();
         args.weight_type = MarlinMoeF16WeightType::E4M3;
         args.group_size = -1;
         args.zero_points = Some(0xa000);
         args.has_zero_points = true;
-        assert_invalid_marlin_moe_args(args, "E4M3 requires channelwise");
+        assert_invalid_marlin_moe_args(args, "E4M3 forbids zero points");
     }
 
     #[test]

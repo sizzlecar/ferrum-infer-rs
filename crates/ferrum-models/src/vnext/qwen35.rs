@@ -4409,7 +4409,7 @@ mod tests {
         WeightComponentSource, WeightMaterializationFidelity,
     };
     use ferrum_kernels::marlin_fp8_materializer::{
-        block_fp8_to_marlin_fp8_weight_materializer, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+        block_fp8_to_marlin_fp8_weight_materializer, MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
     };
     use ferrum_quantization::SafetensorsTensor;
     use half::{bf16, f16};
@@ -6153,7 +6153,7 @@ mod tests {
         let materializer = block_fp8_to_marlin_fp8_weight_materializer().unwrap();
         assert_eq!(
             materializer.descriptor().fidelity(),
-            WeightMaterializationFidelity::Approximate
+            WeightMaterializationFidelity::Exact
         );
         let device = DeviceDescriptor {
             id: DeviceId::new("device.test.qwen35-block-fp8-marlin").unwrap(),
@@ -6238,8 +6238,9 @@ mod tests {
             };
             assert_eq!(
                 quantization.format_id.as_str(),
-                MARLIN_FP8_QUANTIZATION_FORMAT_ID
+                MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID
             );
+            assert_eq!(quantization.grouping, QuantizationGrouping::fixed(128));
             let scales = execution_schema
                 .components
                 .iter()
@@ -6250,6 +6251,16 @@ mod tests {
                 WeightEncoding::Dense {
                     element_type: ElementType::F16
                 }
+            );
+            let input_features = *packed
+                .dimensions
+                .last()
+                .expect("Marlin packed component has an input axis");
+            assert!(input_features.is_multiple_of(128));
+            assert_eq!(
+                scales.dimensions.last().copied(),
+                Some(input_features / 128),
+                "group-128 scale grid must cover the full input axis"
             );
         }
 

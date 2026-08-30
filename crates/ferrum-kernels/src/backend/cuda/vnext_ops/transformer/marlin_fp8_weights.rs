@@ -11,7 +11,8 @@ use ferrum_interfaces::vnext::{
 
 use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
 use crate::marlin_fp8_materializer::{
-    marlin_fp8_projection_shape_supported, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+    marlin_fp8_projection_shape_supported, MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
+    MARLIN_FP8_QUANTIZATION_FORMAT_ID,
 };
 
 const MARLIN_REGION_ALIGNMENT_BYTES: u64 = 16;
@@ -22,6 +23,7 @@ pub(super) struct CudaMarlinFp8Weight {
     scales_region: CudaBufferRegion,
     output_features: u64,
     input_features: u64,
+    group_size: i32,
 }
 
 impl CudaMarlinFp8Weight {
@@ -41,6 +43,10 @@ impl CudaMarlinFp8Weight {
         self.input_features
     }
 
+    pub(super) const fn group_size(&self) -> i32 {
+        self.group_size
+    }
+
     pub(super) fn into_regions(self) -> [CudaBufferRegion; 2] {
         [self.packed_region, self.scales_region]
     }
@@ -54,6 +60,7 @@ struct MarlinFp8Metadata {
     input_features: u64,
     packed_bytes: u64,
     scales_bytes: u64,
+    group_size: i32,
 }
 
 pub(super) fn resolve_marlin_fp8_weight(
@@ -121,6 +128,7 @@ pub(super) fn resolve_marlin_fp8_layout(
         scales_region,
         output_features: metadata.output_features,
         input_features: metadata.input_features,
+        group_size: metadata.group_size,
     })
 }
 
@@ -199,9 +207,7 @@ fn validate_marlin_fp8_layout_contract(
     if usize::try_from(*group_axis).ok() != packed_dimensions.len().checked_sub(1)
         || !matches!(group_padding, PhysicalWeightPadding::Exact)
     {
-        return Err(
-            "CUDA Marlin FP8 requires exact channelwise groups on the final input axis".to_owned(),
-        );
+        return Err("CUDA Marlin FP8 requires exact grouping on the final input axis".to_owned());
     }
     if !is_exact_contiguous(&packed_values.storage) || !is_exact_contiguous(&scales.storage) {
         return Err(
@@ -244,18 +250,34 @@ fn validate_marlin_fp8_layout_contract(
     quantization
         .validate()
         .map_err(|error| format!("CUDA Marlin FP8 quantization ABI is invalid: {error}"))?;
-    if quantization.format_id.as_str() != MARLIN_FP8_QUANTIZATION_FORMAT_ID
-        || quantization.bits_per_weight != 8
-        || quantization.grouping != QuantizationGrouping::WholeAxis
+    if quantization.bits_per_weight != 8
         || quantization.packing != QuantizationPacking::Tiled
         || quantization.scale_type != ElementType::F16
         || quantization.zero_point_type.is_some()
     {
         return Err(format!(
-            "CUDA Marlin FP8 component `{}` is not channelwise E4M3 tiled W8A16",
+            "CUDA Marlin FP8 component `{}` is not an E4M3 tiled W8A16 ABI",
             packed_component.component_id()
         ));
     }
+    let group_size = match quantization.format_id.as_str() {
+        MARLIN_FP8_QUANTIZATION_FORMAT_ID
+            if quantization.grouping == QuantizationGrouping::WholeAxis =>
+        {
+            MARLIN_FP8_CHANNELWISE_GROUP_SIZE
+        }
+        MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID
+            if quantization.grouping == QuantizationGrouping::fixed(128) =>
+        {
+            128
+        }
+        _ => {
+            return Err(format!(
+                "CUDA Marlin FP8 component `{}` has an unsupported quantization format or grouping",
+                packed_component.component_id()
+            ))
+        }
+    };
     if !matches!(
         scales_component.encoding(),
         WeightEncoding::Dense {
@@ -265,16 +287,26 @@ fn validate_marlin_fp8_layout_contract(
         return Err("CUDA Marlin FP8 scales component must be dense F16".to_owned());
     }
 
+    if group_size > 0 && !input_features.is_multiple_of(group_size as u64) {
+        return Err(format!(
+            "CUDA Marlin FP8 input width {input_features} is not divisible by group size {group_size}"
+        ));
+    }
+    let scale_group_extent = if group_size == MARLIN_FP8_CHANNELWISE_GROUP_SIZE {
+        1
+    } else {
+        input_features / group_size as u64
+    };
     let expected_scales_dimensions = match packed_dimensions.as_slice() {
         [packed_output, packed_input]
             if *packed_output == output_features && *packed_input == input_features =>
         {
-            vec![output_features, 1]
+            vec![output_features, scale_group_extent]
         }
         [1, packed_output, packed_input]
             if *packed_output == output_features && *packed_input == input_features =>
         {
-            vec![1, output_features, 1]
+            vec![1, output_features, scale_group_extent]
         }
         _ => {
             return Err(format!(
@@ -319,6 +351,7 @@ fn validate_marlin_fp8_layout_contract(
         input_features,
         packed_bytes,
         scales_bytes,
+        group_size,
     })
 }
 
@@ -715,6 +748,48 @@ mod tests {
     }
 
     #[test]
+    fn accepts_group128_component_abi_and_propagates_native_group_size() {
+        let mut schema = valid_schema(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID);
+        schema.components[0].dimensions = vec![256, 256];
+        let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
+            unreachable!();
+        };
+        spec.format_id =
+            QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID).unwrap();
+        spec.grouping = QuantizationGrouping::fixed(128);
+        schema.components[1].dimensions = vec![256, 2];
+        schema.tensors[0].dimensions = vec![256, 256];
+        let PhysicalWeightLayout::Quantized {
+            packed_dimensions, ..
+        } = &mut schema.tensors[0].physical_layout
+        else {
+            unreachable!();
+        };
+        *packed_dimensions = vec![256, 256];
+
+        let metadata = validate(&schema).unwrap();
+        assert_eq!(metadata.output_features, 256);
+        assert_eq!(metadata.input_features, 256);
+        assert_eq!(metadata.group_size, 128);
+        assert_eq!(metadata.scales_bytes, 256 * 2 * 2);
+    }
+
+    #[test]
+    fn rejects_group128_identity_with_channelwise_grouping() {
+        let mut schema = valid_schema(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID);
+        let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
+            unreachable!();
+        };
+        spec.format_id =
+            QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID).unwrap();
+        let error = validate(&schema).unwrap_err();
+        assert!(
+            error.contains("unsupported quantization format or grouping"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn rejects_a_different_component_quantization_abi() {
         let mut schema = valid_schema(MARLIN_FP8_WEIGHT_FORMAT_ID);
         let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
@@ -722,7 +797,10 @@ mod tests {
         };
         spec.format_id = QuantizationFormatId::new("quantization.test.other").unwrap();
         let error = validate(&schema).unwrap_err();
-        assert!(error.contains("not channelwise E4M3"), "{error}");
+        assert!(
+            error.contains("unsupported quantization format or grouping"),
+            "{error}"
+        );
     }
 
     #[test]

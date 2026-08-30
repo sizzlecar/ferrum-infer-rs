@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package": {
     "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.ecdde468ea546bf807a1467c086baabecf58124a4e319ae5d682ee72a4c171ce",
-    "sha256": "5b6c74405d61f6744889e2d2594d905bf797aced96e4f315c31fc82b81d34132"
+    "revision": "ferrum-native-cuda-v1+sha256.df27bdb0c6d5fd5a33fe839a27eb21bb0202daaef024c69340e43203992fabeb",
+    "sha256": "b5d8d16c1c08c3b8b68bdae8066a649043d1eff1ca74905bfbd035e1d30dafda"
   },
   "upstream_sources": [
     {
@@ -16,7 +16,7 @@
   "translation_units": [
     {
       "path": "vllm_marlin/gptq_marlin_repack.cu",
-      "sha256": "fc675bbe27ebea4634eddc490ceed35855c63b7191b5cb081c6c592de477f91e"
+      "sha256": "c85a77adec392e4ece35dbef7f16f6a5ea66a29342371f5d448a56c4de4303bf"
     },
     {
       "path": "vllm_marlin/marlin.cu",
@@ -150,7 +150,7 @@
           "sha256": "a8092f95748c350395771ae4ad6e3840764aaaaa5242b7647cb8f88f09299d3b"
         }
       ],
-      "closure_sha256": "59cc122d22b66817991a03d9206f48c81e27dfa2bd8af64d536ff29b7efa232b"
+      "closure_sha256": "a08cf208e348fdd89144f944994a17365c9b4c132dfc97b8e39ca914893d79ec"
     },
     {
       "translation_unit": "vllm_marlin/marlin.cu",

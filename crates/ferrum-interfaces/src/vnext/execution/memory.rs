@@ -269,6 +269,12 @@ impl MemoryPlan {
                             AllocationKind::Value => {
                                 allocation.storage.profile() != static_contiguous_profile
                             }
+                            AllocationKind::InitializationScratch => {
+                                allocation.usage != BufferUsage::Scratch
+                                    || allocation.element_type != ElementType::U8
+                                    || allocation.storage.logical_layout_fingerprint()
+                                        != workspace_layout_fingerprint
+                            }
                             AllocationKind::Persistent { .. } => {
                                 allocation.usage != BufferUsage::Persistent
                                     || allocation.element_type != ElementType::U8

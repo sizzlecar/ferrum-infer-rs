@@ -13,7 +13,8 @@ use ferrum_types::AttentionExecutionPolicy;
 use super::{
     CapabilityId, DeviceAllocationPermit, DeviceId, DynamicStorageProfile, ElementType,
     ExecutionIdentityEnvelope, FailureDomain, FailureEnvelope, IdentifiedFailure, PlanHash,
-    ReusableExecutionBucketId, VNextError, WeightComponentPayload,
+    ReusableExecutionBucketId, StaticWeightTransformPlan, VNextError, WeightComponentPayload,
+    WeightComponentSegments, WeightComponentSpec,
 };
 
 /// Backend-neutral device capability for an explicit cold-path reusable
@@ -3278,6 +3279,83 @@ pub trait StaticWeightImportSession<B, E> {
     fn seal(self: Box<Self>) -> Result<(), E>;
 }
 
+/// One final execution-component destination for a required static transform.
+pub struct StaticWeightTransformDestination<'request, B> {
+    component: &'request WeightComponentSpec,
+    buffer: &'request B,
+    destination_offset_bytes: u64,
+}
+
+impl<'request, B> StaticWeightTransformDestination<'request, B> {
+    pub(crate) const fn new(
+        component: &'request WeightComponentSpec,
+        buffer: &'request B,
+        destination_offset_bytes: u64,
+    ) -> Self {
+        Self {
+            component,
+            buffer,
+            destination_offset_bytes,
+        }
+    }
+
+    pub fn component(&self) -> &WeightComponentSpec {
+        self.component
+    }
+
+    pub const fn buffer(&self) -> &B {
+        self.buffer
+    }
+
+    pub const fn destination_offset_bytes(&self) -> u64 {
+        self.destination_offset_bytes
+    }
+}
+
+/// Fully validated input for one required cold-path device transform.
+///
+/// Source segment order and output order are part of the trusted plan. The
+/// scratch buffer is a single plan-admitted allocation sized from the largest
+/// matrix transform and reused serially across the model.
+pub struct StaticWeightTransformRequest<'request, 'source, B> {
+    plan: &'request StaticWeightTransformPlan,
+    sources: &'request [WeightComponentSegments<'source>],
+    destinations: &'request [StaticWeightTransformDestination<'request, B>],
+    scratch: &'request B,
+}
+
+impl<'request, 'source, B> StaticWeightTransformRequest<'request, 'source, B> {
+    pub(crate) const fn new(
+        plan: &'request StaticWeightTransformPlan,
+        sources: &'request [WeightComponentSegments<'source>],
+        destinations: &'request [StaticWeightTransformDestination<'request, B>],
+        scratch: &'request B,
+    ) -> Self {
+        Self {
+            plan,
+            sources,
+            destinations,
+            scratch,
+        }
+    }
+
+    pub const fn plan(&self) -> &StaticWeightTransformPlan {
+        self.plan
+    }
+
+    pub fn sources(&self) -> &[WeightComponentSegments<'source>] {
+        self.sources
+    }
+
+    pub fn destinations(&self) -> &[StaticWeightTransformDestination<'request, B>] {
+        self.destinations
+    }
+
+    pub const fn scratch(&self) -> &B {
+        self.scratch
+    }
+}
+
 /// Stable primitive boundary implemented by a concrete device runtime.
 ///
 /// Associated buffer, stream, command, and error types preserve compile-time
@@ -3312,6 +3390,19 @@ pub trait DeviceRuntime: Send + Sync + 'static {
     ) -> Option<
         Result<Box<dyn StaticWeightImportSession<Self::Buffer, Self::Error> + '_>, Self::Error>,
     > {
+        None
+    }
+
+    /// Encode a required source-to-execution static weight transform.
+    ///
+    /// `None` means this runtime does not implement the exact transform. Core
+    /// treats that as a contract failure; it never uploads source bytes into a
+    /// final execution layout and never falls back to a host transform hidden
+    /// from the plan.
+    fn encode_static_weight_transform(
+        &self,
+        _request: StaticWeightTransformRequest<'_, '_, Self::Buffer>,
+    ) -> Option<Result<Self::Command, Self::Error>> {
         None
     }
 

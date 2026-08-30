@@ -12,7 +12,8 @@ use crate::vnext::{
 use super::{
     canonical_fingerprint, canonical_json, invalid_plan, is_canonical_sha256, CapabilityCatalog,
     CapabilityId, ContractVersion, Deserialize, DeviceDescriptor, ModelFamilyId,
-    PreparedModelFamily, Serialize, VNextError, WeightId, WeightMaterializerId, WeightSchema,
+    PreparedModelFamily, ResourceId, Serialize, VNextError, WeightId, WeightMaterializerId,
+    WeightSchema,
 };
 
 pub const IDENTITY_WEIGHT_MATERIALIZER_ID: &str = "weight-materializer.identity";
@@ -22,6 +23,7 @@ pub const NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID: &str =
     "quality-approval.weight-materializer.numeric.v1";
 pub const NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID: &str = "quality-approval-authority.ferrum.numeric";
 pub const MAX_APPROXIMATE_WEIGHT_QUALITY_ARTIFACT_BYTES: usize = 64 * 1024;
+pub const STATIC_WEIGHT_TRANSFORM_SCRATCH_ALIGNMENT_BYTES: u64 = 256;
 
 const NUMERIC_WEIGHT_QUALITY_AUTHORITY_VERSION: ContractVersion = ContractVersion::new(1, 0);
 const REQUIRED_NUMERIC_WEIGHT_QUALITY_CASES: usize = 4;
@@ -120,6 +122,180 @@ impl WeightMaterializerSelection {
 pub enum WeightMaterializationFidelity {
     Exact,
     Approximate,
+}
+
+/// Stable physical ABI of cached or device-produced execution weights.
+///
+/// This identity deliberately excludes the materializer implementation
+/// fingerprint, compiler SHA, device model, and worker count. Those values are
+/// useful runtime evidence, but none of them changes the bytes accepted by an
+/// execution provider. Cache compatibility is therefore tied to this typed
+/// ABI plus the source/component identity rather than to one producer build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WeightArtifactAbi {
+    version: ContractVersion,
+    weight_format_id: WeightFormatId,
+    weight_layout_id: WeightLayoutId,
+    quantization_format_ids: BTreeSet<QuantizationFormatId>,
+}
+
+impl WeightArtifactAbi {
+    const VERSION: ContractVersion = ContractVersion::new(1, 0);
+
+    fn from_schema(schema: &WeightSchema) -> Result<Self, VNextError> {
+        let abi = Self {
+            version: Self::VERSION,
+            weight_format_id: schema.format_id.clone(),
+            weight_layout_id: schema.layout_id.clone(),
+            quantization_format_ids: schema.quantization_formats(),
+        };
+        abi.validate()?;
+        Ok(abi)
+    }
+
+    pub const fn version(&self) -> ContractVersion {
+        self.version
+    }
+
+    pub fn weight_format_id(&self) -> &WeightFormatId {
+        &self.weight_format_id
+    }
+
+    pub fn weight_layout_id(&self) -> &WeightLayoutId {
+        &self.weight_layout_id
+    }
+
+    pub fn quantization_format_ids(&self) -> &BTreeSet<QuantizationFormatId> {
+        &self.quantization_format_ids
+    }
+
+    pub fn fingerprint(&self) -> Result<String, VNextError> {
+        canonical_fingerprint(self, "fingerprint weight artifact ABI")
+    }
+
+    fn validate(&self) -> Result<(), VNextError> {
+        if self.version != Self::VERSION {
+            return Err(invalid_plan(
+                "weight artifact ABI has an unsupported contract version",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One required cold-path device transform from source checkpoint components
+/// into final execution-weight components.
+///
+/// The first supported producer preserves official E4M3 bytes, converts the
+/// BF16 inverse-scale grid into Marlin's grouped F16 scale ABI, and repacks one
+/// logical matrix at a time. `matrices_per_output == 2` represents the routed
+/// gate/up fusion `[E, 2, N, K] -> [E, 2N, K]`; all other projections use one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StaticWeightTransformPlan {
+    BlockFp8ToMarlinFp8Group128 {
+        source_values_id: WeightId,
+        source_scales_id: WeightId,
+        packed_values_id: WeightId,
+        scales_id: WeightId,
+        logical_dimensions: Vec<u64>,
+        matrices_per_output: u32,
+    },
+}
+
+impl StaticWeightTransformPlan {
+    pub fn source_component_ids(&self) -> [&WeightId; 2] {
+        match self {
+            Self::BlockFp8ToMarlinFp8Group128 {
+                source_values_id,
+                source_scales_id,
+                ..
+            } => [source_values_id, source_scales_id],
+        }
+    }
+
+    pub fn execution_component_ids(&self) -> [&WeightId; 2] {
+        match self {
+            Self::BlockFp8ToMarlinFp8Group128 {
+                packed_values_id,
+                scales_id,
+                ..
+            } => [packed_values_id, scales_id],
+        }
+    }
+
+    pub fn logical_dimensions(&self) -> &[u64] {
+        match self {
+            Self::BlockFp8ToMarlinFp8Group128 {
+                logical_dimensions, ..
+            } => logical_dimensions,
+        }
+    }
+
+    pub const fn matrices_per_output(&self) -> u32 {
+        match self {
+            Self::BlockFp8ToMarlinFp8Group128 {
+                matrices_per_output,
+                ..
+            } => *matrices_per_output,
+        }
+    }
+
+    /// Device scratch is shared across transforms and sized for the largest
+    /// single fused output matrix, never for the model or expert count.
+    pub fn scratch_bytes(&self) -> Result<u64, VNextError> {
+        let dimensions = self.logical_dimensions();
+        if dimensions.len() < 2 {
+            return Err(invalid_plan(
+                "static block-FP8 transform requires at least two dimensions",
+            ));
+        }
+        let [n, k] = dimensions[dimensions.len() - 2..] else {
+            unreachable!("two-axis slice has exact length")
+        };
+        n.checked_mul(u64::from(self.matrices_per_output()))
+            .and_then(|rows| rows.checked_mul(k))
+            .ok_or_else(|| invalid_plan("static block-FP8 transform scratch size overflows u64"))
+    }
+
+    fn validate(&self) -> Result<(), VNextError> {
+        let source_ids = self.source_component_ids();
+        let execution_ids = self.execution_component_ids();
+        let dimensions = self.logical_dimensions();
+        if dimensions.len() < 2 {
+            return Err(invalid_plan(
+                "static block-FP8 transform requires matrix dimensions",
+            ));
+        }
+        let n = dimensions[dimensions.len() - 2];
+        let k = dimensions[dimensions.len() - 1];
+        let matrices_per_output = self.matrices_per_output();
+        let source_matrix_count = dimensions[..dimensions.len() - 2]
+            .iter()
+            .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+            .ok_or_else(|| invalid_plan("static block-FP8 matrix count overflows u64"))?;
+        let fused_prefix_is_typed = matrices_per_output == 1
+            || (matrices_per_output == 2
+                && dimensions.len() >= 4
+                && dimensions[dimensions.len() - 3] == 2);
+        if source_ids[0] == source_ids[1]
+            || execution_ids[0] == execution_ids[1]
+            || n == 0
+            || k == 0
+            || !n.is_multiple_of(128)
+            || !k.is_multiple_of(128)
+            || !matches!(matrices_per_output, 1 | 2)
+            || !source_matrix_count.is_multiple_of(u64::from(matrices_per_output))
+            || !fused_prefix_is_typed
+            || self.scratch_bytes()? == 0
+        {
+            return Err(invalid_plan(
+                "static block-FP8 group-128 transform has invalid identities, shape, fusion, or scratch demand",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Checked-in numerical policy for an approximate materializer.
@@ -1032,6 +1208,21 @@ pub trait WeightMaterializer: Send + Sync {
         identity_component_sources(family, execution_schema)
     }
 
+    /// Required device-side transforms for final execution artifacts.
+    ///
+    /// An empty set means every execution component is produced as a host
+    /// payload through [`Self::materialize_components`]. A non-empty set is a
+    /// fail-closed contract: static initialization must use a runtime that
+    /// implements the exact transform and must never call the host
+    /// materializer for those outputs.
+    fn static_weight_transforms(
+        &self,
+        _family: &PreparedModelFamily,
+        _execution_schema: &WeightSchema,
+    ) -> Result<Vec<StaticWeightTransformPlan>, VNextError> {
+        Ok(Vec::new())
+    }
+
     /// Materialize one execution component on the cold initialization path.
     ///
     /// `source_components` is resolved from the immutable plan's ordered source
@@ -1206,8 +1397,14 @@ impl WeightMaterializerRegistry {
         let mut schema = materializer.execution_schema(family, catalog.device())?;
         schema.normalize();
         let component_sources = materializer.component_sources(family, &schema)?;
-        let plan =
-            ExecutionWeightPlan::from_materializer(family, descriptor, schema, component_sources)?;
+        let static_weight_transforms = materializer.static_weight_transforms(family, &schema)?;
+        let plan = ExecutionWeightPlan::from_materializer(
+            family,
+            descriptor,
+            schema,
+            component_sources,
+            static_weight_transforms,
+        )?;
         Ok(TrustedExecutionWeightPlan {
             plan,
             descriptor: descriptor.clone(),
@@ -1254,11 +1451,13 @@ impl WeightMaterializerRegistry {
         let approval =
             verify_numeric_weight_quality_artifact(artifact_bytes, descriptor, family, &schema)?;
         let component_sources = materializer.component_sources(family, &schema)?;
+        let static_weight_transforms = materializer.static_weight_transforms(family, &schema)?;
         let plan = ExecutionWeightPlan::from_materializer_with_approval(
             family,
             descriptor,
             schema,
             component_sources,
+            static_weight_transforms,
             Some(approval),
         )?;
         Ok(TrustedExecutionWeightPlan {
@@ -1334,6 +1533,7 @@ impl TrustedExecutionWeightPlan {
                 &descriptor,
                 schema,
                 component_sources,
+                Vec::new(),
             )?,
             descriptor,
             materializer,
@@ -1358,7 +1558,18 @@ impl TrustedExecutionWeightPlan {
             )));
         }
         self.plan
-            .validate_against_materializer(family, &self.descriptor)
+            .validate_against_materializer(family, &self.descriptor)?;
+        let mut expected_transforms = self
+            .materializer
+            .static_weight_transforms(family, self.plan.schema())?;
+        expected_transforms.sort();
+        if expected_transforms != self.plan.static_weight_transforms {
+            return Err(invalid_plan(format!(
+                "weight materializer `{}` static transform authority differs from the trusted plan",
+                self.descriptor.id()
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn materialize_components<'source>(
@@ -1460,6 +1671,52 @@ impl TrustedExecutionWeightPlan {
         Ok(payloads)
     }
 
+    pub(crate) fn static_weight_transform_for_components(
+        &self,
+        execution_components: &[&WeightComponentSpec],
+    ) -> Result<Option<&StaticWeightTransformPlan>, VNextError> {
+        self.validate_runtime_authority()?;
+        if execution_components.is_empty() {
+            return Err(invalid_plan(
+                "static weight transform lookup received an empty component group",
+            ));
+        }
+        let requested = execution_components
+            .iter()
+            .map(|component| component.id.clone())
+            .collect::<BTreeSet<_>>();
+        let matching = self
+            .plan
+            .static_weight_transforms
+            .iter()
+            .filter(|transform| {
+                transform
+                    .execution_component_ids()
+                    .into_iter()
+                    .any(|component_id| requested.contains(component_id))
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            return Ok(None);
+        }
+        let [transform] = matching.as_slice() else {
+            return Err(invalid_plan(
+                "execution component group spans multiple static weight transforms",
+            ));
+        };
+        let expected = transform
+            .execution_component_ids()
+            .into_iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if requested != expected {
+            return Err(invalid_plan(
+                "execution component group contains a partial or mixed static weight transform",
+            ));
+        }
+        Ok(Some(transform))
+    }
+
     fn validate_runtime_authority(&self) -> Result<(), VNextError> {
         if self.materializer.descriptor() != &self.descriptor {
             return Err(invalid_plan(format!(
@@ -1485,9 +1742,12 @@ pub struct ExecutionWeightPlan {
     materializer_id: WeightMaterializerId,
     materializer_version: ContractVersion,
     materializer_implementation_fingerprint: String,
+    artifact_abi: WeightArtifactAbi,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approximate_quality_approval: Option<ApproximateWeightQualityApprovalRecord>,
     component_sources: BTreeMap<WeightId, Vec<WeightId>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    static_weight_transforms: Vec<StaticWeightTransformPlan>,
     schema: WeightSchema,
 }
 
@@ -1496,7 +1756,7 @@ impl ExecutionWeightPlan {
         let descriptor = WeightMaterializerDescriptor::identity()?;
         let schema = family.weight_schema().clone();
         let component_sources = identity_component_sources(family, &schema)?;
-        Self::from_materializer(family, &descriptor, schema, component_sources)
+        Self::from_materializer(family, &descriptor, schema, component_sources, Vec::new())
     }
 
     fn from_materializer(
@@ -1504,8 +1764,16 @@ impl ExecutionWeightPlan {
         descriptor: &WeightMaterializerDescriptor,
         schema: WeightSchema,
         component_sources: BTreeMap<WeightId, Vec<WeightId>>,
+        static_weight_transforms: Vec<StaticWeightTransformPlan>,
     ) -> Result<Self, VNextError> {
-        Self::from_materializer_with_approval(family, descriptor, schema, component_sources, None)
+        Self::from_materializer_with_approval(
+            family,
+            descriptor,
+            schema,
+            component_sources,
+            static_weight_transforms,
+            None,
+        )
     }
 
     fn from_materializer_with_approval(
@@ -1513,8 +1781,10 @@ impl ExecutionWeightPlan {
         descriptor: &WeightMaterializerDescriptor,
         schema: WeightSchema,
         component_sources: BTreeMap<WeightId, Vec<WeightId>>,
+        mut static_weight_transforms: Vec<StaticWeightTransformPlan>,
         approximate_quality_approval: Option<ApproximateWeightQualityApprovalRecord>,
     ) -> Result<Self, VNextError> {
+        static_weight_transforms.sort();
         let plan = Self {
             source_schema_fingerprint: family.weight_schema().fingerprint()?,
             materializer_id: descriptor.id().clone(),
@@ -1522,8 +1792,10 @@ impl ExecutionWeightPlan {
             materializer_implementation_fingerprint: descriptor
                 .implementation_fingerprint()
                 .to_owned(),
+            artifact_abi: WeightArtifactAbi::from_schema(&schema)?,
             approximate_quality_approval,
             component_sources,
+            static_weight_transforms,
             schema,
         };
         plan.validate_against_materializer(family, descriptor)?;
@@ -1546,6 +1818,10 @@ impl ExecutionWeightPlan {
         &self.materializer_implementation_fingerprint
     }
 
+    pub fn artifact_abi(&self) -> &WeightArtifactAbi {
+        &self.artifact_abi
+    }
+
     pub fn approximate_quality_approval(&self) -> Option<&ApproximateWeightQualityApprovalRecord> {
         self.approximate_quality_approval.as_ref()
     }
@@ -1556,6 +1832,35 @@ impl ExecutionWeightPlan {
 
     pub fn component_sources(&self) -> &BTreeMap<WeightId, Vec<WeightId>> {
         &self.component_sources
+    }
+
+    pub fn static_weight_transforms(&self) -> &[StaticWeightTransformPlan] {
+        &self.static_weight_transforms
+    }
+
+    pub fn maximum_static_weight_transform_scratch_bytes(&self) -> Result<u64, VNextError> {
+        self.static_weight_transforms
+            .iter()
+            .map(StaticWeightTransformPlan::scratch_bytes)
+            .try_fold(0_u64, |maximum, bytes| {
+                bytes.map(|bytes| maximum.max(bytes))
+            })
+    }
+
+    pub fn static_weight_transform_scratch_resource_id(
+        &self,
+    ) -> Result<Option<ResourceId>, VNextError> {
+        if self.static_weight_transforms.is_empty() {
+            return Ok(None);
+        }
+        let digest = canonical_fingerprint(
+            &(&self.artifact_abi, &self.static_weight_transforms),
+            "fingerprint static weight transform scratch identity",
+        )?;
+        ResourceId::new(format!(
+            "resource/static-weight-transform-scratch/sha256/{digest}"
+        ))
+        .map(Some)
     }
 
     pub fn fingerprint(&self) -> Result<String, VNextError> {
@@ -1575,6 +1880,12 @@ impl ExecutionWeightPlan {
             approval.validate_structure()?;
         }
         self.schema.validate(family_id)?;
+        self.artifact_abi.validate()?;
+        if self.artifact_abi != WeightArtifactAbi::from_schema(&self.schema)? {
+            return Err(invalid_plan(
+                "execution weight artifact ABI differs from the physical schema",
+            ));
+        }
         let execution_component_ids = self
             .schema
             .components
@@ -1595,6 +1906,34 @@ impl ExecutionWeightPlan {
             return Err(invalid_plan(
                 "execution weight component source map is incomplete or contains duplicate sources",
             ));
+        }
+        if self
+            .static_weight_transforms
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(invalid_plan(
+                "static weight transforms are duplicate or non-canonical",
+            ));
+        }
+        let mut transformed_components = BTreeSet::new();
+        for transform in &self.static_weight_transforms {
+            transform.validate()?;
+            let source_ids = transform
+                .source_component_ids()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            for execution_id in transform.execution_component_ids() {
+                if !execution_component_ids.contains(execution_id)
+                    || self.component_sources.get(execution_id) != Some(&source_ids)
+                    || !transformed_components.insert(execution_id.clone())
+                {
+                    return Err(invalid_plan(
+                        "static weight transform outputs differ from the execution schema source map",
+                    ));
+                }
+            }
         }
         Ok(())
     }
