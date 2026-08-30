@@ -14,7 +14,9 @@ use ferrum_interfaces::vnext::{
 
 use crate::backend::cuda::marlin::MarlinMoeF16WeightType;
 use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
-use crate::marlin_fp8_materializer::MARLIN_FP8_QUANTIZATION_FORMAT_ID;
+use crate::marlin_fp8_materializer::{
+    MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+};
 
 pub(super) const GPTQ_MARLIN_WEIGHT_FORMAT_ID: &str = "weight-format.safetensors.gptq-marlin-int4";
 pub(super) const GPTQ_MARLIN_QUANTIZATION_FORMAT_ID: &str =
@@ -188,7 +190,7 @@ pub(super) fn resolve_gptq_marlin_moe_weight(
     resolve_gptq_marlin_weight(participant, binding, logical_dimensions)
 }
 
-/// Resolve one whole expert-major channelwise E4M3 Marlin stack. Routed
+/// Resolve one whole expert-major E4M3 Marlin stack. Routed
 /// gate/up is `[E, 2, N, K]`; routed down is `[E, N, K]`. Splitting experts or
 /// projections into unrelated physical regions is deliberately rejected.
 pub(super) fn resolve_marlin_fp8_moe_weight(
@@ -912,8 +914,7 @@ fn validate_marlin_fp8_moe_contract(
         || !matches!(group_padding, PhysicalWeightPadding::Exact)
     {
         return Err(
-            "CUDA Marlin FP8 MoE requires exact channelwise grouping on the final input axis"
-                .to_owned(),
+            "CUDA Marlin FP8 MoE requires exact grouping on the final input axis".to_owned(),
         );
     }
     if !is_exact_contiguous(&packed_values.storage) || !is_exact_contiguous(&scales.storage) {
@@ -963,18 +964,34 @@ fn validate_marlin_fp8_moe_contract(
     quantization
         .validate()
         .map_err(|error| format!("CUDA Marlin FP8 MoE quantization ABI is invalid: {error}"))?;
-    if quantization.format_id.as_str() != MARLIN_FP8_QUANTIZATION_FORMAT_ID
-        || quantization.bits_per_weight != 8
-        || quantization.grouping != QuantizationGrouping::WholeAxis
+    if quantization.bits_per_weight != 8
         || quantization.packing != QuantizationPacking::Tiled
         || quantization.scale_type != ElementType::F16
         || quantization.zero_point_type.is_some()
     {
         return Err(format!(
-            "CUDA Marlin FP8 MoE component `{}` is not channelwise E4M3 tiled W8A16",
+            "CUDA Marlin FP8 MoE component `{}` is not an E4M3 tiled W8A16 ABI",
             packed_component.component_id()
         ));
     }
+    let group_size = match quantization.format_id.as_str() {
+        MARLIN_FP8_QUANTIZATION_FORMAT_ID
+            if quantization.grouping == QuantizationGrouping::WholeAxis =>
+        {
+            -1
+        }
+        MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID
+            if quantization.grouping == QuantizationGrouping::fixed(128) =>
+        {
+            128
+        }
+        _ => {
+            return Err(format!(
+            "CUDA Marlin FP8 MoE component `{}` has an unsupported quantization format or grouping",
+            packed_component.component_id()
+        ))
+        }
+    };
     if !matches!(
         scales_component.encoding(),
         WeightEncoding::Dense {
@@ -993,7 +1010,17 @@ fn validate_marlin_fp8_moe_contract(
         ));
     }
     let mut expected_scales_dimensions = bound_logical_dimensions.to_vec();
-    expected_scales_dimensions[last_axis] = 1;
+    expected_scales_dimensions[last_axis] = if group_size == -1 {
+        1
+    } else {
+        let input_features = expected_scales_dimensions[last_axis];
+        if !input_features.is_multiple_of(group_size as u64) {
+            return Err(format!(
+                "CUDA Marlin FP8 MoE input width {input_features} is not divisible by group size {group_size}"
+            ));
+        }
+        input_features / group_size as u64
+    };
     if scales_component.physical_dimensions() != expected_scales_dimensions {
         return Err(format!(
             "CUDA Marlin FP8 MoE scales physical shape must be {expected_scales_dimensions:?}"
@@ -1032,7 +1059,7 @@ fn validate_marlin_fp8_moe_contract(
         scales_bytes,
         packed_expert_stride_bytes: expert_stride_bytes("FP8 packed", packed_bytes, expert_count)?,
         scales_expert_stride_bytes: expert_stride_bytes("FP8 scales", scales_bytes, expert_count)?,
-        group_size: -1,
+        group_size,
         weight_type: MarlinMoeF16WeightType::E4M3,
     })
 }
@@ -1348,6 +1375,36 @@ mod tests {
         }
     }
 
+    fn valid_group128_fp8_schema(gate_up: bool) -> WeightSchema {
+        let mut schema = valid_fp8_schema(gate_up);
+        let (dimensions, scales_dimensions) = if gate_up {
+            (vec![2, 2, 64, 256], vec![2, 2, 64, 2])
+        } else {
+            (vec![2, 128, 256], vec![2, 128, 2])
+        };
+        schema.format_id = WeightFormatId::new(
+            crate::marlin_fp8_materializer::MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID,
+        )
+        .unwrap();
+        schema.components[0].dimensions = dimensions.clone();
+        let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
+            unreachable!();
+        };
+        spec.format_id =
+            QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID).unwrap();
+        spec.grouping = QuantizationGrouping::fixed(128);
+        schema.components[1].dimensions = scales_dimensions;
+        schema.tensors[0].dimensions = dimensions.clone();
+        let PhysicalWeightLayout::Quantized {
+            packed_dimensions, ..
+        } = &mut schema.tensors[0].physical_layout
+        else {
+            unreachable!();
+        };
+        *packed_dimensions = dimensions;
+        schema
+    }
+
     fn resolved(schema: &WeightSchema) -> ResolvedWeightBinding {
         ResolvedWeightBinding::from_schema(schema, &schema.tensors[0].id).unwrap()
     }
@@ -1411,7 +1468,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_marlin_fp8_moe_shape_or_channelwise_contract_drift() {
+    fn accepts_group128_expert_major_marlin_fp8_stacks() {
+        let gate_up = validate_fp8(&valid_group128_fp8_schema(true)).unwrap();
+        assert_eq!(gate_up.logical_dimensions, [2, 2, 64, 256]);
+        assert_eq!(gate_up.scales_physical_dimensions, [2, 2, 64, 2]);
+        assert_eq!(gate_up.scales_expert_stride_bytes, 2 * 64 * 2 * 2);
+        assert_eq!(gate_up.group_size, 128);
+
+        let down = validate_fp8(&valid_group128_fp8_schema(false)).unwrap();
+        assert_eq!(down.logical_dimensions, [2, 128, 256]);
+        assert_eq!(down.scales_physical_dimensions, [2, 128, 2]);
+        assert_eq!(down.scales_expert_stride_bytes, 128 * 2 * 2);
+        assert_eq!(down.group_size, 128);
+    }
+
+    #[test]
+    fn rejects_marlin_fp8_moe_shape_or_grouping_contract_drift() {
         let valid = valid_fp8_schema(true);
         let bad_shape = [2, 3, 64, 128];
         let error = validate_marlin_fp8_moe_contract(
@@ -1429,7 +1501,10 @@ mod tests {
         };
         spec.format_id = QuantizationFormatId::new("quantization.test.fp8-other").unwrap();
         let error = validate_fp8(&wrong_format).unwrap_err();
-        assert!(error.contains("not channelwise E4M3"), "{error}");
+        assert!(
+            error.contains("unsupported quantization format or grouping"),
+            "{error}"
+        );
 
         let mut fragmented = valid_fp8_schema(false);
         let PhysicalWeightLayout::Quantized { packed_values, .. } =

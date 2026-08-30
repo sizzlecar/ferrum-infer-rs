@@ -9,7 +9,7 @@
 //! `sm80_kernel_float16_u4b8_float16.cu` is ~10-20 min on a fresh build
 //! (heavy template instantiation). Subsequent rebuilds are incremental.
 
-use cudarc::driver::sys::CUstream;
+use cudarc::driver::{sys::CUstream, CudaStream};
 use std::os::raw::{c_int, c_void};
 
 const FERRUM_MARLIN_ABI_VERSION: u32 = 1;
@@ -178,6 +178,22 @@ impl MarlinMmF16WeightRequest {
 }
 
 extern "C" {
+    fn ferrum_block_fp8_group128_repack(
+        row_major: *const c_void,
+        marlin_packed: *mut c_void,
+        size_k: c_int,
+        size_n: c_int,
+        stream: CUstream,
+    ) -> c_int;
+
+    fn ferrum_block_fp8_group128_scales(
+        inverse_scales_bf16: *const c_void,
+        marlin_scales_f16: *mut c_void,
+        size_k: c_int,
+        size_n: c_int,
+        stream: CUstream,
+    ) -> c_int;
+
     /// GPTQ → vLLM-Marlin tile-format repack. Same total bytes as input
     /// (size_k × size_n / pack_factor uint32), just a permutation. Single
     /// expert per call; caller loops for stacked MoE.
@@ -204,6 +220,155 @@ extern "C" {
     ) -> c_int;
 
     fn ferrum_marlin_mm(launch: *const FerrumMarlinLaunch);
+}
+
+fn block_fp8_group128_launch_dimensions(
+    size_k: u64,
+    size_n: u64,
+) -> candle_core::Result<(c_int, c_int)> {
+    if size_k == 0 || size_n == 0 || !size_k.is_multiple_of(128) || !size_n.is_multiple_of(128) {
+        return Err(candle_core::Error::Msg(format!(
+            "block-FP8 group-128 CUDA transform requires positive K/N multiples of 128, got K={size_k}, N={size_n}"
+        )));
+    }
+    let size_k = c_int::try_from(size_k).map_err(|_| {
+        candle_core::Error::Msg("block-FP8 group-128 K exceeds native i32".to_owned())
+    })?;
+    let size_n = c_int::try_from(size_n).map_err(|_| {
+        candle_core::Error::Msg("block-FP8 group-128 N exceeds native i32".to_owned())
+    })?;
+    Ok((size_k, size_n))
+}
+
+#[cfg(test)]
+fn block_fp8_group128_marlin_word_source_indices(
+    word: usize,
+    size_k: usize,
+    size_n: usize,
+) -> Option<[usize; 4]> {
+    if size_k == 0
+        || size_n == 0
+        || !size_k.is_multiple_of(128)
+        || !size_n.is_multiple_of(128)
+        || word >= size_k.checked_mul(size_n)?.checked_div(4)?
+    {
+        return None;
+    }
+    let words_per_tile = 16 * 64 / 4;
+    let tile = word / words_per_tile;
+    let word_in_tile = word % words_per_tile;
+    let n_tiles = size_n / 64;
+    let k_tile = tile / n_tiles;
+    let n_tile = tile % n_tiles;
+    let marlin_thread = word_in_tile / 8;
+    let word_lane = word_in_tile % 8;
+    let warp = word_lane / 2;
+    let column_half = word_lane % 2;
+    let tensor_core_column = marlin_thread / 4;
+    let tensor_core_row = (marlin_thread % 4) * 2;
+    let output = n_tile * 64 + warp * 16 + tensor_core_column + column_half * 8;
+    let source_base = output * size_k + k_tile * 16;
+    Some([
+        source_base + tensor_core_row,
+        source_base + tensor_core_row + 8,
+        source_base + tensor_core_row + 1,
+        source_base + tensor_core_row + 9,
+    ])
+}
+
+#[cfg(test)]
+fn block_fp8_group128_scale_source_index(
+    destination: usize,
+    size_k: usize,
+    size_n: usize,
+) -> Option<usize> {
+    if size_k == 0 || size_n == 0 || !size_k.is_multiple_of(128) || !size_n.is_multiple_of(128) {
+        return None;
+    }
+    let group_count = size_k / 128;
+    let scale_count = group_count.checked_mul(size_n)?;
+    if destination >= scale_count {
+        return None;
+    }
+    let permutation_width = if group_count == 1 { 32 } else { 64 };
+    let destination_lane = destination % permutation_width;
+    let source_lane = if permutation_width == 32 {
+        const COLUMNS: [usize; 8] = [0, 1, 8, 9, 16, 17, 24, 25];
+        2 * (destination_lane / 8) + COLUMNS[destination_lane % 8]
+    } else {
+        destination_lane / 8 + 8 * (destination_lane % 8)
+    };
+    let logical = destination / permutation_width * permutation_width + source_lane;
+    let group = logical / size_n;
+    let output = logical % size_n;
+    Some((output / 128) * group_count + group)
+}
+
+/// Launch the product static-weight transform from exact row-major checkpoint
+/// E4M3 bits directly into the final vLLM Marlin W8A16 tile layout.
+///
+/// # Safety
+///
+/// `row_major` must address `size_n * size_k` readable device bytes and
+/// `marlin_packed` the same number of writable device bytes on `stream`'s
+/// context. The two ranges must not overlap.
+pub(crate) unsafe fn launch_block_fp8_group128_repack(
+    stream: &CudaStream,
+    row_major: cudarc::driver::sys::CUdeviceptr,
+    marlin_packed: cudarc::driver::sys::CUdeviceptr,
+    size_k: u64,
+    size_n: u64,
+) -> candle_core::Result<()> {
+    let (size_k, size_n) = block_fp8_group128_launch_dimensions(size_k, size_n)?;
+    let ret = unsafe {
+        ferrum_block_fp8_group128_repack(
+            row_major as usize as *const c_void,
+            marlin_packed as usize as *mut c_void,
+            size_k,
+            size_n,
+            stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "block-FP8 group-128 direct Marlin repack launch failed: ret={ret} (K={size_k}, N={size_n})"
+        )));
+    }
+    Ok(())
+}
+
+/// Launch BF16 inverse-scale expansion, exponent-bias correction, and the
+/// final P32/P64 Marlin scale permutation directly into F16 destination bytes.
+///
+/// # Safety
+///
+/// `inverse_scales_bf16` must address `(size_n / 128) * (size_k / 128)`
+/// readable BF16 elements and `marlin_scales_f16` must address
+/// `size_n * (size_k / 128)` writable F16 elements on `stream`'s context. The
+/// two ranges must not overlap.
+pub(crate) unsafe fn launch_block_fp8_group128_scales(
+    stream: &CudaStream,
+    inverse_scales_bf16: cudarc::driver::sys::CUdeviceptr,
+    marlin_scales_f16: cudarc::driver::sys::CUdeviceptr,
+    size_k: u64,
+    size_n: u64,
+) -> candle_core::Result<()> {
+    let (size_k, size_n) = block_fp8_group128_launch_dimensions(size_k, size_n)?;
+    let ret = unsafe {
+        ferrum_block_fp8_group128_scales(
+            inverse_scales_bf16 as usize as *const c_void,
+            marlin_scales_f16 as usize as *mut c_void,
+            size_k,
+            size_n,
+            stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "block-FP8 group-128 scale transform launch failed: ret={ret} (K={size_k}, N={size_n})"
+        )));
+    }
+    Ok(())
 }
 
 /// Launch an FP16-activation Marlin GEMM through the shared versioned FFI.
@@ -549,14 +714,105 @@ pub fn vllm_gptq_marlin_repack(
     Ok(())
 }
 
+fn validate_vllm_fp8_marlin_repack_raw_bits(
+    input_elements: usize,
+    output_elements: usize,
+    size_k: i32,
+    size_n: i32,
+) -> candle_core::Result<()> {
+    if size_k <= 0 || size_k % 16 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "vLLM FP8 Marlin repack size_k must be a positive multiple of 16, got {size_k}"
+        )));
+    }
+    if size_n <= 0 || size_n % 64 != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "vLLM FP8 Marlin repack size_n must be a positive multiple of 64, got {size_n}"
+        )));
+    }
+    let size_k = usize::try_from(size_k).expect("positive i32 size_k fits usize");
+    let size_n = usize::try_from(size_n).expect("positive i32 size_n fits usize");
+    let expected_elements = size_k
+        .checked_mul(size_n)
+        .and_then(|elements| elements.checked_div(4))
+        .ok_or_else(|| {
+            candle_core::Error::Msg("vLLM FP8 Marlin repack element count exceeds usize".to_owned())
+        })?;
+    if input_elements != expected_elements || output_elements != expected_elements {
+        return Err(candle_core::Error::Msg(format!(
+            "vLLM FP8 Marlin repack requires [K/4, N] input and equal-size output: \
+             expected {expected_elements} u32 elements, got input={input_elements}, output={output_elements}"
+        )));
+    }
+    Ok(())
+}
+
+/// Repack raw E4M3 bytes from the GPTQ-compatible K-major input ABI into the
+/// vLLM Marlin W8A16 tile ABI without decoding or requantizing the weights.
+///
+/// `raw_bits_k_major` has shape `[size_k / 4, size_n]` in `u32` elements. Each
+/// little-endian word contains four consecutive K-axis E4M3 bytes for one
+/// output channel. A row-major checkpoint matrix `[N, K]` must therefore be
+/// transposed and packed into this shape before calling this function. The
+/// output contains the same number of `u32` elements in Marlin tile order.
+pub fn vllm_fp8_marlin_repack_raw_bits(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    raw_bits_k_major: &cudarc::driver::CudaSlice<u32>,
+    marlin_packed: &mut cudarc::driver::CudaSlice<u32>,
+    size_k: i32,
+    size_n: i32,
+) -> candle_core::Result<()> {
+    validate_vllm_fp8_marlin_repack_raw_bits(
+        raw_bits_k_major.len(),
+        marlin_packed.len(),
+        size_k,
+        size_n,
+    )?;
+    let stream_ordinal = stream.context().ordinal();
+    if raw_bits_k_major.ordinal() != stream_ordinal || marlin_packed.ordinal() != stream_ordinal {
+        return Err(candle_core::Error::Msg(
+            "vLLM FP8 Marlin repack buffers and stream must belong to the same CUDA device"
+                .to_owned(),
+        ));
+    }
+    let device_ordinal = i32::try_from(stream_ordinal)
+        .map_err(|_| candle_core::Error::Msg("CUDA device ordinal exceeds i32".to_owned()))?;
+
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    let (input_pointer, _input_guard) = raw_bits_k_major.device_ptr(stream);
+    let (output_pointer, _output_guard) = marlin_packed.device_ptr_mut(stream);
+    let ret = unsafe {
+        ferrum_vllm_gptq_marlin_repack(
+            input_pointer as *const _,
+            std::ptr::null(),
+            output_pointer as *mut _,
+            size_k,
+            size_n,
+            8,
+            0,
+            device_ordinal,
+            stream.cu_stream(),
+        )
+    };
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "vLLM FP8 gptq_marlin_repack failed: ret={ret} (size_k={size_k}, size_n={size_n})"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        gptq_qzeros_are_symmetric_code7, repack_gptq_qzeros_to_marlin, FerrumMarlinLaunch,
-        MarlinF16WeightType, MarlinMmBuffers, MarlinMmExecution, MarlinMmF16WeightRequest,
-        MarlinMmProblem, FERRUM_MARLIN_HAS_ACT_ORDER, FERRUM_MARLIN_HAS_ZERO_POINTS,
-        FERRUM_MARLIN_IS_K_FULL, FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4,
-        FERRUM_MARLIN_SCALAR_U4B8, FERRUM_MARLIN_USE_ATOMIC_ADD, FERRUM_MARLIN_USE_FP32_REDUCE,
+        block_fp8_group128_marlin_word_source_indices, block_fp8_group128_scale_source_index,
+        gptq_qzeros_are_symmetric_code7, launch_block_fp8_group128_repack,
+        launch_block_fp8_group128_scales, repack_gptq_qzeros_to_marlin,
+        validate_vllm_fp8_marlin_repack_raw_bits, FerrumMarlinLaunch, MarlinF16WeightType,
+        MarlinMmBuffers, MarlinMmExecution, MarlinMmF16WeightRequest, MarlinMmProblem,
+        FERRUM_MARLIN_HAS_ACT_ORDER, FERRUM_MARLIN_HAS_ZERO_POINTS, FERRUM_MARLIN_IS_K_FULL,
+        FERRUM_MARLIN_SCALAR_FE4M3FN, FERRUM_MARLIN_SCALAR_U4, FERRUM_MARLIN_SCALAR_U4B8,
+        FERRUM_MARLIN_USE_ATOMIC_ADD, FERRUM_MARLIN_USE_FP32_REDUCE,
     };
 
     #[test]
@@ -641,6 +897,252 @@ mod tests {
                 | FERRUM_MARLIN_USE_ATOMIC_ADD
                 | FERRUM_MARLIN_USE_FP32_REDUCE
         );
+
+        let fp8_request = MarlinMmF16WeightRequest {
+            weight_type: MarlinF16WeightType::E4M3Fn,
+            buffers: MarlinMmBuffers {
+                zero_points: std::ptr::null_mut(),
+                ..request.buffers
+            },
+            problem: MarlinMmProblem {
+                m: 1,
+                n: 128,
+                k: 256,
+                lda: 256,
+                num_groups: 2,
+                group_size: 128,
+            },
+            execution: MarlinMmExecution {
+                has_act_order: false,
+                ..request.execution
+            },
+        };
+        let fp8_launch = fp8_request.into_ffi();
+        assert_eq!(fp8_launch.b_type, FERRUM_MARLIN_SCALAR_FE4M3FN);
+        assert_eq!(fp8_launch.num_groups, 2);
+        assert_eq!(fp8_launch.group_size, 128);
+        assert_eq!(
+            fp8_launch.flags & (FERRUM_MARLIN_HAS_ACT_ORDER | FERRUM_MARLIN_HAS_ZERO_POINTS),
+            0
+        );
+    }
+
+    #[test]
+    fn fp8_raw_bit_repack_requires_exact_k_major_u32_extents() {
+        let expected = 128 * 64 / 4;
+        validate_vllm_fp8_marlin_repack_raw_bits(expected, expected, 128, 64).unwrap();
+
+        for (input, output) in [(expected - 1, expected), (expected, expected - 1)] {
+            let error = validate_vllm_fp8_marlin_repack_raw_bits(input, output, 128, 64)
+                .expect_err("mismatched raw-bit extent must fail");
+            assert!(error.to_string().contains("[K/4, N]"));
+        }
+    }
+
+    #[test]
+    fn fp8_raw_bit_repack_rejects_non_tile_shapes() {
+        let cases = [(0, 64, "size_k"), (127, 64, "size_k"), (128, 32, "size_n")];
+        for (size_k, size_n, expected) in cases {
+            let error = validate_vllm_fp8_marlin_repack_raw_bits(0, 0, size_k, size_n)
+                .expect_err("non-tile shape must fail");
+            assert!(error.to_string().contains(expected));
+        }
+    }
+
+    #[test]
+    fn block_fp8_direct_repack_indices_match_nested_marlin_tile_oracle() {
+        let n = 256_usize;
+        let k = 256_usize;
+        let source = (0..n * k)
+            .map(|index| (index as u8).wrapping_mul(73).wrapping_add(0x5b))
+            .collect::<Vec<_>>();
+        let direct = (0..n * k / 4)
+            .flat_map(|word| {
+                block_fp8_group128_marlin_word_source_indices(word, k, n)
+                    .expect("validated fixture word")
+                    .map(|source_index| source[source_index])
+            })
+            .collect::<Vec<_>>();
+
+        let mut nested = vec![0_u8; n * k];
+        for k_tile in 0..k / 16 {
+            for n_tile in 0..n / 64 {
+                let output_base = (k_tile * (n / 64) + n_tile) * 16 * 64;
+                for thread in 0..32 {
+                    let tensor_core_column = thread / 4;
+                    let tensor_core_row = (thread % 4) * 2;
+                    for warp in 0..4 {
+                        for half in 0..2 {
+                            let output = n_tile * 64 + warp * 16 + tensor_core_column + half * 8;
+                            let rows = [
+                                tensor_core_row,
+                                tensor_core_row + 8,
+                                tensor_core_row + 1,
+                                tensor_core_row + 9,
+                            ];
+                            let output_word = thread * 8 + warp * 2 + half;
+                            for (byte, row) in rows.into_iter().enumerate() {
+                                nested[output_base + output_word * 4 + byte] =
+                                    source[output * k + k_tile * 16 + row];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(direct, nested);
+    }
+
+    #[test]
+    fn block_fp8_direct_repack_fuses_gate_up_before_tiling() {
+        let source_n = 128_usize;
+        let fused_n = source_n * 2;
+        let k = 128_usize;
+        let gate = (0..source_n * k)
+            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+            .collect::<Vec<_>>();
+        let up = (0..source_n * k)
+            .map(|index| (index as u8).wrapping_mul(29).wrapping_add(11))
+            .collect::<Vec<_>>();
+        let fused = [gate, up].concat();
+        let packed = (0..fused_n * k / 4)
+            .flat_map(|word| {
+                block_fp8_group128_marlin_word_source_indices(word, k, fused_n)
+                    .expect("validated fused fixture word")
+                    .map(|source_index| fused[source_index])
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(packed.len(), fused.len());
+
+        let up_source_position = (0..fused_n * k / 4)
+            .find_map(|word| {
+                block_fp8_group128_marlin_word_source_indices(word, k, fused_n)
+                    .expect("validated fused fixture word")
+                    .into_iter()
+                    .position(|source_index| source_index == source_n * k)
+                    .map(|byte| word * 4 + byte)
+            })
+            .expect("fused up row is represented in final tiles");
+        assert_eq!(packed[up_source_position], fused[source_n * k]);
+    }
+
+    #[test]
+    fn block_fp8_direct_scale_indices_match_p32_and_p64_oracles() {
+        for (n, k) in [(128_usize, 128_usize), (256_usize, 256_usize)] {
+            let source = (0..(n / 128) * (k / 128))
+                .flat_map(|index| half::bf16::from_f32((index + 1) as f32 / 8.0).to_le_bytes())
+                .collect::<Vec<_>>();
+            let actual = (0..n * (k / 128))
+                .map(|destination| {
+                    let source_index = block_fp8_group128_scale_source_index(destination, k, n)
+                        .expect("validated scale fixture index");
+                    let offset = source_index * 2;
+                    let inverse =
+                        half::bf16::from_le_bytes([source[offset], source[offset + 1]]).to_f32();
+                    half::f16::from_f32(inverse * 256.0)
+                })
+                .collect::<Vec<_>>();
+            let expected = crate::marlin_repack::block_fp8_group128_scales_to_marlin_f16_reference(
+                &source, n, k,
+            )
+            .unwrap();
+            assert_eq!(actual, expected, "N={n}, K={k}");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn block_fp8_group128_cuda_exports_match_rust_oracles() {
+        use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
+
+        const N: usize = 128;
+        const K: usize = 128;
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+
+        let source = (0..N * K)
+            .map(|index| (index as u8).wrapping_mul(73).wrapping_add(0x5b))
+            .collect::<Vec<_>>();
+        let expected_packed = (0..N * K / 4)
+            .map(|word| {
+                let bytes = block_fp8_group128_marlin_word_source_indices(word, K, N)
+                    .expect("validated group-128 fixture")
+                    .map(|source_index| source[source_index]);
+                u32::from_le_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        let source_device: CudaSlice<u8> = stream
+            .clone_htod(&source)
+            .expect("upload row-major block-FP8 values");
+        let mut packed_device: CudaSlice<u32> = stream
+            .alloc_zeros(expected_packed.len())
+            .expect("allocate Marlin-packed values");
+        {
+            let (source_pointer, _source_guard) = source_device.device_ptr(&stream);
+            let (packed_pointer, _packed_guard) = packed_device.device_ptr_mut(&stream);
+            unsafe {
+                launch_block_fp8_group128_repack(
+                    &stream,
+                    source_pointer,
+                    packed_pointer,
+                    K as u64,
+                    N as u64,
+                )
+            }
+            .expect("launch group-128 value repack export");
+        }
+
+        let inverse_scale = half::bf16::from_f32(0.375);
+        let inverse_scale_words = [inverse_scale.to_bits()];
+        let inverse_scale_bytes = inverse_scale
+            .to_bits()
+            .to_le_bytes()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let expected_scales =
+            crate::marlin_repack::block_fp8_group128_scales_to_marlin_f16_reference(
+                &inverse_scale_bytes,
+                N,
+                K,
+            )
+            .expect("build group-128 scale oracle")
+            .into_iter()
+            .map(half::f16::to_bits)
+            .collect::<Vec<_>>();
+        let inverse_scale_device: CudaSlice<u16> = stream
+            .clone_htod(&inverse_scale_words)
+            .expect("upload block-FP8 inverse scale");
+        let mut scales_device: CudaSlice<u16> = stream
+            .alloc_zeros(expected_scales.len())
+            .expect("allocate Marlin scales");
+        {
+            let (source_pointer, _source_guard) = inverse_scale_device.device_ptr(&stream);
+            let (scales_pointer, _scales_guard) = scales_device.device_ptr_mut(&stream);
+            unsafe {
+                launch_block_fp8_group128_scales(
+                    &stream,
+                    source_pointer,
+                    scales_pointer,
+                    K as u64,
+                    N as u64,
+                )
+            }
+            .expect("launch group-128 scale export");
+        }
+
+        stream
+            .synchronize()
+            .expect("synchronize group-128 CUDA exports");
+        let actual_packed = stream
+            .clone_dtoh(&packed_device)
+            .expect("download Marlin-packed values");
+        let actual_scales = stream
+            .clone_dtoh(&scales_device)
+            .expect("download Marlin scales");
+
+        assert_eq!(actual_packed, expected_packed);
+        assert_eq!(actual_scales, expected_scales);
     }
 
     #[test]

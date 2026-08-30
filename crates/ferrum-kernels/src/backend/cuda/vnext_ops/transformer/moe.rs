@@ -41,7 +41,9 @@ use super::{
     static_contiguous_reusable_topology, CapturedProviderWorkspace, MarlinProjectionRuntime,
 };
 use crate::marlin_fp8_materializer::{
-    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
+    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
+    MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+    MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 
 const GPTQ_PROVIDER_ID: &str = "provider.cuda.routed_shared_swiglu_moe.f16.gptq_marlin";
@@ -170,6 +172,7 @@ struct MoeLaunchShape {
 struct MarlinWeightRegions {
     packed: usize,
     scales: usize,
+    group_size: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -295,6 +298,30 @@ impl CudaRoutedSharedSwiGluMoeProvider {
             kind.estimator_id().as_bytes(),
             provider_fingerprint.as_bytes(),
         ]);
+        let accepted_weight_formats = match kind {
+            MoeProviderKind::GptqMarlin => {
+                BTreeSet::from([
+                    WeightFormatId::new(kind.weight_format_id()).map_err(contract_error)?
+                ])
+            }
+            MoeProviderKind::MarlinFp8 => BTreeSet::from([
+                WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?,
+                WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID)
+                    .map_err(contract_error)?,
+            ]),
+        };
+        let accepted_quantization_formats = match kind {
+            MoeProviderKind::GptqMarlin => {
+                BTreeSet::from([QuantizationFormatId::new(kind.quantization_format_id())
+                    .map_err(contract_error)?])
+            }
+            MoeProviderKind::MarlinFp8 => BTreeSet::from([
+                QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+                QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+            ]),
+        };
         let descriptor = OperationProviderDescriptor::new(
             ProviderId::new(kind.provider_id()).map_err(contract_error)?,
             contract.descriptor().id.clone(),
@@ -307,10 +334,8 @@ impl CudaRoutedSharedSwiGluMoeProvider {
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
             required_capabilities,
-            BTreeSet::from([WeightFormatId::new(kind.weight_format_id()).map_err(contract_error)?]),
-            BTreeSet::from([
-                QuantizationFormatId::new(kind.quantization_format_id()).map_err(contract_error)?
-            ]),
+            accepted_weight_formats,
+            accepted_quantization_formats,
             contiguous_bindings(7),
             kind.estimator_id(),
             ContractVersion::new(1, 0),
@@ -526,10 +551,12 @@ fn encode_moe(
     let routed_gate_up = MarlinWeightRegions {
         packed: push_region(gate_up.packed_region().clone()),
         scales: push_region(gate_up.scales_region().clone()),
+        group_size: gate_up.group_size(),
     };
     let routed_down = MarlinWeightRegions {
         packed: push_region(down.packed_region().clone()),
         scales: push_region(down.scales_region().clone()),
+        group_size: down.group_size(),
     };
     let shared_gate_region = push_region(shared_full_region(
         &invocation,
@@ -588,14 +615,17 @@ fn encode_moe(
                 gate: MarlinWeightRegions {
                     packed: gate.packed_region,
                     scales: gate.scales_region,
+                    group_size: gate.group_size,
                 },
                 up: MarlinWeightRegions {
                     packed: up.packed_region,
                     scales: up.scales_region,
+                    group_size: up.group_size,
                 },
                 down: MarlinWeightRegions {
                     packed: down.packed_region,
                     scales: down.scales_region,
+                    group_size: down.group_size,
                 },
             }
         }
@@ -654,12 +684,20 @@ fn encode_moe(
         .bytes(match provider_kind {
             MoeProviderKind::GptqMarlin => b"u4b8",
             MoeProviderKind::MarlinFp8 => b"e4m3",
-        })
-        .i32(shape.device_ordinal)
-        .bytes(routing_plan.replay_tag())
-        .u64(layout.total_bytes)
-        .u64(MOE_BLOCK_SIZE)
-        .finish();
+        });
+    let replay_key = match shared_projection {
+        SharedProjectionRegions::F16 { .. } => replay_key.bytes(b"shared-f16"),
+        SharedProjectionRegions::MarlinFp8 { gate, up, down } => replay_key
+            .bytes(b"shared-marlin-fp8")
+            .i32(gate.group_size)
+            .i32(up.group_size)
+            .i32(down.group_size),
+    }
+    .i32(shape.device_ordinal)
+    .bytes(routing_plan.replay_tag())
+    .u64(layout.total_bytes)
+    .u64(MOE_BLOCK_SIZE)
+    .finish();
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA MoE participant count exceeds u32".to_owned())?;
 
@@ -881,7 +919,7 @@ fn encode_moe(
                             shape.tokens,
                             shape.shared_intermediate_size,
                             shape.hidden_size,
-                            -1,
+                            weight.group_size,
                             "Marlin FP8 MoE shared gate/up projection",
                         )?;
                     }
@@ -906,7 +944,7 @@ fn encode_moe(
                         shape.tokens,
                         shape.hidden_size,
                         shape.shared_intermediate_size,
-                        -1,
+                        down.group_size,
                         "Marlin FP8 MoE shared down projection",
                     )?;
                 }
