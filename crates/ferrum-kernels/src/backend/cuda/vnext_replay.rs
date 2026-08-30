@@ -37,7 +37,7 @@ use super::vnext_tool_correlation::correlate_replay_launch;
 const COMMAND_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.command-replay.v1\0";
 const SEGMENT_KEY_DOMAIN: &[u8] = b"ferrum.cuda-vnext.executable-segment.v1\0";
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CudaCommandReplayKey([u8; 32]);
 
 impl CudaCommandReplayKey {
