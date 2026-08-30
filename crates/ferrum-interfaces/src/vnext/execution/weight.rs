@@ -1742,7 +1742,6 @@ pub struct ExecutionWeightPlan {
     materializer_id: WeightMaterializerId,
     materializer_version: ContractVersion,
     materializer_implementation_fingerprint: String,
-    artifact_abi: WeightArtifactAbi,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approximate_quality_approval: Option<ApproximateWeightQualityApprovalRecord>,
     component_sources: BTreeMap<WeightId, Vec<WeightId>>,
@@ -1792,7 +1791,6 @@ impl ExecutionWeightPlan {
             materializer_implementation_fingerprint: descriptor
                 .implementation_fingerprint()
                 .to_owned(),
-            artifact_abi: WeightArtifactAbi::from_schema(&schema)?,
             approximate_quality_approval,
             component_sources,
             static_weight_transforms,
@@ -1818,8 +1816,8 @@ impl ExecutionWeightPlan {
         &self.materializer_implementation_fingerprint
     }
 
-    pub fn artifact_abi(&self) -> &WeightArtifactAbi {
-        &self.artifact_abi
+    pub fn artifact_abi(&self) -> Result<WeightArtifactAbi, VNextError> {
+        WeightArtifactAbi::from_schema(&self.schema)
     }
 
     pub fn approximate_quality_approval(&self) -> Option<&ApproximateWeightQualityApprovalRecord> {
@@ -1853,8 +1851,9 @@ impl ExecutionWeightPlan {
         if self.static_weight_transforms.is_empty() {
             return Ok(None);
         }
+        let artifact_abi = self.artifact_abi()?;
         let digest = canonical_fingerprint(
-            &(&self.artifact_abi, &self.static_weight_transforms),
+            &(&artifact_abi, &self.static_weight_transforms),
             "fingerprint static weight transform scratch identity",
         )?;
         ResourceId::new(format!(
@@ -1880,12 +1879,7 @@ impl ExecutionWeightPlan {
             approval.validate_structure()?;
         }
         self.schema.validate(family_id)?;
-        self.artifact_abi.validate()?;
-        if self.artifact_abi != WeightArtifactAbi::from_schema(&self.schema)? {
-            return Err(invalid_plan(
-                "execution weight artifact ABI differs from the physical schema",
-            ));
-        }
+        self.artifact_abi()?.validate()?;
         let execution_component_ids = self
             .schema
             .components
