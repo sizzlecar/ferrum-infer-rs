@@ -275,6 +275,8 @@ mod tests {
         let records: Vec<RequestRecord> = records
             .into_iter()
             .map(|(success, ttft, e2e, in_tok, out_tok)| RequestRecord {
+                benchmark_correlation: None,
+                server_request_id: None,
                 success,
                 ttft_ms: ttft,
                 e2e_ms: e2e,
