@@ -4429,6 +4429,13 @@ mod tests {
     const QWEN35_08B_SOURCE_PAYLOAD_BYTES: u64 = 1_746_882_752;
     const QWEN35_08B_DERIVED_FP8_PAIR_COUNT: usize = 150;
     const QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT: usize = 37;
+    const QWEN35_08B_A3_MOE_EXPERT_COUNT: usize = 2;
+    const QWEN35_08B_A3_MOE_EXPERTS_PER_TOKEN: usize = 1;
+    const QWEN35_08B_A3_MOE_DERIVED_FP8_PAIR_COUNT: usize =
+        QWEN35_08B_DERIVED_FP8_PAIR_COUNT - 24 * 3 + 24 * 9;
+    const QWEN35_08B_A3_MOE_DERIVED_TENSOR_COUNT: usize = QWEN35_08B_SOURCE_TENSOR_COUNT - 24 * 3
+        + 24 * 11
+        + QWEN35_08B_A3_MOE_DERIVED_FP8_PAIR_COUNT;
     const BLOCK_FP8_OUTPUT_BLOCK: usize = 128;
     const BLOCK_FP8_INPUT_BLOCK: usize = 128;
     const BLOCK_FP8_MAX_FINITE: f32 = 448.0;
@@ -4447,6 +4454,11 @@ mod tests {
             source: SafetensorsTensor<'archive>,
             shape: Vec<usize>,
         },
+        Owned {
+            dtype: Dtype,
+            shape: Vec<usize>,
+            bytes: Arc<[u8]>,
+        },
         BlockFp8Values {
             source: SafetensorsTensor<'archive>,
             shape: Vec<usize>,
@@ -4462,6 +4474,7 @@ mod tests {
         fn dtype(&self) -> Dtype {
             match self {
                 Self::Borrowed { source, .. } => source.dtype(),
+                Self::Owned { dtype, .. } => *dtype,
                 Self::BlockFp8Values { .. } => Dtype::F8_E4M3,
                 Self::BlockFp8Scales { .. } => Dtype::BF16,
             }
@@ -4470,6 +4483,7 @@ mod tests {
         fn shape(&self) -> &[usize] {
             match self {
                 Self::Borrowed { shape, .. }
+                | Self::Owned { shape, .. }
                 | Self::BlockFp8Values { shape, .. }
                 | Self::BlockFp8Scales { shape, .. } => shape,
             }
@@ -4478,6 +4492,7 @@ mod tests {
         fn data(&self) -> Cow<'_, [u8]> {
             match self {
                 Self::Borrowed { source, .. } => Cow::Borrowed(source.bytes()),
+                Self::Owned { bytes, .. } => Cow::Borrowed(bytes),
                 Self::BlockFp8Values {
                     source,
                     shape,
@@ -4503,6 +4518,7 @@ mod tests {
         fn data_len(&self) -> usize {
             match self {
                 Self::Borrowed { source, .. } => source.bytes().len(),
+                Self::Owned { bytes, .. } => bytes.len(),
                 Self::BlockFp8Values { shape, .. } => shape
                     .iter()
                     .copied()
@@ -4799,7 +4815,7 @@ mod tests {
         Ok(metadata.metadata().clone())
     }
 
-    fn create_unique_derived_model_dir() -> Result<PathBuf, String> {
+    fn create_unique_derived_model_dir(fixture_id: &str) -> Result<PathBuf, String> {
         let temporary_root = std::env::temp_dir();
         if !temporary_root.is_dir() {
             return Err(format!(
@@ -4812,8 +4828,8 @@ mod tests {
             .as_nanos();
         for attempt in 0..100_u32 {
             let path = temporary_root.join(format!(
-                "ferrum-qwen35-08b-block-fp8-{}-{nonce}-{attempt}",
-                std::process::id()
+                "ferrum-{fixture_id}-{}-{nonce}-{attempt}",
+                std::process::id(),
             ));
             match std::fs::create_dir(&path) {
                 Ok(()) => return Ok(path),
@@ -4886,6 +4902,71 @@ mod tests {
             .map_err(|error| format!("write {path:?}: {error}"))?;
         file.flush()
             .map_err(|error| format!("flush {path:?}: {error}"))
+    }
+
+    fn push_derived_tensor_view<'archive>(
+        views: &mut Vec<(String, DerivedSafetensorsView<'archive>)>,
+        output_weight_map: &mut BTreeMap<String, String>,
+        name: String,
+        view: DerivedSafetensorsView<'archive>,
+        output_shard: &str,
+    ) {
+        assert!(
+            output_weight_map
+                .insert(name.clone(), output_shard.to_owned())
+                .is_none(),
+            "derived tensor name {name:?} must be unique"
+        );
+        views.push((name, view));
+    }
+
+    fn push_owned_block_fp8_pair<'archive>(
+        views: &mut Vec<(String, DerivedSafetensorsView<'archive>)>,
+        output_weight_map: &mut BTreeMap<String, String>,
+        value_name: String,
+        shape: Vec<usize>,
+        values_e4m3: Arc<[u8]>,
+        scales_bf16_le: Arc<[u8]>,
+        output_shard: &str,
+    ) {
+        let [n, k] = shape.as_slice() else {
+            panic!("owned block-FP8 tensor {value_name:?} must be a matrix")
+        };
+        let (n, k) = (*n, *k);
+        assert_eq!(values_e4m3.len(), n * k, "{value_name}");
+        let scale_shape = vec![n.div_ceil(128), k.div_ceil(128)];
+        assert_eq!(
+            scales_bf16_le.len(),
+            scale_shape.iter().product::<usize>() * 2,
+            "{value_name}"
+        );
+        let scale_name = format!(
+            "{}.weight_scale_inv",
+            value_name
+                .strip_suffix(".weight")
+                .expect("owned block-FP8 tensor has .weight suffix")
+        );
+        push_derived_tensor_view(
+            views,
+            output_weight_map,
+            value_name,
+            DerivedSafetensorsView::Owned {
+                dtype: Dtype::F8_E4M3,
+                shape,
+                bytes: values_e4m3,
+            },
+            output_shard,
+        );
+        push_derived_tensor_view(
+            views,
+            output_weight_map,
+            scale_name,
+            DerivedSafetensorsView::BlockFp8Scales {
+                shape: scale_shape,
+                scales_bf16_le,
+            },
+            output_shard,
+        );
     }
 
     #[test]
@@ -5007,7 +5088,6 @@ mod tests {
                 "source index total_size must equal tensor payload bytes"
             );
         }
-
         let source_inventory = Qwen35WeightInventory::from_names(source_archive.tensor_names());
         let source_plan = source_inventory
             .detect_prefix_and_resolve(&source_text)
@@ -5134,7 +5214,7 @@ mod tests {
             QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT
         );
 
-        let output_dir = create_unique_derived_model_dir().unwrap();
+        let output_dir = create_unique_derived_model_dir("qwen35-08b-block-fp8").unwrap();
         assert_ne!(output_dir, source_dir);
         copy_snapshot_metadata_files(&source_dir, &output_dir).unwrap();
         let mut config_bytes = serde_json::to_vec_pretty(&derived_config).unwrap();
@@ -5289,6 +5369,658 @@ mod tests {
 
         println!(
             "FERRUM QWEN35 0.8B BLOCK-FP8 DERIVED SNAPSHOT PASS: {}",
+            output_dir.display()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires fixed Qwen/Qwen3.5-0.8B BF16 snapshot; writes A3 MoE-derived model under TMPDIR"]
+    fn derives_fixed_qwen35_08b_a3_moe_block_fp8_snapshot_for_cuda_e2e() {
+        struct DenseMlpSources {
+            mlp_prefix: String,
+            gate: String,
+            up: String,
+            down: String,
+        }
+
+        let source_input = fixed_qwen35_08b_snapshot_dir();
+        let source_dir = std::fs::canonicalize(&source_input).unwrap_or_else(|error| {
+            panic!(
+                "fixed Qwen/Qwen3.5-0.8B@{QWEN35_08B_REVISION} snapshot is absent at \
+                 {source_input:?}; populate the standard Hugging Face cache first: {error}"
+            )
+        });
+        assert!(
+            source_dir.is_dir(),
+            "source is not a directory: {source_dir:?}"
+        );
+        assert!(
+            source_dir
+                .components()
+                .any(|component| component.as_os_str() == QWEN35_08B_REVISION),
+            "source path must bind fixed revision {QWEN35_08B_REVISION}: {source_dir:?}"
+        );
+
+        let source_config_bytes = std::fs::read(source_dir.join("config.json"))
+            .unwrap_or_else(|error| panic!("read source config.json: {error}"));
+        let mut derived_config: Value = serde_json::from_slice(&source_config_bytes)
+            .unwrap_or_else(|error| panic!("parse source config.json: {error}"));
+        assert!(
+            derived_config
+                .get("quantization_config")
+                .is_none_or(Value::is_null),
+            "fixed source top-level quantization_config must be absent or null"
+        );
+        assert!(
+            derived_config
+                .get("text_config")
+                .and_then(|text| text.get("quantization_config"))
+                .is_none_or(Value::is_null),
+            "fixed source nested quantization_config must be absent or null"
+        );
+        let source_text = Qwen35TextConfig::from_hf_config_value(&derived_config).unwrap();
+        assert!(!source_text.is_moe());
+        assert_eq!(source_text.hidden_size, 1024);
+        assert_eq!(source_text.num_hidden_layers, 24);
+        assert_eq!(source_text.linear_attention_layers(), 18);
+        assert_eq!(source_text.full_attention_layers(), 6);
+        assert!(source_text.tie_word_embeddings);
+        assert!(source_text.quantization.is_none());
+        let dense_intermediate_size = source_text
+            .dense_intermediate_size
+            .expect("fixed dense source has intermediate_size");
+
+        let source_archive = SafetensorsArchive::open(&source_dir).unwrap();
+        assert_eq!(
+            source_archive.tensor_count(),
+            QWEN35_08B_SOURCE_TENSOR_COUNT
+        );
+        let source_payload_bytes = source_archive
+            .tensor_names()
+            .try_fold(0_u64, |total, name| {
+                let bytes = source_archive.tensor(name).unwrap().bytes().len();
+                total.checked_add(u64::try_from(bytes).unwrap())
+            })
+            .expect("source payload byte total does not overflow");
+        assert_eq!(
+            source_payload_bytes, QWEN35_08B_SOURCE_PAYLOAD_BYTES,
+            "fixed source payload identity drifted"
+        );
+        if source_dir.join("model.safetensors.index.json").is_file() {
+            let index: Value = serde_json::from_slice(
+                &std::fs::read(source_dir.join("model.safetensors.index.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                index["metadata"]["total_size"].as_u64(),
+                Some(source_payload_bytes),
+                "source index total_size must equal tensor payload bytes"
+            );
+        }
+
+        let source_inventory = Qwen35WeightInventory::from_names(source_archive.tensor_names());
+        let source_plan = source_inventory
+            .detect_prefix_and_resolve(&source_text)
+            .unwrap();
+        source_inventory
+            .partition_resolved_plan(&source_plan)
+            .unwrap()
+            .require_no_unknown()
+            .unwrap();
+        assert_eq!(source_plan.layers.len(), source_text.num_hidden_layers);
+
+        let mut dense_mlp_layers = Vec::with_capacity(source_text.num_hidden_layers);
+        let mut dense_mlp_source_names = BTreeSet::<String>::new();
+        for layer in &source_plan.layers {
+            assert_eq!(layer.layer_index, dense_mlp_layers.len());
+            let dense_source = |role: &str| {
+                let weight = layer
+                    .tensors
+                    .iter()
+                    .find(|weight| weight.present && weight.role == role)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "fixed dense layer {} is missing role {role:?}",
+                            layer.layer_index
+                        )
+                    });
+                let Some(Qwen35ResolvedWeightSource::Dense { values }) = &weight.source else {
+                    panic!(
+                        "fixed dense layer {} role {role:?} is not BF16",
+                        layer.layer_index
+                    )
+                };
+                values.clone()
+            };
+            let gate = dense_source("mlp_gate");
+            let up = dense_source("mlp_up");
+            let down = dense_source("mlp_down");
+            let mlp_prefix = gate
+                .strip_suffix(".gate_proj.weight")
+                .unwrap_or_else(|| panic!("dense MLP gate has unexpected name {gate:?}"))
+                .to_owned();
+            assert_eq!(up, format!("{mlp_prefix}.up_proj.weight"));
+            assert_eq!(down, format!("{mlp_prefix}.down_proj.weight"));
+            assert!(dense_mlp_source_names.insert(gate.clone()));
+            assert!(dense_mlp_source_names.insert(up.clone()));
+            assert!(dense_mlp_source_names.insert(down.clone()));
+            dense_mlp_layers.push(DenseMlpSources {
+                mlp_prefix,
+                gate,
+                up,
+                down,
+            });
+        }
+        assert_eq!(dense_mlp_source_names.len(), 24 * 3);
+
+        let resolved = source_plan.global_tensors.iter().chain(
+            source_plan
+                .layers
+                .iter()
+                .flat_map(|layer| layer.tensors.iter()),
+        );
+        let mut role_by_source = BTreeMap::<String, String>::new();
+        let mut quantized_sources = BTreeSet::<String>::new();
+        let mut dense_exclusions = BTreeSet::from(["lm_head".to_owned()]);
+        for weight in resolved.filter(|weight| weight.present) {
+            let Qwen35ResolvedWeightSource::Dense { values } = weight
+                .source
+                .as_ref()
+                .expect("present source has a typed bundle")
+            else {
+                panic!(
+                    "fixed BF16 source unexpectedly contains quantized role {:?}",
+                    weight.role
+                );
+            };
+            assert!(
+                role_by_source
+                    .insert(values.clone(), weight.role.clone())
+                    .is_none(),
+                "typed source {values:?} is referenced by more than one role"
+            );
+            if block_fp8_derived_quantizes_role(&weight.role) {
+                let tensor = source_archive.tensor(values).unwrap();
+                assert_eq!(tensor.dtype(), Dtype::BF16, "projection {values:?}");
+                assert_eq!(tensor.shape().len(), 2, "projection {values:?}");
+                assert!(values.ends_with(".weight"), "projection {values:?}");
+                assert!(quantized_sources.insert(values.clone()));
+            } else if BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str()) {
+                let module = values
+                    .strip_suffix(".weight")
+                    .unwrap_or_else(|| panic!("dense projection {values:?} lacks .weight suffix"));
+                dense_exclusions.insert(module.to_owned());
+            }
+        }
+        assert_eq!(quantized_sources.len(), QWEN35_08B_DERIVED_FP8_PAIR_COUNT);
+        assert!(dense_mlp_source_names.is_subset(&quantized_sources));
+        assert_eq!(
+            dense_exclusions.len(),
+            QWEN35_08B_TYPED_DENSE_EXCLUSION_COUNT
+        );
+
+        let mut derived_scales = BTreeMap::<String, Arc<[u8]>>::new();
+        let mut encoded_dense_mlp = BTreeMap::<String, Arc<[u8]>>::new();
+        for values in &quantized_sources {
+            let scale_name = format!(
+                "{}.weight_scale_inv",
+                values.strip_suffix(".weight").unwrap()
+            );
+            assert!(
+                !source_archive.contains(&scale_name),
+                "derived sidecar would collide with source tensor {scale_name:?}"
+            );
+            let tensor = source_archive.tensor(values).unwrap();
+            let [n, k] = tensor.shape() else {
+                unreachable!("quantized source rank was preflighted")
+            };
+            let n = usize::try_from(*n).expect("N fits usize");
+            let k = usize::try_from(*k).expect("K fits usize");
+            let scales = derive_block_fp8_scales(tensor.bytes(), n, k, values).unwrap();
+            if dense_mlp_source_names.contains(values) {
+                let encoded =
+                    quantize_bf16_matrix_to_block_fp8(tensor.bytes(), n, k, scales.as_ref())
+                        .unwrap();
+                assert!(encoded_dense_mlp
+                    .insert(values.clone(), encoded.into())
+                    .is_none());
+            }
+            assert!(derived_scales.insert(values.clone(), scales).is_none());
+        }
+        assert_eq!(encoded_dense_mlp.len(), 24 * 3);
+
+        let source_shards = source_archive
+            .tensor_names()
+            .map(|name| {
+                source_archive
+                    .tensor(name)
+                    .unwrap()
+                    .source_file()
+                    .to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(source_shards.len(), 1, "fixed source must use one shard");
+        let source_shard = source_dir.join(source_shards.iter().next().unwrap());
+        let source_header_metadata = safetensors_file_metadata(&source_shard).unwrap();
+
+        let quantization_config = serde_json::json!({
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "modules_to_not_convert": dense_exclusions,
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        });
+        assert_eq!(quantization_config.as_object().unwrap().len(), 5);
+        let root = derived_config
+            .as_object_mut()
+            .expect("fixed source config root is an object");
+        root.insert(
+            "architectures".to_owned(),
+            serde_json::json!(["Qwen3_5MoeForConditionalGeneration"]),
+        );
+        root.insert("model_type".to_owned(), Value::from("qwen3_5_moe"));
+        root.remove("norm_topk_prob");
+        {
+            let nested = root
+                .get_mut("text_config")
+                .and_then(Value::as_object_mut)
+                .expect("fixed source has text_config object");
+            assert!(
+                nested
+                    .remove("quantization_config")
+                    .is_none_or(|value| value.is_null()),
+                "fixed source nested quantization_config must be absent or null"
+            );
+            assert_eq!(
+                nested
+                    .remove("intermediate_size")
+                    .and_then(|value| value.as_u64()),
+                Some(dense_intermediate_size as u64)
+            );
+            nested.insert("model_type".to_owned(), Value::from("qwen3_5_moe_text"));
+            nested.insert(
+                "num_experts".to_owned(),
+                Value::from(QWEN35_08B_A3_MOE_EXPERT_COUNT),
+            );
+            nested.insert(
+                "num_experts_per_tok".to_owned(),
+                Value::from(QWEN35_08B_A3_MOE_EXPERTS_PER_TOKEN),
+            );
+            nested.insert(
+                "moe_intermediate_size".to_owned(),
+                Value::from(dense_intermediate_size),
+            );
+            nested.insert(
+                "shared_expert_intermediate_size".to_owned(),
+                Value::from(dense_intermediate_size),
+            );
+            nested.insert("norm_topk_prob".to_owned(), Value::Bool(true));
+        }
+        root.insert(
+            "quantization_config".to_owned(),
+            quantization_config.clone(),
+        );
+        let derived_text = Qwen35TextConfig::from_hf_config_value(&derived_config).unwrap();
+        assert!(derived_text.is_moe());
+        assert!(derived_text.dense_intermediate_size.is_none());
+        let derived_moe = derived_text.moe.as_ref().unwrap();
+        assert_eq!(derived_moe.num_experts, QWEN35_08B_A3_MOE_EXPERT_COUNT);
+        assert_eq!(
+            derived_moe.num_experts_per_tok,
+            QWEN35_08B_A3_MOE_EXPERTS_PER_TOKEN
+        );
+        assert_eq!(derived_moe.moe_intermediate_size, dense_intermediate_size);
+        assert_eq!(
+            derived_moe.shared_expert_intermediate_size,
+            dense_intermediate_size
+        );
+        assert!(derived_moe.norm_topk_prob);
+
+        let output_dir = create_unique_derived_model_dir("qwen35-08b-a3-moe-block-fp8").unwrap();
+        assert_ne!(output_dir, source_dir);
+        copy_snapshot_metadata_files(&source_dir, &output_dir).unwrap();
+        let mut config_bytes = serde_json::to_vec_pretty(&derived_config).unwrap();
+        config_bytes.push(b'\n');
+        write_new_file(&output_dir.join("config.json"), &config_bytes).unwrap();
+
+        const OUTPUT_SHARD: &str = "model-00001-of-00001.safetensors";
+        let mut views = Vec::<(String, DerivedSafetensorsView<'_>)>::new();
+        let mut output_weight_map = BTreeMap::<String, String>::new();
+        for name in source_archive.tensor_names() {
+            if dense_mlp_source_names.contains(name) {
+                continue;
+            }
+            let source = source_archive.tensor(name).unwrap();
+            let shape = usize_shape(source.shape(), name).unwrap();
+            if let Some(scales_bf16_le) = derived_scales.get(name) {
+                let scale_name =
+                    format!("{}.weight_scale_inv", name.strip_suffix(".weight").unwrap());
+                let [n, k] = shape.as_slice() else {
+                    unreachable!("quantized source rank was preflighted")
+                };
+                let (n, k) = (*n, *k);
+                push_derived_tensor_view(
+                    &mut views,
+                    &mut output_weight_map,
+                    name.to_owned(),
+                    DerivedSafetensorsView::BlockFp8Values {
+                        source,
+                        shape,
+                        scales_bf16_le: Arc::clone(scales_bf16_le),
+                    },
+                    OUTPUT_SHARD,
+                );
+                push_derived_tensor_view(
+                    &mut views,
+                    &mut output_weight_map,
+                    scale_name,
+                    DerivedSafetensorsView::BlockFp8Scales {
+                        shape: vec![n.div_ceil(128), k.div_ceil(128)],
+                        scales_bf16_le: Arc::clone(scales_bf16_le),
+                    },
+                    OUTPUT_SHARD,
+                );
+            } else {
+                push_derived_tensor_view(
+                    &mut views,
+                    &mut output_weight_map,
+                    name.to_owned(),
+                    DerivedSafetensorsView::Borrowed { source, shape },
+                    OUTPUT_SHARD,
+                );
+            }
+        }
+
+        // A zero router plus normalized top-k=1 gives the selected routed
+        // expert weight 1.0. Both routed experts are byte-identical copies of
+        // the dense MLP, while the shared expert's zero down projection makes
+        // its contribution exactly zero.
+        let hidden_size = source_text.hidden_size;
+        let router_zeros: Arc<[u8]> =
+            vec![0_u8; QWEN35_08B_A3_MOE_EXPERT_COUNT * hidden_size * 2].into();
+        let shared_gate_zeros: Arc<[u8]> = vec![0_u8; hidden_size * 2].into();
+        let shared_down_zeros: Arc<[u8]> = vec![0_u8; hidden_size * dense_intermediate_size].into();
+        let shared_down_scale_shape = [
+            hidden_size.div_ceil(BLOCK_FP8_OUTPUT_BLOCK),
+            dense_intermediate_size.div_ceil(BLOCK_FP8_INPUT_BLOCK),
+        ];
+        let unit_bf16 = bf16::from_f32(1.0).to_bits().to_le_bytes();
+        let mut shared_down_scale_bytes =
+            Vec::with_capacity(shared_down_scale_shape.iter().product::<usize>() * 2);
+        for _ in 0..shared_down_scale_shape.iter().product::<usize>() {
+            shared_down_scale_bytes.extend_from_slice(&unit_bf16);
+        }
+        let shared_down_unit_scales: Arc<[u8]> = shared_down_scale_bytes.into();
+
+        for layer in &dense_mlp_layers {
+            push_derived_tensor_view(
+                &mut views,
+                &mut output_weight_map,
+                format!("{}.gate.weight", layer.mlp_prefix),
+                DerivedSafetensorsView::Owned {
+                    dtype: Dtype::BF16,
+                    shape: vec![QWEN35_08B_A3_MOE_EXPERT_COUNT, hidden_size],
+                    bytes: Arc::clone(&router_zeros),
+                },
+                OUTPUT_SHARD,
+            );
+            push_derived_tensor_view(
+                &mut views,
+                &mut output_weight_map,
+                format!("{}.shared_expert_gate.weight", layer.mlp_prefix),
+                DerivedSafetensorsView::Owned {
+                    dtype: Dtype::BF16,
+                    shape: vec![1, hidden_size],
+                    bytes: Arc::clone(&shared_gate_zeros),
+                },
+                OUTPUT_SHARD,
+            );
+
+            for expert in 0..QWEN35_08B_A3_MOE_EXPERT_COUNT {
+                for (projection, source_name) in [
+                    ("gate_proj", layer.gate.as_str()),
+                    ("up_proj", layer.up.as_str()),
+                    ("down_proj", layer.down.as_str()),
+                ] {
+                    let source = source_archive.tensor(source_name).unwrap();
+                    let shape = usize_shape(source.shape(), source_name).unwrap();
+                    push_owned_block_fp8_pair(
+                        &mut views,
+                        &mut output_weight_map,
+                        format!("{}.experts.{expert}.{projection}.weight", layer.mlp_prefix),
+                        shape,
+                        Arc::clone(encoded_dense_mlp.get(source_name).unwrap()),
+                        Arc::clone(derived_scales.get(source_name).unwrap()),
+                        OUTPUT_SHARD,
+                    );
+                }
+            }
+
+            for (projection, source_name) in [
+                ("gate_proj", layer.gate.as_str()),
+                ("up_proj", layer.up.as_str()),
+            ] {
+                let source = source_archive.tensor(source_name).unwrap();
+                let shape = usize_shape(source.shape(), source_name).unwrap();
+                push_owned_block_fp8_pair(
+                    &mut views,
+                    &mut output_weight_map,
+                    format!("{}.shared_expert.{projection}.weight", layer.mlp_prefix),
+                    shape,
+                    Arc::clone(encoded_dense_mlp.get(source_name).unwrap()),
+                    Arc::clone(derived_scales.get(source_name).unwrap()),
+                    OUTPUT_SHARD,
+                );
+            }
+            push_owned_block_fp8_pair(
+                &mut views,
+                &mut output_weight_map,
+                format!("{}.shared_expert.down_proj.weight", layer.mlp_prefix),
+                vec![hidden_size, dense_intermediate_size],
+                Arc::clone(&shared_down_zeros),
+                Arc::clone(&shared_down_unit_scales),
+                OUTPUT_SHARD,
+            );
+        }
+        assert_eq!(views.len(), QWEN35_08B_A3_MOE_DERIVED_TENSOR_COUNT);
+        assert_eq!(output_weight_map.len(), views.len());
+
+        let output_payload_bytes = views
+            .iter()
+            .try_fold(0_u64, |total, (_, view)| {
+                total.checked_add(u64::try_from(view.data_len()).unwrap())
+            })
+            .expect("derived payload byte total does not overflow");
+        let output_shard = output_dir.join(OUTPUT_SHARD);
+        assert!(!output_shard.exists());
+        serialize_to_file(views, &source_header_metadata, &output_shard).unwrap();
+        drop(encoded_dense_mlp);
+        drop(derived_scales);
+        drop(source_archive);
+
+        let index = serde_json::json!({
+            "metadata": {"total_size": output_payload_bytes},
+            "weight_map": output_weight_map
+        });
+        let mut index_bytes = serde_json::to_vec_pretty(&index).unwrap();
+        index_bytes.push(b'\n');
+        write_new_file(
+            &output_dir.join("model.safetensors.index.json"),
+            &index_bytes,
+        )
+        .unwrap();
+
+        for entry in std::fs::read_dir(&output_dir).unwrap() {
+            let path = entry.unwrap().path();
+            assert!(
+                !std::fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "derived output must materialize symlink {path:?}"
+            );
+        }
+        assert_eq!(
+            safetensors_file_metadata(&output_shard).unwrap(),
+            source_header_metadata
+        );
+        let output_archive = SafetensorsArchive::open(&output_dir).unwrap();
+        assert_eq!(
+            output_archive.tensor_count(),
+            QWEN35_08B_A3_MOE_DERIVED_TENSOR_COUNT
+        );
+        let reopened_payload_bytes = output_archive
+            .tensor_names()
+            .try_fold(0_u64, |total, name| {
+                total.checked_add(
+                    u64::try_from(output_archive.tensor(name).unwrap().bytes().len()).unwrap(),
+                )
+            })
+            .unwrap();
+        assert_eq!(reopened_payload_bytes, output_payload_bytes);
+        assert_eq!(
+            index["metadata"]["total_size"].as_u64(),
+            Some(output_payload_bytes)
+        );
+
+        let output_config: Value =
+            serde_json::from_slice(&std::fs::read(output_dir.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            output_config["architectures"],
+            serde_json::json!(["Qwen3_5MoeForConditionalGeneration"])
+        );
+        assert_eq!(output_config["model_type"], "qwen3_5_moe");
+        assert_eq!(
+            output_config["text_config"]["model_type"],
+            "qwen3_5_moe_text"
+        );
+        assert!(output_config["text_config"]
+            .get("intermediate_size")
+            .is_none());
+        assert!(output_config["text_config"]
+            .get("quantization_config")
+            .is_none());
+        assert_eq!(output_config["quantization_config"], quantization_config);
+        let output_text = Qwen35TextConfig::from_hf_config_value(&output_config).unwrap();
+        let output_inventory = Qwen35WeightInventory::from_names(output_archive.tensor_names());
+        let output_plan = output_inventory
+            .detect_prefix_and_resolve(&output_text)
+            .unwrap();
+        output_inventory
+            .partition_resolved_plan(&output_plan)
+            .unwrap()
+            .require_no_unknown()
+            .unwrap();
+        let output_pair_count = output_plan
+            .global_tensors
+            .iter()
+            .chain(
+                output_plan
+                    .layers
+                    .iter()
+                    .flat_map(|layer| layer.tensors.iter()),
+            )
+            .filter(|weight| {
+                matches!(
+                    weight.source,
+                    Some(Qwen35ResolvedWeightSource::BlockFp8 { .. })
+                )
+            })
+            .count();
+        assert_eq!(output_pair_count, QWEN35_08B_A3_MOE_DERIVED_FP8_PAIR_COUNT);
+
+        for layer in &dense_mlp_layers {
+            let router = output_archive
+                .tensor(&format!("{}.gate.weight", layer.mlp_prefix))
+                .unwrap();
+            assert_eq!(router.dtype(), Dtype::BF16);
+            assert!(router.bytes().iter().all(|byte| *byte == 0));
+            let shared_gate = output_archive
+                .tensor(&format!("{}.shared_expert_gate.weight", layer.mlp_prefix))
+                .unwrap();
+            assert_eq!(shared_gate.dtype(), Dtype::BF16);
+            assert!(shared_gate.bytes().iter().all(|byte| *byte == 0));
+
+            for projection in ["gate_proj", "up_proj", "down_proj"] {
+                let expert_zero_name =
+                    format!("{}.experts.0.{projection}.weight", layer.mlp_prefix);
+                let expert_one_name = format!("{}.experts.1.{projection}.weight", layer.mlp_prefix);
+                assert_eq!(
+                    output_archive.tensor(&expert_zero_name).unwrap().bytes(),
+                    output_archive.tensor(&expert_one_name).unwrap().bytes(),
+                    "routed experts must be identical for {expert_zero_name}"
+                );
+                assert_eq!(
+                    output_archive
+                        .tensor(&expert_zero_name.replace(".weight", ".weight_scale_inv"))
+                        .unwrap()
+                        .bytes(),
+                    output_archive
+                        .tensor(&expert_one_name.replace(".weight", ".weight_scale_inv"))
+                        .unwrap()
+                        .bytes(),
+                    "routed expert scales must be identical for {expert_zero_name}"
+                );
+                if projection != "down_proj" {
+                    let shared_name =
+                        format!("{}.shared_expert.{projection}.weight", layer.mlp_prefix);
+                    assert_eq!(
+                        output_archive.tensor(&expert_zero_name).unwrap().bytes(),
+                        output_archive.tensor(&shared_name).unwrap().bytes(),
+                        "shared {projection} must reuse the fixed dense MLP source"
+                    );
+                }
+            }
+            let shared_down_name = format!("{}.shared_expert.down_proj.weight", layer.mlp_prefix);
+            let shared_down = output_archive.tensor(&shared_down_name).unwrap();
+            assert_eq!(shared_down.dtype(), Dtype::F8_E4M3);
+            assert!(shared_down.bytes().iter().all(|byte| *byte == 0));
+            let shared_down_scale = output_archive
+                .tensor(&shared_down_name.replace(".weight", ".weight_scale_inv"))
+                .unwrap();
+            assert_eq!(shared_down_scale.dtype(), Dtype::BF16);
+            assert!(shared_down_scale.bytes().chunks_exact(2).all(|bytes| {
+                bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])) == bf16::from_f32(1.0)
+            }));
+        }
+
+        let prepared = prepare_from_model_dir(&output_dir).unwrap();
+        assert_eq!(
+            prepared.family().external_metadata_id().as_str(),
+            MOE_EXTERNAL_METADATA_ID
+        );
+        assert_eq!(
+            prepared.family().weight_schema().format_id.as_str(),
+            "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
+        );
+        assert_eq!(
+            prepared.family().weight_schema().layout_id.as_str(),
+            "weight-layout.qwen3_5.hybrid_moe.fp8_block_grid.expert_major.packed_gdn_qkvzba"
+        );
+        assert_eq!(
+            crate::vnext::moe_capabilities_from_program(prepared.family()).unwrap(),
+            Some(ferrum_types::MoeCapabilities {
+                num_experts: QWEN35_08B_A3_MOE_EXPERT_COUNT,
+                experts_per_token: QWEN35_08B_A3_MOE_EXPERTS_PER_TOKEN,
+                moe_intermediate_size: Some(dense_intermediate_size),
+            })
+        );
+        let prepared_value_source_count = prepared
+            .family()
+            .weight_schema()
+            .components
+            .iter()
+            .filter(|component| component.role == WeightComponentRole::PackedValues)
+            .map(|component| component.external_names.len())
+            .sum::<usize>();
+        assert_eq!(
+            prepared_value_source_count,
+            QWEN35_08B_A3_MOE_DERIVED_FP8_PAIR_COUNT
+        );
+
+        println!(
+            "FERRUM QWEN35 0.8B A3 MOE BLOCK-FP8 DERIVED SNAPSHOT PASS: {}",
             output_dir.display()
         );
     }
