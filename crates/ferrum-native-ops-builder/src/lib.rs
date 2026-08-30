@@ -860,9 +860,9 @@ fn validate_source_build_for_package(
             receipt.operator
         )));
     }
-    if receipt.nvcc_threads == 0 || receipt.nvcc_threads > MAX_NVCC_THREADS {
+    if receipt.nvcc_threads == 0 {
         return Err(NativeOperatorBuilderError::Invalid(format!(
-            "{} source-build nvcc_threads must be in [1,{MAX_NVCC_THREADS}]",
+            "{} source-build nvcc_threads must be greater than zero",
             receipt.operator
         )));
     }
