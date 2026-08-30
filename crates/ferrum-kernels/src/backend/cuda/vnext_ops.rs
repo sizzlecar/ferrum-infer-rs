@@ -63,11 +63,6 @@ const BLOCK_FP8_SAFETENSORS_FORMAT_ID: &str =
     "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale";
 const BLOCK_FP8_SOURCE_QUANTIZATION_FORMAT_ID: &str =
     "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale";
-// Replaced only after the exact checked-in body has been emitted by the four-case
-// sm89 Rust fixture and accepted by the crate-owned verifier. An empty object is
-// deliberately invalid, so a source-format match cannot silently authorize the
-// approximate materializer while the M3 evidence is still being assembled.
-#[cfg(feature = "vllm-marlin")]
 const EMBEDDING_FUNCTION_NAME: &str = "vnext_embedding_lookup_f16";
 const MASKED_ARGMAX_PRESERVING_LOGITS_FUNCTION_NAME: &str =
     "last_token_masked_argmax_preserving_logits_f16";
