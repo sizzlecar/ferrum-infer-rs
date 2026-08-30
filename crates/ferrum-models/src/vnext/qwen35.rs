@@ -86,6 +86,12 @@ const BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES: &[&str] = &[
     "mlp_gate",
     "mlp_up",
     "mlp_down",
+    "moe_per_expert_gate_proj",
+    "moe_per_expert_up_proj",
+    "moe_per_expert_down_proj",
+    "moe_shared_expert_gate_proj",
+    "moe_shared_expert_up_proj",
+    "moe_shared_expert_down_proj",
 ];
 
 pub(super) fn validate_semantic_config(
@@ -1331,13 +1337,6 @@ fn safetensors_quantized_weight_schema(
             "the fixed compressed-tensors adoption contract is dense-only",
         ));
     }
-    if block_fp8 && text.is_moe() {
-        return Err(invalid_config(
-            "hf_config.quantization_config",
-            "the first block-FP8 adoption contract is dense-only",
-        ));
-    }
-
     let mut components = Vec::with_capacity(config.weights.len() * 3);
     let mut tensors = Vec::with_capacity(config.weights.len());
     for weight in &config.weights {
@@ -1487,7 +1486,9 @@ fn safetensors_quantized_weight_schema(
         } else {
             "weight-format.safetensors.gptq-marlin-int4"
         })?,
-        layout_id: WeightLayoutId::new(if block_fp8 {
+        layout_id: WeightLayoutId::new(if block_fp8 && text.is_moe() {
+            "weight-layout.qwen3_5.hybrid_moe.fp8_block_grid.expert_major.packed_gdn_qkvzba"
+        } else if block_fp8 {
             "weight-layout.qwen3_5.dense_hybrid.fp8_block_grid.packed_gdn_qkvzba"
         } else if compressed_tensors {
             "weight-layout.qwen3_5.dense_hybrid.compressed_tensors_marlin_asymmetric.packed_gdn_qkvzba"
@@ -1496,7 +1497,9 @@ fn safetensors_quantized_weight_schema(
         } else {
             "weight-layout.qwen3_5.dense_hybrid.gptq_marlin.packed_gdn_qkvzba"
         })?,
-        version: if block_fp8 || compressed_tensors {
+        version: if block_fp8 && text.is_moe() {
+            ContractVersion::new(1, 0)
+        } else if block_fp8 || compressed_tensors {
             ContractVersion::new(1, 0)
         } else if text.is_moe() {
             ContractVersion::new(3, 2)
@@ -1805,24 +1808,28 @@ fn append_safetensors_moe_weight_schema(
             "MoE schema requested for dense model",
         )
     })?;
-    let gates = required_expert_weights(
-        config,
-        layer_index,
-        "moe_per_expert_gate_proj_qweight",
-        moe.num_experts,
-    )?;
-    let ups = required_expert_weights(
-        config,
-        layer_index,
-        "moe_per_expert_up_proj_qweight",
-        moe.num_experts,
-    )?;
+    let (gate_role, up_role, down_role) =
+        if matches!(quantization, Qwen35QuantizationConfig::Fp8(_)) {
+            (
+                "moe_per_expert_gate_proj",
+                "moe_per_expert_up_proj",
+                "moe_per_expert_down_proj",
+            )
+        } else {
+            (
+                "moe_per_expert_gate_proj_qweight",
+                "moe_per_expert_up_proj_qweight",
+                "moe_per_expert_down_proj_qweight",
+            )
+        };
+    let gates = required_expert_weights(config, layer_index, gate_role, moe.num_experts)?;
+    let ups = required_expert_weights(config, layer_index, up_role, moe.num_experts)?;
     let routed_gate_up_sources = gates
         .into_iter()
         .zip(ups)
         .flat_map(|(gate, up)| [gate, up])
         .collect::<Vec<_>>();
-    append_safetensors_gptq_expert_stack(
+    append_safetensors_quantized_expert_stack(
         routed_gate_up_sources,
         moe_weight_id(layer_index, MOE_ROUTED_GATE_UP_ROLE)?,
         moe_logical_dimensions(text, MOE_ROUTED_GATE_UP_ROLE)?,
@@ -1831,13 +1838,8 @@ fn append_safetensors_moe_weight_schema(
         tensors,
     )?;
 
-    let downs = required_expert_weights(
-        config,
-        layer_index,
-        "moe_per_expert_down_proj_qweight",
-        moe.num_experts,
-    )?;
-    append_safetensors_gptq_expert_stack(
+    let downs = required_expert_weights(config, layer_index, down_role, moe.num_experts)?;
+    append_safetensors_quantized_expert_stack(
         downs,
         moe_weight_id(layer_index, MOE_ROUTED_DOWN_ROLE)?,
         moe_logical_dimensions(text, MOE_ROUTED_DOWN_ROLE)?,
@@ -1876,6 +1878,143 @@ fn append_safetensors_moe_weight_schema(
         components,
         tensors,
     )
+}
+
+fn append_safetensors_quantized_expert_stack(
+    sources: Vec<&FamilyWeight>,
+    logical_id: WeightId,
+    logical_dimensions: Vec<u64>,
+    quantization: &Qwen35QuantizationConfig,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    match quantization {
+        Qwen35QuantizationConfig::Fp8(_) => append_safetensors_block_fp8_expert_stack(
+            sources,
+            logical_id,
+            logical_dimensions,
+            quantization,
+            components,
+            tensors,
+        ),
+        Qwen35QuantizationConfig::Gptq(_) => append_safetensors_gptq_expert_stack(
+            sources,
+            logical_id,
+            logical_dimensions,
+            quantization,
+            components,
+            tensors,
+        ),
+        Qwen35QuantizationConfig::CompressedTensors(_) => Err(invalid_config(
+            "hf_config.quantization_config",
+            "compressed-tensors MoE expert stacks are outside the fixed adoption contract",
+        )),
+    }
+}
+
+fn append_safetensors_block_fp8_expert_stack(
+    sources: Vec<&FamilyWeight>,
+    logical_id: WeightId,
+    logical_dimensions: Vec<u64>,
+    quantization: &Qwen35QuantizationConfig,
+    components: &mut Vec<WeightComponentSpec>,
+    tensors: &mut Vec<WeightTensorSpec>,
+) -> Result<(), VNextError> {
+    let recipe = validate_block_fp8_config(quantization)?;
+    if logical_dimensions.len() < 3 {
+        return Err(invalid_config(
+            "weights.dimensions",
+            "block-FP8 expert stack must expose an expert prefix and a matrix",
+        ));
+    }
+    let matrix_axis = logical_dimensions.len() - 2;
+    let source_count = logical_dimensions[..matrix_axis]
+        .iter()
+        .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+        .ok_or_else(|| invalid_config("weights.dimensions", "expert stack size overflows"))?;
+    if usize::try_from(source_count).ok() != Some(sources.len()) {
+        return Err(invalid_config(
+            "weights.dimensions",
+            format!(
+                "block-FP8 expert stack {logical_id} requires {source_count} ordered projections, got {}",
+                sources.len()
+            ),
+        ));
+    }
+
+    let source_dimensions = &logical_dimensions[matrix_axis..];
+    let mut value_sources = Vec::with_capacity(sources.len());
+    let mut scale_sources = Vec::with_capacity(sources.len());
+    for source in sources {
+        if source.dimensions != source_dimensions {
+            return Err(invalid_config(
+                "weights.dimensions",
+                format!(
+                    "block-FP8 expert stack {logical_id} source {:?} shape {:?} differs from {source_dimensions:?}",
+                    source.role, source.dimensions
+                ),
+            ));
+        }
+        let FamilyWeightSourceEncoding::BlockFp8 { values, scale_inv } = &source.source_encoding
+        else {
+            return Err(invalid_config(
+                "weights.source_encoding",
+                format!("block-FP8 expert stack {logical_id} contains a non-block-FP8 source"),
+            ));
+        };
+        validate_block_fp8_weight_source(source, values, scale_inv, quantization)?;
+        value_sources.push(values.external_name.clone());
+        scale_sources.push(scale_inv.external_name.clone());
+    }
+
+    let spec = block_fp8_source_quantization_spec(quantization)?;
+    let packed_dimensions = logical_dimensions.clone();
+    let mut scale_dimensions = logical_dimensions.clone();
+    let [output_block, input_block] = recipe.weight_block_size.as_array();
+    scale_dimensions[matrix_axis] = scale_dimensions[matrix_axis].div_ceil(output_block as u64);
+    scale_dimensions[matrix_axis + 1] =
+        scale_dimensions[matrix_axis + 1].div_ceil(input_block as u64);
+    let block_axes = [
+        u32::try_from(matrix_axis)
+            .map_err(|_| invalid_config("weights.dimensions", "FP8 output axis exceeds u32"))?,
+        u32::try_from(matrix_axis + 1)
+            .map_err(|_| invalid_config("weights.dimensions", "FP8 input axis exceeds u32"))?,
+    ];
+
+    let base = logical_id.to_string();
+    let packed_id = WeightId::new(format!("{base}.packed"))?;
+    let scales_id = WeightId::new(format!("{base}.inverse_scales"))?;
+    components.push(WeightComponentSpec {
+        id: packed_id.clone(),
+        role: WeightComponentRole::PackedValues,
+        external_names: value_sources,
+        dimensions: packed_dimensions.clone(),
+        encoding: WeightEncoding::Quantized(spec),
+        required: true,
+    });
+    components.push(WeightComponentSpec {
+        id: scales_id.clone(),
+        role: WeightComponentRole::Scales,
+        external_names: scale_sources,
+        dimensions: scale_dimensions,
+        encoding: WeightEncoding::Dense {
+            element_type: ElementType::Bf16,
+        },
+        required: true,
+    });
+    tensors.push(WeightTensorSpec {
+        id: logical_id,
+        dimensions: logical_dimensions,
+        logical_element_type: DENSE_MATERIALIZED_ELEMENT_TYPE,
+        physical_layout: PhysicalWeightLayout::QuantizedBlockGrid {
+            packed_values: PhysicalWeightComponentBinding::exact_contiguous(packed_id),
+            packed_dimensions,
+            scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
+            block_axes,
+        },
+        required: true,
+    });
+    Ok(())
 }
 
 fn append_safetensors_gptq_expert_stack(
@@ -6619,6 +6758,62 @@ mod tests {
         config
     }
 
+    fn test_moe_block_fp8_config() -> Qwen35FamilyConfig {
+        let mut config = test_moe_gptq_config();
+        config.hf_config["text_config"]["quantization_config"] = serde_json::json!({
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "modules_to_not_convert": ["model.language_model.embed_tokens"],
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128]
+        });
+        for weight in &mut config.weights {
+            weight.role = match weight.role.as_str() {
+                "moe_per_expert_gate_proj_qweight" => "moe_per_expert_gate_proj".to_owned(),
+                "moe_per_expert_up_proj_qweight" => "moe_per_expert_up_proj".to_owned(),
+                "moe_per_expert_down_proj_qweight" => "moe_per_expert_down_proj".to_owned(),
+                _ => weight.role.clone(),
+            };
+            if weight.external_name.ends_with(".qweight") {
+                weight.external_name = format!(
+                    "{}.weight",
+                    weight.external_name.strip_suffix(".qweight").unwrap()
+                );
+            }
+            if !BLOCK_FP8_ELIGIBLE_PROJECTION_ROLES.contains(&weight.role.as_str()) {
+                continue;
+            }
+            let [n, k] = weight.dimensions.as_slice() else {
+                panic!("test block-FP8 MoE projection must be a matrix")
+            };
+            let scale_name = format!(
+                "{}.weight_scale_inv",
+                weight.external_name.strip_suffix(".weight").unwrap()
+            );
+            weight.source_encoding = FamilyWeightSourceEncoding::BlockFp8 {
+                values: FamilyBlockFp8Tensor {
+                    external_name: weight.external_name.clone(),
+                    dimensions: weight.dimensions.clone(),
+                    dtype: FamilyBlockFp8Dtype::F8E4m3,
+                },
+                scale_inv: FamilyBlockFp8Tensor {
+                    external_name: scale_name,
+                    dimensions: vec![n.div_ceil(128), k.div_ceil(128)],
+                    dtype: FamilyBlockFp8Dtype::Bf16,
+                },
+            };
+        }
+        config.weights.sort_by(|left, right| {
+            (left.layer_index, left.role.as_str(), left.expert_index).cmp(&(
+                right.layer_index,
+                right.role.as_str(),
+                right.expert_index,
+            ))
+        });
+        config.weight_format = FamilyWeightFormat::SafetensorsBlockFp8;
+        config
+    }
+
     #[test]
     fn builds_aggregate_gptq_moe_expert_stacks_in_numeric_order() {
         let config = test_moe_gptq_config();
@@ -6713,6 +6908,169 @@ mod tests {
             .unwrap();
         assert_eq!(shared_component.dimensions, shared_gate_up.dimensions);
         assert_eq!(shared_component.external_names.len(), 2);
+    }
+
+    #[test]
+    fn builds_aggregate_block_fp8_moe_expert_stacks_in_numeric_order() {
+        let mut config = test_moe_block_fp8_config();
+        config.weights.reverse();
+        let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+            .prepare(&serde_json::to_value(&config).unwrap())
+            .unwrap();
+        let schema = prepared.weight_schema();
+        assert_eq!(
+            schema.format_id.as_str(),
+            "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
+        );
+        assert_eq!(
+            schema.layout_id.as_str(),
+            "weight-layout.qwen3_5.hybrid_moe.fp8_block_grid.expert_major.packed_gdn_qkvzba"
+        );
+        assert_eq!(schema.version, ContractVersion::new(1, 0));
+
+        let routed = schema
+            .tensor(&moe_weight_id(0, MOE_ROUTED_GATE_UP_ROLE).unwrap())
+            .unwrap();
+        let PhysicalWeightLayout::QuantizedBlockGrid {
+            packed_values,
+            packed_dimensions,
+            scales,
+            block_axes,
+        } = &routed.physical_layout
+        else {
+            panic!("routed gate/up must be one aggregate block-FP8 grid")
+        };
+        assert_eq!(routed.dimensions, [12, 2, 16, 16]);
+        assert_eq!(packed_dimensions, &[12, 2, 16, 16]);
+        assert_eq!(*block_axes, [2, 3]);
+        let packed = schema
+            .components
+            .iter()
+            .find(|component| component.id == packed_values.component_id)
+            .unwrap();
+        let scale = schema
+            .components
+            .iter()
+            .find(|component| component.id == scales.component_id)
+            .unwrap();
+        assert_eq!(packed.dimensions, [12, 2, 16, 16]);
+        assert_eq!(scale.dimensions, [12, 2, 1, 1]);
+        assert_eq!(packed.external_names.len(), 12 * 2);
+        assert_eq!(scale.external_names.len(), 12 * 2);
+        for expert in 0..12 {
+            let gate =
+                format!("model.language_model.layers.0.mlp.experts.{expert}.gate_proj.weight");
+            let up = format!("model.language_model.layers.0.mlp.experts.{expert}.up_proj.weight");
+            assert_eq!(
+                packed.external_names[expert * 2..expert * 2 + 2],
+                [gate.clone(), up.clone()]
+            );
+            assert_eq!(
+                scale.external_names[expert * 2..expert * 2 + 2],
+                [
+                    gate.replace(".weight", ".weight_scale_inv"),
+                    up.replace(".weight", ".weight_scale_inv"),
+                ]
+            );
+        }
+
+        let down = schema
+            .tensor(&moe_weight_id(0, MOE_ROUTED_DOWN_ROLE).unwrap())
+            .unwrap();
+        let PhysicalWeightLayout::QuantizedBlockGrid {
+            packed_values,
+            packed_dimensions,
+            scales,
+            block_axes,
+        } = &down.physical_layout
+        else {
+            panic!("routed down must be one aggregate block-FP8 grid")
+        };
+        assert_eq!(down.dimensions, [12, 16, 16]);
+        assert_eq!(packed_dimensions, &[12, 16, 16]);
+        assert_eq!(*block_axes, [1, 2]);
+        let packed = schema
+            .components
+            .iter()
+            .find(|component| component.id == packed_values.component_id)
+            .unwrap();
+        let scale = schema
+            .components
+            .iter()
+            .find(|component| component.id == scales.component_id)
+            .unwrap();
+        assert_eq!(packed.dimensions, [12, 16, 16]);
+        assert_eq!(scale.dimensions, [12, 1, 1]);
+        for expert in 0..12 {
+            let down =
+                format!("model.language_model.layers.0.mlp.experts.{expert}.down_proj.weight");
+            assert_eq!(packed.external_names[expert], down);
+            assert_eq!(
+                scale.external_names[expert],
+                down.replace(".weight", ".weight_scale_inv")
+            );
+        }
+
+        let shared_gate_up = schema
+            .tensor(&moe_weight_id(0, MOE_SHARED_GATE_UP_ROLE).unwrap())
+            .unwrap();
+        assert!(matches!(
+            &shared_gate_up.physical_layout,
+            PhysicalWeightLayout::Composite { parts }
+                if parts.len() == 2
+                    && parts.iter().all(|part| matches!(
+                        part.layout.as_ref(),
+                        PhysicalWeightLayout::QuantizedBlockGrid { .. }
+                    ))
+        ));
+        assert_eq!(schema.physical_component_refs(&routed.id).unwrap().len(), 2);
+        assert_eq!(schema.physical_component_refs(&down.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn rejects_block_fp8_moe_sidecar_or_grid_drift_before_allocation() {
+        for drift in ["sidecar", "grid"] {
+            let mut config = test_moe_block_fp8_config();
+            let weight = config
+                .weights
+                .iter_mut()
+                .find(|weight| {
+                    weight.layer_index == Some(0)
+                        && weight.expert_index == Some(0)
+                        && weight.role == "moe_per_expert_gate_proj"
+                })
+                .unwrap();
+            let FamilyWeightSourceEncoding::BlockFp8 { scale_inv, .. } =
+                &mut weight.source_encoding
+            else {
+                panic!("test expert projection is block-FP8")
+            };
+            match drift {
+                "sidecar" => {
+                    scale_inv.external_name = scale_inv
+                        .external_name
+                        .replace("gate_proj.weight_scale_inv", "up_proj.weight_scale_inv")
+                }
+                "grid" => scale_inv.dimensions = vec![2, 1],
+                _ => unreachable!(),
+            }
+
+            let error = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+                .prepare(&serde_json::to_value(config).unwrap())
+                .expect_err("block-FP8 MoE source drift must fail before allocation");
+            let VNextError::InvalidModelConfig { field, reason, .. } = error else {
+                panic!("expected typed invalid-model-config rejection, got {error}")
+            };
+            assert!(field.starts_with("weights"), "{drift}: {field}: {reason}");
+            assert!(
+                reason.contains(if drift == "sidecar" {
+                    "identity or dtype"
+                } else {
+                    "block grid"
+                }),
+                "{drift}: {reason}"
+            );
+        }
     }
 
     #[test]

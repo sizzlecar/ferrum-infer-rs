@@ -5,6 +5,7 @@
 //! decoding, requantizing, or selecting an execution kernel. A later,
 //! explicitly registered materializer owns source-to-execution conversion.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use ferrum_interfaces::vnext::{
@@ -44,36 +45,12 @@ impl BlockFp8SafetensorsSource {
         quantization: &QuantizationSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
         validate_source_quantization(component, quantization)?;
-        let [external_name] = component.external_names.as_slice() else {
-            return Err(invalid_component(
-                component,
-                "FP8 values require exactly one safetensors source",
-            ));
-        };
-        if !external_name.ends_with(".weight") {
-            return Err(invalid_component(
-                component,
-                "FP8 values source must end with .weight",
-            ));
-        }
-        let tensor = self.tensor(component, external_name)?;
-        if tensor.dtype() != Dtype::F8_E4M3 {
-            return Err(invalid_component(
-                component,
-                format!(
-                    "FP8 values must use safetensors F8_E4M3, got {:?}",
-                    tensor.dtype()
-                ),
-            ));
-        }
-        validate_unit_prefix_shape(component, tensor.shape(), "FP8 values")?;
-        WeightComponentPayload::new(
+        self.ordered_matrix_payload(
             component,
-            tensor.external_name(),
-            tensor.source_file(),
-            component.dimensions.clone(),
+            ".weight",
+            Dtype::F8_E4M3,
             ElementType::U8,
-            tensor.bytes(),
+            "FP8 values",
         )
     }
 
@@ -81,36 +58,91 @@ impl BlockFp8SafetensorsSource {
         &'source self,
         component: &WeightComponentSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
-        let [external_name] = component.external_names.as_slice() else {
-            return Err(invalid_component(
-                component,
-                "FP8 inverse scales require exactly one safetensors source",
-            ));
-        };
-        if !external_name.ends_with(".weight_scale_inv") {
-            return Err(invalid_component(
-                component,
-                "FP8 inverse-scale source must end with .weight_scale_inv",
-            ));
-        }
-        let tensor = self.tensor(component, external_name)?;
-        if tensor.dtype() != Dtype::BF16 {
-            return Err(invalid_component(
-                component,
-                format!(
-                    "FP8 inverse scales must use safetensors BF16, got {:?}",
-                    tensor.dtype()
-                ),
-            ));
-        }
-        validate_unit_prefix_shape(component, tensor.shape(), "FP8 inverse scales")?;
-        WeightComponentPayload::new(
+        self.ordered_matrix_payload(
             component,
-            tensor.external_name(),
-            tensor.source_file(),
-            component.dimensions.clone(),
+            ".weight_scale_inv",
+            Dtype::BF16,
             ElementType::Bf16,
-            tensor.bytes(),
+            "FP8 inverse scales",
+        )
+    }
+
+    fn ordered_matrix_payload<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+        required_suffix: &str,
+        required_dtype: Dtype,
+        element_type: ElementType,
+        label: &str,
+    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        if component.external_names.is_empty() {
+            return Err(invalid_component(
+                component,
+                format!("{label} require at least one safetensors source"),
+            ));
+        }
+        let mut unique_names = BTreeSet::new();
+        for external_name in &component.external_names {
+            if !external_name.ends_with(required_suffix) {
+                return Err(invalid_component(
+                    component,
+                    format!("every {label} source must end with {required_suffix}"),
+                ));
+            }
+            if !unique_names.insert(external_name) {
+                return Err(invalid_component(
+                    component,
+                    format!("ordered {label} sources contain duplicate tensor {external_name:?}"),
+                ));
+            }
+        }
+
+        if let [external_name] = component.external_names.as_slice() {
+            let tensor = self.tensor(component, external_name)?;
+            validate_source_tensor(component, &tensor, required_dtype, label)?;
+            validate_unit_prefix_shape(component, tensor.shape(), label)?;
+            return WeightComponentPayload::new(
+                component,
+                tensor.external_name(),
+                tensor.source_file(),
+                component.dimensions.clone(),
+                element_type,
+                tensor.bytes(),
+            );
+        }
+
+        let source_dimensions =
+            aggregate_source_matrix_dimensions(component, component.external_names.len(), label)?;
+        let expected_bytes = usize::try_from(component.physical_bytes()?).map_err(|_| {
+            invalid_component(
+                component,
+                format!("aggregate {label} byte size exceeds host address space"),
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(expected_bytes);
+        let mut source_files = Vec::with_capacity(component.external_names.len());
+        for external_name in &component.external_names {
+            let tensor = self.tensor(component, external_name)?;
+            validate_source_tensor(component, &tensor, required_dtype, label)?;
+            if tensor.shape() != source_dimensions {
+                return Err(invalid_component(
+                    component,
+                    format!(
+                        "ordered {label} source {external_name:?} shape {:?} differs from the typed matrix axes {source_dimensions:?}",
+                        tensor.shape()
+                    ),
+                ));
+            }
+            source_files.push(tensor.source_file().to_owned());
+            bytes.extend_from_slice(tensor.bytes());
+        }
+        WeightComponentPayload::from_ordered_sources(
+            component,
+            component.external_names.clone(),
+            source_files,
+            component.dimensions.clone(),
+            element_type,
+            bytes,
         )
     }
 
@@ -123,6 +155,58 @@ impl BlockFp8SafetensorsSource {
             .tensor(external_name)
             .map_err(|error| invalid_component(component, error.to_string()))
     }
+}
+
+fn validate_source_tensor(
+    component: &WeightComponentSpec,
+    tensor: &SafetensorsTensor<'_>,
+    required_dtype: Dtype,
+    label: &str,
+) -> std::result::Result<(), VNextError> {
+    if tensor.dtype() != required_dtype {
+        return Err(invalid_component(
+            component,
+            format!(
+                "{label} must use safetensors {required_dtype:?}, got {:?} for {:?}",
+                tensor.dtype(),
+                tensor.external_name()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn aggregate_source_matrix_dimensions<'component>(
+    component: &'component WeightComponentSpec,
+    source_count: usize,
+    label: &str,
+) -> std::result::Result<&'component [u64], VNextError> {
+    let matrix_axis = component.dimensions.len().checked_sub(2).ok_or_else(|| {
+        invalid_component(
+            component,
+            format!("aggregate {label} require typed prefix plus matrix axes"),
+        )
+    })?;
+    if matrix_axis == 0 {
+        return Err(invalid_component(
+            component,
+            format!("aggregate {label} require at least one typed prefix axis"),
+        ));
+    }
+    let expected_sources = component.dimensions[..matrix_axis]
+        .iter()
+        .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+        .ok_or_else(|| invalid_component(component, format!("aggregate {label} size overflows")))?;
+    if usize::try_from(expected_sources).ok() != Some(source_count) {
+        return Err(invalid_component(
+            component,
+            format!(
+                "aggregate {label} typed prefix {:?} requires {expected_sources} ordered matrices, got {source_count}",
+                &component.dimensions[..matrix_axis]
+            ),
+        ));
+    }
+    Ok(&component.dimensions[matrix_axis..])
 }
 
 impl WeightComponentSource for BlockFp8SafetensorsSource {
@@ -224,6 +308,18 @@ mod tests {
 
     const VALUES_NAME: &str = "model.layers.0.mlp.gate_proj.weight";
     const SCALES_NAME: &str = "model.layers.0.mlp.gate_proj.weight_scale_inv";
+    const ORDERED_VALUE_NAMES: [&str; 4] = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+        "model.layers.0.mlp.experts.1.gate_proj.weight",
+        "model.layers.0.mlp.experts.1.up_proj.weight",
+    ];
+    const ORDERED_SCALE_NAMES: [&str; 4] = [
+        "model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv",
+        "model.layers.0.mlp.experts.0.up_proj.weight_scale_inv",
+        "model.layers.0.mlp.experts.1.gate_proj.weight_scale_inv",
+        "model.layers.0.mlp.experts.1.up_proj.weight_scale_inv",
+    ];
 
     fn quantization() -> QuantizationSpec {
         QuantizationSpec {
@@ -268,6 +364,54 @@ mod tests {
         directory
     }
 
+    fn write_ordered_fixture(last_scale_shape: [usize; 2]) -> tempfile::TempDir {
+        let directory = tempdir().unwrap();
+        let value_0 = [1_u8; 6];
+        let value_1 = [2_u8; 6];
+        let value_2 = [3_u8; 6];
+        let value_3 = [4_u8; 6];
+        let scale_0 = [10_u8, 0];
+        let scale_1 = [20_u8, 0];
+        let scale_2 = [30_u8, 0];
+        let scale_3 = vec![40_u8; last_scale_shape[0] * last_scale_shape[1] * 2];
+        let views = BTreeMap::from([
+            (
+                ORDERED_VALUE_NAMES[0],
+                TensorView::new(Dtype::F8_E4M3, vec![2, 3], &value_0).unwrap(),
+            ),
+            (
+                ORDERED_VALUE_NAMES[1],
+                TensorView::new(Dtype::F8_E4M3, vec![2, 3], &value_1).unwrap(),
+            ),
+            (
+                ORDERED_VALUE_NAMES[2],
+                TensorView::new(Dtype::F8_E4M3, vec![2, 3], &value_2).unwrap(),
+            ),
+            (
+                ORDERED_VALUE_NAMES[3],
+                TensorView::new(Dtype::F8_E4M3, vec![2, 3], &value_3).unwrap(),
+            ),
+            (
+                ORDERED_SCALE_NAMES[0],
+                TensorView::new(Dtype::BF16, vec![1, 1], &scale_0).unwrap(),
+            ),
+            (
+                ORDERED_SCALE_NAMES[1],
+                TensorView::new(Dtype::BF16, vec![1, 1], &scale_1).unwrap(),
+            ),
+            (
+                ORDERED_SCALE_NAMES[2],
+                TensorView::new(Dtype::BF16, vec![1, 1], &scale_2).unwrap(),
+            ),
+            (
+                ORDERED_SCALE_NAMES[3],
+                TensorView::new(Dtype::BF16, last_scale_shape.to_vec(), &scale_3).unwrap(),
+            ),
+        ]);
+        serialize_to_file(views, &None, &directory.path().join("model.safetensors")).unwrap();
+        directory
+    }
+
     fn values_component() -> WeightComponentSpec {
         WeightComponentSpec {
             id: WeightId::new("component.fp8.values").unwrap(),
@@ -285,6 +429,30 @@ mod tests {
             role: WeightComponentRole::Scales,
             external_names: vec![SCALES_NAME.to_owned()],
             dimensions: vec![1, 2, 3],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::Bf16,
+            },
+            required: true,
+        }
+    }
+
+    fn ordered_values_component() -> WeightComponentSpec {
+        WeightComponentSpec {
+            id: WeightId::new("component.fp8.expert_gate_up.values").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: ORDERED_VALUE_NAMES.map(str::to_owned).to_vec(),
+            dimensions: vec![2, 2, 2, 3],
+            encoding: WeightEncoding::Quantized(quantization()),
+            required: true,
+        }
+    }
+
+    fn ordered_scales_component() -> WeightComponentSpec {
+        WeightComponentSpec {
+            id: WeightId::new("component.fp8.expert_gate_up.scales").unwrap(),
+            role: WeightComponentRole::Scales,
+            external_names: ORDERED_SCALE_NAMES.map(str::to_owned).to_vec(),
+            dimensions: vec![2, 2, 1, 1],
             encoding: WeightEncoding::Dense {
                 element_type: ElementType::Bf16,
             },
@@ -315,6 +483,67 @@ mod tests {
                 .bytes()
                 .as_ptr()
         ));
+    }
+
+    #[test]
+    fn aggregates_expert_major_matrices_in_exact_schema_order() {
+        let fixture = write_ordered_fixture([1, 1]);
+        let source = BlockFp8SafetensorsSource::open(fixture.path()).unwrap();
+
+        let values = source.component(&ordered_values_component()).unwrap();
+        let scales = source.component(&ordered_scales_component()).unwrap();
+
+        assert_eq!(
+            values.external_names(),
+            ORDERED_VALUE_NAMES.map(str::to_owned)
+        );
+        assert_eq!(values.dimensions(), [2, 2, 2, 3]);
+        assert_eq!(
+            values.bytes(),
+            [vec![1_u8; 6], vec![2_u8; 6], vec![3_u8; 6], vec![4_u8; 6]].concat()
+        );
+        assert_eq!(
+            scales.external_names(),
+            ORDERED_SCALE_NAMES.map(str::to_owned)
+        );
+        assert_eq!(scales.dimensions(), [2, 2, 1, 1]);
+        assert_eq!(scales.bytes(), [10, 0, 20, 0, 30, 0, 40, 40]);
+    }
+
+    #[test]
+    fn rejects_aggregate_prefix_sidecar_or_grid_drift() {
+        let fixture = write_ordered_fixture([1, 1]);
+        let source = BlockFp8SafetensorsSource::open(fixture.path()).unwrap();
+
+        let mut wrong_prefix = ordered_values_component();
+        wrong_prefix.dimensions[1] = 3;
+        let error = match source.component(&wrong_prefix) {
+            Ok(_) => panic!("aggregate prefix drift must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("requires 6 ordered matrices"),
+            "{error}"
+        );
+
+        let mut wrong_sidecar = ordered_scales_component();
+        wrong_sidecar.external_names[3] = "model.layers.0.mlp.experts.1.up_proj.scale".to_owned();
+        let error = match source.component(&wrong_sidecar) {
+            Ok(_) => panic!("aggregate sidecar drift must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("weight_scale_inv"), "{error}");
+
+        let bad_grid = write_ordered_fixture([1, 2]);
+        let source = BlockFp8SafetensorsSource::open(bad_grid.path()).unwrap();
+        let error = match source.component(&ordered_scales_component()) {
+            Ok(_) => panic!("aggregate scale-grid drift must fail closed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("typed matrix axes [1, 1]"),
+            "{error}"
+        );
     }
 
     #[test]

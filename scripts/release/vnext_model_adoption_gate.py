@@ -106,6 +106,16 @@ M1_RUST_CONTRACTS = {
             "rejects_block_fp8_inverse_scale_grid_drift_before_runtime"
         ),
     },
+    "qwen36-35b-a3b-fp8": {
+        "qwen36-35b-a3b-fp8-wrong-format": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_metadata_recipe_drift_with_typed_error_before_runtime"
+        ),
+        "qwen36-35b-a3b-fp8-expert-scale-grid-drift": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_moe_sidecar_or_grid_drift_before_allocation"
+        ),
+    },
 }
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SECRET_KEY = re.compile(r"(?:api[_-]?key|token|password|secret|authorization)", re.I)
@@ -1247,14 +1257,18 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
     return expected_line
 
 
-def synthetic_envelope(artifact_type: str) -> dict[str, Any]:
+def synthetic_envelope(
+    artifact_type: str,
+    checkpoint_id: str = "qwen38-27b-fp8",
+) -> dict[str, Any]:
+    repository, revision = CHECKPOINTS[checkpoint_id]
     return {
         "schema_version": 1,
         "artifact_type": artifact_type,
         "checkpoint": {
-            "id": "qwen38-27b-fp8",
-            "repository": CHECKPOINTS["qwen38-27b-fp8"][0],
-            "revision": CHECKPOINTS["qwen38-27b-fp8"][1],
+            "id": checkpoint_id,
+            "repository": repository,
+            "revision": revision,
         },
         "candidate": {"git_sha": "1" * 40, "dirty": False, "dirty_status": []},
         "sanitized_environment": {"CUDA_VISIBLE_DEVICES": "0", "HF_TOKEN": "<redacted>"},
@@ -1271,7 +1285,10 @@ def synthetic_envelope(artifact_type: str) -> dict[str, Any]:
     }
 
 
-def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
+def synthetic_pass_documents(
+    out_dir: Path,
+    checkpoint_id: str = "qwen38-27b-fp8",
+) -> dict[str, dict[str, Any]]:
     unit_manifest = out_dir.parent / f"{out_dir.name}-upstream" / "unit.gate.json"
     write_json(unit_manifest, {"status": "pass"})
     expected_tensors = ["model.layers.0.q_proj.weight", "model.layers.0.o_proj.weight"]
@@ -1289,14 +1306,18 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
         "quality_vector_digest": "d" * 64,
     }
     model_lock = {
-        **synthetic_envelope("model-lock"),
+        **synthetic_envelope("model-lock", checkpoint_id),
         "milestones": {"M0": {"status": "pass"}},
         "source_lock": {
             "identity": {
-                "repository": CHECKPOINTS["qwen38-27b-fp8"][0],
-                "revision": CHECKPOINTS["qwen38-27b-fp8"][1],
+                "repository": CHECKPOINTS[checkpoint_id][0],
+                "revision": CHECKPOINTS[checkpoint_id][1],
                 "license": "apache-2.0",
-                "architecture": "Qwen3_5ForConditionalGeneration",
+                "architecture": (
+                    "Qwen3_5MoeForConditionalGeneration"
+                    if checkpoint_id == "qwen36-35b-a3b-fp8"
+                    else "Qwen3_5ForConditionalGeneration"
+                ),
             },
             "lock_checks": {
                 "config": True,
@@ -1431,7 +1452,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
     }
     m1_cases = []
     m1_references = []
-    for case_id, rust_test_id in M1_RUST_CONTRACTS["qwen38-27b-fp8"].items():
+    for case_id, rust_test_id in M1_RUST_CONTRACTS[checkpoint_id].items():
         case_root = m1_root / case_id
         case_root.mkdir(parents=True, exist_ok=True)
         stdout_path = (case_root / "stdout.log").resolve()
@@ -1513,7 +1534,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
         )
 
     validation = {
-        **synthetic_envelope("validation"),
+        **synthetic_envelope("validation", checkpoint_id),
         "binary_sha256": "e" * 64,
         "milestones": {stage: {"status": "pass"} for stage in ["M1", "M2", "M3", "M6"]},
         "fail_closed": {
@@ -1581,7 +1602,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
     }
     validation["references"] = [reference_for(unit_manifest), *m1_references]
     product = {
-        **synthetic_envelope("product"),
+        **synthetic_envelope("product", checkpoint_id),
         "binary_sha256": "e" * 64,
         "hardware": {
             "gpu_count": 1,
@@ -1682,15 +1703,19 @@ def write_synthetic_package(
     status: str = "PASS",
     reason: tuple[str, str] | None = None,
 ) -> None:
+    checkpoint_id = non_empty_string(
+        as_object(documents["model-lock.json"]["checkpoint"], "synthetic checkpoint")["id"],
+        "synthetic checkpoint.id",
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     for filename, document in documents.items():
         write_json(out_dir / filename, document)
     manifest = {
-        **synthetic_envelope("manifest"),
+        **synthetic_envelope("manifest", checkpoint_id),
         "validator_version": VALIDATOR_VERSION,
         "final_status": status,
         "terminal_reason": None if reason is None else {"code": reason[0], "detail": reason[1]},
-        "terminal_line": expected_terminal_line(status, "qwen38-27b-fp8", out_dir),
+        "terminal_line": expected_terminal_line(status, checkpoint_id, out_dir),
         "receipts": {
             filename: reference_for(out_dir / filename, filename)
             for filename in ["model-lock.json", "validation.json", "product.json"]
@@ -1734,6 +1759,15 @@ def run_self_test() -> None:
         write_synthetic_package(passing, pass_docs)
         expected = expected_terminal_line("PASS", "qwen38-27b-fp8", passing)
         require(validate_package("qwen38-27b-fp8", passing) == expected, "synthetic PASS line mismatch")
+
+        a3_passing = root / "a3-pass"
+        a3_pass_docs = synthetic_pass_documents(a3_passing, "qwen36-35b-a3b-fp8")
+        write_synthetic_package(a3_passing, a3_pass_docs)
+        a3_expected = expected_terminal_line("PASS", "qwen36-35b-a3b-fp8", a3_passing)
+        require(
+            validate_package("qwen36-35b-a3b-fp8", a3_passing) == a3_expected,
+            "synthetic A3 PASS line mismatch",
+        )
 
         threshold = root / "bad-threshold"
         threshold_docs = synthetic_pass_documents(threshold)
