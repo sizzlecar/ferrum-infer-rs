@@ -16,7 +16,6 @@ use ferrum_kernels::marlin_fp8_materializer::{
     MARLIN_FP8_GROUP128_WEIGHT_LAYOUT_ID,
 };
 use ferrum_kernels::marlin_repack::{
-    block_fp8_group128_raw_bits_to_marlin_u32_reference,
     block_fp8_group128_scales_to_marlin_f16_reference,
     repack_compressed_tensors_zero_points_to_marlin, repack_gptq_to_marlin,
     repack_scales_to_marlin,
@@ -114,6 +113,43 @@ struct ExactParityArtifactV1 {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Pack exact row-major E4M3 bytes from `[N, K]` into the final 16-by-64
+/// Marlin W8A16 tile ABI. This test-only oracle is deliberately independent
+/// of both the product CUDA transform and its staging-layout reference.
+fn block_fp8_group128_raw_bits_to_final_marlin_u32_reference(
+    source_fp8_e4m3: &[u8],
+    n: usize,
+    k: usize,
+) -> Vec<u32> {
+    assert_eq!(n % 128, 0, "group-128 output dimension");
+    assert_eq!(k % 128, 0, "group-128 input dimension");
+    assert_eq!(source_fp8_e4m3.len(), n * k, "group-128 value count");
+
+    let mut packed = Vec::with_capacity(n * k / 4);
+    for k_tile in 0..k / 16 {
+        for n_tile in 0..n / 64 {
+            for marlin_thread in 0..32 {
+                let tensor_core_column = marlin_thread / 4;
+                let tensor_core_row = (marlin_thread % 4) * 2;
+                for warp in 0..4 {
+                    for column_half in 0..2 {
+                        let output = n_tile * 64 + warp * 16 + tensor_core_column + column_half * 8;
+                        let source_base = output * k + k_tile * 16;
+                        packed.push(u32::from_le_bytes([
+                            source_fp8_e4m3[source_base + tensor_core_row],
+                            source_fp8_e4m3[source_base + tensor_core_row + 8],
+                            source_fp8_e4m3[source_base + tensor_core_row + 1],
+                            source_fp8_e4m3[source_base + tensor_core_row + 9],
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(packed.len(), n * k / 4, "final Marlin word count");
+    packed
 }
 
 fn conservative_relative_l2_upper_bound(relative_l2: f64) -> CanonicalRational {
@@ -598,8 +634,7 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
         );
 
         let expected_packed =
-            block_fp8_group128_raw_bits_to_marlin_u32_reference(&source_values, n, k)
-                .expect("build exact group-128 final Marlin packed-weight oracle");
+            block_fp8_group128_raw_bits_to_final_marlin_u32_reference(&source_values, n, k);
         let expected_scales =
             block_fp8_group128_scales_to_marlin_f16_reference(&inverse_scale_bytes, n, k)
                 .expect("build exact group-128 scale oracle")
