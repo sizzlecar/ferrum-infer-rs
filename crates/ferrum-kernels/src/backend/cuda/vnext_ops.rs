@@ -225,9 +225,11 @@ fn cuda_weight_materializer_selection(
 
     #[cfg(feature = "vllm-marlin")]
     {
-        WeightMaterializerSelection::exact(WeightMaterializerId::new(
-            crate::marlin_fp8_materializer::BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
-        )?)
+        Ok(WeightMaterializerSelection::exact(
+            WeightMaterializerId::new(
+                crate::marlin_fp8_materializer::BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
+            )?,
+        ))
     }
     #[cfg(not(feature = "vllm-marlin"))]
     {
