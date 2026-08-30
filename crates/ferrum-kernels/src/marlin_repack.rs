@@ -50,6 +50,10 @@ pub enum Fp8MarlinPrepareError {
         n: usize,
         k: usize,
     },
+    UnsupportedGroup128Shape {
+        n: usize,
+        k: usize,
+    },
     SourceLength {
         actual: usize,
         expected: usize,
@@ -119,6 +123,10 @@ impl fmt::Display for Fp8MarlinPrepareError {
             Self::UnsupportedBlockShape { n, k } => write!(
                 formatter,
                 "block-FP8 shape [N={n}, K={k}] must have non-zero block extents"
+            ),
+            Self::UnsupportedGroup128Shape { n, k } => write!(
+                formatter,
+                "exact block-FP8 group-128 shape [N={n}, K={k}] must be divisible by 128 on both axes"
             ),
             Self::SourceLength { actual, expected } => write!(
                 formatter,
@@ -393,14 +401,236 @@ pub fn prepare_f16_weight_for_fp8_marlin(
     })
 }
 
-/// Convert block-scaled E4M3 checkpoint storage directly into the Marlin
-/// channel-wise E4M3 W8A16 ABI.
+/// Pack exact row-major E4M3 bytes from `[N, K]` into the u32 staging ABI
+/// `[K / 4, N]` consumed by Marlin's 8-bit repacker.
+///
+/// This is a small-shape/reference implementation for validating the GPU
+/// static transform. It never decodes or canonicalizes E4M3 values, so every
+/// source bit pattern, including non-finite encodings, is preserved verbatim.
+pub fn block_fp8_group128_raw_bits_to_u32_reference(
+    source_fp8_e4m3: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Vec<u32>, Fp8MarlinPrepareError> {
+    pack_block_fp8_group128_matrix_slices_to_u32_reference(&[source_fp8_e4m3], n, k)
+}
+
+/// Fuse adjacent gate/up `[N, K]` source matrices into `[2N, K]` before
+/// emitting the `[K / 4, 2N]` u32 staging ABI.
+///
+/// Concatenating independently packed gate and up buffers is incorrect because
+/// the packed-input axis is outermost. This helper is the pure Rust oracle for
+/// the required GPU fusion order.
+pub fn block_fp8_group128_gate_up_raw_bits_to_u32_reference(
+    gate_fp8_e4m3: &[u8],
+    up_fp8_e4m3: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Vec<u32>, Fp8MarlinPrepareError> {
+    pack_block_fp8_group128_matrix_slices_to_u32_reference(&[gate_fp8_e4m3, up_fp8_e4m3], n, k)
+}
+
+fn pack_block_fp8_group128_matrix_slices_to_u32_reference(
+    matrices: &[&[u8]],
+    n: usize,
+    k: usize,
+) -> Result<Vec<u32>, Fp8MarlinPrepareError> {
+    validate_block_fp8_group128_shape(n, k)?;
+    let values_per_matrix = n
+        .checked_mul(k)
+        .ok_or(Fp8MarlinPrepareError::BlockFp8ValueLength {
+            actual: matrices.first().map_or(0, |matrix| matrix.len()),
+            expected: usize::MAX,
+        })?;
+    if let Some(matrix) = matrices
+        .iter()
+        .find(|matrix| matrix.len() != values_per_matrix)
+    {
+        return Err(Fp8MarlinPrepareError::BlockFp8ValueLength {
+            actual: matrix.len(),
+            expected: values_per_matrix,
+        });
+    }
+    let fused_n =
+        n.checked_mul(matrices.len())
+            .ok_or(Fp8MarlinPrepareError::BlockFp8ValueLength {
+                actual: values_per_matrix,
+                expected: usize::MAX,
+            })?;
+    let word_count =
+        (k / 4)
+            .checked_mul(fused_n)
+            .ok_or(Fp8MarlinPrepareError::AllocationFailed {
+                buffer: "raw-bit u32 staging",
+                elements: usize::MAX,
+            })?;
+    let mut packed = Vec::new();
+    packed
+        .try_reserve_exact(word_count)
+        .map_err(|_| Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "raw-bit u32 staging",
+            elements: word_count,
+        })?;
+    packed.resize(word_count, 0_u32);
+    for packed_input in 0..k / 4 {
+        for fused_output in 0..fused_n {
+            let matrix = matrices[fused_output / n];
+            let output = fused_output % n;
+            let input = packed_input * 4;
+            packed[packed_input * fused_n + fused_output] = u32::from_le_bytes([
+                matrix[output * k + input],
+                matrix[output * k + input + 1],
+                matrix[output * k + input + 2],
+                matrix[output * k + input + 3],
+            ]);
+        }
+    }
+    Ok(packed)
+}
+
+/// Expand the source BF16 128x128 inverse-scale grid into Marlin's grouped
+/// F16 scale ABI and apply the exponent-bias correction (`scale * 256`).
+///
+/// The returned flat storage has logical shape `[K / 128, N]` before Marlin's
+/// P32 (`G=1`) or P64 (`G>1`) fragment permutation.
+pub fn block_fp8_group128_scales_to_marlin_f16_reference(
+    source_inverse_scales_bf16_le: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Vec<half::f16>, Fp8MarlinPrepareError> {
+    validate_block_fp8_group128_shape(n, k)?;
+    let block_rows = n / 128;
+    let group_count = k / 128;
+    let scale_count =
+        block_rows
+            .checked_mul(group_count)
+            .ok_or(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+                actual: source_inverse_scales_bf16_le.len(),
+                expected: usize::MAX,
+            })?;
+    let expected_scale_bytes =
+        scale_count
+            .checked_mul(2)
+            .ok_or(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+                actual: source_inverse_scales_bf16_le.len(),
+                expected: usize::MAX,
+            })?;
+    if source_inverse_scales_bf16_le.len() != expected_scale_bytes {
+        return Err(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+            actual: source_inverse_scales_bf16_le.len(),
+            expected: expected_scale_bytes,
+        });
+    }
+
+    let expanded_count =
+        group_count
+            .checked_mul(n)
+            .ok_or(Fp8MarlinPrepareError::AllocationFailed {
+                buffer: "group-128 scales",
+                elements: usize::MAX,
+            })?;
+    let mut expanded = Vec::new();
+    expanded.try_reserve_exact(expanded_count).map_err(|_| {
+        Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "group-128 scales",
+            elements: expanded_count,
+        }
+    })?;
+    expanded.resize(expanded_count, half::f16::ZERO);
+    for group in 0..group_count {
+        for output in 0..n {
+            let block_output = output / 128;
+            let source_index = block_output * group_count + group;
+            let source_offset = source_index * 2;
+            let inverse_scale = half::bf16::from_le_bytes([
+                source_inverse_scales_bf16_le[source_offset],
+                source_inverse_scales_bf16_le[source_offset + 1],
+            ])
+            .to_f32();
+            if !inverse_scale.is_finite() {
+                return Err(Fp8MarlinPrepareError::NonFiniteBlockFp8Scale {
+                    block_output,
+                    block_input: group,
+                });
+            }
+            if !(inverse_scale > 0.0) {
+                return Err(Fp8MarlinPrepareError::NonPositiveBlockFp8Scale {
+                    block_output,
+                    block_input: group,
+                });
+            }
+            let marlin_scale = half::f16::from_f32(inverse_scale * FP8_F16_EXPONENT_BIAS_SCALE);
+            if !marlin_scale.is_finite() || marlin_scale == half::f16::ZERO {
+                return Err(Fp8MarlinPrepareError::UnrepresentableMarlinScale { output });
+            }
+            expanded[group * n + output] = marlin_scale;
+        }
+    }
+    Ok(repack_scales_to_marlin(&expanded, k, n, 128))
+}
+
+/// Fuse adjacent gate/up inverse-scale grids before grouped scale expansion
+/// and Marlin permutation.
+pub fn block_fp8_group128_gate_up_scales_to_marlin_f16_reference(
+    gate_inverse_scales_bf16_le: &[u8],
+    up_inverse_scales_bf16_le: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Vec<half::f16>, Fp8MarlinPrepareError> {
+    validate_block_fp8_group128_shape(n, k)?;
+    let source_scale_bytes = (n / 128)
+        .checked_mul(k / 128)
+        .and_then(|scales| scales.checked_mul(2))
+        .ok_or(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+            actual: gate_inverse_scales_bf16_le.len(),
+            expected: usize::MAX,
+        })?;
+    for source in [gate_inverse_scales_bf16_le, up_inverse_scales_bf16_le] {
+        if source.len() != source_scale_bytes {
+            return Err(Fp8MarlinPrepareError::BlockFp8ScaleLength {
+                actual: source.len(),
+                expected: source_scale_bytes,
+            });
+        }
+    }
+    let fused_n = n
+        .checked_mul(2)
+        .ok_or(Fp8MarlinPrepareError::UnsupportedGroup128Shape { n, k })?;
+    let fused_scale_bytes =
+        source_scale_bytes
+            .checked_mul(2)
+            .ok_or(Fp8MarlinPrepareError::AllocationFailed {
+                buffer: "fused gate/up inverse-scale grid",
+                elements: usize::MAX,
+            })?;
+    let mut fused = Vec::new();
+    fused.try_reserve_exact(fused_scale_bytes).map_err(|_| {
+        Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "fused gate/up inverse-scale grid",
+            elements: fused_scale_bytes,
+        }
+    })?;
+    fused.extend_from_slice(gate_inverse_scales_bf16_le);
+    fused.extend_from_slice(up_inverse_scales_bf16_le);
+    block_fp8_group128_scales_to_marlin_f16_reference(&fused, fused_n, k)
+}
+
+fn validate_block_fp8_group128_shape(n: usize, k: usize) -> Result<(), Fp8MarlinPrepareError> {
+    if n == 0 || k == 0 || !n.is_multiple_of(128) || !k.is_multiple_of(128) {
+        return Err(Fp8MarlinPrepareError::UnsupportedGroup128Shape { n, k });
+    }
+    Ok(())
+}
+
+/// Reference-only conversion from block-scaled E4M3 checkpoint storage into
+/// the legacy Marlin channel-wise E4M3 W8A16 ABI.
 ///
 /// `source_fp8_e4m3` is a row-major logical `[N, K]` byte matrix. The BF16
 /// inverse-scale grid is row-major `[ceil(N / block_n), ceil(K / block_k)]` and
 /// decodes each source value as `E4M3(value) * inverse_scale[block]`. The
 /// conversion scans the source twice and never allocates a dense `[N, K]`
-/// intermediate.
+/// intermediate. Product block-FP8 initialization must not call this routine;
+/// it exists for numerical comparison tests against the exact group-128 path.
 pub fn prepare_block_fp8_weight_for_fp8_marlin(
     source_fp8_e4m3: &[u8],
     source_inverse_scales_bf16_le: &[u8],
@@ -1081,6 +1311,157 @@ mod tests {
             .into_iter()
             .flat_map(|value| half::f16::from_f32(value).to_le_bytes())
             .collect()
+    }
+
+    fn permute_scale_chunks_reference(
+        input: &[half::f16],
+        permutation: &[usize],
+    ) -> Vec<half::f16> {
+        let mut output = vec![half::f16::ZERO; input.len()];
+        for (input_chunk, output_chunk) in input
+            .chunks_exact(permutation.len())
+            .zip(output.chunks_exact_mut(permutation.len()))
+        {
+            for (destination, source) in permutation.iter().copied().enumerate() {
+                output_chunk[destination] = input_chunk[source];
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn group128_raw_bit_staging_is_exact_k_over_four_by_n() {
+        let n = 128;
+        let k = 128;
+        let source = (0..n * k)
+            .map(|index| (index as u8).wrapping_mul(73).wrapping_add(0x7f))
+            .collect::<Vec<_>>();
+
+        let packed = block_fp8_group128_raw_bits_to_u32_reference(&source, n, k).unwrap();
+        assert_eq!(packed.len(), (k / 4) * n);
+        for packed_input in 0..k / 4 {
+            for output in 0..n {
+                let input = packed_input * 4;
+                assert_eq!(
+                    packed[packed_input * n + output].to_le_bytes(),
+                    source[output * k + input..output * k + input + 4],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn group128_gate_up_is_fused_before_raw_bit_staging() {
+        let n = 128;
+        let k = 128;
+        let gate = (0..n * k)
+            .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+            .collect::<Vec<_>>();
+        let up = (0..n * k)
+            .map(|index| (index as u8).wrapping_mul(29).wrapping_add(11))
+            .collect::<Vec<_>>();
+
+        let fused = block_fp8_group128_gate_up_raw_bits_to_u32_reference(&gate, &up, n, k).unwrap();
+        let separately_concatenated = [
+            block_fp8_group128_raw_bits_to_u32_reference(&gate, n, k).unwrap(),
+            block_fp8_group128_raw_bits_to_u32_reference(&up, n, k).unwrap(),
+        ]
+        .concat();
+        assert_ne!(fused, separately_concatenated);
+        assert_eq!(fused.len(), (k / 4) * (2 * n));
+        for packed_input in 0..k / 4 {
+            for fused_output in 0..2 * n {
+                let source = if fused_output < n { &gate } else { &up };
+                let output = fused_output % n;
+                let input = packed_input * 4;
+                assert_eq!(
+                    fused[packed_input * (2 * n) + fused_output].to_le_bytes(),
+                    source[output * k + input..output * k + input + 4],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn group128_gate_up_scales_are_fused_before_group_major_permutation() {
+        let n = 256;
+        let k = 256;
+        let encode = |values: [f32; 4]| {
+            values
+                .into_iter()
+                .flat_map(|scale| half::bf16::from_f32(scale).to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        let gate = encode([0.5, 1.0, 2.0, 4.0]);
+        let up = encode([8.0, 16.0, 32.0, 64.0]);
+
+        let fused =
+            block_fp8_group128_gate_up_scales_to_marlin_f16_reference(&gate, &up, n, k).unwrap();
+        let separately_concatenated = [
+            block_fp8_group128_scales_to_marlin_f16_reference(&gate, n, k).unwrap(),
+            block_fp8_group128_scales_to_marlin_f16_reference(&up, n, k).unwrap(),
+        ]
+        .concat();
+        let fused_source = [gate, up].concat();
+        let expected =
+            block_fp8_group128_scales_to_marlin_f16_reference(&fused_source, 2 * n, k).unwrap();
+
+        assert_eq!(fused, expected);
+        assert_ne!(fused, separately_concatenated);
+        assert_eq!(fused.len(), 2 * n * (k / 128));
+    }
+
+    #[test]
+    fn marlin_scales_use_p32_for_one_group_and_p64_for_multiple_groups() {
+        const P32: [usize; 32] = [
+            0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29,
+            6, 7, 14, 15, 22, 23, 30, 31,
+        ];
+        let p64 = (0..8)
+            .flat_map(|row| (0..8).map(move |column| row + 8 * column))
+            .collect::<Vec<_>>();
+
+        let one_group = (0..128)
+            .map(|index| half::f16::from_f32(index as f32))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repack_scales_to_marlin(&one_group, 128, 128, 128),
+            permute_scale_chunks_reference(&one_group, &P32)
+        );
+
+        let multiple_groups = (0..256)
+            .map(|index| half::f16::from_f32(index as f32))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repack_scales_to_marlin(&multiple_groups, 256, 128, 128),
+            permute_scale_chunks_reference(&multiple_groups, &p64)
+        );
+    }
+
+    #[test]
+    fn group128_inverse_bf16_scales_expand_multiply_and_permute_exactly() {
+        let n = 256;
+        let k = 256;
+        let source_scales = [0.5_f32, 1.0, 2.0, 4.0]
+            .into_iter()
+            .flat_map(|scale| half::bf16::from_f32(scale).to_le_bytes())
+            .collect::<Vec<_>>();
+        let actual =
+            block_fp8_group128_scales_to_marlin_f16_reference(&source_scales, n, k).unwrap();
+
+        let expanded = (0..k / 128)
+            .flat_map(|group| {
+                (0..n).map(move |output| {
+                    let source = [0.5_f32, 1.0, 2.0, 4.0][(output / 128) * (k / 128) + group];
+                    half::f16::from_f32(source * 256.0)
+                })
+            })
+            .collect::<Vec<_>>();
+        let p64 = (0..8)
+            .flat_map(|row| (0..8).map(move |column| row + 8 * column))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, permute_scale_chunks_reference(&expanded, &p64));
+        assert_eq!(actual.len(), n * (k / 128));
     }
 
     fn vllm_fp8_repack_reference(

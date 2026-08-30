@@ -9,19 +9,20 @@ use super::{
     CanonicalValueBinding, CapabilityCatalog, CapabilityId, DimensionConstraint,
     DynamicResourceDemand, DynamicResourceDescriptor, DynamicStorageContract,
     DynamicStorageProfile, DynamicStorageRequirement, ElementType, ExecutionPlanPayload,
-    GlobalValueRange, JointComponentSolution, JointPartialSelection, JointProviderCandidate,
-    JointProviderStorageSelection, JointSelectionObjective, MemoryPlan, NodeId,
-    NodeTokenBindingProjection, NodeWorkContract, OperationDescriptor, OperationRegistryAuthority,
-    PlanBuildRequest, PlanExactAlias, PlanExactAliasKind, PlanHash, PlanHashMaterial, PlanId,
-    PlanNode, PlanNodeResolution, PlanProviderRejectReason, PlanStateEffect, PreparedModelFamily,
-    ProgramNode, ProgramNodeWorkSpec, ProgramValueId, ProviderCompatibilityRequest, ProviderId,
-    ProviderResourcePlan, ProviderSelection, ProviderSelectionReason, ProviderWorkspaceScope,
-    QuantizationFormatId, RejectedProvider, ResolvedValueBinding, ResolvedValueRole,
-    ResourceAllocation, ResourceId, ReusableExecutionMemoryPlan, ReusableExecutionPolicy,
-    RuntimePolicy, Serialize, StateCapacityDemand, StateDependencyTracker, StateInitialization,
-    StateLifetime, TensorAccess, TrustedExecutionWeightPlan, VNextError,
+    ExecutionWeightPlan, GlobalValueRange, JointComponentSolution, JointPartialSelection,
+    JointProviderCandidate, JointProviderStorageSelection, JointSelectionObjective, MemoryPlan,
+    NodeId, NodeTokenBindingProjection, NodeWorkContract, OperationDescriptor,
+    OperationRegistryAuthority, PlanBuildRequest, PlanExactAlias, PlanExactAliasKind, PlanHash,
+    PlanHashMaterial, PlanId, PlanNode, PlanNodeResolution, PlanProviderRejectReason,
+    PlanStateEffect, PreparedModelFamily, ProgramNode, ProgramNodeWorkSpec, ProgramValueId,
+    ProviderCompatibilityRequest, ProviderId, ProviderResourcePlan, ProviderSelection,
+    ProviderSelectionReason, ProviderWorkspaceScope, QuantizationFormatId, RejectedProvider,
+    ResolvedValueBinding, ResolvedValueRole, ResourceAllocation, ResourceId,
+    ReusableExecutionMemoryPlan, ReusableExecutionPolicy, RuntimePolicy, Serialize,
+    StateCapacityDemand, StateDependencyTracker, StateInitialization, StateLifetime,
+    StaticWeightTransformPlan, TensorAccess, TrustedExecutionWeightPlan, VNextError,
     ValueAllocationAccumulator, ValueResourceDemand, WeightFormatId, WeightSchema,
-    EXECUTION_PLAN_SCHEMA,
+    EXECUTION_PLAN_SCHEMA, STATIC_WEIGHT_TRANSFORM_SCRATCH_ALIGNMENT_BYTES,
 };
 use super::{resolve_retained_completion_values, CompletionRetentionSpec, RetainedCompletionValue};
 use crate::vnext::{
@@ -198,6 +199,7 @@ impl ExecutionPlan {
             .collect::<BTreeSet<_>>();
         let memory = Self::build_memory_plan(
             family,
+            request.execution_weights.plan(),
             device_capacity,
             policy_capacity,
             memory_reserve,
@@ -1480,6 +1482,7 @@ impl ExecutionPlan {
 
     pub(super) fn build_memory_plan(
         family: &PreparedModelFamily,
+        execution_weights: &ExecutionWeightPlan,
         device_capacity_bytes: u64,
         policy_capacity_bytes: u64,
         reserve_bytes: u64,
@@ -1513,6 +1516,22 @@ impl ExecutionPlan {
         let mut static_allocations = Vec::new();
         let mut dynamic_descriptors = Vec::new();
         let workspace_layout_fingerprint = workspace_storage_layout_fingerprint()?;
+        if let Some(resource_id) =
+            execution_weights.static_weight_transform_scratch_resource_id()?
+        {
+            static_allocations.push(ResourceAllocation::new(
+                resource_id,
+                execution_weights.maximum_static_weight_transform_scratch_bytes()?,
+                STATIC_WEIGHT_TRANSFORM_SCRATCH_ALIGNMENT_BYTES,
+                BufferUsage::Scratch,
+                ElementType::U8,
+                AllocationKind::InitializationScratch,
+                DynamicStorageContract::new(
+                    static_contiguous_storage_profile()?,
+                    workspace_layout_fingerprint.clone(),
+                )?,
+            )?);
+        }
         for node in nodes {
             let value_alignment = node.provider_resources.value_alignment_bytes;
             for binding in &node.values {
@@ -2088,6 +2107,43 @@ impl ExecutionPlan {
             .iter()
             .map(|descriptor| (descriptor.base_resource_id.clone(), descriptor))
             .collect::<BTreeMap<_, _>>();
+        let initialization_scratch = static_allocations
+            .values()
+            .filter(|allocation| allocation.kind == AllocationKind::InitializationScratch)
+            .collect::<Vec<_>>();
+        match self
+            .payload
+            .execution_weights
+            .static_weight_transform_scratch_resource_id()?
+        {
+            Some(expected_id) => {
+                let [allocation] = initialization_scratch.as_slice() else {
+                    return Err(invalid_plan(
+                        "static weight transforms require exactly one initialization scratch allocation",
+                    ));
+                };
+                if allocation.resource_id != expected_id
+                    || allocation.per_instance_bytes
+                        != self
+                            .payload
+                            .execution_weights
+                            .maximum_static_weight_transform_scratch_bytes()?
+                    || allocation.alignment_bytes != STATIC_WEIGHT_TRANSFORM_SCRATCH_ALIGNMENT_BYTES
+                    || allocation.usage != BufferUsage::Scratch
+                    || allocation.element_type != ElementType::U8
+                {
+                    return Err(invalid_plan(
+                        "static weight transform scratch differs from its execution weight plan",
+                    ));
+                }
+            }
+            None if initialization_scratch.is_empty() => {}
+            None => {
+                return Err(invalid_plan(
+                    "initialization scratch exists without a static weight transform",
+                ));
+            }
+        }
         let mut seen_nodes = BTreeSet::new();
         let mut canonical_values = BTreeMap::new();
         for node in &self.payload.nodes {
@@ -2431,5 +2487,13 @@ impl ExecutionPlan {
     ) -> Result<Vec<WeightComponentPayload<'source>>, VNextError> {
         self.trusted_execution_weights
             .materialize_components(family, source, components)
+    }
+
+    pub(crate) fn static_weight_transform_for_components(
+        &self,
+        components: &[&WeightComponentSpec],
+    ) -> Result<Option<&StaticWeightTransformPlan>, VNextError> {
+        self.trusted_execution_weights
+            .static_weight_transform_for_components(components)
     }
 }

@@ -31,7 +31,8 @@ use ferrum_interfaces::vnext::{
     DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
     DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
     DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
-    ProgramBindingNodeBinding, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
+    ProgramBindingNodeBinding, RetainedHostMemoryRegion, StaticWeightTransformPlan,
+    StaticWeightTransformRequest, StreamState, VNextError, DEVICE_COPY_NATIVE_OPERATION_ID,
     DEVICE_ZERO_NATIVE_OPERATION_ID, HOST_UPLOAD_NATIVE_OPERATION_ID,
 };
 use ferrum_types::AttentionExecutionPolicy;
@@ -742,6 +743,21 @@ impl CudaDeviceCommand {
         self.participant_start = 0;
         self.participant_count = participant_count;
         self.token_count = token_count;
+        self.compute_dispatch_count = compute_dispatch_count;
+        self.transfer_command_count = transfer_command_count;
+        Ok(self)
+    }
+
+    fn with_initialization_native_work(
+        mut self,
+        compute_dispatch_count: u64,
+        transfer_command_count: u64,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if compute_dispatch_count == 0 || transfer_command_count == 0 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA static transform attribution requires compute and transfer work",
+            ));
+        }
         self.compute_dispatch_count = compute_dispatch_count;
         self.transfer_command_count = transfer_command_count;
         Ok(self)
@@ -1739,6 +1755,490 @@ impl CudaDeviceRuntime {
     }
 }
 
+#[cfg(feature = "vllm-marlin")]
+const BLOCK_FP8_GROUP128_STATIC_TRANSFORM_OPERATION: &str =
+    "static_weight.block_fp8_to_marlin_fp8_group128";
+
+#[cfg(feature = "vllm-marlin")]
+#[derive(Clone, Copy)]
+struct BlockFp8Group128CudaTransform {
+    size_n: u64,
+    size_k: u64,
+    matrices_per_output: usize,
+    source_matrix_count: usize,
+    output_matrix_count: usize,
+    value_matrix_bytes: u64,
+    source_scale_matrix_bytes: u64,
+    packed_matrix_bytes: u64,
+    scale_matrix_bytes: u64,
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn checked_product(
+    values: impl IntoIterator<Item = u64>,
+    context: &'static str,
+) -> Result<u64, CudaDeviceRuntimeError> {
+    values.into_iter().try_fold(1_u64, |product, value| {
+        product
+            .checked_mul(value)
+            .ok_or_else(|| CudaDeviceRuntimeError::contract(format!("{context} overflows u64")))
+    })
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn validate_static_transform_regions(
+    packed: &CudaBufferRegion,
+    scales: &CudaBufferRegion,
+    scratch: &CudaBufferRegion,
+) -> Result<(), CudaDeviceRuntimeError> {
+    if packed.device_ptr() % 4 != 0 || scales.device_ptr() % 2 != 0 || scratch.device_ptr() % 4 != 0
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform has a misaligned packed, scale, or scratch address",
+        ));
+    }
+    let regions = [packed, scales, scratch];
+    for left in 0..regions.len() {
+        let left_end = regions[left]
+            .device_ptr()
+            .checked_add(regions[left].length_bytes())
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA block-FP8 static transform region address overflows",
+                )
+            })?;
+        for right in left + 1..regions.len() {
+            let right_end = regions[right]
+                .device_ptr()
+                .checked_add(regions[right].length_bytes())
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA block-FP8 static transform region address overflows",
+                    )
+                })?;
+            if regions[left].device_ptr() < right_end && regions[right].device_ptr() < left_end {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA block-FP8 static transform packed, scale, and scratch regions must not overlap",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn encode_block_fp8_group128_static_transform(
+    runtime: &CudaDeviceRuntime,
+    request: StaticWeightTransformRequest<'_, '_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, CudaDeviceRuntimeError> {
+    let (
+        source_values_id,
+        source_scales_id,
+        packed_values_id,
+        scales_id,
+        logical_dimensions,
+        matrices_per_output,
+    ) = match request.plan() {
+        StaticWeightTransformPlan::BlockFp8ToMarlinFp8Group128 {
+            source_values_id,
+            source_scales_id,
+            packed_values_id,
+            scales_id,
+            logical_dimensions,
+            matrices_per_output,
+        } => (
+            source_values_id,
+            source_scales_id,
+            packed_values_id,
+            scales_id,
+            logical_dimensions,
+            *matrices_per_output,
+        ),
+    };
+
+    if logical_dimensions.len() < 2 || !matches!(matrices_per_output, 1 | 2) {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform has an unsupported rank or fusion count",
+        ));
+    }
+    let rank = logical_dimensions.len();
+    let size_n = logical_dimensions[rank - 2];
+    let size_k = logical_dimensions[rank - 1];
+    if size_n == 0
+        || size_k == 0
+        || !size_n.is_multiple_of(128)
+        || !size_k.is_multiple_of(128)
+        || (matrices_per_output == 2 && (rank < 4 || logical_dimensions[rank - 3] != 2))
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform requires positive 128-aligned matrices and typed gate/up fusion",
+        ));
+    }
+
+    let source_matrix_count_u64 = checked_product(
+        logical_dimensions[..rank - 2].iter().copied(),
+        "CUDA block-FP8 source matrix count",
+    )?;
+    if !source_matrix_count_u64.is_multiple_of(u64::from(matrices_per_output)) {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 source matrix count is not divisible by its fusion count",
+        ));
+    }
+    let source_matrix_count = checked_usize(
+        source_matrix_count_u64,
+        "CUDA block-FP8 source matrix count",
+    )?;
+    let matrices_per_output = usize::try_from(matrices_per_output).expect("1 or 2 fits usize");
+    let output_matrix_count = source_matrix_count / matrices_per_output;
+    if output_matrix_count == 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform has no output matrix",
+        ));
+    }
+
+    let value_matrix_bytes = size_n.checked_mul(size_k).ok_or_else(|| {
+        CudaDeviceRuntimeError::contract("CUDA block-FP8 matrix byte size overflows u64")
+    })?;
+    let source_scale_matrix_bytes = (size_n / 128)
+        .checked_mul(size_k / 128)
+        .and_then(|elements| elements.checked_mul(ElementType::Bf16.size_bytes()))
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA block-FP8 source scale matrix byte size overflows u64",
+            )
+        })?;
+    let fused_n = size_n
+        .checked_mul(matrices_per_output as u64)
+        .ok_or_else(|| CudaDeviceRuntimeError::contract("CUDA block-FP8 fused N overflows u64"))?;
+    let packed_matrix_bytes = fused_n.checked_mul(size_k).ok_or_else(|| {
+        CudaDeviceRuntimeError::contract("CUDA block-FP8 packed matrix byte size overflows u64")
+    })?;
+    let scale_matrix_bytes = fused_n
+        .checked_mul(size_k / 128)
+        .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA block-FP8 destination scale matrix byte size overflows u64",
+            )
+        })?;
+    let packed_total_bytes = packed_matrix_bytes
+        .checked_mul(output_matrix_count as u64)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("CUDA block-FP8 packed stack size overflows u64")
+        })?;
+    let scales_total_bytes = scale_matrix_bytes
+        .checked_mul(output_matrix_count as u64)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("CUDA block-FP8 scale stack size overflows u64")
+        })?;
+
+    let sources = request.sources();
+    let destinations = request.destinations();
+    if sources.len() != 2
+        || destinations.len() != 2
+        || sources[0].component_id() != source_values_id
+        || sources[1].component_id() != source_scales_id
+        || destinations[0].component().id != *packed_values_id
+        || destinations[1].component().id != *scales_id
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform source or destination identity/order differs from its plan",
+        ));
+    }
+
+    let mut expected_source_scale_dimensions = logical_dimensions.clone();
+    expected_source_scale_dimensions[rank - 2] /= 128;
+    expected_source_scale_dimensions[rank - 1] /= 128;
+    let mut expected_destination_scale_dimensions = logical_dimensions.clone();
+    expected_destination_scale_dimensions[rank - 1] /= 128;
+    if sources[0].dimensions() != logical_dimensions.as_slice()
+        || sources[1].dimensions() != expected_source_scale_dimensions.as_slice()
+        || destinations[0].component().dimensions != *logical_dimensions
+        || destinations[1].component().dimensions != expected_destination_scale_dimensions
+        || sources[0].element_type() != ElementType::U8
+        || sources[1].element_type() != ElementType::Bf16
+        || destinations[0].component().physical_element_type() != ElementType::U8
+        || destinations[1].component().physical_element_type() != ElementType::F16
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform source/destination shape or element type differs from the group-128 ABI",
+        ));
+    }
+    let source_values_total_bytes = value_matrix_bytes
+        .checked_mul(source_matrix_count_u64)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("CUDA block-FP8 source stack size overflows u64")
+        })?;
+    let source_scales_total_bytes = source_scale_matrix_bytes
+        .checked_mul(source_matrix_count_u64)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("CUDA block-FP8 source scale stack size overflows u64")
+        })?;
+    if sources[0].total_bytes() != source_values_total_bytes
+        || sources[1].total_bytes() != source_scales_total_bytes
+        || destinations[0]
+            .component()
+            .physical_bytes()
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?
+            != packed_total_bytes
+        || destinations[1]
+            .component()
+            .physical_bytes()
+            .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?
+            != scales_total_bytes
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform component byte extents differ from the exact product ABI",
+        ));
+    }
+
+    let value_segment_bytes =
+        checked_usize(value_matrix_bytes, "CUDA block-FP8 value segment byte size")?;
+    let scale_segment_bytes = checked_usize(
+        source_scale_matrix_bytes,
+        "CUDA block-FP8 scale segment byte size",
+    )?;
+    if sources[0].segments().len() != source_matrix_count
+        || sources[1].segments().len() != source_matrix_count
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform requires one ordered retained source segment per matrix",
+        ));
+    }
+    let mut retained_sources = Vec::with_capacity(source_matrix_count.saturating_mul(2));
+    for (matrix, segment) in sources[0].segments().iter().enumerate() {
+        let retained = segment.retained_host_memory().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(format!(
+                "CUDA block-FP8 value matrix {matrix} lacks retained stable host memory"
+            ))
+        })?;
+        if segment.bytes().len() != value_segment_bytes
+            || retained.length_bytes() != value_segment_bytes
+            || !std::ptr::eq(segment.bytes().as_ptr(), retained.bytes().as_ptr())
+        {
+            return Err(CudaDeviceRuntimeError::contract(format!(
+                "CUDA block-FP8 value matrix {matrix} segment differs from its exact retained range"
+            )));
+        }
+        retained_sources.push(retained.clone());
+    }
+    for (matrix, segment) in sources[1].segments().iter().enumerate() {
+        let retained = segment.retained_host_memory().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(format!(
+                "CUDA block-FP8 scale matrix {matrix} lacks retained stable host memory"
+            ))
+        })?;
+        if segment.bytes().len() != scale_segment_bytes
+            || retained.length_bytes() != scale_segment_bytes
+            || !std::ptr::eq(segment.bytes().as_ptr(), retained.bytes().as_ptr())
+        {
+            return Err(CudaDeviceRuntimeError::contract(format!(
+                "CUDA block-FP8 scale matrix {matrix} segment differs from its exact retained range"
+            )));
+        }
+        for (block, bytes) in segment.bytes().chunks_exact(2).enumerate() {
+            let inverse_scale = half::bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32();
+            let marlin_scale = half::f16::from_f32(inverse_scale * 256.0);
+            if !inverse_scale.is_finite()
+                || inverse_scale <= 0.0
+                || !marlin_scale.is_finite()
+                || marlin_scale == half::f16::ZERO
+            {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "CUDA block-FP8 scale matrix {matrix} block {block} cannot be represented by the group-128 Marlin F16 ABI"
+                )));
+            }
+        }
+        retained_sources.push(retained.clone());
+    }
+
+    let packed_destination = &destinations[0];
+    let scales_destination = &destinations[1];
+    let scratch = request.scratch();
+    runtime.validate_buffer(packed_destination.buffer())?;
+    runtime.validate_buffer(scales_destination.buffer())?;
+    runtime.validate_buffer(scratch)?;
+    if packed_destination.buffer().descriptor.element_type != ElementType::U8
+        || scales_destination.buffer().descriptor.element_type != ElementType::F16
+        || scratch.descriptor.element_type != ElementType::U8
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform buffer element types differ from U8/F16/U8",
+        ));
+    }
+    let admitted_scratch_bytes = request
+        .plan()
+        .scratch_bytes()
+        .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+    if admitted_scratch_bytes != packed_matrix_bytes
+        || scratch.descriptor.size_bytes < admitted_scratch_bytes
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform scratch differs from its single fused-matrix plan",
+        ));
+    }
+    let packed_end = checked_end(
+        packed_destination.destination_offset_bytes(),
+        packed_total_bytes,
+        packed_destination.buffer().descriptor.size_bytes,
+        "CUDA block-FP8 packed destination",
+    )?;
+    let scales_end = checked_end(
+        scales_destination.destination_offset_bytes(),
+        scales_total_bytes,
+        scales_destination.buffer().descriptor.size_bytes,
+        "CUDA block-FP8 scales destination",
+    )?;
+    let packed_region = packed_destination
+        .buffer()
+        .region(packed_destination.destination_offset_bytes()..packed_end)?;
+    let scales_region = scales_destination
+        .buffer()
+        .region(scales_destination.destination_offset_bytes()..scales_end)?;
+    let scratch_region = scratch.region(0..admitted_scratch_bytes)?;
+    validate_static_transform_regions(&packed_region, &scales_region, &scratch_region)?;
+
+    let transform = BlockFp8Group128CudaTransform {
+        size_n,
+        size_k,
+        matrices_per_output,
+        source_matrix_count,
+        output_matrix_count,
+        value_matrix_bytes,
+        source_scale_matrix_bytes,
+        packed_matrix_bytes,
+        scale_matrix_bytes,
+    };
+    let compute_dispatch_count = (output_matrix_count as u64).checked_mul(2).ok_or_else(|| {
+        CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform dispatch count overflows u64",
+        )
+    })?;
+    let transfer_command_count = source_matrix_count_u64.checked_mul(2).ok_or_else(|| {
+        CudaDeviceRuntimeError::contract(
+            "CUDA block-FP8 static transform transfer count overflows u64",
+        )
+    })?;
+    let command = CudaDeviceCommand::operation(
+        BLOCK_FP8_GROUP128_STATIC_TRANSFORM_OPERATION,
+        vec![packed_region, scales_region, scratch_region],
+        move |stream, regions| {
+            debug_assert_eq!(regions.len(), 3);
+            for output_matrix in 0..transform.output_matrix_count {
+                for matrix_lane in 0..transform.matrices_per_output {
+                    let source_matrix = output_matrix * transform.matrices_per_output + matrix_lane;
+                    let scratch_offset = (matrix_lane as u64)
+                        .checked_mul(transform.value_matrix_bytes)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "CUDA block-FP8 scratch value offset overflows",
+                            )
+                        })?;
+                    let scratch_pointer = regions[2]
+                        .device_ptr()
+                        .checked_add(scratch_offset)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "CUDA block-FP8 scratch value pointer overflows",
+                            )
+                        })?;
+                    unsafe {
+                        cudarc::driver::result::memcpy_htod_async(
+                            scratch_pointer,
+                            retained_sources[source_matrix].bytes(),
+                            stream.cu_stream(),
+                        )
+                    }
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("block-FP8 value upload", error)
+                    })?;
+                }
+                let packed_offset = (output_matrix as u64)
+                    .checked_mul(transform.packed_matrix_bytes)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA block-FP8 packed destination offset overflows",
+                        )
+                    })?;
+                let packed_pointer = regions[0]
+                    .device_ptr()
+                    .checked_add(packed_offset)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA block-FP8 packed destination pointer overflows",
+                        )
+                    })?;
+                unsafe {
+                    super::vllm_marlin::launch_block_fp8_group128_repack(
+                        stream,
+                        regions[2].device_ptr(),
+                        packed_pointer,
+                        transform.size_k,
+                        transform.size_n * transform.matrices_per_output as u64,
+                    )
+                }
+                .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+
+                for matrix_lane in 0..transform.matrices_per_output {
+                    let source_matrix = output_matrix * transform.matrices_per_output + matrix_lane;
+                    let scratch_offset = (matrix_lane as u64)
+                        .checked_mul(transform.source_scale_matrix_bytes)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "CUDA block-FP8 scratch scale offset overflows",
+                            )
+                        })?;
+                    let scratch_pointer = regions[2]
+                        .device_ptr()
+                        .checked_add(scratch_offset)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "CUDA block-FP8 scratch scale pointer overflows",
+                            )
+                        })?;
+                    unsafe {
+                        cudarc::driver::result::memcpy_htod_async(
+                            scratch_pointer,
+                            retained_sources[transform.source_matrix_count + source_matrix].bytes(),
+                            stream.cu_stream(),
+                        )
+                    }
+                    .map_err(|error| {
+                        CudaDeviceRuntimeError::driver("block-FP8 scale upload", error)
+                    })?;
+                }
+                let scales_offset = (output_matrix as u64)
+                    .checked_mul(transform.scale_matrix_bytes)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA block-FP8 scale destination offset overflows",
+                        )
+                    })?;
+                let scales_pointer = regions[1]
+                    .device_ptr()
+                    .checked_add(scales_offset)
+                    .ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "CUDA block-FP8 scale destination pointer overflows",
+                        )
+                    })?;
+                unsafe {
+                    super::vllm_marlin::launch_block_fp8_group128_scales(
+                        stream,
+                        regions[2].device_ptr(),
+                        scales_pointer,
+                        transform.size_k,
+                        transform.size_n * transform.matrices_per_output as u64,
+                    )
+                }
+                .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
+            }
+            Ok(())
+        },
+    )?;
+    command.with_initialization_native_work(compute_dispatch_count, transfer_command_count)
+}
+
 fn checked_usize(value: u64, context: &'static str) -> Result<usize, CudaDeviceRuntimeError> {
     usize::try_from(value).map_err(|_| {
         CudaDeviceRuntimeError::contract(format!("{context} exceeds host address space"))
@@ -1823,6 +2323,21 @@ impl DeviceRuntime for CudaDeviceRuntime {
 
     fn buffer_descriptor(&self, buffer: &Self::Buffer) -> BufferDescriptor {
         buffer.descriptor.clone()
+    }
+
+    fn encode_static_weight_transform(
+        &self,
+        request: StaticWeightTransformRequest<'_, '_, Self::Buffer>,
+    ) -> Option<Result<Self::Command, Self::Error>> {
+        #[cfg(feature = "vllm-marlin")]
+        {
+            Some(encode_block_fp8_group128_static_transform(self, request))
+        }
+        #[cfg(not(feature = "vllm-marlin"))]
+        {
+            let _ = request;
+            None
+        }
     }
 
     fn create_stream(&self) -> Result<Self::Stream, Self::Error> {
