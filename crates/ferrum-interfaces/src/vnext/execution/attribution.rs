@@ -328,9 +328,6 @@ impl StaticProviderAttributionWitness {
         let plan = resolved.execution_plan();
         let payload = plan.payload();
         let execution_weights = payload.execution_weights();
-        if execution_weights.approximate_quality_approval().is_none() {
-            return Ok(None);
-        }
         let Some(denominator) =
             QuantizedProviderAttributionDenominator::from_prepared_family(family)?
         else {
