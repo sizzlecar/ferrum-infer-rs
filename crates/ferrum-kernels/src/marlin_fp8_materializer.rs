@@ -16,7 +16,7 @@ use ferrum_interfaces::vnext::{
     WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightMaterializationFidelity,
     WeightMaterializer, WeightMaterializerDescriptor, WeightMaterializerId, WeightSchema,
     CAUSAL_PAGED_ATTENTION_OPERATION_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_OPERATION_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -573,13 +573,40 @@ impl BlockFp8ToMarlinFp8WeightMaterializer {
                 ))
                 },
             )?;
-        let [n, k] = logical_dimensions[logical_dimensions.len() - 2..] else {
+        let [source_n, k] = logical_dimensions[logical_dimensions.len() - 2..] else {
             unreachable!("block-FP8 source validation requires at least two dimensions")
         };
-        let n =
-            usize::try_from(n).map_err(|_| invalid_plan("block-FP8 output width exceeds usize"))?;
+        let source_n = usize::try_from(source_n)
+            .map_err(|_| invalid_plan("block-FP8 output width exceeds usize"))?;
         let k =
             usize::try_from(k).map_err(|_| invalid_plan("block-FP8 input width exceeds usize"))?;
+        let source_matrix_count = block_fp8_matrix_count(&logical_dimensions)
+            .ok_or_else(|| invalid_plan("block-FP8 matrix stack size exceeds usize"))?;
+        // Routed gate/up is logically [E, 2, N, K], while the fused
+        // Marlin-MoE launch consumes one [2N, K] matrix per expert. Marlin's
+        // packed order is K-tile-major, so repacking gate and up independently
+        // and concatenating the packed bytes is not equivalent to repacking
+        // their fused matrix. Group each adjacent raw gate/up pair first.
+        let matrices_per_output = match logical_dimensions.as_slice() {
+            [expert_count, 2, _, _]
+                if usize::try_from(*expert_count)
+                    .ok()
+                    .and_then(|experts| experts.checked_mul(2))
+                    == Some(source_matrix_count) =>
+            {
+                if !source_n.is_multiple_of(BLOCK_FP8_BLOCK_SHAPE[0]) {
+                    return Err(invalid_plan(
+                        "fused block-FP8 gate/up rows must align to the source block height",
+                    ));
+                }
+                2
+            }
+            _ => 1,
+        };
+        let output_matrix_count = source_matrix_count / matrices_per_output;
+        let output_n = source_n
+            .checked_mul(matrices_per_output)
+            .ok_or_else(|| invalid_plan("fused block-FP8 output width exceeds usize"))?;
         let (expected_packed, expected_scales) =
             block_fp8_derived_components(source_values, source_scales, &logical_dimensions)?;
         let mut requested = BTreeSet::new();
@@ -596,39 +623,95 @@ impl BlockFp8ToMarlinFp8WeightMaterializer {
 
         let values_payload = source.component(source_values)?;
         let scales_payload = source.component(source_scales)?;
-        let [values_source_file] = values_payload.source_files() else {
+        if values_payload.source_files().len() != source_matrix_count
+            || scales_payload.source_files().len() != source_matrix_count
+        {
             return Err(invalid_plan(format!(
-                "block-FP8 values component `{}` must resolve from exactly one checkpoint tensor",
-                source_values.id
-            )));
-        };
-        let [scales_source_file] = scales_payload.source_files() else {
-            return Err(invalid_plan(format!(
-                "block-FP8 inverse-scale component `{}` must resolve from exactly one checkpoint tensor",
-                source_scales.id
-            )));
-        };
-        let prepared = prepare_block_fp8_weight_for_fp8_marlin(
-            values_payload.bytes(),
-            scales_payload.bytes(),
-            n,
-            k,
-            BLOCK_FP8_BLOCK_SHAPE,
-        )
-        .map_err(|error| {
-            invalid_plan(format!(
-                "prepare Marlin FP8 components from `{}` and `{}`: {error}",
+                "block-FP8 source pair `{}`, `{}` does not preserve one ordered checkpoint tensor per matrix",
                 source_values.id, source_scales.id
-            ))
-        })?;
-        let (packed_values, scales) = prepared.into_parts();
-        let scales = scales
-            .into_iter()
-            .flat_map(|scale| scale.to_le_bytes())
-            .collect::<Vec<_>>();
+            )));
+        }
+        let values_per_source_matrix = source_n
+            .checked_mul(k)
+            .ok_or_else(|| invalid_plan("block-FP8 matrix element count exceeds usize"))?;
+        let scale_bytes_per_source_matrix = source_n
+            .div_ceil(BLOCK_FP8_BLOCK_SHAPE[0])
+            .checked_mul(k.div_ceil(BLOCK_FP8_BLOCK_SHAPE[1]))
+            .and_then(|count| count.checked_mul(ElementType::Bf16.size_bytes() as usize))
+            .ok_or_else(|| invalid_plan("block-FP8 matrix scale bytes exceed usize"))?;
+        let values_per_output_matrix = values_per_source_matrix
+            .checked_mul(matrices_per_output)
+            .ok_or_else(|| invalid_plan("fused block-FP8 matrix element count exceeds usize"))?;
+        let scale_bytes_per_output_matrix = scale_bytes_per_source_matrix
+            .checked_mul(matrices_per_output)
+            .ok_or_else(|| invalid_plan("fused block-FP8 matrix scale bytes exceed usize"))?;
+        let expected_fused_scale_bytes = output_n
+            .div_ceil(BLOCK_FP8_BLOCK_SHAPE[0])
+            .checked_mul(k.div_ceil(BLOCK_FP8_BLOCK_SHAPE[1]))
+            .and_then(|count| count.checked_mul(ElementType::Bf16.size_bytes() as usize))
+            .ok_or_else(|| invalid_plan("fused block-FP8 scale grid bytes exceed usize"))?;
+        if scale_bytes_per_output_matrix != expected_fused_scale_bytes {
+            return Err(invalid_plan(
+                "fused block-FP8 gate/up scale grids do not form one exact 2N x K block grid",
+            ));
+        }
+        let packed_capacity = output_matrix_count
+            .checked_mul(values_per_output_matrix)
+            .ok_or_else(|| invalid_plan("Marlin FP8 packed stack bytes exceed usize"))?;
+        let scales_capacity = output_matrix_count
+            .checked_mul(output_n)
+            .and_then(|count| count.checked_mul(ElementType::F16.size_bytes() as usize))
+            .ok_or_else(|| invalid_plan("Marlin FP8 scale stack bytes exceed usize"))?;
+        let mut packed_values = Vec::new();
+        packed_values
+            .try_reserve_exact(packed_capacity)
+            .map_err(|_| invalid_plan("could not reserve Marlin FP8 packed stack"))?;
+        let mut scales = Vec::new();
+        scales
+            .try_reserve_exact(scales_capacity)
+            .map_err(|_| invalid_plan("could not reserve Marlin FP8 scale stack"))?;
+        for matrix_index in 0..output_matrix_count {
+            let values_start = matrix_index
+                .checked_mul(values_per_output_matrix)
+                .ok_or_else(|| invalid_plan("block-FP8 values offset exceeds usize"))?;
+            let scales_start = matrix_index
+                .checked_mul(scale_bytes_per_output_matrix)
+                .ok_or_else(|| invalid_plan("block-FP8 scale offset exceeds usize"))?;
+            let values_end = values_start
+                .checked_add(values_per_output_matrix)
+                .ok_or_else(|| invalid_plan("block-FP8 values range exceeds usize"))?;
+            let scales_end = scales_start
+                .checked_add(scale_bytes_per_output_matrix)
+                .ok_or_else(|| invalid_plan("block-FP8 scale range exceeds usize"))?;
+            let prepared = prepare_block_fp8_weight_for_fp8_marlin(
+                values_payload
+                    .bytes()
+                    .get(values_start..values_end)
+                    .ok_or_else(|| invalid_plan("block-FP8 values stack is truncated"))?,
+                scales_payload
+                    .bytes()
+                    .get(scales_start..scales_end)
+                    .ok_or_else(|| invalid_plan("block-FP8 scale stack is truncated"))?,
+                output_n,
+                k,
+                BLOCK_FP8_BLOCK_SHAPE,
+            )
+            .map_err(|error| {
+                invalid_plan(format!(
+                    "prepare Marlin FP8 output matrix {matrix_index} from `{}` and `{}`: {error}",
+                    source_values.id, source_scales.id
+                ))
+            })?;
+            let (matrix_packed, matrix_scales) = prepared.into_parts();
+            packed_values.extend_from_slice(&matrix_packed);
+            scales.extend(matrix_scales.into_iter().flat_map(half::f16::to_le_bytes));
+        }
+        debug_assert_eq!(packed_values.len(), packed_capacity);
+        debug_assert_eq!(scales.len(), scales_capacity);
         let mut packed_values = Some(packed_values);
         let mut scales = Some(scales);
-        let mut source_files = vec![values_source_file.clone(), scales_source_file.clone()];
+        let mut source_files = values_payload.source_files().to_vec();
+        source_files.extend_from_slice(scales_payload.source_files());
         let requested_count = execution_components.len();
         execution_components
             .iter()
@@ -938,7 +1021,7 @@ fn collect_block_fp8_leaves<'schema>(
                         scales.component_id
                     ))
                 })?;
-            if logical_dimensions.len() < 2 || logical_dimensions.len() > 3 {
+            if logical_dimensions.len() < 2 {
                 return Err(invalid_plan(format!(
                     "block-FP8 source pair `{}`, `{}` has unsupported logical rank {}",
                     values.id,
@@ -955,9 +1038,6 @@ fn collect_block_fp8_leaves<'schema>(
             if !is_exact_contiguous(&packed_values.storage)
                 || !is_exact_contiguous(&scales.storage)
                 || packed_dimensions != logical_dimensions
-                || logical_dimensions[..logical_dimensions.len() - 2]
-                    .iter()
-                    .any(|extent| *extent != 1)
                 || *block_axes != expected_block_axes
                 || block_fp8_source_component_dimensions(values, scale_component).as_deref()
                     != Some(logical_dimensions)
@@ -1005,15 +1085,11 @@ fn block_fp8_source_component_dimensions(
     scales: &WeightComponentSpec,
 ) -> Option<Vec<u64>> {
     let dimensions = &values.dimensions;
-    if dimensions.len() < 2
-        || dimensions.len() > 3
-        || dimensions[..dimensions.len() - 2]
-            .iter()
-            .any(|extent| *extent != 1)
-        || values.role != WeightComponentRole::PackedValues
-        || values.external_names.len() != 1
+    let matrix_count = block_fp8_matrix_count(dimensions)?;
+    if values.role != WeightComponentRole::PackedValues
+        || values.external_names.len() != matrix_count
         || scales.role != WeightComponentRole::Scales
-        || scales.external_names.len() != 1
+        || scales.external_names.len() != matrix_count
         || values.required != scales.required
         || !block_fp8_source_quantization_matches(&values.encoding)
         || scales.encoding
@@ -1033,6 +1109,16 @@ fn block_fp8_source_component_dimensions(
     expected_scale_dimensions[rank - 2] = expected_scale_dimensions[rank - 2].div_ceil(128);
     expected_scale_dimensions[rank - 1] = expected_scale_dimensions[rank - 1].div_ceil(128);
     (scales.dimensions == expected_scale_dimensions).then(|| dimensions.clone())
+}
+
+fn block_fp8_matrix_count(dimensions: &[u64]) -> Option<usize> {
+    let prefix_end = dimensions.len().checked_sub(2)?;
+    dimensions[..prefix_end]
+        .iter()
+        .try_fold(1_usize, |count, extent| {
+            count.checked_mul(usize::try_from(*extent).ok()?)
+        })
+        .filter(|count| *count > 0)
 }
 
 fn block_fp8_source_quantization_matches(encoding: &WeightEncoding) -> bool {
@@ -1082,6 +1168,11 @@ fn block_fp8_derived_components(
     let required = source_values.required && source_scales.required;
     let quantization = marlin_fp8_quantization_spec()?;
     quantization.validate()?;
+    let derived_source_count = source_values
+        .external_names
+        .len()
+        .checked_add(source_scales.external_names.len())
+        .ok_or_else(|| invalid_plan("block-FP8 derived source count exceeds usize"))?;
     Ok((
         WeightComponentSpec {
             id: packed_id,
@@ -1090,6 +1181,7 @@ fn block_fp8_derived_components(
                 &source_values.id,
                 &source_scales.id,
                 DerivedComponentKind::Packed,
+                derived_source_count,
             ),
             dimensions: logical_dimensions.to_vec(),
             encoding: WeightEncoding::Quantized(quantization),
@@ -1102,6 +1194,7 @@ fn block_fp8_derived_components(
                 &source_values.id,
                 &source_scales.id,
                 DerivedComponentKind::Scales,
+                derived_source_count,
             ),
             dimensions: scales_dimensions,
             encoding: WeightEncoding::Dense {
@@ -1128,9 +1221,10 @@ fn block_fp8_derived_external_names(
     source_values_id: &WeightId,
     source_scales_id: &WeightId,
     kind: DerivedComponentKind,
+    source_count: usize,
 ) -> Vec<String> {
     let digest = block_fp8_source_pair_digest(source_values_id, source_scales_id);
-    (0..2)
+    (0..source_count)
         .map(|index| {
             format!(
                 "execution.block-fp8-marlin-fp8.{digest}.{}.{index}",
@@ -1167,6 +1261,8 @@ fn eligible_block_fp8_projection_use(operation_id: &str, ordinal: usize) -> bool
             && matches!(ordinal, 2 | 7))
         || (operation_id == CAUSAL_PAGED_ATTENTION_OPERATION_ID && matches!(ordinal, 2 | 3 | 4 | 5))
         || (operation_id == DENSE_SWIGLU_OPERATION_ID && matches!(ordinal, 1 | 2))
+        || (operation_id == ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID
+            && matches!(ordinal, 2 | 3 | 5 | 6))
 }
 
 fn implementation_fingerprint(parts: &[&[u8]]) -> String {
@@ -1234,7 +1330,15 @@ mod tests {
             WeightComponentPayload::from_ordered_sources(
                 component,
                 component.external_names.clone(),
-                vec![source_file.to_owned()],
+                (0..component.external_names.len())
+                    .map(|index| {
+                        if component.external_names.len() == 1 {
+                            source_file.to_owned()
+                        } else {
+                            source_file.replace(".safetensors", &format!("-{index}.safetensors"))
+                        }
+                    })
+                    .collect(),
                 component.dimensions.clone(),
                 component.physical_element_type(),
                 Cow::Borrowed(bytes),
@@ -1272,6 +1376,20 @@ mod tests {
             },
             required: true,
         };
+        (values, scales)
+    }
+
+    fn stacked_block_fp8_components(prefix: &[u64]) -> (WeightComponentSpec, WeightComponentSpec) {
+        let (mut values, mut scales) = test_block_fp8_components();
+        let matrix_count = prefix.iter().product::<u64>() as usize;
+        values.dimensions = prefix.iter().copied().chain([256, 128]).collect();
+        values.external_names = (0..matrix_count)
+            .map(|index| format!("model.layers.0.experts.{index}.weight"))
+            .collect();
+        scales.dimensions = prefix.iter().copied().chain([2, 1]).collect();
+        scales.external_names = (0..matrix_count)
+            .map(|index| format!("model.layers.0.experts.{index}.weight_scale_inv"))
+            .collect();
         (values, scales)
     }
 
@@ -1412,6 +1530,12 @@ mod tests {
                 ordinal
             ));
         }
+        for ordinal in [2, 3, 5, 6] {
+            assert!(eligible_block_fp8_projection_use(
+                ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+                ordinal
+            ));
+        }
         assert!(!eligible_block_fp8_projection_use(
             DENSE_LINEAR_OPERATION_ID,
             0
@@ -1428,23 +1552,24 @@ mod tests {
             DENSE_SWIGLU_OPERATION_ID,
             3
         ));
+        assert!(!eligible_block_fp8_projection_use(
+            ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
+            4
+        ));
     }
 
     #[test]
-    fn block_fp8_source_accepts_rank_two_and_unit_prefix_rank_three_only() {
+    fn block_fp8_source_accepts_rank_two_and_ordered_matrix_stacks() {
         let (values, inverse_scales) = test_block_fp8_components();
         assert_eq!(
             block_fp8_source_component_dimensions(&values, &inverse_scales),
             Some(vec![256, 128])
         );
 
-        let mut stacked_values = values.clone();
-        stacked_values.dimensions = vec![1, 256, 128];
-        let mut stacked_scales = inverse_scales.clone();
-        stacked_scales.dimensions = vec![1, 2, 1];
+        let (stacked_values, stacked_scales) = stacked_block_fp8_components(&[2, 2]);
         assert_eq!(
             block_fp8_source_component_dimensions(&stacked_values, &stacked_scales),
-            Some(vec![1, 256, 128])
+            Some(vec![2, 2, 256, 128])
         );
         let (packed, scales) = block_fp8_derived_components(
             &stacked_values,
@@ -1452,8 +1577,10 @@ mod tests {
             &stacked_values.dimensions,
         )
         .unwrap();
-        assert_eq!(packed.dimensions, [1, 256, 128]);
-        assert_eq!(scales.dimensions, [1, 256, 1]);
+        assert_eq!(packed.dimensions, [2, 2, 256, 128]);
+        assert_eq!(scales.dimensions, [2, 2, 256, 1]);
+        assert_eq!(packed.external_names.len(), 8);
+        assert_eq!(scales.external_names.len(), 8);
         let candidate = BlockFp8Candidate {
             source_values_id: stacked_values.id.clone(),
             source_scales_id: stacked_scales.id.clone(),
@@ -1463,12 +1590,92 @@ mod tests {
         };
         let PhysicalWeightLayout::Quantized { group_axis, .. } = candidate.execution_layout()
         else {
-            panic!("rank-three source must produce quantized execution layout")
+            panic!("rank-four source must produce one quantized execution layout")
         };
-        assert_eq!(group_axis, 2);
+        assert_eq!(group_axis, 3);
 
-        stacked_values.dimensions[0] = 2;
-        assert!(block_fp8_source_component_dimensions(&stacked_values, &stacked_scales).is_none());
+        let mut missing_name = stacked_values.clone();
+        missing_name.external_names.pop();
+        assert!(block_fp8_source_component_dimensions(&missing_name, &stacked_scales).is_none());
+
+        let mut wrong_prefix = stacked_scales.clone();
+        wrong_prefix.dimensions[1] = 3;
+        assert!(block_fp8_source_component_dimensions(&stacked_values, &wrong_prefix).is_none());
+
+        let mut zero_prefix = stacked_values.clone();
+        zero_prefix.dimensions[0] = 0;
+        zero_prefix.external_names.clear();
+        assert!(block_fp8_source_component_dimensions(&zero_prefix, &stacked_scales).is_none());
+    }
+
+    #[test]
+    fn block_fp8_materialization_preserves_rank_three_and_four_matrix_order() {
+        for prefix in [vec![2], vec![2, 2]] {
+            let (values, inverse_scales) = stacked_block_fp8_components(&prefix);
+            let source_matrix_count = block_fp8_matrix_count(&values.dimensions).unwrap();
+            let matrices_per_output = usize::from(prefix.len() == 2) + 1;
+            let output_matrix_count = source_matrix_count / matrices_per_output;
+            let output_n = 256 * matrices_per_output;
+            let (packed, scales) =
+                block_fp8_derived_components(&values, &inverse_scales, &values.dimensions).unwrap();
+            let patterns = [0x38_u8, 0xb8, 0x40, 0xc0];
+            let source_values = (0..source_matrix_count)
+                .flat_map(|index| std::iter::repeat_n(patterns[index], 256 * 128))
+                .collect::<Vec<_>>();
+            let one_scale = half::bf16::from_f32(1.0).to_le_bytes();
+            let source_scales = (0..source_matrix_count)
+                .flat_map(|_| [one_scale, one_scale].concat())
+                .collect::<Vec<_>>();
+            let source = BlockFp8TestSource {
+                values_id: values.id.clone(),
+                scales_id: inverse_scales.id.clone(),
+                values: source_values.clone(),
+                scales: source_scales.clone(),
+            };
+            let materializer = BlockFp8ToMarlinFp8WeightMaterializer::new().unwrap();
+            let payloads = materializer
+                .materialize_components(&source, &[&values, &inverse_scales], &[&packed, &scales])
+                .unwrap();
+
+            assert_eq!(
+                payloads[0].bytes().len(),
+                output_matrix_count * output_n * 128
+            );
+            assert_eq!(
+                payloads[1].bytes().len(),
+                output_matrix_count * output_n * 2
+            );
+            assert_eq!(payloads[0].source_files().len(), source_matrix_count * 2);
+            assert_eq!(payloads[1].source_files().len(), source_matrix_count * 2);
+            for matrix_index in 0..output_matrix_count {
+                let source_start = matrix_index * output_n * 128;
+                let source_scale_start = matrix_index * matrices_per_output * 4;
+                let expected = prepare_block_fp8_weight_for_fp8_marlin(
+                    &source_values[source_start..source_start + output_n * 128],
+                    &source_scales
+                        [source_scale_start..source_scale_start + matrices_per_output * 4],
+                    output_n,
+                    128,
+                    BLOCK_FP8_BLOCK_SHAPE,
+                )
+                .unwrap();
+                let (expected_packed, expected_scales) = expected.into_parts();
+                assert_eq!(
+                    &payloads[0].bytes()
+                        [matrix_index * output_n * 128..(matrix_index + 1) * output_n * 128],
+                    expected_packed
+                );
+                let expected_scales = expected_scales
+                    .into_iter()
+                    .flat_map(half::f16::to_le_bytes)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    &payloads[1].bytes()
+                        [matrix_index * output_n * 2..(matrix_index + 1) * output_n * 2],
+                    expected_scales
+                );
+            }
+        }
     }
 
     #[test]

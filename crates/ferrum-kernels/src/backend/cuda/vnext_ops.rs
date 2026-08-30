@@ -323,6 +323,9 @@ pub fn cuda_vnext_operation_registry(
         providers.push(Box::new(
             transformer::CudaRoutedSharedSwiGluMoeProvider::new(runtime)?,
         ));
+        providers.push(Box::new(
+            transformer::CudaRoutedSharedSwiGluMoeProvider::new_marlin_fp8(runtime)?,
+        ));
         providers.push(Box::new(transformer::CudaRoutedSwiGluMoeProvider::new(
             runtime,
         )?));
