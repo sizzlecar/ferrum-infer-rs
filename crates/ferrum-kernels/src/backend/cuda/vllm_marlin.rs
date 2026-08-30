@@ -312,7 +312,7 @@ fn block_fp8_group128_scale_source_index(
 /// `row_major` must address `size_n * size_k` readable device bytes and
 /// `marlin_packed` the same number of writable device bytes on `stream`'s
 /// context. The two ranges must not overlap.
-pub(crate) unsafe fn launch_block_fp8_group128_repack(
+pub unsafe fn launch_block_fp8_group128_repack(
     stream: &CudaStream,
     row_major: cudarc::driver::sys::CUdeviceptr,
     marlin_packed: cudarc::driver::sys::CUdeviceptr,
@@ -346,7 +346,7 @@ pub(crate) unsafe fn launch_block_fp8_group128_repack(
 /// readable BF16 elements and `marlin_scales_f16` must address
 /// `size_n * (size_k / 128)` writable F16 elements on `stream`'s context. The
 /// two ranges must not overlap.
-pub(crate) unsafe fn launch_block_fp8_group128_scales(
+pub unsafe fn launch_block_fp8_group128_scales(
     stream: &CudaStream,
     inverse_scales_bf16: cudarc::driver::sys::CUdeviceptr,
     marlin_scales_f16: cudarc::driver::sys::CUdeviceptr,
