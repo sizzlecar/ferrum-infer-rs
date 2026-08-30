@@ -387,6 +387,33 @@ extern "C" {
         use_atomic_add: i32,
         use_fp32_reduce: i32,
     ) -> i32;
+
+    fn ferrum_vllm_marlin_moe_fp8_f16(
+        a: *const std::ffi::c_void,        // [size_m, size_k] fp16
+        b: *const std::ffi::c_void,        // [num_experts, ...] E4M3 Marlin-packed
+        c: *mut std::ffi::c_void,          // [size_m * top_k, size_n] fp16
+        c_tmp: *mut std::ffi::c_void,      // fp32 scratch (or null)
+        b_scales: *const std::ffi::c_void, // [num_experts, 1, size_n] fp16
+        b_zeros: *const std::ffi::c_void,  // always null for E4M3
+        workspace: *mut std::ffi::c_void,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_past_padded: *const i32,
+        topk_weights: *const f32,
+        moe_block_size: i32,
+        top_k: i32,
+        mul_topk_weights: i32,
+        is_ep: i32,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        group_size: i32, // always -1 for channelwise E4M3
+        has_zp: i32,     // always 0 for E4M3
+        dev: i32,
+        stream: cudarc::driver::sys::CUstream,
+        use_atomic_add: i32,
+        use_fp32_reduce: i32,
+    ) -> i32;
 }
 
 #[cfg(feature = "vllm-moe-marlin")]
@@ -1060,7 +1087,14 @@ fn marlin_moe_ffi_status(ret: i32) -> (&'static str, u32) {
 /// corresponding mode flags so this boundary can reject inconsistent FFI
 /// states before the native C++ implementation reaches `TORCH_CHECK`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarlinMoeF16WeightType {
+    U4B8,
+    E4M3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MarlinMoeRawLaunchArgs {
+    pub(crate) weight_type: MarlinMoeF16WeightType,
     pub(crate) a: cudarc::driver::sys::CUdeviceptr,
     pub(crate) b: cudarc::driver::sys::CUdeviceptr,
     pub(crate) c: cudarc::driver::sys::CUdeviceptr,
@@ -1166,6 +1200,13 @@ impl MarlinMoeRawLaunchArgs {
                 "has_zero_points must exactly match the zero_points pointer",
             ));
         }
+        if self.weight_type == MarlinMoeF16WeightType::E4M3
+            && (self.group_size != -1 || self.has_zero_points || self.zero_points.is_some())
+        {
+            return Err(invalid_marlin_moe_args(
+                "E4M3 requires channelwise group_size=-1 and forbids zero points",
+            ));
+        }
         if self.mul_topk_weights && self.topk_weights.is_none() {
             return Err(invalid_marlin_moe_args(
                 "mul_topk_weights requires a non-null topk_weights pointer",
@@ -1213,38 +1254,72 @@ pub(crate) fn launch_marlin_moe_vllm_raw(
     args: MarlinMoeRawLaunchArgs,
 ) -> candle_core::Result<()> {
     args.validate()?;
-    let ret = unsafe {
-        ferrum_vllm_marlin_moe_f16(
-            args.a as *const _,
-            args.b as *const _,
-            args.c as *mut _,
-            args.c_tmp.unwrap_or_default() as *mut _,
-            args.scales as *const _,
-            args.zero_points.unwrap_or_default() as *const _,
-            args.workspace as *mut _,
-            args.sorted_token_ids as *const i32,
-            args.expert_ids as *const i32,
-            args.num_tokens_past_padded as *const i32,
-            args.topk_weights.unwrap_or_default() as *const f32,
-            args.moe_block_size,
-            args.top_k,
-            i32::from(args.mul_topk_weights),
-            i32::from(args.is_ep),
-            args.prob_m,
-            args.prob_n,
-            args.prob_k,
-            args.group_size,
-            i32::from(args.has_zero_points),
-            args.device_ordinal,
-            stream.cu_stream(),
-            i32::from(args.use_atomic_add),
-            i32::from(args.use_fp32_reduce),
-        )
+    let (entrypoint, ret) = unsafe {
+        match args.weight_type {
+            MarlinMoeF16WeightType::U4B8 => (
+                "ferrum_vllm_marlin_moe_f16",
+                ferrum_vllm_marlin_moe_f16(
+                    args.a as *const _,
+                    args.b as *const _,
+                    args.c as *mut _,
+                    args.c_tmp.unwrap_or_default() as *mut _,
+                    args.scales as *const _,
+                    args.zero_points.unwrap_or_default() as *const _,
+                    args.workspace as *mut _,
+                    args.sorted_token_ids as *const i32,
+                    args.expert_ids as *const i32,
+                    args.num_tokens_past_padded as *const i32,
+                    args.topk_weights.unwrap_or_default() as *const f32,
+                    args.moe_block_size,
+                    args.top_k,
+                    i32::from(args.mul_topk_weights),
+                    i32::from(args.is_ep),
+                    args.prob_m,
+                    args.prob_n,
+                    args.prob_k,
+                    args.group_size,
+                    i32::from(args.has_zero_points),
+                    args.device_ordinal,
+                    stream.cu_stream(),
+                    i32::from(args.use_atomic_add),
+                    i32::from(args.use_fp32_reduce),
+                ),
+            ),
+            MarlinMoeF16WeightType::E4M3 => (
+                "ferrum_vllm_marlin_moe_fp8_f16",
+                ferrum_vllm_marlin_moe_fp8_f16(
+                    args.a as *const _,
+                    args.b as *const _,
+                    args.c as *mut _,
+                    args.c_tmp.unwrap_or_default() as *mut _,
+                    args.scales as *const _,
+                    std::ptr::null(),
+                    args.workspace as *mut _,
+                    args.sorted_token_ids as *const i32,
+                    args.expert_ids as *const i32,
+                    args.num_tokens_past_padded as *const i32,
+                    args.topk_weights.unwrap_or_default() as *const f32,
+                    args.moe_block_size,
+                    args.top_k,
+                    i32::from(args.mul_topk_weights),
+                    i32::from(args.is_ep),
+                    args.prob_m,
+                    args.prob_n,
+                    args.prob_k,
+                    -1,
+                    0,
+                    args.device_ordinal,
+                    stream.cu_stream(),
+                    i32::from(args.use_atomic_add),
+                    i32::from(args.use_fp32_reduce),
+                ),
+            ),
+        }
     };
     if ret != 0 {
         let (stage, cuda_status) = marlin_moe_ffi_status(ret);
         return Err(candle_core::Error::Msg(format!(
-            "ferrum_vllm_marlin_moe_f16 failed at {stage}: \
+            "{entrypoint} failed at {stage}: \
              cuda_status={cuda_status}, ret={ret} (m={}, n={}, k={})",
             args.prob_m, args.prob_n, args.prob_k
         )));
@@ -1339,6 +1414,7 @@ pub fn marlin_gemm_moe_vllm(
     let result = launch_marlin_moe_vllm_raw(
         stream,
         MarlinMoeRawLaunchArgs {
+            weight_type: MarlinMoeF16WeightType::U4B8,
             a: a_ptr,
             b: b_ptr,
             c: c_ptr,
@@ -1406,14 +1482,25 @@ pub use crate::marlin_repack::{
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "vllm-moe-marlin")]
+    use super::launch_marlin_moe_vllm_raw;
     use super::{
         marlin_moe_ffi_status, marlin_profile_bucket_from_label, should_zero_workspace,
-        CudaMarlinRuntimeConfig, MarlinMoeRawLaunchArgs, MarlinProfileBucket,
-        MarlinProfileBucketStats,
+        CudaMarlinRuntimeConfig, MarlinMoeF16WeightType, MarlinMoeRawLaunchArgs,
+        MarlinProfileBucket, MarlinProfileBucketStats,
     };
+    #[cfg(feature = "vllm-moe-marlin")]
+    use crate::marlin_repack::prepare_block_fp8_weight_for_fp8_marlin;
+    #[cfg(feature = "vllm-moe-marlin")]
+    use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
+    #[cfg(feature = "vllm-moe-marlin")]
+    use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
+    #[cfg(feature = "vllm-moe-marlin")]
+    use half::{bf16, f16};
 
     fn valid_marlin_moe_raw_args() -> MarlinMoeRawLaunchArgs {
         MarlinMoeRawLaunchArgs {
+            weight_type: MarlinMoeF16WeightType::U4B8,
             a: 0x1000,
             b: 0x2000,
             c: 0x3000,
@@ -1479,6 +1566,11 @@ mod tests {
         let mut per_channel = valid_marlin_moe_raw_args();
         per_channel.group_size = -1;
         per_channel.validate().unwrap();
+
+        let mut fp8 = valid_marlin_moe_raw_args();
+        fp8.weight_type = MarlinMoeF16WeightType::E4M3;
+        fp8.group_size = -1;
+        fp8.validate().unwrap();
     }
 
     #[test]
@@ -1557,6 +1649,248 @@ mod tests {
         let mut args = valid_marlin_moe_raw_args();
         args.c_tmp = Some(0x9000);
         assert_invalid_marlin_moe_args(args, "use_fp32_reduce must exactly match");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.weight_type = MarlinMoeF16WeightType::E4M3;
+        assert_invalid_marlin_moe_args(args, "E4M3 requires channelwise");
+
+        let mut args = valid_marlin_moe_raw_args();
+        args.weight_type = MarlinMoeF16WeightType::E4M3;
+        args.group_size = -1;
+        args.zero_points = Some(0xa000);
+        args.has_zero_points = true;
+        assert_invalid_marlin_moe_args(args, "E4M3 requires channelwise");
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the FP8 Marlin-MoE native artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn qwen36_a3_fp8_marlin_moe_ffi_matches_cpu_reference_for_four_cases() {
+        const BLOCK_SHAPE: [usize; 2] = [128, 128];
+        const MOE_BLOCK_SIZE: usize = 16;
+        const LCG_MULTIPLIER: u64 = 0x5851_f42d_4c95_7f2d;
+        const LCG_INCREMENT: u64 = 0x1405_7b7e_f767_814f;
+        const ROOT_SEED: u64 = 0x5147_454e_3338_4650;
+        const SHAPE_SEED_XOR: u64 = 0x9e37_79b9_7f4a_7c15;
+        const WEIGHT_SEED_XOR: u64 = 0x5745_4947_4854_5f31;
+        const SCALE_SEED_XOR: u64 = 0x5343_414c_455f_5f31;
+        const ACTIVATION_SEED_XOR: u64 = 0x4143_5449_5641_5445;
+        const CASES: [(&str, usize, usize, usize, usize); 4] = [
+            ("weight-256x128-batch-1", 0, 256, 128, 1),
+            ("weight-256x128-batch-4", 0, 256, 128, 4),
+            ("weight-256x256-batch-1", 1, 256, 256, 1),
+            ("weight-256x256-batch-4", 1, 256, 256, 4),
+        ];
+
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(LCG_MULTIPLIER)
+                .wrapping_add(LCG_INCREMENT);
+            *state
+        }
+
+        fn stream_seed(shape_index: usize, stream_xor: u64) -> u64 {
+            let mut state = ROOT_SEED
+                ^ (u64::try_from(shape_index + 1)
+                    .expect("shape index fits u64")
+                    .wrapping_mul(SHAPE_SEED_XOR))
+                ^ stream_xor;
+            next(&mut state)
+        }
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+        let sms = usize::try_from(
+            context
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .expect("query CUDA SM count"),
+        )
+        .expect("CUDA SM count must be positive");
+
+        for (case_id, shape_index, n, k, batch) in CASES {
+            let mut activation_state = stream_seed(shape_index, ACTIVATION_SEED_XOR);
+            let input = (0..batch * k)
+                .map(|_| {
+                    let signed = i32::try_from(next(&mut activation_state) % 129)
+                        .expect("activation residue fits i32")
+                        - 64;
+                    f16::from_f32(signed as f32 / 64.0)
+                })
+                .collect::<Vec<_>>();
+
+            let scale_rows = n.div_ceil(BLOCK_SHAPE[0]);
+            let scale_columns = k.div_ceil(BLOCK_SHAPE[1]);
+            let mut scale_state = stream_seed(shape_index, SCALE_SEED_XOR);
+            let inverse_scales = (0..scale_rows * scale_columns)
+                .map(|_| {
+                    bf16::from_bits(
+                        0x3b80
+                            + 0x20
+                                * u16::try_from(next(&mut scale_state) % 5)
+                                    .expect("scale residue fits u16"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let inverse_scale_bytes = inverse_scales
+                .iter()
+                .flat_map(|scale| scale.to_le_bytes())
+                .collect::<Vec<_>>();
+
+            let mut weight_state = stream_seed(shape_index, WEIGHT_SEED_XOR);
+            let source_values = (0..n * k)
+                .map(|index| {
+                    let word = next(&mut weight_state);
+                    if word & 0x0f == 0 {
+                        0
+                    } else {
+                        let output_channel = index / k;
+                        let exponent_tier =
+                            u8::try_from((output_channel % 8) / 2).expect("exponent tier fits u8");
+                        let magnitude = 0x20 + exponent_tier * 8 + ((word >> 9) & 0x07) as u8;
+                        let sign = ((word >> 31) & 0x80) as u8;
+                        magnitude | sign
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut reference = vec![0.0_f32; batch * n];
+            for row in 0..batch {
+                for output in 0..n {
+                    let mut sum = 0.0_f32;
+                    for input_feature in 0..k {
+                        let source =
+                            float8::F8E4M3::from_bits(source_values[output * k + input_feature])
+                                .to_f32();
+                        let scale_index = (output / BLOCK_SHAPE[0]) * scale_columns
+                            + input_feature / BLOCK_SHAPE[1];
+                        let decoded_weight = source * inverse_scales[scale_index].to_f32();
+                        sum += input[row * k + input_feature].to_f32() * decoded_weight;
+                    }
+                    reference[row * n + output] = sum;
+                }
+            }
+
+            let prepared = prepare_block_fp8_weight_for_fp8_marlin(
+                &source_values,
+                &inverse_scale_bytes,
+                n,
+                k,
+                BLOCK_SHAPE,
+            )
+            .expect("prepare block-FP8 Marlin-MoE weight");
+            let (packed_weight, packed_scales) = prepared.into_parts();
+
+            let input_device: CudaSlice<f16> = stream.clone_htod(&input).expect("upload input");
+            let weight_device: CudaSlice<u8> = stream
+                .clone_htod(&packed_weight)
+                .expect("upload packed FP8 weight");
+            let scales_device: CudaSlice<f16> = stream
+                .clone_htod(&packed_scales)
+                .expect("upload packed FP8 scales");
+            let mut output_device: CudaSlice<f16> = stream
+                .alloc_zeros(batch * n)
+                .expect("allocate Marlin-MoE output");
+
+            // One active expert owns one 16-row block. Actual token ids occupy
+            // the prefix and every remaining row uses the vLLM sentinel
+            // `prob_m * top_k` so the kernel skips padded rows.
+            let mut sorted_token_ids = vec![i32::try_from(batch).unwrap(); MOE_BLOCK_SIZE];
+            for (token, sorted) in sorted_token_ids.iter_mut().take(batch).enumerate() {
+                *sorted = i32::try_from(token).expect("token index fits i32");
+            }
+            let sorted_token_ids_device: CudaSlice<i32> = stream
+                .clone_htod(&sorted_token_ids)
+                .expect("upload padded sorted token ids");
+            let expert_ids_device: CudaSlice<i32> =
+                stream.clone_htod(&[0]).expect("upload expert block id");
+            let num_tokens_past_padded_device: CudaSlice<i32> = stream
+                .clone_htod(&[i32::try_from(MOE_BLOCK_SIZE).unwrap()])
+                .expect("upload padded token count");
+            let workspace: CudaSlice<i32> = stream
+                .alloc_zeros(n.div_ceil(128) * sms * 4)
+                .expect("allocate Marlin-MoE workspace");
+
+            {
+                let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
+                let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
+                let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
+                let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
+                let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+                let (sorted_pointer, _sorted_guard) = sorted_token_ids_device.device_ptr(&stream);
+                let (expert_pointer, _expert_guard) = expert_ids_device.device_ptr(&stream);
+                let (padded_pointer, _padded_guard) =
+                    num_tokens_past_padded_device.device_ptr(&stream);
+
+                launch_marlin_moe_vllm_raw(
+                    &stream,
+                    MarlinMoeRawLaunchArgs {
+                        weight_type: MarlinMoeF16WeightType::E4M3,
+                        a: input_pointer,
+                        b: weight_pointer,
+                        c: output_pointer,
+                        c_tmp: None,
+                        scales: scales_pointer,
+                        zero_points: None,
+                        workspace: workspace_pointer,
+                        sorted_token_ids: sorted_pointer,
+                        expert_ids: expert_pointer,
+                        num_tokens_past_padded: padded_pointer,
+                        topk_weights: None,
+                        moe_block_size: i32::try_from(MOE_BLOCK_SIZE).unwrap(),
+                        top_k: 1,
+                        mul_topk_weights: false,
+                        is_ep: false,
+                        prob_m: i32::try_from(batch).unwrap(),
+                        prob_n: i32::try_from(n).unwrap(),
+                        prob_k: i32::try_from(k).unwrap(),
+                        group_size: -1,
+                        has_zero_points: false,
+                        device_ordinal: 0,
+                        use_atomic_add: true,
+                        use_fp32_reduce: false,
+                    },
+                )
+                .expect("launch ferrum_vllm_marlin_moe_fp8_f16");
+                stream.synchronize().expect("synchronize FP8 Marlin-MoE");
+            }
+
+            let actual = stream
+                .clone_dtoh(&output_device)
+                .expect("download FP8 Marlin-MoE output");
+            let mut reference_squared = 0.0_f64;
+            let mut error_squared = 0.0_f64;
+            let mut nan_count = 0_usize;
+            let mut infinity_count = 0_usize;
+            for (actual, expected) in actual.iter().zip(reference.iter().copied()) {
+                let actual = actual.to_f32();
+                reference_squared += f64::from(expected) * f64::from(expected);
+                if actual.is_nan() {
+                    nan_count += 1;
+                } else if actual.is_infinite() {
+                    infinity_count += 1;
+                } else {
+                    let error = f64::from(actual - expected);
+                    error_squared += error * error;
+                }
+            }
+            let relative_l2 = if nan_count == 0 && infinity_count == 0 {
+                error_squared.sqrt() / reference_squared.sqrt().max(1.0e-6)
+            } else {
+                f64::INFINITY
+            };
+
+            eprintln!(
+                "QWEN36_A3_FP8_MARLIN_MOE_FFI_FIXTURE name={case_id} \
+                 rel_err={relative_l2:.8} nan_count={nan_count} \
+                 infinity_count={infinity_count}"
+            );
+            assert_eq!(nan_count, 0, "{case_id} emitted NaN");
+            assert_eq!(infinity_count, 0, "{case_id} emitted Inf");
+            assert!(
+                relative_l2 <= 0.05,
+                "{case_id} rel_err={relative_l2:.8} exceeds 0.05"
+            );
+        }
     }
 
     #[test]

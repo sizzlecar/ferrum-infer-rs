@@ -493,6 +493,16 @@ impl VNextPlanObservationPolicy {
     }
 }
 
+fn budget_reusable_decode_seed_prefill(
+    chunks: &mut Vec<PrefillChunk>,
+    prepare_device_programs: bool,
+) -> Result<()> {
+    if prepare_device_programs {
+        chunks.push(PrefillChunk::new(0, 1, 1)?);
+    }
+    Ok(())
+}
+
 /// Typed executor policy resolved before plan compilation. None of these
 /// values are inferred from a model name, GPU name, or hidden environment
 /// combination.
@@ -609,6 +619,12 @@ impl VNextExecutorConfig {
             .copied()
             .collect::<Vec<_>>();
 
+        let device_reusable_execution_supported = descriptor
+            .capabilities
+            .iter()
+            .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
+        let prepare_device_programs =
+            engine.backend.enable_reusable_execution && device_reusable_execution_supported;
         let mut reusable_execution_prefill_chunks = [
             engine.scheduler.prefill_step_chunk,
             engine.scheduler.active_decode_prefill_chunk,
@@ -624,6 +640,13 @@ impl VNextExecutorConfig {
         .map(|token_count| PrefillChunk::new(0, token_count, token_count))
         .collect::<Result<Vec<_>>>()?;
         reusable_execution_prefill_chunks.extend_from_slice(additional_prefill_chunks);
+        // Decode startup admission executes this exact prefill before the
+        // synthetic sequence can participate in capture. Budget it in the
+        // immutable program policy instead of observing an unplanned case.
+        budget_reusable_decode_seed_prefill(
+            &mut reusable_execution_prefill_chunks,
+            prepare_device_programs,
+        )?;
         if reusable_execution_prefill_chunks.iter().any(|chunk| {
             !chunk.is_final()
                 || chunk.total_prompt_tokens() > maximum_model_tokens
@@ -641,12 +664,6 @@ impl VNextExecutorConfig {
                 .then_with(|| left.total_prompt_tokens().cmp(&right.total_prompt_tokens()))
         });
         reusable_execution_prefill_chunks.dedup();
-        let device_reusable_execution_supported = descriptor
-            .capabilities
-            .iter()
-            .any(|capability| capability.as_str() == DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID);
-        let prepare_device_programs =
-            engine.backend.enable_reusable_execution && device_reusable_execution_supported;
         // Workspace buckets remain backend-independent capacity policy. The
         // exact device-program matrix is attached only when this runtime will
         // prepare it, and becomes part of the resolved policy fingerprint.
@@ -10154,8 +10171,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        apply_teacher_forced_decision, bounded_wall_anchor, decode_output_width,
-        decode_selected_token, is_language_masked_argmax_operation,
+        apply_teacher_forced_decision, bounded_wall_anchor, budget_reusable_decode_seed_prefill,
+        decode_output_width, decode_selected_token, is_language_masked_argmax_operation,
         is_language_token_embedding_operation, journal_clock_anchor_required,
         nonterminal_completion_message, normalized_product_token_mask,
         product_output_mode_for_policies, product_repetition_input, reported_allocated_bytes,
@@ -10639,6 +10656,31 @@ mod tests {
         assert_eq!(plan.prefill_token_counts(), [4, 1]);
         assert_eq!(plan.prefill_wave_shapes(), 4);
         assert_eq!(plan.device_plan.maximum_executables(), 828);
+    }
+
+    #[test]
+    fn reusable_execution_product_policy_budgets_decode_seed_prefill() {
+        let seed = PrefillChunk::new(0, 1, 1).unwrap();
+        let mut enabled_chunks = Vec::new();
+        budget_reusable_decode_seed_prefill(&mut enabled_chunks, true).unwrap();
+        assert_eq!(enabled_chunks, [seed]);
+
+        let plan = resolve_test_reusable_startup_plan(
+            32,
+            2_048,
+            128,
+            &enabled_chunks,
+            23,
+            &ReusableExecutionCaptureConfig::default(),
+        )
+        .unwrap();
+        assert!(plan
+            .descriptors
+            .contains(&VNextReusableExecutionDescriptor::prefill(seed)));
+
+        let mut disabled_chunks = Vec::new();
+        budget_reusable_decode_seed_prefill(&mut disabled_chunks, false).unwrap();
+        assert!(disabled_chunks.is_empty());
     }
 
     #[test]

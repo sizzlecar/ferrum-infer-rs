@@ -58,6 +58,7 @@ impl CudaNativeBuildUnit {
             Self::VllmMoeMarlin => &[
                 "ferrum_vllm_marlin_moe_clear_profile_config",
                 "ferrum_vllm_marlin_moe_f16",
+                "ferrum_vllm_marlin_moe_fp8_f16",
                 "ferrum_vllm_marlin_moe_set_profile_config",
             ],
             Self::VllmPagedAttentionV2 => &[
@@ -228,6 +229,32 @@ mod tests {
             CudaNativeBuildCoverageError::MissingExport {
                 unit: "vllm_moe_marlin",
                 export: "ferrum_vllm_marlin_moe_clear_profile_config",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_moe_artifact_without_fp8_entrypoint_before_link() {
+        let exports = CudaNativeBuildUnit::VllmMoeMarlin
+            .required_exports()
+            .iter()
+            .copied()
+            .filter(|export| *export != "ferrum_vllm_marlin_moe_fp8_f16")
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let artifacts = [ArtifactView {
+            operator: CudaNativeBuildUnit::VllmMoeMarlin.artifact_operator(),
+            backend: NativeOperatorBackend::Cuda,
+            exports: &exports,
+        }];
+
+        let error = resolve_views(&artifacts, [CudaNativeBuildUnit::VllmMoeMarlin]).unwrap_err();
+
+        assert_eq!(
+            error,
+            CudaNativeBuildCoverageError::MissingExport {
+                unit: "vllm_moe_marlin",
+                export: "ferrum_vllm_marlin_moe_fp8_f16",
             }
         );
     }

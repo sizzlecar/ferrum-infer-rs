@@ -15,6 +15,13 @@
       ]
     },
     {
+      "operation_id": "operation.routed_shared_swiglu_moe",
+      "provider_id": "provider.cuda.routed_shared_swiglu_moe.f16.marlin-fp8-w8a16",
+      "entrypoints": [
+        "ferrum_vllm_marlin_moe_fp8_f16"
+      ]
+    },
+    {
       "operation_id": "operation.routed_swiglu_moe",
       "provider_id": "provider.cuda.routed_swiglu_moe.f16.gptq_marlin",
       "entrypoints": [
@@ -25,6 +32,7 @@
   "required_exports": [
     "ferrum_vllm_marlin_moe_clear_profile_config",
     "ferrum_vllm_marlin_moe_f16",
+    "ferrum_vllm_marlin_moe_fp8_f16",
     "ferrum_vllm_marlin_moe_set_profile_config"
   ],
   "license_files": [
