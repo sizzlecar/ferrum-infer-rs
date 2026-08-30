@@ -40,7 +40,7 @@
       "path": "crates/ferrum-models/src/vnext/qwen35.rs",
       "classification": "reviewed-provider",
       "owner": "ferrum-models/vnext::qwen35",
-      "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
+      "reviewed_at_git_sha": "a6600f8ebaab83d7b464343c4d6ea27c79f0638b",
       "reason": "The typed family provider is reviewed function by function below."
         }
     ],
@@ -64,7 +64,7 @@
 	    "provider_review": {
     "path": "crates/ferrum-models/src/vnext/qwen35.rs",
     "owner": "ferrum-models/vnext::qwen35",
-    "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
+    "reviewed_at_git_sha": "a6600f8ebaab83d7b464343c4d6ea27c79f0638b",
 	        "classification_reasons": {
             "counted-execution-scaffolding": "Family-owned execution, scheduling, batching, state transition, or lifecycle code counts toward the frozen G00 scaffolding delta.",
             "counted-provider-glue": "Typed family identity, validation, preparation, and descriptor glue count toward the G08A provider limit.",
@@ -122,6 +122,8 @@
       "safetensors_quantized_weight_schema",
       "append_safetensors_source_layout",
       "append_safetensors_moe_weight_schema",
+      "append_safetensors_quantized_expert_stack",
+      "append_safetensors_block_fp8_expert_stack",
       "append_safetensors_gptq_expert_stack",
       "append_safetensors_direct_moe_weight",
       "append_safetensors_composite_moe_weight",
