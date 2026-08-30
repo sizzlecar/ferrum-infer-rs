@@ -22,6 +22,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use ferrum_bench_core::{
+    BenchmarkRequestCorrelation, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
+    BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
+};
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
     has_unclosed_thinking_block, parse_reasoning_response,
@@ -951,6 +955,63 @@ fn request_session_id(headers: &HeaderMap, request: &ChatCompletionsRequest) -> 
         })
 }
 
+fn benchmark_request_correlation(
+    headers: &HeaderMap,
+) -> std::result::Result<Option<BenchmarkRequestCorrelation>, ServerError> {
+    let header_value = |name: &'static str| {
+        headers
+            .get(name)
+            .map(|value| {
+                value.to_str().map_err(|_| {
+                    ServerError::invalid_request(
+                        format!("{name} must contain visible ASCII text"),
+                        Some(name),
+                    )
+                })
+            })
+            .transpose()
+    };
+    BenchmarkRequestCorrelation::from_header_values(
+        header_value(BENCHMARK_RUN_ID_HEADER)?,
+        header_value(BENCHMARK_CELL_ID_HEADER)?,
+        header_value(BENCHMARK_REPEAT_INDEX_HEADER)?,
+        header_value(BENCHMARK_PHASE_HEADER)?,
+        header_value(BENCHMARK_REQUEST_INDEX_HEADER)?,
+    )
+    .map_err(|error| ServerError::invalid_request(error, Some(BENCHMARK_RUN_ID_HEADER)))
+}
+
+fn extend_benchmark_profile_attributes(
+    attributes: &mut BTreeMap<String, serde_json::Value>,
+    correlation: Option<&BenchmarkRequestCorrelation>,
+) {
+    let Some(correlation) = correlation else {
+        return;
+    };
+    attributes.extend([
+        (
+            "benchmark_run_id".to_string(),
+            serde_json::json!(correlation.benchmark_run_id),
+        ),
+        (
+            "cell_id".to_string(),
+            serde_json::json!(correlation.cell_id),
+        ),
+        (
+            "repeat_index".to_string(),
+            serde_json::json!(correlation.repeat_index),
+        ),
+        (
+            "phase".to_string(),
+            serde_json::json!(correlation.phase.as_str()),
+        ),
+        (
+            "request_index".to_string(),
+            serde_json::json!(correlation.request_index),
+        ),
+    ]);
+}
+
 fn approx_tokens(text: &str) -> usize {
     approx_tokens_for_chars(text.chars().count())
 }
@@ -1124,6 +1185,7 @@ async fn chat_completions_handler(
             None,
         )
     })?;
+    let benchmark_correlation = benchmark_request_correlation(&headers)?;
     let cache_policy = CachePolicy::current();
     let session_context =
         state
@@ -1174,9 +1236,17 @@ async fn chat_completions_handler(
 
     // Check if streaming is requested
     if request.stream.unwrap_or(false) {
-        handle_chat_completions_stream(state, request, inference_request).await
+        handle_chat_completions_stream(state, request, inference_request, benchmark_correlation)
+            .await
     } else {
-        handle_chat_completions_sync(state, request, inference_request, session_context).await
+        handle_chat_completions_sync(
+            state,
+            request,
+            inference_request,
+            session_context,
+            benchmark_correlation,
+        )
+        .await
     }
 }
 
@@ -1444,6 +1514,7 @@ struct ChatRequestProfileTiming<'a> {
 fn write_chat_request_profile_event(
     state: &AppState,
     request_id: &str,
+    benchmark_correlation: Option<&BenchmarkRequestCorrelation>,
     model: &str,
     stream: bool,
     phase: &str,
@@ -1493,6 +1564,7 @@ fn write_chat_request_profile_event(
             serde_json::json!(format!("request.product.{request_id}")),
         ),
     ]);
+    extend_benchmark_profile_attributes(&mut attributes, benchmark_correlation);
     if let Some(usage) = usage {
         attributes.insert(
             "prompt_token_count".to_string(),
@@ -1632,6 +1704,7 @@ fn write_chat_request_profile_event(
 fn maybe_write_first_request_memory_stage(
     state: &AppState,
     request_id: &str,
+    benchmark_correlation: Option<&BenchmarkRequestCorrelation>,
     model: &str,
     stream: bool,
     started_at: Instant,
@@ -1671,6 +1744,7 @@ fn maybe_write_first_request_memory_stage(
         ),
         ("stream".to_string(), serde_json::json!(stream)),
     ]);
+    extend_benchmark_profile_attributes(&mut attributes, benchmark_correlation);
     let memory_snapshot = if let Some(memory) = &memory {
         attributes.insert(
             "memory_measurement".to_string(),
@@ -2259,6 +2333,7 @@ async fn handle_chat_completions_stream(
     state: AppState,
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
+    benchmark_correlation: Option<BenchmarkRequestCorrelation>,
 ) -> std::result::Result<Response, ServerError> {
     let (tx, rx) = mpsc::unbounded_channel::<std::result::Result<Event, axum::Error>>();
 
@@ -2310,6 +2385,7 @@ async fn handle_chat_completions_stream(
             if let Err(err) = write_chat_request_profile_event(
                 &state,
                 &replay_request_id,
+                benchmark_correlation.as_ref(),
                 &profile_request_model,
                 true,
                 "chat_completions_stream_start",
@@ -2656,6 +2732,7 @@ async fn handle_chat_completions_stream(
                         if let Err(err) = write_chat_request_profile_event(
                             &profile_state,
                             &replay_request_id,
+                            benchmark_correlation.as_ref(),
                             &profile_request_model,
                             true,
                             "chat_completions_stream_complete",
@@ -2675,6 +2752,7 @@ async fn handle_chat_completions_stream(
                         if let Err(err) = maybe_write_first_request_memory_stage(
                             &profile_state,
                             &replay_request_id,
+                            benchmark_correlation.as_ref(),
                             &profile_request_model,
                             true,
                             profile_started_at,
@@ -2713,6 +2791,7 @@ async fn handle_chat_completions_stream(
                     if let Err(err) = write_chat_request_profile_event(
                         &profile_state,
                         &replay_request_id,
+                        benchmark_correlation.as_ref(),
                         &profile_request_model,
                         true,
                         "chat_completions_stream_next",
@@ -2772,6 +2851,7 @@ async fn handle_chat_completions_sync(
     openai_request: ChatCompletionsRequest,
     inference_request: InferenceRequest,
     session_context: Option<SessionContext>,
+    benchmark_correlation: Option<BenchmarkRequestCorrelation>,
 ) -> std::result::Result<Response, ServerError> {
     info!("Processing non-streaming chat completion");
 
@@ -2859,6 +2939,7 @@ async fn handle_chat_completions_sync(
                     if let Err(err) = write_chat_request_profile_event(
                         &state,
                         &replay_request_id,
+                        benchmark_correlation.as_ref(),
                         &profile_request_model,
                         false,
                         "chat_completions_sync_tool_contract",
@@ -2896,6 +2977,7 @@ async fn handle_chat_completions_sync(
                 if let Err(err) = write_chat_request_profile_event(
                     &state,
                     &replay_request_id,
+                    benchmark_correlation.as_ref(),
                     &profile_request_model,
                     false,
                     "chat_completions_sync_tool_choice",
@@ -2925,6 +3007,7 @@ async fn handle_chat_completions_sync(
                 if let Err(err) = write_chat_request_profile_event(
                     &state,
                     &replay_request_id,
+                    benchmark_correlation.as_ref(),
                     &profile_request_model,
                     false,
                     "chat_completions_sync_structured_output",
@@ -2958,6 +3041,7 @@ async fn handle_chat_completions_sync(
             if let Err(err) = write_chat_request_profile_event(
                 &state,
                 &replay_request_id,
+                benchmark_correlation.as_ref(),
                 &profile_request_model,
                 false,
                 "chat_completions_sync_complete",
@@ -2976,6 +3060,7 @@ async fn handle_chat_completions_sync(
             if let Err(err) = maybe_write_first_request_memory_stage(
                 &state,
                 &replay_request_id,
+                benchmark_correlation.as_ref(),
                 &profile_request_model,
                 false,
                 profile_started_at,
@@ -3015,6 +3100,7 @@ async fn handle_chat_completions_sync(
             if let Err(err) = write_chat_request_profile_event(
                 &state,
                 &replay_request_id,
+                benchmark_correlation.as_ref(),
                 &profile_request_model,
                 false,
                 "chat_completions_sync",
@@ -6501,6 +6587,35 @@ mod tests {
         .expect("route response")
     }
 
+    async fn post_json_with_benchmark_correlation(
+        app: Router,
+        path: &str,
+        body: Value,
+        correlation: &BenchmarkRequestCorrelation,
+    ) -> Response {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(BENCHMARK_RUN_ID_HEADER, &correlation.benchmark_run_id)
+                .header(BENCHMARK_CELL_ID_HEADER, &correlation.cell_id)
+                .header(
+                    BENCHMARK_REPEAT_INDEX_HEADER,
+                    correlation.repeat_index.to_string(),
+                )
+                .header(BENCHMARK_PHASE_HEADER, correlation.phase.as_str())
+                .header(
+                    BENCHMARK_REQUEST_INDEX_HEADER,
+                    correlation.request_index.to_string(),
+                )
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("route response")
+    }
+
     async fn post_raw_json(app: Router, path: &str, body: &str) -> Response {
         app.oneshot(
             Request::builder()
@@ -9434,6 +9549,67 @@ mod tests {
             .is_some_and(|bytes| bytes > 0));
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(profile);
+    }
+
+    #[tokio::test]
+    async fn route_chat_profile_events_preserve_benchmark_correlation() {
+        let root = unique_request_dump_dir("chat-benchmark-correlation");
+        let profile = unique_profile_jsonl("chat-benchmark-correlation");
+        let correlation = BenchmarkRequestCorrelation::new(
+            "bench-123".to_string(),
+            "cell-1-closed-c8".to_string(),
+            2,
+            ferrum_bench_core::BenchmarkPhase::Measured,
+            17,
+        )
+        .unwrap();
+        let response = post_json_with_benchmark_correlation(
+            router_with_stub_request_dump_and_profile("OK", root.clone(), profile.clone()),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            &correlation,
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let _ = response_json(response).await;
+
+        let events = read_profile_events(&profile);
+        assert_eq!(events.len(), 2, "events: {events:#?}");
+        for event in events {
+            assert_eq!(event["attributes"]["benchmark_run_id"], "bench-123");
+            assert_eq!(event["attributes"]["cell_id"], "cell-1-closed-c8");
+            assert_eq!(event["attributes"]["repeat_index"], 2);
+            assert_eq!(event["attributes"]["phase"], "measured");
+            assert_eq!(event["attributes"]["request_index"], 17);
+        }
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(profile);
+    }
+
+    #[tokio::test]
+    async fn route_chat_rejects_partial_benchmark_correlation_headers() {
+        let response = router_with_stub("OK")
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(BENCHMARK_RUN_ID_HEADER, "bench-123")
+                    .body(Body::from(
+                        json!({
+                            "model": "stub-model",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

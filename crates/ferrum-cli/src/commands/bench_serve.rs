@@ -17,9 +17,11 @@
 use clap::{Args, ValueEnum};
 use colored::*;
 use ferrum_bench_core::{
-    arrivals::poisson_arrival_times, compute_metrics, BenchReport, Env, ItlEvidenceSource,
-    OutputTokenCountSource, QualityIssueCounts, RequestItlEvidence, RequestRecord, RunRecord,
-    Scenario, Slo, TokenLengthStats, WarmupSummary,
+    arrivals::poisson_arrival_times, compute_metrics, BenchReport, BenchmarkPhase,
+    BenchmarkRequestCorrelation, Env, ItlEvidenceSource, OutputTokenCountSource,
+    QualityIssueCounts, RequestItlEvidence, RequestRecord, RunRecord, Scenario, Slo,
+    TokenLengthStats, WarmupSummary, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
+    BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
 use ferrum_types::Result;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -30,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
+use uuid::Uuid;
 
 use crate::config::CliConfig;
 
@@ -257,6 +260,7 @@ pub(super) fn parse_slo(s: &str) -> std::result::Result<Slo, String> {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiStreamChunk {
+    id: Option<String>,
     choices: Option<Vec<OpenAiStreamChoice>>,
     usage: Option<OpenAiUsage>,
     error: Option<OpenAiStreamError>,
@@ -307,6 +311,7 @@ async fn stream_one(
     ignore_eos: bool,
     enable_thinking: Option<bool>,
     timeout_s: f64,
+    correlation: BenchmarkRequestCorrelation,
 ) -> RequestRecord {
     let PromptCase {
         text,
@@ -315,10 +320,26 @@ async fn stream_one(
     } = prompt;
     let body = chat_completion_body(model, &text, max_tokens, ignore_eos, enable_thinking);
     let start = Instant::now();
-    let mut state = StreamState::for_prompt(start, input_tokens, prompt_sha256.clone());
+    let mut state = StreamState::for_prompt(
+        start,
+        input_tokens,
+        prompt_sha256.clone(),
+        Some(correlation.clone()),
+    );
 
     let resp = match client
         .post(format!("{}/v1/chat/completions", base_url))
+        .header(BENCHMARK_RUN_ID_HEADER, &correlation.benchmark_run_id)
+        .header(BENCHMARK_CELL_ID_HEADER, &correlation.cell_id)
+        .header(
+            BENCHMARK_REPEAT_INDEX_HEADER,
+            correlation.repeat_index.to_string(),
+        )
+        .header(BENCHMARK_PHASE_HEADER, correlation.phase.as_str())
+        .header(
+            BENCHMARK_REQUEST_INDEX_HEADER,
+            correlation.request_index.to_string(),
+        )
         .json(&body)
         .timeout(Duration::from_secs_f64(timeout_s))
         .send()
@@ -338,7 +359,7 @@ async fn stream_one(
             );
             let mut quality_issues = QualityIssueCounts::default();
             quality_issues.malformed_stream = 1;
-            return failed_record(input_tokens, start, quality_issues);
+            return failed_record(input_tokens, start, quality_issues, correlation);
         }
     };
     if !resp.status().is_success() {
@@ -355,7 +376,7 @@ async fn stream_one(
         if looks_like_panic(&txt) {
             quality_issues.panic = 1;
         }
-        return failed_record(input_tokens, start, quality_issues);
+        return failed_record(input_tokens, start, quality_issues, correlation);
     }
 
     let mut stream = resp.bytes_stream();
@@ -477,8 +498,11 @@ fn failed_record(
     input_tokens: u32,
     start: Instant,
     quality_issues: QualityIssueCounts,
+    benchmark_correlation: BenchmarkRequestCorrelation,
 ) -> RequestRecord {
     RequestRecord {
+        benchmark_correlation: Some(benchmark_correlation),
+        server_request_id: None,
         success: false,
         ttft_ms: 0.0,
         e2e_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -491,10 +515,15 @@ fn failed_record(
     }
 }
 
-fn join_failed_record(input_tokens: u32) -> RequestRecord {
+fn join_failed_record(
+    input_tokens: u32,
+    benchmark_correlation: BenchmarkRequestCorrelation,
+) -> RequestRecord {
     let mut quality_issues = QualityIssueCounts::default();
     quality_issues.panic = 1;
     RequestRecord {
+        benchmark_correlation: Some(benchmark_correlation),
+        server_request_id: None,
         success: false,
         ttft_ms: 0.0,
         e2e_ms: 0.0,
@@ -508,15 +537,19 @@ fn join_failed_record(input_tokens: u32) -> RequestRecord {
 }
 
 async fn collect_measured_handles(
-    handles: Vec<(u32, tokio::task::JoinHandle<RequestRecord>)>,
+    handles: Vec<(
+        u32,
+        BenchmarkRequestCorrelation,
+        tokio::task::JoinHandle<RequestRecord>,
+    )>,
 ) -> Vec<RequestRecord> {
     let mut records = Vec::with_capacity(handles.len());
-    for (input_tokens, handle) in handles {
+    for (input_tokens, correlation, handle) in handles {
         match handle.await {
             Ok(record) => records.push(record),
             Err(error) => {
                 eprintln!("[err] measured request task: {error}");
-                records.push(join_failed_record(input_tokens));
+                records.push(join_failed_record(input_tokens, correlation));
             }
         }
     }
@@ -536,15 +569,22 @@ struct StreamState {
     stream_error: Option<String>,
     quality_issues: QualityIssueCounts,
     prompt_sha256: String,
+    benchmark_correlation: Option<BenchmarkRequestCorrelation>,
+    server_request_id: Option<String>,
 }
 
 impl StreamState {
     #[cfg(test)]
     fn new(start: Instant, input_tokens: u32) -> Self {
-        Self::for_prompt(start, input_tokens, "unknown".to_string())
+        Self::for_prompt(start, input_tokens, "unknown".to_string(), None)
     }
 
-    fn for_prompt(start: Instant, input_tokens: u32, prompt_sha256: String) -> Self {
+    fn for_prompt(
+        start: Instant,
+        input_tokens: u32,
+        prompt_sha256: String,
+        benchmark_correlation: Option<BenchmarkRequestCorrelation>,
+    ) -> Self {
         Self {
             start,
             input_tokens,
@@ -558,12 +598,27 @@ impl StreamState {
             stream_error: None,
             quality_issues: QualityIssueCounts::default(),
             prompt_sha256,
+            benchmark_correlation,
+            server_request_id: None,
         }
     }
 
     fn handle_payload(&mut self, payload: &str) -> std::result::Result<(), String> {
         let chunk: OpenAiStreamChunk =
             serde_json::from_str(payload).map_err(|e| format!("{e}: {payload}"))?;
+        if let Some(id) = chunk.id.filter(|id| !id.is_empty()) {
+            if self
+                .server_request_id
+                .as_ref()
+                .is_some_and(|observed| observed != &id)
+            {
+                return Err(format!(
+                    "OpenAI stream response changed request id from {} to {id}",
+                    self.server_request_id.as_deref().unwrap_or_default()
+                ));
+            }
+            self.server_request_id = Some(id);
+        }
         if let Some(error) = chunk.error {
             return Err(format!(
                 "OpenAI stream error type={} code={} message={}",
@@ -659,6 +714,8 @@ impl StreamState {
             self.transport_coalesced_output_chunks,
         );
         RequestRecord {
+            benchmark_correlation: self.benchmark_correlation,
+            server_request_id: self.server_request_id,
             success,
             ttft_ms,
             e2e_ms,
@@ -1093,6 +1150,24 @@ struct RunContext {
     ignore_eos: bool,
     enable_thinking: Option<bool>,
     timeout_s: f64,
+    benchmark_run_id: Arc<String>,
+}
+
+fn benchmark_request_correlation(
+    benchmark_run_id: &str,
+    cell_id: &str,
+    repeat_index: u32,
+    phase: BenchmarkPhase,
+    request_index: usize,
+) -> BenchmarkRequestCorrelation {
+    BenchmarkRequestCorrelation::new(
+        benchmark_run_id.to_string(),
+        cell_id.to_string(),
+        repeat_index,
+        phase,
+        u32::try_from(request_index).expect("benchmark request index overflow"),
+    )
+    .expect("generated benchmark correlation must be valid")
 }
 
 fn summarize_warmup(
@@ -1129,6 +1204,8 @@ async fn run_closed_loop(
     prompts: Vec<PromptCase>,
     warmup_requests: u32,
     concurrency: u32,
+    cell_id: &str,
+    repeat_index: u32,
 ) -> RunRecord {
     let n_warmup = warmup_requests as usize;
     let total = prompts.len();
@@ -1141,10 +1218,17 @@ async fn run_closed_loop(
     let warmup = {
         let sem = Arc::new(Semaphore::new(concurrency as usize));
         let mut handles = Vec::new();
-        for prompt in prompts.iter().take(n_warmup) {
+        for (request_index, prompt) in prompts.iter().take(n_warmup).enumerate() {
             let permit = sem.clone().acquire_owned().await.expect("semaphore");
             let ctx_c = ctx.clone_inner();
             let p = prompt.clone();
+            let correlation = benchmark_request_correlation(
+                &ctx.benchmark_run_id,
+                cell_id,
+                repeat_index,
+                BenchmarkPhase::Warmup,
+                request_index,
+            );
             handles.push(tokio::spawn(async move {
                 let _g = permit;
                 stream_one(
@@ -1156,6 +1240,7 @@ async fn run_closed_loop(
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
                     ctx_c.timeout_s,
+                    correlation,
                 )
                 .await
             }));
@@ -1175,12 +1260,20 @@ async fn run_closed_loop(
     let sem = Arc::new(Semaphore::new(concurrency as usize));
     let start = Instant::now();
     let mut handles = Vec::with_capacity(total - n_warmup);
-    for prompt in prompts.into_iter().skip(n_warmup) {
+    for (request_index, prompt) in prompts.into_iter().skip(n_warmup).enumerate() {
         let input_tokens = prompt.input_tokens;
         let permit = sem.clone().acquire_owned().await.expect("semaphore");
         let ctx_c = ctx.clone_inner();
+        let correlation = benchmark_request_correlation(
+            &ctx.benchmark_run_id,
+            cell_id,
+            repeat_index,
+            BenchmarkPhase::Measured,
+            request_index,
+        );
         handles.push((
             input_tokens,
+            correlation.clone(),
             tokio::spawn(async move {
                 let _g = permit;
                 stream_one(
@@ -1192,6 +1285,7 @@ async fn run_closed_loop(
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
                     ctx_c.timeout_s,
+                    correlation,
                 )
                 .await
             }),
@@ -1215,6 +1309,8 @@ async fn run_open_loop(
     prompts: Vec<PromptCase>,
     warmup_requests: u32,
     rate: f64,
+    cell_id: &str,
+    repeat_index: u32,
 ) -> RunRecord {
     let n_warmup = warmup_requests as usize;
     let total = prompts.len();
@@ -1222,7 +1318,7 @@ async fn run_open_loop(
 
     // Warmup: send a few sequentially to load caches.
     let mut warmup_records = Vec::with_capacity(n_warmup);
-    for prompt in prompts.iter().take(n_warmup) {
+    for (request_index, prompt) in prompts.iter().take(n_warmup).enumerate() {
         warmup_records.push(
             stream_one(
                 &ctx.client,
@@ -1233,6 +1329,13 @@ async fn run_open_loop(
                 ctx.ignore_eos,
                 ctx.enable_thinking,
                 ctx.timeout_s,
+                benchmark_request_correlation(
+                    &ctx.benchmark_run_id,
+                    cell_id,
+                    repeat_index,
+                    BenchmarkPhase::Warmup,
+                    request_index,
+                ),
             )
             .await,
         );
@@ -1254,8 +1357,16 @@ async fn run_open_loop(
         }
         let ctx_c = ctx.clone_inner();
         let input_tokens = prompt.input_tokens;
+        let correlation = benchmark_request_correlation(
+            &ctx.benchmark_run_id,
+            cell_id,
+            repeat_index,
+            BenchmarkPhase::Measured,
+            i,
+        );
         handles.push((
             input_tokens,
+            correlation.clone(),
             tokio::spawn(async move {
                 stream_one(
                     &ctx_c.client,
@@ -1266,6 +1377,7 @@ async fn run_open_loop(
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
                     ctx_c.timeout_s,
+                    correlation,
                 )
                 .await
             }),
@@ -1292,6 +1404,7 @@ impl RunContext {
             ignore_eos: self.ignore_eos,
             enable_thinking: self.enable_thinking,
             timeout_s: self.timeout_s,
+            benchmark_run_id: self.benchmark_run_id.clone(),
         }
     }
 }
@@ -1355,6 +1468,7 @@ async fn execute_cell(
     cmd: &BenchServeCommand,
     ctx: &RunContext,
     cell: Cell,
+    cell_id: &str,
 ) -> Result<BenchReport> {
     // A neutral HTTP client can measure a different backend, so canonical
     // collectors supply the target explicitly. Direct product invocations keep
@@ -1425,8 +1539,12 @@ async fn execute_cell(
             .dimmed()
         );
         let run = match cell {
-            Cell::Closed(c) => run_closed_loop(ctx, prompts, cmd.warmup_requests, c).await,
-            Cell::Open(r) => run_open_loop(ctx, prompts, cmd.warmup_requests, r).await,
+            Cell::Closed(c) => {
+                run_closed_loop(ctx, prompts, cmd.warmup_requests, c, cell_id, repeat_idx).await
+            }
+            Cell::Open(r) => {
+                run_open_loop(ctx, prompts, cmd.warmup_requests, r, cell_id, repeat_idx).await
+            }
         };
         eprintln!(
             "    {} completed / {} errored / {:.1}s",
@@ -1540,6 +1658,13 @@ fn cell_label(cell: Cell) -> String {
     }
 }
 
+fn benchmark_cell_id(index: usize, cell: Cell) -> String {
+    match cell {
+        Cell::Closed(concurrency) => format!("cell-{index}-closed-c{concurrency}"),
+        Cell::Open(rate) => format!("cell-{index}-open-rate-bits-{:016x}", rate.to_bits()),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Top-level entry
 // ─────────────────────────────────────────────────────────────────────
@@ -1592,12 +1717,14 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         ignore_eos: cmd.ignore_eos,
         enable_thinking: cmd.enable_thinking,
         timeout_s: cmd.timeout,
+        benchmark_run_id: Arc::new(format!("bench-{}", Uuid::new_v4())),
     };
 
     let mut reports: Vec<BenchReport> = Vec::with_capacity(cells.len());
-    for cell in cells {
+    for (cell_index, cell) in cells.into_iter().enumerate() {
         eprintln!("{}", format!("→ {}", cell_label(cell)).bold());
-        let r = execute_cell(&cmd, &ctx, cell).await?;
+        let cell_id = benchmark_cell_id(cell_index, cell);
+        let r = execute_cell(&cmd, &ctx, cell, &cell_id).await?;
         emit_summary_line(&r);
         reports.push(r);
     }
@@ -1947,6 +2074,18 @@ mod tests {
     }
 
     #[test]
+    fn stream_record_preserves_openai_response_request_id() {
+        let record = parse_sse_chunks([
+            b"data: {\"id\":\"chatcmpl-123\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}],\"usage\":null}\n\n"
+                .as_slice(),
+            b"data: {\"id\":\"chatcmpl-123\",\"choices\":[],\"usage\":{\"completion_tokens\":1}}\n\ndata: [DONE]\n\n"
+                .as_slice(),
+        ]);
+        assert!(record.success);
+        assert_eq!(record.server_request_id.as_deref(), Some("chatcmpl-123"));
+    }
+
+    #[test]
     fn chat_completion_body_omits_ignore_eos_by_default() {
         let body = chat_completion_body("model", "prompt", 128, false, None);
         assert_eq!(body["model"], serde_json::json!("model"));
@@ -2131,8 +2270,23 @@ mod tests {
 
     #[tokio::test]
     async fn measured_join_error_becomes_failed_evidence() {
-        let good = tokio::spawn(async {
+        let correlation = |request_index| {
+            BenchmarkRequestCorrelation::new(
+                "bench-test".to_string(),
+                "cell-test".to_string(),
+                0,
+                BenchmarkPhase::Measured,
+                request_index,
+            )
+            .unwrap()
+        };
+        let first_correlation = correlation(0);
+        let second_correlation = correlation(1);
+        let good_record_correlation = first_correlation.clone();
+        let good = tokio::spawn(async move {
             RequestRecord {
+                benchmark_correlation: Some(good_record_correlation),
+                server_request_id: None,
                 success: true,
                 ttft_ms: 1.0,
                 e2e_ms: 2.0,
@@ -2144,13 +2298,18 @@ mod tests {
                 itl_ms: vec![],
             }
         });
-        let panicked = tokio::spawn(async {
+        let panic_record_correlation = second_correlation.clone();
+        let panicked = tokio::spawn(async move {
             if true {
                 panic!("measured task panic");
             }
-            join_failed_record(0)
+            join_failed_record(0, panic_record_correlation)
         });
-        let records = collect_measured_handles(vec![(7, good), (11, panicked)]).await;
+        let records = collect_measured_handles(vec![
+            (7, first_correlation, good),
+            (11, second_correlation, panicked),
+        ])
+        .await;
         assert_eq!(records.len(), 2);
         assert!(records[0].success);
         assert!(!records[1].success);
@@ -2365,6 +2524,8 @@ mod tests {
         let mut records = Vec::with_capacity((completed + errored) as usize);
         for _ in 0..completed {
             records.push(RequestRecord {
+                benchmark_correlation: None,
+                server_request_id: None,
                 success: true,
                 ttft_ms: 10.0,
                 e2e_ms: 30.0,
@@ -2380,6 +2541,8 @@ mod tests {
             let mut quality = QualityIssueCounts::default();
             quality.missing_done = 1;
             records.push(RequestRecord {
+                benchmark_correlation: None,
+                server_request_id: None,
                 success: false,
                 ttft_ms: 0.0,
                 e2e_ms: 30.0,
@@ -2470,6 +2633,8 @@ mod tests {
         let run = RunRecord {
             records: vec![
                 RequestRecord {
+                    benchmark_correlation: None,
+                    server_request_id: None,
                     success: true,
                     ttft_ms: 10.0,
                     e2e_ms: 30.0,
@@ -2481,6 +2646,8 @@ mod tests {
                     itl_ms: vec![10.0, 10.0],
                 },
                 RequestRecord {
+                    benchmark_correlation: None,
+                    server_request_id: None,
                     success: false,
                     ttft_ms: 0.0,
                     e2e_ms: 50.0,
@@ -2575,6 +2742,8 @@ mod tests {
             Slo::default(),
             vec![RunRecord {
                 records: vec![RequestRecord {
+                    benchmark_correlation: None,
+                    server_request_id: None,
                     success: true,
                     ttft_ms: 10.0,
                     e2e_ms: 30.0,
