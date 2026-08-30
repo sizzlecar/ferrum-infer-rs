@@ -2934,14 +2934,13 @@ impl ContinuousBatchScheduler {
             return 0;
         }
 
-        // Keep the mixed-prefill lane bounded, but spend real batch headroom.
-        // The previous proportional scaling often collapsed to a single tiny
-        // chunk at c=32 even when 4-7 batch slots were idle, serializing
-        // capacity-deferred recompute behind decode work.
-        let max_mixed_prefill_chunks = self.cb_config.max_prefill_batch.div_ceil(2).max(1);
-        free_batch_slots
-            .min(max_mixed_prefill_chunks)
-            .min(prefill_backlog)
+        // `BatchHint` already carries the executor's sequence and token
+        // capacity for this iteration. Spend that live headroom instead of
+        // imposing a second, unrelated cap derived from the cold-prefill
+        // batch default. The old `max_prefill_batch / 2` ceiling limited the
+        // default mixed lane to four requests even when the executor had room
+        // for a much larger cohort.
+        free_batch_slots.min(prefill_backlog)
     }
 
     fn maybe_active_decode_prefill_chunk(
@@ -8522,10 +8521,10 @@ mod tests {
 
         assert_eq!(
             mixed_batch.requests.len(),
-            23,
-            "small final prefill chunks must not bypass the mixed-prefill count budget"
+            32,
+            "small final prefill chunks should spend all live batch headroom"
         );
-        assert_eq!(prefill_tokens, vec![Some(1), Some(1), Some(1), Some(1)]);
+        assert_eq!(prefill_tokens, vec![Some(1); 13]);
     }
 
     #[test]
@@ -8573,11 +8572,14 @@ mod tests {
             .collect();
         assert_eq!(
             mixed_batch.requests.len(),
-            11,
-            "large explicit active chunks must not bypass the prefill-step aggregate cap"
+            32,
+            "mixed prefill should spend live sequence headroom while respecting the token budget"
         );
-        assert_eq!(prefill_tokens, vec![Some(64), Some(64), Some(64), Some(64)]);
-        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (7 + 256) * 16);
+        assert_eq!(prefill_tokens, vec![Some(64); 25]);
+        assert_eq!(
+            mixed_batch.resource_requirements.gpu_memory,
+            (7 + 1600) * 16
+        );
     }
 
     #[tokio::test]
