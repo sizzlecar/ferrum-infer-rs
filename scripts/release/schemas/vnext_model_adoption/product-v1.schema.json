@@ -66,6 +66,12 @@
             "object",
             "null"
           ]
+        },
+        "regression_checks": {
+          "type": [
+            "object",
+            "null"
+          ]
         }
       }
     }
