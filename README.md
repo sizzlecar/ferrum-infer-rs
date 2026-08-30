@@ -81,7 +81,7 @@ Latest R2 development `ferrum serve` checkpoint. The first three rows use
 64-token input / 128-token output on Metal and 256 / 128 on CUDA. Values are
 mean tok/s with the 95% confidence-interval half-width across three repeats.
 
-| Model | M1 Max 32 GB Metal | RTX 4090 CUDA | L40S 48 GB CUDA smoke |
+| Model | M1 Max 32 GB Metal | RTX 4090 CUDA | L40S 48 GB CUDA |
 |---|---:|---:|---:|
 | Qwen3.5 4B | c=16 · 61.9 ± 0.1 | c=32 · 241.3 ± 0.6 |  |
 | Qwen3.5 35B-A3B | c=4 · 26.1 ± 0.2 | c=16 · 174.1 ± 1.0 |  |
@@ -89,6 +89,7 @@ mean tok/s with the 95% confidence-interval half-width across three repeats.
 | Qwen3.8 27B AWQ INT4 |  | c=4 · 78.19 ± 0.04 · c=16 · 115.12 ± 1.18 · c=32 · 115.18 ± 0.97 |  |
 | [Qwen3.8 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8/tree/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a) |  |  | ready 119.49 s · c=1 · 16.53 · c=2 · 24.33 |
 | [Qwen3.6 27B official block-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8/tree/e89b16ebf1988b3d6befa7de50abc2d76f26eb09) |  |  | ready 162.23 s · c=1 · 16.36 · c=2 · 20.33 |
+| [Qwen3.6 35B-A3B official block-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8/tree/95a723d08a9490559dae23d0cff1d9466213d989) |  |  | load 568.70 s · c=1 · 36.25 ± 1.33 · c=8 · 77.18 ± 7.10 · c=32 · 83.70 ± 11.76 |
 
 `c` is active server concurrency. The first three rows completed 100 requests ×
 3 repeats with zero errors. [Measurement details](docs/release/runtime-vnext/0.8.0/PERFORMANCE_REPORT.md).
