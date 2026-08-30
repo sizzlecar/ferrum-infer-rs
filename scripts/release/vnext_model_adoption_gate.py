@@ -24,7 +24,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_DIR = REPO_ROOT / "scripts/release/schemas/vnext_model_adoption"
 SCHEMA_VERSION = 1
-VALIDATOR_VERSION = "1.1.0"
+VALIDATOR_VERSION = "1.2.0"
 RECEIPT_SCHEMAS = {
     "model-lock.json": "model-lock-v1.schema.json",
     "validation.json": "validation-v1.schema.json",
@@ -84,6 +84,21 @@ PRODUCT_ERROR_KEYS = {
     "raw_control_or_special_token",
 }
 FALLBACK_KEYS = {"silent", "dense", "legacy"}
+PAID_BENCH_SWEEP_CHECKPOINTS = {
+    "qwen36-35b-a3b-fp8",
+    "gpt-oss-20b-mxfp4",
+    "gemma4-12b-w4a16-ct",
+}
+LEGACY_VALIDATOR_VERSION_CHECKPOINTS = {
+    "qwen38-27b-fp8",
+    "qwen36-27b-fp8",
+}
+PAID_BENCH_CONCURRENCY_CELLS = {1, 8, 32}
+QWEN38_REGRESSION_CHECKPOINT_ID = "qwen38-27b-fp8"
+QWEN38_REGRESSION_ATTRIBUTION_COUNT = 403
+QWEN38_REGRESSION_ATTRIBUTION_DENOMINATOR = (
+    "5e366997e15e1a94d90b1ae07281269e8a46f75904306564d56354c8ebea2e4e"
+)
 BOUNDED_RECEIPT_SCHEMA = "ferrum.bounded-command-receipt.v1"
 M1_RUST_CONTRACTS = {
     "qwen38-27b-fp8": {
@@ -104,6 +119,16 @@ M1_RUST_CONTRACTS = {
         "qwen36-fp8-scale-grid-drift": (
             "vnext::qwen35::tests::"
             "rejects_block_fp8_inverse_scale_grid_drift_before_runtime"
+        ),
+    },
+    "qwen36-35b-a3b-fp8": {
+        "qwen36-35b-a3b-fp8-wrong-format": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_metadata_recipe_drift_with_typed_error_before_runtime"
+        ),
+        "qwen36-35b-a3b-fp8-expert-scale-grid-drift": (
+            "vnext::qwen35::tests::"
+            "rejects_block_fp8_moe_sidecar_or_grid_drift_before_allocation"
         ),
     },
 }
@@ -1014,17 +1039,22 @@ def flag_value(argv: list[str], flag: str, label: str) -> str:
     return argv[index + 1]
 
 
-def validate_hardware(value: Any) -> None:
-    hardware = as_object(value, "product.json.hardware")
-    required_keys(hardware, {"gpu_count", "gpus", "driver_version", "cuda_runtime"}, "product hardware")
-    require(hardware["gpu_count"] == 1, "product evidence must use exactly one GPU")
-    gpus = as_list(hardware["gpus"], "product hardware.gpus")
-    require(len(gpus) == 1, "product hardware must identify exactly one GPU")
-    gpu = as_object(gpus[0], "product hardware.gpus[0]")
-    non_empty_string(gpu.get("name"), "product GPU name")
-    positive_int(gpu.get("memory_bytes"), "product GPU memory_bytes")
-    non_empty_string(hardware["driver_version"], "product driver_version")
-    non_empty_string(hardware["cuda_runtime"], "product cuda_runtime")
+def validate_hardware(value: Any, label: str = "product.json.hardware") -> dict[str, Any]:
+    hardware = as_object(value, label)
+    required_keys(
+        hardware,
+        {"gpu_count", "gpus", "driver_version", "cuda_runtime"},
+        label,
+    )
+    require(hardware["gpu_count"] == 1, f"{label} must use exactly one GPU")
+    gpus = as_list(hardware["gpus"], f"{label}.gpus")
+    require(len(gpus) == 1, f"{label} must identify exactly one GPU")
+    gpu = as_object(gpus[0], f"{label}.gpus[0]")
+    non_empty_string(gpu.get("name"), f"{label} GPU name")
+    positive_int(gpu.get("memory_bytes"), f"{label} GPU memory_bytes")
+    non_empty_string(hardware["driver_version"], f"{label}.driver_version")
+    non_empty_string(hardware["cuda_runtime"], f"{label}.cuda_runtime")
+    return gpu
 
 
 def validate_m4(value: Any, checkpoint_id: str) -> None:
@@ -1104,7 +1134,152 @@ def validate_m4(value: Any, checkpoint_id: str) -> None:
     require(bool(serve_argv), "M4 serve argv is empty")
 
 
-def validate_m5(value: Any, checkpoint_id: str, m0: dict[str, Any]) -> None:
+def validate_provider_attribution(
+    value: Any,
+    *,
+    expected_count: int,
+    denominator: str,
+    label: str,
+) -> None:
+    attribution = as_object(value, label)
+    required_keys(
+        attribution,
+        {"expected_item_count", "attributed_item_count", "percent", "denominator_sha256"},
+        label,
+    )
+    require(
+        attribution["expected_item_count"] == expected_count,
+        f"{label} denominator count mismatch",
+    )
+    require(
+        attribution["attributed_item_count"] == expected_count,
+        f"{label} is not 100%",
+    )
+    require(
+        finite_number(attribution["percent"], f"{label} percent") == 100.0,
+        f"{label} percent must be 100",
+    )
+    require(
+        attribution["denominator_sha256"] == denominator,
+        f"{label} denominator digest mismatch",
+    )
+
+
+def validate_fallback_counts(value: Any, label: str) -> None:
+    fallbacks = as_object(value, label)
+    require(set(fallbacks) == FALLBACK_KEYS, f"{label} counter set mismatch")
+    require(all(value == 0 for value in fallbacks.values()), f"{label} must all be zero")
+
+
+def positive_flag_int(argv: list[str], flag: str, label: str) -> int:
+    raw = flag_value(argv, flag, label)
+    require(raw.isascii() and raw.isdecimal(), f"{label} {flag} must be a positive integer")
+    return positive_int(int(raw), f"{label} {flag}")
+
+
+def validate_paid_bench_sweep(
+    value: Any,
+    checkpoint_id: str,
+    *,
+    expected_attribution_count: int,
+    attribution_denominator: str,
+    label: str,
+) -> None:
+    section = as_object(value, label)
+    required_keys(
+        section,
+        {"bench_argv", "bench_cells", "provider_attribution", "fallback_counts"},
+        label,
+    )
+    argv = argv_contains_subcommand(section["bench_argv"], "bench-serve", f"{label}.bench_argv")
+    require("--fail-on-error" in argv, f"{label} bench must use --fail-on-error")
+    require("--require-ci" in argv, f"{label} bench must use --require-ci")
+    require(
+        flag_value(argv, "--seed", f"{label} bench") == "9271",
+        f"{label} bench seed must be 9271",
+    )
+    require(
+        flag_value(argv, "--n-repeats", f"{label} bench") == "3",
+        f"{label} n-repeats must be 3",
+    )
+    require(
+        flag_value(argv, "--concurrency-sweep", f"{label} bench") == "1,8,32",
+        f"{label} concurrency sweep must be 1,8,32",
+    )
+    require(
+        "--request-rate" not in argv,
+        f"{label} bench must not override the concurrency sweep with --request-rate",
+    )
+    prompts_per_repeat = positive_flag_int(argv, "--num-prompts", f"{label} bench")
+    require(prompts_per_repeat >= 32, f"{label} must measure at least 32 prompts per cell")
+    if checkpoint_id.startswith("qwen3"):
+        require(
+            flag_value(argv, "--enable-thinking", f"{label} bench") == "false",
+            f"Qwen {label} bench must disable thinking through the typed option",
+        )
+
+    cells = as_list(section["bench_cells"], f"{label}.bench_cells")
+    require(len(cells) == 3, f"{label} must contain exactly three concurrency cells")
+    seen: set[int] = set()
+    for index, raw_cell in enumerate(cells):
+        cell_label = f"{label}.bench_cells[{index}]"
+        cell = as_object(raw_cell, cell_label)
+        required_keys(
+            cell,
+            {
+                "concurrency",
+                "requests_per_repeat",
+                "repeat_count",
+                "successful_requests",
+                "errored_requests",
+                "output_throughput_tokens_per_second",
+                "p50_ttft_seconds",
+                "output_token_count_source",
+            },
+            cell_label,
+        )
+        concurrency = positive_int(cell["concurrency"], f"{cell_label}.concurrency")
+        require(concurrency not in seen, f"{label} contains duplicate c={concurrency}")
+        seen.add(concurrency)
+        require(
+            cell["requests_per_repeat"] == prompts_per_repeat,
+            f"{cell_label} requests_per_repeat does not match --num-prompts",
+        )
+        require(cell["repeat_count"] == 3, f"{cell_label} repeat_count must be 3")
+        expected_requests = prompts_per_repeat * 3
+        require(
+            cell["successful_requests"] == expected_requests,
+            f"{cell_label} did not complete every measured request",
+        )
+        require(cell["errored_requests"] == 0, f"{cell_label} has request errors")
+        require(
+            cell["output_token_count_source"] == "usage",
+            f"{cell_label} output tokens must come from usage",
+        )
+        throughput = finite_number(
+            cell["output_throughput_tokens_per_second"],
+            f"{cell_label} output throughput",
+        )
+        ttft = finite_number(cell["p50_ttft_seconds"], f"{cell_label} p50 TTFT")
+        require(throughput > 0.0, f"{cell_label} output throughput must be positive")
+        require(ttft >= 0.0, f"{cell_label} p50 TTFT must be non-negative")
+        if concurrency == 1:
+            require(throughput >= 5.0, f"{cell_label} output throughput is below 5 tok/s")
+            require(ttft <= 60.0, f"{cell_label} p50 TTFT exceeds 60 seconds")
+    require(
+        seen == PAID_BENCH_CONCURRENCY_CELLS,
+        f"{label} concurrency cells must be exactly [1, 8, 32]",
+    )
+    validate_provider_attribution(
+        section["provider_attribution"],
+        expected_count=expected_attribution_count,
+        denominator=attribution_denominator,
+        label=f"{label}.provider_attribution",
+    )
+    validate_fallback_counts(section["fallback_counts"], f"{label}.fallback_counts")
+
+
+def validate_legacy_m5(value: Any, checkpoint_id: str, m0: dict[str, Any]) -> None:
     section = as_object(value, "product.json.usability")
     required_keys(
         section,
@@ -1138,19 +1313,121 @@ def validate_m5(value: Any, checkpoint_id: str, m0: dict[str, Any]) -> None:
     require(throughput >= 5.0, "M5 median output throughput is below 5 tok/s")
     require(0 <= ttft <= 60.0, "M5 p50 TTFT exceeds 60 seconds")
     require(section["output_token_count_source"] == "usage", "M5 output tokens must come from usage")
-    attribution = as_object(section["provider_attribution"], "M5 provider_attribution")
-    required_keys(
-        attribution,
-        {"expected_item_count", "attributed_item_count", "percent", "denominator_sha256"},
-        "M5 provider_attribution",
+    validate_provider_attribution(
+        section["provider_attribution"],
+        expected_count=m0["expected_count"],
+        denominator=m0["denominator"],
+        label="M5 provider_attribution",
     )
-    require(attribution["expected_item_count"] == m0["expected_count"], "M5 attribution denominator count mismatch")
-    require(attribution["attributed_item_count"] == m0["expected_count"], "M5 attribution is not 100%")
-    require(finite_number(attribution["percent"], "M5 attribution percent") == 100.0, "M5 attribution percent must be 100")
-    require(attribution["denominator_sha256"] == m0["denominator"], "M5 attribution denominator digest mismatch")
-    fallbacks = as_object(section["fallback_counts"], "M5 fallback_counts")
-    require(set(fallbacks) == FALLBACK_KEYS, "M5 fallback counter set mismatch")
-    require(all(value == 0 for value in fallbacks.values()), "M5 fallback counts must all be zero")
+    validate_fallback_counts(section["fallback_counts"], "M5 fallback_counts")
+
+
+def validate_m5(value: Any, checkpoint_id: str, m0: dict[str, Any]) -> None:
+    if checkpoint_id not in PAID_BENCH_SWEEP_CHECKPOINTS:
+        validate_legacy_m5(value, checkpoint_id, m0)
+        return
+    validate_paid_bench_sweep(
+        value,
+        checkpoint_id,
+        expected_attribution_count=m0["expected_count"],
+        attribution_denominator=m0["denominator"],
+        label="M5",
+    )
+
+
+def validate_qwen38_regression(product: dict[str, Any]) -> None:
+    checks = as_object(product.get("regression_checks"), "product.json.regression_checks")
+    regression = as_object(
+        checks.get("qwen38_27b_official_block_fp8"),
+        "product.json.regression_checks.qwen38_27b_official_block_fp8",
+    )
+    label = "Qwen3.8 official block-FP8 regression"
+    required_keys(
+        regression,
+        {
+            "checkpoint",
+            "candidate",
+            "binary_sha256",
+            "hardware",
+            "load_to_ready_seconds",
+            "run",
+            "serve_argv",
+            "serve_non_stream",
+            "serve_stream",
+            "usability",
+            "errors",
+        },
+        label,
+    )
+    repository, revision = CHECKPOINTS[QWEN38_REGRESSION_CHECKPOINT_ID]
+    require(
+        regression["checkpoint"]
+        == {
+            "id": QWEN38_REGRESSION_CHECKPOINT_ID,
+            "repository": repository,
+            "revision": revision,
+        },
+        f"{label} checkpoint mismatch",
+    )
+    require(regression["candidate"] == product["candidate"], f"{label} candidate mismatch")
+    require(
+        validate_sha(regression["binary_sha256"], f"{label}.binary_sha256")
+        == validate_sha(product["binary_sha256"], "product.json.binary_sha256"),
+        f"{label} binary SHA256 mismatch",
+    )
+    require(regression["hardware"] == product["hardware"], f"{label} hardware mismatch")
+    gpu = validate_hardware(regression["hardware"], f"{label}.hardware")
+    gpu_name = non_empty_string(gpu["name"], f"{label} GPU name")
+    require("l40s" in gpu_name.lower(), f"{label} must run on an L40S")
+    require(
+        positive_int(gpu["memory_bytes"], f"{label} GPU memory_bytes") >= 47_000_000_000,
+        f"{label} L40S must expose approximately 48 GB",
+    )
+    load_time = finite_number(regression["load_to_ready_seconds"], f"{label} load-to-ready")
+    require(0 <= load_time <= 600, f"{label} load-to-ready exceeds 600 seconds")
+
+    run = as_object(regression["run"], f"{label}.run")
+    run_argv = argv_contains_subcommand(run.get("argv"), "run", f"{label}.run.argv")
+    require("--disable-thinking" in run_argv, f"{label} run must use --disable-thinking")
+    require(run.get("exit_code") == 0, f"{label} ferrum run failed")
+    require(run.get("assistant_nonempty") is True, f"{label} ferrum run assistant is empty")
+    require(run.get("marker_matched") is True, f"{label} ferrum run marker did not match")
+    argv_contains_subcommand(regression["serve_argv"], "serve", f"{label}.serve_argv")
+    non_stream = as_object(regression["serve_non_stream"], f"{label}.serve_non_stream")
+    require(non_stream.get("http_status") == 200, f"{label} non-stream HTTP status must be 200")
+    require(non_stream.get("json_parseable") is True, f"{label} non-stream response is not JSON")
+    require(non_stream.get("assistant_nonempty") is True, f"{label} non-stream assistant is empty")
+    non_stream_kwargs = as_object(
+        non_stream.get("chat_template_kwargs"),
+        f"{label}.serve_non_stream.chat_template_kwargs",
+    )
+    require(
+        non_stream_kwargs.get("enable_thinking") is False,
+        f"{label} non-stream request must disable thinking",
+    )
+    stream = as_object(regression["serve_stream"], f"{label}.serve_stream")
+    require(stream.get("http_status") == 200, f"{label} stream HTTP status must be 200")
+    require(stream.get("done_count") == 1, f"{label} stream must have exactly one [DONE]")
+    require(stream.get("usage_chunk_count") == 1, f"{label} stream must have exactly one usage chunk")
+    positive_int(stream.get("output_tokens"), f"{label} stream output_tokens")
+    stream_kwargs = as_object(
+        stream.get("chat_template_kwargs"),
+        f"{label}.serve_stream.chat_template_kwargs",
+    )
+    require(
+        stream_kwargs.get("enable_thinking") is False,
+        f"{label} stream request must disable thinking",
+    )
+    errors = as_object(regression["errors"], f"{label}.errors")
+    require(set(errors) == PRODUCT_ERROR_KEYS, f"{label} error counter set mismatch")
+    require(all(value == 0 for value in errors.values()), f"{label} error counts must all be zero")
+    validate_paid_bench_sweep(
+        regression["usability"],
+        QWEN38_REGRESSION_CHECKPOINT_ID,
+        expected_attribution_count=QWEN38_REGRESSION_ATTRIBUTION_COUNT,
+        attribution_denominator=QWEN38_REGRESSION_ATTRIBUTION_DENOMINATOR,
+        label=f"{label}.usability",
+    )
 
 
 def validate_m6(value: Any) -> None:
@@ -1198,7 +1475,13 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
         reference = manifest["receipts"][filename]
         require(reference["path"] == filename, f"manifest receipt path must be exactly {filename}")
         verify_reference(reference, f"manifest.receipts.{filename}", out_dir)
-    require(manifest["validator_version"] == VALIDATOR_VERSION, "manifest validator_version mismatch")
+    allowed_validator_versions = {VALIDATOR_VERSION}
+    if checkpoint_id in LEGACY_VALIDATOR_VERSION_CHECKPOINTS:
+        allowed_validator_versions.add("1.1.0")
+    require(
+        manifest["validator_version"] in allowed_validator_versions,
+        "manifest validator_version mismatch",
+    )
     expected_line = expected_terminal_line(final_status, checkpoint_id, out_dir)
     require(manifest["terminal_line"] == expected_line, "manifest terminal line mismatch")
     validate_stage_states(receipts, manifest)
@@ -1224,6 +1507,8 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
     if stages["M5"]["status"] == "pass":
         require(m0_result is not None, "M5 cannot pass without a valid M0")
         validate_m5(receipts["product.json"]["usability"], checkpoint_id, m0_result)
+    if final_status == "PASS" and checkpoint_id == "qwen36-35b-a3b-fp8":
+        validate_qwen38_regression(receipts["product.json"])
     if stages["M6"]["status"] == "pass":
         validate_m6(receipts["validation.json"]["architecture_audit"])
     if final_status == "PASS":
@@ -1247,14 +1532,18 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
     return expected_line
 
 
-def synthetic_envelope(artifact_type: str) -> dict[str, Any]:
+def synthetic_envelope(
+    artifact_type: str,
+    checkpoint_id: str = "qwen38-27b-fp8",
+) -> dict[str, Any]:
+    repository, revision = CHECKPOINTS[checkpoint_id]
     return {
         "schema_version": 1,
         "artifact_type": artifact_type,
         "checkpoint": {
-            "id": "qwen38-27b-fp8",
-            "repository": CHECKPOINTS["qwen38-27b-fp8"][0],
-            "revision": CHECKPOINTS["qwen38-27b-fp8"][1],
+            "id": checkpoint_id,
+            "repository": repository,
+            "revision": revision,
         },
         "candidate": {"git_sha": "1" * 40, "dirty": False, "dirty_status": []},
         "sanitized_environment": {"CUDA_VISIBLE_DEVICES": "0", "HF_TOKEN": "<redacted>"},
@@ -1271,7 +1560,57 @@ def synthetic_envelope(artifact_type: str) -> dict[str, Any]:
     }
 
 
-def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
+def synthetic_paid_usability(
+    checkpoint_id: str,
+    *,
+    expected_attribution_count: int,
+    attribution_denominator: str,
+) -> dict[str, Any]:
+    bench_argv = [
+        "ferrum",
+        "bench-serve",
+        "--fail-on-error",
+        "--require-ci",
+        "--seed",
+        "9271",
+        "--n-repeats",
+        "3",
+        "--concurrency-sweep",
+        "1,8,32",
+        "--num-prompts",
+        "32",
+    ]
+    if checkpoint_id.startswith("qwen3"):
+        bench_argv.extend(["--enable-thinking", "false"])
+    return {
+        "bench_argv": bench_argv,
+        "bench_cells": [
+            {
+                "concurrency": concurrency,
+                "requests_per_repeat": 32,
+                "repeat_count": 3,
+                "successful_requests": 96,
+                "errored_requests": 0,
+                "output_throughput_tokens_per_second": 5.0,
+                "p50_ttft_seconds": 60.0,
+                "output_token_count_source": "usage",
+            }
+            for concurrency in [1, 8, 32]
+        ],
+        "provider_attribution": {
+            "expected_item_count": expected_attribution_count,
+            "attributed_item_count": expected_attribution_count,
+            "percent": 100.0,
+            "denominator_sha256": attribution_denominator,
+        },
+        "fallback_counts": {key: 0 for key in sorted(FALLBACK_KEYS)},
+    }
+
+
+def synthetic_pass_documents(
+    out_dir: Path,
+    checkpoint_id: str = "qwen38-27b-fp8",
+) -> dict[str, dict[str, Any]]:
     unit_manifest = out_dir.parent / f"{out_dir.name}-upstream" / "unit.gate.json"
     write_json(unit_manifest, {"status": "pass"})
     expected_tensors = ["model.layers.0.q_proj.weight", "model.layers.0.o_proj.weight"]
@@ -1289,14 +1628,18 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
         "quality_vector_digest": "d" * 64,
     }
     model_lock = {
-        **synthetic_envelope("model-lock"),
+        **synthetic_envelope("model-lock", checkpoint_id),
         "milestones": {"M0": {"status": "pass"}},
         "source_lock": {
             "identity": {
-                "repository": CHECKPOINTS["qwen38-27b-fp8"][0],
-                "revision": CHECKPOINTS["qwen38-27b-fp8"][1],
+                "repository": CHECKPOINTS[checkpoint_id][0],
+                "revision": CHECKPOINTS[checkpoint_id][1],
                 "license": "apache-2.0",
-                "architecture": "Qwen3_5ForConditionalGeneration",
+                "architecture": (
+                    "Qwen3_5MoeForConditionalGeneration"
+                    if checkpoint_id == "qwen36-35b-a3b-fp8"
+                    else "Qwen3_5ForConditionalGeneration"
+                ),
             },
             "lock_checks": {
                 "config": True,
@@ -1431,7 +1774,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
     }
     m1_cases = []
     m1_references = []
-    for case_id, rust_test_id in M1_RUST_CONTRACTS["qwen38-27b-fp8"].items():
+    for case_id, rust_test_id in M1_RUST_CONTRACTS[checkpoint_id].items():
         case_root = m1_root / case_id
         case_root.mkdir(parents=True, exist_ok=True)
         stdout_path = (case_root / "stdout.log").resolve()
@@ -1513,7 +1856,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
         )
 
     validation = {
-        **synthetic_envelope("validation"),
+        **synthetic_envelope("validation", checkpoint_id),
         "binary_sha256": "e" * 64,
         "milestones": {stage: {"status": "pass"} for stage in ["M1", "M2", "M3", "M6"]},
         "fail_closed": {
@@ -1581,7 +1924,7 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
     }
     validation["references"] = [reference_for(unit_manifest), *m1_references]
     product = {
-        **synthetic_envelope("product"),
+        **synthetic_envelope("product", checkpoint_id),
         "binary_sha256": "e" * 64,
         "hardware": {
             "gpu_count": 1,
@@ -1668,6 +2011,55 @@ def synthetic_pass_documents(out_dir: Path) -> dict[str, dict[str, Any]]:
             "fallback_counts": {key: 0 for key in sorted(FALLBACK_KEYS)},
         },
     }
+    if checkpoint_id in PAID_BENCH_SWEEP_CHECKPOINTS:
+        product["usability"] = synthetic_paid_usability(
+            checkpoint_id,
+            expected_attribution_count=4,
+            attribution_denominator=denominator,
+        )
+    if checkpoint_id == "qwen36-35b-a3b-fp8":
+        product["regression_checks"] = {
+            "qwen38_27b_official_block_fp8": {
+                "checkpoint": {
+                    "id": QWEN38_REGRESSION_CHECKPOINT_ID,
+                    "repository": CHECKPOINTS[QWEN38_REGRESSION_CHECKPOINT_ID][0],
+                    "revision": CHECKPOINTS[QWEN38_REGRESSION_CHECKPOINT_ID][1],
+                },
+                "candidate": dict(product["candidate"]),
+                "binary_sha256": product["binary_sha256"],
+                "hardware": {
+                    **product["hardware"],
+                    "gpus": [dict(product["hardware"]["gpus"][0])],
+                },
+                "load_to_ready_seconds": 500.0,
+                "run": {
+                    "argv": ["ferrum", "run", "--disable-thinking"],
+                    "exit_code": 0,
+                    "assistant_nonempty": True,
+                    "marker_matched": True,
+                },
+                "serve_argv": ["ferrum", "serve"],
+                "serve_non_stream": {
+                    "http_status": 200,
+                    "json_parseable": True,
+                    "assistant_nonempty": True,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                "serve_stream": {
+                    "http_status": 200,
+                    "done_count": 1,
+                    "usage_chunk_count": 1,
+                    "output_tokens": 32,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+                "usability": synthetic_paid_usability(
+                    QWEN38_REGRESSION_CHECKPOINT_ID,
+                    expected_attribution_count=QWEN38_REGRESSION_ATTRIBUTION_COUNT,
+                    attribution_denominator=QWEN38_REGRESSION_ATTRIBUTION_DENOMINATOR,
+                ),
+                "errors": {key: 0 for key in sorted(PRODUCT_ERROR_KEYS)},
+            }
+        }
     return {
         "model-lock.json": model_lock,
         "validation.json": validation,
@@ -1682,15 +2074,19 @@ def write_synthetic_package(
     status: str = "PASS",
     reason: tuple[str, str] | None = None,
 ) -> None:
+    checkpoint_id = non_empty_string(
+        as_object(documents["model-lock.json"]["checkpoint"], "synthetic checkpoint")["id"],
+        "synthetic checkpoint.id",
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     for filename, document in documents.items():
         write_json(out_dir / filename, document)
     manifest = {
-        **synthetic_envelope("manifest"),
+        **synthetic_envelope("manifest", checkpoint_id),
         "validator_version": VALIDATOR_VERSION,
         "final_status": status,
         "terminal_reason": None if reason is None else {"code": reason[0], "detail": reason[1]},
-        "terminal_line": expected_terminal_line(status, "qwen38-27b-fp8", out_dir),
+        "terminal_line": expected_terminal_line(status, checkpoint_id, out_dir),
         "receipts": {
             filename: reference_for(out_dir / filename, filename)
             for filename in ["model-lock.json", "validation.json", "product.json"]
@@ -1734,6 +2130,63 @@ def run_self_test() -> None:
         write_synthetic_package(passing, pass_docs)
         expected = expected_terminal_line("PASS", "qwen38-27b-fp8", passing)
         require(validate_package("qwen38-27b-fp8", passing) == expected, "synthetic PASS line mismatch")
+
+        a3_passing = root / "a3-pass"
+        a3_pass_docs = synthetic_pass_documents(a3_passing, "qwen36-35b-a3b-fp8")
+        write_synthetic_package(a3_passing, a3_pass_docs)
+        a3_expected = expected_terminal_line("PASS", "qwen36-35b-a3b-fp8", a3_passing)
+        require(
+            validate_package("qwen36-35b-a3b-fp8", a3_passing) == a3_expected,
+            "synthetic A3 PASS line mismatch",
+        )
+
+        a3_missing_c8 = root / "a3-missing-c8"
+        a3_missing_c8_docs = synthetic_pass_documents(
+            a3_missing_c8, "qwen36-35b-a3b-fp8"
+        )
+        a3_missing_c8_docs["product.json"]["usability"]["bench_cells"][1][
+            "concurrency"
+        ] = 16
+        write_synthetic_package(a3_missing_c8, a3_missing_c8_docs)
+        expect_failure(
+            "A3 missing c8",
+            lambda: validate_package(
+                "qwen36-35b-a3b-fp8", a3_missing_c8, write_log=False
+            ),
+            "concurrency cells must be exactly [1, 8, 32]",
+        )
+
+        a3_request_rate = root / "a3-request-rate"
+        a3_request_rate_docs = synthetic_pass_documents(
+            a3_request_rate, "qwen36-35b-a3b-fp8"
+        )
+        a3_request_rate_docs["product.json"]["usability"]["bench_argv"].extend(
+            ["--request-rate", "7"]
+        )
+        write_synthetic_package(a3_request_rate, a3_request_rate_docs)
+        expect_failure(
+            "A3 request-rate override",
+            lambda: validate_package(
+                "qwen36-35b-a3b-fp8", a3_request_rate, write_log=False
+            ),
+            "must not override the concurrency sweep with --request-rate",
+        )
+
+        a3_wrong_regression_binary = root / "a3-wrong-regression-binary"
+        a3_wrong_regression_docs = synthetic_pass_documents(
+            a3_wrong_regression_binary, "qwen36-35b-a3b-fp8"
+        )
+        a3_wrong_regression_docs["product.json"]["regression_checks"][
+            "qwen38_27b_official_block_fp8"
+        ]["binary_sha256"] = "d" * 64
+        write_synthetic_package(a3_wrong_regression_binary, a3_wrong_regression_docs)
+        expect_failure(
+            "A3 mismatched Qwen3.8 regression binary",
+            lambda: validate_package(
+                "qwen36-35b-a3b-fp8", a3_wrong_regression_binary, write_log=False
+            ),
+            "binary SHA256 mismatch",
+        )
 
         threshold = root / "bad-threshold"
         threshold_docs = synthetic_pass_documents(threshold)

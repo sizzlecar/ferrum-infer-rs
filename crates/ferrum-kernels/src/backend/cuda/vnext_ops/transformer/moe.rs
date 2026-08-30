@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
+use cudarc::driver::{
+    sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, CudaFunction,
+};
+use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     routed_shared_swiglu_moe_contract, AttributeId, BatchedOperationInvocation, CapabilityId,
     ContractVersion, DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
@@ -15,7 +18,9 @@ use ferrum_interfaces::vnext::{
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
 };
 
-use super::super::super::marlin::{launch_marlin_moe_vllm_raw, MarlinMoeRawLaunchArgs};
+use super::super::super::marlin::{
+    launch_marlin_moe_vllm_raw, MarlinMoeF16WeightType, MarlinMoeRawLaunchArgs,
+};
 use super::super::super::vnext_replay::CudaCommandReplayKeyBuilder;
 use super::super::super::vnext_runtime::{
     CudaDeviceBuffer, CudaDeviceCommand, CudaDeviceRuntime, CudaDeviceRuntimeError,
@@ -23,8 +28,8 @@ use super::super::super::vnext_runtime::{
 use super::super::{binding, contract_error, implementation_fingerprint, same_physical_region};
 use super::moe_launch::{region_pointer, zero_region, MoeCudaKernels};
 use super::moe_weights::{
-    resolve_gptq_marlin_moe_weight, CudaMarlinMoeWeight, GPTQ_MARLIN_QUANTIZATION_FORMAT_ID,
-    GPTQ_MARLIN_WEIGHT_FORMAT_ID,
+    resolve_gptq_marlin_moe_weight, resolve_marlin_fp8_moe_weight, CudaMarlinMoeWeight,
+    GPTQ_MARLIN_QUANTIZATION_FORMAT_ID, GPTQ_MARLIN_WEIGHT_FORMAT_ID,
 };
 use super::moe_workspace::{
     workspace_formula_terms, MoeWorkspaceLayout, WorkspaceRegion, MAX_ROUTER_EXPERTS,
@@ -33,14 +38,63 @@ use super::moe_workspace::{
 use super::{
     contiguous_bindings, ensure_estimator_request, estimate, f16_contiguous, launch_gemm_f16,
     shared_full_region, shared_scratch_region, shared_token_region,
-    static_contiguous_reusable_topology, CapturedProviderWorkspace,
+    static_contiguous_reusable_topology, CapturedProviderWorkspace, MarlinProjectionRuntime,
 };
-use crate::marlin_fp8_materializer::MARLIN_FP8_WEIGHT_FORMAT_ID;
+use crate::marlin_fp8_materializer::{
+    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
+};
 
-const PROVIDER_ID: &str = "provider.cuda.routed_shared_swiglu_moe.f16.gptq_marlin";
-const ESTIMATOR_ID: &str = "resource-estimator.cuda.routed_shared_swiglu_moe.f16.gptq_marlin";
+const GPTQ_PROVIDER_ID: &str = "provider.cuda.routed_shared_swiglu_moe.f16.gptq_marlin";
+const GPTQ_ESTIMATOR_ID: &str = "resource-estimator.cuda.routed_shared_swiglu_moe.f16.gptq_marlin";
+const MARLIN_FP8_PROVIDER_ID: &str = "provider.cuda.routed_shared_swiglu_moe.f16.marlin-fp8-w8a16";
+const MARLIN_FP8_ESTIMATOR_ID: &str =
+    "resource-estimator.cuda.routed_shared_swiglu_moe.f16.marlin-fp8-w8a16";
 const COMMAND_NAME: &str = "vnext_routed_shared_swiglu_moe";
+const PLANAR_SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_f16";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoeProviderKind {
+    GptqMarlin,
+    MarlinFp8,
+}
+
+impl MoeProviderKind {
+    const fn provider_id(self) -> &'static str {
+        match self {
+            Self::GptqMarlin => GPTQ_PROVIDER_ID,
+            Self::MarlinFp8 => MARLIN_FP8_PROVIDER_ID,
+        }
+    }
+
+    const fn estimator_id(self) -> &'static str {
+        match self {
+            Self::GptqMarlin => GPTQ_ESTIMATOR_ID,
+            Self::MarlinFp8 => MARLIN_FP8_ESTIMATOR_ID,
+        }
+    }
+
+    const fn weight_format_id(self) -> &'static str {
+        match self {
+            Self::GptqMarlin => GPTQ_MARLIN_WEIGHT_FORMAT_ID,
+            Self::MarlinFp8 => MARLIN_FP8_WEIGHT_FORMAT_ID,
+        }
+    }
+
+    const fn quantization_format_id(self) -> &'static str {
+        match self {
+            Self::GptqMarlin => GPTQ_MARLIN_QUANTIZATION_FORMAT_ID,
+            Self::MarlinFp8 => MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+        }
+    }
+
+    const fn routed_weight_type(self) -> MarlinMoeF16WeightType {
+        match self {
+            Self::GptqMarlin => MarlinMoeF16WeightType::U4B8,
+            Self::MarlinFp8 => MarlinMoeF16WeightType::E4M3,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MoeAttributes {
@@ -112,6 +166,37 @@ struct MoeLaunchShape {
     device_ordinal: i32,
 }
 
+#[derive(Clone, Copy)]
+struct MarlinWeightRegions {
+    packed: usize,
+    scales: usize,
+}
+
+#[derive(Clone, Copy)]
+enum SharedProjectionRegions {
+    F16 {
+        gate_up: usize,
+        down: usize,
+    },
+    MarlinFp8 {
+        gate: MarlinWeightRegions,
+        up: MarlinWeightRegions,
+        down: MarlinWeightRegions,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct MoeCommandRegions {
+    input: usize,
+    router: usize,
+    routed_gate_up: MarlinWeightRegions,
+    routed_down: MarlinWeightRegions,
+    shared_gate: usize,
+    shared_projection: SharedProjectionRegions,
+    output: usize,
+    scratch: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MoeRoutingPlan {
     SingleTokenDirectMarlin,
@@ -151,22 +236,45 @@ impl MoeRoutingPlan {
 
 pub(in crate::backend::cuda::vnext_ops) struct CudaRoutedSharedSwiGluMoeProvider {
     descriptor: OperationProviderDescriptor,
+    kind: MoeProviderKind,
     kernels: MoeCudaKernels,
     multiprocessor_count: u64,
     device_ordinal: i32,
+    projection_runtime: Option<MarlinProjectionRuntime>,
+    planar_silu_mul: Option<CudaFunction>,
 }
 
 impl CudaRoutedSharedSwiGluMoeProvider {
     pub(in crate::backend::cuda::vnext_ops) fn new(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_for_kind(runtime, MoeProviderKind::GptqMarlin)
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_marlin_fp8(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_for_kind(runtime, MoeProviderKind::MarlinFp8)
+    }
+
+    fn new_for_kind(
+        runtime: &CudaDeviceRuntime,
+        kind: MoeProviderKind,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = routed_shared_swiglu_moe_contract().map_err(contract_error)?;
-        let capability = CapabilityId::new(ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID)
+        let operation_capability = CapabilityId::new(ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID)
             .map_err(contract_error)?;
-        if !runtime.descriptor().capabilities.contains(&capability) {
-            return Err(CudaDeviceRuntimeError::contract(format!(
-                "CUDA runtime does not advertise capability `{ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID}`"
-            )));
+        let mut required_capabilities = BTreeSet::from([operation_capability]);
+        if kind == MoeProviderKind::MarlinFp8 {
+            required_capabilities
+                .insert(CapabilityId::new(MARLIN_FP8_CAPABILITY_ID).map_err(contract_error)?);
+        }
+        for capability in &required_capabilities {
+            if !runtime.descriptor().capabilities.contains(capability) {
+                return Err(CudaDeviceRuntimeError::contract(format!(
+                    "CUDA runtime does not advertise capability `{capability}`"
+                )));
+            }
         }
         let provider_fingerprint = implementation_fingerprint(&[
             include_str!("moe.rs").as_bytes(),
@@ -180,14 +288,15 @@ impl CudaRoutedSharedSwiGluMoeProvider {
             crate::ptx::MOE_ALIGN_BLOCK_SIZE_PAIR_IDS.as_bytes(),
             crate::ptx::MOE_COMBINE.as_bytes(),
             crate::ptx::FUSED_SILU_MUL.as_bytes(),
+            kind.provider_id().as_bytes(),
         ]);
         let estimator_fingerprint = implementation_fingerprint(&[
             include_str!("moe_workspace.rs").as_bytes(),
-            ESTIMATOR_ID.as_bytes(),
+            kind.estimator_id().as_bytes(),
             provider_fingerprint.as_bytes(),
         ]);
         let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(PROVIDER_ID).map_err(contract_error)?,
+            ProviderId::new(kind.provider_id()).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -197,18 +306,13 @@ impl CudaRoutedSharedSwiGluMoeProvider {
             ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
             contract.descriptor().version,
             runtime.descriptor().id.clone(),
-            BTreeSet::from([capability]),
-            [GPTQ_MARLIN_WEIGHT_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID]
-                .into_iter()
-                .map(WeightFormatId::new)
-                .collect::<Result<BTreeSet<_>, _>>()
-                .map_err(contract_error)?,
+            required_capabilities,
+            BTreeSet::from([WeightFormatId::new(kind.weight_format_id()).map_err(contract_error)?]),
             BTreeSet::from([
-                QuantizationFormatId::new(GPTQ_MARLIN_QUANTIZATION_FORMAT_ID)
-                    .map_err(contract_error)?,
+                QuantizationFormatId::new(kind.quantization_format_id()).map_err(contract_error)?
             ]),
             contiguous_bindings(7),
-            ESTIMATOR_ID,
+            kind.estimator_id(),
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )
@@ -228,11 +332,33 @@ impl CudaRoutedSharedSwiGluMoeProvider {
         let device_ordinal = i32::try_from(runtime.descriptor().ordinal)
             .map_err(|_| CudaDeviceRuntimeError::contract("CUDA device ordinal exceeds i32"))?;
         let kernels = MoeCudaKernels::load(runtime)?;
+        let (projection_runtime, planar_silu_mul) = if kind == MoeProviderKind::MarlinFp8 {
+            let module = runtime
+                .context()
+                .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("MoE planar SiLU module load", error)
+                })?;
+            let planar_silu_mul = module
+                .load_function(PLANAR_SILU_MUL_FUNCTION_NAME)
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("MoE planar SiLU function load", error)
+                })?;
+            (
+                Some(MarlinProjectionRuntime::query(runtime)?),
+                Some(planar_silu_mul),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
             descriptor,
+            kind,
             kernels,
             multiprocessor_count,
             device_ordinal,
+            projection_runtime,
+            planar_silu_mul,
         })
     }
 }
@@ -291,9 +417,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRoutedSharedSwiGluMoeProvider 
         let identity = invocation.participants()[0].identity().clone();
         encode_moe(
             self.descriptor.provider_implementation_fingerprint(),
+            self.kind,
             self.kernels.clone(),
             self.multiprocessor_count,
             self.device_ordinal,
+            self.projection_runtime,
+            self.planar_silu_mul.clone(),
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -312,9 +441,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRoutedSharedSwiGluMoeProvider 
 
 fn encode_moe(
     provider_fingerprint: &str,
+    provider_kind: MoeProviderKind,
     kernels: MoeCudaKernels,
     multiprocessor_count: u64,
     device_ordinal: i32,
+    projection_runtime: Option<MarlinProjectionRuntime>,
+    planar_silu_mul: Option<CudaFunction>,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
     if invocation.participants().is_empty()
@@ -348,13 +480,18 @@ fn encode_moe(
         attributes.hidden_size,
         attributes.routed_intermediate_size,
     ];
-    let gate_up = resolve_shared_marlin_weight(&invocation, 2, &gate_up_dimensions)?;
-    let down = resolve_shared_marlin_weight(&invocation, 3, &down_dimensions)?;
+    let gate_up =
+        resolve_shared_marlin_weight_for_kind(&invocation, 2, &gate_up_dimensions, provider_kind)?;
+    let down =
+        resolve_shared_marlin_weight_for_kind(&invocation, 3, &down_dimensions, provider_kind)?;
     if gate_up.expert_count() != attributes.expert_count
         || down.expert_count() != attributes.expert_count
+        || gate_up.weight_type() != provider_kind.routed_weight_type()
+        || down.weight_type() != provider_kind.routed_weight_type()
     {
         return Err(
-            "CUDA routed/shared MoE physical expert count differs from attributes".to_owned(),
+            "CUDA routed/shared MoE physical expert stack differs from provider kind or attributes"
+                .to_owned(),
         );
     }
 
@@ -367,31 +504,122 @@ fn encode_moe(
         attributes.shared_intermediate_size,
         multiprocessor_count,
     )?;
-    let regions = vec![
-        shared_token_region(
-            &invocation,
-            ResolvedValueRole::Input,
-            0,
-            ElementType::F16,
-            tokens,
-        )?,
-        shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?,
-        gate_up.packed_region().clone(),
-        gate_up.scales_region().clone(),
-        down.packed_region().clone(),
-        down.scales_region().clone(),
-        shared_full_region(&invocation, ResolvedValueRole::Input, 4, ElementType::F16)?,
-        shared_full_region(&invocation, ResolvedValueRole::Input, 5, ElementType::F16)?,
-        shared_full_region(&invocation, ResolvedValueRole::Input, 6, ElementType::F16)?,
-        shared_token_region(
-            &invocation,
-            ResolvedValueRole::Output,
-            0,
-            ElementType::F16,
-            tokens,
-        )?,
-        shared_scratch_region(&invocation, layout.total_bytes)?,
-    ];
+    let mut regions = Vec::new();
+    let mut push_region = |region| {
+        let index = regions.len();
+        regions.push(region);
+        index
+    };
+    let input_region = push_region(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let router_region = push_region(shared_full_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        1,
+        ElementType::F16,
+    )?);
+    let routed_gate_up = MarlinWeightRegions {
+        packed: push_region(gate_up.packed_region().clone()),
+        scales: push_region(gate_up.scales_region().clone()),
+    };
+    let routed_down = MarlinWeightRegions {
+        packed: push_region(down.packed_region().clone()),
+        scales: push_region(down.scales_region().clone()),
+    };
+    let shared_gate_region = push_region(shared_full_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        4,
+        ElementType::F16,
+    )?);
+    drop(push_region);
+    let shared_projection = match provider_kind {
+        MoeProviderKind::GptqMarlin => {
+            let gate_up = regions.len();
+            regions.push(shared_full_region(
+                &invocation,
+                ResolvedValueRole::Input,
+                5,
+                ElementType::F16,
+            )?);
+            let down = regions.len();
+            regions.push(shared_full_region(
+                &invocation,
+                ResolvedValueRole::Input,
+                6,
+                ElementType::F16,
+            )?);
+            SharedProjectionRegions::F16 { gate_up, down }
+        }
+        MoeProviderKind::MarlinFp8 => {
+            if projection_runtime.is_none() || planar_silu_mul.is_none() {
+                return Err(
+                    "CUDA Marlin FP8 MoE provider lacks its projection runtime or planar SiLU kernel"
+                        .to_owned(),
+                );
+            }
+            let gate = super::push_shared_marlin_fp8_weight(
+                &mut regions,
+                &invocation,
+                5,
+                &[attributes.shared_intermediate_size, attributes.hidden_size],
+                Some(0),
+            )?;
+            let up = super::push_shared_marlin_fp8_weight(
+                &mut regions,
+                &invocation,
+                5,
+                &[attributes.shared_intermediate_size, attributes.hidden_size],
+                Some(1),
+            )?;
+            let down = super::push_shared_marlin_fp8_weight(
+                &mut regions,
+                &invocation,
+                6,
+                &[attributes.hidden_size, attributes.shared_intermediate_size],
+                None,
+            )?;
+            SharedProjectionRegions::MarlinFp8 {
+                gate: MarlinWeightRegions {
+                    packed: gate.packed_region,
+                    scales: gate.scales_region,
+                },
+                up: MarlinWeightRegions {
+                    packed: up.packed_region,
+                    scales: up.scales_region,
+                },
+                down: MarlinWeightRegions {
+                    packed: down.packed_region,
+                    scales: down.scales_region,
+                },
+            }
+        }
+    };
+    let output_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Output,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let scratch_region = regions.len();
+    regions.push(shared_scratch_region(&invocation, layout.total_bytes)?);
+    let command_regions = MoeCommandRegions {
+        input: input_region,
+        router: router_region,
+        routed_gate_up,
+        routed_down,
+        shared_gate: shared_gate_region,
+        shared_projection,
+        output: output_region,
+        scratch: scratch_region,
+    };
     let shape = MoeLaunchShape {
         tokens: checked_i32(tokens, "MoE token count")?,
         expert_count: checked_i32(attributes.expert_count, "MoE expert count")?,
@@ -408,10 +636,8 @@ fn encode_moe(
         pair_count: checked_i32(layout.pair_count, "MoE pair count")?,
         sorted_capacity: checked_i32(layout.sorted_capacity, "MoE sorted capacity")?,
         normalize_topk: attributes.normalize_topk,
-        gate_up_group_size: i32::try_from(gate_up.group_size())
-            .map_err(|_| "MoE gate/up group size exceeds i32".to_owned())?,
-        down_group_size: i32::try_from(down.group_size())
-            .map_err(|_| "MoE down group size exceeds i32".to_owned())?,
+        gate_up_group_size: gate_up.group_size(),
+        down_group_size: down.group_size(),
         device_ordinal,
     };
     let routing_plan = MoeRoutingPlan::for_tokens(shape.tokens);
@@ -425,6 +651,10 @@ fn encode_moe(
         .boolean(shape.normalize_topk)
         .i32(shape.gate_up_group_size)
         .i32(shape.down_group_size)
+        .bytes(match provider_kind {
+            MoeProviderKind::GptqMarlin => b"u4b8",
+            MoeProviderKind::MarlinFp8 => b"e4m3",
+        })
         .i32(shape.device_ordinal)
         .bytes(routing_plan.replay_tag())
         .u64(layout.total_bytes)
@@ -438,7 +668,7 @@ fn encode_moe(
         regions,
         replay_key,
         move |stream, blas, regions| {
-            let scratch = &regions[10];
+            let scratch = &regions[command_regions.scratch];
             if scratch.length_bytes() < layout.total_bytes {
                 return Err(CudaDeviceRuntimeError::contract(
                     "MoE scratch is smaller than its admitted estimate",
@@ -448,8 +678,8 @@ fn encode_moe(
 
             launch_gemm_f16(
                 blas,
-                regions[0].device_ptr(),
-                regions[1].device_ptr(),
+                regions[command_regions.input].device_ptr(),
+                regions[command_regions.router].device_ptr(),
                 pointers.router_logits,
                 shape.tokens,
                 shape.expert_count,
@@ -496,11 +726,12 @@ fn encode_moe(
             }
 
             zero_region(stream, scratch.device_ptr(), layout.marlin_workspace)?;
-            launch_marlin(
+            launch_marlin_typed(
                 stream,
-                regions[0].device_ptr(),
-                regions[2].device_ptr(),
-                regions[3].device_ptr(),
+                provider_kind.routed_weight_type(),
+                regions[command_regions.input].device_ptr(),
+                regions[command_regions.routed_gate_up.packed].device_ptr(),
+                regions[command_regions.routed_gate_up.scales].device_ptr(),
                 pointers.routed_gate_up,
                 pointers.marlin(),
                 shape.tokens,
@@ -530,11 +761,12 @@ fn encode_moe(
                     })?,
             )?;
             zero_region(stream, scratch.device_ptr(), layout.marlin_workspace)?;
-            launch_marlin(
+            launch_marlin_typed(
                 stream,
+                provider_kind.routed_weight_type(),
                 pointers.routed_activation,
-                regions[4].device_ptr(),
-                regions[5].device_ptr(),
+                regions[command_regions.routed_down.packed].device_ptr(),
+                regions[command_regions.routed_down.scales].device_ptr(),
                 pointers.routed_down_slots,
                 pointers.marlin(),
                 shape.pair_count,
@@ -548,7 +780,7 @@ fn encode_moe(
                 stream,
                 pointers.routed_down_slots,
                 pointers.route_weights,
-                regions[9].device_ptr(),
+                regions[command_regions.output].device_ptr(),
                 shape.tokens,
                 shape.experts_per_token,
                 shape.hidden_size,
@@ -556,28 +788,13 @@ fn encode_moe(
 
             launch_gemm_f16(
                 blas,
-                regions[0].device_ptr(),
-                regions[6].device_ptr(),
+                regions[command_regions.input].device_ptr(),
+                regions[command_regions.shared_gate].device_ptr(),
                 pointers.shared_gate,
                 shape.tokens,
                 1,
                 shape.hidden_size,
                 "vNext MoE shared gate GEMM",
-            )?;
-            launch_gemm_f16(
-                blas,
-                regions[0].device_ptr(),
-                regions[7].device_ptr(),
-                pointers.shared_gate_up,
-                shape.tokens,
-                shape
-                    .shared_intermediate_size
-                    .checked_mul(2)
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract("MoE shared gate/up width exceeds i32")
-                    })?,
-                shape.hidden_size,
-                "vNext MoE shared gate/up GEMM",
             )?;
             let shared_activation_elements = u64::try_from(shape.tokens)
                 .ok()
@@ -587,26 +804,116 @@ fn encode_moe(
                         "MoE shared activation element count overflows",
                     )
                 })?;
-            kernels.launch_silu(
-                stream,
-                pointers.shared_gate_up,
-                pointers.shared_activation,
-                shape.shared_intermediate_size,
-                shared_activation_elements,
-            )?;
-            launch_gemm_f16(
-                blas,
-                pointers.shared_activation,
-                regions[8].device_ptr(),
-                pointers.shared_output,
-                shape.tokens,
-                shape.hidden_size,
-                shape.shared_intermediate_size,
-                "vNext MoE shared down GEMM",
-            )?;
+            match command_regions.shared_projection {
+                SharedProjectionRegions::F16 { gate_up, down } => {
+                    launch_gemm_f16(
+                        blas,
+                        regions[command_regions.input].device_ptr(),
+                        regions[gate_up].device_ptr(),
+                        pointers.shared_gate_up,
+                        shape.tokens,
+                        shape
+                            .shared_intermediate_size
+                            .checked_mul(2)
+                            .ok_or_else(|| {
+                                CudaDeviceRuntimeError::contract(
+                                    "MoE shared gate/up width exceeds i32",
+                                )
+                            })?,
+                        shape.hidden_size,
+                        "vNext MoE shared gate/up GEMM",
+                    )?;
+                    kernels.launch_silu(
+                        stream,
+                        pointers.shared_gate_up,
+                        pointers.shared_activation,
+                        shape.shared_intermediate_size,
+                        shared_activation_elements,
+                    )?;
+                    launch_gemm_f16(
+                        blas,
+                        pointers.shared_activation,
+                        regions[down].device_ptr(),
+                        pointers.shared_output,
+                        shape.tokens,
+                        shape.hidden_size,
+                        shape.shared_intermediate_size,
+                        "vNext MoE shared down GEMM",
+                    )?;
+                }
+                SharedProjectionRegions::MarlinFp8 { gate, up, down } => {
+                    let projection_runtime = projection_runtime.ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "Marlin FP8 MoE projection runtime is absent",
+                        )
+                    })?;
+                    let planar_silu_mul = planar_silu_mul.as_ref().ok_or_else(|| {
+                        CudaDeviceRuntimeError::contract(
+                            "Marlin FP8 MoE planar SiLU kernel is absent",
+                        )
+                    })?;
+                    let shared_activation_bytes = shared_activation_elements
+                        .checked_mul(ElementType::F16.size_bytes())
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "Marlin FP8 MoE shared activation bytes overflow",
+                            )
+                        })?;
+                    let shared_up = pointers
+                        .shared_gate_up
+                        .checked_add(shared_activation_bytes)
+                        .ok_or_else(|| {
+                            CudaDeviceRuntimeError::contract(
+                                "Marlin FP8 MoE shared up pointer overflows",
+                            )
+                        })?;
+                    for (weight, output) in [(gate, pointers.shared_gate_up), (up, shared_up)] {
+                        projection_runtime.launch(
+                            crate::backend::cuda::vllm_marlin::MarlinF16WeightType::E4M3Fn,
+                            stream,
+                            regions[command_regions.input].device_ptr(),
+                            regions[weight.packed].device_ptr(),
+                            regions[weight.scales].device_ptr(),
+                            None,
+                            output,
+                            pointers.marlin_c_tmp,
+                            layout.marlin_c_tmp.length_bytes(),
+                            shape.tokens,
+                            shape.shared_intermediate_size,
+                            shape.hidden_size,
+                            -1,
+                            "Marlin FP8 MoE shared gate/up projection",
+                        )?;
+                    }
+                    super::launch_planar_silu_mul(
+                        stream,
+                        planar_silu_mul,
+                        pointers.shared_gate_up,
+                        shared_up,
+                        pointers.shared_activation,
+                        shared_activation_elements,
+                    )?;
+                    projection_runtime.launch(
+                        crate::backend::cuda::vllm_marlin::MarlinF16WeightType::E4M3Fn,
+                        stream,
+                        pointers.shared_activation,
+                        regions[down.packed].device_ptr(),
+                        regions[down.scales].device_ptr(),
+                        None,
+                        pointers.shared_output,
+                        pointers.marlin_c_tmp,
+                        layout.marlin_c_tmp.length_bytes(),
+                        shape.tokens,
+                        shape.hidden_size,
+                        shape.shared_intermediate_size,
+                        -1,
+                        "Marlin FP8 MoE shared down projection",
+                    )?;
+                }
+            }
             kernels.launch_token_gate_add(
                 stream,
-                regions[9].device_ptr(),
+                regions[command_regions.output].device_ptr(),
                 pointers.shared_output,
                 pointers.shared_gate,
                 shape.tokens,
@@ -620,7 +927,8 @@ fn encode_moe(
             DeviceBatchingForm::Packed,
             participant_count,
             tokens,
-            routing_plan.compute_dispatch_count(),
+            routing_plan.compute_dispatch_count()
+                + u64::from(provider_kind == MoeProviderKind::MarlinFp8),
             2,
         )
     })
@@ -642,9 +950,43 @@ pub(super) fn launch_marlin(
     group_size: i32,
     device_ordinal: i32,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    launch_marlin_typed(
+        stream,
+        MarlinMoeF16WeightType::U4B8,
+        input,
+        packed_weight,
+        scales,
+        output,
+        workspace,
+        prob_m,
+        top_k,
+        prob_n,
+        prob_k,
+        group_size,
+        device_ordinal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_marlin_typed(
+    stream: &cudarc::driver::CudaStream,
+    weight_type: MarlinMoeF16WeightType,
+    input: u64,
+    packed_weight: u64,
+    scales: u64,
+    output: u64,
+    workspace: MarlinMoeWorkspacePointers,
+    prob_m: i32,
+    top_k: i32,
+    prob_n: i32,
+    prob_k: i32,
+    group_size: i32,
+    device_ordinal: i32,
+) -> Result<(), CudaDeviceRuntimeError> {
     launch_marlin_moe_vllm_raw(
         stream,
         MarlinMoeRawLaunchArgs {
+            weight_type,
             a: input,
             b: packed_weight,
             c: output,
@@ -754,18 +1096,36 @@ pub(super) fn resolve_shared_marlin_weight(
     ordinal: u32,
     logical_dimensions: &[u64],
 ) -> Result<CudaMarlinMoeWeight, String> {
-    let first = &invocation.participants()[0];
-    let resolved = resolve_gptq_marlin_moe_weight(
-        first,
-        binding(first.bindings(), ResolvedValueRole::Input, ordinal)?,
+    resolve_shared_marlin_weight_for_kind(
+        invocation,
+        ordinal,
         logical_dimensions,
-    )?;
+        MoeProviderKind::GptqMarlin,
+    )
+}
+
+fn resolve_shared_marlin_weight_for_kind(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ordinal: u32,
+    logical_dimensions: &[u64],
+    provider_kind: MoeProviderKind,
+) -> Result<CudaMarlinMoeWeight, String> {
+    let resolve =
+        |participant: &ferrum_interfaces::vnext::OperationInvocation<'_, CudaDeviceBuffer>| {
+            let binding = binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+            match provider_kind {
+                MoeProviderKind::GptqMarlin => {
+                    resolve_gptq_marlin_moe_weight(participant, binding, logical_dimensions)
+                }
+                MoeProviderKind::MarlinFp8 => {
+                    resolve_marlin_fp8_moe_weight(participant, binding, logical_dimensions)
+                }
+            }
+        };
+    let first = &invocation.participants()[0];
+    let resolved = resolve(first)?;
     for participant in &invocation.participants()[1..] {
-        let candidate = resolve_gptq_marlin_moe_weight(
-            participant,
-            binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
-            logical_dimensions,
-        )?;
+        let candidate = resolve(participant)?;
         if !same_marlin_weight(&resolved, &candidate) {
             return Err(format!(
                 "CUDA routed/shared MoE input {ordinal} is not one shared physical Marlin stack"
@@ -783,6 +1143,7 @@ fn same_marlin_weight(left: &CudaMarlinMoeWeight, right: &CudaMarlinMoeWeight) -
         && left.packed_expert_stride_bytes() == right.packed_expert_stride_bytes()
         && left.scales_expert_stride_bytes() == right.scales_expert_stride_bytes()
         && left.group_size() == right.group_size()
+        && left.weight_type() == right.weight_type()
         && same_physical_region(left.packed_region(), right.packed_region())
         && same_physical_region(left.scales_region(), right.scales_region())
 }
@@ -947,5 +1308,28 @@ mod tests {
             11
         );
         assert_eq!(MoeRoutingPlan::GenericAlign.compute_dispatch_count(), 12);
+    }
+
+    #[test]
+    fn gptq_and_marlin_fp8_providers_advertise_disjoint_weight_abis() {
+        let gptq = MoeProviderKind::GptqMarlin;
+        assert_eq!(gptq.provider_id(), GPTQ_PROVIDER_ID);
+        assert_eq!(gptq.weight_format_id(), GPTQ_MARLIN_WEIGHT_FORMAT_ID);
+        assert_eq!(
+            gptq.quantization_format_id(),
+            GPTQ_MARLIN_QUANTIZATION_FORMAT_ID
+        );
+        assert_eq!(gptq.routed_weight_type(), MarlinMoeF16WeightType::U4B8);
+        assert_ne!(gptq.weight_format_id(), MARLIN_FP8_WEIGHT_FORMAT_ID);
+
+        let fp8 = MoeProviderKind::MarlinFp8;
+        assert_eq!(fp8.provider_id(), MARLIN_FP8_PROVIDER_ID);
+        assert_eq!(fp8.weight_format_id(), MARLIN_FP8_WEIGHT_FORMAT_ID);
+        assert_eq!(
+            fp8.quantization_format_id(),
+            MARLIN_FP8_QUANTIZATION_FORMAT_ID
+        );
+        assert_eq!(fp8.routed_weight_type(), MarlinMoeF16WeightType::E4M3);
+        assert_ne!(fp8.weight_format_id(), GPTQ_MARLIN_WEIGHT_FORMAT_ID);
     }
 }

@@ -61,7 +61,7 @@ EXPECTED_OPERATION_COUNTS = {
     "operation.last_token_dense_linear": 0,
 }
 
-MAX_METADATA_BYTES = 4 * 1024 * 1024
+MAX_METADATA_BYTES = 8 * 1024 * 1024
 MAX_HEADER_BYTES = 16 * 1024 * 1024
 MAX_TENSORS_PER_SHARD = 10_000
 MAX_TOTAL_TENSORS = 100_000
@@ -81,6 +81,7 @@ DTYPE_BYTES = {
 OP_GATED_DELTA = "operation.gated_delta_recurrent_attention"
 OP_CAUSAL_ATTENTION = "operation.causal_paged_attention"
 OP_DENSE_SWIGLU = "operation.dense_swiglu"
+OP_ROUTED_SHARED_MOE = "operation.routed_shared_swiglu_moe"
 OP_LOGITS = "operation.last_token_dense_linear"
 
 
@@ -387,6 +388,29 @@ PRODUCTION_PROFILE = ExpectedProfile(
     operation_counts=EXPECTED_OPERATION_COUNTS,
 )
 
+A3_MOE_PROFILE = ExpectedProfile(
+    shard_count=42,
+    tensor_count=64_196,
+    partition_counts={
+        "execution_eligible_text": 62_303,
+        "typed_nonexecuted_visual": 333,
+        "typed_nonexecuted_mtp": 1_560,
+        "unknown": 0,
+    },
+    dtype_counts={"BF16": 32_451, "F8_E4M3": 31_745},
+    pair_counts={
+        "execution_eligible_text": 30_970,
+        "typed_nonexecuted_visual": 0,
+        "typed_nonexecuted_mtp": 775,
+    },
+    operation_counts={
+        OP_GATED_DELTA: 90,
+        OP_CAUSAL_ATTENTION: 40,
+        OP_ROUTED_SHARED_MOE: 30_840,
+        OP_LOGITS: 0,
+    },
+)
+
 
 @dataclass(frozen=True)
 class CheckpointProfile:
@@ -396,6 +420,7 @@ class CheckpointProfile:
     license_id: str
     architecture: str
     model_type: str
+    config_language_model_only: bool | None
     format_id: str
     expected: ExpectedProfile
 
@@ -408,6 +433,7 @@ CHECKPOINT_PROFILES = {
         license_id="apache-2.0",
         architecture="Qwen3_5ForConditionalGeneration",
         model_type="qwen3_5",
+        config_language_model_only=False,
         format_id=CHECKPOINT_FORMAT,
         expected=PRODUCTION_PROFILE,
     ),
@@ -418,8 +444,20 @@ CHECKPOINT_PROFILES = {
         license_id="apache-2.0",
         architecture="Qwen3_5ForConditionalGeneration",
         model_type="qwen3_5",
+        config_language_model_only=False,
         format_id=CHECKPOINT_FORMAT,
         expected=PRODUCTION_PROFILE,
+    ),
+    "qwen36-35b-a3b-fp8": CheckpointProfile(
+        checkpoint_id="qwen36-35b-a3b-fp8",
+        repository="Qwen/Qwen3.6-35B-A3B-FP8",
+        revision="95a723d08a9490559dae23d0cff1d9466213d989",
+        license_id="apache-2.0",
+        architecture="Qwen3_5MoeForConditionalGeneration",
+        model_type="qwen3_5_moe",
+        config_language_model_only=None,
+        format_id=CHECKPOINT_FORMAT,
+        expected=A3_MOE_PROFILE,
     ),
 }
 DEFAULT_CHECKPOINT = CHECKPOINT_PROFILES[DEFAULT_CHECKPOINT_ID]
@@ -536,7 +574,13 @@ def parse_recipe(config_body: bytes, checkpoint: CheckpointProfile = DEFAULT_CHE
     architectures = as_list(config.get("architectures"), "config.architectures")
     require(architectures == [checkpoint.architecture], "config architecture differs")
     require(config.get("model_type") == checkpoint.model_type, "config model_type differs")
-    require(config.get("language_model_only") is False, "config language_model_only differs")
+    if checkpoint.config_language_model_only is None:
+        require("language_model_only" not in config, "config language_model_only differs")
+    else:
+        require(
+            config.get("language_model_only") is checkpoint.config_language_model_only,
+            "config language_model_only differs",
+        )
     quant = as_object(config.get("quantization_config"), "config.quantization_config")
     require(set(quant) == {
         "activation_scheme",
@@ -715,6 +759,13 @@ def operation_for_quant_weight(name: str) -> str | None:
         name,
     ):
         return OP_DENSE_SWIGLU
+    if re.fullmatch(
+        r"model\.language_model\.layers\.[0-9]+\.mlp\."
+        r"(?:experts\.[0-9]+|shared_expert)\."
+        r"(?:gate_proj|up_proj|down_proj)\.weight",
+        name,
+    ):
+        return OP_ROUTED_SHARED_MOE
     if name == "lm_head.weight":
         return OP_LOGITS
     return None
@@ -965,7 +1016,8 @@ def build_lock(
             "license": checkpoint.license_id,
             "architecture": checkpoint.architecture,
             "model_type": checkpoint.model_type,
-            "language_model_only": False,
+            "language_model_only_present": checkpoint.config_language_model_only is not None,
+            "language_model_only": checkpoint.config_language_model_only,
             "backend": "cuda",
             "format": checkpoint.format_id,
         },
@@ -1086,22 +1138,25 @@ def make_safetensors_fixture(tensors: dict[str, tuple[str, list[int]]]) -> bytes
     return struct.pack("<Q", len(raw_header)) + raw_header + bytes(payload)
 
 
-def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, ExpectedProfile]:
+def selftest_world(
+    case: str,
+    checkpoint: CheckpointProfile = DEFAULT_CHECKPOINT,
+) -> tuple[ResolutionInput, FixtureTransport, ExpectedProfile]:
     require(case in {"good", "bad_scale", "unknown_namespace", "orphan_sidecar"}, "bad fixture case")
-    config = canonical_json_bytes(
-        {
-            "architectures": [DEFAULT_CHECKPOINT.architecture],
-            "language_model_only": False,
-            "model_type": DEFAULT_CHECKPOINT.model_type,
-            "quantization_config": {
-                "activation_scheme": "dynamic",
-                "fmt": "e4m3",
-                "modules_to_not_convert": ["lm_head"],
-                "quant_method": "fp8",
-                "weight_block_size": [128, 128],
-            },
-        }
-    )
+    config_document = {
+        "architectures": [checkpoint.architecture],
+        "model_type": checkpoint.model_type,
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "modules_to_not_convert": ["lm_head"],
+            "quant_method": "fp8",
+            "weight_block_size": [128, 128],
+        },
+    }
+    if checkpoint.config_language_model_only is not None:
+        config_document["language_model_only"] = checkpoint.config_language_model_only
+    config = canonical_json_bytes(config_document)
     shard_tensors: dict[str, dict[str, tuple[str, list[int]]]] = {
         "layers-0.safetensors": {
             "lm_head.weight": ("BF16", [8, 8]),
@@ -1113,13 +1168,45 @@ def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, Expect
                 "BF16",
                 [2, 3],
             ),
-            "model.language_model.layers.0.mlp.gate_proj.weight": ("F8_E4M3", [128, 256]),
-            "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv": ("BF16", [1, 2]),
             "mtp.layers.0.mlp.down_proj.weight": ("F8_E4M3", [128, 128]),
             "mtp.layers.0.mlp.down_proj.weight_scale_inv": ("BF16", [1, 1]),
             "mtp.norm.weight": ("BF16", [8]),
         }
     }
+    if checkpoint.model_type == "qwen3_5_moe":
+        shard_tensors["layers-0.safetensors"].update(
+            {
+                "model.language_model.layers.0.mlp.experts.0.gate_proj.weight": (
+                    "F8_E4M3",
+                    [128, 256],
+                ),
+                "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_scale_inv": (
+                    "BF16",
+                    [1, 2],
+                ),
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight": (
+                    "F8_E4M3",
+                    [256, 128],
+                ),
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight_scale_inv": (
+                    "BF16",
+                    [2, 1],
+                ),
+            }
+        )
+    else:
+        shard_tensors["layers-0.safetensors"].update(
+            {
+                "model.language_model.layers.0.mlp.gate_proj.weight": (
+                    "F8_E4M3",
+                    [128, 256],
+                ),
+                "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv": (
+                    "BF16",
+                    [1, 2],
+                ),
+            }
+        )
     if case == "bad_scale":
         shard_tensors["layers-0.safetensors"][
             "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale_inv"
@@ -1149,14 +1236,16 @@ def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, Expect
                 "sha256": sha256_bytes(body),
                 "sha256_source": "downloaded_content",
                 "content_request_url": stable_file_url(
-                    DEFAULT_CHECKPOINT.repository,
-                    DEFAULT_CHECKPOINT.revision,
+                    checkpoint.repository,
+                    checkpoint.revision,
                     path,
                 ),
             }
         )
     for index_number, (path, body) in enumerate(shards.items(), start=1):
-        digest = hashlib.sha256(f"fixture-{case}-{index_number}".encode()).hexdigest()
+        digest = hashlib.sha256(
+            f"fixture-{checkpoint.checkpoint_id}-{case}-{index_number}".encode()
+        ).hexdigest()
         file_rows.append(
             {
                 "path": path,
@@ -1173,21 +1262,21 @@ def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, Expect
         "resolver": {"path": "fixture", "sha256": "f" * 64},
         "lanes": [
             {
-                "catalog_lane_id": DEFAULT_CHECKPOINT.checkpoint_id,
-                "model_id": DEFAULT_CHECKPOINT.checkpoint_id,
+                "catalog_lane_id": checkpoint.checkpoint_id,
+                "model_id": checkpoint.checkpoint_id,
                 "backend": "cuda",
-                "format": DEFAULT_CHECKPOINT.format_id,
+                "format": checkpoint.format_id,
                 "safetensors_shard_naming": "index_authoritative",
                 "weight_source": {
-                    "repo": DEFAULT_CHECKPOINT.repository,
-                    "revision": DEFAULT_CHECKPOINT.revision,
+                    "repo": checkpoint.repository,
+                    "revision": checkpoint.revision,
                     "gated": False,
-                    "license": {"hugging_face_id": DEFAULT_CHECKPOINT.license_id, "files": []},
+                    "license": {"hugging_face_id": checkpoint.license_id, "files": []},
                     "files": file_rows,
                 },
                 "semantic_source": {
-                    "repo": DEFAULT_CHECKPOINT.repository,
-                    "revision": DEFAULT_CHECKPOINT.revision,
+                    "repo": checkpoint.repository,
+                    "revision": checkpoint.revision,
                 },
                 "chat_template": {
                     "content_sha256": "a" * 64,
@@ -1206,34 +1295,33 @@ def selftest_world(case: str) -> tuple[ResolutionInput, FixtureTransport, Expect
         resolution_sha256=sha256_bytes(resolution_raw),
     )
     partition_counts = {
-        "execution_eligible_text": 5,
+        "execution_eligible_text": 0,
         "typed_nonexecuted_visual": 0,
-        "typed_nonexecuted_mtp": 3,
+        "typed_nonexecuted_mtp": 0,
         "unknown": 0,
     }
-    dtype_counts = {"BF16": 5, "F8_E4M3": 3}
-    if case == "unknown_namespace":
-        partition_counts["unknown"] = 1
-        dtype_counts["BF16"] += 1
-    elif case == "orphan_sidecar":
-        partition_counts["typed_nonexecuted_mtp"] += 1
-        dtype_counts["BF16"] += 1
+    dtype_counts: dict[str, int] = {}
+    pair_counts = {key: 0 for key in checkpoint.expected.pair_counts}
+    operation_counts = {key: 0 for key in checkpoint.expected.operation_counts}
+    for tensors in shard_tensors.values():
+        for name, (dtype, _shape) in tensors.items():
+            partition, _component = classify_tensor(name)
+            partition_counts[partition] += 1
+            dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+            if not name.endswith(".weight_scale_inv"):
+                continue
+            pair_counts[partition] += 1
+            if partition == "execution_eligible_text":
+                operation_id = operation_for_quant_weight(name.removesuffix("_scale_inv"))
+                require(operation_id in operation_counts, f"fixture operation is unmapped: {name}")
+                operation_counts[operation_id] += 1
     profile = ExpectedProfile(
         shard_count=1,
         tensor_count=sum(len(tensors) for tensors in shard_tensors.values()),
         partition_counts=partition_counts,
         dtype_counts=dtype_counts,
-        pair_counts={
-            "execution_eligible_text": 2,
-            "typed_nonexecuted_visual": 0,
-            "typed_nonexecuted_mtp": 1,
-        },
-        operation_counts={
-            OP_GATED_DELTA: 1,
-            OP_CAUSAL_ATTENTION: 0,
-            OP_DENSE_SWIGLU: 1,
-            OP_LOGITS: 0,
-        },
+        pair_counts=pair_counts,
+        operation_counts=operation_counts,
     )
     return resolution, FixtureTransport(metadata, shards), profile
 
@@ -1295,24 +1383,44 @@ def run_selftest() -> None:
         require("mismatched Content-Range" in str(exc), "bad total rejected for wrong reason")
     else:
         raise SourceLockError("mismatched Content-Range total was accepted")
-    resolution, transport, profile = selftest_world("good")
-    lock = build_lock(resolution, transport, profile=profile, emit_progress=False)
-    require(lock["inventory"]["tensor_count"] == 8, "good fixture tensor count differs")
-    require(lock["inventory"]["fp8_pair_count"] == 3, "good fixture pair count differs")
-    require(lock["inventory"]["partition"]["unknown"]["tensor_count"] == 0, "good fixture has unknown tensors")
-    require(lock["fingerprints"]["execution_contract_fingerprint"] is None, "execution digest must be null")
-    require(lock["fingerprints"]["quality_vector_digest"] is None, "quality digest must be null")
-    parallel_lock = build_lock(
-        resolution,
-        transport,
-        profile=profile,
-        emit_progress=False,
-        shard_workers=MAX_SHARD_WORKERS,
-    )
-    require(
-        parallel_lock["fingerprints"] == lock["fingerprints"],
-        "bounded parallel header scan changed source identities",
-    )
+    for checkpoint in CHECKPOINT_PROFILES.values():
+        resolution, transport, profile = selftest_world("good", checkpoint)
+        lock = build_lock(
+            resolution,
+            transport,
+            checkpoint=checkpoint,
+            profile=profile,
+            emit_progress=False,
+        )
+        expected_pair_count = 4 if checkpoint.model_type == "qwen3_5_moe" else 3
+        require(
+            lock["inventory"]["fp8_pair_count"] == expected_pair_count,
+            f"{checkpoint.checkpoint_id} fixture pair count differs",
+        )
+        require(
+            lock["inventory"]["partition"]["unknown"]["tensor_count"] == 0,
+            f"{checkpoint.checkpoint_id} fixture has unknown tensors",
+        )
+        require(
+            lock["fingerprints"]["execution_contract_fingerprint"] is None,
+            "execution digest must be null",
+        )
+        require(
+            lock["fingerprints"]["quality_vector_digest"] is None,
+            "quality digest must be null",
+        )
+        parallel_lock = build_lock(
+            resolution,
+            transport,
+            checkpoint=checkpoint,
+            profile=profile,
+            emit_progress=False,
+            shard_workers=MAX_SHARD_WORKERS,
+        )
+        require(
+            parallel_lock["fingerprints"] == lock["fingerprints"],
+            "bounded parallel header scan changed source identities",
+        )
     expect_reject("bad_scale", "bad block scale shape")
     expect_reject("unknown_namespace", "unknown tensor namespace")
     expect_reject("orphan_sidecar", "orphan FP8 sidecar")

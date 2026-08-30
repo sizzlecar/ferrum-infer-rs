@@ -62,7 +62,7 @@
     "status": "implemented",
     "id": "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16",
     "version": {"major": 1, "minor": 0},
-    "implementation_fingerprint": "fc1191a77acbeb7ee225699cfd3cde57a8cb92d3dd9660fababfbba1ca9da58b",
+    "implementation_fingerprint": "004d29e877fa60e2c996969a05a685c319c792384e0e413a015770239018c964",
     "fidelity": "approximate",
     "fidelity_enum": "WeightMaterializationFidelity::Approximate",
     "source_format_id": "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale",
@@ -91,7 +91,7 @@
       "materializer": {
         "id": "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16",
         "version": {"major": 1, "minor": 0},
-        "implementation_fingerprint": "fc1191a77acbeb7ee225699cfd3cde57a8cb92d3dd9660fababfbba1ca9da58b",
+        "implementation_fingerprint": "004d29e877fa60e2c996969a05a685c319c792384e0e413a015770239018c964",
         "fidelity": "approximate"
       },
       "source": {
@@ -108,7 +108,7 @@
       },
       "numeric_evidence": {
         "artifact_schema_id": "quality-approval.weight-materializer.numeric.v1",
-        "artifact_sha256": "e192f5c20893fa18648490c56fa891979d1f889670f24f7ad0c902feba0b11eb",
+        "artifact_sha256": "3e197dbeead55ad6af0833bff15d4413babb26a952e3f0ef2e085012a62057ed",
         "artifact_bytes": 48067,
         "required_case_count": 4,
         "completed_case_count": 4,

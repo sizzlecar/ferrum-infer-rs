@@ -1,4 +1,4 @@
-//! Typed GPTQ-Marlin weight translation for CUDA vNext providers.
+//! Typed Marlin weight translation for CUDA vNext providers.
 //!
 //! This boundary accepts one exact physical ABI. It deliberately does not
 //! infer component meaning from sorted ids, model names, or allocation sizes.
@@ -12,7 +12,9 @@ use ferrum_interfaces::vnext::{
     WeightId,
 };
 
+use crate::backend::cuda::marlin::MarlinMoeF16WeightType;
 use crate::backend::cuda::vnext_runtime::{CudaBufferRegion, CudaDeviceBuffer};
+use crate::marlin_fp8_materializer::MARLIN_FP8_QUANTIZATION_FORMAT_ID;
 
 pub(super) const GPTQ_MARLIN_WEIGHT_FORMAT_ID: &str = "weight-format.safetensors.gptq-marlin-int4";
 pub(super) const GPTQ_MARLIN_QUANTIZATION_FORMAT_ID: &str =
@@ -38,7 +40,8 @@ pub(super) struct CudaMarlinMoeWeight {
     expert_count: u64,
     packed_expert_stride_bytes: u64,
     scales_expert_stride_bytes: u64,
-    group_size: u32,
+    group_size: i32,
+    weight_type: MarlinMoeF16WeightType,
 }
 
 pub(super) type CudaMarlinGptqMatrixWeight = CudaMarlinMoeWeight;
@@ -129,8 +132,12 @@ impl CudaMarlinMoeWeight {
         self.scales_expert_stride_bytes
     }
 
-    pub(super) const fn group_size(&self) -> u32 {
+    pub(super) const fn group_size(&self) -> i32 {
         self.group_size
+    }
+
+    pub(super) const fn weight_type(&self) -> MarlinMoeF16WeightType {
+        self.weight_type
     }
 
     pub(super) fn into_regions(self) -> [CudaBufferRegion; 2] {
@@ -150,7 +157,8 @@ struct MarlinMoeWeightMetadata {
     scales_bytes: u64,
     packed_expert_stride_bytes: u64,
     scales_expert_stride_bytes: u64,
-    group_size: u32,
+    group_size: i32,
+    weight_type: MarlinMoeF16WeightType,
 }
 
 /// Resolve a whole, expert-major GPTQ-Marlin INT4 weight into two retained
@@ -178,6 +186,43 @@ pub(super) fn resolve_gptq_marlin_moe_weight(
     let input_features = logical_dimensions[logical_dimensions.len() - 1];
     validate_marlin_thread_tile(output_features, input_features, "CUDA Marlin-MoE")?;
     resolve_gptq_marlin_weight(participant, binding, logical_dimensions)
+}
+
+/// Resolve one whole expert-major channelwise E4M3 Marlin stack. Routed
+/// gate/up is `[E, 2, N, K]`; routed down is `[E, N, K]`. Splitting experts or
+/// projections into unrelated physical regions is deliberately rejected.
+pub(super) fn resolve_marlin_fp8_moe_weight(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    logical_dimensions: &[u64],
+) -> Result<CudaMarlinMoeWeight, String> {
+    let (output_features, input_features) = match logical_dimensions {
+        [expert_count, output_features, input_features] if *expert_count > 0 => {
+            (*output_features, *input_features)
+        }
+        [expert_count, 2, output_features, input_features] if *expert_count > 0 => (
+            output_features
+                .checked_mul(2)
+                .ok_or_else(|| "CUDA Marlin FP8 MoE fused gate/up width overflows".to_owned())?,
+            *input_features,
+        ),
+        _ => {
+            return Err(
+                "CUDA Marlin FP8 MoE logical shape must be [E, N, K] or [E, 2, N, K]".to_owned(),
+            )
+        }
+    };
+    validate_marlin_thread_tile(output_features, input_features, "CUDA Marlin FP8 MoE")?;
+    let weight = binding
+        .weight()
+        .ok_or_else(|| "CUDA Marlin FP8 MoE weight lacks its typed physical layout".to_owned())?;
+    let metadata = validate_marlin_fp8_moe_contract(
+        weight,
+        binding.tensor().dimensions(),
+        binding.tensor().element_type(),
+        logical_dimensions,
+    )?;
+    resolve_marlin_moe_weight_from_metadata(participant, binding, metadata)
 }
 
 /// Resolve one exact rank-2 GPTQ-Marlin projection matrix `[N, K]`.
@@ -503,6 +548,14 @@ fn resolve_gptq_marlin_weight(
         logical_dimensions,
     )?;
 
+    resolve_marlin_moe_weight_from_metadata(participant, binding, metadata)
+}
+
+fn resolve_marlin_moe_weight_from_metadata(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    metadata: MarlinMoeWeightMetadata,
+) -> Result<CudaMarlinMoeWeight, String> {
     let mut stored_by_id = BTreeMap::new();
     for stored in binding.storage().components() {
         let component_id = stored.component_id().ok_or_else(|| {
@@ -567,6 +620,7 @@ fn resolve_gptq_marlin_weight(
         packed_expert_stride_bytes: metadata.packed_expert_stride_bytes,
         scales_expert_stride_bytes: metadata.scales_expert_stride_bytes,
         group_size: metadata.group_size,
+        weight_type: metadata.weight_type,
     })
 }
 
@@ -789,7 +843,197 @@ fn validate_gptq_marlin_moe_contract(
         scales_bytes,
         packed_expert_stride_bytes,
         scales_expert_stride_bytes,
-        group_size,
+        group_size: i32::try_from(group_size)
+            .map_err(|_| "CUDA Marlin-MoE group size exceeds i32".to_owned())?,
+        weight_type: MarlinMoeF16WeightType::U4B8,
+    })
+}
+
+fn validate_marlin_fp8_moe_contract(
+    weight: &ResolvedWeightBinding,
+    bound_logical_dimensions: &[u64],
+    logical_element_type: ElementType,
+    caller_logical_dimensions: &[u64],
+) -> Result<MarlinMoeWeightMetadata, String> {
+    if caller_logical_dimensions != bound_logical_dimensions {
+        return Err(format!(
+            "CUDA Marlin FP8 MoE caller shape {caller_logical_dimensions:?} differs from bound shape {bound_logical_dimensions:?}"
+        ));
+    }
+    match bound_logical_dimensions {
+        [expert_count, output_features, input_features]
+            if *expert_count > 0 && *output_features > 0 && *input_features > 0 => {}
+        [expert_count, 2, output_features, input_features]
+            if *expert_count > 0 && *output_features > 0 && *input_features > 0 => {}
+        _ => {
+            return Err(
+                "CUDA Marlin FP8 MoE logical shape must be [E, N, K] or [E, 2, N, K]".to_owned(),
+            )
+        }
+    }
+    if logical_element_type != ElementType::F16 {
+        return Err(format!(
+            "CUDA Marlin FP8 MoE logical element type must be F16, got {logical_element_type:?}"
+        ));
+    }
+    weight
+        .validate_logical(bound_logical_dimensions, logical_element_type)
+        .map_err(|error| format!("CUDA Marlin FP8 MoE logical contract is invalid: {error}"))?;
+    let PhysicalWeightLayout::Quantized {
+        packed_values,
+        packed_dimensions,
+        scales,
+        zero_points,
+        zero_point_packed_dimensions,
+        axis_indices,
+        permutation,
+        codebook,
+        group_axis,
+        group_padding,
+    } = weight.physical_layout()
+    else {
+        return Err(
+            "CUDA Marlin FP8 MoE requires one whole quantized expert-major layout".to_owned(),
+        );
+    };
+    if zero_points.is_some()
+        || zero_point_packed_dimensions.is_some()
+        || axis_indices.is_some()
+        || permutation.is_some()
+        || codebook.is_some()
+    {
+        return Err(
+            "CUDA Marlin FP8 MoE forbids zero-point, index, permutation, and codebook components"
+                .to_owned(),
+        );
+    }
+    let last_axis = bound_logical_dimensions.len() - 1;
+    if usize::try_from(*group_axis).ok() != Some(last_axis)
+        || !matches!(group_padding, PhysicalWeightPadding::Exact)
+    {
+        return Err(
+            "CUDA Marlin FP8 MoE requires exact channelwise grouping on the final input axis"
+                .to_owned(),
+        );
+    }
+    if !is_exact_contiguous(&packed_values.storage) || !is_exact_contiguous(&scales.storage) {
+        return Err(
+            "CUDA Marlin FP8 MoE packed values and scales must use exact contiguous storage"
+                .to_owned(),
+        );
+    }
+    if packed_values.component_id == scales.component_id {
+        return Err(
+            "CUDA Marlin FP8 MoE packed values and scales must have distinct identities".to_owned(),
+        );
+    }
+
+    let mut component_by_id = BTreeMap::new();
+    for component in weight.components() {
+        if component_by_id
+            .insert(component.component_id().clone(), component)
+            .is_some()
+        {
+            return Err(format!(
+                "CUDA Marlin FP8 MoE layout duplicates component `{}`",
+                component.component_id()
+            ));
+        }
+    }
+    if component_by_id.len() != 2 {
+        return Err(
+            "CUDA Marlin FP8 MoE layout must contain exactly packed values and scales".to_owned(),
+        );
+    }
+    let packed_component = required_component(
+        &component_by_id,
+        &packed_values.component_id,
+        WeightComponentRole::PackedValues,
+        "packed values",
+    )?;
+    let scales_component = required_component(
+        &component_by_id,
+        &scales.component_id,
+        WeightComponentRole::Scales,
+        "scales",
+    )?;
+    let WeightEncoding::Quantized(quantization) = packed_component.encoding() else {
+        return Err("CUDA Marlin FP8 MoE packed component must be quantized".to_owned());
+    };
+    quantization
+        .validate()
+        .map_err(|error| format!("CUDA Marlin FP8 MoE quantization ABI is invalid: {error}"))?;
+    if quantization.format_id.as_str() != MARLIN_FP8_QUANTIZATION_FORMAT_ID
+        || quantization.bits_per_weight != 8
+        || quantization.grouping != QuantizationGrouping::WholeAxis
+        || quantization.packing != QuantizationPacking::Tiled
+        || quantization.scale_type != ElementType::F16
+        || quantization.zero_point_type.is_some()
+    {
+        return Err(format!(
+            "CUDA Marlin FP8 MoE component `{}` is not channelwise E4M3 tiled W8A16",
+            packed_component.component_id()
+        ));
+    }
+    if !matches!(
+        scales_component.encoding(),
+        WeightEncoding::Dense {
+            element_type: ElementType::F16
+        }
+    ) {
+        return Err("CUDA Marlin FP8 MoE scales component must be dense F16".to_owned());
+    }
+
+    let expected_packed_dimensions = bound_logical_dimensions.to_vec();
+    if packed_dimensions != &expected_packed_dimensions
+        || packed_component.physical_dimensions() != expected_packed_dimensions
+    {
+        return Err(format!(
+            "CUDA Marlin FP8 MoE packed physical shape must be {expected_packed_dimensions:?}"
+        ));
+    }
+    let mut expected_scales_dimensions = bound_logical_dimensions.to_vec();
+    expected_scales_dimensions[last_axis] = 1;
+    if scales_component.physical_dimensions() != expected_scales_dimensions {
+        return Err(format!(
+            "CUDA Marlin FP8 MoE scales physical shape must be {expected_scales_dimensions:?}"
+        ));
+    }
+
+    let expert_count = bound_logical_dimensions[0];
+    let packed_bytes = checked_physical_bytes(&expected_packed_dimensions, 1, "FP8 packed")?;
+    let scales_bytes = checked_physical_bytes(
+        &expected_scales_dimensions,
+        ElementType::F16.size_bytes(),
+        "FP8 scales",
+    )?;
+    if packed_component
+        .physical_bytes()
+        .map_err(|error| error.to_string())?
+        != packed_bytes
+        || scales_component
+            .physical_bytes()
+            .map_err(|error| error.to_string())?
+            != scales_bytes
+    {
+        return Err(
+            "CUDA Marlin FP8 MoE component byte counts differ from the typed ABI".to_owned(),
+        );
+    }
+
+    Ok(MarlinMoeWeightMetadata {
+        packed_component_id: packed_values.component_id.clone(),
+        scales_component_id: scales.component_id.clone(),
+        logical_dimensions: bound_logical_dimensions.to_vec(),
+        packed_physical_dimensions: expected_packed_dimensions,
+        scales_physical_dimensions: expected_scales_dimensions,
+        expert_count,
+        packed_bytes,
+        scales_bytes,
+        packed_expert_stride_bytes: expert_stride_bytes("FP8 packed", packed_bytes, expert_count)?,
+        scales_expert_stride_bytes: expert_stride_bytes("FP8 scales", scales_bytes, expert_count)?,
+        group_size: -1,
+        weight_type: MarlinMoeF16WeightType::E4M3,
     })
 }
 
@@ -1043,12 +1287,82 @@ mod tests {
         schema
     }
 
+    fn valid_fp8_schema(gate_up: bool) -> WeightSchema {
+        let packed_id = id("component.fp8_packed");
+        let scales_id = id("component.fp8_scales");
+        let (dimensions, scales_dimensions, group_axis) = if gate_up {
+            (vec![2, 2, 64, 128], vec![2, 2, 64, 1], 3)
+        } else {
+            (vec![2, 128, 64], vec![2, 128, 1], 2)
+        };
+        WeightSchema {
+            format_id: WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).unwrap(),
+            layout_id: WeightLayoutId::new("weight-layout.test.marlin-fp8-moe").unwrap(),
+            version: ContractVersion::new(1, 0),
+            components: vec![
+                WeightComponentSpec {
+                    id: packed_id.clone(),
+                    role: WeightComponentRole::PackedValues,
+                    external_names: vec!["experts.fp8".to_owned()],
+                    dimensions: dimensions.clone(),
+                    encoding: WeightEncoding::Quantized(QuantizationSpec {
+                        format_id: QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                            .unwrap(),
+                        bits_per_weight: 8,
+                        grouping: QuantizationGrouping::WholeAxis,
+                        packing: QuantizationPacking::Tiled,
+                        scale_type: ElementType::F16,
+                        zero_point_type: None,
+                    }),
+                    required: true,
+                },
+                WeightComponentSpec {
+                    id: scales_id.clone(),
+                    role: WeightComponentRole::Scales,
+                    external_names: vec!["experts.fp8_scales".to_owned()],
+                    dimensions: scales_dimensions,
+                    encoding: WeightEncoding::Dense {
+                        element_type: ElementType::F16,
+                    },
+                    required: true,
+                },
+            ],
+            tensors: vec![WeightTensorSpec {
+                id: id("weight.fp8_experts"),
+                dimensions: dimensions.clone(),
+                logical_element_type: ElementType::F16,
+                physical_layout: PhysicalWeightLayout::Quantized {
+                    packed_values: PhysicalWeightComponentBinding::exact_contiguous(packed_id),
+                    packed_dimensions: dimensions,
+                    scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
+                    zero_points: None,
+                    zero_point_packed_dimensions: None,
+                    axis_indices: None,
+                    permutation: None,
+                    codebook: None,
+                    group_axis,
+                    group_padding: PhysicalWeightPadding::Exact,
+                },
+                required: true,
+            }],
+        }
+    }
+
     fn resolved(schema: &WeightSchema) -> ResolvedWeightBinding {
         ResolvedWeightBinding::from_schema(schema, &schema.tensors[0].id).unwrap()
     }
 
     fn validate(schema: &WeightSchema) -> Result<MarlinMoeWeightMetadata, String> {
         validate_gptq_marlin_moe_contract(
+            &resolved(schema),
+            &schema.tensors[0].dimensions,
+            schema.tensors[0].logical_element_type,
+            &schema.tensors[0].dimensions,
+        )
+    }
+
+    fn validate_fp8(schema: &WeightSchema) -> Result<MarlinMoeWeightMetadata, String> {
+        validate_marlin_fp8_moe_contract(
             &resolved(schema),
             &schema.tensors[0].dimensions,
             schema.tensors[0].logical_element_type,
@@ -1072,6 +1386,63 @@ mod tests {
         assert_eq!(metadata.packed_expert_stride_bytes, 4096);
         assert_eq!(metadata.scales_expert_stride_bytes, 128);
         assert_eq!(metadata.group_size, 128);
+        assert_eq!(metadata.weight_type, MarlinMoeF16WeightType::U4B8);
+    }
+
+    #[test]
+    fn accepts_whole_expert_major_marlin_fp8_gate_up_and_down_stacks() {
+        let gate_up = validate_fp8(&valid_fp8_schema(true)).unwrap();
+        assert_eq!(gate_up.logical_dimensions, [2, 2, 64, 128]);
+        assert_eq!(gate_up.packed_physical_dimensions, [2, 2, 64, 128]);
+        assert_eq!(gate_up.scales_physical_dimensions, [2, 2, 64, 1]);
+        assert_eq!(gate_up.expert_count, 2);
+        assert_eq!(gate_up.packed_expert_stride_bytes, 2 * 64 * 128);
+        assert_eq!(gate_up.scales_expert_stride_bytes, 2 * 64 * 2);
+        assert_eq!(gate_up.group_size, -1);
+        assert_eq!(gate_up.weight_type, MarlinMoeF16WeightType::E4M3);
+
+        let down = validate_fp8(&valid_fp8_schema(false)).unwrap();
+        assert_eq!(down.logical_dimensions, [2, 128, 64]);
+        assert_eq!(down.packed_physical_dimensions, [2, 128, 64]);
+        assert_eq!(down.scales_physical_dimensions, [2, 128, 1]);
+        assert_eq!(down.packed_expert_stride_bytes, 128 * 64);
+        assert_eq!(down.scales_expert_stride_bytes, 128 * 2);
+        assert_eq!(down.weight_type, MarlinMoeF16WeightType::E4M3);
+    }
+
+    #[test]
+    fn rejects_marlin_fp8_moe_shape_or_channelwise_contract_drift() {
+        let valid = valid_fp8_schema(true);
+        let bad_shape = [2, 3, 64, 128];
+        let error = validate_marlin_fp8_moe_contract(
+            &resolved(&valid),
+            &bad_shape,
+            ElementType::F16,
+            &bad_shape,
+        )
+        .unwrap_err();
+        assert!(error.contains("[E, N, K] or [E, 2, N, K]"), "{error}");
+
+        let mut wrong_format = valid_fp8_schema(false);
+        let WeightEncoding::Quantized(spec) = &mut wrong_format.components[0].encoding else {
+            unreachable!();
+        };
+        spec.format_id = QuantizationFormatId::new("quantization.test.fp8-other").unwrap();
+        let error = validate_fp8(&wrong_format).unwrap_err();
+        assert!(error.contains("not channelwise E4M3"), "{error}");
+
+        let mut fragmented = valid_fp8_schema(false);
+        let PhysicalWeightLayout::Quantized { packed_values, .. } =
+            &mut fragmented.tensors[0].physical_layout
+        else {
+            unreachable!();
+        };
+        packed_values.storage = PhysicalStorageLayout::Strided {
+            strides_in_elements: vec![8192, 64, 1],
+            padding: PhysicalWeightPadding::Exact,
+        };
+        let error = validate_fp8(&fragmented).unwrap_err();
+        assert!(error.contains("exact contiguous"), "{error}");
     }
 
     #[test]

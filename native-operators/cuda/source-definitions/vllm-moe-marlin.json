@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_moe_marlin",
   "source_package_kind": "ferrum-native-source-bundle",
-  "source_package_revision": "ferrum-native-cuda-v1+sha256.7f6f35f91a85df6ea5374d5597f7f8ca4c159b5e567c1c1ef122a0ab88657613",
+  "source_package_revision": "ferrum-native-cuda-v1+sha256.ecdde468ea546bf807a1467c086baabecf58124a4e319ae5d682ee72a4c171ce",
   "upstream_sources": [
     {
       "repository": "https://github.com/vllm-project/vllm.git",
