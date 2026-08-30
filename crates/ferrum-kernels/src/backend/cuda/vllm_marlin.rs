@@ -806,7 +806,8 @@ pub fn vllm_fp8_marlin_repack_raw_bits(
 mod tests {
     use super::{
         block_fp8_group128_marlin_word_source_indices, block_fp8_group128_scale_source_index,
-        gptq_qzeros_are_symmetric_code7, repack_gptq_qzeros_to_marlin,
+        gptq_qzeros_are_symmetric_code7, launch_block_fp8_group128_repack,
+        launch_block_fp8_group128_scales, repack_gptq_qzeros_to_marlin,
         validate_vllm_fp8_marlin_repack_raw_bits, FerrumMarlinLaunch, MarlinF16WeightType,
         MarlinMmBuffers, MarlinMmExecution, MarlinMmF16WeightRequest, MarlinMmProblem,
         FERRUM_MARLIN_HAS_ACT_ORDER, FERRUM_MARLIN_HAS_ZERO_POINTS, FERRUM_MARLIN_IS_K_FULL,
@@ -1047,6 +1048,101 @@ mod tests {
             .unwrap();
             assert_eq!(actual, expected, "N={n}, K={k}");
         }
+    }
+
+    #[test]
+    #[ignore]
+    fn block_fp8_group128_cuda_exports_match_rust_oracles() {
+        use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
+
+        const N: usize = 128;
+        const K: usize = 128;
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+
+        let source = (0..N * K)
+            .map(|index| (index as u8).wrapping_mul(73).wrapping_add(0x5b))
+            .collect::<Vec<_>>();
+        let expected_packed = (0..N * K / 4)
+            .map(|word| {
+                let bytes = block_fp8_group128_marlin_word_source_indices(word, K, N)
+                    .expect("validated group-128 fixture")
+                    .map(|source_index| source[source_index]);
+                u32::from_le_bytes(bytes)
+            })
+            .collect::<Vec<_>>();
+        let source_device: CudaSlice<u8> = stream
+            .clone_htod(&source)
+            .expect("upload row-major block-FP8 values");
+        let mut packed_device: CudaSlice<u32> = stream
+            .alloc_zeros(expected_packed.len())
+            .expect("allocate Marlin-packed values");
+        {
+            let (source_pointer, _source_guard) = source_device.device_ptr(&stream);
+            let (packed_pointer, _packed_guard) = packed_device.device_ptr_mut(&stream);
+            unsafe {
+                launch_block_fp8_group128_repack(
+                    &stream,
+                    source_pointer,
+                    packed_pointer,
+                    K as u64,
+                    N as u64,
+                )
+            }
+            .expect("launch group-128 value repack export");
+        }
+
+        let inverse_scale = half::bf16::from_f32(0.375);
+        let inverse_scale_words = [inverse_scale.to_bits()];
+        let inverse_scale_bytes = inverse_scale
+            .to_bits()
+            .to_le_bytes()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let expected_scales =
+            crate::marlin_repack::block_fp8_group128_scales_to_marlin_f16_reference(
+                &inverse_scale_bytes,
+                N,
+                K,
+            )
+            .expect("build group-128 scale oracle")
+            .into_iter()
+            .map(half::f16::to_bits)
+            .collect::<Vec<_>>();
+        let inverse_scale_device: CudaSlice<u16> = stream
+            .clone_htod(&inverse_scale_words)
+            .expect("upload block-FP8 inverse scale");
+        let mut scales_device: CudaSlice<u16> = stream
+            .alloc_zeros(expected_scales.len())
+            .expect("allocate Marlin scales");
+        {
+            let (source_pointer, _source_guard) = inverse_scale_device.device_ptr(&stream);
+            let (scales_pointer, _scales_guard) = scales_device.device_ptr_mut(&stream);
+            unsafe {
+                launch_block_fp8_group128_scales(
+                    &stream,
+                    source_pointer,
+                    scales_pointer,
+                    K as u64,
+                    N as u64,
+                )
+            }
+            .expect("launch group-128 scale export");
+        }
+
+        stream
+            .synchronize()
+            .expect("synchronize group-128 CUDA exports");
+        let actual_packed = stream
+            .clone_dtoh(&packed_device)
+            .expect("download Marlin-packed values");
+        let actual_scales = stream
+            .clone_dtoh(&scales_device)
+            .expect("download Marlin scales");
+
+        assert_eq!(actual_packed, expected_packed);
+        assert_eq!(actual_scales, expected_scales);
     }
 
     #[test]
