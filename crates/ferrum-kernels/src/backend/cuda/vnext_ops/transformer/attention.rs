@@ -57,7 +57,9 @@ use crate::backend::cuda::vnext_runtime::{
 };
 #[cfg(feature = "vllm-marlin")]
 use crate::marlin_fp8_materializer::{
-    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
+    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
+    MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+    MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 
 const PROVIDER_ID: &str = "provider.cuda.gated_delta_recurrent_attention.f16";
@@ -134,6 +136,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             include_str!("moe_weights.rs").as_bytes(),
             include_str!("../../vllm_marlin.rs").as_bytes(),
             MARLIN_FP8_QUANTIZATION_FORMAT_ID.as_bytes(),
+            MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID.as_bytes(),
             COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
         ]);
         let provider_fingerprint = implementation_fingerprint(&provider_fingerprint_parts);
@@ -175,11 +178,19 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             accepted_weight_formats
                 .insert(WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?);
             accepted_weight_formats.insert(
+                WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
+            accepted_weight_formats.insert(
                 WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
                     .map_err(contract_error)?,
             );
             accepted_quantization_formats.insert(
                 QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
+            accepted_quantization_formats.insert(
+                QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)
                     .map_err(contract_error)?,
             );
             accepted_quantization_formats.insert(
@@ -742,7 +753,8 @@ impl AttentionProjection {
                 .next()
                 .map(|format| format.as_str())
             {
-                Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => {
+                Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                | Some(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID) => {
                     uses_fp8 = true;
                     uses_segmented_fp8 |= matches!(
                         weight.physical_layout(),
@@ -3154,6 +3166,7 @@ fn push_shared_marlin_fp8_projection(
                     )?;
                     if candidate.output_features() != first.output_features()
                         || candidate.input_features() != first.input_features()
+                        || candidate.group_size() != first.group_size()
                         || !super::same_physical_region(
                             first.packed_region(),
                             candidate.packed_region(),
@@ -3169,6 +3182,7 @@ fn push_shared_marlin_fp8_projection(
                         );
                     }
                 }
+                let group_size = first.group_size();
                 let [packed, scales] = first.into_regions();
                 let packed_region = regions.len();
                 regions.push(packed);
@@ -3177,7 +3191,7 @@ fn push_shared_marlin_fp8_projection(
                 encoded[part_index] = Some(SegmentedProjectionPart::MarlinFp8 {
                     packed_region,
                     scales_region,
-                    group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
+                    group_size,
                     output_offset: checked_i32(output_offset, "attention output offset")?,
                     output_features: checked_i32(output_features, "attention part width")?,
                 });
@@ -3288,6 +3302,7 @@ fn push_shared_projection_weight(
                 );
             }
             Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+            | Some(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)
                 if matches!(
                     first_layout.physical_layout(),
                     PhysicalWeightLayout::Composite { .. }
@@ -3300,7 +3315,8 @@ fn push_shared_projection_weight(
                     logical_dimensions,
                 );
             }
-            Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => {}
+            Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+            | Some(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID) => {}
             Some(other) => {
                 return Err(format!(
                     "attention projection input {ordinal} has unsupported quantization format {other:?}"
@@ -3333,12 +3349,14 @@ fn push_shared_projection_weight(
                         first.scales_region(),
                         candidate.scales_region(),
                     )
+                    || candidate.group_size() != first.group_size()
                 {
                     return Err(format!(
                         "attention projection input {ordinal} is not shared by all participants"
                     ));
                 }
             }
+            let group_size = first.group_size();
             let [packed, scales] = first.into_regions();
             let packed_region = regions.len();
             regions.push(packed);
@@ -3347,7 +3365,7 @@ fn push_shared_projection_weight(
             return Ok(SharedProjectionWeight::MarlinFp8 {
                 packed_region,
                 scales_region,
-                group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
+                group_size,
             });
         }
     }
@@ -3821,19 +3839,20 @@ mod tests {
                 output_features,
             })
         };
-        let fp8_part = |packed_region, scales_region, output_offset, output_features| {
-            Some(SegmentedProjectionPart::MarlinFp8 {
-                packed_region,
-                scales_region,
-                group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
-                output_offset,
-                output_features,
-            })
-        };
+        let fp8_part =
+            |packed_region, scales_region, group_size, output_offset, output_features| {
+                Some(SegmentedProjectionPart::MarlinFp8 {
+                    packed_region,
+                    scales_region,
+                    group_size,
+                    output_offset,
+                    output_features,
+                })
+            };
         let qkvzba = SharedProjectionWeight::SegmentedMarlin {
             parts: [
-                fp8_part(0, 1, 0, 10_240),
-                fp8_part(2, 3, 10_240, 6_144),
+                fp8_part(0, 1, MARLIN_FP8_CHANNELWISE_GROUP_SIZE, 0, 10_240),
+                fp8_part(2, 3, MARLIN_FP8_CHANNELWISE_GROUP_SIZE, 10_240, 6_144),
                 dense_part(4, 16_384, 48),
                 dense_part(5, 16_432, 48),
             ],
@@ -3855,8 +3874,8 @@ mod tests {
             .finish();
         let changed = SharedProjectionWeight::SegmentedMarlin {
             parts: [
-                fp8_part(0, 1, 0, 10_240),
-                fp8_part(2, 3, 10_240, 6_144),
+                fp8_part(0, 1, MARLIN_FP8_CHANNELWISE_GROUP_SIZE, 0, 10_240),
+                fp8_part(2, 3, MARLIN_FP8_CHANNELWISE_GROUP_SIZE, 10_240, 6_144),
                 dense_part(4, 16_384, 47),
                 dense_part(5, 16_431, 49),
             ],
@@ -3865,5 +3884,18 @@ mod tests {
         .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))
         .finish();
         assert!(canonical != changed);
+
+        let group128 = SharedProjectionWeight::SegmentedMarlin {
+            parts: [
+                fp8_part(0, 1, 128, 0, 10_240),
+                fp8_part(2, 3, 128, 10_240, 6_144),
+                dense_part(4, 16_384, 48),
+                dense_part(5, 16_432, 48),
+            ],
+            part_count: 4,
+        }
+        .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))
+        .finish();
+        assert_ne!(canonical, group128);
     }
 }

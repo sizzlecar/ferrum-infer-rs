@@ -455,7 +455,16 @@ pub enum AllocationLifetime {
 #[serde(rename_all = "snake_case")]
 pub enum AllocationKind {
     Value,
-    Scratch { node_id: NodeId },
-    Binding { node_id: NodeId },
-    Persistent { node_id: NodeId },
+    /// One plan-admitted buffer reused only while source weights are converted
+    /// into their final execution ABI during static initialization.
+    InitializationScratch,
+    Scratch {
+        node_id: NodeId,
+    },
+    Binding {
+        node_id: NodeId,
+    },
+    Persistent {
+        node_id: NodeId,
+    },
 }

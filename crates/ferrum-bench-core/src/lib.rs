@@ -45,6 +45,132 @@ pub use stats::{ci95_half_width, percentile, student_t_975, PercentileStats, Sca
 
 use serde::{Deserialize, Serialize};
 
+pub const BENCHMARK_RUN_ID_HEADER: &str = "x-ferrum-benchmark-run-id";
+pub const BENCHMARK_CELL_ID_HEADER: &str = "x-ferrum-benchmark-cell-id";
+pub const BENCHMARK_REPEAT_INDEX_HEADER: &str = "x-ferrum-benchmark-repeat-index";
+pub const BENCHMARK_PHASE_HEADER: &str = "x-ferrum-benchmark-phase";
+pub const BENCHMARK_REQUEST_INDEX_HEADER: &str = "x-ferrum-benchmark-request-index";
+pub const MAX_BENCHMARK_CORRELATION_ID_LEN: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkPhase {
+    Warmup,
+    Measured,
+}
+
+impl BenchmarkPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Warmup => "warmup",
+            Self::Measured => "measured",
+        }
+    }
+}
+
+impl std::str::FromStr for BenchmarkPhase {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "warmup" => Ok(Self::Warmup),
+            "measured" => Ok(Self::Measured),
+            _ => Err("benchmark phase must be 'warmup' or 'measured'".to_string()),
+        }
+    }
+}
+
+/// Typed identity carried from `bench-serve` to request-scoped server events.
+/// Indices are zero-based and local to their enclosing cell/repeat/phase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkRequestCorrelation {
+    pub benchmark_run_id: String,
+    pub cell_id: String,
+    pub repeat_index: u32,
+    pub phase: BenchmarkPhase,
+    pub request_index: u32,
+}
+
+impl BenchmarkRequestCorrelation {
+    pub fn new(
+        benchmark_run_id: String,
+        cell_id: String,
+        repeat_index: u32,
+        phase: BenchmarkPhase,
+        request_index: u32,
+    ) -> Result<Self, String> {
+        validate_benchmark_correlation_id("benchmark_run_id", &benchmark_run_id)?;
+        validate_benchmark_correlation_id("cell_id", &cell_id)?;
+        Ok(Self {
+            benchmark_run_id,
+            cell_id,
+            repeat_index,
+            phase,
+            request_index,
+        })
+    }
+
+    pub fn from_header_values(
+        benchmark_run_id: Option<&str>,
+        cell_id: Option<&str>,
+        repeat_index: Option<&str>,
+        phase: Option<&str>,
+        request_index: Option<&str>,
+    ) -> Result<Option<Self>, String> {
+        let present = [
+            benchmark_run_id.is_some(),
+            cell_id.is_some(),
+            repeat_index.is_some(),
+            phase.is_some(),
+            request_index.is_some(),
+        ];
+        if !present.into_iter().any(|value| value) {
+            return Ok(None);
+        }
+        if !present.into_iter().all(|value| value) {
+            return Err("benchmark correlation headers must be provided together".to_string());
+        }
+        let parse_index = |field: &str, value: &str| {
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("{field} must be an unsigned 32-bit integer"))
+        };
+        Self::new(
+            benchmark_run_id.expect("presence checked").to_string(),
+            cell_id.expect("presence checked").to_string(),
+            parse_index("repeat_index", repeat_index.expect("presence checked"))?,
+            phase.expect("presence checked").parse()?,
+            parse_index("request_index", request_index.expect("presence checked"))?,
+        )
+        .map(Some)
+    }
+}
+
+fn validate_benchmark_correlation_id(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > MAX_BENCHMARK_CORRELATION_ID_LEN {
+        return Err(format!(
+            "{field} must contain 1..={MAX_BENCHMARK_CORRELATION_ID_LEN} ASCII characters"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(format!(
+            "{field} may contain only ASCII letters, digits, '-', '_', '.', and ':'"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchmarkRequestRecord {
+    #[serde(flatten)]
+    pub correlation: BenchmarkRequestCorrelation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_request_id: Option<String>,
+}
+
 /// Locked enum of bench scenarios — see `docs/bench/PLAYBOOK.md` § 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -151,6 +277,15 @@ pub struct BenchReport {
     pub n_requests_per_run: u32,
     pub warmup_requests: u32,
 
+    /// Request-level join keys for measured requests, grouped by repeat.
+    /// Older/non-HTTP reports omit these fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub benchmark_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_records: Option<Vec<Vec<BenchmarkRequestRecord>>>,
+
     /// Canonical per-repeat evidence used to derive the aggregate statistics
     /// below. Older reports may omit it; release gates can require it by
     /// checking that it contains exactly `n_repeats` rows.
@@ -223,6 +358,8 @@ pub struct TokenLengthStats {
 /// One request's measurements (input to [`compute_metrics`]).
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
+    pub benchmark_correlation: Option<BenchmarkRequestCorrelation>,
+    pub server_request_id: Option<String>,
     pub success: bool,
     pub ttft_ms: f64,
     pub e2e_ms: f64,
@@ -819,7 +956,7 @@ pub fn compute_metrics(
             "compute_metrics: repeat {} warmup outcomes do not sum to expected",
             index + 1
         );
-        for record in &run.records {
+        for (request_index, record) in run.records.iter().enumerate() {
             assert!(
                 record.ttft_ms.is_finite() && record.ttft_ms >= 0.0,
                 "compute_metrics: request TTFT must be finite and nonnegative"
@@ -866,6 +1003,23 @@ pub fn compute_metrics(
                 assert!(
                     record.output_tokens >= 2,
                     "compute_metrics: eligible ITL request must contain at least two tokens"
+                );
+            }
+            if let Some(correlation) = &record.benchmark_correlation {
+                assert_eq!(
+                    correlation.repeat_index,
+                    u32::try_from(index).expect("compute_metrics: repeat index overflow"),
+                    "compute_metrics: benchmark repeat index differs from report position"
+                );
+                assert_eq!(
+                    correlation.phase,
+                    BenchmarkPhase::Measured,
+                    "compute_metrics: measured request has non-measured benchmark phase"
+                );
+                assert_eq!(
+                    correlation.request_index,
+                    u32::try_from(request_index).expect("compute_metrics: request index overflow"),
+                    "compute_metrics: benchmark request index differs from report position"
                 );
             }
         }
@@ -985,6 +1139,48 @@ pub fn compute_metrics(
                 .collect()
         })
         .collect();
+    let correlated_records = runs
+        .iter()
+        .flat_map(|run| &run.records)
+        .filter(|record| record.benchmark_correlation.is_some())
+        .count();
+    let total_records = runs.iter().map(|run| run.records.len()).sum::<usize>();
+    assert!(
+        correlated_records == 0 || correlated_records == total_records,
+        "compute_metrics: benchmark request correlation must be present for all or no requests"
+    );
+    let request_records = (correlated_records > 0).then(|| {
+        runs.iter()
+            .map(|run| {
+                run.records
+                    .iter()
+                    .map(|record| BenchmarkRequestRecord {
+                        correlation: record
+                            .benchmark_correlation
+                            .clone()
+                            .expect("correlation presence checked above"),
+                        server_request_id: record.server_request_id.clone(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    });
+    let benchmark_run_id = request_records.as_ref().map(|repeats| {
+        let run_id = repeats[0][0].correlation.benchmark_run_id.clone();
+        assert!(repeats.iter().flatten().all(|record| {
+            record.correlation.benchmark_run_id == run_id
+                && record.correlation.phase == BenchmarkPhase::Measured
+        }));
+        run_id
+    });
+    let cell_id = request_records.as_ref().map(|repeats| {
+        let cell_id = repeats[0][0].correlation.cell_id.clone();
+        assert!(repeats
+            .iter()
+            .flatten()
+            .all(|record| record.correlation.cell_id == cell_id));
+        cell_id
+    });
 
     let env_hash = env.hash();
     BenchReport {
@@ -1003,6 +1199,9 @@ pub fn compute_metrics(
         n_repeats,
         n_requests_per_run,
         warmup_requests,
+        benchmark_run_id,
+        cell_id,
+        request_records,
         repeat_metrics,
         ttft_ms: MetricSet {
             p50: checked_scalar_stats(&ttft_p50, "TTFT p50"),
@@ -1055,6 +1254,8 @@ mod tests {
 
     fn req(success: bool, ttft: f64, e2e: f64, in_tok: u32, out_tok: u32) -> RequestRecord {
         RequestRecord {
+            benchmark_correlation: None,
+            server_request_id: None,
             success,
             ttft_ms: ttft,
             e2e_ms: e2e,
@@ -1075,6 +1276,8 @@ mod tests {
         assert!(out_tok >= 2);
         let observed_intervals = out_tok - 1;
         RequestRecord {
+            benchmark_correlation: None,
+            server_request_id: None,
             success: true,
             ttft_ms: ttft,
             e2e_ms: e2e,
@@ -1631,5 +1834,62 @@ mod tests {
             panic: u32::MAX,
         };
         assert_eq!(issues.request_error_count(), u32::MAX);
+    }
+
+    #[test]
+    fn benchmark_correlation_headers_require_complete_valid_identity() {
+        let correlation = BenchmarkRequestCorrelation::from_header_values(
+            Some("bench-123"),
+            Some("cell-0-closed-c8"),
+            Some("2"),
+            Some("measured"),
+            Some("17"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(correlation.benchmark_run_id, "bench-123");
+        assert_eq!(correlation.cell_id, "cell-0-closed-c8");
+        assert_eq!(correlation.repeat_index, 2);
+        assert_eq!(correlation.phase, BenchmarkPhase::Measured);
+        assert_eq!(correlation.request_index, 17);
+
+        assert!(BenchmarkRequestCorrelation::from_header_values(
+            Some("bench-123"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_err());
+        assert!(BenchmarkRequestCorrelation::from_header_values(
+            Some("bad id"),
+            Some("cell-0"),
+            Some("0"),
+            Some("warmup"),
+            Some("0"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn report_preserves_measured_request_join_keys() {
+        let mut request = req(true, 10.0, 20.0, 8, 4);
+        request.benchmark_correlation = Some(
+            BenchmarkRequestCorrelation::new(
+                "bench-123".to_string(),
+                "cell-0-closed-c1".to_string(),
+                0,
+                BenchmarkPhase::Measured,
+                0,
+            )
+            .unwrap(),
+        );
+        request.server_request_id = Some("chatcmpl-123".to_string());
+        let report = compute_one(make_run(vec![request], 1.0), 0, Slo::default());
+        assert_eq!(report.benchmark_run_id.as_deref(), Some("bench-123"));
+        assert_eq!(report.cell_id.as_deref(), Some("cell-0-closed-c1"));
+        let record = &report.request_records.as_ref().unwrap()[0][0];
+        assert_eq!(record.correlation.request_index, 0);
+        assert_eq!(record.server_request_id.as_deref(), Some("chatcmpl-123"));
     }
 }

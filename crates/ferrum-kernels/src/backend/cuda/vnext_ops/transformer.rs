@@ -48,6 +48,7 @@ use crate::backend::cuda::vnext_replay::CudaCommandReplayKeyBuilder;
 #[cfg(feature = "vllm-marlin")]
 use crate::marlin_fp8_materializer::{
     marlin_fp8_projection_shape_supported, MARLIN_FP8_CAPABILITY_ID,
+    MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID, MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID,
     MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 #[cfg(feature = "vllm-marlin")]
@@ -339,12 +340,16 @@ impl CudaMarlinFp8DenseLinearProvider {
             runtime.descriptor().id.clone(),
             BTreeSet::from([operation_capability, marlin_capability]),
             BTreeSet::from([
-                WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?
+                WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?,
+                WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID)
+                    .map_err(contract_error)?,
             ]),
-            BTreeSet::from(
-                [QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
-                    .map_err(contract_error)?],
-            ),
+            BTreeSet::from([
+                QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+                QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+            ]),
             contiguous_bindings(2),
             MARLIN_FP8_DENSE_LINEAR_ESTIMATOR_ID,
             ContractVersion::new(1, 0),
@@ -440,7 +445,10 @@ fn dense_swiglu_projection_for_formats(
             ));
         }
         match formats.iter().next().map(|format| format.as_str()) {
-            Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID) => Ok(DenseSwiGluProjection::MarlinFp8),
+            Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+            | Some(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID) => {
+                Ok(DenseSwiGluProjection::MarlinFp8)
+            }
             Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID) => {
                 Ok(DenseSwiGluProjection::CompressedTensorsMarlin)
             }
@@ -821,11 +829,14 @@ fn marlin_swiglu_provider_descriptor(
             WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
                 .map_err(contract_error)?,
             WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?,
+            WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID).map_err(contract_error)?,
         ]),
         BTreeSet::from([
             QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
                 .map_err(contract_error)?,
             QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID).map_err(contract_error)?,
+            QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)
+                .map_err(contract_error)?,
         ]),
         contiguous_bindings(3),
         DENSE_SWIGLU_ESTIMATOR_ID,
@@ -1157,7 +1168,7 @@ fn encode_marlin_fp8_dense_linear(
     projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    use marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE};
+    use marlin_fp8_weights::resolve_marlin_fp8_weight;
 
     ensure_invocation(&invocation, DENSE_LINEAR_OPERATION_ID)?;
     let first = &invocation.participants()[0];
@@ -1189,6 +1200,7 @@ fn encode_marlin_fp8_dense_linear(
             resolve_marlin_fp8_weight(participant, weight_binding, &[out_features, in_features])?;
         if !same_physical_region(first_weight.packed_region(), candidate.packed_region())
             || !same_physical_region(first_weight.scales_region(), candidate.scales_region())
+            || first_weight.group_size() != candidate.group_size()
         {
             return Err(
                 "CUDA Marlin FP8 dense linear participants do not share one weight".to_owned(),
@@ -1197,8 +1209,8 @@ fn encode_marlin_fp8_dense_linear(
     }
 
     let workspace_bytes = projection_runtime.workspace_bytes()?;
+    let group_size = first_weight.group_size();
     let [packed_region, scales_region] = first_weight.into_regions();
-    let group_size = MARLIN_FP8_CHANNELWISE_GROUP_SIZE;
     let mut regions = vec![
         packed_region,
         scales_region,
@@ -1604,6 +1616,7 @@ fn marlin_fp8_swiglu_gate_up_layout(
 struct SharedMarlinFp8Weight {
     packed_region: usize,
     scales_region: usize,
+    group_size: i32,
 }
 
 #[cfg(feature = "vllm-marlin")]
@@ -1647,6 +1660,7 @@ fn push_shared_marlin_fp8_weight(
         let candidate = resolve(participant)?;
         if candidate.output_features() != first.output_features()
             || candidate.input_features() != first.input_features()
+            || candidate.group_size() != first.group_size()
             || !same_physical_region(first.packed_region(), candidate.packed_region())
             || !same_physical_region(first.scales_region(), candidate.scales_region())
         {
@@ -1655,6 +1669,7 @@ fn push_shared_marlin_fp8_weight(
             ));
         }
     }
+    let group_size = first.group_size();
     let [packed, scales] = first.into_regions();
     let packed_region = regions.len();
     regions.push(packed);
@@ -1663,6 +1678,7 @@ fn push_shared_marlin_fp8_weight(
     Ok(SharedMarlinFp8Weight {
         packed_region,
         scales_region,
+        group_size,
     })
 }
 
@@ -1712,7 +1728,8 @@ mod dense_swiglu_marlin_tests {
     use super::{
         dense_swiglu_projection_for_formats, marlin_fp8_swiglu_gate_up_layout,
         marlin_swiglu_scratch_layout, DenseSwiGluProjection, PhysicalWeightLayout,
-        COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+        COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
     };
     use ferrum_interfaces::vnext::{
         CompositeWeightPart, PhysicalWeightComponentBinding, PhysicalWeightPadding,
@@ -1769,6 +1786,10 @@ mod dense_swiglu_marlin_tests {
             (None, DenseSwiGluProjection::F16),
             (
                 Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID),
+                DenseSwiGluProjection::MarlinFp8,
+            ),
+            (
+                Some(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID),
                 DenseSwiGluProjection::MarlinFp8,
             ),
             (
@@ -2150,8 +2171,6 @@ fn encode_marlin_fp8_dense_swiglu(
     projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    use marlin_fp8_weights::MARLIN_FP8_CHANNELWISE_GROUP_SIZE;
-
     ensure_invocation(&invocation, DENSE_SWIGLU_OPERATION_ID)?;
     let first = &invocation.participants()[0];
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
@@ -2229,7 +2248,6 @@ fn encode_marlin_fp8_dense_swiglu(
     let rows = checked_i32(tokens, "Marlin FP8 SwiGLU token count")?;
     let hidden = checked_i32(hidden_size, "Marlin FP8 SwiGLU hidden width")?;
     let intermediate = checked_i32(intermediate_size, "Marlin FP8 SwiGLU intermediate width")?;
-    let group_size = MARLIN_FP8_CHANNELWISE_GROUP_SIZE;
     let planar_silu_mul = planar_silu_mul.clone();
     let participant_count = checked_u32(
         invocation.participants().len() as u64,
@@ -2239,7 +2257,9 @@ fn encode_marlin_fp8_dense_swiglu(
         CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_swiglu_marlin_fp8")
             .i32(projection_runtime.multiprocessor_count)
             .i32(projection_runtime.device_ordinal)
-            .i32(group_size)
+            .i32(gate.group_size)
+            .i32(up.group_size)
+            .i32(down.group_size)
             .i32(rows)
             .i32(hidden)
             .i32(intermediate)
@@ -2286,7 +2306,7 @@ fn encode_marlin_fp8_dense_swiglu(
                     rows,
                     intermediate,
                     hidden,
-                    group_size,
+                    weight.group_size,
                     "Marlin FP8 SwiGLU gate/up projection",
                 )?;
             }
@@ -2311,7 +2331,7 @@ fn encode_marlin_fp8_dense_swiglu(
                 rows,
                 hidden,
                 intermediate,
-                group_size,
+                down.group_size,
                 "Marlin FP8 SwiGLU down projection",
             )?;
             Ok(())

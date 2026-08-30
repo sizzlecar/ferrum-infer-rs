@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use super::{attach_invocation_binding, ensure_estimator_request, estimate, launch_gemm_f16};
 #[cfg(feature = "vllm-marlin")]
 use super::{
-    marlin_fp8_weights::{resolve_marlin_fp8_weight, MARLIN_FP8_CHANNELWISE_GROUP_SIZE},
+    marlin_fp8_weights::resolve_marlin_fp8_weight,
     moe_weights::{
         resolve_compressed_tensors_marlin_matrix_weight, resolve_gptq_marlin_matrix_weight,
         COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
@@ -53,7 +53,9 @@ use crate::backend::cuda::vnext_runtime::{
 };
 #[cfg(feature = "vllm-marlin")]
 use crate::marlin_fp8_materializer::{
-    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID,
+    MARLIN_FP8_CAPABILITY_ID, MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
+    MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID, MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+    MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 
 const PROVIDER_ID: &str = "provider.cuda.causal_paged_attention.f16";
@@ -145,7 +147,9 @@ impl CudaCausalPagedAttentionProvider {
             include_str!("../../vllm_marlin.rs").as_bytes(),
             MARLIN_FP8_CAPABILITY_ID.as_bytes(),
             MARLIN_FP8_WEIGHT_FORMAT_ID.as_bytes(),
+            MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID.as_bytes(),
             MARLIN_FP8_QUANTIZATION_FORMAT_ID.as_bytes(),
+            MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID.as_bytes(),
             GPTQ_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
             COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
         ]);
@@ -205,6 +209,10 @@ impl CudaCausalPagedAttentionProvider {
             provider_capabilities.insert(compressed_tensors_capability);
             accepted_weight_formats
                 .insert(WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?);
+            accepted_weight_formats.insert(
+                WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
             accepted_weight_formats
                 .insert(WeightFormatId::new(GPTQ_MARLIN_WEIGHT_FORMAT_ID).map_err(contract_error)?);
             accepted_weight_formats.insert(
@@ -213,6 +221,10 @@ impl CudaCausalPagedAttentionProvider {
             );
             accepted_quantization_formats.insert(
                 QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
+            accepted_quantization_formats.insert(
+                QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)
                     .map_err(contract_error)?,
             );
             accepted_quantization_formats.insert(
@@ -1057,7 +1069,9 @@ fn causal_projection_weight_abi(
         return Err("causal attention projection has more than one quantization format".to_owned());
     }
     match format.as_str() {
-        MARLIN_FP8_QUANTIZATION_FORMAT_ID => Ok(CausalProjectionWeightAbi::MarlinFp8),
+        MARLIN_FP8_QUANTIZATION_FORMAT_ID | MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID => {
+            Ok(CausalProjectionWeightAbi::MarlinFp8)
+        }
         GPTQ_MARLIN_QUANTIZATION_FORMAT_ID => Ok(CausalProjectionWeightAbi::GptqMarlinInt4),
         COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID => {
             Ok(CausalProjectionWeightAbi::CompressedTensorsMarlinInt4)
@@ -1346,12 +1360,24 @@ impl SharedProjectionWeight {
             Self::Marlin { weight_type, .. } => marlin_projection_replay_tag(weight_type),
         }
     }
+
+    fn bind_replay_abi(
+        self,
+        replay_key: CudaCommandReplayKeyBuilder,
+    ) -> CudaCommandReplayKeyBuilder {
+        let replay_key = replay_key.bytes(self.replay_tag().as_bytes());
+        match self {
+            Self::F16 { .. } => replay_key.i32(0),
+            #[cfg(feature = "vllm-marlin")]
+            Self::Marlin { group_size, .. } => replay_key.i32(group_size),
+        }
+    }
 }
 
 #[cfg(feature = "vllm-marlin")]
 const fn marlin_projection_replay_tag(weight_type: MarlinF16WeightType) -> &'static str {
     match weight_type {
-        MarlinF16WeightType::E4M3Fn => "marlin-fp8-e4m3fn-channelwise",
+        MarlinF16WeightType::E4M3Fn => "marlin-fp8-e4m3fn",
         MarlinF16WeightType::U4 => "compressed-tensors-marlin-u4-zp",
         MarlinF16WeightType::U4B8 => "gptq-marlin-u4b8",
     }
@@ -1730,53 +1756,55 @@ fn encode_attention(
         .iter()
         .all(|launch| launch.replay_topology.is_partition_stable())
         .then(|| {
-            let mut replay_key =
+            let replay_key =
                 CudaCommandReplayKeyBuilder::new(provider_fingerprint, compute_operation)
-                    .bytes(projection.replay_tag().as_bytes())
-                    .bytes(shared.query_weight.replay_tag().as_bytes())
-                    .bytes(shared.key_weight.replay_tag().as_bytes())
-                    .bytes(shared.value_weight.replay_tag().as_bytes())
-                    .bytes(shared.output_weight.replay_tag().as_bytes())
-                    .u64(shape.hidden_size)
-                    .u64(shape.query_heads)
-                    .u64(shape.key_value_heads)
-                    .u64(shape.head_dim)
-                    .u64(shape.query_features)
-                    .u64(shape.query_projection_features)
-                    .u64(shape.kv_features)
-                    .u64(shape.rope_dim)
-                    .u64(shape.maximum_context_tokens)
-                    .f32(shape.epsilon)
-                    .f32(shape.rope_theta)
-                    .boolean(shape.rope_interleaved)
-                    .boolean(shape.output_gate)
-                    .u64(total_tokens)
-                    .boolean(packed_enabled)
-                    .u64(
-                        packed
-                            .map(|launch| launch.input_region as u64)
-                            .unwrap_or(u64::MAX),
-                    )
-                    .u64(
-                        packed
-                            .map(|launch| launch.output_region as u64)
-                            .unwrap_or(u64::MAX),
-                    )
-                    .u64(layout.required_bytes)
-                    .u64(layout.projection_workspace.unwrap_or(u64::MAX))
-                    .u64(layout.normalized)
-                    .u64(layout.query_raw)
-                    .u64(layout.key_raw)
-                    .u64(layout.value_raw)
-                    .u64(layout.query)
-                    .u64(layout.context)
-                    .u64(layout.projected)
-                    .u64(layout.vllm.map_or(0, |vllm| vllm.exp_sums))
-                    .u64(layout.vllm.map_or(0, |vllm| vllm.max_logits))
-                    .u64(layout.vllm.map_or(0, |vllm| vllm.temporary_output))
-                    .u64(binding_layout.required_bytes)
-                    .u64(binding_layout.slot_bytes)
-                    .u64(launches.len() as u64);
+                    .bytes(projection.replay_tag().as_bytes());
+            let replay_key = shared.query_weight.bind_replay_abi(replay_key);
+            let replay_key = shared.key_weight.bind_replay_abi(replay_key);
+            let replay_key = shared.value_weight.bind_replay_abi(replay_key);
+            let mut replay_key = shared
+                .output_weight
+                .bind_replay_abi(replay_key)
+                .u64(shape.hidden_size)
+                .u64(shape.query_heads)
+                .u64(shape.key_value_heads)
+                .u64(shape.head_dim)
+                .u64(shape.query_features)
+                .u64(shape.query_projection_features)
+                .u64(shape.kv_features)
+                .u64(shape.rope_dim)
+                .u64(shape.maximum_context_tokens)
+                .f32(shape.epsilon)
+                .f32(shape.rope_theta)
+                .boolean(shape.rope_interleaved)
+                .boolean(shape.output_gate)
+                .u64(total_tokens)
+                .boolean(packed_enabled)
+                .u64(
+                    packed
+                        .map(|launch| launch.input_region as u64)
+                        .unwrap_or(u64::MAX),
+                )
+                .u64(
+                    packed
+                        .map(|launch| launch.output_region as u64)
+                        .unwrap_or(u64::MAX),
+                )
+                .u64(layout.required_bytes)
+                .u64(layout.projection_workspace.unwrap_or(u64::MAX))
+                .u64(layout.normalized)
+                .u64(layout.query_raw)
+                .u64(layout.key_raw)
+                .u64(layout.value_raw)
+                .u64(layout.query)
+                .u64(layout.context)
+                .u64(layout.projected)
+                .u64(layout.vllm.map_or(0, |vllm| vllm.exp_sums))
+                .u64(layout.vllm.map_or(0, |vllm| vllm.max_logits))
+                .u64(layout.vllm.map_or(0, |vllm| vllm.temporary_output))
+                .u64(binding_layout.required_bytes)
+                .u64(binding_layout.slot_bytes)
+                .u64(launches.len() as u64);
             for launch in &launches {
                 let replay_envelope = launch.replay_topology.envelope();
                 replay_key = replay_key
@@ -3088,6 +3116,7 @@ fn push_shared_projection_weight(
                 )?;
                 if candidate.output_features() != first.output_features()
                     || candidate.input_features() != first.input_features()
+                    || candidate.group_size() != first.group_size()
                     || !super::same_physical_region(
                         first.packed_region(),
                         candidate.packed_region(),
@@ -3102,6 +3131,7 @@ fn push_shared_projection_weight(
                     ));
                 }
             }
+            let group_size = first.group_size();
             let [packed, scales] = first.into_regions();
             let packed_region = regions.len();
             regions.push(packed);
@@ -3111,7 +3141,7 @@ fn push_shared_projection_weight(
                 packed_region,
                 scales_region,
                 zero_points_region: None,
-                group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
+                group_size,
                 weight_type: MarlinF16WeightType::E4M3Fn,
             });
         }
@@ -3502,6 +3532,10 @@ mod tests {
                 CausalProjectionWeightAbi::MarlinFp8,
             ),
             (
+                MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
+                CausalProjectionWeightAbi::MarlinFp8,
+            ),
+            (
                 GPTQ_MARLIN_QUANTIZATION_FORMAT_ID,
                 CausalProjectionWeightAbi::GptqMarlinInt4,
             ),
@@ -3570,12 +3604,31 @@ mod tests {
         let fp8 = marlin_projection_replay_tag(MarlinF16WeightType::E4M3Fn);
         let compressed_tensors = marlin_projection_replay_tag(MarlinF16WeightType::U4);
         let gptq = marlin_projection_replay_tag(MarlinF16WeightType::U4B8);
-        assert_eq!(fp8, "marlin-fp8-e4m3fn-channelwise");
+        assert_eq!(fp8, "marlin-fp8-e4m3fn");
         assert_eq!(compressed_tensors, "compressed-tensors-marlin-u4-zp");
         assert_eq!(gptq, "gptq-marlin-u4b8");
         assert_ne!(fp8, compressed_tensors);
         assert_ne!(fp8, gptq);
         assert_ne!(compressed_tensors, gptq);
+    }
+
+    #[cfg(feature = "vllm-marlin")]
+    #[test]
+    fn causal_marlin_replay_identity_includes_fp8_group_size() {
+        let weight = |group_size| SharedProjectionWeight::Marlin {
+            packed_region: 0,
+            scales_region: 1,
+            zero_points_region: None,
+            group_size,
+            weight_type: MarlinF16WeightType::E4M3Fn,
+        };
+        let channelwise = weight(-1)
+            .bind_replay_abi(CudaCommandReplayKeyBuilder::new("test", "causal"))
+            .finish();
+        let group128 = weight(128)
+            .bind_replay_abi(CudaCommandReplayKeyBuilder::new("test", "causal"))
+            .finish();
+        assert_ne!(channelwise, group128);
     }
 
     #[test]

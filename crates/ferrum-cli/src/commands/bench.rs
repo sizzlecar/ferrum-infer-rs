@@ -388,6 +388,8 @@ async fn run_concurrent_round(
 
 fn failed_bench_record(quality_issues: QualityIssueCounts) -> RequestRecord {
     RequestRecord {
+        benchmark_correlation: None,
+        server_request_id: None,
         success: false,
         ttft_ms: 0.0,
         e2e_ms: 0.0,
@@ -513,6 +515,8 @@ async fn collect_stream(
     let observed_intervals =
         u32::try_from(itl_ms.len()).expect("benchmark ITL interval count overflow");
     Ok(RequestRecord {
+        benchmark_correlation: None,
+        server_request_id: None,
         success,
         ttft_ms,
         e2e_ms,

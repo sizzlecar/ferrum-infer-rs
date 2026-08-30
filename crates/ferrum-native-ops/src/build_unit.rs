@@ -51,6 +51,8 @@ impl CudaNativeBuildUnit {
         match self {
             Self::Marlin => &["marlin_cuda", "marlin_cuda_moe"],
             Self::VllmMarlin => &[
+                "ferrum_block_fp8_group128_repack",
+                "ferrum_block_fp8_group128_scales",
                 "ferrum_marlin_mm",
                 "ferrum_marlin_mm_f16_u4b8",
                 "ferrum_vllm_gptq_marlin_repack",

@@ -597,6 +597,7 @@ impl DynamicResourceDescriptor {
             ));
         }
         let kind_valid = match &kind {
+            AllocationKind::InitializationScratch => false,
             AllocationKind::Scratch { .. } => {
                 lifetime == AllocationLifetime::Invocation
                     && usage == BufferUsage::Scratch

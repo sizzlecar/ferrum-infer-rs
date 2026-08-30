@@ -435,7 +435,7 @@ impl ResourceReservation {
         generation: u64,
     ) -> Result<Self, VNextError> {
         let owner_node_id = match allocation.kind() {
-            AllocationKind::Value => None,
+            AllocationKind::Value | AllocationKind::InitializationScratch => None,
             AllocationKind::Scratch { node_id, .. }
             | AllocationKind::Binding { node_id, .. }
             | AllocationKind::Persistent { node_id, .. } => Some(node_id.clone()),

@@ -16,7 +16,9 @@ use super::{
 };
 use super::{
     DeviceCommandBatch, DeviceTerminal, HostTransferLayout, PreparedModelFamily,
-    WeightComponentPayload, WeightComponentSource, WeightComponentSpec, WeightId,
+    StaticWeightTransformDestination, StaticWeightTransformPlan, StaticWeightTransformRequest,
+    WeightComponentPayload, WeightComponentSegments, WeightComponentSource, WeightComponentSpec,
+    WeightId,
 };
 
 static STATIC_INITIALIZATION_CLEANUP_DOMAIN: OnceLock<DeferredDeviceCleanupDomainId> =
@@ -92,6 +94,9 @@ pub struct StaticInitializationReceipt {
     uploaded_bytes: u64,
     imported_component_count: usize,
     imported_bytes: u64,
+    transformed_component_count: usize,
+    transformed_bytes: u64,
+    transform_command_count: usize,
     upload_command_count: usize,
     submission_batch_count: usize,
     total_duration_us: u64,
@@ -99,6 +104,7 @@ pub struct StaticInitializationReceipt {
     source_materialization_duration_us: u64,
     device_encode_duration_us: u64,
     device_import_duration_us: u64,
+    device_transform_encode_duration_us: u64,
     submission_wait_duration_us: u64,
     import_seal_duration_us: u64,
     slowest_component_id: Option<WeightId>,
@@ -127,6 +133,18 @@ impl StaticInitializationReceipt {
         self.imported_bytes
     }
 
+    pub const fn transformed_component_count(&self) -> usize {
+        self.transformed_component_count
+    }
+
+    pub const fn transformed_bytes(&self) -> u64 {
+        self.transformed_bytes
+    }
+
+    pub const fn transform_command_count(&self) -> usize {
+        self.transform_command_count
+    }
+
     pub const fn upload_command_count(&self) -> usize {
         self.upload_command_count
     }
@@ -153,6 +171,10 @@ impl StaticInitializationReceipt {
 
     pub const fn device_import_duration_us(&self) -> u64 {
         self.device_import_duration_us
+    }
+
+    pub const fn device_transform_encode_duration_us(&self) -> u64 {
+        self.device_transform_encode_duration_us
     }
 
     pub const fn submission_wait_duration_us(&self) -> u64 {
@@ -468,7 +490,12 @@ where
     let placements = weight_placements(family, plan).map_err(contract_failure)?;
     let execution_weight_schema = plan.payload().execution_weights().schema();
     let runtime = Arc::clone(transaction.lease().runtime());
-    let mut weight_import = if placements.is_empty() {
+    let has_required_weight_transforms = !plan
+        .payload()
+        .execution_weights()
+        .static_weight_transforms()
+        .is_empty();
+    let mut weight_import = if placements.is_empty() || has_required_weight_transforms {
         None
     } else {
         match runtime.begin_static_weight_import() {
@@ -500,9 +527,13 @@ where
     let mut uploaded_bytes = 0_u64;
     let mut imported_component_count = 0_usize;
     let mut imported_bytes = 0_u64;
+    let mut transformed_component_count = 0_usize;
+    let mut transformed_bytes = 0_u64;
+    let mut transform_command_count = 0_usize;
     let mut source_materialization_duration = Duration::ZERO;
     let mut device_encode_duration = Duration::ZERO;
     let mut device_import_duration = Duration::ZERO;
+    let mut device_transform_encode_duration = Duration::ZERO;
     let mut submission_wait_duration = Duration::ZERO;
     let mut import_seal_duration = Duration::ZERO;
     let mut slowest_component_id = None;
@@ -560,6 +591,78 @@ where
     }
 
     for components in materialization_groups {
+        if let Some(transform) = plan
+            .static_weight_transform_for_components(&components)
+            .map_err(contract_failure)?
+        {
+            let materialization_started = Instant::now();
+            let sources =
+                prepare_transform_sources(family, source, transform).map_err(contract_failure)?;
+            let materialization_duration = materialization_started.elapsed();
+            source_materialization_duration += materialization_duration;
+            if slowest_component_id.is_none()
+                || materialization_duration > slowest_component_materialization_duration
+            {
+                slowest_component_materialization_duration = materialization_duration;
+                slowest_component_id = Some(components[0].id.clone());
+            }
+            for source_segments in &sources {
+                source_files.extend(source_segments.source_files().iter().cloned());
+            }
+            let scratch_resource_id = plan
+                .payload()
+                .execution_weights()
+                .static_weight_transform_scratch_resource_id()
+                .map_err(contract_failure)?
+                .ok_or_else(|| {
+                    contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "required static weight transform has no admitted scratch resource"
+                            .to_owned(),
+                    })
+                })?;
+            let encode_started = Instant::now();
+            let command = encode_required_weight_transform(
+                transaction,
+                &runtime,
+                transform,
+                &sources,
+                &components,
+                &placements,
+                &scratch_resource_id,
+            )
+            .map_err(|error| {
+                runtime_or_contract_failure(&runtime, error, "static_weight_transform_encode")
+            })?;
+            device_transform_encode_duration += encode_started.elapsed();
+            pending.push(command);
+            transform_command_count += 1;
+            transformed_component_count += components.len();
+            transformed_bytes = components
+                .iter()
+                .try_fold(transformed_bytes, |total, component| {
+                    total.checked_add(
+                        placements
+                            .get(&component.id)
+                            .expect("transform components have selected placements")
+                            .length_bytes,
+                    )
+                })
+                .ok_or_else(|| {
+                    contract_failure(VNextError::InvalidExecutionPlan {
+                        reason: "static transformed bytes overflow u64".to_owned(),
+                    })
+                })?;
+            if pending.len() == policy.maximum_commands_per_batch() {
+                submission_wait_duration += submit_pending(
+                    &runtime,
+                    &mut stream,
+                    &mut pending,
+                    &mut pending_staging_bytes,
+                )?;
+                submission_batch_count += 1;
+            }
+            continue;
+        }
         // Retain only outputs derived from one exact source set. This permits
         // multi-output transforms to read and convert a large source matrix
         // once without retaining converted payloads for the whole model.
@@ -710,6 +813,9 @@ where
         uploaded_bytes,
         imported_component_count,
         imported_bytes,
+        transformed_component_count,
+        transformed_bytes,
+        transform_command_count,
         upload_command_count,
         submission_batch_count,
         total_duration_us: duration_us(initialization_started.elapsed()),
@@ -717,6 +823,7 @@ where
         source_materialization_duration_us: duration_us(source_materialization_duration),
         device_encode_duration_us: duration_us(device_encode_duration),
         device_import_duration_us: duration_us(device_import_duration),
+        device_transform_encode_duration_us: duration_us(device_transform_encode_duration),
         submission_wait_duration_us: duration_us(submission_wait_duration),
         import_seal_duration_us: duration_us(import_seal_duration),
         slowest_component_id,
@@ -1015,6 +1122,157 @@ fn prepare_uploads<'source>(
         }
     }
     Ok(payloads)
+}
+
+fn prepare_transform_sources<'source>(
+    family: &PreparedModelFamily,
+    source: &'source dyn WeightComponentSource,
+    transform: &StaticWeightTransformPlan,
+) -> Result<Vec<WeightComponentSegments<'source>>, VNextError> {
+    transform
+        .source_component_ids()
+        .into_iter()
+        .map(|source_id| {
+            let component_index = family
+                .weight_schema()
+                .components
+                .binary_search_by(|component| component.id.cmp(source_id))
+                .map_err(|_| VNextError::InvalidExecutionPlan {
+                    reason: format!(
+                        "static weight transform references unknown source component `{source_id}`"
+                    ),
+                })?;
+            let component = &family.weight_schema().components[component_index];
+            let segments = source.component_segments(component)?;
+            if segments.component_id() != &component.id
+                || segments.external_names() != component.external_names.as_slice()
+                || segments.dimensions() != component.dimensions.as_slice()
+                || segments.element_type() != component.physical_element_type()
+                || segments.total_bytes() != component.physical_bytes()?
+            {
+                return Err(VNextError::InvalidExecutionPlan {
+                    reason: format!(
+                        "static weight transform source segments for `{}` differ from the trusted source schema",
+                        component.id
+                    ),
+                });
+            }
+            Ok(segments)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_required_weight_transform<'source, D>(
+    transaction: &ResourceTransaction<D, TransactionCommitted>,
+    runtime: &Arc<D::Runtime>,
+    transform: &StaticWeightTransformPlan,
+    sources: &[WeightComponentSegments<'source>],
+    components: &[&WeightComponentSpec],
+    placements: &BTreeMap<WeightId, WeightPlacement>,
+    scratch_resource_id: &ResourceId,
+) -> Result<
+    <D::Runtime as DeviceRuntime>::Command,
+    StaticBufferAccessError<<D::Runtime as DeviceRuntime>::Error>,
+>
+where
+    D: ResourceTransactionDriver,
+{
+    let [packed_values_id, scales_id] = transform.execution_component_ids();
+    let packed_component = components
+        .iter()
+        .copied()
+        .find(|component| &component.id == packed_values_id)
+        .ok_or_else(|| {
+            StaticBufferAccessError::Contract(VNextError::InvalidExecutionPlan {
+                reason: "static weight transform packed output is absent from its component group"
+                    .to_owned(),
+            })
+        })?;
+    let scales_component = components
+        .iter()
+        .copied()
+        .find(|component| &component.id == scales_id)
+        .ok_or_else(|| {
+            StaticBufferAccessError::Contract(VNextError::InvalidExecutionPlan {
+                reason: "static weight transform scale output is absent from its component group"
+                    .to_owned(),
+            })
+        })?;
+    let packed_placement = placements.get(packed_values_id).ok_or_else(|| {
+        StaticBufferAccessError::Contract(VNextError::InvalidExecutionPlan {
+            reason: "static weight transform packed output has no placement".to_owned(),
+        })
+    })?;
+    let scales_placement = placements.get(scales_id).ok_or_else(|| {
+        StaticBufferAccessError::Contract(VNextError::InvalidExecutionPlan {
+            reason: "static weight transform scale output has no placement".to_owned(),
+        })
+    })?;
+    let lease = transaction.lease();
+    let packed_entry = lease
+        .plan_static_entries()
+        .find(|entry| entry.resource_id() == &packed_placement.resource_id)
+        .ok_or_else(|| {
+            StaticBufferAccessError::Contract(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "static lease lacks transform destination `{}`",
+                    packed_placement.resource_id
+                ),
+            })
+        })?;
+    let scales_entry = lease
+        .plan_static_entries()
+        .find(|entry| entry.resource_id() == &scales_placement.resource_id)
+        .ok_or_else(|| {
+            StaticBufferAccessError::Contract(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "static lease lacks transform destination `{}`",
+                    scales_placement.resource_id
+                ),
+            })
+        })?;
+    let scratch_entry = lease
+        .plan_static_entries()
+        .find(|entry| entry.resource_id() == scratch_resource_id)
+        .ok_or_else(|| {
+            StaticBufferAccessError::Contract(VNextError::InvalidExecutionPlan {
+                reason: format!("static lease lacks transform scratch `{scratch_resource_id}`"),
+            })
+        })?;
+    let packed_view = lease
+        .view(&packed_placement.resource_id, packed_entry.generation())
+        .map_err(StaticBufferAccessError::Contract)?;
+    let scales_view = lease
+        .view(&scales_placement.resource_id, scales_entry.generation())
+        .map_err(StaticBufferAccessError::Contract)?;
+    let scratch_view = lease
+        .view(scratch_resource_id, scratch_entry.generation())
+        .map_err(StaticBufferAccessError::Contract)?;
+    let destinations = [
+        StaticWeightTransformDestination::new(
+            packed_component,
+            packed_view.buffer(),
+            packed_placement.offset_bytes,
+        ),
+        StaticWeightTransformDestination::new(
+            scales_component,
+            scales_view.buffer(),
+            scales_placement.offset_bytes,
+        ),
+    ];
+    let request =
+        StaticWeightTransformRequest::new(transform, sources, &destinations, scratch_view.buffer());
+    match runtime.encode_static_weight_transform(request) {
+        Some(Ok(command)) => Ok(command),
+        Some(Err(error)) => Err(StaticBufferAccessError::Runtime(error)),
+        None => Err(StaticBufferAccessError::Contract(
+            VNextError::InvalidExecutionPlan {
+                reason: "device runtime does not support the required static weight transform"
+                    .to_owned(),
+            },
+        )),
+    }
 }
 
 enum StaticBufferAccessError<E> {

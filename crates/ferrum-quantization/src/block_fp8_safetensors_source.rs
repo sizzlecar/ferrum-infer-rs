@@ -10,7 +10,8 @@ use std::path::Path;
 
 use ferrum_interfaces::vnext::{
     ElementType, QuantizationPacking, QuantizationSpec, VNextError, WeightComponentPayload,
-    WeightComponentRole, WeightComponentSource, WeightComponentSpec, WeightEncoding,
+    WeightComponentRole, WeightComponentSegment, WeightComponentSegments, WeightComponentSource,
+    WeightComponentSpec, WeightEncoding,
 };
 use ferrum_types::Result;
 use safetensors::Dtype;
@@ -54,11 +55,39 @@ impl BlockFp8SafetensorsSource {
         )
     }
 
+    fn packed_value_segments<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+        quantization: &QuantizationSpec,
+    ) -> std::result::Result<WeightComponentSegments<'source>, VNextError> {
+        validate_source_quantization(component, quantization)?;
+        self.ordered_matrix_segments(
+            component,
+            ".weight",
+            Dtype::F8_E4M3,
+            ElementType::U8,
+            "FP8 values",
+        )
+    }
+
     fn inverse_scales<'source>(
         &'source self,
         component: &WeightComponentSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
         self.ordered_matrix_payload(
+            component,
+            ".weight_scale_inv",
+            Dtype::BF16,
+            ElementType::Bf16,
+            "FP8 inverse scales",
+        )
+    }
+
+    fn inverse_scale_segments<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+    ) -> std::result::Result<WeightComponentSegments<'source>, VNextError> {
+        self.ordered_matrix_segments(
             component,
             ".weight_scale_inv",
             Dtype::BF16,
@@ -75,6 +104,80 @@ impl BlockFp8SafetensorsSource {
         element_type: ElementType,
         label: &str,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        let mut tensors =
+            self.ordered_matrix_tensors(component, required_suffix, required_dtype, label)?;
+        if tensors.len() == 1 {
+            let tensor = tensors.pop().expect("one tensor was checked above");
+            let retained_host_memory = tensor.retained_host_memory().clone();
+            return WeightComponentPayload::new(
+                component,
+                tensor.external_name(),
+                tensor.source_file(),
+                component.dimensions.clone(),
+                element_type,
+                tensor.bytes(),
+            )?
+            .with_retained_host_memory(retained_host_memory);
+        }
+
+        let expected_bytes = usize::try_from(component.physical_bytes()?).map_err(|_| {
+            invalid_component(
+                component,
+                format!("aggregate {label} byte size exceeds host address space"),
+            )
+        })?;
+        let mut bytes = Vec::with_capacity(expected_bytes);
+        let mut source_files = Vec::with_capacity(component.external_names.len());
+        for tensor in tensors {
+            source_files.push(tensor.source_file().to_owned());
+            bytes.extend_from_slice(tensor.bytes());
+        }
+        WeightComponentPayload::from_ordered_sources(
+            component,
+            component.external_names.clone(),
+            source_files,
+            component.dimensions.clone(),
+            element_type,
+            bytes,
+        )
+    }
+
+    fn ordered_matrix_segments<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+        required_suffix: &str,
+        required_dtype: Dtype,
+        element_type: ElementType,
+        label: &str,
+    ) -> std::result::Result<WeightComponentSegments<'source>, VNextError> {
+        let tensors =
+            self.ordered_matrix_tensors(component, required_suffix, required_dtype, label)?;
+        let mut source_files = Vec::with_capacity(tensors.len());
+        let mut segments = Vec::with_capacity(tensors.len());
+        for tensor in tensors {
+            source_files.push(tensor.source_file().to_owned());
+            segments.push(
+                WeightComponentSegment::new(tensor.bytes())
+                    .with_retained_host_memory(tensor.retained_host_memory().clone())?,
+            );
+        }
+        WeightComponentSegments::from_ordered_segments(
+            component,
+            component.external_names.clone(),
+            source_files,
+            component.dimensions.clone(),
+            element_type,
+            segments,
+        )
+    }
+
+    fn ordered_matrix_tensors<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+        required_suffix: &str,
+        required_dtype: Dtype,
+        label: &str,
+    ) -> std::result::Result<Vec<SafetensorsTensor<'source>>, VNextError> {
         if component.external_names.is_empty() {
             return Err(invalid_component(
                 component,
@@ -101,26 +204,12 @@ impl BlockFp8SafetensorsSource {
             let tensor = self.tensor(component, external_name)?;
             validate_source_tensor(component, &tensor, required_dtype, label)?;
             validate_unit_prefix_shape(component, tensor.shape(), label)?;
-            return WeightComponentPayload::new(
-                component,
-                tensor.external_name(),
-                tensor.source_file(),
-                component.dimensions.clone(),
-                element_type,
-                tensor.bytes(),
-            );
+            return Ok(vec![tensor]);
         }
 
         let source_dimensions =
             aggregate_source_matrix_dimensions(component, component.external_names.len(), label)?;
-        let expected_bytes = usize::try_from(component.physical_bytes()?).map_err(|_| {
-            invalid_component(
-                component,
-                format!("aggregate {label} byte size exceeds host address space"),
-            )
-        })?;
-        let mut bytes = Vec::with_capacity(expected_bytes);
-        let mut source_files = Vec::with_capacity(component.external_names.len());
+        let mut tensors = Vec::with_capacity(component.external_names.len());
         for external_name in &component.external_names {
             let tensor = self.tensor(component, external_name)?;
             validate_source_tensor(component, &tensor, required_dtype, label)?;
@@ -133,17 +222,9 @@ impl BlockFp8SafetensorsSource {
                     ),
                 ));
             }
-            source_files.push(tensor.source_file().to_owned());
-            bytes.extend_from_slice(tensor.bytes());
+            tensors.push(tensor);
         }
-        WeightComponentPayload::from_ordered_sources(
-            component,
-            component.external_names.clone(),
-            source_files,
-            component.dimensions.clone(),
-            element_type,
-            bytes,
-        )
+        Ok(tensors)
     }
 
     fn tensor<'source>(
@@ -226,6 +307,30 @@ impl WeightComponentSource for BlockFp8SafetensorsSource {
             ) => self.inverse_scales(component),
             (_, WeightEncoding::Dense { .. } | WeightEncoding::DenseAffine { .. }) => {
                 self.archive.component(component)
+            }
+            _ => Err(invalid_component(
+                component,
+                "block-FP8 adapter received an unsupported component role or encoding",
+            )),
+        }
+    }
+
+    fn component_segments<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+    ) -> std::result::Result<WeightComponentSegments<'source>, VNextError> {
+        match (&component.role, &component.encoding) {
+            (WeightComponentRole::PackedValues, WeightEncoding::Quantized(quantization)) => {
+                self.packed_value_segments(component, quantization)
+            }
+            (
+                WeightComponentRole::Scales,
+                WeightEncoding::Dense {
+                    element_type: ElementType::Bf16,
+                },
+            ) => self.inverse_scale_segments(component),
+            (_, WeightEncoding::Dense { .. } | WeightEncoding::DenseAffine { .. }) => {
+                self.archive.component_segments(component)
             }
             _ => Err(invalid_component(
                 component,
@@ -474,6 +579,8 @@ mod tests {
         assert_eq!(scales.dimensions(), [1, 2, 3]);
         assert_eq!(scales.element_type(), ElementType::Bf16);
         assert_eq!(scales.bytes().len(), 2 * 3 * 2);
+        assert!(values.retained_host_memory().is_some());
+        assert!(scales.retained_host_memory().is_some());
         assert!(std::ptr::eq(
             values.bytes().as_ptr(),
             source
@@ -508,6 +615,62 @@ mod tests {
         );
         assert_eq!(scales.dimensions(), [2, 2, 1, 1]);
         assert_eq!(scales.bytes(), [10, 0, 20, 0, 30, 0, 40, 40]);
+    }
+
+    #[test]
+    fn exposes_ordered_retained_mmap_segments_without_aggregate_copy() {
+        let fixture = write_ordered_fixture([1, 1]);
+        let source = BlockFp8SafetensorsSource::open(fixture.path()).unwrap();
+
+        let values = source
+            .component_segments(&ordered_values_component())
+            .unwrap();
+        let scales = source
+            .component_segments(&ordered_scales_component())
+            .unwrap();
+
+        assert_eq!(
+            values.external_names(),
+            ORDERED_VALUE_NAMES.map(str::to_owned)
+        );
+        assert_eq!(values.source_files(), ["model.safetensors"; 4]);
+        assert_eq!(values.dimensions(), [2, 2, 2, 3]);
+        assert_eq!(values.element_type(), ElementType::U8);
+        assert_eq!(values.total_bytes(), 24);
+        assert_eq!(values.segments().len(), 4);
+        assert_eq!(
+            scales.external_names(),
+            ORDERED_SCALE_NAMES.map(str::to_owned)
+        );
+        assert_eq!(scales.source_files(), ["model.safetensors"; 4]);
+        assert_eq!(scales.dimensions(), [2, 2, 1, 1]);
+        assert_eq!(scales.element_type(), ElementType::Bf16);
+        assert_eq!(scales.total_bytes(), 8);
+        assert_eq!(scales.segments().len(), 4);
+
+        for (index, external_name) in ORDERED_VALUE_NAMES.iter().enumerate() {
+            let tensor = source.archive().tensor(external_name).unwrap();
+            let segment = &values.segments()[index];
+            assert!(std::ptr::eq(
+                segment.bytes().as_ptr(),
+                tensor.bytes().as_ptr()
+            ));
+            assert!(segment.retained_host_memory().is_some());
+            assert_eq!(segment.bytes(), vec![u8::try_from(index + 1).unwrap(); 6]);
+        }
+        for (index, external_name) in ORDERED_SCALE_NAMES.iter().enumerate() {
+            let tensor = source.archive().tensor(external_name).unwrap();
+            let segment = &scales.segments()[index];
+            assert!(std::ptr::eq(
+                segment.bytes().as_ptr(),
+                tensor.bytes().as_ptr()
+            ));
+            assert!(segment.retained_host_memory().is_some());
+        }
+        assert_eq!(scales.segments()[0].bytes(), [10, 0]);
+        assert_eq!(scales.segments()[1].bytes(), [20, 0]);
+        assert_eq!(scales.segments()[2].bytes(), [30, 0]);
+        assert_eq!(scales.segments()[3].bytes(), [40, 40]);
     }
 
     #[test]

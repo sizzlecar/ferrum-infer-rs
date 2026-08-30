@@ -2,10 +2,11 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ferrum_interfaces::vnext::{
-    CanonicalRational, ElementType, VNextError, WeightComponentPayload, WeightComponentSource,
-    WeightComponentSpec, WeightEncoding,
+    CanonicalRational, ElementType, RetainedHostMemoryRegion, StableHostMemory, VNextError,
+    WeightComponentPayload, WeightComponentSource, WeightComponentSpec, WeightEncoding,
 };
 use ferrum_types::{FerrumError, Result};
 use half::{bf16, f16};
@@ -21,15 +22,23 @@ struct TensorMeta {
     data_end: usize,
 }
 
-struct Shard {
+struct SafetensorsShard {
     relative_path: String,
     mmap: Mmap,
+}
+
+// SAFETY: SafetensorsShard owns an immutable Mmap whose allocation, address,
+// length, and contents remain fixed for the lifetime of the shard.
+unsafe impl StableHostMemory for SafetensorsShard {
+    fn stable_bytes(&self) -> &[u8] {
+        &self.mmap
+    }
 }
 
 /// Mmap-backed, once-indexed safetensors archive shared by vNext model
 /// packages. Tensor payload access does not reparse shard headers.
 pub struct SafetensorsArchive {
-    shards: Vec<Shard>,
+    shards: Vec<Arc<SafetensorsShard>>,
     tensors: BTreeMap<String, TensorMeta>,
 }
 
@@ -39,6 +48,7 @@ pub struct SafetensorsTensor<'archive> {
     dtype: Dtype,
     shape: &'archive [u64],
     bytes: &'archive [u8],
+    retained_host_memory: RetainedHostMemoryRegion,
 }
 
 impl<'archive> SafetensorsTensor<'archive> {
@@ -64,6 +74,11 @@ impl<'archive> SafetensorsTensor<'archive> {
 
     pub fn bytes(&self) -> &'archive [u8] {
         self.bytes
+    }
+
+    /// Stable mmap owner and exact byte range for this tensor payload.
+    pub fn retained_host_memory(&self) -> &RetainedHostMemoryRegion {
+        &self.retained_host_memory
     }
 }
 
@@ -103,10 +118,10 @@ impl SafetensorsArchive {
                     )));
                 }
             }
-            shards.push(Shard {
+            shards.push(Arc::new(SafetensorsShard {
                 relative_path,
                 mmap,
-            });
+            }));
         }
         if tensors.is_empty() {
             return Err(FerrumError::model(
@@ -132,12 +147,23 @@ impl SafetensorsArchive {
                     "tensor {external_name:?} has an invalid safetensors byte range"
                 ))
             })?;
+        let retained_host_memory = RetainedHostMemoryRegion::new(
+            Arc::clone(shard),
+            metadata.data_start,
+            metadata.data_end - metadata.data_start,
+        )
+        .map_err(|error| {
+            FerrumError::model(format!(
+                "tensor {external_name:?} cannot retain its safetensors byte range: {error}"
+            ))
+        })?;
         Ok(SafetensorsTensor {
             external_name,
             source_file: &shard.relative_path,
             dtype: metadata.dtype,
             shape: &metadata.shape,
             bytes,
+            retained_host_memory,
         })
     }
 
@@ -284,14 +310,20 @@ impl WeightComponentSource for SafetensorsArchive {
             external_name,
             affine,
         )?;
-        WeightComponentPayload::new(
+        let retained_host_memory =
+            matches!(&bytes, Cow::Borrowed(_)).then(|| tensor.retained_host_memory().clone());
+        let payload = WeightComponentPayload::new(
             component,
             tensor.external_name(),
             tensor.source_file(),
             component.dimensions.clone(),
             expected_element_type,
             bytes,
-        )
+        )?;
+        match retained_host_memory {
+            Some(retained_host_memory) => payload.with_retained_host_memory(retained_host_memory),
+            None => Ok(payload),
+        }
     }
 }
 
@@ -452,7 +484,32 @@ fn element_type(dtype: Dtype) -> Option<ElementType> {
 
 #[cfg(test)]
 mod tests {
+    use safetensors::tensor::{serialize_to_file, TensorView};
+    use tempfile::tempdir;
+
     use super::*;
+
+    #[test]
+    fn tensor_retains_its_exact_mmap_range_after_archive_drop() {
+        let directory = tempdir().unwrap();
+        let tensor_bytes = [1_u8, 2, 3, 4];
+        let tensors = BTreeMap::from([(
+            "weight",
+            TensorView::new(Dtype::U8, vec![2, 2], &tensor_bytes).unwrap(),
+        )]);
+        serialize_to_file(tensors, &None, &directory.path().join("model.safetensors")).unwrap();
+
+        let archive = SafetensorsArchive::open(directory.path()).unwrap();
+        let tensor = archive.tensor("weight").unwrap();
+        assert!(std::ptr::eq(
+            tensor.bytes().as_ptr(),
+            tensor.retained_host_memory().bytes().as_ptr()
+        ));
+        let retained = tensor.retained_host_memory().clone();
+        drop(tensor);
+        drop(archive);
+        assert_eq!(retained.bytes(), tensor_bytes);
+    }
 
     #[test]
     fn dense_materialization_converts_bf16_and_f32_to_f16() {
