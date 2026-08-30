@@ -3874,8 +3874,8 @@ mod tests {
             .finish();
         let changed = SharedProjectionWeight::SegmentedMarlin {
             parts: [
-                fp8_part(0, 1, 0, 10_240),
-                fp8_part(2, 3, 10_240, 6_144),
+                fp8_part(0, 1, MARLIN_FP8_CHANNELWISE_GROUP_SIZE, 0, 10_240),
+                fp8_part(2, 3, MARLIN_FP8_CHANNELWISE_GROUP_SIZE, 10_240, 6_144),
                 dense_part(4, 16_384, 47),
                 dense_part(5, 16_431, 49),
             ],

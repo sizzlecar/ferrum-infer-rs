@@ -258,8 +258,7 @@ mod block_fp8_exact_materializer_tests {
                 crate::marlin_fp8_materializer::BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
             )
             .expect("block-FP8 materializer id"),
-        )
-        .expect("exact block-FP8 materializer selection");
+        );
         assert!(!selection.has_numeric_quality_artifact());
     }
 }
