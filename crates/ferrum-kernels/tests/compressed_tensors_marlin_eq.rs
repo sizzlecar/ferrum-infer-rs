@@ -16,7 +16,7 @@ use ferrum_kernels::marlin_fp8_materializer::{
     MARLIN_FP8_GROUP128_WEIGHT_LAYOUT_ID,
 };
 use ferrum_kernels::marlin_repack::{
-    block_fp8_group128_raw_bits_to_u32_reference,
+    block_fp8_group128_raw_bits_to_marlin_u32_reference,
     block_fp8_group128_scales_to_marlin_f16_reference,
     repack_compressed_tensors_zero_points_to_marlin, repack_gptq_to_marlin,
     repack_scales_to_marlin,
@@ -597,8 +597,9 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             "{case_id}"
         );
 
-        let expected_packed = block_fp8_group128_raw_bits_to_u32_reference(&source_values, n, k)
-            .expect("build exact group-128 packed-weight oracle");
+        let expected_packed =
+            block_fp8_group128_raw_bits_to_marlin_u32_reference(&source_values, n, k)
+                .expect("build exact group-128 final Marlin packed-weight oracle");
         let expected_scales =
             block_fp8_group128_scales_to_marlin_f16_reference(&inverse_scale_bytes, n, k)
                 .expect("build exact group-128 scale oracle")

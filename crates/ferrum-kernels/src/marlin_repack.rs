@@ -415,6 +415,63 @@ pub fn block_fp8_group128_raw_bits_to_u32_reference(
     pack_block_fp8_group128_matrix_slices_to_u32_reference(&[source_fp8_e4m3], n, k)
 }
 
+/// Pack exact row-major E4M3 bytes from `[N, K]` directly into the final
+/// 16-by-64 Marlin W8A16 tile ABI.
+///
+/// Unlike [`block_fp8_group128_raw_bits_to_u32_reference`], this does not
+/// return the intermediate `[K / 4, N]` staging layout. It is the pure Rust
+/// oracle for the product CUDA direct transform.
+pub fn block_fp8_group128_raw_bits_to_marlin_u32_reference(
+    source_fp8_e4m3: &[u8],
+    n: usize,
+    k: usize,
+) -> Result<Vec<u32>, Fp8MarlinPrepareError> {
+    validate_block_fp8_group128_shape(n, k)?;
+    let value_count = n
+        .checked_mul(k)
+        .ok_or(Fp8MarlinPrepareError::BlockFp8ValueLength {
+            actual: source_fp8_e4m3.len(),
+            expected: usize::MAX,
+        })?;
+    if source_fp8_e4m3.len() != value_count {
+        return Err(Fp8MarlinPrepareError::BlockFp8ValueLength {
+            actual: source_fp8_e4m3.len(),
+            expected: value_count,
+        });
+    }
+
+    let word_count = value_count / 4;
+    let mut packed = Vec::new();
+    packed
+        .try_reserve_exact(word_count)
+        .map_err(|_| Fp8MarlinPrepareError::AllocationFailed {
+            buffer: "Marlin tile raw-bit oracle",
+            elements: word_count,
+        })?;
+    for k_tile in 0..k / 16 {
+        for n_tile in 0..n / 64 {
+            for marlin_thread in 0..32 {
+                let tensor_core_column = marlin_thread / 4;
+                let tensor_core_row = (marlin_thread % 4) * 2;
+                for warp in 0..4 {
+                    for column_half in 0..2 {
+                        let output = n_tile * 64 + warp * 16 + tensor_core_column + column_half * 8;
+                        let source_base = output * k + k_tile * 16;
+                        packed.push(u32::from_le_bytes([
+                            source_fp8_e4m3[source_base + tensor_core_row],
+                            source_fp8_e4m3[source_base + tensor_core_row + 8],
+                            source_fp8_e4m3[source_base + tensor_core_row + 1],
+                            source_fp8_e4m3[source_base + tensor_core_row + 9],
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+    debug_assert_eq!(packed.len(), word_count);
+    Ok(packed)
+}
+
 /// Fuse adjacent gate/up `[N, K]` source matrices into `[2N, K]` before
 /// emitting the `[K / 4, 2N]` u32 staging ABI.
 ///
@@ -1348,6 +1405,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn group128_raw_bit_final_marlin_oracle_is_not_staging() {
+        let n = 128;
+        let k = 128;
+        let source = (0..n * k)
+            .map(|index| (index as u8).wrapping_mul(73).wrapping_add(0x5b))
+            .collect::<Vec<_>>();
+
+        let final_tiles =
+            block_fp8_group128_raw_bits_to_marlin_u32_reference(&source, n, k).unwrap();
+        let staging = block_fp8_group128_raw_bits_to_u32_reference(&source, n, k).unwrap();
+        assert_eq!(final_tiles.len(), n * k / 4);
+        assert_eq!(
+            final_tiles[0].to_le_bytes(),
+            [source[0], source[8], source[1], source[9]]
+        );
+        assert_ne!(final_tiles, staging);
     }
 
     #[test]
