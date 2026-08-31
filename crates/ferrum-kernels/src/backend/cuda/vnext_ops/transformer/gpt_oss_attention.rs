@@ -2108,7 +2108,7 @@ mod tests {
             bindings.binding_offset(2).unwrap(),
             shape.binding_slot_bytes().unwrap() * 2
         );
-        assert_eq!(shape.maximum_pages().unwrap(), 128);
+        assert_eq!(shape.maximum_pages().unwrap(), 4096);
     }
 
     #[test]
