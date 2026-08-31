@@ -21,7 +21,7 @@ pub use ferrum_types::CompiledNativeOperatorIdentity as CompiledNativeOperatorAr
 
 pub const FA2_NATIVE_OPERATOR: &str = "fa2";
 pub const CUDA_NATIVE_SOURCE_BUNDLE_ID: &str = "ferrum-native-cuda-v1+sha256.\
-df27bdb0c6d5fd5a33fe839a27eb21bb0202daaef024c69340e43203992fabeb";
+67914b6e426584051d5b6ef5ef424fcbe0b9fc07981195d866e546cc1408aa8c";
 
 pub fn compiled_native_operator_artifacts() -> &'static [CompiledNativeOperatorArtifact] {
     static COMPILED: OnceLock<Vec<CompiledNativeOperatorArtifact>> = OnceLock::new();
