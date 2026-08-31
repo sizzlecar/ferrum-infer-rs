@@ -9,6 +9,8 @@ use minijinja::Environment;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
 use serde_json::Value;
+use std::fmt;
+use std::str::FromStr;
 
 /// Model-provided chat template, usually from GGUF `tokenizer.chat_template`
 /// or HuggingFace `tokenizer_config.json`.
@@ -68,9 +70,49 @@ fn tool_call_protocol_for_template(template: &str) -> ApiToolCallProtocol {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl fmt::Display for ReasoningEffort {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReasoningEffort {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            _ => Err(format!(
+                "unsupported reasoning effort {value:?}; expected low, medium, or high"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ChatTemplateOptions {
     pub enable_thinking: Option<bool>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Clock seen by the template's `strftime_now` (Mistral-Small-3.2 and
     /// Llama-3.x inject "today's date" into the system prompt). `None` =
     /// local wall clock; golden tests pin the timestamp recorded at
@@ -281,6 +323,8 @@ struct ModelTemplateContext<'a> {
     eos_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_thinking: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
     /// Pre-converted to `serde_json::Value`: minijinja serializes Rust
     /// *structs* with alphabetically sorted fields, but a JSON map (with
     /// serde_json `preserve_order`) keeps the OpenAI canonical key order
@@ -381,6 +425,7 @@ fn render_model_template(
         bos_token: model_template.bos_token.as_deref().unwrap_or(""),
         eos_token: model_template.eos_token.as_deref().unwrap_or(""),
         enable_thinking: options.enable_thinking,
+        reasoning_effort: options.reasoning_effort,
         tools: tools.and_then(|t| serde_json::to_value(t).ok()),
         tool_choice,
         functions: functions.and_then(|f| serde_json::to_value(f).ok()),
@@ -408,6 +453,7 @@ fn detect_model_reasoning_protocol(
             model_template,
             &ChatTemplateOptions {
                 enable_thinking,
+                reasoning_effort: None,
                 now_override: now,
             },
             None,
@@ -1071,6 +1117,34 @@ mod tests {
         )
         .unwrap();
         assert!(out.ends_with("<|im_start|>assistant\n<think>\n"));
+    }
+
+    #[test]
+    fn typed_reasoning_effort_is_exposed_to_model_template() {
+        let template = ModelChatTemplate::new(
+            "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% else %}Reasoning: model-default{% endif %}",
+            "reasoning-effort-template",
+        );
+        let default_prompt = render_chat_prompt_with_model_template_options(
+            &[msg(MessageRole::User, "Hi")],
+            "served-model-alias",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(default_prompt, "Reasoning: model-default");
+
+        let low_prompt = render_chat_prompt_with_model_template_options(
+            &[msg(MessageRole::User, "Hi")],
+            "served-model-alias",
+            Some(&template),
+            &ChatTemplateOptions {
+                reasoning_effort: Some(ReasoningEffort::Low),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(low_prompt, "Reasoning: low");
     }
 
     #[test]
