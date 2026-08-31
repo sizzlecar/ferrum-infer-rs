@@ -2942,7 +2942,7 @@ fn encode_gpt_oss_mxfp4_static_transform(
                     CudaDeviceRuntimeError::driver("GPT-OSS MXFP4 block transpose", error)
                 })?;
                 unsafe {
-                    crate::backend::cuda::vllm_marlin::vllm_gptq_marlin_repack_raw(
+                    super::vllm_marlin::vllm_gptq_marlin_repack_raw(
                         stream,
                         scratch_pointer,
                         packed_pointer,
@@ -4260,7 +4260,7 @@ mod tests {
                 }
                 .unwrap();
                 unsafe {
-                    super::vllm_marlin::vllm_gptq_marlin_repack_raw(
+                    crate::backend::cuda::vllm_marlin::vllm_gptq_marlin_repack_raw(
                         &stream,
                         scratch,
                         expert_packed,
