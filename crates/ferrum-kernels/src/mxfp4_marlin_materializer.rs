@@ -310,6 +310,10 @@ fn derive_execution_schema(
             tensor.physical_layout = candidate.execution_layout();
         }
     }
+    schema
+        .components
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    schema.tensors.sort_by(|left, right| left.id.cmp(&right.id));
     schema.validate(family_id)?;
     Ok(schema)
 }
@@ -921,6 +925,19 @@ mod tests {
         assert_eq!(plan.logical_dimensions(), [2, 64, 64]);
         assert_eq!(plan.matrices_per_output(), 1);
         assert_eq!(plan.scratch_bytes().unwrap(), 64 * 64 / 2);
+    }
+
+    #[test]
+    fn execution_schema_is_stable_across_registry_normalization() {
+        let execution = derive_execution_schema(&source_schema(), &family_id()).unwrap();
+        assert!(execution
+            .components
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id));
+        assert!(execution
+            .tensors
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id));
     }
 
     #[test]
