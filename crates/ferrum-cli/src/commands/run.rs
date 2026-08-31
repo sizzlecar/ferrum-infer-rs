@@ -8,9 +8,10 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    has_unclosed_thinking_block, parse_reasoning_response_for_prompt, FerrumConfigBuilder,
-    FerrumError, FinishReason, InferenceRequest, InferenceResponse, ModelCapabilities, Priority,
-    RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
+    has_unclosed_thinking_block, parse_harmony_response, parse_reasoning_response_for_prompt,
+    FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, InferenceResponse,
+    ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority, RequestId,
+    ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
     RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage,
     WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG, THINK_START_TAG,
 };
@@ -353,6 +354,31 @@ fn display_response_text(text: &str) -> String {
     text.trim().to_string()
 }
 
+fn parse_run_model_output(
+    protocol: ModelOutputProtocol,
+    text: &str,
+    prompt_opened_thinking: bool,
+) -> Result<ParsedReasoningResponse> {
+    match protocol {
+        ModelOutputProtocol::Text => Ok(parse_reasoning_response_for_prompt(
+            text,
+            prompt_opened_thinking,
+        )),
+        ModelOutputProtocol::HarmonyGptOss => {
+            let parsed = parse_harmony_response(text)?;
+            if parsed.tool_call.is_some() {
+                return Err(FerrumError::invalid_format(
+                    "GPT-OSS emitted a Harmony tool call for `ferrum run`, which has no tool executor",
+                ));
+            }
+            Ok(ParsedReasoningResponse {
+                content: parsed.content,
+                reasoning: parsed.reasoning_content,
+            })
+        }
+    }
+}
+
 struct CollectedRunGeneration {
     request_id: String,
     raw_text: String,
@@ -388,6 +414,7 @@ type RunResponseStream = Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>>
 async fn collect_run_stream(
     mut stream: RunResponseStream,
     trace_tokens: bool,
+    buffer_output: bool,
     turn: usize,
     session_id: &str,
     history_epoch: usize,
@@ -413,15 +440,17 @@ async fn collect_run_stream(
         let token_id = chunk.token.map(|token| token.get());
         if !chunk.text.is_empty() {
             raw_text.push_str(&chunk.text);
-            emit_jsonl_assistant_delta(
-                session_id,
-                history_epoch,
-                expected_request_id,
-                turn,
-                chunk_count,
-                &chunk.text,
-                token_id,
-            );
+            if !buffer_output {
+                emit_jsonl_assistant_delta(
+                    session_id,
+                    history_epoch,
+                    expected_request_id,
+                    turn,
+                    chunk_count,
+                    &chunk.text,
+                    token_id,
+                );
+            }
             chunk_count += 1;
         }
         if let Some(token_id) = token_id {
@@ -464,6 +493,7 @@ async fn collect_run_stream(
 async fn collect_run_text_stream(
     mut stream: RunResponseStream,
     trace_tokens: bool,
+    buffer_output: bool,
     turn: usize,
     expected_request_id: &RequestId,
     stdin_is_tty: bool,
@@ -510,8 +540,10 @@ async fn collect_run_text_stream(
         }
         if !chunk.text.is_empty() {
             raw_text.push_str(&chunk.text);
-            print!("{}", chunk.text);
-            io::stdout().flush().ok();
+            if !buffer_output {
+                print!("{}", chunk.text);
+                io::stdout().flush().ok();
+            }
             chunk_count += 1;
         }
         if let Some(token_id) = token_id {
@@ -1155,6 +1187,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         }
         maybe_warn_context_shift(&plan, format);
         let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
+        let model_output_protocol = plan.sampling_params.model_output_protocol;
         let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
         let prompt_chars = plan.prompt.chars().count();
         let request_id = RequestId(Uuid::new_v4());
@@ -1209,6 +1242,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     collect_run_stream(
                         stream,
                         trace_tokens,
+                        model_output_protocol == ModelOutputProtocol::HarmonyGptOss,
                         0,
                         &run_session_id,
                         0,
@@ -1280,7 +1314,8 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             )));
         }
         let raw_response = display_response_text(&raw_text);
-        let parsed = parse_reasoning_response_for_prompt(&raw_response, prompt_opened_thinking);
+        let parsed =
+            parse_run_model_output(model_output_protocol, &raw_response, prompt_opened_thinking)?;
         let content = display_response_text(&parsed.content);
         let reasoning = parsed
             .reasoning
@@ -1289,7 +1324,14 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             .filter(|value| !value.is_empty());
         let bench = cmd.bench_mode;
         if format == OutputFormat::Text && !bench {
-            print!("{}", raw_response);
+            print!(
+                "{}",
+                if model_output_protocol == ModelOutputProtocol::HarmonyGptOss {
+                    &content
+                } else {
+                    &raw_response
+                }
+            );
             io::stdout().flush().ok();
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -1466,6 +1508,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 )?;
                 maybe_warn_context_shift(&plan, format);
                 let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
+                let model_output_protocol = plan.sampling_params.model_output_protocol;
                 let observability_sampling_params =
                     product_memory_enabled.then(|| plan.sampling_params.clone());
                 let prompt_token_ids = plan.prompt_token_ids;
@@ -1538,6 +1581,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             collect_run_text_stream(
                                 stream,
                                 trace_tokens,
+                                model_output_protocol == ModelOutputProtocol::HarmonyGptOss,
                                 turn,
                                 &expected_request_id,
                                 stdin_is_tty,
@@ -1552,6 +1596,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             collect_run_stream(
                                 stream,
                                 trace_tokens,
+                                model_output_protocol == ModelOutputProtocol::HarmonyGptOss,
                                 turn,
                                 &run_session_id,
                                 history_epoch,
@@ -1622,22 +1667,24 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     )));
                 }
                 let raw_response = display_response_text(&raw_text);
-                let (clean_response, reasoning) = match format {
-                    OutputFormat::Text => (raw_response.clone(), None),
-                    OutputFormat::Jsonl => {
-                        let parsed = parse_reasoning_response_for_prompt(
-                            &raw_response,
-                            prompt_opened_thinking,
-                        );
-                        (
-                            display_response_text(&parsed.content),
-                            parsed
-                                .reasoning
-                                .map(|value| value.trim().to_string())
-                                .filter(|value| !value.is_empty()),
-                        )
-                    }
-                };
+                let parsed = parse_run_model_output(
+                    model_output_protocol,
+                    &raw_response,
+                    prompt_opened_thinking,
+                )?;
+                let clean_response = display_response_text(&parsed.content);
+                let reasoning = (format == OutputFormat::Jsonl)
+                    .then_some(parsed.reasoning)
+                    .flatten()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty());
+
+                if format == OutputFormat::Text
+                    && model_output_protocol == ModelOutputProtocol::HarmonyGptOss
+                {
+                    print!("{clean_response}");
+                    io::stdout().flush().ok();
+                }
 
                 let elapsed = start.elapsed();
                 let elapsed_s = elapsed.as_secs_f64();
@@ -2108,7 +2155,10 @@ fn build_run_prompt_plan(
     cmd: &RunCommand,
     budget: &RunBudget,
 ) -> Result<RunPromptPlan> {
-    let base_sampling = build_sampling_params(cmd);
+    let mut base_sampling = build_sampling_params(cmd);
+    base_sampling.model_output_protocol = model_template
+        .map(|template| template.output_protocol)
+        .unwrap_or(ModelOutputProtocol::Text);
 
     if cmd.no_context_shift {
         let prompt = build_chat_prompt(
@@ -3740,6 +3790,33 @@ mod tests {
     #[test]
     fn kv_budget_rejects_prompt_at_capacity() {
         assert!(!fits_kv_budget(&default_params(1), Some(2048), Some(2048)));
+    }
+
+    #[test]
+    fn gpt_oss_run_parses_harmony_without_exposing_control_markers() {
+        let parsed = parse_run_model_output(
+            ModelOutputProtocol::HarmonyGptOss,
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>final<|message|>Answer.<|return|>",
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.content, "Answer.");
+        assert_eq!(parsed.reasoning.as_deref(), Some("Reason."));
+        assert!(!parsed.content.contains("<|"));
+    }
+
+    #[test]
+    fn gpt_oss_run_rejects_harmony_tool_calls_without_a_tool_executor() {
+        let error = parse_run_model_output(
+            ModelOutputProtocol::HarmonyGptOss,
+            "<|channel|>analysis<|message|>Need weather.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.weather\
+             <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>",
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("has no tool executor"));
     }
 
     #[test]
