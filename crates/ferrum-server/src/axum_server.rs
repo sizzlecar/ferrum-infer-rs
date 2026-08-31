@@ -28,12 +28,12 @@ use ferrum_bench_core::{
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    has_unclosed_thinking_block, parse_reasoning_response,
+    has_unclosed_thinking_block, parse_harmony_response, parse_reasoning_response,
     parse_reasoning_response_started_in_think, EngineMetrics, EngineStatus, FerrumConfigBuilder,
     FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
-    InferenceRequest, InferenceResponse, ModelId, ParsedReasoningResponse, Priority,
-    ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler, ProfileEntrypoint,
-    ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
+    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, ParsedReasoningResponse,
+    Priority, ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler,
+    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
     ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
     RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
     DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
@@ -2328,6 +2328,63 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+struct ParsedChatModelOutput {
+    visible: ParsedReasoningResponse,
+    harmony_response: Option<ferrum_types::ApiChatResponse>,
+}
+
+fn parse_chat_model_output(
+    protocol: ModelOutputProtocol,
+    text: &str,
+    started_in_think: bool,
+) -> std::result::Result<ParsedChatModelOutput, ServerError> {
+    match protocol {
+        ModelOutputProtocol::Text => Ok(ParsedChatModelOutput {
+            visible: if started_in_think {
+                parse_reasoning_response_started_in_think(text)
+            } else {
+                parse_reasoning_response(text)
+            },
+            harmony_response: None,
+        }),
+        ModelOutputProtocol::HarmonyGptOss => {
+            let parsed = parse_harmony_response(text).map_err(|error| {
+                ServerError::InternalError(format!(
+                    "model output did not satisfy the GPT-OSS Harmony protocol: {error}"
+                ))
+            })?;
+            let harmony_response =
+                parsed
+                    .tool_call
+                    .map(|tool_call| ferrum_types::ApiChatResponse {
+                        message: ferrum_types::ApiChatMessage {
+                            role: ferrum_types::ApiMessageRole::Assistant,
+                            content: String::new(),
+                            name: None,
+                            tool_calls: vec![ferrum_types::ApiToolCall {
+                                id: format!("call_{}", Uuid::new_v4().simple()),
+                                tool_type: "function".to_string(),
+                                function: ferrum_types::ApiFunctionCall {
+                                    name: tool_call.name,
+                                    arguments: tool_call.arguments_json,
+                                },
+                            }],
+                            tool_call_id: None,
+                            function_call: None,
+                        },
+                        finish_reason: Some("tool_calls".to_string()),
+                    });
+            Ok(ParsedChatModelOutput {
+                visible: ParsedReasoningResponse {
+                    content: parsed.content,
+                    reasoning: parsed.reasoning_content,
+                },
+                harmony_response,
+            })
+        }
+    }
+}
+
 /// Handle streaming chat completions
 async fn handle_chat_completions_stream(
     state: AppState,
@@ -2366,9 +2423,11 @@ async fn handle_chat_completions_stream(
     };
     let buffer_structured_api_stream =
         ferrum_types::chat_api_may_emit_tool_or_function_call(&stream_api_request);
+    let model_output_protocol = inference_request.sampling_params.model_output_protocol;
     let buffer_stream_output = buffer_json_object_stream
         || buffer_strict_json_schema_stream
-        || buffer_structured_api_stream;
+        || buffer_structured_api_stream
+        || model_output_protocol == ModelOutputProtocol::HarmonyGptOss;
     // R1-distill-style templates open the think block inside the prompt;
     // the parser must know generation starts mid-think.
     let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
@@ -2528,11 +2587,24 @@ async fn handle_chat_completions_stream(
                             warn!("failed to write chat stream prompt-token evidence: {}", err);
                         }
                         let usage = chunk.usage.as_ref().map(openai_usage_from_token_usage);
-                        let mut parsed_final = if started_in_think {
-                            parse_reasoning_response_started_in_think(&current_text)
-                        } else {
-                            parse_reasoning_response(&current_text)
+                        let parsed_model_output = match parse_chat_model_output(
+                            model_output_protocol,
+                            &current_text,
+                            started_in_think,
+                        ) {
+                            Ok(parsed) => parsed,
+                            Err(error) => {
+                                let error_event = openai_error_sse_event(
+                                    stream_validation_error_message(error),
+                                    "internal_server_error",
+                                    Some("model_output"),
+                                );
+                                let _ = tx.send(Ok(error_event));
+                                let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                                break;
+                            }
                         };
+                        let mut parsed_final = parsed_model_output.visible;
                         parsed_final.content = normalize_structured_response_content(
                             &openai_request,
                             &parsed_final.content,
@@ -2542,6 +2614,9 @@ async fn handle_chat_completions_stream(
                                 .then(|| match chunk.api_response.as_ref() {
                                     Some(ferrum_types::ApiResponse::Chat(response)) => {
                                         Some(response.clone())
+                                    }
+                                    _ if parsed_model_output.harmony_response.is_some() => {
+                                        parsed_model_output.harmony_response.clone()
                                     }
                                     _ if buffer_structured_api_stream => {
                                         chat_api_response_from_parsed_generated_text(
@@ -2868,6 +2943,7 @@ async fn handle_chat_completions_sync(
             }
             _ => None,
         });
+    let model_output_protocol = inference_request.sampling_params.model_output_protocol;
     // R1-distill-style templates open the think block inside the prompt.
     let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
     let replay_request_id = inference_request.id.to_string();
@@ -2899,11 +2975,9 @@ async fn handle_chat_completions_sync(
             // here; malformed output must fail the response contract below.
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_after_stop(&output_text, &stop_sequences);
-            let parsed = if started_in_think {
-                parse_reasoning_response_started_in_think(&content)
-            } else {
-                parse_reasoning_response(&content)
-            };
+            let parsed_model_output =
+                parse_chat_model_output(model_output_protocol, &content, started_in_think)?;
+            let parsed = parsed_model_output.visible;
             let visible_content =
                 normalize_structured_response_content(&openai_request, &parsed.content);
             let mut message = ChatMessage {
@@ -2921,6 +2995,9 @@ async fn handle_chat_completions_sync(
                     .then(|| match api_response.as_ref() {
                         Some(ferrum_types::ApiResponse::Chat(chat_response)) => {
                             Some(chat_response.clone())
+                        }
+                        _ if parsed_model_output.harmony_response.is_some() => {
+                            parsed_model_output.harmony_response.clone()
                         }
                         _ => match request_chat_api.as_ref() {
                             Some(chat_request) => chat_api_response_from_parsed_generated_text(
@@ -5414,6 +5491,41 @@ mod tests {
             ),
             "KS0214Z\nS0225\n"
         );
+    }
+
+    #[test]
+    fn gpt_oss_harmony_final_is_split_into_reasoning_and_visible_content() {
+        let parsed = parse_chat_model_output(
+            ModelOutputProtocol::HarmonyGptOss,
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>final<|message|>Answer.<|return|>",
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.visible.content, "Answer.");
+        assert_eq!(parsed.visible.reasoning.as_deref(), Some("Reason."));
+        assert!(parsed.harmony_response.is_none());
+    }
+
+    #[test]
+    fn gpt_oss_harmony_tool_call_becomes_openai_structured_response() {
+        let parsed = parse_chat_model_output(
+            ModelOutputProtocol::HarmonyGptOss,
+            "<|channel|>analysis<|message|>Need weather.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.weather\
+             <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>",
+            false,
+        )
+        .unwrap();
+        let response = parsed.harmony_response.unwrap();
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(response.message.tool_calls.len(), 1);
+        assert_eq!(response.message.tool_calls[0].function.name, "weather");
+        assert_eq!(
+            response.message.tool_calls[0].function.arguments,
+            "{\"city\":\"Paris\"}"
+        );
+        assert!(response.message.tool_calls[0].id.starts_with("call_"));
     }
 
     #[tokio::test]
