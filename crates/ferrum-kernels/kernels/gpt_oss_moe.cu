@@ -203,16 +203,21 @@ extern "C" __global__ void gpt_oss_router_topk_selected_softmax_f16_single_token
 extern "C" __global__ void gpt_oss_clamped_swiglu_interleaved_bf16(
     const __nv_bfloat16* __restrict__ gate_up,
     __nv_bfloat16* __restrict__ output,
-    int intermediate_size,
+    int logical_intermediate_size,
+    int physical_intermediate_size,
     int64_t elements,
     float limit) {
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= elements) {
         return;
     }
-    const int64_t row = index / intermediate_size;
-    const int feature = static_cast<int>(index - row * intermediate_size);
-    const int64_t base = row * (2LL * intermediate_size) + 2LL * feature;
+    const int64_t row = index / physical_intermediate_size;
+    const int feature = static_cast<int>(index - row * physical_intermediate_size);
+    if (feature >= logical_intermediate_size) {
+        output[index] = __float2bfloat16(0.0f);
+        return;
+    }
+    const int64_t base = row * (2LL * logical_intermediate_size) + 2LL * feature;
     const float gate = fminf(__bfloat162float(gate_up[base]), limit);
     const float up = fminf(fmaxf(__bfloat162float(gate_up[base + 1]), -limit), limit);
     const float glu = gate / (1.0f + expf(-1.702f * gate));

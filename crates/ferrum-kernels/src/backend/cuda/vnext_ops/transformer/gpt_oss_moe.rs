@@ -41,8 +41,8 @@ use super::super::{binding, contract_error, implementation_fingerprint, same_phy
 use super::moe::{checked_i32, invalid_plan, MarlinMoeWorkspacePointers, MoeRoutingPlan};
 use super::moe_launch::{region_pointer, zero_region, MoeCudaKernels};
 use super::moe_workspace::{
-    routed_workspace_formula_terms, MoeWorkspaceLayout, MAX_ROUTER_EXPERTS, MAX_ROUTER_TOP_K,
-    MOE_BLOCK_SIZE,
+    routed_workspace_formula_terms_with_activation_width, MoeWorkspaceLayout, MAX_ROUTER_EXPERTS,
+    MAX_ROUTER_TOP_K, MOE_BLOCK_SIZE,
 };
 use super::{
     contiguous_bindings, ensure_estimator_request, estimate, f16_contiguous, shared_full_region,
@@ -58,6 +58,7 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.gpt_oss.routed_clamped_swigl
 const COMMAND_NAME: &str = "vnext_gpt_oss_routed_clamped_swiglu_moe";
 const VALUE_ALIGNMENT_BYTES: u64 = 16;
 const MXFP4_GROUP_SIZE: u64 = 32;
+const MARLIN_DOWN_K_ALIGNMENT: u64 = 128;
 const THREADS_PER_BLOCK: u32 = 256;
 const F16_TO_BF16_FUNCTION: &str = "gpt_oss_f16_to_bf16";
 const ROUTER_LOGITS_FUNCTION: &str = "gpt_oss_router_logits_f16_bf16";
@@ -125,6 +126,10 @@ impl GptOssMoeAttributes {
         }
         Ok(())
     }
+
+    fn marlin_intermediate_size(self) -> Result<u64, String> {
+        align_up_to(self.intermediate_size, MARLIN_DOWN_K_ALIGNMENT)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +139,7 @@ struct GptOssMoeLaunchShape {
     experts_per_token: i32,
     hidden_size: i32,
     intermediate_size: i32,
+    marlin_intermediate_size: i32,
     gate_up_features: i32,
     pair_count: i32,
     sorted_capacity: i32,
@@ -159,6 +165,10 @@ impl GptOssMoeLaunchShape {
                 attributes.intermediate_size,
                 "GPT-OSS MoE intermediate size",
             )?,
+            marlin_intermediate_size: checked_i32(
+                layout.marlin_intermediate_size,
+                "GPT-OSS MoE Marlin intermediate size",
+            )?,
             gate_up_features: checked_i32(
                 attributes.gate_up_features,
                 "GPT-OSS MoE gate/up features",
@@ -175,7 +185,7 @@ impl GptOssMoeLaunchShape {
     fn activation_elements(self) -> Result<u64, CudaDeviceRuntimeError> {
         u64::try_from(self.pair_count)
             .ok()
-            .and_then(|pairs| pairs.checked_mul(self.intermediate_size as u64))
+            .and_then(|pairs| pairs.checked_mul(self.marlin_intermediate_size as u64))
             .ok_or_else(|| {
                 CudaDeviceRuntimeError::contract(
                     "GPT-OSS MoE activation element count overflows u64",
@@ -342,6 +352,7 @@ impl GptOssMoeKernels {
         builder.arg(&gate_up);
         builder.arg(&output);
         builder.arg(&shape.intermediate_size);
+        builder.arg(&shape.marlin_intermediate_size);
         builder.arg(&elements_i64);
         builder.arg(&limit);
         unsafe {
@@ -496,11 +507,15 @@ impl OperationResourceEstimator for CudaGptOssRoutedClampedSwiGluMoeProvider {
         )?;
         let attributes =
             GptOssMoeAttributes::from_values(request.attributes()).map_err(invalid_plan)?;
+        let marlin_intermediate_size = attributes
+            .marlin_intermediate_size()
+            .map_err(invalid_plan)?;
         let (fixed_bytes, bytes_per_token) = gpt_oss_workspace_formula_terms(
             attributes.expert_count,
             attributes.experts_per_token,
             attributes.hidden_size,
             attributes.intermediate_size,
+            marlin_intermediate_size,
             self.multiprocessor_count,
         )
         .map_err(invalid_plan)?;
@@ -591,8 +606,16 @@ fn encode_gpt_oss_moe(
         attributes.hidden_size,
         attributes.intermediate_size,
     ];
-    let gate_up = resolve_shared_mxfp4_weight(&invocation, 3, &gate_up_dimensions)?;
-    let down = resolve_shared_mxfp4_weight(&invocation, 5, &down_dimensions)?;
+    let marlin_intermediate_size = attributes.marlin_intermediate_size()?;
+    let down_execution_dimensions = vec![
+        attributes.expert_count,
+        attributes.hidden_size,
+        marlin_intermediate_size,
+    ];
+    let gate_up =
+        resolve_shared_mxfp4_weight(&invocation, 3, &gate_up_dimensions, &gate_up_dimensions)?;
+    let down =
+        resolve_shared_mxfp4_weight(&invocation, 5, &down_dimensions, &down_execution_dimensions)?;
     if gate_up.expert_count != attributes.expert_count
         || down.expert_count != attributes.expert_count
     {
@@ -605,14 +628,17 @@ fn encode_gpt_oss_moe(
         attributes.experts_per_token,
         attributes.hidden_size,
         attributes.intermediate_size,
+        marlin_intermediate_size,
         multiprocessor_count,
     )?;
     let shape = GptOssMoeLaunchShape::from_layout(attributes, tokens, &layout, device_ordinal)?;
     validate_launch_problem(
         shape,
         &gate_up.logical_dimensions,
+        &gate_up.execution_dimensions,
         gate_up.group_size,
         &down.logical_dimensions,
+        &down.execution_dimensions,
         down.group_size,
     )?;
     let routing_plan = MoeRoutingPlan::for_tokens(shape.tokens);
@@ -647,6 +673,7 @@ fn encode_gpt_oss_moe(
         .i32(shape.experts_per_token)
         .i32(shape.hidden_size)
         .i32(shape.intermediate_size)
+        .i32(shape.marlin_intermediate_size)
         .i32(shape.gate_up_features)
         .i32(gate_up.group_size)
         .i32(down.group_size)
@@ -734,7 +761,7 @@ fn encode_gpt_oss_moe(
                 shape.pair_count,
                 1,
                 shape.hidden_size,
-                shape.intermediate_size,
+                shape.marlin_intermediate_size,
                 down.group_size,
                 shape.device_ordinal,
             )?;
@@ -875,8 +902,10 @@ struct CudaMxfp4MoeWeight {
     packed_region: CudaBufferRegion,
     scales_region: CudaBufferRegion,
     logical_dimensions: Vec<u64>,
-    packed_dimensions: Vec<u64>,
-    scales_dimensions: Vec<u64>,
+    execution_dimensions: Vec<u64>,
+    semantic_packed_dimensions: Vec<u64>,
+    physical_packed_dimensions: Vec<u64>,
+    physical_scales_dimensions: Vec<u64>,
     expert_count: u64,
     group_size: i32,
 }
@@ -885,17 +914,20 @@ fn resolve_shared_mxfp4_weight(
     invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ordinal: u32,
     logical_dimensions: &[u64],
+    execution_dimensions: &[u64],
 ) -> Result<CudaMxfp4MoeWeight, String> {
     let resolve = |participant: &OperationInvocation<'_, CudaDeviceBuffer>| {
         let value = binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
-        resolve_mxfp4_weight(participant, value, logical_dimensions)
+        resolve_mxfp4_weight(participant, value, logical_dimensions, execution_dimensions)
     };
     let resolved = resolve(&invocation.participants()[0])?;
     for participant in &invocation.participants()[1..] {
         let candidate = resolve(participant)?;
         if resolved.logical_dimensions != candidate.logical_dimensions
-            || resolved.packed_dimensions != candidate.packed_dimensions
-            || resolved.scales_dimensions != candidate.scales_dimensions
+            || resolved.execution_dimensions != candidate.execution_dimensions
+            || resolved.semantic_packed_dimensions != candidate.semantic_packed_dimensions
+            || resolved.physical_packed_dimensions != candidate.physical_packed_dimensions
+            || resolved.physical_scales_dimensions != candidate.physical_scales_dimensions
             || resolved.expert_count != candidate.expert_count
             || resolved.group_size != candidate.group_size
             || !same_physical_region(&resolved.packed_region, &candidate.packed_region)
@@ -913,18 +945,28 @@ fn resolve_mxfp4_weight(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     binding: &ResolvedValueBinding,
     logical_dimensions: &[u64],
+    execution_dimensions: &[u64],
 ) -> Result<CudaMxfp4MoeWeight, String> {
     let [expert_count, output_features, input_features] = logical_dimensions else {
         return Err("GPT-OSS MXFP4 expert weight must have shape [E,N,K]".to_owned());
+    };
+    let [execution_experts, execution_output_features, execution_input_features] =
+        execution_dimensions
+    else {
+        return Err("GPT-OSS MXFP4 execution weight must have shape [E,N,K]".to_owned());
     };
     if *expert_count == 0
         || *output_features == 0
         || *input_features == 0
         || !output_features.is_multiple_of(64)
         || !input_features.is_multiple_of(64)
+        || execution_experts != expert_count
+        || execution_output_features != output_features
+        || execution_input_features < input_features
+        || !execution_input_features.is_multiple_of(64)
     {
         return Err(format!(
-            "GPT-OSS MXFP4 expert shape {logical_dimensions:?} violates Marlin tiles"
+            "GPT-OSS MXFP4 logical {logical_dimensions:?} / execution {execution_dimensions:?} shape violates Marlin tiles"
         ));
     }
     if binding.tensor().dimensions() != logical_dimensions
@@ -960,12 +1002,10 @@ fn resolve_mxfp4_weight(
         || codebook.is_some()
         || *group_axis != 2
         || !matches!(group_padding, PhysicalWeightPadding::Exact)
-        || !is_exact_contiguous(&packed_values.storage)
-        || !is_exact_contiguous(&scales.storage)
         || packed_values.component_id == scales.component_id
     {
         return Err(
-            "GPT-OSS MXFP4 physical layout must be exact contiguous group-32 without auxiliary components"
+            "GPT-OSS MXFP4 physical layout must be contiguous group-32 with typed execution padding and no auxiliary components"
                 .to_owned(),
         );
     }
@@ -1015,22 +1055,42 @@ fn resolve_mxfp4_weight(
     {
         return Err("GPT-OSS expert components are not tiled E2M1/E8M0 group-32 MXFP4".to_owned());
     }
-    let expected_packed = vec![*expert_count, *output_features, *input_features / 2];
-    let expected_scales = vec![
+    let expected_semantic_packed = vec![*expert_count, *output_features, *input_features / 2];
+    let expected_physical_packed = vec![
+        *expert_count,
+        *output_features,
+        *execution_input_features / 2,
+    ];
+    let expected_semantic_scales = vec![
         *expert_count,
         *output_features,
         *input_features / MXFP4_GROUP_SIZE,
     ];
-    if packed_dimensions != &expected_packed
-        || packed_component.physical_dimensions() != expected_packed
-        || scales_component.physical_dimensions() != expected_scales
+    let expected_physical_scales = vec![
+        *expert_count,
+        *output_features,
+        *execution_input_features / MXFP4_GROUP_SIZE,
+    ];
+    if packed_dimensions != &expected_semantic_packed
+        || packed_component.physical_dimensions() != expected_physical_packed
+        || scales_component.physical_dimensions() != expected_physical_scales
+        || !matches_execution_storage(
+            &packed_values.storage,
+            &expected_semantic_packed,
+            &expected_physical_packed,
+        )
+        || !matches_execution_storage(
+            &scales.storage,
+            &expected_semantic_scales,
+            &expected_physical_scales,
+        )
     {
         return Err(format!(
-            "GPT-OSS MXFP4 physical shapes must be packed={expected_packed:?}, scales={expected_scales:?}"
+            "GPT-OSS MXFP4 physical shapes must preserve semantic packed={expected_semantic_packed:?}, scales={expected_semantic_scales:?} and use execution packed={expected_physical_packed:?}, scales={expected_physical_scales:?}"
         ));
     }
-    let packed_bytes = checked_product(&expected_packed, "GPT-OSS packed bytes")?;
-    let scales_bytes = checked_product(&expected_scales, "GPT-OSS scale bytes")?;
+    let packed_bytes = checked_product(&expected_physical_packed, "GPT-OSS packed bytes")?;
+    let scales_bytes = checked_product(&expected_physical_scales, "GPT-OSS scale bytes")?;
     if packed_component
         .physical_bytes()
         .map_err(|error| error.to_string())?
@@ -1062,8 +1122,10 @@ fn resolve_mxfp4_weight(
         packed_region,
         scales_region,
         logical_dimensions: logical_dimensions.to_vec(),
-        packed_dimensions: expected_packed,
-        scales_dimensions: expected_scales,
+        execution_dimensions: execution_dimensions.to_vec(),
+        semantic_packed_dimensions: expected_semantic_packed,
+        physical_packed_dimensions: expected_physical_packed,
+        physical_scales_dimensions: expected_physical_scales,
         expert_count: *expert_count,
         group_size: MXFP4_GROUP_SIZE as i32,
     })
@@ -1148,13 +1210,20 @@ fn retain_component_region(
     Ok(region)
 }
 
-fn is_exact_contiguous(storage: &PhysicalStorageLayout) -> bool {
-    matches!(
-        storage,
+fn matches_execution_storage(
+    storage: &PhysicalStorageLayout,
+    semantic_dimensions: &[u64],
+    physical_dimensions: &[u64],
+) -> bool {
+    match storage {
         PhysicalStorageLayout::Contiguous {
-            padding: PhysicalWeightPadding::Exact
-        }
-    )
+            padding: PhysicalWeightPadding::Exact,
+        } => semantic_dimensions == physical_dimensions,
+        PhysicalStorageLayout::Contiguous {
+            padding: PhysicalWeightPadding::ZeroFill { padded_dimensions },
+        } => semantic_dimensions != physical_dimensions && padded_dimensions == physical_dimensions,
+        PhysicalStorageLayout::Strided { .. } | PhysicalStorageLayout::Tiled { .. } => false,
+    }
 }
 
 fn checked_product(dimensions: &[u64], label: &str) -> Result<u64, String> {
@@ -1167,6 +1236,7 @@ fn checked_product(dimensions: &[u64], label: &str) -> Result<u64, String> {
 #[derive(Debug, Clone)]
 struct GptOssMoeWorkspaceLayout {
     base: MoeWorkspaceLayout,
+    marlin_intermediate_size: u64,
     input_bf16_offset: u64,
     input_bf16_bytes: u64,
     total_bytes: u64,
@@ -1180,14 +1250,23 @@ impl GptOssMoeWorkspaceLayout {
         experts_per_token: u64,
         hidden_size: u64,
         intermediate_size: u64,
+        marlin_intermediate_size: u64,
         multiprocessor_count: u64,
     ) -> Result<Self, String> {
-        let base = MoeWorkspaceLayout::routed_only(
+        let expected_marlin_intermediate_size =
+            align_up_to(intermediate_size, MARLIN_DOWN_K_ALIGNMENT)?;
+        if marlin_intermediate_size != expected_marlin_intermediate_size {
+            return Err(format!(
+                "GPT-OSS Marlin intermediate width {marlin_intermediate_size} is not canonical padding of {intermediate_size} to {MARLIN_DOWN_K_ALIGNMENT}"
+            ));
+        }
+        let base = MoeWorkspaceLayout::routed_only_with_activation_width(
             tokens,
             expert_count,
             experts_per_token,
             hidden_size,
             intermediate_size,
+            marlin_intermediate_size,
             multiprocessor_count,
         )?;
         let input_bf16_bytes = tokens
@@ -1209,6 +1288,7 @@ impl GptOssMoeWorkspaceLayout {
             experts_per_token,
             hidden_size,
             intermediate_size,
+            marlin_intermediate_size,
             multiprocessor_count,
         )?;
         let admitted = fixed
@@ -1225,6 +1305,7 @@ impl GptOssMoeWorkspaceLayout {
         }
         Ok(Self {
             base,
+            marlin_intermediate_size,
             input_bf16_offset,
             input_bf16_bytes,
             total_bytes,
@@ -1237,13 +1318,22 @@ fn gpt_oss_workspace_formula_terms(
     experts_per_token: u64,
     hidden_size: u64,
     intermediate_size: u64,
+    marlin_intermediate_size: u64,
     multiprocessor_count: u64,
 ) -> Result<(u64, u64), String> {
-    let (fixed, per_token) = routed_workspace_formula_terms(
+    let expected_marlin_intermediate_size =
+        align_up_to(intermediate_size, MARLIN_DOWN_K_ALIGNMENT)?;
+    if marlin_intermediate_size != expected_marlin_intermediate_size {
+        return Err(format!(
+            "GPT-OSS workspace estimator received non-canonical Marlin width {marlin_intermediate_size} for logical width {intermediate_size}"
+        ));
+    }
+    let (fixed, per_token) = routed_workspace_formula_terms_with_activation_width(
         expert_count,
         experts_per_token,
         hidden_size,
         intermediate_size,
+        marlin_intermediate_size,
         multiprocessor_count,
     )?;
     let input_bf16_per_token = hidden_size
@@ -1317,8 +1407,10 @@ impl GptOssMoeWorkspacePointers {
 fn validate_launch_problem(
     shape: GptOssMoeLaunchShape,
     gate_up_dimensions: &[u64],
+    gate_up_execution_dimensions: &[u64],
     gate_up_group_size: i32,
     down_dimensions: &[u64],
+    down_execution_dimensions: &[u64],
     down_group_size: i32,
 ) -> Result<(), String> {
     if gate_up_group_size != MXFP4_GROUP_SIZE as i32
@@ -1329,11 +1421,18 @@ fn validate_launch_problem(
                 shape.gate_up_features as u64,
                 shape.hidden_size as u64,
             ]
+        || gate_up_execution_dimensions != gate_up_dimensions
         || down_dimensions
             != [
                 shape.expert_count as u64,
                 shape.hidden_size as u64,
                 shape.intermediate_size as u64,
+            ]
+        || down_execution_dimensions
+            != [
+                shape.expert_count as u64,
+                shape.hidden_size as u64,
+                shape.marlin_intermediate_size as u64,
             ]
         || shape.tokens <= 0
         || shape.pair_count
@@ -1409,6 +1508,16 @@ fn require_rational(
 fn checked_i64_runtime(value: u64, label: &str) -> Result<i64, CudaDeviceRuntimeError> {
     i64::try_from(value)
         .map_err(|_| CudaDeviceRuntimeError::contract(format!("{label} exceeds i64")))
+}
+
+fn align_up_to(value: u64, alignment: u64) -> Result<u64, String> {
+    if value == 0 || alignment == 0 || !alignment.is_power_of_two() {
+        return Err("GPT-OSS Marlin alignment requires nonzero power-of-two geometry".to_owned());
+    }
+    value
+        .checked_add(alignment - 1)
+        .map(|rounded| rounded / alignment * alignment)
+        .ok_or_else(|| "GPT-OSS Marlin alignment overflows u64".to_owned())
 }
 
 fn checked_grid(elements: u64, label: &str) -> Result<u32, CudaDeviceRuntimeError> {
@@ -1487,12 +1596,28 @@ mod tests {
 
     #[test]
     fn gpt_oss_workspace_adds_only_the_typed_bf16_input_copy() {
-        let base = MoeWorkspaceLayout::routed_only(8, 32, 4, 2880, 2880, 46).unwrap();
-        let layout = GptOssMoeWorkspaceLayout::new(8, 32, 4, 2880, 2880, 46).unwrap();
+        let base =
+            MoeWorkspaceLayout::routed_only_with_activation_width(8, 32, 4, 2880, 2880, 2944, 46)
+                .unwrap();
+        let layout = GptOssMoeWorkspaceLayout::new(8, 32, 4, 2880, 2880, 2944, 46).unwrap();
         assert_eq!(layout.input_bf16_offset, base.total_bytes);
         assert_eq!(layout.input_bf16_bytes, 8 * 2880 * 2);
         assert_eq!(layout.total_bytes, base.total_bytes + 8 * 2880 * 2);
+        assert_eq!(layout.marlin_intermediate_size, 2944);
+        assert_eq!(layout.base.routed_gate_up.length_bytes(), 8 * 4 * 5760 * 2);
+        assert_eq!(
+            layout.base.routed_activation.length_bytes(),
+            8 * 4 * 2944 * 2
+        );
         assert!(layout.total_bytes.is_multiple_of(VALUE_ALIGNMENT_BYTES));
+    }
+
+    #[test]
+    fn official_down_width_uses_minimal_marlin_k_padding() {
+        let attributes = GptOssMoeAttributes::from_values(&official_attributes()).unwrap();
+        assert_eq!(attributes.marlin_intermediate_size().unwrap(), 2944);
+        assert_eq!(align_up_to(2944, MARLIN_DOWN_K_ALIGNMENT).unwrap(), 2944);
+        assert!(GptOssMoeWorkspaceLayout::new(1, 32, 4, 2880, 2880, 2880, 46).is_err());
     }
 
     #[test]
@@ -1512,6 +1637,7 @@ mod tests {
             experts_per_token: 4,
             hidden_size: 2880,
             intermediate_size: 2880,
+            marlin_intermediate_size: 2944,
             gate_up_features: 5760,
             pair_count: 32,
             sorted_capacity: 544,
@@ -1519,18 +1645,41 @@ mod tests {
         };
         let gate_up = [32, 5760, 2880];
         let down = [32, 2880, 2880];
-        validate_launch_problem(valid, &gate_up, 32, &down, 32).unwrap();
+        let down_execution = [32, 2880, 2944];
+        validate_launch_problem(valid, &gate_up, &gate_up, 32, &down, &down_execution, 32).unwrap();
 
         let mut bad_pairs = valid;
         bad_pairs.pair_count = 31;
-        assert!(validate_launch_problem(bad_pairs, &gate_up, 32, &down, 32).is_err());
-        assert!(validate_launch_problem(valid, &gate_up, 64, &down, 32).is_err());
-        assert!(validate_launch_problem(valid, &[32, 2880, 2880], 32, &down, 32).is_err());
+        assert!(validate_launch_problem(
+            bad_pairs,
+            &gate_up,
+            &gate_up,
+            32,
+            &down,
+            &down_execution,
+            32,
+        )
+        .is_err());
+        assert!(
+            validate_launch_problem(valid, &gate_up, &gate_up, 64, &down, &down_execution, 32,)
+                .is_err()
+        );
+        assert!(validate_launch_problem(
+            valid,
+            &[32, 2880, 2880],
+            &gate_up,
+            32,
+            &down,
+            &down_execution,
+            32,
+        )
+        .is_err());
+        assert!(validate_launch_problem(valid, &gate_up, &gate_up, 32, &down, &down, 32,).is_err());
     }
 
     #[test]
     fn workspace_pointer_translation_rejects_address_overflow() {
-        let layout = GptOssMoeWorkspaceLayout::new(8, 32, 4, 2880, 2880, 46).unwrap();
+        let layout = GptOssMoeWorkspaceLayout::new(8, 32, 4, 2880, 2880, 2944, 46).unwrap();
         assert!(GptOssMoeWorkspacePointers::new(u64::MAX - 8, &layout).is_err());
     }
 

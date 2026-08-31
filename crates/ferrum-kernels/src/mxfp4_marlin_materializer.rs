@@ -43,6 +43,7 @@ const SOURCE_SCHEMA_VERSION: ContractVersion = ContractVersion::new(1, 0);
 const MXFP4_GROUP_SIZE: usize = 32;
 const MXFP4_PACKED_BYTES_PER_GROUP: usize = 16;
 const MARLIN_OUTPUT_TILE: usize = 64;
+const MARLIN_WIDE_TILE: u64 = 128;
 const DERIVED_COMPONENT_PREFIX: &str = "component.execution.gpt-oss-mxfp4-marlin";
 
 pub fn gpt_oss_mxfp4_to_marlin_weight_materializer(
@@ -182,6 +183,7 @@ impl WeightMaterializer for GptOssMxfp4ToMarlinWeightMaterializer {
                     packed_values_id: descriptor.packed_values_id,
                     scales_id: descriptor.scales_id,
                     logical_dimensions: descriptor.logical_dimensions,
+                    execution_dimensions: descriptor.execution_dimensions,
                 })
             })
             .collect()
@@ -215,6 +217,7 @@ pub(crate) struct Mxfp4MarlinTransformDescriptor {
     pub(crate) packed_values_id: WeightId,
     pub(crate) scales_id: WeightId,
     pub(crate) logical_dimensions: Vec<u64>,
+    pub(crate) execution_dimensions: Vec<u64>,
 }
 
 /// Exact fields needed by the pending typed static-device transform plan.
@@ -240,19 +243,32 @@ struct Mxfp4MarlinCandidate {
     source_blocks_id: WeightId,
     source_scales_id: WeightId,
     logical_dimensions: Vec<u64>,
+    execution_dimensions: Vec<u64>,
     packed_component: WeightComponentSpec,
     scales_component: WeightComponentSpec,
 }
 
 impl Mxfp4MarlinCandidate {
     fn execution_layout(&self) -> PhysicalWeightLayout {
+        let [experts, rows, logical_columns] = self.logical_dimensions.as_slice() else {
+            unreachable!("validated MXFP4 candidate has [E,N,K] logical dimensions")
+        };
+        let [_, _, _] = self.execution_dimensions.as_slice() else {
+            unreachable!("validated MXFP4 candidate has [E,N,K] execution dimensions")
+        };
+        let logical_packed_dimensions = vec![*experts, *rows, logical_columns / 2];
+        let logical_scale_dimensions = vec![*experts, *rows, logical_columns / 32];
         PhysicalWeightLayout::Quantized {
-            packed_values: PhysicalWeightComponentBinding::exact_contiguous(
+            packed_values: execution_component_binding(
                 self.packed_component.id.clone(),
+                &logical_packed_dimensions,
+                &self.packed_component.dimensions,
             ),
-            packed_dimensions: self.packed_component.dimensions.clone(),
-            scales: PhysicalWeightComponentBinding::exact_contiguous(
+            packed_dimensions: logical_packed_dimensions,
+            scales: execution_component_binding(
                 self.scales_component.id.clone(),
+                &logical_scale_dimensions,
+                &self.scales_component.dimensions,
             ),
             zero_points: None,
             zero_point_packed_dimensions: None,
@@ -271,7 +287,26 @@ impl Mxfp4MarlinCandidate {
             packed_values_id: self.packed_component.id.clone(),
             scales_id: self.scales_component.id.clone(),
             logical_dimensions: self.logical_dimensions.clone(),
+            execution_dimensions: self.execution_dimensions.clone(),
         }
+    }
+}
+
+fn execution_component_binding(
+    component_id: WeightId,
+    logical_dimensions: &[u64],
+    physical_dimensions: &[u64],
+) -> PhysicalWeightComponentBinding {
+    let padding = if logical_dimensions == physical_dimensions {
+        PhysicalWeightPadding::Exact
+    } else {
+        PhysicalWeightPadding::ZeroFill {
+            padded_dimensions: physical_dimensions.to_vec(),
+        }
+    };
+    PhysicalWeightComponentBinding {
+        component_id,
+        storage: PhysicalStorageLayout::Contiguous { padding },
     }
 }
 
@@ -468,6 +503,15 @@ fn candidate_from_source_pair(
         .checked_mul(MXFP4_GROUP_SIZE as u64)
         .ok_or_else(|| invalid_plan("GPT-OSS MXFP4 input width overflows u64"))?;
     let logical_dimensions = vec![*experts, *rows, columns];
+    let execution_columns =
+        if rows.is_multiple_of(MARLIN_WIDE_TILE) || columns.is_multiple_of(MARLIN_WIDE_TILE) {
+            columns
+        } else {
+            columns
+                .checked_add(MARLIN_OUTPUT_TILE as u64)
+                .ok_or_else(|| invalid_plan("GPT-OSS MXFP4 execution width overflows u64"))?
+        };
+    let execution_dimensions = vec![*experts, *rows, execution_columns];
     let packed_id = derived_component_id(source_blocks, source_scales, DerivedKind::Packed)?;
     let scales_id = derived_component_id(source_blocks, source_scales, DerivedKind::Scales)?;
     let required = source_blocks.required && source_scales.required;
@@ -478,6 +522,7 @@ fn candidate_from_source_pair(
         source_blocks_id: source_blocks.id.clone(),
         source_scales_id: source_scales.id.clone(),
         logical_dimensions,
+        execution_dimensions,
         packed_component: WeightComponentSpec {
             id: packed_id,
             role: WeightComponentRole::PackedValues,
@@ -486,7 +531,7 @@ fn candidate_from_source_pair(
                 source_scales,
                 DerivedKind::Packed,
             )],
-            dimensions: vec![*experts, *rows, columns / 2],
+            dimensions: vec![*experts, *rows, execution_columns / 2],
             encoding: WeightEncoding::Quantized(quantization),
             required,
         },
@@ -498,7 +543,7 @@ fn candidate_from_source_pair(
                 source_scales,
                 DerivedKind::Scales,
             )],
-            dimensions: vec![*experts, *rows, *groups],
+            dimensions: vec![*experts, *rows, execution_columns / MXFP4_GROUP_SIZE as u64],
             encoding: WeightEncoding::Dense {
                 element_type: ElementType::U8,
             },
@@ -755,7 +800,9 @@ mod tests {
         }
     }
 
-    fn source_schema() -> WeightSchema {
+    fn source_schema_with_shape(rows: u64, columns: u64) -> WeightSchema {
+        assert!(rows.is_multiple_of(64));
+        assert!(columns.is_multiple_of(64));
         let dense_id = WeightId::new("component.test.router").unwrap();
         let blocks_id = WeightId::new("component.test.experts.blocks").unwrap();
         let scales_id = WeightId::new("component.test.experts.scales").unwrap();
@@ -780,7 +827,7 @@ mod tests {
                     external_names: vec![
                         "model.layers.0.mlp.experts.gate_up_proj_blocks".to_owned()
                     ],
-                    dimensions: vec![2, 64, 2, 16],
+                    dimensions: vec![2, rows, columns / 32, 16],
                     encoding: WeightEncoding::Quantized(source_quantization()),
                     required: true,
                 },
@@ -790,7 +837,7 @@ mod tests {
                     external_names: vec![
                         "model.layers.0.mlp.experts.gate_up_proj_scales".to_owned()
                     ],
-                    dimensions: vec![2, 64, 2],
+                    dimensions: vec![2, rows, columns / 32],
                     encoding: WeightEncoding::Dense {
                         element_type: ElementType::U8,
                     },
@@ -809,11 +856,11 @@ mod tests {
                 },
                 WeightTensorSpec {
                     id: WeightId::new("weight.layer.0.routed_gate_up").unwrap(),
-                    dimensions: vec![2, 64, 64],
+                    dimensions: vec![2, rows, columns],
                     logical_element_type: ElementType::Bf16,
                     physical_layout: PhysicalWeightLayout::Quantized {
                         packed_values: PhysicalWeightComponentBinding::exact_contiguous(blocks_id),
-                        packed_dimensions: vec![2, 64, 2, 16],
+                        packed_dimensions: vec![2, rows, columns / 32, 16],
                         scales: PhysicalWeightComponentBinding::exact_contiguous(scales_id),
                         zero_points: None,
                         zero_point_packed_dimensions: None,
@@ -829,6 +876,10 @@ mod tests {
         };
         schema.validate(&family_id()).unwrap();
         schema
+    }
+
+    fn source_schema() -> WeightSchema {
+        source_schema_with_shape(64, 64)
     }
 
     #[test]
@@ -887,8 +938,8 @@ mod tests {
             .iter()
             .find(|component| component.role == WeightComponentRole::Scales)
             .unwrap();
-        assert_eq!(packed.dimensions, [2, 64, 32]);
-        assert_eq!(scales.dimensions, [2, 64, 2]);
+        assert_eq!(packed.dimensions, [2, 64, 64]);
+        assert_eq!(scales.dimensions, [2, 64, 4]);
         let WeightEncoding::Quantized(quantization) = &packed.encoding else {
             panic!("Marlin packed component must retain typed quantization")
         };
@@ -905,6 +956,7 @@ mod tests {
         let candidate = collect_candidates(&source).unwrap().pop().unwrap();
         let transform = candidate.transform_descriptor();
         assert_eq!(transform.logical_dimensions, [2, 64, 64]);
+        assert_eq!(transform.execution_dimensions, [2, 64, 128]);
         assert_eq!(
             transform.source_blocks_id.as_str(),
             "component.test.experts.blocks"
@@ -921,10 +973,68 @@ mod tests {
             packed_values_id: transform.packed_values_id,
             scales_id: transform.scales_id,
             logical_dimensions: transform.logical_dimensions,
+            execution_dimensions: transform.execution_dimensions,
         };
         assert_eq!(plan.logical_dimensions(), [2, 64, 64]);
+        assert_eq!(plan.execution_dimensions(), [2, 64, 128]);
         assert_eq!(plan.matrices_per_output(), 1);
-        assert_eq!(plan.scratch_bytes().unwrap(), 64 * 64 / 2);
+        assert_eq!(plan.scratch_bytes().unwrap(), 64 * 128 / 2);
+    }
+
+    #[test]
+    fn official_2880_down_projection_has_explicit_minimal_marlin_k_padding() {
+        let source = source_schema_with_shape(2880, 2880);
+        let execution = derive_execution_schema(&source, &family_id()).unwrap();
+        execution.validate(&family_id()).unwrap();
+
+        let tensor = execution
+            .tensors
+            .iter()
+            .find(|tensor| tensor.id.as_str() == "weight.layer.0.routed_gate_up")
+            .unwrap();
+        assert_eq!(tensor.dimensions, [2, 2880, 2880]);
+        let PhysicalWeightLayout::Quantized {
+            packed_values,
+            packed_dimensions,
+            scales,
+            group_padding,
+            ..
+        } = &tensor.physical_layout
+        else {
+            panic!("MXFP4 execution tensor must stay quantized")
+        };
+        assert_eq!(packed_dimensions, &[2, 2880, 1440]);
+        assert_eq!(group_padding, &PhysicalWeightPadding::Exact);
+        assert_eq!(
+            packed_values.storage,
+            PhysicalStorageLayout::Contiguous {
+                padding: PhysicalWeightPadding::ZeroFill {
+                    padded_dimensions: vec![2, 2880, 1472],
+                },
+            }
+        );
+        assert_eq!(
+            scales.storage,
+            PhysicalStorageLayout::Contiguous {
+                padding: PhysicalWeightPadding::ZeroFill {
+                    padded_dimensions: vec![2, 2880, 92],
+                },
+            }
+        );
+
+        let candidate = collect_candidates(&source).unwrap().pop().unwrap();
+        let transform = candidate.transform_descriptor();
+        assert_eq!(transform.logical_dimensions, [2, 2880, 2880]);
+        assert_eq!(transform.execution_dimensions, [2, 2880, 2944]);
+        let plan = StaticWeightTransformPlan::GptOssMxfp4ToMarlin {
+            source_blocks_id: transform.source_blocks_id,
+            source_scales_id: transform.source_scales_id,
+            packed_values_id: transform.packed_values_id,
+            scales_id: transform.scales_id,
+            logical_dimensions: transform.logical_dimensions,
+            execution_dimensions: transform.execution_dimensions,
+        };
+        assert_eq!(plan.scratch_bytes().unwrap(), 2880 * 2944 / 2);
     }
 
     #[test]

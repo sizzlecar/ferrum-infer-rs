@@ -208,6 +208,7 @@ pub enum StaticWeightTransformPlan {
         packed_values_id: WeightId,
         scales_id: WeightId,
         logical_dimensions: Vec<u64>,
+        execution_dimensions: Vec<u64>,
     },
 }
 
@@ -253,6 +254,21 @@ impl StaticWeightTransformPlan {
         }
     }
 
+    /// Matrix dimensions consumed by the native execution kernel after any
+    /// explicitly typed cold-path padding. Block-FP8 transforms are exact;
+    /// GPT-OSS MXFP4 may zero-extend only K to a supported Marlin tile.
+    pub fn execution_dimensions(&self) -> &[u64] {
+        match self {
+            Self::BlockFp8ToMarlinFp8Group128 {
+                logical_dimensions, ..
+            } => logical_dimensions,
+            Self::GptOssMxfp4ToMarlin {
+                execution_dimensions,
+                ..
+            } => execution_dimensions,
+        }
+    }
+
     pub const fn matrices_per_output(&self) -> u32 {
         match self {
             Self::BlockFp8ToMarlinFp8Group128 {
@@ -287,11 +303,12 @@ impl StaticWeightTransformPlan {
                     })
             }
             Self::GptOssMxfp4ToMarlin {
-                logical_dimensions, ..
+                execution_dimensions,
+                ..
             } => {
-                let [_, n, k] = logical_dimensions.as_slice() else {
+                let [_, n, k] = execution_dimensions.as_slice() else {
                     return Err(invalid_plan(
-                        "static GPT-OSS MXFP4 transform requires [E,N,K] dimensions",
+                        "static GPT-OSS MXFP4 transform requires [E,N,K] execution dimensions",
                     ));
                 };
                 n.checked_mul(*k)
@@ -347,22 +364,39 @@ impl StaticWeightTransformPlan {
                 }
             }
             Self::GptOssMxfp4ToMarlin {
-                logical_dimensions, ..
+                logical_dimensions,
+                execution_dimensions,
+                ..
             } => {
                 let [experts, n, k] = logical_dimensions.as_slice() else {
                     return Err(invalid_plan(
                         "static GPT-OSS MXFP4 transform requires [E,N,K] dimensions",
                     ));
                 };
+                let [execution_experts, execution_n, execution_k] = execution_dimensions.as_slice()
+                else {
+                    return Err(invalid_plan(
+                        "static GPT-OSS MXFP4 transform requires [E,N,K] execution dimensions",
+                    ));
+                };
+                let expected_execution_k = if n.is_multiple_of(128) || k.is_multiple_of(128) {
+                    Some(*k)
+                } else {
+                    k.checked_add(64)
+                };
                 if *experts == 0
                     || *n == 0
                     || *k == 0
                     || !n.is_multiple_of(64)
                     || !k.is_multiple_of(64)
+                    || execution_experts != experts
+                    || execution_n != n
+                    || Some(*execution_k) != expected_execution_k
+                    || !execution_k.is_multiple_of(64)
                     || self.scratch_bytes()? == 0
                 {
                     return Err(invalid_plan(
-                        "static GPT-OSS MXFP4 transform requires positive E and 64-aligned N/K",
+                        "static GPT-OSS MXFP4 transform requires positive 64-aligned logical E/N/K and the exact safe Marlin execution K",
                     ));
                 }
             }
