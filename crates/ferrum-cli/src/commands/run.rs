@@ -992,6 +992,10 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     );
     let load_start = std::time::Instant::now();
     engine_config.sampling.default_params = build_sampling_params(&cmd);
+    if let Some(prepared) = prepared_model.as_deref() {
+        engine_config.sampling.default_params.model_output_protocol =
+            prepared.descriptor().output_protocol();
+    }
     engine_config.backend.device = device.clone();
     engine_config.scheduler.policy = ferrum_types::SchedulingPolicy::ContinuousBatch;
     engine_config.backend.backend_options.insert(

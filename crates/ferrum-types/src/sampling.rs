@@ -12,6 +12,56 @@ use crate::{FerrumError, Result, TokenId};
 /// serving on the same default unless an endpoint exposes an explicit override.
 pub const DEFAULT_CHAT_REPETITION_PENALTY: f32 = 1.1;
 
+/// Typed wire protocol emitted by the model after prompt rendering.
+///
+/// This is carried per request because output-token policy and response
+/// parsing must agree on the exact model protocol. It must be selected from
+/// resolved model metadata rather than inferred from a user-facing model name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelOutputProtocol {
+    /// Ordinary text output with no model-specific control-token protocol.
+    #[default]
+    Text,
+    /// OpenAI Harmony output used by GPT-OSS checkpoints.
+    HarmonyGptOss,
+}
+
+impl ModelOutputProtocol {
+    /// Non-terminal control tokens that generation must be able to emit for
+    /// this protocol. Terminal `<|call|>` / `<|return|>` tokens remain owned
+    /// by the model's typed EOS configuration.
+    pub const fn generated_control_token_texts(self) -> &'static [&'static str] {
+        match self {
+            Self::Text => &[],
+            Self::HarmonyGptOss => &[
+                "<|channel|>",
+                "<|message|>",
+                "<|start|>",
+                "<|end|>",
+                "<|constrain|>",
+            ],
+        }
+    }
+
+    /// Special-token text that skip-special decoding must preserve so the
+    /// product parser can observe the complete protocol envelope.
+    pub const fn preserved_special_token_texts(self) -> &'static [&'static str] {
+        match self {
+            Self::Text => &[],
+            Self::HarmonyGptOss => &[
+                "<|channel|>",
+                "<|message|>",
+                "<|start|>",
+                "<|end|>",
+                "<|constrain|>",
+                "<|call|>",
+                "<|return|>",
+            ],
+        }
+    }
+}
+
 /// Sampling parameters for generation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingParams {
@@ -58,6 +108,10 @@ pub struct SamplingParams {
     /// response envelope, such as a tool call, is an alternate terminal path.
     #[serde(default)]
     pub response_completion_boundary: ResponseCompletionBoundary,
+    /// Typed model-output protocol used for control-token sampling and
+    /// response parsing.
+    #[serde(default)]
+    pub model_output_protocol: ModelOutputProtocol,
 }
 
 /// Typed activation boundary for constrained decoding.
@@ -141,6 +195,7 @@ impl Default for SamplingParams {
             response_format: ResponseFormat::default(),
             structured_output_start: StructuredOutputStart::default(),
             response_completion_boundary: ResponseCompletionBoundary::default(),
+            model_output_protocol: ModelOutputProtocol::default(),
         }
     }
 }

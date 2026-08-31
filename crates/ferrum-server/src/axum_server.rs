@@ -3397,6 +3397,9 @@ fn convert_chat_request_with_template_model_and_default(
             response_format,
             structured_output_start,
             response_completion_boundary,
+            model_output_protocol: model_template
+                .map(|template| template.output_protocol)
+                .unwrap_or(ferrum_types::ModelOutputProtocol::Text),
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -4479,6 +4482,7 @@ fn convert_completion_request(request: &CompletionsRequest) -> InferenceRequest 
             response_format: ferrum_types::ResponseFormat::Text,
             structured_output_start: StructuredOutputStart::Immediate,
             response_completion_boundary: ResponseCompletionBoundary::Immediate,
+            model_output_protocol: ferrum_types::ModelOutputProtocol::Text,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal,

@@ -2,7 +2,8 @@ use crate::openai::{
     ChatFunction, ChatMessage, ChatTool, FunctionCallChoice, MessageRole, ToolChoice,
 };
 use ferrum_types::{
-    has_unclosed_thinking_block, ApiToolCallProtocol, FerrumError, THINK_END_TAG, THINK_START_TAG,
+    has_unclosed_thinking_block, ApiToolCallProtocol, FerrumError, ModelOutputProtocol,
+    THINK_END_TAG, THINK_START_TAG,
 };
 use minijinja::Environment;
 use serde::ser::SerializeStruct;
@@ -25,6 +26,7 @@ pub struct ModelChatTemplate {
     pub bos_token: Option<String>,
     pub eos_token: Option<String>,
     pub tool_call_protocol: ApiToolCallProtocol,
+    pub output_protocol: ModelOutputProtocol,
     pub reasoning_protocol: ModelReasoningProtocol,
     pub reasoning_default_enabled: bool,
 }
@@ -34,6 +36,7 @@ impl ModelChatTemplate {
         let template = template.into();
         let mut model_template = Self {
             tool_call_protocol: tool_call_protocol_for_template(&template),
+            output_protocol: ModelOutputProtocol::Text,
             template,
             source: source.into(),
             bos_token: None,

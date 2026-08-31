@@ -10,14 +10,16 @@ use ferrum_interfaces::vnext::{
     AttributeId, ElementType, ExternalModelMetadataId, ModelFamilyRegistration,
     ModelFamilyRegistry, ModelSourceKind, OriginalModelSource, OriginalModelSources,
     PreparedModelFamily, ProgramNode, SemanticValue, StateCapacityDemand, StateLifetime,
-    TypedFamilyRegistration, WeightComponentSource, ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID,
-    ROUTED_SWIGLU_MOE_OPERATION_ID,
+    TypedFamilyRegistration, WeightComponentSource, GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_OPERATION_ID,
+    ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID, ROUTED_SWIGLU_MOE_OPERATION_ID,
 };
 use ferrum_types::{
-    DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelType, MoeCapabilities,
+    DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelOutputProtocol, ModelType,
+    MoeCapabilities,
 };
 use serde_json::Value;
 
+pub mod gpt_oss;
 mod hf_metadata;
 pub mod qwen35;
 pub mod qwen3_moe;
@@ -44,6 +46,14 @@ struct ModelLoaderRegistration {
 }
 
 const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
+    ModelLoaderRegistration {
+        external_metadata_ids: &[gpt_oss::EXTERNAL_METADATA_ID],
+        gguf_architectures: &[],
+        execution_kind: ProductionExecutionKind::CausalLanguage,
+        validate_semantic_config: gpt_oss::validate_semantic_config,
+        prepare: gpt_oss::prepare_from_sources,
+        create_family_registration: gpt_oss::family_registration,
+    },
     ModelLoaderRegistration {
         external_metadata_ids: &[
             qwen35::EXTERNAL_METADATA_ID,
@@ -191,6 +201,7 @@ pub struct CausalLanguageModelDescriptor {
     vocabulary_size: NonZeroUsize,
     maximum_sequence_tokens: NonZeroUsize,
     execution_dtype: DataType,
+    output_protocol: ModelOutputProtocol,
 }
 
 impl CausalLanguageModelDescriptor {
@@ -268,7 +279,13 @@ impl CausalLanguageModelDescriptor {
             vocabulary_size,
             maximum_sequence_tokens,
             execution_dtype,
+            output_protocol: ModelOutputProtocol::Text,
         })
+    }
+
+    pub fn with_output_protocol(mut self, output_protocol: ModelOutputProtocol) -> Self {
+        self.output_protocol = output_protocol;
+        self
     }
 
     pub fn architecture(&self) -> &str {
@@ -309,6 +326,10 @@ impl CausalLanguageModelDescriptor {
 
     pub const fn execution_dtype(&self) -> DataType {
         self.execution_dtype
+    }
+
+    pub const fn output_protocol(&self) -> ModelOutputProtocol {
+        self.output_protocol
     }
 }
 
@@ -485,16 +506,24 @@ fn moe_capabilities_from_program(
         .filter(|node| {
             matches!(
                 node.operation_id.as_str(),
-                ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID | ROUTED_SWIGLU_MOE_OPERATION_ID
+                ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID
+                    | ROUTED_SWIGLU_MOE_OPERATION_ID
+                    | GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_OPERATION_ID
             )
         })
     {
+        let intermediate_attribute =
+            if node.operation_id.as_str() == GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_OPERATION_ID {
+                "intermediate_size"
+            } else {
+                "routed_intermediate_size"
+            };
         let current = MoeCapabilities {
             num_experts: required_positive_node_attribute(node, "expert_count")?,
             experts_per_token: required_positive_node_attribute(node, "experts_per_token")?,
             moe_intermediate_size: Some(required_positive_node_attribute(
                 node,
-                "routed_intermediate_size",
+                intermediate_attribute,
             )?),
         };
         if current.experts_per_token > current.num_experts {
