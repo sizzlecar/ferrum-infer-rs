@@ -3323,9 +3323,17 @@ fn convert_chat_request_with_template_model_and_default(
         .as_ref()
         .or(default_tool_choice.as_ref());
     let functions = request.functions.as_deref().unwrap_or_default();
+    let model_output_protocol = model_template
+        .map(|template| template.output_protocol)
+        .unwrap_or(ModelOutputProtocol::Text);
     let output_contract = EffectiveChatOutputContract::resolve(request);
     let output_budget = ChatOutputBudget::resolve(request);
-    let forced_response_format = forced_tool_choice_response_format(request);
+    // Harmony tool calls own their complete channel/message/call envelope.
+    // Applying the generic tool-argument JSON grammar at token zero would
+    // mask that envelope and force the model to emit bare arguments instead.
+    let forced_response_format = (model_output_protocol != ModelOutputProtocol::HarmonyGptOss)
+        .then(|| forced_tool_choice_response_format(request))
+        .flatten();
     let hard_tool_call_contract = forced_response_format.is_some();
     let requested_response_format = output_contract
         .accepts_requested_response_format()
@@ -3474,9 +3482,7 @@ fn convert_chat_request_with_template_model_and_default(
             response_format,
             structured_output_start,
             response_completion_boundary,
-            model_output_protocol: model_template
-                .map(|template| template.output_protocol)
-                .unwrap_or(ferrum_types::ModelOutputProtocol::Text),
+            model_output_protocol,
         },
         stream: request.stream.unwrap_or(false),
         priority: Priority::Normal, // Default priority
@@ -10999,6 +11005,72 @@ mod tests {
             }
             ref other => panic!("expected forced tool json schema, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn harmony_named_tool_choice_preserves_native_protocol_envelope() {
+        let request: ChatCompletionsRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-20b-mxfp4",
+            "messages": [{
+                "role": "user",
+                "content": "Call get_weather exactly once with city set to Paris."
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "get_weather"}
+            }
+        }))
+        .expect("Harmony tool request parses");
+        let mut template = ModelChatTemplate::new(
+            "{% if tools %}<|start|>developer<|message|>{{ tools | tojson }}<|end|>{% endif %}{% for message in messages %}<|start|>{{ message.role }}<|message|>{{ message.content }}<|end|>{% endfor %}{% if add_generation_prompt %}<|start|>assistant{% endif %}",
+            "harmony-tool-template",
+        );
+        template.output_protocol = ModelOutputProtocol::HarmonyGptOss;
+
+        validate_chat_request(&request).expect("Harmony tool request validates");
+        let internal =
+            convert_chat_request_with_template_model(&request, "gpt-oss-20b", Some(&template))
+                .expect("convert Harmony tool request");
+
+        assert!(internal.prompt.ends_with("<|start|>assistant"));
+        assert_eq!(
+            internal.sampling_params.model_output_protocol,
+            ModelOutputProtocol::HarmonyGptOss
+        );
+        assert_eq!(
+            internal.sampling_params.response_format,
+            ferrum_types::ResponseFormat::Text,
+            "Harmony must generate its channel/message/call envelope before tool arguments"
+        );
+        assert_eq!(
+            internal.metadata[INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY],
+            json!([THINK_END_TAG]),
+            "the generic structured-call mask must remain disabled for Harmony"
+        );
+        let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request else {
+            panic!("expected chat API request");
+        };
+        assert_eq!(
+            api.tool_choice,
+            Some(ferrum_types::ApiToolChoice::Function {
+                tool_type: "function".to_string(),
+                function: ferrum_types::ApiToolChoiceFunction {
+                    name: "get_weather".to_string(),
+                },
+            })
+        );
     }
 
     #[test]
