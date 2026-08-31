@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Validate the implemented A1 Qwen3.8 block-FP8 execution contract lock.
 
-This static lock records the implemented provider coverage, materializer
-identity, and typed numeric-quality artifact consumed by the compiler. It does
-not execute CUDA, bind that artifact to a git or binary SHA, or produce an
-M0/model-adoption PASS receipt.
+This static lock records provider coverage, the exact group-128 materializer
+identity, and the required CUDA parity-vector contract. It does not execute
+CUDA, bind parity evidence to a git or binary SHA, or produce an adoption PASS.
 """
 
 from __future__ import annotations
@@ -32,35 +31,28 @@ CHECKPOINT = {
     "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
 }
 SOURCE_FORMAT_ID = "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale"
-SOURCE_WEIGHT_FORMAT_ID = "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
 QUALITY_VECTOR_DIGEST = "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51"
 MATERIALIZER_ID = "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16"
-MATERIALIZER_VERSION = {"major": 1, "minor": 0}
+MATERIALIZER_VERSION = {"major": 2, "minor": 0}
 MATERIALIZER_IMPLEMENTATION_FINGERPRINT = (
-    "004d29e877fa60e2c996969a05a685c319c792384e0e413a015770239018c964"
+    "3b9ee0b67b7ce6be88807cf8c80ae4ef47a993826fe9c5f7228726ca230e8859"
 )
-EXECUTION_WEIGHT_FORMAT_ID = "weight-format.execution.cuda.marlin-fp8-w8a16-mixed"
-EXECUTION_WEIGHT_LAYOUT_ID = "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed"
-EXECUTION_QUANTIZATION_FORMAT_ID = "quantization.marlin.fp8-e4m3fn-channelwise"
+EXECUTION_WEIGHT_FORMAT_ID = (
+    "weight-format.execution.cuda.marlin-fp8-w8a16-group128-mixed"
+)
+EXECUTION_WEIGHT_LAYOUT_ID = (
+    "weight-layout.execution.cuda.marlin-fp8-w8a16-group128-mixed"
+)
+EXECUTION_QUANTIZATION_FORMAT_ID = "quantization.marlin.fp8-e4m3fn-group128"
 MARLIN_CAPABILITY_ID = "capability.kernel.cuda.marlin.fp8-w8a16"
-QUALITY_AUTHORITY_ID = "quality-approval-authority.ferrum.numeric"
-QUALITY_AUTHORITY_VERSION = {"major": 1, "minor": 0}
-QUALITY_AUTHORITY_IMPLEMENTATION_FINGERPRINT = (
-    "b6f4f723a7266750f526674b96c35c302eba68b4008fa3d1257b0fc9a10ebfa8"
-)
-NUMERIC_ARTIFACT_SCHEMA_ID = "quality-approval.weight-materializer.numeric.v1"
-NUMERIC_ARTIFACT_SHA256 = (
-    "3e197dbeead55ad6af0833bff15d4413babb26a952e3f0ef2e085012a62057ed"
-)
-NUMERIC_ARTIFACT_BYTES = 48_067
-MAX_RELATIVE_L2_OBSERVED = {"numerator": 2_547_279, "denominator": 100_000_000}
+NUMERIC_ARTIFACT_SCHEMA_ID = "validation.weight-materializer.exact-parity.v1"
 
-EXECUTION_SEMANTICS_VERSION = 1
+EXECUTION_SEMANTICS_VERSION = 2
 EXPECTED_EXECUTION_CONTRACT_FINGERPRINT = (
-    "882bc49ca312875a12a5290319f6c8294386a5960c2065cbda3f3dff2d55598e"
+    "33a732037f95f05ab7cbba996376ba4835f5e5775b234152b18fb7fd00012973"
 )
 VERSIONED_EXECUTION_SEMANTICS_FINGERPRINTS = {
-    "qwen38-27b-fp8-a1-execution-coverage-v1": EXPECTED_EXECUTION_CONTRACT_FINGERPRINT,
+    "qwen38-27b-fp8-a1-execution-coverage-v2": EXPECTED_EXECUTION_CONTRACT_FINGERPRINT,
 }
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -121,14 +113,14 @@ QUALITY_KEYS = {
     "selection_requirements",
 }
 WITNESS_FIELDS_KEYS = {
-    "approval_authority",
+    "cases",
     "checkpoint",
+    "execution",
     "materializer",
+    "quality_vector_digest",
+    "quality_vector_payload",
+    "schema_id",
     "source",
-    "execution_schema",
-    "contract",
-    "numeric_evidence",
-    "artifact_scope",
 }
 SELECTION_KEYS = {
     "all_bound_identities_must_match",
@@ -192,74 +184,30 @@ EXPECTED_COVERAGE = [
 ]
 
 EXPECTED_WITNESS_FIELDS = {
-    "approval_authority": ["id", "version", "implementation_fingerprint"],
+    "cases": [
+        "actual_f16_bits",
+        "actual_f16le_sha256",
+        "case_id",
+        "inf_count",
+        "nan_count",
+        "reference_f32_bits",
+        "reference_f32le_sha256",
+        "relative_l2_upper_bound",
+    ],
     "checkpoint": ["id", "repository", "revision"],
-    "materializer": ["id", "version", "implementation_fingerprint", "fidelity"],
-    "source": ["weight_format_id"],
-    "execution_schema": [
+    "execution": [
+        "quantization_format_ids",
         "weight_format_id",
         "weight_layout_id",
-        "quantization_format_ids",
     ],
-    "contract": ["execution_contract_fingerprint", "quality_vector_digest"],
-    "numeric_evidence": [
-        "artifact_schema_id",
-        "artifact_sha256",
-        "artifact_bytes",
-        "required_case_count",
-        "completed_case_count",
-        "relative_l2_max_observed",
-        "nan_count",
-        "inf_count",
-    ],
-    "artifact_scope": [
-        "source_schema_fingerprint_bound_live",
-        "execution_schema_fingerprint_bound_live",
-        "git_sha_bound",
-        "binary_sha256_bound",
-    ],
+    "materializer": ["id", "version", "implementation_fingerprint", "fidelity"],
+    "quality_vector_digest": ["quality_vector_digest"],
+    "quality_vector_payload": ["quality_vector_payload"],
+    "schema_id": ["schema_id"],
+    "source": ["weight_format_id"],
 }
 
-EXPECTED_CURRENT_WITNESS = {
-    "approval_authority": {
-        "id": QUALITY_AUTHORITY_ID,
-        "version": QUALITY_AUTHORITY_VERSION,
-        "implementation_fingerprint": QUALITY_AUTHORITY_IMPLEMENTATION_FINGERPRINT,
-    },
-    "checkpoint": CHECKPOINT,
-    "materializer": {
-        "id": MATERIALIZER_ID,
-        "version": MATERIALIZER_VERSION,
-        "implementation_fingerprint": MATERIALIZER_IMPLEMENTATION_FINGERPRINT,
-        "fidelity": "approximate",
-    },
-    "source": {"weight_format_id": SOURCE_WEIGHT_FORMAT_ID},
-    "execution_schema": {
-        "weight_format_id": EXECUTION_WEIGHT_FORMAT_ID,
-        "weight_layout_id": EXECUTION_WEIGHT_LAYOUT_ID,
-        "quantization_format_ids": [EXECUTION_QUANTIZATION_FORMAT_ID],
-    },
-    "contract": {
-        "execution_contract_fingerprint": EXPECTED_EXECUTION_CONTRACT_FINGERPRINT,
-        "quality_vector_digest": QUALITY_VECTOR_DIGEST,
-    },
-    "numeric_evidence": {
-        "artifact_schema_id": NUMERIC_ARTIFACT_SCHEMA_ID,
-        "artifact_sha256": NUMERIC_ARTIFACT_SHA256,
-        "artifact_bytes": NUMERIC_ARTIFACT_BYTES,
-        "required_case_count": 4,
-        "completed_case_count": 4,
-        "relative_l2_max_observed": MAX_RELATIVE_L2_OBSERVED,
-        "nan_count": 0,
-        "inf_count": 0,
-    },
-    "artifact_scope": {
-        "source_schema_fingerprint_bound_live": True,
-        "execution_schema_fingerprint_bound_live": True,
-        "git_sha_bound": False,
-        "binary_sha256_bound": False,
-    },
-}
+EXPECTED_CURRENT_WITNESS = None
 
 
 class ContractError(Exception):
@@ -376,9 +324,9 @@ def validate_materializer(value: Any) -> None:
         == MATERIALIZER_IMPLEMENTATION_FINGERPRINT,
         "materializer implementation fingerprint drifted",
     )
-    require(materializer["fidelity"] == "approximate", "planned materializer fidelity must be approximate")
+    require(materializer["fidelity"] == "exact", "planned materializer fidelity must be exact")
     require(
-        materializer["fidelity_enum"] == "WeightMaterializationFidelity::Approximate",
+        materializer["fidelity_enum"] == "WeightMaterializationFidelity::Exact",
         "planned materializer fidelity enum drifted",
     )
     require(materializer["source_format_id"] == SOURCE_FORMAT_ID, "planned materializer source format drifted")
@@ -401,19 +349,22 @@ def validate_materializer(value: Any) -> None:
     )
     require(
         materializer["conversion_semantics"]
-        == "cold-path decode of source E4M3 values with BF16 128x128 inverse scales followed by channelwise E4M3FN quantization and existing tiled Marlin packing",
+        == "cold-path bit-exact device repack of source E4M3 values plus BF16 128x128 inverse-scale expansion into grouped Marlin FP8 W8A16",
         "planned conversion semantics drifted",
     )
     require(
         materializer["transient_policy"]
-        == "one bounded source component group at a time; no persistent dense checkpoint copy",
+        == "one bounded source pair transformed on device at a time; no persistent dense checkpoint copy",
         "planned transient policy drifted",
     )
 
 
 def validate_quality_approval(value: Any) -> None:
     quality = exact_keys(value, QUALITY_KEYS, "quality_approval")
-    require(quality["status"] == "implemented", "quality authority status must be implemented")
+    require(
+        quality["status"] == "not_required_for_exact",
+        "exact materializer must not require approximate quality approval",
+    )
     require(
         quality["witness_schema_id"] == NUMERIC_ARTIFACT_SCHEMA_ID,
         "quality witness schema id drifted",
@@ -421,18 +372,18 @@ def validate_quality_approval(value: Any) -> None:
     require(quality["quality_vector_digest"] == QUALITY_VECTOR_DIGEST, "quality vector digest drifted")
     require(
         quality["current_witness"] == EXPECTED_CURRENT_WITNESS,
-        "typed numeric quality witness drifted",
+        "checked contract must not embed a stale runtime parity witness",
     )
     require(
-        quality["compiler_selection_authorized"] is True,
-        "implemented typed quality contract must authorize live-bound compiler selection",
+        quality["compiler_selection_authorized"] is False,
+        "exact materializer selection must not depend on numeric approval",
     )
     witness_fields = exact_keys(
         quality["required_witness_fields"],
         WITNESS_FIELDS_KEYS,
         "quality_approval.required_witness_fields",
     )
-    require(witness_fields == EXPECTED_WITNESS_FIELDS, "typed quality witness fields drifted")
+    require(witness_fields == EXPECTED_WITNESS_FIELDS, "exact parity witness fields drifted")
     selection = exact_keys(
         quality["selection_requirements"],
         SELECTION_KEYS,
@@ -453,7 +404,7 @@ def validate_quality_approval(value: Any) -> None:
         "artifact_sha256_required": True,
         "global_boolean_or_environment_override_forbidden": True,
     }
-    require(selection == expected_selection, "quality selection requirements drifted")
+    require(selection == expected_selection, "exact parity requirements drifted")
     require(
         isinstance(selection["relative_l2_max"], (int, float))
         and not isinstance(selection["relative_l2_max"], bool)
@@ -464,14 +415,14 @@ def validate_quality_approval(value: Any) -> None:
 
 def validate_contract(document: dict[str, Any]) -> dict[str, Any]:
     root = exact_keys(document, ROOT_KEYS, "execution contract")
-    require_int(root["schema_version"], 1, "schema_version")
+    require_int(root["schema_version"], 2, "schema_version")
     require_int(
         root["execution_semantics_version"],
         EXECUTION_SEMANTICS_VERSION,
         "execution_semantics_version",
     )
     require(
-        root["contract_id"] == "qwen38-27b-fp8-a1-execution-coverage-v1",
+        root["contract_id"] == "qwen38-27b-fp8-a1-execution-coverage-v2",
         "contract id drifted",
     )
     require(
@@ -517,9 +468,7 @@ def validate_contract(document: dict[str, Any]) -> dict[str, Any]:
         "compiler_selection_authorized": root["quality_approval"][
             "compiler_selection_authorized"
         ],
-        "numeric_artifact_sha256": root["quality_approval"]["current_witness"][
-            "numeric_evidence"
-        ]["artifact_sha256"],
+        "numeric_artifact_sha256": None,
         "execution_contract_fingerprint": fingerprint,
     }
 
@@ -576,17 +525,15 @@ def run_self_test(document: dict[str, Any]) -> None:
         document,
     )
     expect_rejected(
-        "quality authority drift",
-        lambda value: value["quality_approval"]["current_witness"][
-            "approval_authority"
-        ].__setitem__("implementation_fingerprint", "f" * 64),
+        "stale current witness",
+        lambda value: value["quality_approval"].__setitem__("current_witness", {}),
         document,
     )
     expect_rejected(
-        "numeric artifact drift",
-        lambda value: value["quality_approval"]["current_witness"][
-            "numeric_evidence"
-        ].__setitem__("artifact_sha256", "f" * 64),
+        "parity artifact schema drift",
+        lambda value: value["quality_approval"].__setitem__(
+            "witness_schema_id", "forged"
+        ),
         document,
     )
     expect_rejected(
@@ -602,17 +549,17 @@ def run_self_test(document: dict[str, Any]) -> None:
         document,
     )
     expect_rejected(
-        "compiler authorization removed",
+        "compiler authorization added to exact path",
         lambda value: value["quality_approval"].__setitem__(
-            "compiler_selection_authorized", False
+            "compiler_selection_authorized", True
         ),
         document,
     )
     expect_rejected(
-        "artifact scope forged as binary-bound",
-        lambda value: value["quality_approval"]["current_witness"][
-            "artifact_scope"
-        ].__setitem__("binary_sha256_bound", True),
+        "parity case denominator drift",
+        lambda value: value["quality_approval"]["selection_requirements"].__setitem__(
+            "required_case_count", 3
+        ),
         document,
     )
     expect_rejected(

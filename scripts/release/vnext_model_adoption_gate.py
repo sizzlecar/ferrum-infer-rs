@@ -85,14 +85,13 @@ PRODUCT_ERROR_KEYS = {
 }
 FALLBACK_KEYS = {"silent", "dense", "legacy"}
 PAID_BENCH_SWEEP_CHECKPOINTS = {
+    "qwen38-27b-fp8",
+    "qwen36-27b-fp8",
     "qwen36-35b-a3b-fp8",
     "gpt-oss-20b-mxfp4",
     "gemma4-12b-w4a16-ct",
 }
-LEGACY_VALIDATOR_VERSION_CHECKPOINTS = {
-    "qwen38-27b-fp8",
-    "qwen36-27b-fp8",
-}
+LEGACY_VALIDATOR_VERSION_CHECKPOINTS: set[str] = set()
 PAID_BENCH_CONCURRENCY_CELLS = {1, 8, 32}
 QWEN38_REGRESSION_CHECKPOINT_ID = "qwen38-27b-fp8"
 QWEN38_REGRESSION_ATTRIBUTION_COUNT = 403
@@ -2201,10 +2200,12 @@ def run_self_test() -> None:
         tampered = root / "tampered"
         tampered_docs = synthetic_pass_documents(tampered)
         write_synthetic_package(tampered, tampered_docs)
-        tampered_docs["product.json"]["usability"]["p50_ttft_seconds"] = 61.0
+        tampered_docs["product.json"]["usability"]["bench_cells"][0][
+            "p50_ttft_seconds"
+        ] = 61.0
         write_json(tampered / "product.json", tampered_docs["product.json"])
         expect_failure(
-            "receipt digest",
+            "receipt identity",
             lambda: validate_package("qwen38-27b-fp8", tampered, write_log=False),
             "SHA256 mismatch",
         )

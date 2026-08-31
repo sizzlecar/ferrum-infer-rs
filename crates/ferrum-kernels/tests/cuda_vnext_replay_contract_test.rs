@@ -175,6 +175,28 @@ fn executable_cache_has_no_fence_dependency_owner() {
 }
 
 #[test]
+fn replay_capture_attributes_commands_from_one_bulk_graph_topology_query() {
+    assert!(REPLAY_SOURCE.contains("fn capture_dependency_frontier("));
+    assert!(REPLAY_SOURCE.contains("fn captured_graph_topology("));
+    assert!(REPLAY_SOURCE.contains("fn command_graph_node_counts_from_topology<"));
+    assert!(!REPLAY_SOURCE.contains("capture_graph_node_count"));
+    assert_eq!(
+        REPLAY_SOURCE.matches("sys::cuGraphGetNodes(").count(),
+        2,
+        "captured graph nodes must be queried only by the post-capture bulk topology read",
+    );
+    assert_eq!(
+        REPLAY_SOURCE.matches("sys::cuGraphGetEdges_v2(").count(),
+        2,
+        "captured graph edges must be queried only by the post-capture bulk topology read",
+    );
+    assert!(REPLAY_SOURCE.contains("command_frontiers = None"));
+    assert!(REPLAY_SOURCE.contains("topological_order.iter().rev()"));
+    assert!(REPLAY_SOURCE.contains("reachable_command_intervals"));
+    assert!(!REPLAY_SOURCE.contains("let mut closure = vec![false; nodes.len()]"));
+}
+
+#[test]
 fn replay_identity_does_not_enable_full_profile_tool_correlation() {
     assert!(REPLAY_SOURCE.contains(
         "let profile_identity = timing_mode.physical_span_attribution_enabled().then(||"
@@ -234,15 +256,18 @@ fn dynamic_attention_addresses_use_one_hoistable_program_binding_boundary() {
 }
 
 #[test]
-fn typed_program_binding_patches_form_one_layout_owned_upload() {
+fn typed_program_binding_patches_form_one_layout_owned_sparse_prelude() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("CudaDeviceCommand::program_binding_patch("));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("CudaDeviceCommand::program_binding_patch("));
     assert!(RUNTIME_SOURCE.contains("struct CudaProgramBindingPatch"));
     assert!(RUNTIME_SOURCE
         .contains("\"CUDA typed program bindings do not cover one compiled layout exactly\""));
-    assert!(RUNTIME_SOURCE.contains("let mut host_patch = vec![0_u8; patch_bytes]"));
-    assert!(RUNTIME_SOURCE.contains("\"aggregate program binding upload\""));
-    assert!(RUNTIME_SOURCE.contains("transfer_command_count: 1"));
+    assert!(RUNTIME_SOURCE.contains("coalesce_program_binding_transfers("));
+    assert!(RUNTIME_SOURCE.contains("cuMemcpy2DAsync_v2("));
+    assert!(RUNTIME_SOURCE.contains("let transfer_command_count = u64::try_from(transfers.len())"));
+    assert!(RUNTIME_SOURCE.contains("executable: None"));
+    assert!(!RUNTIME_SOURCE.contains("let mut host_patch = vec![0_u8; patch_bytes]"));
+    assert!(!RUNTIME_SOURCE.contains("\"aggregate program binding upload\""));
     assert!(RUNTIME_SOURCE.contains("fence_dependencies.extend(patch.fence_dependencies)"));
 }
 

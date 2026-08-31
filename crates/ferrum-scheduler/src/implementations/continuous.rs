@@ -2934,14 +2934,13 @@ impl ContinuousBatchScheduler {
             return 0;
         }
 
-        // Keep the mixed-prefill lane bounded, but spend real batch headroom.
-        // The previous proportional scaling often collapsed to a single tiny
-        // chunk at c=32 even when 4-7 batch slots were idle, serializing
-        // capacity-deferred recompute behind decode work.
-        let max_mixed_prefill_chunks = self.cb_config.max_prefill_batch.div_ceil(2).max(1);
-        free_batch_slots
-            .min(max_mixed_prefill_chunks)
-            .min(prefill_backlog)
+        // `BatchHint` already carries the executor's sequence and token
+        // capacity for this iteration. Spend that live headroom instead of
+        // imposing a second, unrelated cap derived from the cold-prefill
+        // batch default. The old `max_prefill_batch / 2` ceiling limited the
+        // default mixed lane to four requests even when the executor had room
+        // for a much larger cohort.
+        free_batch_slots.min(prefill_backlog)
     }
 
     fn maybe_active_decode_prefill_chunk(
@@ -8478,7 +8477,7 @@ mod tests {
     }
 
     #[test]
-    fn active_decode_prefill_budget_caps_small_final_chunks_by_count() {
+    fn active_decode_prefill_budget_uses_all_live_headroom_for_small_final_chunks() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             max_running_requests: 32,
             prompt_token_estimate: true,
@@ -8522,14 +8521,14 @@ mod tests {
 
         assert_eq!(
             mixed_batch.requests.len(),
-            23,
-            "small final prefill chunks must not bypass the mixed-prefill count budget"
+            32,
+            "small final prefill chunks should spend all live batch headroom"
         );
-        assert_eq!(prefill_tokens, vec![Some(1), Some(1), Some(1), Some(1)]);
+        assert_eq!(prefill_tokens, vec![Some(1); 13]);
     }
 
     #[test]
-    fn active_decode_prefill_budget_uses_effective_step_chunk_for_aggregate_cap() {
+    fn active_decode_prefill_budget_uses_all_live_headroom_when_token_budget_allows() {
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
             max_running_requests: 32,
             prompt_token_estimate: true,
@@ -8573,11 +8572,71 @@ mod tests {
             .collect();
         assert_eq!(
             mixed_batch.requests.len(),
-            11,
-            "large explicit active chunks must not bypass the prefill-step aggregate cap"
+            32,
+            "mixed prefill should spend live sequence headroom while respecting the token budget"
         );
-        assert_eq!(prefill_tokens, vec![Some(64), Some(64), Some(64), Some(64)]);
-        assert_eq!(mixed_batch.resource_requirements.gpu_memory, (7 + 256) * 16);
+        assert_eq!(prefill_tokens, vec![Some(64); 25]);
+        assert_eq!(
+            mixed_batch.resource_requirements.gpu_memory,
+            (7 + 1600) * 16
+        );
+    }
+
+    #[test]
+    fn active_decode_prefill_budget_stops_at_live_token_budget() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            max_running_requests: 32,
+            prompt_token_estimate: true,
+            active_decode_prefill_chunk: Some(64),
+            prefill_step_chunk: Some(64),
+            ..SchedulerConfig::default()
+        });
+        let initial_hint = BatchHint {
+            max_batch_size: 32,
+            max_tokens: 8192,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let mut decode_ids = Vec::new();
+        for _ in 0..7 {
+            let request = create_test_request_with_prompt_tokens(Priority::Normal, 128);
+            decode_ids.push(request.id.clone());
+            enqueue_waiting(&scheduler, request);
+        }
+        let initial_batch = scheduler.create_iteration_batch(initial_hint).unwrap();
+        assert_eq!(initial_batch.requests.len(), 7);
+        for id in &decode_ids {
+            scheduler.mark_prefill_complete(id, 128);
+        }
+
+        for _ in 0..25 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 256),
+            );
+        }
+
+        let mixed_batch = scheduler
+            .create_iteration_batch(BatchHint {
+                max_batch_size: 32,
+                max_tokens: 199,
+                target_latency_ms: None,
+                available_memory: None,
+                resource_constraints: Default::default(),
+            })
+            .unwrap();
+        let prefill_tokens: Vec<_> = mixed_batch
+            .requests
+            .iter()
+            .filter(|request| request.tokens_to_process != Some(1))
+            .map(|request| request.tokens_to_process)
+            .collect();
+
+        assert_eq!(mixed_batch.requests.len(), 10);
+        assert_eq!(prefill_tokens, vec![Some(64); 3]);
+        assert_eq!(mixed_batch.resource_requirements.gpu_memory, 199 * 16);
     }
 
     #[tokio::test]

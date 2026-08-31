@@ -5,7 +5,7 @@
 //! command in a captured segment. A key binds provider semantics, launch
 //! scalars, physical regions, and retained host bytes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CString;
 use std::fmt;
 use std::fmt::Write;
@@ -307,16 +307,12 @@ impl CudaExecutableProfileIdentity {
     }
 }
 
-fn graph_node_count(graph: sys::CUgraph) -> Option<usize> {
-    if graph.is_null() {
-        return None;
-    }
-    let mut node_count = 0;
-    let status = unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut node_count) };
-    (status == sys::CUresult::CUDA_SUCCESS).then_some(node_count)
+struct CaptureDependencyFrontier {
+    graph: sys::CUgraph,
+    nodes: Vec<sys::CUgraphNode>,
 }
 
-fn capture_graph_node_count(stream: &CudaStream) -> Option<usize> {
+fn capture_dependency_frontier(stream: &CudaStream) -> Option<CaptureDependencyFrontier> {
     let mut capture_state = sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_INVALIDATED;
     let mut capture_id = 0;
     let mut graph: sys::CUgraph = std::ptr::null_mut();
@@ -336,10 +332,306 @@ fn capture_graph_node_count(stream: &CudaStream) -> Option<usize> {
     };
     if status != sys::CUresult::CUDA_SUCCESS
         || capture_state != sys::CUstreamCaptureStatus::CU_STREAM_CAPTURE_STATUS_ACTIVE
+        || graph.is_null()
+        || dependency_count == 0
+        || dependencies.is_null()
     {
         return None;
     }
-    graph_node_count(graph)
+    let nodes = unsafe { std::slice::from_raw_parts(dependencies, dependency_count) }.to_vec();
+    if nodes.iter().any(|node| node.is_null()) {
+        return None;
+    }
+    Some(CaptureDependencyFrontier { graph, nodes })
+}
+
+fn captured_graph_topology(
+    graph: sys::CUgraph,
+) -> Option<(
+    Vec<sys::CUgraphNode>,
+    Vec<(sys::CUgraphNode, sys::CUgraphNode)>,
+)> {
+    if graph.is_null() {
+        return None;
+    }
+
+    let mut node_count = 0;
+    let node_count_status =
+        unsafe { sys::cuGraphGetNodes(graph, std::ptr::null_mut(), &mut node_count) };
+    if node_count_status != sys::CUresult::CUDA_SUCCESS || node_count == 0 {
+        return None;
+    }
+    let mut nodes = vec![std::ptr::null_mut(); node_count];
+    let mut observed_node_count = node_count;
+    let nodes_status =
+        unsafe { sys::cuGraphGetNodes(graph, nodes.as_mut_ptr(), &mut observed_node_count) };
+    if nodes_status != sys::CUresult::CUDA_SUCCESS || observed_node_count != node_count {
+        return None;
+    }
+    if nodes.iter().any(|node| node.is_null()) {
+        return None;
+    }
+
+    let mut edge_count = 0;
+    let edge_count_status = unsafe {
+        sys::cuGraphGetEdges_v2(
+            graph,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut edge_count,
+        )
+    };
+    if edge_count_status != sys::CUresult::CUDA_SUCCESS {
+        return None;
+    }
+    if edge_count == 0 {
+        return Some((nodes, Vec::new()));
+    }
+    let mut from = vec![std::ptr::null_mut(); edge_count];
+    let mut to = vec![std::ptr::null_mut(); edge_count];
+    let mut edge_data = vec![
+        sys::CUgraphEdgeData {
+            from_port: 0,
+            to_port: 0,
+            type_: 0,
+            reserved: [0; 5],
+        };
+        edge_count
+    ];
+    let mut observed_edge_count = edge_count;
+    let edges_status = unsafe {
+        sys::cuGraphGetEdges_v2(
+            graph,
+            from.as_mut_ptr(),
+            to.as_mut_ptr(),
+            edge_data.as_mut_ptr(),
+            &mut observed_edge_count,
+        )
+    };
+    if edges_status != sys::CUresult::CUDA_SUCCESS || observed_edge_count != edge_count {
+        return None;
+    }
+    Some((nodes, from.into_iter().zip(to).collect()))
+}
+
+fn command_graph_node_counts_from_topology<Node>(
+    nodes: &[Node],
+    edges: &[(Node, Node)],
+    command_frontiers: &[Vec<Node>],
+) -> Option<Vec<u32>>
+where
+    Node: Copy + Eq + std::hash::Hash,
+{
+    if nodes.is_empty() || command_frontiers.is_empty() {
+        return None;
+    }
+
+    let node_indices = nodes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, node)| (node, index))
+        .collect::<HashMap<_, _>>();
+    if node_indices.len() != nodes.len() {
+        return None;
+    }
+
+    let mut successors = vec![Vec::new(); nodes.len()];
+    let mut indegrees = vec![0_usize; nodes.len()];
+    let mut unique_edges = HashSet::with_capacity(edges.len());
+    for &(from, to) in edges {
+        let (&from_index, &to_index) = (node_indices.get(&from)?, node_indices.get(&to)?);
+        if from_index == to_index || !unique_edges.insert((from_index, to_index)) {
+            return None;
+        }
+        successors[from_index].push(to_index);
+        indegrees[to_index] = indegrees[to_index].checked_add(1)?;
+    }
+
+    let mut direct_frontier_commands = vec![Vec::new(); nodes.len()];
+    for (command_index, frontier) in command_frontiers.iter().enumerate() {
+        if frontier.is_empty() {
+            return None;
+        }
+        let mut unique_frontier = HashSet::with_capacity(frontier.len());
+        for node in frontier {
+            let &node_index = node_indices.get(node)?;
+            if !unique_frontier.insert(node_index) {
+                return None;
+            }
+            direct_frontier_commands[node_index].push(command_index);
+        }
+    }
+
+    let mut ready = indegrees
+        .iter()
+        .enumerate()
+        .filter_map(|(index, degree)| (*degree == 0).then_some(index))
+        .collect::<VecDeque<_>>();
+    let mut topological_order = Vec::with_capacity(nodes.len());
+    while let Some(index) = ready.pop_front() {
+        topological_order.push(index);
+        for &successor in &successors[index] {
+            indegrees[successor] = indegrees[successor].checked_sub(1)?;
+            if indegrees[successor] == 0 {
+                ready.push_back(successor);
+            }
+        }
+    }
+    if topological_order.len() != nodes.len() {
+        return None;
+    }
+
+    let last_command_index = command_frontiers.len().checked_sub(1)?;
+    let mut reachable_command_intervals = vec![None; nodes.len()];
+    let mut command_counts = vec![0_u32; command_frontiers.len()];
+    for &node_index in topological_order.iter().rev() {
+        let mut intervals = Vec::with_capacity(
+            direct_frontier_commands[node_index].len() + successors[node_index].len(),
+        );
+        intervals.extend(
+            direct_frontier_commands[node_index]
+                .iter()
+                .copied()
+                .map(|command_index| (command_index, command_index)),
+        );
+        for &successor in &successors[node_index] {
+            intervals.push(reachable_command_intervals[successor]?);
+        }
+        if intervals.is_empty() {
+            return None;
+        }
+        intervals.sort_unstable();
+        let (interval_start, mut interval_end) = intervals[0];
+        for &(next_start, next_end) in &intervals[1..] {
+            if next_start > interval_end.checked_add(1)? {
+                return None;
+            }
+            interval_end = interval_end.max(next_end);
+        }
+        if interval_end != last_command_index {
+            return None;
+        }
+        reachable_command_intervals[node_index] = Some((interval_start, interval_end));
+        command_counts[interval_start] = command_counts[interval_start].checked_add(1)?;
+    }
+    command_counts
+        .iter()
+        .all(|count| *count > 0)
+        .then_some(command_counts)
+}
+
+#[cfg(test)]
+mod graph_attribution_tests {
+    use super::command_graph_node_counts_from_topology;
+
+    #[test]
+    fn attributes_linear_commands() {
+        assert_eq!(
+            command_graph_node_counts_from_topology(
+                &[1, 2, 3],
+                &[(1, 2), (2, 3)],
+                &[vec![1], vec![2], vec![3]],
+            ),
+            Some(vec![1, 1, 1]),
+        );
+    }
+
+    #[test]
+    fn attributes_a_long_linear_graph_without_per_frontier_graph_scans() {
+        const NODE_COUNT: usize = 20_000;
+        let nodes = (0..NODE_COUNT).collect::<Vec<_>>();
+        let edges = (0..NODE_COUNT - 1)
+            .map(|node| (node, node + 1))
+            .collect::<Vec<_>>();
+        let frontiers = (0..NODE_COUNT).map(|node| vec![node]).collect::<Vec<_>>();
+
+        let counts = command_graph_node_counts_from_topology(&nodes, &edges, &frontiers)
+            .expect("a linear graph has exact monotonic command attribution");
+        assert_eq!(counts.len(), NODE_COUNT);
+        assert!(counts.into_iter().all(|count| count == 1));
+    }
+
+    #[test]
+    fn attributes_internal_branch_and_join_to_one_command() {
+        assert_eq!(
+            command_graph_node_counts_from_topology(
+                &[1, 2, 3, 4],
+                &[(1, 2), (1, 3), (2, 4), (3, 4)],
+                &[vec![1], vec![4]],
+            ),
+            Some(vec![1, 3]),
+        );
+    }
+
+    #[test]
+    fn attributes_a_multi_node_frontier_before_a_join() {
+        assert_eq!(
+            command_graph_node_counts_from_topology(
+                &[1, 2, 3],
+                &[(1, 3), (2, 3)],
+                &[vec![1, 2], vec![3]],
+            ),
+            Some(vec![2, 1]),
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_or_duplicate_nodes_and_edges() {
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[(1, 2)], &[vec![3]]),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 1], &[], &[vec![1]]),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[(1, 3)], &[vec![2]]),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[(1, 2), (1, 2)], &[vec![2]],),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[(1, 2)], &[vec![2, 2]]),
+            None,
+        );
+    }
+
+    #[test]
+    fn rejects_cycles_non_monotonic_frontiers_and_zero_node_commands() {
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[(1, 2), (2, 1)], &[vec![2]],),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[], &[vec![1], vec![2]]),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[(1, 2)], &[vec![1], vec![1]],),
+            None,
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_incompletely_attributed_graphs() {
+        assert_eq!(
+            command_graph_node_counts_from_topology::<u8>(&[], &[], &[vec![1]]),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1], &[], &[]),
+            None,
+        );
+        assert_eq!(
+            command_graph_node_counts_from_topology(&[1, 2], &[], &[vec![1]]),
+            None,
+        );
+    }
 }
 
 impl CudaExecutableSegment {
@@ -365,27 +657,22 @@ impl CudaExecutableSegment {
             ));
         }
 
-        let mut previous_graph_node_count = capture_graph_node_count(stream);
-        let mut command_graph_node_counts = Vec::with_capacity(commands.len());
+        let mut capture_graph = None;
+        let mut command_frontiers = Some(Vec::with_capacity(commands.len()));
         let encoded = catch_unwind(AssertUnwindSafe(|| {
             for command in commands {
                 command.enqueue(stream, blas)?;
-                if let Some(previous) = previous_graph_node_count {
-                    let observed = capture_graph_node_count(stream)
-                        .and_then(|current| {
-                            current.checked_sub(previous).map(|delta| (current, delta))
-                        })
-                        .and_then(|(current, delta)| {
-                            u32::try_from(delta).ok().map(|delta| (current, delta))
-                        });
-                    match observed {
-                        Some((current, delta)) => {
-                            command_graph_node_counts.push(delta);
-                            previous_graph_node_count = Some(current);
+                if let Some(frontiers) = command_frontiers.as_mut() {
+                    match capture_dependency_frontier(stream) {
+                        Some(frontier)
+                            if capture_graph.is_none_or(|graph| graph == frontier.graph) =>
+                        {
+                            capture_graph = Some(frontier.graph);
+                            frontiers.push(frontier.nodes);
                         }
-                        None => {
-                            command_graph_node_counts.clear();
-                            previous_graph_node_count = None;
+                        _ => {
+                            command_frontiers = None;
+                            capture_graph = None;
                         }
                     }
                 }
@@ -434,15 +721,14 @@ impl CudaExecutableSegment {
                 capture_terminated,
             ));
         }
-        let command_graph_node_counts = (command_graph_node_counts.len() == commands.len())
-            .then(|| {
-                command_graph_node_counts
-                    .iter()
-                    .map(|count| *count as usize)
-                    .sum::<usize>()
+        let command_graph_node_counts = command_frontiers
+            .filter(|frontiers| frontiers.len() == commands.len())
+            .filter(|_| capture_graph == Some(graph))
+            .and_then(|frontiers| {
+                let (nodes, edges) = captured_graph_topology(graph)?;
+                command_graph_node_counts_from_topology(&nodes, &edges, &frontiers)
             })
-            .filter(|captured_count| graph_node_count(graph) == Some(*captured_count))
-            .map(|_| Arc::<[u32]>::from(command_graph_node_counts));
+            .map(Arc::<[u32]>::from);
 
         let mut executable: sys::CUgraphExec = std::ptr::null_mut();
         let instantiate_status =

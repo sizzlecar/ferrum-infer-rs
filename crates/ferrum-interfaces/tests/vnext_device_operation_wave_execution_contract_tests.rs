@@ -607,6 +607,91 @@ fn provider_keeps_lane_stable_scratch_in_a_reusable_segment() {
 }
 
 #[test]
+fn provider_contract_skips_identity_materialization_for_overwrite_scratch() {
+    let (fixture, sequence, session, batch, step) = setup_with_fixture(
+        fixture_with_provider_behavior(false, ProviderBehavior::ProgramBindingWithScratchTail),
+    );
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(providers.len(), 2);
+    let topology =
+        OperationDispatch::compile_submission_wave_identity(&fixture.resolved, &lane).unwrap();
+    let batch_identity = OperationDispatch::bind_compiled_submission_wave_identity(
+        &topology,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    assert_eq!(
+        batch_identity
+            .materialization_snapshot()
+            .materialized_nodes(),
+        0
+    );
+    let program_id = OperationDispatch::reusable_execution_program_id_for_wave(
+        &providers,
+        &fixture.resolved,
+        &wave,
+        &lane,
+    )
+    .unwrap()
+    .expect("scratch-tail wave must have a reusable program identity");
+    let node_count = u32::try_from(providers.len()).unwrap();
+    let program = test_reusable_program(
+        program_id,
+        node_count,
+        vec![],
+        vec![DeviceReusableExecutionSegment::new(0, 0, node_count, node_count).unwrap()],
+        vec![0],
+        vec![],
+    );
+
+    let handle = OperationDispatch::encode_and_submit_reusable_wave_with_inputs(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        &[],
+        &program,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+
+    assert_eq!(
+        batch_identity
+            .materialization_snapshot()
+            .materialized_nodes(),
+        1,
+        "only the live program-binding node should materialize; overwrite scratch needs no identity"
+    );
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(topology);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
 fn sealed_reusable_program_encodes_only_bindings_and_one_direct_segment() {
     let (fixture, sequence, session, batch, step) = setup_with_fixture(
         fixture_with_provider_behavior(false, ProviderBehavior::ProgramBinding),
