@@ -2282,8 +2282,12 @@ mod tests {
             let mut output_device: CudaSlice<bf16> = stream
                 .alloc_zeros(batch * n)
                 .expect("allocate MXFP4 output");
+            // Match the production MoE workspace bound: every resident SM may
+            // own four 16-row, 256-column FP32 reduction tiles. The native
+            // kernel indexes this fixed arena, not merely the logical [M,N]
+            // output extent.
             let mut reduce_device: CudaSlice<f32> = stream
-                .alloc_zeros(batch * n)
+                .alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256)
                 .expect("allocate MXFP4 reduction scratch");
 
             let mut sorted_token_ids = vec![i32::try_from(batch).unwrap(); MOE_BLOCK_SIZE];
