@@ -8,13 +8,12 @@
 //   * the interleaved, clamped GPT-OSS SwiGLU variant, and
 //   * BF16 expert-slot reduction into the public F16 operation output.
 
+#include <cfloat>
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 namespace {
-
-constexpr int kThreads = 256;
 
 __device__ __forceinline__ float block_sum(float value) {
     __shared__ float warp_sums[32];
@@ -71,7 +70,7 @@ __device__ __forceinline__ void selected_topk_softmax(
         float selected[32];
         for (int rank = 0; rank < top_k; ++rank) {
             int best_id = 0;
-            float best = -CUDART_INF_F;
+            float best = -FLT_MAX;
             for (int expert = 0; expert < expert_count; ++expert) {
                 const float value = candidates[expert];
                 if (value > best) {
@@ -81,7 +80,7 @@ __device__ __forceinline__ void selected_topk_softmax(
             }
             route_ids[token * top_k + rank] = best_id;
             selected[rank] = best;
-            candidates[best_id] = -CUDART_INF_F;
+            candidates[best_id] = -FLT_MAX;
         }
 
         // GPT-OSS applies softmax after top-K, not full softmax followed by a
