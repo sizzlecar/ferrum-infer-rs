@@ -112,7 +112,7 @@ GPT_OSS_SOURCE_CANARY_E2E_REASON = (
     "source_metadata_missing_harmony_call_eos_and_provider_geometry_64_tile"
 )
 GPT_OSS_DERIVED_CANARY_GENERATOR_ID = "ferrum.gpt_oss.native-mxfp4-canary"
-GPT_OSS_DERIVED_CANARY_GENERATOR_VERSION = "1"
+GPT_OSS_DERIVED_CANARY_GENERATOR_VERSION = "2"
 GPT_OSS_CANARY_OPERATION_ID = "operation.gpt_oss.routed_clamped_swiglu_moe"
 GPT_OSS_CANARY_PROVIDER_ID = (
     "provider.cuda.gpt_oss.routed_clamped_swiglu_moe.mxfp4_bf16"

@@ -700,10 +700,12 @@ mod tests {
     const GPT_OSS_TINY_SOURCE_ENV: &str = "FERRUM_GPT_OSS_TINY_SOURCE";
     const GPT_OSS_CANARY_OUT_ENV: &str = "FERRUM_GPT_OSS_CANARY_OUT";
     const FIXED_TINY_REVISION: &str = "27b6ad8040614834e65239f102de94bc459f48e5";
-    const CANARY_HIDDEN_SIZE: u64 = 64;
-    const CANARY_INTERMEDIATE_SIZE: u64 = 64;
+    // Keep the model small enough for the 6 GiB development GPU while using
+    // matrix extents accepted by the production Marlin-MoE tile catalog.
+    const CANARY_HIDDEN_SIZE: u64 = 256;
+    const CANARY_INTERMEDIATE_SIZE: u64 = 512;
     const CANARY_LAYER_COUNT: u64 = 2;
-    const CANARY_ATTENTION_HEADS: u64 = 2;
+    const CANARY_ATTENTION_HEADS: u64 = 4;
     const CANARY_KV_HEADS: u64 = 1;
     const CANARY_HEAD_DIM: u64 = 64;
     const CANARY_EXPERT_COUNT: u64 = 32;
@@ -910,7 +912,7 @@ mod tests {
         assert_eq!(semantic.attention_head_count, CANARY_ATTENTION_HEADS);
         assert_eq!(semantic.kv_head_count, CANARY_KV_HEADS);
         assert_eq!(semantic.head_dim, CANARY_HEAD_DIM);
-        assert_eq!(semantic.query_features().unwrap(), 128);
+        assert_eq!(semantic.query_features().unwrap(), 256);
         assert_eq!(semantic.kv_features().unwrap(), 64);
         assert_eq!(semantic.expert_count, CANARY_EXPERT_COUNT);
         assert_eq!(semantic.experts_per_token, CANARY_EXPERTS_PER_TOKEN);
@@ -1291,13 +1293,17 @@ mod tests {
         );
         assert_eq!(
             inventory["model.layers.0.self_attn.q_proj.weight"].1,
-            [128, 64]
+            [256, 256]
+        );
+        assert_eq!(
+            inventory["model.layers.0.mlp.experts.gate_up_proj_blocks"].1,
+            [32, 1024, 8, 16]
         );
         assert_eq!(
             inventory["model.layers.1.mlp.experts.down_proj_blocks"],
             (
                 ElementType::U8,
-                vec![32, 64, 2, 16],
+                vec![32, 256, 16, 16],
                 CanaryTensorFill::ZeroMxfp4Blocks,
             )
         );
@@ -1335,14 +1341,14 @@ mod tests {
         let blocks = canary_tensor(
             "model.layers.0.mlp.experts.down_proj_blocks",
             ElementType::U8,
-            &[32, 64, 2, 16],
+            &[32, 256, 16, 16],
             &transitions,
         );
         assert!(blocks.bytes.iter().all(|value| *value == 0));
         let scales = canary_tensor(
             "model.layers.0.mlp.experts.down_proj_scales",
             ElementType::U8,
-            &[32, 64, 2],
+            &[32, 256, 16],
             &transitions,
         );
         assert!(scales.bytes.iter().all(|value| *value == E8M0_UNIT_SCALE));
@@ -1503,7 +1509,7 @@ mod tests {
                 "ferrum_generator_id".to_owned(),
                 "ferrum.gpt_oss.native-mxfp4-canary".to_owned(),
             ),
-            ("ferrum_generator_version".to_owned(), "1".to_owned()),
+            ("ferrum_generator_version".to_owned(), "2".to_owned()),
             (
                 "ferrum_source_revision".to_owned(),
                 FIXED_TINY_REVISION.to_owned(),
@@ -1595,9 +1601,9 @@ mod tests {
 
         let prepared = super::super::prepare_from_model_dir(&output).unwrap();
         assert_eq!(prepared.descriptor().architecture(), "gpt_oss");
-        assert_eq!(prepared.descriptor().hidden_size(), 64);
+        assert_eq!(prepared.descriptor().hidden_size(), 256);
         assert_eq!(prepared.descriptor().layer_count(), 2);
-        assert_eq!(prepared.descriptor().attention_head_count(), 2);
+        assert_eq!(prepared.descriptor().attention_head_count(), 4);
         assert_eq!(prepared.descriptor().kv_head_count(), 1);
         assert_eq!(prepared.descriptor().attention_head_dimension(), 64);
         assert_eq!(prepared.descriptor().vocabulary_size(), 201_088);
