@@ -1383,17 +1383,15 @@ mod tests {
         assert_eq!(source_semantic.vocabulary_size, 201_088);
         assert!(source_semantic.tie_word_embeddings);
         assert_eq!(source_quantization.quant_method(), "mxfp4");
-        let source_prepared = super::super::prepare_from_model_dir(&source).unwrap();
-        assert_eq!(source_prepared.descriptor().architecture(), "gpt_oss");
-        assert_eq!(source_prepared.descriptor().hidden_size(), 32);
-        assert_eq!(source_prepared.descriptor().layer_count(), 2);
-        assert_eq!(source_prepared.descriptor().attention_head_dimension(), 32);
-        assert_eq!(source_prepared.descriptor().vocabulary_size(), 201_088);
-        assert_eq!(
-            source_prepared.family().weight_schema().format_id.as_str(),
-            "weight-format.safetensors.gpt-oss-mxfp4-source"
-        );
-        drop(source_prepared);
+        let source_archive = SafetensorsArchive::open(&source).unwrap();
+        let source_manifest =
+            GptOssWeightManifest::load(&source_archive, &source_semantic, &source_quantization)
+                .unwrap();
+        assert_eq!(source_manifest.tensor_count, 40);
+        assert_eq!(source_manifest.mxfp4_block_tensor_count, 4);
+        assert_eq!(source_manifest.e8m0_scale_tensor_count, 4);
+        assert_eq!(source_manifest.bf16_exclusion_tensor_count, 32);
+        drop(source_archive);
 
         let template = std::str::from_utf8(&fixed_files["chat_template.jinja"])
             .expect("fixed chat_template.jinja is UTF-8");

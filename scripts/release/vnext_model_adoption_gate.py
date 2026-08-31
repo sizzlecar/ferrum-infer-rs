@@ -108,7 +108,9 @@ GPT_OSS_SOURCE_CANARY_REVISION = "27b6ad8040614834e65239f102de94bc459f48e5"
 GPT_OSS_SOURCE_CANARY_MODEL_SHA256 = (
     "9a94c6b13dccbe61223a871c60f1e5ce020b54d1e54e969ad8ef4813f2524211"
 )
-GPT_OSS_SOURCE_CANARY_E2E_REASON = "provider_geometry_64_tile"
+GPT_OSS_SOURCE_CANARY_E2E_REASON = (
+    "source_metadata_missing_harmony_call_eos_and_provider_geometry_64_tile"
+)
 GPT_OSS_DERIVED_CANARY_GENERATOR_ID = "ferrum.gpt_oss.native-mxfp4-canary"
 GPT_OSS_DERIVED_CANARY_GENERATOR_VERSION = "1"
 GPT_OSS_CANARY_OPERATION_ID = "operation.gpt_oss.routed_clamped_swiglu_moe"
@@ -1018,7 +1020,7 @@ def validate_gpt_oss_source_canary(value: Any) -> dict[str, Any]:
         "model_sha256",
         "architecture",
         "quantization_format",
-        "typed_prepare",
+        "typed_ingestion",
         "product_e2e",
     }
     required_keys(canary, fields, label)
@@ -1045,21 +1047,39 @@ def validate_gpt_oss_source_canary(value: Any) -> dict[str, Any]:
         canary["quantization_format"] == GPT_OSS_NATIVE_MXFP4_FORMAT,
         f"{label} quantization format mismatch",
     )
-    typed_prepare = as_object(canary["typed_prepare"], f"{label}.typed_prepare")
-    typed_fields = {"accepted", "prepared_family_id", "weight_schema_accepted"}
-    required_keys(typed_prepare, typed_fields, f"{label}.typed_prepare")
+    typed_ingestion = as_object(canary["typed_ingestion"], f"{label}.typed_ingestion")
+    typed_fields = {
+        "config_accepted",
+        "weight_schema_accepted",
+        "expected_family_id",
+        "full_prepare_status",
+        "reason_code",
+    }
+    required_keys(typed_ingestion, typed_fields, f"{label}.typed_ingestion")
     require(
-        set(typed_prepare) == typed_fields,
-        f"{label}.typed_prepare field set mismatch",
+        set(typed_ingestion) == typed_fields,
+        f"{label}.typed_ingestion field set mismatch",
     )
-    require(typed_prepare["accepted"] is True, f"{label} typed prepare was not accepted")
     require(
-        typed_prepare["prepared_family_id"] == GPT_OSS_FAMILY_ID,
-        f"{label} prepared family mismatch",
+        typed_ingestion["config_accepted"] is True,
+        f"{label} typed config was not accepted",
     )
     require(
-        typed_prepare["weight_schema_accepted"] is True,
+        typed_ingestion["expected_family_id"] == GPT_OSS_FAMILY_ID,
+        f"{label} expected family mismatch",
+    )
+    require(
+        typed_ingestion["weight_schema_accepted"] is True,
         f"{label} weight schema was not accepted",
+    )
+    require(
+        typed_ingestion["full_prepare_status"] == "not_applicable",
+        f"{label} immutable source full prepare status mismatch",
+    )
+    require(
+        typed_ingestion["reason_code"]
+        == "source_metadata_missing_harmony_call_eos",
+        f"{label} immutable source prepare reason mismatch",
     )
     product_e2e = as_object(canary["product_e2e"], f"{label}.product_e2e")
     product_fields = {"status", "reason_code", "reason"}
@@ -2071,15 +2091,20 @@ def synthetic_gpt_oss_m2_canaries() -> dict[str, Any]:
             "model_sha256": source_model_sha256,
             "architecture": GPT_OSS_ARCHITECTURE,
             "quantization_format": GPT_OSS_NATIVE_MXFP4_FORMAT,
-            "typed_prepare": {
-                "accepted": True,
-                "prepared_family_id": GPT_OSS_FAMILY_ID,
+            "typed_ingestion": {
+                "config_accepted": True,
                 "weight_schema_accepted": True,
+                "expected_family_id": GPT_OSS_FAMILY_ID,
+                "full_prepare_status": "not_applicable",
+                "reason_code": "source_metadata_missing_harmony_call_eos",
             },
             "product_e2e": {
                 "status": "not_applicable",
                 "reason_code": GPT_OSS_SOURCE_CANARY_E2E_REASON,
-                "reason": "H32/head_dim32 cannot enter the production 64-tile provider",
+                "reason": (
+                    "immutable source omits Harmony CALL from generation EOS and "
+                    "H32/head_dim32 cannot enter the production 64-tile provider"
+                ),
             },
         },
         "target_format_derived": {
