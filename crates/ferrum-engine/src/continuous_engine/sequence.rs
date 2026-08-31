@@ -1630,6 +1630,35 @@ impl SequenceState {
         None
     }
 
+    /// Return whether the just-committed token belongs in the incremental
+    /// response stream.
+    ///
+    /// Ordinary stop/EOS tokens remain engine-owned and are never exposed.
+    /// Harmony is different: `<|call|>` and `<|return|>` are both model EOS
+    /// tokens and required wire-protocol terminators, so its typed response
+    /// parser must observe the decoded marker before completion is published.
+    pub(in crate::continuous_engine) fn should_stream_generated_token(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+        stop_reason: Option<FinishReason>,
+    ) -> bool {
+        match stop_reason {
+            Some(FinishReason::Error) => false,
+            Some(FinishReason::Stop | FinishReason::EOS) => {
+                self.sampling_params.model_output_protocol
+                    == ferrum_types::ModelOutputProtocol::HarmonyGptOss
+                    && tokenizer.is_some_and(|tokenizer| {
+                        ["<|call|>", "<|return|>"]
+                            .into_iter()
+                            .filter_map(|marker| tokenizer.token_id(marker))
+                            .any(|terminal| terminal == token)
+                    })
+            }
+            _ => true,
+        }
+    }
+
     /// Cheap stop check for tests and callers that do not have tokenizer
     /// access. Engine hot paths use `stop_reason` through `EngineInner`.
     pub fn should_stop(&self) -> bool {

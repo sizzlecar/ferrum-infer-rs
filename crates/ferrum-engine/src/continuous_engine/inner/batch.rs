@@ -390,7 +390,7 @@ impl EngineInner {
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
                     let stop_reason = self.stop_reason_for_request(rid);
-                    if self.should_stream_generated_token(stop_reason) {
+                    if self.should_stream_generated_token(rid, first_token, stop_reason) {
                         self.send_stream_update(rid, first_token).await;
                     }
                     if let Some(reason) = stop_reason {
@@ -896,7 +896,7 @@ impl EngineInner {
                 }
             }
             let stop_reason = self.stop_reason_for_request(&work.rid);
-            if self.should_stream_generated_token(stop_reason) {
+            if self.should_stream_generated_token(&work.rid, first_token, stop_reason) {
                 self.send_stream_update(&work.rid, first_token).await;
             }
             if let Some(reason) = stop_reason {
@@ -990,7 +990,7 @@ impl EngineInner {
                 None
             };
             let stop_reason = self.stop_reason_for_request(&rid);
-            if self.should_stream_generated_token(stop_reason) {
+            if self.should_stream_generated_token(&rid, next_token, stop_reason) {
                 self.send_stream_update(&rid, next_token).await;
             }
             if let Some(t0) = t0_stream {

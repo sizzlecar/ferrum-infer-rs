@@ -6,6 +6,7 @@
 //! semantics and therefore have a separate provider identity and CUDA ABI.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 
 use cudarc::cublas::CudaBlas;
@@ -615,6 +616,31 @@ struct AttentionLaunch {
     sequence_tokens: u64,
 }
 
+fn bind_launch_replay_key(
+    replay_key: CudaCommandReplayKeyBuilder,
+    launch: AttentionLaunch,
+) -> CudaCommandReplayKeyBuilder {
+    // The sequence frontier is runtime data, not executable topology. The
+    // eager binding command writes `position_start`, `sequence_tokens`, and
+    // the current page table into the stable per-program binding region
+    // before the captured compute segment runs. Binding those values into the
+    // compute key would compile a fresh executable at every decode position.
+    replay_key
+        .u64(launch.input_region as u64)
+        .u64(launch.output_region as u64)
+        .u64(launch.binding_offset)
+        .u64(launch.packed_token_start)
+        .u64(launch.normalized_offset)
+        .u64(launch.query_raw_offset)
+        .u64(launch.key_raw_offset)
+        .u64(launch.value_raw_offset)
+        .u64(launch.query_offset)
+        .u64(launch.context_offset)
+        .u64(launch.projected_offset)
+        .u64(launch.tokens)
+        .i32(launch.tokens_i32)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PackedLaunch {
     input_region: usize,
@@ -642,25 +668,57 @@ fn gpt_oss_reusable_topology(
     if ranges.is_empty() {
         return Err("CUDA GPT-OSS attention topology has no participants".to_owned());
     }
+    let fingerprint = gpt_oss_reusable_topology_fingerprint(
+        shape,
+        ranges.len(),
+        ranges.iter().map(|range| {
+            (
+                range.source_token_range(),
+                range.full_input_tokens(),
+                range.immediate_tokens(),
+            )
+        }),
+    )?;
+    Ok(ReusableExecutionTopology::Dynamic(fingerprint))
+}
+
+fn gpt_oss_reusable_topology_fingerprint(
+    shape: GptOssAttentionShape,
+    participant_count: usize,
+    ranges: impl IntoIterator<Item = (Range<u64>, u64, u64)>,
+) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
+    if participant_count == 0 {
+        return Err("CUDA GPT-OSS attention topology has no participants".to_owned());
+    }
     let mut digest = Sha256::new();
-    digest.update(b"ferrum.cuda.gpt-oss-attention.reusable-topology.v1\0");
+    digest.update(b"ferrum.cuda.gpt-oss-attention.reusable-topology.v2\0");
     hash_shape(&mut digest, shape);
-    digest.update((ranges.len() as u64).to_le_bytes());
-    for range in ranges {
-        let source = range.source_token_range();
-        if source.end > range.full_input_tokens()
-            || range.full_input_tokens() > shape.maximum_context_tokens
-            || range.immediate_tokens() == 0
+    let participant_count_u64 = u64::try_from(participant_count)
+        .map_err(|_| "CUDA GPT-OSS attention participant count exceeds u64".to_owned())?;
+    digest.update(participant_count_u64.to_le_bytes());
+    let mut observed_participants = 0_usize;
+    for (source, full_input_tokens, immediate_tokens) in ranges {
+        if source.start >= source.end
+            || source.end > full_input_tokens
+            || full_input_tokens > shape.maximum_context_tokens
+            || immediate_tokens == 0
+            || source.end - source.start != immediate_tokens
         {
             return Err("CUDA GPT-OSS attention topology token range is invalid".to_owned());
         }
-        digest.update(range.immediate_tokens().to_le_bytes());
-        digest.update(source.start.to_le_bytes());
-        digest.update(source.end.to_le_bytes());
-        digest.update(range.full_input_tokens().to_le_bytes());
+        // The exact frontier and page table are written into the stable
+        // program-binding region before each replay. Only the participant's
+        // active token width changes compute launch topology.
+        digest.update(immediate_tokens.to_le_bytes());
+        observed_participants = observed_participants
+            .checked_add(1)
+            .ok_or_else(|| "CUDA GPT-OSS attention participant count overflowed".to_owned())?;
     }
-    Ok(ReusableExecutionTopology::Dynamic(
-        DeviceReusableExecutionTopologyFingerprint::from_sha256(digest.finalize().into()),
+    if observed_participants != participant_count {
+        return Err("CUDA GPT-OSS attention topology participant count differs".to_owned());
+    }
+    Ok(DeviceReusableExecutionTopologyFingerprint::from_sha256(
+        digest.finalize().into(),
     ))
 }
 
@@ -1021,22 +1079,7 @@ fn encode_attention(
     .u64(binding_layout.slot_bytes)
     .u64(launches.len() as u64);
     for launch in &launches {
-        replay_key = replay_key
-            .u64(launch.input_region as u64)
-            .u64(launch.output_region as u64)
-            .u64(launch.binding_offset)
-            .u64(launch.packed_token_start)
-            .u64(launch.normalized_offset)
-            .u64(launch.query_raw_offset)
-            .u64(launch.key_raw_offset)
-            .u64(launch.value_raw_offset)
-            .u64(launch.query_offset)
-            .u64(launch.context_offset)
-            .u64(launch.projected_offset)
-            .u64(launch.tokens)
-            .i32(launch.tokens_i32)
-            .u64(launch.position_start)
-            .u64(launch.sequence_tokens);
+        replay_key = bind_launch_replay_key(replay_key, *launch);
     }
     let replay_key = replay_key.finish();
     let functions = functions.clone();
@@ -2141,6 +2184,58 @@ mod tests {
         let mut changed_yarn = sliding;
         changed_yarn.yarn_beta_fast = 16.0;
         assert_ne!(key(sliding), key(changed_yarn));
+    }
+
+    #[test]
+    fn replay_identity_treats_the_binding_frontier_as_runtime_data() {
+        let launch = |position_start| AttentionLaunch {
+            input_region: 0,
+            output_region: 1,
+            binding_offset: 64,
+            packed_token_start: 0,
+            normalized_offset: 128,
+            query_raw_offset: 256,
+            key_raw_offset: 384,
+            value_raw_offset: 512,
+            query_offset: 640,
+            context_offset: 768,
+            projected_offset: 896,
+            tokens: 1,
+            tokens_i32: 1,
+            position_start,
+            sequence_tokens: position_start + 1,
+        };
+        let key = |launch| {
+            bind_launch_replay_key(
+                CudaCommandReplayKeyBuilder::new("provider", COMPUTE_OPERATION),
+                launch,
+            )
+            .finish()
+        };
+
+        assert_eq!(key(launch(1)), key(launch(127)));
+
+        let mut wider = launch(127);
+        wider.tokens = 2;
+        wider.tokens_i32 = 2;
+        assert_ne!(key(launch(1)), key(wider));
+    }
+
+    #[test]
+    fn reusable_topology_treats_the_binding_frontier_as_runtime_data() {
+        let shape = GptOssAttentionShape::from_attributes(&attributes(128)).unwrap();
+        let topology = |source: Range<u64>, full_input_tokens, immediate_tokens| {
+            gpt_oss_reusable_topology_fingerprint(
+                shape,
+                1,
+                [(source, full_input_tokens, immediate_tokens)],
+            )
+            .unwrap()
+        };
+
+        assert_eq!(topology(1..2, 2, 1), topology(127..128, 128, 1));
+        assert_ne!(topology(1..2, 2, 1), topology(126..128, 128, 2));
+        assert!(gpt_oss_reusable_topology_fingerprint(shape, 2, [(1..2, 2, 1)],).is_err());
     }
 
     #[test]
