@@ -1810,7 +1810,8 @@ mod tests {
     use crate::marlin_repack::{prepare_block_fp8_weight_for_fp8_marlin, repack_gptq_to_marlin};
     #[cfg(feature = "vllm-moe-marlin")]
     use crate::mxfp4_marlin_materializer::{
-        prepare_mxfp4_expert_scales_for_marlin, transpose_mxfp4_expert_blocks_to_gptq_words,
+        permute_mxfp4_marlin_bias_bf16, prepare_mxfp4_expert_scales_for_marlin,
+        transpose_mxfp4_expert_blocks_to_gptq_words,
     };
     #[cfg(feature = "vllm-moe-marlin")]
     use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
@@ -1856,6 +1857,21 @@ mod tests {
             use_atomic_add: true,
             use_fp32_reduce: false,
         }
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn prepare_mxfp4_marlin_bias(bias: &[bf16], expert_count: usize, n: usize) -> Vec<bf16> {
+        let source_bytes = bias
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let prepared = permute_mxfp4_marlin_bias_bf16(&source_bytes, expert_count, n)
+            .expect("prepare MXFP4 Marlin P32 bias");
+        assert_eq!(prepared.len(), source_bytes.len());
+        prepared
+            .chunks_exact(2)
+            .map(|bytes| bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
+            .collect()
     }
 
     #[cfg(feature = "vllm-moe-marlin")]
@@ -1962,7 +1978,8 @@ mod tests {
 
         let weight_device: CudaSlice<i32> = stream.clone_htod(&packed_weight).unwrap();
         let scales_device: CudaSlice<u8> = stream.clone_htod(&packed_scales).unwrap();
-        let bias_device: CudaSlice<bf16> = stream.clone_htod(&bias).unwrap();
+        let prepared_bias = prepare_mxfp4_marlin_bias(&bias, EXPERTS, n);
+        let bias_device: CudaSlice<bf16> = stream.clone_htod(&prepared_bias).unwrap();
         let mut output_device: CudaSlice<bf16> = stream.alloc_zeros(ROWS * n).unwrap();
         let sms = usize::try_from(
             context
@@ -2341,6 +2358,120 @@ mod tests {
     #[test]
     #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE native artifact"]
     #[cfg(feature = "vllm-moe-marlin")]
+    fn gpt_oss_mxfp4_marlin_bias_p32_two_experts_matches_logical_source() {
+        const EXPERTS: usize = 2;
+        const ROWS: usize = 2;
+        const N: usize = 64;
+        const K: usize = 128;
+        const MOE_BLOCK_SIZE: usize = 16;
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+        let sms = usize::try_from(
+            context
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .expect("query CUDA SM count"),
+        )
+        .expect("CUDA SM count must be positive");
+        let input_device: CudaSlice<bf16> = stream
+            .alloc_zeros(ROWS * K)
+            .expect("allocate zero MXFP4 input");
+        let weight_device: CudaSlice<i32> = stream
+            .alloc_zeros(EXPERTS * N * K / 8)
+            .expect("allocate zero MXFP4 weights");
+        let neutral_scales = vec![127_u8; EXPERTS * N * (K / 32)];
+        let scales_device: CudaSlice<u8> = stream
+            .clone_htod(&neutral_scales)
+            .expect("upload neutral MXFP4 scales");
+        let logical_bias = (0..EXPERTS)
+            .flat_map(|expert| {
+                (0..N).map(move |output| {
+                    let magnitude = (output + 1) as f32;
+                    bf16::from_f32(if expert == 0 { -magnitude } else { magnitude })
+                })
+            })
+            .collect::<Vec<_>>();
+        let prepared_bias = prepare_mxfp4_marlin_bias(&logical_bias, EXPERTS, N);
+        let bias_device: CudaSlice<bf16> = stream
+            .clone_htod(&prepared_bias)
+            .expect("upload P32 MXFP4 bias");
+        let mut output_device: CudaSlice<bf16> =
+            stream.alloc_zeros(ROWS * N).expect("allocate MXFP4 output");
+        let mut reduce_device: CudaSlice<f32> = stream
+            .alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256)
+            .expect("allocate MXFP4 reduction scratch");
+        let mut sorted = vec![ROWS as i32; EXPERTS * MOE_BLOCK_SIZE];
+        sorted[0] = 0;
+        sorted[MOE_BLOCK_SIZE] = 1;
+        let sorted_device: CudaSlice<i32> = stream.clone_htod(&sorted).unwrap();
+        let expert_device: CudaSlice<i32> = stream.clone_htod(&[0, 1]).unwrap();
+        let padded_device: CudaSlice<i32> = stream
+            .clone_htod(&[(EXPERTS * MOE_BLOCK_SIZE) as i32])
+            .unwrap();
+        let workspace: CudaSlice<i32> = stream.alloc_zeros(sms * 4).unwrap();
+
+        {
+            let (a, _a_guard) = input_device.device_ptr(&stream);
+            let (b, _b_guard) = weight_device.device_ptr(&stream);
+            let (c, _c_guard) = output_device.device_ptr_mut(&stream);
+            let (c_tmp, _c_tmp_guard) = reduce_device.device_ptr_mut(&stream);
+            let (bias, _bias_guard) = bias_device.device_ptr(&stream);
+            let (scales, _scales_guard) = scales_device.device_ptr(&stream);
+            let (workspace, _workspace_guard) = workspace.device_ptr(&stream);
+            let (sorted, _sorted_guard) = sorted_device.device_ptr(&stream);
+            let (experts, _experts_guard) = expert_device.device_ptr(&stream);
+            let (padded, _padded_guard) = padded_device.device_ptr(&stream);
+            launch_marlin_moe_mxfp4_bf16(
+                &stream,
+                MarlinMoeMxfp4Bf16LaunchArgs {
+                    weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+                    expert_count: EXPERTS as i32,
+                    a,
+                    b,
+                    c,
+                    c_tmp: Some(c_tmp),
+                    bias,
+                    scales,
+                    workspace,
+                    sorted_token_ids: sorted,
+                    expert_ids: experts,
+                    num_tokens_past_padded: padded,
+                    topk_weights: None,
+                    moe_block_size: MOE_BLOCK_SIZE as i32,
+                    top_k: 1,
+                    mul_topk_weights: false,
+                    is_ep: false,
+                    prob_m: ROWS as i32,
+                    prob_n: N as i32,
+                    prob_k: K as i32,
+                    group_size: 32,
+                    device_ordinal: 0,
+                    use_atomic_add: false,
+                    use_fp32_reduce: true,
+                },
+            )
+            .expect("launch MXFP4 bias-only Marlin-MoE");
+            stream.synchronize().expect("synchronize bias-only launch");
+        }
+
+        let actual = stream
+            .clone_dtoh(&output_device)
+            .expect("download bias-only output");
+        for row in 0..ROWS {
+            for output in 0..N {
+                assert_eq!(
+                    actual[row * N + output].to_bits(),
+                    logical_bias[row * N + output].to_bits(),
+                    "row={row} expert={row} output={output}"
+                );
+            }
+        }
+        eprintln!("FERRUM GPTOSS MXFP4 MARLIN BIAS P32 E2 M2 PASS: N={N} K={K}");
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE native artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
     fn gpt_oss_mxfp4_marlin_moe_bf16_ffi_matches_source_reference_for_four_cases() {
         const MOE_BLOCK_SIZE: usize = 16;
         const LCG_MULTIPLIER: u64 = 0x5851_f42d_4c95_7f2d;
@@ -2480,7 +2611,9 @@ mod tests {
             let scales_device: CudaSlice<u8> = stream
                 .clone_htod(&packed_scales)
                 .expect("upload packed E8M0 scales");
-            let bias_device: CudaSlice<bf16> = stream.clone_htod(&bias).expect("upload bias");
+            let prepared_bias = prepare_mxfp4_marlin_bias(&bias, 1, n);
+            let bias_device: CudaSlice<bf16> =
+                stream.clone_htod(&prepared_bias).expect("upload P32 bias");
             let mut output_device: CudaSlice<bf16> = stream
                 .alloc_zeros(batch * n)
                 .expect("allocate MXFP4 output");
@@ -2689,7 +2822,9 @@ mod tests {
         let scales_device: CudaSlice<u8> = stream
             .clone_htod(&packed_scales)
             .expect("upload official-shape E8M0 scales");
-        let bias_device: CudaSlice<bf16> = stream.clone_htod(&bias).expect("upload bias");
+        let prepared_bias = prepare_mxfp4_marlin_bias(&bias, 1, N);
+        let bias_device: CudaSlice<bf16> =
+            stream.clone_htod(&prepared_bias).expect("upload P32 bias");
         let mut output_device: CudaSlice<bf16> = stream
             .alloc_zeros(BATCH * N)
             .expect("allocate official-shape output");

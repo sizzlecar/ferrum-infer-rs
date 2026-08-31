@@ -20,6 +20,8 @@ use ferrum_interfaces::vnext::{
 };
 use sha2::{Digest, Sha256};
 
+use crate::marlin_repack::MARLIN_CHANNEL_PERMUTATION;
+
 #[cfg(test)]
 use crate::marlin_repack::repack_scales_to_marlin;
 
@@ -38,7 +40,7 @@ pub const GPT_OSS_MXFP4_MARLIN_WEIGHT_LAYOUT_ID: &str =
 pub const GPT_OSS_MXFP4_MARLIN_QUANTIZATION_FORMAT_ID: &str =
     "quantization.marlin.mxfp4-e2m1-e8m0-group32";
 
-const MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(1, 0);
+const MATERIALIZER_VERSION: ContractVersion = ContractVersion::new(1, 1);
 const SOURCE_SCHEMA_VERSION: ContractVersion = ContractVersion::new(1, 0);
 const MXFP4_GROUP_SIZE: usize = 32;
 const MXFP4_PACKED_BYTES_PER_GROUP: usize = 16;
@@ -88,6 +90,24 @@ impl GptOssMxfp4ToMarlinWeightMaterializer {
                 return source
                     .component(source_component)
                     .map(|payload| vec![payload]);
+            }
+            let bias = bias_candidate_from_source_component(source_component)?;
+            if **execution_component == bias.execution_component {
+                let source_payload = source.component(source_component)?;
+                let bytes = permute_mxfp4_marlin_bias_bf16(
+                    source_payload.bytes(),
+                    bias.expert_count,
+                    bias.output_features,
+                )?;
+                return WeightComponentPayload::from_ordered_sources(
+                    execution_component,
+                    execution_component.external_names.clone(),
+                    source_payload.source_files().to_vec(),
+                    execution_component.dimensions.clone(),
+                    execution_component.physical_element_type(),
+                    bytes,
+                )
+                .map(|payload| vec![payload]);
             }
         }
 
@@ -150,11 +170,15 @@ impl WeightMaterializer for GptOssMxfp4ToMarlinWeightMaterializer {
         let mut derived_sources = BTreeMap::new();
         for candidate in candidates {
             let sources = vec![
-                candidate.source_blocks_id.clone(),
-                candidate.source_scales_id.clone(),
+                candidate.weight.source_blocks_id.clone(),
+                candidate.weight.source_scales_id.clone(),
             ];
-            derived_sources.insert(candidate.packed_component.id, sources.clone());
-            derived_sources.insert(candidate.scales_component.id, sources);
+            derived_sources.insert(candidate.weight.packed_component.id, sources.clone());
+            derived_sources.insert(candidate.weight.scales_component.id, sources);
+            derived_sources.insert(
+                candidate.bias.execution_component.id,
+                vec![candidate.bias.source_component_id],
+            );
         }
         execution_schema
             .components
@@ -233,8 +257,14 @@ pub(crate) fn mxfp4_marlin_transform_descriptors(
     }
     collect_candidates(family.weight_schema())?
         .into_iter()
-        .map(|candidate| Ok(candidate.transform_descriptor()))
+        .map(|candidate| Ok(candidate.weight.transform_descriptor()))
         .collect()
+}
+
+#[derive(Debug, Clone)]
+struct GptOssMarlinCandidate {
+    weight: Mxfp4MarlinCandidate,
+    bias: Mxfp4MarlinBiasCandidate,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +276,15 @@ struct Mxfp4MarlinCandidate {
     execution_dimensions: Vec<u64>,
     packed_component: WeightComponentSpec,
     scales_component: WeightComponentSpec,
+}
+
+#[derive(Debug, Clone)]
+struct Mxfp4MarlinBiasCandidate {
+    weight_id: WeightId,
+    source_component_id: WeightId,
+    expert_count: usize,
+    output_features: usize,
+    execution_component: WeightComponentSpec,
 }
 
 impl Mxfp4MarlinCandidate {
@@ -292,6 +331,25 @@ impl Mxfp4MarlinCandidate {
     }
 }
 
+impl Mxfp4MarlinBiasCandidate {
+    fn execution_layout(&self) -> PhysicalWeightLayout {
+        let channel_blocks = u64::try_from(self.output_features / MARLIN_CHANNEL_PERMUTATION.len())
+            .expect("validated Marlin bias channel-block count fits u64");
+        let output_features =
+            u64::try_from(self.output_features).expect("validated Marlin bias width fits u64");
+        PhysicalWeightLayout::AxisReshapePermutation {
+            values: Box::new(PhysicalWeightLayout::Dense {
+                component_id: self.execution_component.id.clone(),
+            }),
+            axis: 1,
+            logical_offset: 0,
+            extent: output_features,
+            reshape: vec![channel_blocks, 4, 4, 2],
+            stored_axis_order: vec![0, 2, 1, 3],
+        }
+    }
+}
+
 fn execution_component_binding(
     component_id: WeightId,
     logical_dimensions: &[u64],
@@ -317,14 +375,19 @@ fn derive_execution_schema(
     let candidates = collect_candidates(source_schema)?;
     let by_weight = candidates
         .iter()
-        .map(|candidate| (&candidate.weight_id, candidate))
+        .map(|candidate| (&candidate.weight.weight_id, &candidate.weight))
+        .collect::<BTreeMap<_, _>>();
+    let by_bias_weight = candidates
+        .iter()
+        .map(|candidate| (&candidate.bias.weight_id, &candidate.bias))
         .collect::<BTreeMap<_, _>>();
     let removed = candidates
         .iter()
         .flat_map(|candidate| {
             [
-                candidate.source_blocks_id.clone(),
-                candidate.source_scales_id.clone(),
+                candidate.weight.source_blocks_id.clone(),
+                candidate.weight.source_scales_id.clone(),
+                candidate.bias.source_component_id.clone(),
             ]
         })
         .collect::<BTreeSet<_>>();
@@ -337,11 +400,20 @@ fn derive_execution_schema(
         .components
         .retain(|component| !removed.contains(&component.id));
     for candidate in &candidates {
-        schema.components.push(candidate.packed_component.clone());
-        schema.components.push(candidate.scales_component.clone());
+        schema
+            .components
+            .push(candidate.weight.packed_component.clone());
+        schema
+            .components
+            .push(candidate.weight.scales_component.clone());
+        schema
+            .components
+            .push(candidate.bias.execution_component.clone());
     }
     for tensor in &mut schema.tensors {
         if let Some(candidate) = by_weight.get(&tensor.id) {
+            tensor.physical_layout = candidate.execution_layout();
+        } else if let Some(candidate) = by_bias_weight.get(&tensor.id) {
             tensor.physical_layout = candidate.execution_layout();
         }
     }
@@ -355,7 +427,7 @@ fn derive_execution_schema(
 
 fn collect_candidates(
     source_schema: &WeightSchema,
-) -> Result<Vec<Mxfp4MarlinCandidate>, VNextError> {
+) -> Result<Vec<GptOssMarlinCandidate>, VNextError> {
     if source_schema.format_id.as_str() != GPT_OSS_MXFP4_SOURCE_WEIGHT_FORMAT_ID
         || source_schema.layout_id.as_str() != GPT_OSS_MXFP4_SOURCE_WEIGHT_LAYOUT_ID
         || source_schema.version != SOURCE_SCHEMA_VERSION
@@ -370,6 +442,24 @@ fn collect_candidates(
         .iter()
         .map(|component| (&component.id, component))
         .collect::<BTreeMap<_, _>>();
+    let mut components_by_external_name = BTreeMap::new();
+    for component in &source_schema.components {
+        for external_name in &component.external_names {
+            components_by_external_name
+                .entry(external_name.as_str())
+                .or_insert_with(Vec::new)
+                .push(component);
+        }
+    }
+    let mut dense_tensors_by_component = BTreeMap::new();
+    for tensor in &source_schema.tensors {
+        if let PhysicalWeightLayout::Dense { component_id } = &tensor.physical_layout {
+            dense_tensors_by_component
+                .entry(component_id)
+                .or_insert_with(Vec::new)
+                .push(tensor);
+        }
+    }
     let mut candidates = Vec::new();
     let mut selected = BTreeSet::new();
     for tensor in &source_schema.tensors {
@@ -431,8 +521,8 @@ fn collect_candidates(
                 tensor.id
             )));
         }
-        let mut candidate = candidate_from_source_pair(source_blocks, source_scales)?;
-        if candidate.logical_dimensions != tensor.dimensions
+        let mut weight = candidate_from_source_pair(source_blocks, source_scales)?;
+        if weight.logical_dimensions != tensor.dimensions
             || tensor.required != (source_blocks.required && source_scales.required)
         {
             return Err(invalid_plan(format!(
@@ -440,8 +530,54 @@ fn collect_candidates(
                 tensor.id
             )));
         }
-        candidate.weight_id = tensor.id.clone();
-        candidates.push(candidate);
+        weight.weight_id = tensor.id.clone();
+
+        let bias_external_name = paired_bias_external_name(source_blocks, source_scales)?;
+        let Some([source_bias]) = components_by_external_name
+            .get(bias_external_name.as_str())
+            .map(Vec::as_slice)
+        else {
+            return Err(invalid_plan(format!(
+                "GPT-OSS MXFP4 tensor `{}` requires exactly one paired bias component named `{bias_external_name}`",
+                tensor.id
+            )));
+        };
+        if !selected.insert(source_bias.id.clone()) {
+            return Err(invalid_plan(format!(
+                "GPT-OSS MXFP4 bias component `{}` is shared or repeated",
+                source_bias.id
+            )));
+        }
+        let mut bias = bias_candidate_from_source_component(source_bias)?;
+        let Some([bias_tensor]) = dense_tensors_by_component
+            .get(&source_bias.id)
+            .map(Vec::as_slice)
+        else {
+            return Err(invalid_plan(format!(
+                "GPT-OSS MXFP4 bias component `{}` must back exactly one dense tensor",
+                source_bias.id
+            )));
+        };
+        if bias_tensor.dimensions != source_bias.dimensions
+            || bias_tensor.logical_element_type != ElementType::Bf16
+            || bias_tensor.required != source_bias.required
+        {
+            return Err(invalid_plan(format!(
+                "GPT-OSS MXFP4 bias tensor `{}` differs from its source component",
+                bias_tensor.id
+            )));
+        }
+        let [experts, rows, _] = weight.logical_dimensions.as_slice() else {
+            unreachable!("validated MXFP4 candidate has [E,N,K] dimensions")
+        };
+        if source_bias.dimensions != [*experts, *rows] {
+            return Err(invalid_plan(format!(
+                "GPT-OSS MXFP4 bias component `{}` shape differs from paired tensor `{}`",
+                source_bias.id, tensor.id
+            )));
+        }
+        bias.weight_id = bias_tensor.id.clone();
+        candidates.push(GptOssMarlinCandidate { weight, bias });
     }
 
     let source_mxfp4_components = source_schema
@@ -451,13 +587,50 @@ fn collect_candidates(
         .count();
     if candidates.is_empty()
         || source_mxfp4_components != candidates.len()
-        || selected.len() != candidates.len() * 2
+        || selected.len() != candidates.len() * 3
     {
         return Err(invalid_plan(
-            "GPT-OSS MXFP4 source schema contains no complete one-to-one blocks/scale pairs",
+            "GPT-OSS MXFP4 source schema contains no complete one-to-one blocks/scale/bias groups",
         ));
     }
     Ok(candidates)
+}
+
+fn paired_bias_external_name(
+    source_blocks: &WeightComponentSpec,
+    source_scales: &WeightComponentSpec,
+) -> Result<String, VNextError> {
+    let [blocks_name] = source_blocks.external_names.as_slice() else {
+        return Err(invalid_plan(format!(
+            "GPT-OSS MXFP4 blocks component `{}` must have one external name",
+            source_blocks.id
+        )));
+    };
+    let [scales_name] = source_scales.external_names.as_slice() else {
+        return Err(invalid_plan(format!(
+            "GPT-OSS MXFP4 scales component `{}` must have one external name",
+            source_scales.id
+        )));
+    };
+    let blocks_stem = blocks_name.strip_suffix("_blocks").ok_or_else(|| {
+        invalid_plan(format!(
+            "GPT-OSS MXFP4 blocks component `{}` lacks the locked `_blocks` suffix",
+            source_blocks.id
+        ))
+    })?;
+    let scales_stem = scales_name.strip_suffix("_scales").ok_or_else(|| {
+        invalid_plan(format!(
+            "GPT-OSS MXFP4 scales component `{}` lacks the locked `_scales` suffix",
+            source_scales.id
+        ))
+    })?;
+    if blocks_stem != scales_stem {
+        return Err(invalid_plan(format!(
+            "GPT-OSS MXFP4 components `{}` and `{}` do not share one checkpoint stem",
+            source_blocks.id, source_scales.id
+        )));
+    }
+    Ok(format!("{blocks_stem}_bias"))
 }
 
 fn candidate_from_source_pair(
@@ -552,6 +725,100 @@ fn candidate_from_source_pair(
     })
 }
 
+fn bias_candidate_from_source_component(
+    source_bias: &WeightComponentSpec,
+) -> Result<Mxfp4MarlinBiasCandidate, VNextError> {
+    let [experts, output_features] = source_bias.dimensions.as_slice() else {
+        return Err(invalid_plan(format!(
+            "GPT-OSS MXFP4 bias component `{}` must have [E,N] shape",
+            source_bias.id
+        )));
+    };
+    if *experts == 0
+        || *output_features == 0
+        || !output_features.is_multiple_of(MARLIN_CHANNEL_PERMUTATION.len() as u64)
+        || source_bias.role != WeightComponentRole::Values
+        || source_bias.encoding
+            != (WeightEncoding::Dense {
+                element_type: ElementType::Bf16,
+            })
+        || source_bias.external_names.len() != 1
+        || !source_bias.external_names[0].ends_with("_bias")
+    {
+        return Err(invalid_plan(format!(
+            "GPT-OSS MXFP4 bias component `{}` violates the BF16 Marlin P32 ABI",
+            source_bias.id
+        )));
+    }
+    let expert_count = usize::try_from(*experts)
+        .map_err(|_| invalid_plan("GPT-OSS MXFP4 bias expert count exceeds host address space"))?;
+    let output_features = usize::try_from(*output_features)
+        .map_err(|_| invalid_plan("GPT-OSS MXFP4 bias width exceeds host address space"))?;
+    Ok(Mxfp4MarlinBiasCandidate {
+        weight_id: WeightId::new("weight.pending.gpt-oss-mxfp4-bias")?,
+        source_component_id: source_bias.id.clone(),
+        expert_count,
+        output_features,
+        execution_component: WeightComponentSpec {
+            id: derived_bias_component_id(source_bias)?,
+            role: WeightComponentRole::Values,
+            external_names: vec![derived_bias_external_name(source_bias)],
+            dimensions: source_bias.dimensions.clone(),
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::Bf16,
+            },
+            required: source_bias.required,
+        },
+    })
+}
+
+/// Permute one expert-major logical BF16 bias stack into Marlin's P32 output
+/// fragment order. Values remain opaque little-endian BF16 bytes.
+pub(crate) fn permute_mxfp4_marlin_bias_bf16(
+    source_bytes: &[u8],
+    expert_count: usize,
+    output_features: usize,
+) -> Result<Vec<u8>, VNextError> {
+    const BF16_BYTES: usize = 2;
+
+    if expert_count == 0
+        || output_features == 0
+        || !output_features.is_multiple_of(MARLIN_CHANNEL_PERMUTATION.len())
+    {
+        return Err(invalid_plan(
+            "GPT-OSS MXFP4 Marlin bias requires non-zero [E,N] with N divisible by 32",
+        ));
+    }
+    let expected_bytes = expert_count
+        .checked_mul(output_features)
+        .and_then(|elements| elements.checked_mul(BF16_BYTES))
+        .ok_or_else(|| invalid_plan("GPT-OSS MXFP4 Marlin bias byte count overflows usize"))?;
+    if source_bytes.len() != expected_bytes {
+        return Err(invalid_plan(format!(
+            "GPT-OSS MXFP4 Marlin bias contains {} bytes, expected {expected_bytes}",
+            source_bytes.len()
+        )));
+    }
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(expected_bytes)
+        .map_err(|_| invalid_plan("could not reserve GPT-OSS MXFP4 Marlin bias output"))?;
+    output.resize(expected_bytes, 0_u8);
+    let expert_bytes = output_features * BF16_BYTES;
+    for expert in 0..expert_count {
+        let expert_base = expert * expert_bytes;
+        for channel_base in (0..output_features).step_by(MARLIN_CHANNEL_PERMUTATION.len()) {
+            for (destination, source) in MARLIN_CHANNEL_PERMUTATION.iter().copied().enumerate() {
+                let source = expert_base + (channel_base + source) * BF16_BYTES;
+                let destination = expert_base + (channel_base + destination) * BF16_BYTES;
+                output[destination..destination + BF16_BYTES]
+                    .copy_from_slice(&source_bytes[source..source + BF16_BYTES]);
+            }
+        }
+    }
+    Ok(output)
+}
+
 fn execution_quantization_spec() -> Result<QuantizationSpec, VNextError> {
     Ok(QuantizationSpec {
         format_id: QuantizationFormatId::new(GPT_OSS_MXFP4_MARLIN_QUANTIZATION_FORMAT_ID)?,
@@ -633,6 +900,27 @@ fn source_pair_digest(
         hash.update((source_id.as_str().len() as u64).to_le_bytes());
         hash.update(source_id.as_str().as_bytes());
     }
+    format!("{:x}", hash.finalize())
+}
+
+fn derived_bias_component_id(source_bias: &WeightComponentSpec) -> Result<WeightId, VNextError> {
+    WeightId::new(format!(
+        "{DERIVED_COMPONENT_PREFIX}.{}.bias",
+        source_component_digest(source_bias)
+    ))
+}
+
+fn derived_bias_external_name(source_bias: &WeightComponentSpec) -> String {
+    format!(
+        "execution.gpt-oss-mxfp4-marlin.{}.bias",
+        source_component_digest(source_bias)
+    )
+}
+
+fn source_component_digest(source: &WeightComponentSpec) -> String {
+    let mut hash = Sha256::new();
+    hash.update((source.id.as_str().len() as u64).to_le_bytes());
+    hash.update(source.id.as_str().as_bytes());
     format!("{:x}", hash.finalize())
 }
 
@@ -806,6 +1094,7 @@ mod tests {
         let dense_id = WeightId::new("component.test.router").unwrap();
         let blocks_id = WeightId::new("component.test.experts.blocks").unwrap();
         let scales_id = WeightId::new("component.test.experts.scales").unwrap();
+        let bias_id = WeightId::new("component.test.experts.bias").unwrap();
         let schema = WeightSchema {
             format_id: WeightFormatId::new(GPT_OSS_MXFP4_SOURCE_WEIGHT_FORMAT_ID).unwrap(),
             layout_id: WeightLayoutId::new(GPT_OSS_MXFP4_SOURCE_WEIGHT_LAYOUT_ID).unwrap(),
@@ -843,6 +1132,16 @@ mod tests {
                     },
                     required: true,
                 },
+                WeightComponentSpec {
+                    id: bias_id.clone(),
+                    role: WeightComponentRole::Values,
+                    external_names: vec!["model.layers.0.mlp.experts.gate_up_proj_bias".to_owned()],
+                    dimensions: vec![2, rows],
+                    encoding: WeightEncoding::Dense {
+                        element_type: ElementType::Bf16,
+                    },
+                    required: true,
+                },
             ],
             tensors: vec![
                 WeightTensorSpec {
@@ -872,6 +1171,15 @@ mod tests {
                     },
                     required: true,
                 },
+                WeightTensorSpec {
+                    id: WeightId::new("weight.layer.0.routed_gate_up_bias").unwrap(),
+                    dimensions: vec![2, rows],
+                    logical_element_type: ElementType::Bf16,
+                    physical_layout: PhysicalWeightLayout::Dense {
+                        component_id: bias_id,
+                    },
+                    required: true,
+                },
             ],
         };
         schema.validate(&family_id()).unwrap();
@@ -890,7 +1198,7 @@ mod tests {
             descriptor.id().as_str(),
             GPT_OSS_MXFP4_TO_MARLIN_WEIGHT_MATERIALIZER_ID
         );
-        assert_eq!(descriptor.version(), ContractVersion::new(1, 0));
+        assert_eq!(descriptor.version(), ContractVersion::new(1, 1));
         assert_eq!(descriptor.fidelity(), WeightMaterializationFidelity::Exact);
         assert_eq!(
             descriptor.required_capabilities(),
@@ -924,9 +1232,50 @@ mod tests {
         assert!(!execution.components.iter().any(|component| {
             matches!(
                 component.id.as_str(),
-                "component.test.experts.blocks" | "component.test.experts.scales"
+                "component.test.experts.blocks"
+                    | "component.test.experts.scales"
+                    | "component.test.experts.bias"
             )
         }));
+
+        let candidate = collect_candidates(&source).unwrap().pop().unwrap();
+        let bias = execution
+            .components
+            .iter()
+            .find(|component| component.id == candidate.bias.execution_component.id)
+            .unwrap();
+        assert_eq!(bias.dimensions, [2, 64]);
+        assert_eq!(
+            bias.encoding,
+            WeightEncoding::Dense {
+                element_type: ElementType::Bf16
+            }
+        );
+        let bias_tensor = execution
+            .tensors
+            .iter()
+            .find(|tensor| tensor.id.as_str() == "weight.layer.0.routed_gate_up_bias")
+            .unwrap();
+        let PhysicalWeightLayout::AxisReshapePermutation {
+            values,
+            axis,
+            logical_offset,
+            extent,
+            reshape,
+            stored_axis_order,
+        } = &bias_tensor.physical_layout
+        else {
+            panic!("Marlin bias must declare its P32 execution layout")
+        };
+        assert_eq!(
+            values.as_ref(),
+            &PhysicalWeightLayout::Dense {
+                component_id: bias.id.clone()
+            }
+        );
+        assert_eq!((*axis, *logical_offset, *extent), (1, 0, 64));
+        assert_eq!(reshape, &[2, 4, 4, 2]);
+        assert_eq!(stored_axis_order, &[0, 2, 1, 3]);
 
         let packed = execution
             .components
@@ -953,8 +1302,7 @@ mod tests {
         assert_eq!(quantization.scale_type, ElementType::U8);
         assert!(quantization.zero_point_type.is_none());
 
-        let candidate = collect_candidates(&source).unwrap().pop().unwrap();
-        let transform = candidate.transform_descriptor();
+        let transform = candidate.weight.transform_descriptor();
         assert_eq!(transform.logical_dimensions, [2, 64, 64]);
         assert_eq!(transform.execution_dimensions, [2, 64, 128]);
         assert_eq!(
@@ -1023,7 +1371,7 @@ mod tests {
         );
 
         let candidate = collect_candidates(&source).unwrap().pop().unwrap();
-        let transform = candidate.transform_descriptor();
+        let transform = candidate.weight.transform_descriptor();
         assert_eq!(transform.logical_dimensions, [2, 2880, 2880]);
         assert_eq!(transform.execution_dimensions, [2, 2880, 2944]);
         let plan = StaticWeightTransformPlan::GptOssMxfp4ToMarlin {
@@ -1151,6 +1499,81 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(direct, oracle, "N={rows}, K={columns}");
         }
+    }
+
+    struct BiasSource(Vec<u8>);
+
+    impl WeightComponentSource for BiasSource {
+        fn component<'source>(
+            &'source self,
+            component: &WeightComponentSpec,
+        ) -> Result<WeightComponentPayload<'source>, VNextError> {
+            WeightComponentPayload::new(
+                component,
+                component.external_names[0].clone(),
+                "model.safetensors",
+                component.dimensions.clone(),
+                ElementType::Bf16,
+                self.0.as_slice(),
+            )
+        }
+    }
+
+    #[test]
+    fn expert_bias_materialization_applies_marlin_p32_per_expert() {
+        const EXPECTED_P32: [usize; 32] = [
+            0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29,
+            6, 7, 14, 15, 22, 23, 30, 31,
+        ];
+        assert_eq!(MARLIN_CHANNEL_PERMUTATION, EXPECTED_P32);
+
+        let source_schema = source_schema();
+        let candidate = collect_candidates(&source_schema).unwrap().pop().unwrap();
+        let source_bias = source_schema
+            .components
+            .iter()
+            .find(|component| component.id == candidate.bias.source_component_id)
+            .unwrap();
+        let logical_values = (0_u16..128)
+            .map(|index| 0x3c00_u16 + index)
+            .collect::<Vec<_>>();
+        let source = BiasSource(
+            logical_values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        );
+        let materializer = GptOssMxfp4ToMarlinWeightMaterializer::new().unwrap();
+        let payloads = materializer
+            .materialize_components(
+                &source,
+                &[source_bias],
+                &[&candidate.bias.execution_component],
+            )
+            .unwrap();
+        let [payload] = payloads.as_slice() else {
+            panic!("bias materialization must return one derived component")
+        };
+        let actual = payload
+            .bytes()
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect::<Vec<_>>();
+        let expected = (0..2)
+            .flat_map(|expert| {
+                (0..2).flat_map(move |block| {
+                    EXPECTED_P32
+                        .into_iter()
+                        .map(move |source| 0x3c00_u16 + (expert * 64 + block * 32 + source) as u16)
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            payload.component_id(),
+            &candidate.bias.execution_component.id
+        );
+        assert_eq!(payload.source_files(), &["model.safetensors"]);
     }
 
     #[test]
