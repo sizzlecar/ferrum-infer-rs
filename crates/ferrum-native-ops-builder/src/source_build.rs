@@ -29,7 +29,6 @@ pub const NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION: u32 = 7;
 pub const NATIVE_OPERATOR_CUDA_TOOLKIT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const NATIVE_OPERATOR_OBJECT_DEPENDENCY_PROOF_SCHEMA_VERSION: u32 = 3;
-pub const MAX_NVCC_THREADS: u32 = 8;
 const REQUIRED_CUDA_TOOLKIT_FILES: [&str; 6] = [
     "bin/bin2c",
     "bin/cudafe++",
@@ -597,10 +596,10 @@ pub fn run_native_operator_source_build(
         ));
     }
     validate_compute_capability(&request.compute_capability)?;
-    if request.nvcc_threads == 0 || request.nvcc_threads > MAX_NVCC_THREADS {
-        return Err(NativeOperatorBuilderError::Invalid(format!(
-            "nvcc_threads must be in [1,{MAX_NVCC_THREADS}]"
-        )));
+    if request.nvcc_threads == 0 {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "nvcc_threads must be greater than zero".to_string(),
+        ));
     }
     if !is_git_oid(&request.builder_sha) {
         return Err(NativeOperatorBuilderError::Invalid(
@@ -5725,7 +5724,7 @@ mod tests {
             cuda_toolkit_root: PathBuf::from("/missing/cuda"),
             ccbin_path: PathBuf::from("/missing/c++"),
             ar_path: PathBuf::from("/missing/ar"),
-            nvcc_threads: 4,
+            nvcc_threads: 256,
             object_cache_dir: root.path().join("object-cache"),
             plan_only: true,
         })
@@ -5737,7 +5736,7 @@ mod tests {
         assert!(receipt.commands[0]
             .argv
             .windows(2)
-            .any(|pair| pair == ["--threads", "4"]));
+            .any(|pair| pair == ["--threads", "256"]));
         assert!(receipt.toolchain.is_none());
         assert!(receipt.commands.iter().all(|command| {
             [

@@ -426,7 +426,7 @@ fn all_plan_nodes_encode_into_one_submission_and_one_completion() {
 }
 
 #[test]
-fn typed_input_upload_precedes_the_plan_in_one_submission() {
+fn typed_contiguous_input_uploads_coalesce_before_the_plan() {
     let (fixture, sequence, session, batch, step) = setup();
     let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
     let active_bindings = wave_active_bindings(&wave, &session);
@@ -446,15 +446,26 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         &lane,
     )
     .unwrap();
-    let upload = SubmissionWaveInputUpload::new(
-        id("node.main"),
-        0,
-        0,
-        0,
-        HostTransferLayout::new(ElementType::F32, 4).unwrap(),
-        vec![0; 16],
-    )
-    .unwrap();
+    let uploads = [
+        SubmissionWaveInputUpload::new(
+            id("node.main"),
+            0,
+            0,
+            0,
+            HostTransferLayout::new(ElementType::F32, 2).unwrap(),
+            vec![1; 8],
+        )
+        .unwrap(),
+        SubmissionWaveInputUpload::new(
+            id("node.main"),
+            0,
+            0,
+            8,
+            HostTransferLayout::new(ElementType::F32, 2).unwrap(),
+            vec![2; 8],
+        )
+        .unwrap(),
+    ];
     let timing = RecordingSubmissionTimingSink::default();
     let handle = OperationDispatch::encode_and_submit_wave_with_inputs_and_timing(
         &providers,
@@ -462,7 +473,7 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         &batch_identity,
         active_bindings.iter(),
         DeviceTimingMode::Off,
-        &[upload],
+        &uploads,
         SubmissionExecutionPolicy::adaptive(),
         &timing,
         wave,
@@ -491,6 +502,10 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
         ]]
     );
     assert_eq!(
+        fixture.runtime_trace.lock().unwrap().uploaded_payloads,
+        vec![[vec![1; 8], vec![2; 8]].concat()]
+    );
+    assert_eq!(
         *timing.stages.lock().unwrap(),
         vec![
             SubmissionWaveDispatchStage::ContractValidateAndReserve,
@@ -504,6 +519,97 @@ fn typed_input_upload_precedes_the_plan_in_one_submission() {
     );
     let (handle, attribution) = handle.into_parts();
     assert!(attribution.is_none());
+    assert!(matches!(
+        handle.wait().unwrap(),
+        CompletionObservation::Terminal(_)
+    ));
+
+    drop(handle);
+    drop(providers);
+    drop(active_bindings);
+    drop(reaper);
+    drop(lane);
+    teardown(fixture, sequence, session, batch, step);
+}
+
+#[test]
+fn typed_noncontiguous_input_uploads_remain_separate() {
+    let (fixture, sequence, session, batch, step) = setup();
+    let wave = prepare_wave(&fixture.plan_resources, &fixture.plan, &step);
+    let active_bindings = wave_active_bindings(&wave, &session);
+    let lane = Arc::clone(step.execution_lane());
+    let reaper = CompletionReaper::new();
+    let providers = fixture
+        .plan
+        .payload()
+        .nodes()
+        .iter()
+        .map(|node| fixture.registry.bind(&fixture.resolved, node.id()).unwrap())
+        .collect::<Vec<_>>();
+    let batch_identity = OperationDispatch::bind_submission_wave_identity(
+        &fixture.resolved,
+        active_bindings.iter(),
+        &wave,
+        &lane,
+    )
+    .unwrap();
+    let uploads = [
+        SubmissionWaveInputUpload::new(
+            id("node.main"),
+            0,
+            0,
+            0,
+            HostTransferLayout::new(ElementType::F32, 1).unwrap(),
+            vec![1; 4],
+        )
+        .unwrap(),
+        SubmissionWaveInputUpload::new(
+            id("node.main"),
+            0,
+            0,
+            8,
+            HostTransferLayout::new(ElementType::F32, 1).unwrap(),
+            vec![2; 4],
+        )
+        .unwrap(),
+    ];
+    let handle = OperationDispatch::encode_and_submit_wave_with_inputs(
+        &providers,
+        &fixture.resolved,
+        &batch_identity,
+        active_bindings.iter(),
+        DeviceTimingMode::Off,
+        &uploads,
+        wave,
+        &lane,
+        &reaper,
+    )
+    .unwrap();
+    assert_eq!(
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .submitted_command_counts,
+        vec![4]
+    );
+    assert_eq!(
+        fixture
+            .runtime_trace
+            .lock()
+            .unwrap()
+            .submitted_command_phases,
+        vec![vec![
+            DeviceCommandPhase::DynamicBinding,
+            DeviceCommandPhase::DynamicBinding,
+            DeviceCommandPhase::Compute,
+            DeviceCommandPhase::Compute,
+        ]]
+    );
+    assert_eq!(
+        fixture.runtime_trace.lock().unwrap().uploaded_payloads,
+        vec![vec![1; 4], vec![2; 4]]
+    );
     assert!(matches!(
         handle.wait().unwrap(),
         CompletionObservation::Terminal(_)

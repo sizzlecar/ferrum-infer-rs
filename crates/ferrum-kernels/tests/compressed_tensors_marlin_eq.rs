@@ -9,20 +9,19 @@
 
 use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
 use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
-use ferrum_interfaces::vnext::{
-    numeric_weight_quality_authority_implementation_fingerprint, CanonicalRational,
-    ContractVersion, WeightMaterializationFidelity, WeightMaterializerSelection,
-    NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID, NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID,
-};
+use ferrum_interfaces::vnext::{CanonicalRational, ContractVersion, WeightMaterializationFidelity};
 use ferrum_kernels::marlin_fp8_materializer::{
     block_fp8_to_marlin_fp8_weight_materializer, BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID,
-    MARLIN_FP8_QUANTIZATION_FORMAT_ID, MARLIN_FP8_WEIGHT_FORMAT_ID, MARLIN_FP8_WEIGHT_LAYOUT_ID,
+    MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID, MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID,
+    MARLIN_FP8_GROUP128_WEIGHT_LAYOUT_ID,
 };
 use ferrum_kernels::marlin_repack::{
-    prepare_block_fp8_weight_for_fp8_marlin, repack_compressed_tensors_zero_points_to_marlin,
-    repack_gptq_to_marlin, repack_scales_to_marlin,
+    block_fp8_group128_scales_to_marlin_f16_reference,
+    repack_compressed_tensors_zero_points_to_marlin, repack_gptq_to_marlin,
+    repack_scales_to_marlin,
 };
 use ferrum_kernels::vllm_marlin::{
+    launch_block_fp8_group128_repack, launch_block_fp8_group128_scales,
     launch_marlin_mm_f16_weight, MarlinF16WeightType, MarlinMmBuffers, MarlinMmExecution,
     MarlinMmF16WeightRequest, MarlinMmProblem,
 };
@@ -34,6 +33,10 @@ use std::os::raw::c_void;
 
 const BLOCK_FP8_SOURCE_WEIGHT_FORMAT_ID: &str =
     "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale";
+const BLOCK_FP8_EXACT_PARITY_ARTIFACT_SCHEMA_ID: &str =
+    "validation.weight-materializer.exact-parity.v1";
+const BLOCK_FP8_QUALITY_VECTOR_DIGEST: &str =
+    "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51";
 const RELATIVE_L2_REPORT_DENOMINATOR: u64 = 100_000_000;
 const LOCKED_QUALITY_VECTOR_JSON: &str = include_str!(
     "../../../scripts/release/configs/vnext_model_adoption/qwen38_27b_fp8_m3_quality_vector.json"
@@ -50,14 +53,6 @@ const QUALITY_VECTOR_PAYLOAD_KEYS: [&str; 10] = [
     "activation_batches",
     "cases",
 ];
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NumericArtifactAuthority {
-    id: String,
-    implementation_fingerprint: String,
-    version: ContractVersion,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,13 +87,6 @@ struct NumericArtifactExecution {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NumericArtifactContract {
-    execution_contract_fingerprint: String,
-    quality_vector_digest: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct NumericArtifactCase {
     actual_f16_bits: Vec<u16>,
     actual_f16le_sha256: String,
@@ -112,20 +100,56 @@ struct NumericArtifactCase {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NumericQualityArtifactV1 {
-    authority: NumericArtifactAuthority,
+struct ExactParityArtifactV1 {
     cases: Vec<NumericArtifactCase>,
     checkpoint: NumericArtifactCheckpoint,
-    contract: NumericArtifactContract,
     execution: NumericArtifactExecution,
     materializer: NumericArtifactMaterializer,
     quality_vector_payload: Value,
+    quality_vector_digest: String,
     schema_id: String,
     source: NumericArtifactSource,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Pack exact row-major E4M3 bytes from `[N, K]` into the final 16-by-64
+/// Marlin W8A16 tile ABI. This test-only oracle is deliberately independent
+/// of both the product CUDA transform and its staging-layout reference.
+fn block_fp8_group128_raw_bits_to_final_marlin_u32_reference(
+    source_fp8_e4m3: &[u8],
+    n: usize,
+    k: usize,
+) -> Vec<u32> {
+    assert_eq!(n % 128, 0, "group-128 output dimension");
+    assert_eq!(k % 128, 0, "group-128 input dimension");
+    assert_eq!(source_fp8_e4m3.len(), n * k, "group-128 value count");
+
+    let mut packed = Vec::with_capacity(n * k / 4);
+    for k_tile in 0..k / 16 {
+        for n_tile in 0..n / 64 {
+            for marlin_thread in 0..32 {
+                let tensor_core_column = marlin_thread / 4;
+                let tensor_core_row = (marlin_thread % 4) * 2;
+                for warp in 0..4 {
+                    for column_half in 0..2 {
+                        let output = n_tile * 64 + warp * 16 + tensor_core_column + column_half * 8;
+                        let source_base = output * k + k_tile * 16;
+                        packed.push(u32::from_le_bytes([
+                            source_fp8_e4m3[source_base + tensor_core_row],
+                            source_fp8_e4m3[source_base + tensor_core_row + 8],
+                            source_fp8_e4m3[source_base + tensor_core_row + 1],
+                            source_fp8_e4m3[source_base + tensor_core_row + 9],
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(packed.len(), n * k / 4, "final Marlin word count");
+    packed
 }
 
 fn conservative_relative_l2_upper_bound(relative_l2: f64) -> CanonicalRational {
@@ -448,10 +472,6 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
     const WEIGHT_SEED_XOR: u64 = 0x5745_4947_4854_5f31;
     const SCALE_SEED_XOR: u64 = 0x5343_414c_455f_5f31;
     const ACTIVATION_SEED_XOR: u64 = 0x4143_5449_5641_5445;
-    const CHANNEL_SCALE_PERMUTATION: [usize; 32] = [
-        0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6,
-        7, 14, 15, 22, 23, 30, 31,
-    ];
     const CASES: [(&str, usize, usize, usize, usize, &str, &str, &str, &str); 4] = [
         (
             "weight-256x128-batch-1",
@@ -520,9 +540,9 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
         descriptor.id().as_str(),
         BLOCK_FP8_TO_MARLIN_FP8_WEIGHT_MATERIALIZER_ID
     );
-    let quality_contract = descriptor
-        .approximate_quality_contract()
-        .expect("block-FP8 materializer quality contract");
+    assert_eq!(descriptor.version(), ContractVersion::new(2, 0));
+    assert_eq!(descriptor.fidelity(), WeightMaterializationFidelity::Exact);
+    assert!(descriptor.approximate_quality_contract().is_none());
     let context = CudaContext::new(0).expect("CUDA context");
     let stream = context.default_stream();
     let mut artifact_cases = Vec::with_capacity(CASES.len());
@@ -613,107 +633,75 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             "{case_id}"
         );
 
-        let prepared = prepare_block_fp8_weight_for_fp8_marlin(
-            &source_values,
-            &inverse_scale_bytes,
-            n,
-            k,
-            BLOCK_SHAPE,
-        )
-        .expect("prepare block-FP8 Marlin weight");
-        let (packed_weight, packed_scales) = prepared.into_parts();
-
-        // Canary for the exact class of bug this fixture is meant to expose:
-        // channel-wise weights are quantized correctly, but logical scales are
-        // uploaded in identity order instead of Marlin's 32-channel order.
-        // The fixture's four power-of-two channel tiers are deliberately not
-        // invariant under CHANNEL_SCALE_PERMUTATION.
-        let mut quantization_scales = vec![0.0_f32; n];
-        let mut logical_runtime_scales = vec![0.0_f32; n];
-        for output in 0..n {
-            let mut maximum = 0.0_f32;
-            for input_feature in 0..k {
-                let source =
-                    float8::F8E4M3::from_bits(source_values[output * k + input_feature]).to_f32();
-                let scale_index =
-                    (output / BLOCK_SHAPE[0]) * scale_columns + input_feature / BLOCK_SHAPE[1];
-                maximum = maximum.max((source * inverse_scales[scale_index].to_f32()).abs());
-            }
-            let scale = maximum / 448.0;
-            quantization_scales[output] = scale;
-            logical_runtime_scales[output] = f16::from_f32(scale * 256.0).to_f32() / 256.0;
-        }
-
-        let mut identity_scale_for_output = vec![0.0_f32; n];
-        for chunk_start in (0..n).step_by(CHANNEL_SCALE_PERMUTATION.len()) {
-            for (destination, source) in CHANNEL_SCALE_PERMUTATION.iter().copied().enumerate() {
-                let expected = f16::from_f32(quantization_scales[chunk_start + source] * 256.0);
-                assert_eq!(
-                    packed_scales[chunk_start + destination].to_bits(),
-                    expected.to_bits(),
-                    "{case_id} prepared scale permutation drifted"
-                );
-                identity_scale_for_output[chunk_start + source] =
-                    logical_runtime_scales[chunk_start + destination];
-            }
-        }
-        assert_ne!(
-            identity_scale_for_output, logical_runtime_scales,
-            "{case_id} fixture does not distinguish identity scale layout"
-        );
-
-        let mut identity_scale_output = vec![0.0_f32; batch * n];
-        for row in 0..batch {
-            for output in 0..n {
-                let mut sum = 0.0_f32;
-                for input_feature in 0..k {
-                    let source =
-                        float8::F8E4M3::from_bits(source_values[output * k + input_feature])
-                            .to_f32();
-                    let scale_index =
-                        (output / BLOCK_SHAPE[0]) * scale_columns + input_feature / BLOCK_SHAPE[1];
-                    let decoded = source * inverse_scales[scale_index].to_f32();
-                    let quantized = if quantization_scales[output] == 0.0 {
-                        0.0
-                    } else {
-                        float8::F8E4M3::from_f32(decoded / quantization_scales[output]).to_f32()
-                    };
-                    sum += input[row * k + input_feature].to_f32()
-                        * quantized
-                        * identity_scale_for_output[output];
-                }
-                identity_scale_output[row * n + output] = sum;
-            }
-        }
-        let identity_error_squared = identity_scale_output
+        let expected_packed =
+            block_fp8_group128_raw_bits_to_final_marlin_u32_reference(&source_values, n, k);
+        let expected_scales =
+            block_fp8_group128_scales_to_marlin_f16_reference(&inverse_scale_bytes, n, k)
+                .expect("build exact group-128 scale oracle")
+                .into_iter()
+                .map(f16::to_bits)
+                .collect::<Vec<_>>();
+        let source_device: CudaSlice<u8> = stream
+            .clone_htod(&source_values)
+            .expect("upload row-major block-FP8 values");
+        let inverse_scale_words = inverse_scales
             .iter()
-            .zip(reference.iter())
-            .map(|(actual, expected)| {
-                let error = f64::from(actual - expected);
-                error * error
-            })
-            .sum::<f64>();
-        let reference_squared = reference
-            .iter()
-            .map(|value| f64::from(*value) * f64::from(*value))
-            .sum::<f64>();
-        let identity_relative_l2 =
-            identity_error_squared.sqrt() / reference_squared.sqrt().max(1.0e-6);
-        eprintln!(
-            "QWEN38_BLOCK_FP8_IDENTITY_SCALE_CANARY name={case_id} rel_err={identity_relative_l2:.8}"
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let inverse_scale_device: CudaSlice<u16> = stream
+            .clone_htod(&inverse_scale_words)
+            .expect("upload BF16 inverse-scale grid");
+        let mut weight_device: CudaSlice<u32> = stream
+            .alloc_zeros(expected_packed.len())
+            .expect("allocate exact group-128 packed weight");
+        let mut scales_device: CudaSlice<u16> = stream
+            .alloc_zeros(expected_scales.len())
+            .expect("allocate exact group-128 Marlin scales");
+        {
+            let (source_pointer, _source_guard) = source_device.device_ptr(&stream);
+            let (inverse_scale_pointer, _inverse_scale_guard) =
+                inverse_scale_device.device_ptr(&stream);
+            let (weight_pointer, _weight_guard) = weight_device.device_ptr_mut(&stream);
+            let (scales_pointer, _scales_guard) = scales_device.device_ptr_mut(&stream);
+            unsafe {
+                launch_block_fp8_group128_repack(
+                    &stream,
+                    source_pointer,
+                    weight_pointer,
+                    u64::try_from(k).expect("K fits u64"),
+                    u64::try_from(n).expect("N fits u64"),
+                )
+            }
+            .expect("launch exact group-128 value transform");
+            unsafe {
+                launch_block_fp8_group128_scales(
+                    &stream,
+                    inverse_scale_pointer,
+                    scales_pointer,
+                    u64::try_from(k).expect("K fits u64"),
+                    u64::try_from(n).expect("N fits u64"),
+                )
+            }
+            .expect("launch exact group-128 scale transform");
+        }
+        stream
+            .synchronize()
+            .expect("synchronize exact group-128 transforms");
+        assert_eq!(
+            stream
+                .clone_dtoh(&weight_device)
+                .expect("download transformed weight"),
+            expected_packed,
+            "{case_id} exact group-128 weight transform drifted"
         );
-        assert!(
-            identity_relative_l2 > 0.05,
-            "{case_id} identity-scale canary rel_err={identity_relative_l2:.8} did not exceed 0.05"
+        assert_eq!(
+            stream
+                .clone_dtoh(&scales_device)
+                .expect("download transformed scales"),
+            expected_scales,
+            "{case_id} exact group-128 scale transform drifted"
         );
-
         let input_device: CudaSlice<f16> = stream.clone_htod(&input).expect("upload input");
-        let weight_device: CudaSlice<u8> = stream
-            .clone_htod(&packed_weight)
-            .expect("upload packed weight");
-        let scales_device: CudaSlice<f16> = stream
-            .clone_htod(&packed_scales)
-            .expect("upload packed scales");
         let mut output_device: CudaSlice<f16> =
             stream.alloc_zeros(batch * n).expect("allocate output");
         let sms = context
@@ -750,8 +738,9 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
                         n: n as i32,
                         k: k as i32,
                         lda: k as i32,
-                        num_groups: 1,
-                        group_size: -1,
+                        num_groups: i32::try_from(k / BLOCK_SHAPE[1])
+                            .expect("group count fits i32"),
+                        group_size: i32::try_from(BLOCK_SHAPE[1]).expect("group size fits i32"),
                     },
                     execution: MarlinMmExecution {
                         device: 0,
@@ -818,40 +807,24 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
         });
     }
 
-    assert_eq!(
-        artifact_cases.len(),
-        usize::try_from(quality_contract.required_case_count()).expect("case count fits usize")
-    );
+    assert_eq!(artifact_cases.len(), CASES.len());
     let quality_vector_payload = locked_quality_vector_payload();
+    let quality_vector_digest = sha256_hex(&canonical_json_bytes(&quality_vector_payload));
     assert_eq!(
-        sha256_hex(&canonical_json_bytes(&quality_vector_payload)),
-        quality_contract.quality_vector_digest(),
+        quality_vector_digest, BLOCK_FP8_QUALITY_VECTOR_DIGEST,
         "locked quality vector payload digest drifted"
     );
-    let artifact = NumericQualityArtifactV1 {
-        authority: NumericArtifactAuthority {
-            id: NUMERIC_WEIGHT_QUALITY_AUTHORITY_ID.to_owned(),
-            implementation_fingerprint:
-                numeric_weight_quality_authority_implementation_fingerprint()
-                    .expect("numeric quality authority implementation fingerprint"),
-            version: ContractVersion::new(1, 0),
-        },
+    let artifact = ExactParityArtifactV1 {
         cases: artifact_cases,
         checkpoint: NumericArtifactCheckpoint {
             id: "qwen38-27b-fp8".to_owned(),
             repository: "Qwen/Qwen3.8-27B-FP8".to_owned(),
             revision: "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a".to_owned(),
         },
-        contract: NumericArtifactContract {
-            execution_contract_fingerprint: quality_contract
-                .execution_contract_fingerprint()
-                .to_owned(),
-            quality_vector_digest: quality_contract.quality_vector_digest().to_owned(),
-        },
         execution: NumericArtifactExecution {
-            quantization_format_ids: vec![MARLIN_FP8_QUANTIZATION_FORMAT_ID.to_owned()],
-            weight_format_id: MARLIN_FP8_WEIGHT_FORMAT_ID.to_owned(),
-            weight_layout_id: MARLIN_FP8_WEIGHT_LAYOUT_ID.to_owned(),
+            quantization_format_ids: vec![MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID.to_owned()],
+            weight_format_id: MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID.to_owned(),
+            weight_layout_id: MARLIN_FP8_GROUP128_WEIGHT_LAYOUT_ID.to_owned(),
         },
         materializer: NumericArtifactMaterializer {
             fidelity: descriptor.fidelity(),
@@ -860,35 +833,29 @@ fn qwen38_block_fp8_marlin_matches_four_locked_quality_vector_cases() {
             version: descriptor.version(),
         },
         quality_vector_payload,
-        schema_id: NUMERIC_WEIGHT_QUALITY_ARTIFACT_SCHEMA_ID.to_owned(),
+        quality_vector_digest,
+        schema_id: BLOCK_FP8_EXACT_PARITY_ARTIFACT_SCHEMA_ID.to_owned(),
         source: NumericArtifactSource {
             weight_format_id: BLOCK_FP8_SOURCE_WEIGHT_FORMAT_ID.to_owned(),
         },
     };
     let canonical_json = canonical_json_bytes(&artifact);
-    let decoded: NumericQualityArtifactV1 =
-        serde_json::from_slice(&canonical_json).expect("parse canonical numeric artifact");
+    let decoded: ExactParityArtifactV1 =
+        serde_json::from_slice(&canonical_json).expect("parse canonical exact-parity artifact");
     assert_eq!(
         decoded, artifact,
-        "numeric artifact typed roundtrip drifted"
+        "exact-parity artifact typed roundtrip drifted"
     );
     assert_eq!(
         canonical_json_bytes(&decoded),
         canonical_json,
-        "numeric artifact canonical JSON drifted after roundtrip"
+        "exact-parity artifact canonical JSON drifted after roundtrip"
     );
-    let selection = WeightMaterializerSelection::numeric_quality_artifact(
-        descriptor.id().clone(),
-        canonical_json.clone(),
-    )
-    .expect("typed numeric quality artifact selection");
-    assert_eq!(selection.materializer_id(), descriptor.id());
-    assert!(selection.has_numeric_quality_artifact());
     let artifact_sha256 = sha256_hex(&canonical_json);
     let artifact_bytes = canonical_json.len();
     let artifact_json =
         std::str::from_utf8(&canonical_json).expect("canonical artifact is valid UTF-8");
     eprintln!(
-        "QWEN38_BLOCK_FP8_NUMERIC_ARTIFACT_V1 sha256={artifact_sha256} bytes={artifact_bytes} json={artifact_json}"
+        "QWEN38_BLOCK_FP8_EXACT_PARITY_ARTIFACT_V1 sha256={artifact_sha256} bytes={artifact_bytes} json={artifact_json}"
     );
 }

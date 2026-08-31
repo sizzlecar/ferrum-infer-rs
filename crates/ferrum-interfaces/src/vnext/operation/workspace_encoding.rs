@@ -183,21 +183,14 @@ where
     }
     let mut command_count = 0_usize;
     for (node_index, prepared_node) in completion.wave().nodes().iter().enumerate() {
-        let plan_node = plan_nodes
-            .iter()
-            .find(|node| node.id() == prepared_node.node_id())
-            .ok_or_else(|| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "workspace initialization node is absent from the immutable plan",
-                ))
-            })?;
-        let node_identity = batch_identity.nodes().get(node_index).ok_or_else(|| {
+        let plan_node_index = prepared_node.plan_node_index();
+        let plan_node = plan_nodes.get(plan_node_index).ok_or_else(|| {
             SubmissionWaveDispatchError::Contract(invalid_operation(
-                "workspace initialization node has no batch identity",
+                "workspace initialization node is absent from the immutable plan",
             ))
         })?;
         if plan_node.id() != prepared_node.node_id()
-            || node_identity.node_id() != prepared_node.node_id()
+            || batch_identity.node_id_at(node_index) != Some(prepared_node.node_id())
         {
             return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
                 "workspace initialization node differs from the prepared wave",
@@ -211,6 +204,9 @@ where
         {
             continue;
         }
+        let node_identity = batch_identity
+            .materialize_node(node_index)
+            .map_err(SubmissionWaveDispatchError::Contract)?;
         let resource_id = plan_node.scratch_resource().ok_or_else(|| {
             SubmissionWaveDispatchError::Contract(invalid_operation(
                 "scratch workspace initialization has no base resource",

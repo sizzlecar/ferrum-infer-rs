@@ -4612,6 +4612,7 @@ async fn plan_runtime_adaptive_decode_failure_only_completes_its_exact_subcohort
 async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
     for (profile_detail, expected_stage_count) in [
         (ObservabilityProfileDetail::Full, 3),
+        (ObservabilityProfileDetail::Latency, 3),
         (ObservabilityProfileDetail::Off, 0),
     ] {
         let (engine, scheduler, executor, tokenizer) =
@@ -4644,7 +4645,10 @@ async fn plan_runtime_profile_records_only_explicit_decode_host_stages() {
             "profile detail {} stage capture",
             profile_detail.as_str()
         );
-        if profile_detail == ObservabilityProfileDetail::Full {
+        if matches!(
+            profile_detail,
+            ObservabilityProfileDetail::Full | ObservabilityProfileDetail::Latency
+        ) {
             let scheduling = &timing.decode_stage_intervals[0];
             let execution = &timing.decode_stage_intervals[1];
             let postprocess = &timing.decode_stage_intervals[2];
@@ -7272,22 +7276,25 @@ fn staged_vnext_profiles_separate_resource_latency_and_kernel_costs() {
     let cases = [
         (
             ObservabilityProfileDetail::Resource,
+            ExecutionEventCapturePolicy::AllFrames,
             ferrum_interfaces::vnext::DeviceTimingMode::Off,
             false,
         ),
         (
             ObservabilityProfileDetail::Latency,
-            ferrum_interfaces::vnext::DeviceTimingMode::Completion,
+            ExecutionEventCapturePolicy::FirstFramePerRequest,
+            ferrum_interfaces::vnext::DeviceTimingMode::Off,
             false,
         ),
         (
             ObservabilityProfileDetail::Kernel,
+            ExecutionEventCapturePolicy::AllFrames,
             ferrum_interfaces::vnext::DeviceTimingMode::Kernel,
             true,
         ),
     ];
 
-    for (detail, expected_timing, diagnostic_only) in cases {
+    for (detail, expected_capture_policy, expected_timing, diagnostic_only) in cases {
         let trace_path = resource_trace_temp_path(detail.as_str());
         let _ = std::fs::remove_file(&trace_path);
         let journal = create_scheduler_trace_sink(Some(&trace_path)).unwrap();
@@ -7296,10 +7303,7 @@ fn staged_vnext_profiles_separate_resource_latency_and_kernel_costs() {
         let sink =
             VNextProfileExecutionEventSink::new(journal.clone(), ProfileEntrypoint::Run, &config);
 
-        assert_eq!(
-            sink.capture_policy(),
-            ExecutionEventCapturePolicy::AllFrames
-        );
+        assert_eq!(sink.capture_policy(), expected_capture_policy);
         assert_eq!(sink.device_timing_mode(), expected_timing);
         let (_, _, accepted) = vnext_profile_test_event();
         let profile = sink.profile_event(&accepted).unwrap();

@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
-  "execution_semantics_version": 1,
-  "contract_id": "qwen38-27b-fp8-a1-execution-coverage-v1",
+  "schema_version": 2,
+  "execution_semantics_version": 2,
+  "contract_id": "qwen38-27b-fp8-a1-execution-coverage-v2",
   "status": "implemented",
   "checkpoint": {
     "id": "qwen38-27b-fp8",
@@ -61,78 +61,33 @@
   "planned_materializer": {
     "status": "implemented",
     "id": "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16",
-    "version": {"major": 1, "minor": 0},
-    "implementation_fingerprint": "004d29e877fa60e2c996969a05a685c319c792384e0e413a015770239018c964",
-    "fidelity": "approximate",
-    "fidelity_enum": "WeightMaterializationFidelity::Approximate",
+    "version": {"major": 2, "minor": 0},
+    "implementation_fingerprint": "3b9ee0b67b7ce6be88807cf8c80ae4ef47a993826fe9c5f7228726ca230e8859",
+    "fidelity": "exact",
+    "fidelity_enum": "WeightMaterializationFidelity::Exact",
     "source_format_id": "quantization.safetensors.fp8-e4m3-block-grid-inverse-scale",
-    "execution_weight_format_id": "weight-format.execution.cuda.marlin-fp8-w8a16-mixed",
-    "execution_weight_layout_id": "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed",
-    "execution_quantization_format_id": "quantization.marlin.fp8-e4m3fn-channelwise",
+    "execution_weight_format_id": "weight-format.execution.cuda.marlin-fp8-w8a16-group128-mixed",
+    "execution_weight_layout_id": "weight-layout.execution.cuda.marlin-fp8-w8a16-group128-mixed",
+    "execution_quantization_format_id": "quantization.marlin.fp8-e4m3fn-group128",
     "required_capability_id": "capability.kernel.cuda.marlin.fp8-w8a16",
-    "conversion_semantics": "cold-path decode of source E4M3 values with BF16 128x128 inverse scales followed by channelwise E4M3FN quantization and existing tiled Marlin packing",
-    "transient_policy": "one bounded source component group at a time; no persistent dense checkpoint copy"
+    "conversion_semantics": "cold-path bit-exact device repack of source E4M3 values plus BF16 128x128 inverse-scale expansion into grouped Marlin FP8 W8A16",
+    "transient_policy": "one bounded source pair transformed on device at a time; no persistent dense checkpoint copy"
   },
   "quality_approval": {
-    "status": "implemented",
-    "witness_schema_id": "quality-approval.weight-materializer.numeric.v1",
+    "status": "not_required_for_exact",
+    "witness_schema_id": "validation.weight-materializer.exact-parity.v1",
     "quality_vector_digest": "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51",
-    "current_witness": {
-      "approval_authority": {
-        "id": "quality-approval-authority.ferrum.numeric",
-        "version": {"major": 1, "minor": 0},
-        "implementation_fingerprint": "b6f4f723a7266750f526674b96c35c302eba68b4008fa3d1257b0fc9a10ebfa8"
-      },
-      "checkpoint": {
-        "id": "qwen38-27b-fp8",
-        "repository": "Qwen/Qwen3.8-27B-FP8",
-        "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
-      },
-      "materializer": {
-        "id": "weight-materializer.cuda.block-fp8-to-marlin-fp8-w8a16",
-        "version": {"major": 1, "minor": 0},
-        "implementation_fingerprint": "004d29e877fa60e2c996969a05a685c319c792384e0e413a015770239018c964",
-        "fidelity": "approximate"
-      },
-      "source": {
-        "weight_format_id": "weight-format.safetensors.fp8-e4m3-block-grid-inverse-scale"
-      },
-      "execution_schema": {
-        "weight_format_id": "weight-format.execution.cuda.marlin-fp8-w8a16-mixed",
-        "weight_layout_id": "weight-layout.execution.cuda.marlin-fp8-w8a16-mixed",
-        "quantization_format_ids": ["quantization.marlin.fp8-e4m3fn-channelwise"]
-      },
-      "contract": {
-        "execution_contract_fingerprint": "882bc49ca312875a12a5290319f6c8294386a5960c2065cbda3f3dff2d55598e",
-        "quality_vector_digest": "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51"
-      },
-      "numeric_evidence": {
-        "artifact_schema_id": "quality-approval.weight-materializer.numeric.v1",
-        "artifact_sha256": "3e197dbeead55ad6af0833bff15d4413babb26a952e3f0ef2e085012a62057ed",
-        "artifact_bytes": 48067,
-        "required_case_count": 4,
-        "completed_case_count": 4,
-        "relative_l2_max_observed": {"numerator": 2547279, "denominator": 100000000},
-        "nan_count": 0,
-        "inf_count": 0
-      },
-      "artifact_scope": {
-        "source_schema_fingerprint_bound_live": true,
-        "execution_schema_fingerprint_bound_live": true,
-        "git_sha_bound": false,
-        "binary_sha256_bound": false
-      }
-    },
-    "compiler_selection_authorized": true,
+    "current_witness": null,
+    "compiler_selection_authorized": false,
     "required_witness_fields": {
-      "approval_authority": ["id", "version", "implementation_fingerprint"],
+      "cases": ["actual_f16_bits", "actual_f16le_sha256", "case_id", "inf_count", "nan_count", "reference_f32_bits", "reference_f32le_sha256", "relative_l2_upper_bound"],
       "checkpoint": ["id", "repository", "revision"],
+      "execution": ["quantization_format_ids", "weight_format_id", "weight_layout_id"],
       "materializer": ["id", "version", "implementation_fingerprint", "fidelity"],
-      "source": ["weight_format_id"],
-      "execution_schema": ["weight_format_id", "weight_layout_id", "quantization_format_ids"],
-      "contract": ["execution_contract_fingerprint", "quality_vector_digest"],
-      "numeric_evidence": ["artifact_schema_id", "artifact_sha256", "artifact_bytes", "required_case_count", "completed_case_count", "relative_l2_max_observed", "nan_count", "inf_count"],
-      "artifact_scope": ["source_schema_fingerprint_bound_live", "execution_schema_fingerprint_bound_live", "git_sha_bound", "binary_sha256_bound"]
+      "quality_vector_digest": ["quality_vector_digest"],
+      "quality_vector_payload": ["quality_vector_payload"],
+      "schema_id": ["schema_id"],
+      "source": ["weight_format_id"]
     },
     "selection_requirements": {
       "all_bound_identities_must_match": true,
@@ -150,5 +105,5 @@
       "global_boolean_or_environment_override_forbidden": true
     }
   },
-  "execution_contract_fingerprint": "882bc49ca312875a12a5290319f6c8294386a5960c2065cbda3f3dff2d55598e"
+  "execution_contract_fingerprint": "33a732037f95f05ab7cbba996376ba4835f5e5775b234152b18fb7fd00012973"
 }

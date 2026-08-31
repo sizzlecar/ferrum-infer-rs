@@ -1810,6 +1810,26 @@ fn product_repetition_input(
     }
 }
 
+fn padded_repetition_token_id_bytes(token_ids: &[u32], capacity: usize) -> Result<Vec<u8>> {
+    if token_ids.len() > capacity {
+        return Err(FerrumError::backend(format!(
+            "vNext sparse repetition input contains {} ids, capacity is {capacity}",
+            token_ids.len()
+        )));
+    }
+    let byte_capacity = capacity
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| FerrumError::backend("vNext repetition token-id bytes overflow usize"))?;
+    let mut bytes = vec![0_u8; byte_capacity];
+    for (destination, token_id) in bytes
+        .chunks_exact_mut(std::mem::size_of::<u32>())
+        .zip(token_ids)
+    {
+        destination.copy_from_slice(&token_id.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
 fn decode_selected_token(bytes: &[u8], vocabulary_size: usize) -> Result<TokenId> {
     let token_bytes: [u8; 4] = bytes.try_into().map_err(|_| {
         FerrumError::backend(format!(
@@ -7065,10 +7085,20 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             Ok(token_mask_uploads) => uploads.extend(token_mask_uploads.into_iter().flatten()),
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         }
-        let repetition_uploads = participants
-            .iter()
-            .enumerate()
-            .map(|(participant_index, participant)| {
+        let repetition_uploads = (|| -> Result<_> {
+            let repetition_capacity = u64::try_from(self.io.repetition_capacity)
+                .map_err(|_| FerrumError::backend("vNext repetition capacity exceeds u64"))?;
+            let repetition_token_id_layout =
+                HostTransferLayout::new(ElementType::U32, repetition_capacity)
+                    .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let repetition_offset_layout = HostTransferLayout::new(ElementType::U32, 2)
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let repetition_penalty_layout = HostTransferLayout::new(ElementType::F32, 1)
+                .map_err(|error| FerrumError::backend(error.to_string()))?;
+            let mut token_id_uploads = Vec::with_capacity(participants.len());
+            let mut offset_uploads = Vec::with_capacity(participants.len());
+            let mut penalty_uploads = Vec::with_capacity(participants.len());
+            for (participant_index, participant) in participants.iter().enumerate() {
                 let repetition = product_repetition_input(participant.logits_policy, output_mode);
                 if !repetition.penalty.is_finite() || repetition.penalty <= 0.0 {
                     return Err(FerrumError::backend(
@@ -7095,33 +7125,29 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 let repetition_count = u32::try_from(repetition.token_ids.len()).map_err(|_| {
                     FerrumError::backend("vNext repetition token count exceeds u32")
                 })?;
-                let mut participant_uploads = Vec::with_capacity(3);
                 if repetition_count != 0 {
-                    participant_uploads.push(
+                    token_id_uploads.push(
                         SubmissionWaveInputUpload::new(
                             self.io.repetition_token_ids_input_node_id.clone(),
                             participant_index,
                             self.io.repetition_token_ids_input_ordinal,
                             0,
-                            HostTransferLayout::new(ElementType::U32, u64::from(repetition_count))
-                                .map_err(|error| FerrumError::backend(error.to_string()))?,
-                            repetition
-                                .token_ids
-                                .iter()
-                                .flat_map(|token| token.to_le_bytes())
-                                .collect(),
+                            repetition_token_id_layout,
+                            padded_repetition_token_id_bytes(
+                                repetition.token_ids,
+                                self.io.repetition_capacity,
+                            )?,
                         )
                         .map_err(|error| FerrumError::backend(error.to_string()))?,
                     );
                 }
-                participant_uploads.push(
+                offset_uploads.push(
                     SubmissionWaveInputUpload::new(
                         self.io.repetition_offsets_input_node_id.clone(),
                         participant_index,
                         self.io.repetition_offsets_input_ordinal,
                         0,
-                        HostTransferLayout::new(ElementType::U32, 2)
-                            .map_err(|error| FerrumError::backend(error.to_string()))?,
+                        repetition_offset_layout,
                         [0_u32, repetition_count]
                             .into_iter()
                             .flat_map(u32::to_le_bytes)
@@ -7129,23 +7155,26 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                     )
                     .map_err(|error| FerrumError::backend(error.to_string()))?,
                 );
-                participant_uploads.push(
+                penalty_uploads.push(
                     SubmissionWaveInputUpload::new(
                         self.io.repetition_penalty_input_node_id.clone(),
                         participant_index,
                         self.io.repetition_penalty_input_ordinal,
                         0,
-                        HostTransferLayout::new(ElementType::F32, 1)
-                            .map_err(|error| FerrumError::backend(error.to_string()))?,
+                        repetition_penalty_layout,
                         repetition.penalty.to_le_bytes().to_vec(),
                     )
                     .map_err(|error| FerrumError::backend(error.to_string()))?,
                 );
-                Ok(participant_uploads)
-            })
-            .collect::<Result<Vec<_>>>();
+            }
+            Ok((token_id_uploads, offset_uploads, penalty_uploads))
+        })();
         match repetition_uploads {
-            Ok(repetition_uploads) => uploads.extend(repetition_uploads.into_iter().flatten()),
+            Ok((token_id_uploads, offset_uploads, penalty_uploads)) => {
+                uploads.extend(token_id_uploads);
+                uploads.extend(offset_uploads);
+                uploads.extend(penalty_uploads);
+            }
             Err(error) => return DispatchOutcome::QuiescentFailure(error.to_string()),
         }
         let uploaded_bytes = uploads.iter().fold(0_u64, |total, upload| {
@@ -10175,23 +10204,23 @@ mod tests {
         decode_output_width, decode_selected_token, is_language_masked_argmax_operation,
         is_language_token_embedding_operation, journal_clock_anchor_required,
         nonterminal_completion_message, normalized_product_token_mask,
-        product_output_mode_for_policies, product_repetition_input, reported_allocated_bytes,
-        resolve_reusable_execution_policy, resolve_runtime_attention_authority,
-        resolved_sequence_fit_policy, reusable_catalog_lookup_allowed,
-        reusable_executable_inventory_matches, reusable_execution_program_catalog_is_usable,
-        reusable_execution_requires_eager_fallback, reusable_program_identity_required,
-        reusable_startup_case_budget_violation, submission_execution_policy_for_timing,
-        validate_sequence_completion_accounting, AdmissionFitPolicy, DecodeFailureDisposition,
-        FerrumError, SequenceFitPolicy, VNextDeviceTimingMetrics, VNextExecutionWaveKind,
-        VNextPhysicalSpanTimingMetrics, VNextPreparedWaveTopologyMetrics, VNextProductOutputMode,
-        VNextProductTokenMaskContent, VNextProductTokenMaskResidency,
-        VNextProductTokenMaskResidencyTransaction, VNextProductTokenMaskSlotIdentity,
-        VNextProductTokenMaskSlotTarget, VNextReusableExecutionCatalogMissKey,
-        VNextReusableExecutionCatalogMissLedger, VNextReusableExecutionCatalogMissReason,
-        VNextReusableExecutionDescriptor, VNextReusableExecutionMetrics,
-        VNextReusableExecutionStartupPlan, VNextTeacherForcedDecision, VNextWaveTimingMetrics,
-        VNextWaveTimingSink, MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES,
-        MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
+        padded_repetition_token_id_bytes, product_output_mode_for_policies,
+        product_repetition_input, reported_allocated_bytes, resolve_reusable_execution_policy,
+        resolve_runtime_attention_authority, resolved_sequence_fit_policy,
+        reusable_catalog_lookup_allowed, reusable_executable_inventory_matches,
+        reusable_execution_program_catalog_is_usable, reusable_execution_requires_eager_fallback,
+        reusable_program_identity_required, reusable_startup_case_budget_violation,
+        submission_execution_policy_for_timing, validate_sequence_completion_accounting,
+        AdmissionFitPolicy, DecodeFailureDisposition, FerrumError, SequenceFitPolicy,
+        VNextDeviceTimingMetrics, VNextExecutionWaveKind, VNextPhysicalSpanTimingMetrics,
+        VNextPreparedWaveTopologyMetrics, VNextProductOutputMode, VNextProductTokenMaskContent,
+        VNextProductTokenMaskResidency, VNextProductTokenMaskResidencyTransaction,
+        VNextProductTokenMaskSlotIdentity, VNextProductTokenMaskSlotTarget,
+        VNextReusableExecutionCatalogMissKey, VNextReusableExecutionCatalogMissLedger,
+        VNextReusableExecutionCatalogMissReason, VNextReusableExecutionDescriptor,
+        VNextReusableExecutionMetrics, VNextReusableExecutionStartupPlan,
+        VNextTeacherForcedDecision, VNextWaveTimingMetrics, VNextWaveTimingSink,
+        MAX_PRODUCT_TOKEN_MASK_SLOT_CACHE_ENTRIES, MAX_REUSABLE_EXECUTION_CATALOG_MISS_KEYS,
     };
     use ferrum_interfaces::model_executor::{
         ExecutorSamplingOutput, ExecutorSequenceCompletion, GreedyRepetitionPenalty,
@@ -11083,6 +11112,22 @@ mod tests {
         assert!(neutral.token_ids.is_empty());
         assert_eq!(neutral.penalty, 1.0);
         assert!(!neutral.is_active());
+    }
+
+    #[test]
+    fn repetition_token_ids_are_zero_padded_to_the_typed_participant_capacity() {
+        let bytes = padded_repetition_token_id_bytes(&[3, 9], 4).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                3_u32.to_le_bytes(),
+                9_u32.to_le_bytes(),
+                0_u32.to_le_bytes(),
+                0_u32.to_le_bytes(),
+            ]
+            .concat()
+        );
+        assert!(padded_repetition_token_id_bytes(&[3, 9], 1).is_err());
     }
 
     #[test]

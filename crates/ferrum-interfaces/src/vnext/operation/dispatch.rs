@@ -9,10 +9,10 @@ use super::super::{
     DeviceReusableExecutionInvocation, DeviceReusableExecutionProgram,
     DeviceReusableExecutionProgramId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
     DeviceTimingMode, ExecutablePlanView, ExecutionIdentityEnvelope, ExecutionIdentityParts,
-    ExecutionLane, HostTransferLayout, InvocationResourceLease, LaneSubmitOutcome, NodeId,
-    NodeInvocationId, OperationId, ParticipantNodeKey, PreparedStepSubmissionWave,
-    ProgramBindingNodeBinding, ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment,
-    SubmissionWavePurpose, TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
+    ExecutionLane, InvocationResourceLease, LaneSubmitOutcome, NodeId, NodeInvocationId,
+    OperationId, ParticipantNodeKey, PreparedStepSubmissionWave, ProgramBindingNodeBinding,
+    ProviderId, ResourceId, SpanId, StepParticipantFrameAssignment, SubmissionWavePurpose,
+    TrustedActiveSequenceBinding, VNextError, EXECUTION_IDENTITY_VERSION,
 };
 use super::backing_upload::encode_submission_wave_backing_upload;
 use super::determinism::{
@@ -2181,45 +2181,49 @@ fn encode_submission_wave_inputs<R>(
 where
     R: DeviceRuntime,
 {
-    for upload in uploads {
+    struct ValidatedInputUpload<'a> {
+        upload: &'a SubmissionWaveInputUpload,
+        participant: &'a BatchOperationParticipantIdentity,
+        destination: std::ops::Range<u64>,
+    }
+
+    let mut upload_cursor = 0_usize;
+    while upload_cursor < uploads.len() {
+        let first_upload = &uploads[upload_cursor];
+        let mut run_end = upload_cursor + 1;
+        while uploads.get(run_end).is_some_and(|upload| {
+            upload.node_id() == first_upload.node_id()
+                && upload.input_ordinal() == first_upload.input_ordinal()
+        }) {
+            run_end += 1;
+        }
         let node = resolved
             .execution_plan()
             .payload()
             .nodes()
             .iter()
-            .find(|node| node.id() == upload.node_id())
+            .find(|node| node.id() == first_upload.node_id())
             .ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
                     "submission input upload references an unknown plan node",
                 ))
             })?;
-        let identity_node_index = batch_identity.node_index(upload.node_id()).ok_or_else(|| {
-            SubmissionWaveDispatchError::Contract(invalid_operation(
-                "submission input upload has no physical node identity",
-            ))
-        })?;
+        let identity_node_index = batch_identity
+            .node_index(first_upload.node_id())
+            .ok_or_else(|| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "submission input upload has no physical node identity",
+                ))
+            })?;
         let node_identity = batch_identity
             .materialize_node(identity_node_index)
             .map_err(SubmissionWaveDispatchError::Contract)?;
-        let participant_index = usize::try_from(upload.participant_index()).map_err(|_| {
-            SubmissionWaveDispatchError::Contract(invalid_operation(
-                "submission input upload participant index exceeds host address space",
-            ))
-        })?;
-        let participant = node_identity
-            .participants()
-            .get(participant_index)
-            .ok_or_else(|| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "submission input upload participant is absent from its plan node",
-                ))
-            })?;
         let value = node
             .values()
             .iter()
             .find(|value| {
                 value.role() == ResolvedValueRole::Input
-                    && value.ordinal() == upload.input_ordinal()
+                    && value.ordinal() == first_upload.input_ordinal()
             })
             .ok_or_else(|| {
                 SubmissionWaveDispatchError::Contract(invalid_operation(
@@ -2231,179 +2235,182 @@ where
                 "submission input upload requires one activation storage component",
             )));
         };
-        let byte_len = upload.source_layout().byte_len().map_err(|error| {
-            SubmissionWaveDispatchError::Contract(invalid_operation(error.to_string()))
-        })?;
-        let value_end = upload
-            .logical_offset_bytes()
-            .checked_add(byte_len)
-            .ok_or_else(|| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "submission input upload value range overflows",
-                ))
-            })?;
-        if value.usage() != BufferUsage::Activations
-            || !matches!(value.access(), TensorAccess::Read | TensorAccess::ReadWrite)
-            || value.tensor().element_type() != upload.source_layout().element_type()
-            || component.element_type() != upload.source_layout().element_type()
-            || value_end > component.length_bytes()
-        {
-            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                "submission input upload differs from its resolved activation binding",
-            )));
-        }
-        let semantic_destination_start = component
-            .offset_bytes()
-            .checked_add(upload.logical_offset_bytes())
-            .ok_or_else(|| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "submission input upload destination overflows",
-                ))
-            })?;
-        let semantic_destination_end = semantic_destination_start
-            .checked_add(byte_len)
-            .ok_or_else(|| {
-                SubmissionWaveDispatchError::Contract(invalid_operation(
-                    "submission input upload destination range overflows",
-                ))
-            })?;
         let descriptor = completion
             .wave()
             .step_resources()
             .dynamic_descriptor(component.resource_id())
             .map_err(SubmissionWaveDispatchError::Contract)?;
-        let destination = if descriptor.lifetime() == AllocationLifetime::Step
-            && descriptor.kind() == &AllocationKind::Value
-        {
-            let work_shape = completion
-                .wave()
-                .nodes()
-                .iter()
-                .find(|wave_node| wave_node.node_id() == upload.node_id())
-                .ok_or_else(|| {
-                    SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission input upload has no prepared wave node",
-                    ))
-                })?
-                .work_shape();
-            translate_step_participant_upload_range(
-                descriptor.demand(),
-                work_shape,
-                participant_index,
-                semantic_destination_start..semantic_destination_end,
+        let participant_packed = descriptor.lifetime() == AllocationLifetime::Step
+            && descriptor.kind() == &AllocationKind::Value;
+        let prepared_work_shape = if participant_packed {
+            Some(
+                completion
+                    .wave()
+                    .nodes()
+                    .iter()
+                    .find(|wave_node| wave_node.node_id() == first_upload.node_id())
+                    .ok_or_else(|| {
+                        SubmissionWaveDispatchError::Contract(invalid_operation(
+                            "submission input upload has no prepared wave node",
+                        ))
+                    })?
+                    .work_shape(),
             )
-            .map_err(SubmissionWaveDispatchError::Contract)?
         } else {
-            semantic_destination_start..semantic_destination_end
+            None
         };
-        let destination_start = destination.start;
-        let destination_end = destination.end;
-        let backing = completion
-            .backing_view(
-                upload.node_id(),
-                upload.participant_index(),
-                component.resource_id(),
-            )
-            .map_err(SubmissionWaveDispatchError::Contract)?;
-        if backing.usage() != BufferUsage::Activations
-            || backing.element_type() != upload.source_layout().element_type()
-            || destination_end > backing.size_bytes()
-        {
-            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                "submission input upload backing differs from its resolved activation",
-            )));
-        }
 
-        let element_bytes = upload.source_layout().element_type().size_bytes();
-        let mut logical_cursor = 0_u64;
-        let mut encoded_bytes = 0_u64;
-        for segment in backing.segment_bindings() {
-            let segment_end = logical_cursor
-                .checked_add(segment.segment().length_bytes())
+        let mut validated = Vec::with_capacity(run_end - upload_cursor);
+        for upload in &uploads[upload_cursor..run_end] {
+            let participant_index = usize::try_from(upload.participant_index()).map_err(|_| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "submission input upload participant index exceeds host address space",
+                ))
+            })?;
+            let participant = node_identity
+                .participants()
+                .get(participant_index)
                 .ok_or_else(|| {
                     SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission input upload backing coverage overflows",
+                        "submission input upload participant is absent from its plan node",
                     ))
                 })?;
-            let overlap_start = logical_cursor.max(destination_start);
-            let overlap_end = segment_end.min(destination_end);
-            if overlap_start < overlap_end {
-                let source_start =
-                    usize::try_from(overlap_start - destination_start).map_err(|_| {
-                        SubmissionWaveDispatchError::Contract(invalid_operation(
-                            "submission input upload source offset exceeds host address space",
-                        ))
-                    })?;
-                let piece_bytes = overlap_end - overlap_start;
-                let source_end = source_start
-                    .checked_add(usize::try_from(piece_bytes).map_err(|_| {
-                        SubmissionWaveDispatchError::Contract(invalid_operation(
-                            "submission input upload piece exceeds host address space",
-                        ))
-                    })?)
-                    .ok_or_else(|| {
-                        SubmissionWaveDispatchError::Contract(invalid_operation(
-                            "submission input upload source range overflows",
-                        ))
-                    })?;
-                let destination_offset = segment
-                    .segment()
-                    .offset_bytes()
-                    .checked_add(overlap_start - logical_cursor)
-                    .ok_or_else(|| {
-                        SubmissionWaveDispatchError::Contract(invalid_operation(
-                            "submission input upload physical offset overflows",
-                        ))
-                    })?;
-                if piece_bytes % element_bytes != 0
-                    || destination_offset % element_bytes != 0
-                    || source_end > upload.bytes().len()
-                {
-                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission input upload splits an element or exceeds its source",
-                    )));
-                }
-                let actual = runtime.buffer_descriptor(segment.buffer());
-                if &actual != segment.descriptor()
-                    || destination_offset
-                        .checked_add(piece_bytes)
-                        .is_none_or(|end| end > actual.size_bytes)
-                {
-                    return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission input upload backing descriptor drifted",
-                    )));
-                }
-                let layout = HostTransferLayout::new(
-                    upload.source_layout().element_type(),
-                    piece_bytes / element_bytes,
+            let byte_len = upload.source_layout().byte_len().map_err(|error| {
+                SubmissionWaveDispatchError::Contract(invalid_operation(error.to_string()))
+            })?;
+            let value_end = upload
+                .logical_offset_bytes()
+                .checked_add(byte_len)
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "submission input upload value range overflows",
+                    ))
+                })?;
+            if value.usage() != BufferUsage::Activations
+                || !matches!(value.access(), TensorAccess::Read | TensorAccess::ReadWrite)
+                || value.tensor().element_type() != upload.source_layout().element_type()
+                || component.element_type() != upload.source_layout().element_type()
+                || value_end > component.length_bytes()
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "submission input upload differs from its resolved activation binding",
+                )));
+            }
+            let semantic_destination_start = component
+                .offset_bytes()
+                .checked_add(upload.logical_offset_bytes())
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "submission input upload destination overflows",
+                    ))
+                })?;
+            let semantic_destination_end = semantic_destination_start
+                .checked_add(byte_len)
+                .ok_or_else(|| {
+                    SubmissionWaveDispatchError::Contract(invalid_operation(
+                        "submission input upload destination range overflows",
+                    ))
+                })?;
+            let destination = if let Some(work_shape) = prepared_work_shape {
+                translate_step_participant_upload_range(
+                    descriptor.demand(),
+                    work_shape,
+                    participant_index,
+                    semantic_destination_start..semantic_destination_end,
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?
+            } else {
+                semantic_destination_start..semantic_destination_end
+            };
+            if destination.end.checked_sub(destination.start) != Some(byte_len) {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "submission input upload translated range differs from its source layout",
+                )));
+            }
+            let backing = completion
+                .backing_view(
+                    upload.node_id(),
+                    upload.participant_index(),
+                    component.resource_id(),
                 )
                 .map_err(SubmissionWaveDispatchError::Contract)?;
-                let command = runtime
-                    .encode_upload(
-                        &upload.bytes()[source_start..source_end],
-                        layout,
-                        segment.buffer(),
-                        destination_offset,
-                    )
-                    .map_err(|error| {
-                        classify_device_error(runtime, participant.identity().clone(), &error)
-                            .map(SubmissionWaveDispatchError::InputUpload)
-                            .unwrap_or_else(SubmissionWaveDispatchError::Contract)
-                    })?;
-                commands.push_dynamic_binding(command);
-                encoded_bytes = encoded_bytes.checked_add(piece_bytes).ok_or_else(|| {
-                    SubmissionWaveDispatchError::Contract(invalid_operation(
-                        "submission input upload encoded byte count overflows",
-                    ))
-                })?;
+            if backing.usage() != BufferUsage::Activations
+                || backing.element_type() != upload.source_layout().element_type()
+                || destination.end > backing.size_bytes()
+            {
+                return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
+                    "submission input upload backing differs from its resolved activation",
+                )));
             }
-            logical_cursor = segment_end;
+            validated.push(ValidatedInputUpload {
+                upload,
+                participant,
+                destination,
+            });
         }
-        if encoded_bytes != byte_len {
-            return Err(SubmissionWaveDispatchError::Contract(invalid_operation(
-                "submission input upload backing does not cover its complete range",
-            )));
+
+        let mut validated_cursor = 0_usize;
+        while validated_cursor < validated.len() {
+            let mut contiguous_end = validated_cursor + 1;
+            if participant_packed {
+                while contiguous_end < validated.len()
+                    && validated[contiguous_end - 1].destination.end
+                        == validated[contiguous_end].destination.start
+                {
+                    contiguous_end += 1;
+                }
+            }
+            let first = &validated[validated_cursor];
+            let backing = completion
+                .backing_view(
+                    first.upload.node_id(),
+                    first.upload.participant_index(),
+                    component.resource_id(),
+                )
+                .map_err(SubmissionWaveDispatchError::Contract)?;
+            if contiguous_end == validated_cursor + 1 {
+                encode_submission_wave_backing_upload(
+                    runtime,
+                    first.participant.identity(),
+                    &backing,
+                    BufferUsage::Activations,
+                    first.upload.source_layout().element_type(),
+                    first.destination.start,
+                    first.upload.bytes(),
+                    "submission input upload",
+                    |command| commands.push_dynamic_binding(command),
+                )?;
+            } else {
+                let aggregate_byte_len = validated[validated_cursor..contiguous_end]
+                    .iter()
+                    .try_fold(0_usize, |total, input| {
+                        total
+                            .checked_add(input.upload.bytes().len())
+                            .ok_or_else(|| {
+                                SubmissionWaveDispatchError::Contract(invalid_operation(
+                                    "submission input upload aggregate byte count overflows usize",
+                                ))
+                            })
+                    })?;
+                let mut aggregate_bytes = Vec::with_capacity(aggregate_byte_len);
+                for input in &validated[validated_cursor..contiguous_end] {
+                    aggregate_bytes.extend_from_slice(input.upload.bytes());
+                }
+                encode_submission_wave_backing_upload(
+                    runtime,
+                    first.participant.identity(),
+                    &backing,
+                    BufferUsage::Activations,
+                    first.upload.source_layout().element_type(),
+                    first.destination.start,
+                    &aggregate_bytes,
+                    "submission input upload aggregate",
+                    |command| commands.push_dynamic_binding(command),
+                )?;
+            }
+            validated_cursor = contiguous_end;
         }
+        upload_cursor = run_end;
     }
     Ok(())
 }

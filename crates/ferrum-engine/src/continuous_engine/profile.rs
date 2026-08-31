@@ -243,7 +243,6 @@ impl VNextProfileExecutionEventSink {
                 capture_policy: if matches!(
                     config.runtime.profile_detail,
                     ObservabilityProfileDetail::Resource
-                        | ObservabilityProfileDetail::Latency
                         | ObservabilityProfileDetail::Kernel
                         | ObservabilityProfileDetail::Replay
                         | ObservabilityProfileDetail::Verify
@@ -1635,12 +1634,12 @@ impl ExecutionEventSink for VNextProfileExecutionEventSink {
 
     fn device_timing_mode(&self) -> ferrum_interfaces::vnext::DeviceTimingMode {
         match self.context.profile_detail {
-            ObservabilityProfileDetail::Off | ObservabilityProfileDetail::Resource => {
+            ObservabilityProfileDetail::Off
+            | ObservabilityProfileDetail::Resource
+            | ObservabilityProfileDetail::Latency => {
                 ferrum_interfaces::vnext::DeviceTimingMode::Off
             }
-            ObservabilityProfileDetail::Basic
-            | ObservabilityProfileDetail::Latency
-            | ObservabilityProfileDetail::Debug => {
+            ObservabilityProfileDetail::Basic | ObservabilityProfileDetail::Debug => {
                 ferrum_interfaces::vnext::DeviceTimingMode::Completion
             }
             ObservabilityProfileDetail::Replay => {

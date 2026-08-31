@@ -300,6 +300,175 @@ struct CudaProgramBindingPatch {
     fence_dependencies: Vec<CudaBufferRegion>,
 }
 
+struct CudaProgramBindingTransfer {
+    destination_offset_bytes: u64,
+    destination_stride_bytes: u64,
+    row_bytes: usize,
+    row_count: usize,
+    payload: Box<[u8]>,
+}
+
+fn coalesce_program_binding_transfers(
+    mut writes: Vec<CudaProgramBindingWrite>,
+    arena_size_bytes: u64,
+) -> Result<Vec<CudaProgramBindingTransfer>, CudaDeviceRuntimeError> {
+    if writes.is_empty() || arena_size_bytes == 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA sparse program binding transfer has no writes or arena",
+        ));
+    }
+    writes.sort_by_key(|write| write.destination_offset_bytes);
+
+    let mut prior_end = 0_u64;
+    for write in &writes {
+        let payload_bytes = u64::try_from(write.payload.len()).map_err(|_| {
+            CudaDeviceRuntimeError::contract("CUDA program binding payload exceeds u64")
+        })?;
+        if payload_bytes == 0 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA sparse program binding write payload is empty",
+            ));
+        }
+        let end = write
+            .destination_offset_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA sparse program binding write range overflows u64",
+                )
+            })?;
+        if write.destination_offset_bytes < prior_end || end > arena_size_bytes {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA sparse program binding writes overlap or exceed the arena",
+            ));
+        }
+        prior_end = end;
+    }
+
+    let mut groups = Vec::new();
+    let mut group_count = 0_usize;
+    let mut group_bytes = 0_usize;
+    let mut group_end = None;
+    for write in &writes {
+        if group_end.is_some_and(|end| end != write.destination_offset_bytes) {
+            groups.push((group_count, group_bytes));
+            group_count = 0;
+            group_bytes = 0;
+        }
+        group_count = group_count.checked_add(1).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA sparse program binding transfer count overflows usize",
+            )
+        })?;
+        group_bytes = group_bytes
+            .checked_add(write.payload.len())
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA sparse program binding transfer size overflows usize",
+                )
+            })?;
+        group_end = Some(
+            write
+                .destination_offset_bytes
+                .checked_add(u64::try_from(write.payload.len()).map_err(|_| {
+                    CudaDeviceRuntimeError::contract("CUDA program binding payload exceeds u64")
+                })?)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA sparse program binding write range overflows u64",
+                    )
+                })?,
+        );
+    }
+    groups.push((group_count, group_bytes));
+
+    let mut writes = writes.into_iter();
+    let mut rows = Vec::with_capacity(groups.len());
+    for (group_count, group_bytes) in groups {
+        let first = writes
+            .next()
+            .expect("validated sparse transfer group owns its first write");
+        let destination_offset_bytes = first.destination_offset_bytes;
+        if group_count == 1 {
+            rows.push(CudaProgramBindingWrite {
+                destination_offset_bytes,
+                payload: first.payload,
+            });
+            continue;
+        }
+        let mut payload = Vec::with_capacity(group_bytes);
+        payload.extend_from_slice(&first.payload);
+        for _ in 1..group_count {
+            let write = writes
+                .next()
+                .expect("validated sparse transfer group owns every adjacent write");
+            payload.extend_from_slice(&write.payload);
+        }
+        debug_assert_eq!(payload.len(), group_bytes);
+        rows.push(CudaProgramBindingWrite {
+            destination_offset_bytes,
+            payload: payload.into_boxed_slice(),
+        });
+    }
+    debug_assert!(writes.next().is_none());
+
+    let mut transfers = Vec::with_capacity(rows.len());
+    let mut row_index = 0_usize;
+    while row_index < rows.len() {
+        let row_bytes = rows[row_index].payload.len();
+        let mut row_count = 1_usize;
+        let mut destination_stride_bytes = u64::try_from(row_bytes).map_err(|_| {
+            CudaDeviceRuntimeError::contract("CUDA sparse program binding row size exceeds u64")
+        })?;
+        if let Some(next) = rows.get(row_index + 1).filter(|next| {
+            next.payload.len() == row_bytes
+                && next.destination_offset_bytes > rows[row_index].destination_offset_bytes
+        }) {
+            destination_stride_bytes = next
+                .destination_offset_bytes
+                .checked_sub(rows[row_index].destination_offset_bytes)
+                .expect("sorted non-overlapping program binding rows have a positive stride");
+            row_count = 2;
+            while let Some(next) = rows.get(row_index + row_count) {
+                let prior = &rows[row_index + row_count - 1];
+                if next.payload.len() != row_bytes
+                    || next
+                        .destination_offset_bytes
+                        .checked_sub(prior.destination_offset_bytes)
+                        != Some(destination_stride_bytes)
+                {
+                    break;
+                }
+                row_count += 1;
+            }
+        }
+
+        let packed_bytes = row_bytes.checked_mul(row_count).ok_or_else(|| {
+            CudaDeviceRuntimeError::contract("CUDA sparse program binding packed rows exceed usize")
+        })?;
+        let destination_offset_bytes = rows[row_index].destination_offset_bytes;
+        let payload = if row_count == 1 {
+            std::mem::take(&mut rows[row_index].payload)
+        } else {
+            let mut payload = Vec::with_capacity(packed_bytes);
+            for row in &rows[row_index..row_index + row_count] {
+                payload.extend_from_slice(&row.payload);
+            }
+            debug_assert_eq!(payload.len(), packed_bytes);
+            payload.into_boxed_slice()
+        };
+        transfers.push(CudaProgramBindingTransfer {
+            destination_offset_bytes,
+            destination_stride_bytes,
+            row_bytes,
+            row_count,
+            payload,
+        });
+        row_index += row_count;
+    }
+    Ok(transfers)
+}
+
 /// Encoded CUDA work. Buffer and host-transfer storage stays alive until the
 /// returned fence reaches a terminal state.
 pub struct CudaDeviceCommand {
@@ -311,7 +480,7 @@ pub struct CudaDeviceCommand {
     token_count: u64,
     compute_dispatch_count: u64,
     transfer_command_count: u64,
-    executable: Arc<CudaCommandExecutable>,
+    executable: Option<Arc<CudaCommandExecutable>>,
     fence_dependencies: Vec<CudaBufferRegion>,
     replay_key: Option<CudaCommandReplayKey>,
     reusable_address_scope: Option<DeviceReusableAddressScope>,
@@ -332,10 +501,19 @@ impl fmt::Debug for CudaDeviceCommand {
             .field("token_count", &self.token_count)
             .field("compute_dispatch_count", &self.compute_dispatch_count)
             .field("transfer_command_count", &self.transfer_command_count)
-            .field("captured_region_count", &self.executable.regions.len())
+            .field(
+                "captured_region_count",
+                &self
+                    .executable
+                    .as_ref()
+                    .map_or(0, |executable| executable.regions.len()),
+            )
             .field(
                 "captured_host_storage_count",
-                &self.executable.host_storage.len(),
+                &self
+                    .executable
+                    .as_ref()
+                    .map_or(0, |executable| executable.host_storage.len()),
             )
             .field("fence_dependency_count", &self.fence_dependencies.len())
             .field("replayable", &self.replay_key.is_some())
@@ -566,11 +744,11 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
-            executable: Arc::new(CudaCommandExecutable {
+            executable: Some(Arc::new(CudaCommandExecutable {
                 regions,
                 host_storage,
                 enqueue: Mutex::new(Box::new(enqueue)),
-            }),
+            })),
             fence_dependencies,
             replay_key,
             reusable_address_scope,
@@ -608,11 +786,11 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
-            executable: Arc::new(CudaCommandExecutable {
+            executable: Some(Arc::new(CudaCommandExecutable {
                 regions,
                 host_storage,
                 enqueue: Mutex::new(Box::new(enqueue)),
-            }),
+            })),
             fence_dependencies,
             replay_key,
             reusable_address_scope,
@@ -643,7 +821,7 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 1,
-            executable,
+            executable: Some(executable),
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
@@ -693,15 +871,6 @@ impl CudaDeviceCommand {
             }
             prior_end = end;
         }
-        let executable = Arc::new(CudaCommandExecutable {
-            regions: Vec::new(),
-            host_storage: Vec::new(),
-            enqueue: Mutex::new(Box::new(|_, _, _, _| {
-                Err(CudaDeviceRuntimeError::contract(
-                    "uncoalesced CUDA program binding patch cannot enqueue",
-                ))
-            })),
-        });
         Ok(Self {
             runtime_instance,
             operation,
@@ -711,7 +880,7 @@ impl CudaDeviceCommand {
             token_count: 0,
             compute_dispatch_count: 0,
             transfer_command_count: 0,
-            executable,
+            executable: None,
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
@@ -803,7 +972,7 @@ impl CudaDeviceCommand {
             token_count,
             compute_dispatch_count: 1,
             transfer_command_count: 0,
-            executable,
+            executable: Some(executable),
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
@@ -886,11 +1055,6 @@ impl CudaDeviceCommand {
         }
 
         let layout_physical_size_bytes = layout.physical_size_bytes();
-        let patch_bytes = checked_usize(
-            layout_physical_size_bytes,
-            "CUDA aggregate program binding patch size",
-        )?;
-        let mut host_patch = vec![0_u8; patch_bytes];
         let first_destination = first.destination.clone();
         let first_slot_offset_bytes = first.binding.slot().physical_offset_bytes();
         let arena_device_ptr = first_destination
@@ -922,6 +1086,7 @@ impl CudaDeviceCommand {
         }
 
         let mut fence_dependencies = Vec::new();
+        let mut arena_writes = Vec::new();
         for patch in patches {
             let slot = patch.binding.slot();
             let expected_device_ptr = arena_device_ptr
@@ -941,61 +1106,141 @@ impl CudaDeviceCommand {
                     "CUDA program binding patch destination differs from its arena slot",
                 ));
             }
-            for write in patch.writes {
-                let destination_start = slot
+            for mut write in patch.writes {
+                write.destination_offset_bytes = slot
                     .physical_offset_bytes()
                     .checked_add(write.destination_offset_bytes)
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(
-                            "CUDA aggregate program binding write offset overflows",
+                            "CUDA sparse program binding write offset overflows",
                         )
                     })?;
-                let destination_start = checked_usize(
-                    destination_start,
-                    "CUDA aggregate program binding write offset",
-                )?;
-                let destination_end = destination_start
-                    .checked_add(write.payload.len())
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "CUDA aggregate program binding write end overflows",
-                        )
-                    })?;
-                let destination = host_patch
-                    .get_mut(destination_start..destination_end)
-                    .ok_or_else(|| {
-                        CudaDeviceRuntimeError::contract(
-                            "CUDA aggregate program binding write exceeds its arena",
-                        )
-                    })?;
-                destination.copy_from_slice(&write.payload);
+                arena_writes.push(write);
             }
             fence_dependencies.extend(patch.fence_dependencies);
         }
 
-        let arena_region = CudaBufferRegion {
-            _allocation: Arc::clone(&first_destination._allocation),
-            _core_retention: first_destination._core_retention.clone(),
-            reusable_address_scope: first_destination.reusable_address_scope,
-            runtime_instance,
-            device_ptr: arena_device_ptr,
-            length_bytes: layout_physical_size_bytes,
-            element_type: ElementType::U8,
-        };
-        let executable = Arc::new(CudaCommandExecutable {
-            regions: vec![arena_region],
-            host_storage: vec![host_patch.into_boxed_slice()],
-            enqueue: Mutex::new(Box::new(|stream, _blas, regions, host_storage| {
-                unsafe {
-                    cudarc::driver::result::memcpy_htod_async(
-                        regions[0].device_ptr,
-                        host_storage[0].as_ref(),
-                        stream.cu_stream(),
+        let transfers =
+            coalesce_program_binding_transfers(arena_writes, layout_physical_size_bytes)?;
+        let transfer_command_count = u64::try_from(transfers.len()).map_err(|_| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA sparse program binding transfer count exceeds u64",
+            )
+        })?;
+        let mut regions = Vec::with_capacity(transfers.len());
+        let mut host_storage = Vec::with_capacity(transfers.len());
+        let mut transfer_shapes = Vec::with_capacity(transfers.len());
+        for transfer in transfers {
+            let row_bytes_u64 = u64::try_from(transfer.row_bytes).map_err(|_| {
+                CudaDeviceRuntimeError::contract("CUDA sparse program binding row size exceeds u64")
+            })?;
+            let trailing_rows =
+                u64::try_from(transfer.row_count.saturating_sub(1)).map_err(|_| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA sparse program binding row count exceeds u64",
                     )
+                })?;
+            let destination_span_bytes = transfer
+                .destination_stride_bytes
+                .checked_mul(trailing_rows)
+                .and_then(|span| span.checked_add(row_bytes_u64))
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA sparse program binding destination span overflows",
+                    )
+                })?;
+            let destination_end = transfer
+                .destination_offset_bytes
+                .checked_add(destination_span_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA sparse program binding destination end overflows",
+                    )
+                })?;
+            if destination_end > layout_physical_size_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA sparse program binding transfer exceeds its arena",
+                ));
+            }
+            let device_ptr = arena_device_ptr
+                .checked_add(transfer.destination_offset_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "CUDA sparse program binding destination pointer overflows",
+                    )
+                })?;
+            regions.push(CudaBufferRegion {
+                _allocation: Arc::clone(&first_destination._allocation),
+                _core_retention: first_destination._core_retention.clone(),
+                reusable_address_scope: first_destination.reusable_address_scope,
+                runtime_instance,
+                device_ptr,
+                length_bytes: destination_span_bytes,
+                element_type: ElementType::U8,
+            });
+            transfer_shapes.push((
+                checked_usize(
+                    transfer.destination_stride_bytes,
+                    "CUDA sparse program binding destination stride",
+                )?,
+                transfer.row_bytes,
+                transfer.row_count,
+            ));
+            host_storage.push(transfer.payload);
+        }
+        let executable = Arc::new(CudaCommandExecutable {
+            regions,
+            host_storage,
+            enqueue: Mutex::new(Box::new(move |stream, _blas, regions, host_storage| {
+                if regions.len() != host_storage.len() || regions.len() != transfer_shapes.len() {
+                    return Err(CudaDeviceRuntimeError::contract(
+                        "CUDA sparse program binding transfer storage differs from its shape",
+                    ));
                 }
-                .map_err(|error| {
-                    CudaDeviceRuntimeError::driver("aggregate program binding upload", error)
-                })
+                for ((region, payload), &(destination_pitch, row_bytes, row_count)) in
+                    regions.iter().zip(host_storage).zip(&transfer_shapes)
+                {
+                    if row_count == 1 {
+                        unsafe {
+                            cudarc::driver::result::memcpy_htod_async(
+                                region.device_ptr,
+                                payload.as_ref(),
+                                stream.cu_stream(),
+                            )
+                        }
+                        .map_err(|error| {
+                            CudaDeviceRuntimeError::driver("sparse program binding upload", error)
+                        })?;
+                        continue;
+                    }
+                    let copy = cudarc::driver::sys::CUDA_MEMCPY2D {
+                        srcXInBytes: 0,
+                        srcY: 0,
+                        srcMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_HOST,
+                        srcHost: payload.as_ptr().cast(),
+                        srcDevice: 0,
+                        srcArray: std::ptr::null_mut(),
+                        srcPitch: row_bytes,
+                        dstXInBytes: 0,
+                        dstY: 0,
+                        dstMemoryType: cudarc::driver::sys::CUmemorytype::CU_MEMORYTYPE_DEVICE,
+                        dstHost: std::ptr::null_mut(),
+                        dstDevice: region.device_ptr,
+                        dstArray: std::ptr::null_mut(),
+                        dstPitch: destination_pitch,
+                        WidthInBytes: row_bytes,
+                        Height: row_count,
+                    };
+                    unsafe { cudarc::driver::sys::cuMemcpy2DAsync_v2(&copy, stream.cu_stream()) }
+                        .result()
+                        .map_err(|error| {
+                            CudaDeviceRuntimeError::driver(
+                                "strided sparse program binding upload",
+                                error,
+                            )
+                        })?;
+                }
+                Ok(())
             })),
         });
         Ok(vec![Self {
@@ -1006,8 +1251,8 @@ impl CudaDeviceCommand {
             participant_count,
             token_count,
             compute_dispatch_count: 0,
-            transfer_command_count: 1,
-            executable,
+            transfer_command_count,
+            executable: Some(executable),
             fence_dependencies,
             replay_key: None,
             reusable_address_scope: None,
@@ -1067,7 +1312,7 @@ impl CudaDeviceCommand {
             token_count,
             compute_dispatch_count: 0,
             transfer_command_count,
-            executable,
+            executable: Some(executable),
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
@@ -1082,17 +1327,16 @@ impl CudaDeviceCommand {
         stream: &CudaStream,
         blas: &CudaBlas,
     ) -> Result<(), CudaDeviceRuntimeError> {
-        let enqueue = self
-            .executable
+        let executable = self.executable.as_ref().ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "uncoalesced CUDA program binding patch cannot enqueue",
+            )
+        })?;
+        let enqueue = executable
             .enqueue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        enqueue(
-            stream,
-            blas,
-            &self.executable.regions,
-            &self.executable.host_storage,
-        )
+        enqueue(stream, blas, &executable.regions, &executable.host_storage)
     }
 
     pub(crate) const fn replay_key(&self) -> Option<CudaCommandReplayKey> {
@@ -1135,7 +1379,11 @@ impl CudaDeviceCommand {
     }
 
     pub(crate) fn executable(&self) -> Arc<CudaCommandExecutable> {
-        Arc::clone(&self.executable)
+        Arc::clone(
+            self.executable
+                .as_ref()
+                .expect("replayable CUDA command owns an executable"),
+        )
     }
 }
 
@@ -3416,6 +3664,186 @@ mod tests {
     use super::*;
     use ferrum_interfaces::vnext::DeviceCommandPhase;
 
+    fn program_binding_write(offset: u64, payload: Vec<u8>) -> CudaProgramBindingWrite {
+        CudaProgramBindingWrite::new(offset, payload.into_boxed_slice()).unwrap()
+    }
+
+    #[test]
+    fn sparse_program_binding_transfers_preserve_live_bytes_and_destination_offsets() {
+        let transfers = coalesce_program_binding_transfers(
+            vec![
+                program_binding_write(16, vec![9, 10]),
+                program_binding_write(2, vec![3]),
+                program_binding_write(0, vec![1, 2]),
+            ],
+            32,
+        )
+        .unwrap();
+
+        assert_eq!(transfers.len(), 2);
+        assert_eq!(transfers[0].destination_offset_bytes, 0);
+        assert_eq!(transfers[0].destination_stride_bytes, 3);
+        assert_eq!(transfers[0].row_bytes, 3);
+        assert_eq!(transfers[0].row_count, 1);
+        assert_eq!(transfers[0].payload.as_ref(), &[1, 2, 3]);
+        assert_eq!(transfers[1].destination_offset_bytes, 16);
+        assert_eq!(transfers[1].payload.as_ref(), &[9, 10]);
+        assert_eq!(
+            transfers
+                .iter()
+                .map(|transfer| transfer.payload.len())
+                .sum::<usize>(),
+            5,
+            "sparse planning must not materialize the unwritten arena gap",
+        );
+    }
+
+    #[test]
+    fn sparse_program_binding_transfers_reject_overlap_and_arena_overflow() {
+        let overlap = coalesce_program_binding_transfers(
+            vec![
+                program_binding_write(0, vec![1, 2, 3, 4]),
+                program_binding_write(3, vec![5, 6]),
+            ],
+            8,
+        );
+        assert!(matches!(overlap, Err(CudaDeviceRuntimeError::Contract(_))));
+
+        let overflow =
+            coalesce_program_binding_transfers(vec![program_binding_write(7, vec![1, 2])], 8);
+        assert!(matches!(overflow, Err(CudaDeviceRuntimeError::Contract(_))));
+    }
+
+    #[test]
+    fn sparse_program_binding_transfers_pack_thirty_two_fixed_stride_rows() {
+        let row_bytes = 80_usize;
+        let stride = 131_088_u64;
+        let writes = (0_u8..32)
+            .map(|row| program_binding_write(128 + u64::from(row) * stride, vec![row; row_bytes]))
+            .collect();
+        let transfers = coalesce_program_binding_transfers(writes, 5_000_000).unwrap();
+
+        assert_eq!(transfers.len(), 1);
+        let transfer = &transfers[0];
+        assert_eq!(transfer.destination_offset_bytes, 128);
+        assert_eq!(transfer.destination_stride_bytes, stride);
+        assert_eq!(transfer.row_bytes, row_bytes);
+        assert_eq!(transfer.row_count, 32);
+        assert_eq!(transfer.payload.len(), 32 * row_bytes);
+        for row in 0_u8..32 {
+            let start = usize::from(row) * row_bytes;
+            assert!(transfer.payload[start..start + row_bytes]
+                .iter()
+                .all(|byte| *byte == row));
+        }
+    }
+
+    #[test]
+    fn sparse_program_binding_transfers_split_when_row_length_changes() {
+        let transfers = coalesce_program_binding_transfers(
+            vec![
+                program_binding_write(0, vec![1; 8]),
+                program_binding_write(64, vec![2; 8]),
+                program_binding_write(128, vec![3; 16]),
+                program_binding_write(256, vec![4; 16]),
+                program_binding_write(384, vec![5; 8]),
+            ],
+            512,
+        )
+        .unwrap();
+
+        assert_eq!(transfers.len(), 3);
+        assert_eq!(
+            transfers
+                .iter()
+                .map(|transfer| (transfer.row_bytes, transfer.row_count))
+                .collect::<Vec<_>>(),
+            vec![(8, 2), (16, 2), (8, 1)],
+        );
+        assert_eq!(
+            transfers
+                .iter()
+                .map(|transfer| transfer.destination_stride_bytes)
+                .collect::<Vec<_>>(),
+            vec![64, 128, 8],
+        );
+    }
+
+    #[test]
+    fn qwen_max_context_sixty_four_patches_keep_only_live_binding_payload() {
+        const PARTICIPANTS: u64 = 32;
+        const RECURRENT_ROW_BYTES: u64 = 16;
+        const CAUSAL_ROW_BYTES: usize = 80;
+        const MAXIMUM_CONTEXT_TOKENS: u64 = 262_144;
+        const PAGE_TOKENS: u64 = 16;
+        const ADDRESS_BYTES: u64 = 8;
+        const CONTROL_BYTES: u64 = 16;
+
+        let causal_row_capacity =
+            CONTROL_BYTES + MAXIMUM_CONTEXT_TOKENS.div_ceil(PAGE_TOKENS) * ADDRESS_BYTES;
+        let recurrent_slot_capacity = PARTICIPANTS * RECURRENT_ROW_BYTES;
+        let causal_slot_capacity = PARTICIPANTS * causal_row_capacity;
+        let group_capacity = 3 * recurrent_slot_capacity + causal_slot_capacity;
+        let arena_size = 16 * group_capacity;
+        assert_eq!(arena_size, 67_141_632);
+
+        let mut logical_patches = Vec::with_capacity(64);
+        for group in 0_u64..16 {
+            let group_offset = group * group_capacity;
+            for recurrent in 0_u64..3 {
+                let slot_offset = group_offset + recurrent * recurrent_slot_capacity;
+                logical_patches.push(
+                    (0_u64..PARTICIPANTS)
+                        .map(|participant| {
+                            program_binding_write(
+                                slot_offset + participant * RECURRENT_ROW_BYTES,
+                                vec![
+                                    u8::try_from(recurrent).unwrap();
+                                    usize::try_from(RECURRENT_ROW_BYTES).unwrap()
+                                ],
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            let causal_slot_offset = group_offset + 3 * recurrent_slot_capacity;
+            logical_patches.push(
+                (0_u64..PARTICIPANTS)
+                    .map(|participant| {
+                        program_binding_write(
+                            causal_slot_offset + participant * causal_row_capacity,
+                            vec![u8::try_from(group).unwrap(); CAUSAL_ROW_BYTES],
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(logical_patches.len(), 64);
+
+        let transfers = coalesce_program_binding_transfers(
+            logical_patches.into_iter().flatten().collect(),
+            arena_size,
+        )
+        .unwrap();
+        let live_payload_bytes = transfers
+            .iter()
+            .map(|transfer| transfer.payload.len())
+            .sum::<usize>();
+        assert_eq!(live_payload_bytes, 65_536);
+        assert_eq!(transfers.len(), 32);
+        assert_eq!(transfers[0].destination_offset_bytes, 0);
+        assert_eq!(transfers[0].row_bytes, 1_616);
+        assert_eq!(transfers[0].row_count, 1);
+        assert_eq!(
+            transfers[1].destination_offset_bytes,
+            3 * recurrent_slot_capacity + causal_row_capacity,
+        );
+        assert_eq!(transfers[1].destination_stride_bytes, causal_row_capacity);
+        assert_eq!(transfers[1].row_bytes, CAUSAL_ROW_BYTES);
+        assert_eq!(transfers[1].row_count, 31);
+        assert_eq!(transfers[2].destination_offset_bytes, group_capacity);
+    }
+
     fn command(operation: &'static str) -> CudaDeviceCommand {
         CudaDeviceCommand {
             runtime_instance: 1,
@@ -3426,11 +3854,11 @@ mod tests {
             token_count: 1,
             compute_dispatch_count: 1,
             transfer_command_count: 0,
-            executable: Arc::new(CudaCommandExecutable {
+            executable: Some(Arc::new(CudaCommandExecutable {
                 regions: Vec::new(),
                 host_storage: Vec::new(),
                 enqueue: Mutex::new(Box::new(|_, _, _, _| Ok(()))),
-            }),
+            })),
             fence_dependencies: Vec::new(),
             replay_key: None,
             reusable_address_scope: None,
