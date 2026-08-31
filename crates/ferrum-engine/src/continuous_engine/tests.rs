@@ -12475,6 +12475,103 @@ fn harmony_protocol_allows_only_its_typed_generation_controls() {
 }
 
 #[test]
+fn harmony_call_and_return_terminals_are_sent_to_the_incremental_stream() {
+    let mut tokenizer = PolicyTokenizer::new(
+        9,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("<eos>", 3),
+            ("<pad>", 4),
+            ("<|call|>", 7),
+            ("<|return|>", 8),
+        ],
+    );
+    tokenizer.special.extra_eos_tokens = vec![TokenId::new(7), TokenId::new(8)];
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let mut request = policy_request();
+    request.sampling_params.model_output_protocol =
+        ferrum_types::ModelOutputProtocol::HarmonyGptOss;
+    let mut state = SequenceState::new_with_tokenizer(
+        request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+
+    for (token, marker) in [
+        (TokenId::new(7), "<|call|>"),
+        (TokenId::new(8), "<|return|>"),
+    ] {
+        state.generated_tokens.clear();
+        state.generated_tokens.push(token);
+        let stop_reason = state.stop_reason(Some(tokenizer.as_ref()));
+
+        assert_eq!(stop_reason, Some(FinishReason::Stop));
+        assert!(state.should_stream_generated_token(Some(tokenizer.as_ref()), token, stop_reason,));
+        assert_eq!(
+            tokenizer.decode(&state.generated_tokens, true).unwrap(),
+            marker
+        );
+    }
+}
+
+#[test]
+fn ordinary_eos_and_untyped_harmony_terminal_are_not_sent_to_the_stream() {
+    let mut tokenizer = PolicyTokenizer::new(
+        8,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("<eos>", 3),
+            ("<pad>", 4),
+            ("<|return|>", 7),
+        ],
+    );
+    tokenizer.special.extra_eos_tokens = vec![TokenId::new(7)];
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+
+    let mut text_state = SequenceState::new_with_tokenizer(
+        policy_request(),
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+    for token in [TokenId::new(3), TokenId::new(7)] {
+        text_state.generated_tokens.clear();
+        text_state.generated_tokens.push(token);
+        let stop_reason = text_state.stop_reason(Some(tokenizer.as_ref()));
+        assert_eq!(stop_reason, Some(FinishReason::Stop));
+        assert!(
+            !text_state
+                .should_stream_generated_token(Some(tokenizer.as_ref()), token, stop_reason,),
+            "text protocol must not leak decoded stop token {:?}",
+            tokenizer.decode(&[token], true).unwrap()
+        );
+    }
+
+    let mut harmony_request = policy_request();
+    harmony_request.sampling_params.model_output_protocol =
+        ferrum_types::ModelOutputProtocol::HarmonyGptOss;
+    let mut harmony_state = SequenceState::new_with_tokenizer(
+        harmony_request,
+        vec![TokenId::new(0)],
+        Some(Arc::clone(&tokenizer)),
+    );
+    harmony_state.generated_tokens.push(TokenId::new(3));
+    let stop_reason = harmony_state.stop_reason(Some(tokenizer.as_ref()));
+    assert_eq!(stop_reason, Some(FinishReason::Stop));
+    assert!(
+        !harmony_state.should_stream_generated_token(
+            Some(tokenizer.as_ref()),
+            TokenId::new(3),
+            stop_reason,
+        ),
+        "Harmony must not expose an ordinary model EOS token"
+    );
+}
+
+#[test]
 fn tool_protocol_does_not_widen_sampling_when_tool_choice_is_none() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         6,

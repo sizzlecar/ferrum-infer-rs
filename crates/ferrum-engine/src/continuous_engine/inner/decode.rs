@@ -194,7 +194,7 @@ impl EngineInner {
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 
             let stop_reason = self.stop_reason_for_request(rid);
-            if self.should_stream_generated_token(stop_reason) {
+            if self.should_stream_generated_token(rid, next_token, stop_reason) {
                 self.send_stream_update(rid, next_token).await;
             }
             if let Some(reason) = stop_reason {
@@ -713,7 +713,7 @@ impl EngineInner {
 
             let stop_reason = self.stop_reason_for_request(rid);
             let t0_stream = if prof { Some(Instant::now()) } else { None };
-            if self.should_stream_generated_token(stop_reason) {
+            if self.should_stream_generated_token(rid, next_token, stop_reason) {
                 self.send_stream_update(rid, next_token).await;
             }
             if let Some(t0) = t0_stream {
@@ -866,7 +866,7 @@ impl EngineInner {
         counter!("ferrum.engine.decode_tokens_total").increment(1);
 
         let stop_reason = self.stop_reason_for_request(request_id);
-        if self.should_stream_generated_token(stop_reason) {
+        if self.should_stream_generated_token(request_id, next_token, stop_reason) {
             self.send_stream_update(request_id, next_token).await;
         }
 
@@ -1105,7 +1105,7 @@ impl EngineInner {
             counter!("ferrum.engine.decode_tokens_total").increment(1);
 
             let stop_reason = self.stop_reason_for_request(request_id);
-            if self.should_stream_generated_token(stop_reason) {
+            if self.should_stream_generated_token(request_id, tok, stop_reason) {
                 self.send_stream_update(request_id, tok).await;
             }
             if let Some(reason) = stop_reason {
