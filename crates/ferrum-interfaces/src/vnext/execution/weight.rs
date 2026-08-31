@@ -202,6 +202,13 @@ pub enum StaticWeightTransformPlan {
         logical_dimensions: Vec<u64>,
         matrices_per_output: u32,
     },
+    GptOssMxfp4ToMarlin {
+        source_blocks_id: WeightId,
+        source_scales_id: WeightId,
+        packed_values_id: WeightId,
+        scales_id: WeightId,
+        logical_dimensions: Vec<u64>,
+    },
 }
 
 impl StaticWeightTransformPlan {
@@ -212,12 +219,22 @@ impl StaticWeightTransformPlan {
                 source_scales_id,
                 ..
             } => [source_values_id, source_scales_id],
+            Self::GptOssMxfp4ToMarlin {
+                source_blocks_id,
+                source_scales_id,
+                ..
+            } => [source_blocks_id, source_scales_id],
         }
     }
 
     pub fn execution_component_ids(&self) -> [&WeightId; 2] {
         match self {
             Self::BlockFp8ToMarlinFp8Group128 {
+                packed_values_id,
+                scales_id,
+                ..
+            } => [packed_values_id, scales_id],
+            Self::GptOssMxfp4ToMarlin {
                 packed_values_id,
                 scales_id,
                 ..
@@ -230,6 +247,9 @@ impl StaticWeightTransformPlan {
             Self::BlockFp8ToMarlinFp8Group128 {
                 logical_dimensions, ..
             } => logical_dimensions,
+            Self::GptOssMxfp4ToMarlin {
+                logical_dimensions, ..
+            } => logical_dimensions,
         }
     }
 
@@ -239,60 +259,113 @@ impl StaticWeightTransformPlan {
                 matrices_per_output,
                 ..
             } => *matrices_per_output,
+            Self::GptOssMxfp4ToMarlin { .. } => 1,
         }
     }
 
     /// Device scratch is shared across transforms and sized for the largest
     /// single fused output matrix, never for the model or expert count.
     pub fn scratch_bytes(&self) -> Result<u64, VNextError> {
-        let dimensions = self.logical_dimensions();
-        if dimensions.len() < 2 {
-            return Err(invalid_plan(
-                "static block-FP8 transform requires at least two dimensions",
-            ));
+        match self {
+            Self::BlockFp8ToMarlinFp8Group128 {
+                logical_dimensions,
+                matrices_per_output,
+                ..
+            } => {
+                if logical_dimensions.len() < 2 {
+                    return Err(invalid_plan(
+                        "static block-FP8 transform requires at least two dimensions",
+                    ));
+                }
+                let [n, k] = logical_dimensions[logical_dimensions.len() - 2..] else {
+                    unreachable!("two-axis slice has exact length")
+                };
+                n.checked_mul(u64::from(*matrices_per_output))
+                    .and_then(|rows| rows.checked_mul(k))
+                    .ok_or_else(|| {
+                        invalid_plan("static block-FP8 transform scratch size overflows u64")
+                    })
+            }
+            Self::GptOssMxfp4ToMarlin {
+                logical_dimensions, ..
+            } => {
+                let [_, n, k] = logical_dimensions.as_slice() else {
+                    return Err(invalid_plan(
+                        "static GPT-OSS MXFP4 transform requires [E,N,K] dimensions",
+                    ));
+                };
+                n.checked_mul(*k)
+                    .and_then(|weights| weights.checked_div(2))
+                    .ok_or_else(|| {
+                        invalid_plan("static GPT-OSS MXFP4 transform scratch size overflows u64")
+                    })
+            }
         }
-        let [n, k] = dimensions[dimensions.len() - 2..] else {
-            unreachable!("two-axis slice has exact length")
-        };
-        n.checked_mul(u64::from(self.matrices_per_output()))
-            .and_then(|rows| rows.checked_mul(k))
-            .ok_or_else(|| invalid_plan("static block-FP8 transform scratch size overflows u64"))
     }
 
     fn validate(&self) -> Result<(), VNextError> {
         let source_ids = self.source_component_ids();
         let execution_ids = self.execution_component_ids();
-        let dimensions = self.logical_dimensions();
-        if dimensions.len() < 2 {
+        if source_ids[0] == source_ids[1] || execution_ids[0] == execution_ids[1] {
             return Err(invalid_plan(
-                "static block-FP8 transform requires matrix dimensions",
+                "static weight transform has repeated source or execution component identities",
             ));
         }
-        let n = dimensions[dimensions.len() - 2];
-        let k = dimensions[dimensions.len() - 1];
-        let matrices_per_output = self.matrices_per_output();
-        let source_matrix_count = dimensions[..dimensions.len() - 2]
-            .iter()
-            .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
-            .ok_or_else(|| invalid_plan("static block-FP8 matrix count overflows u64"))?;
-        let fused_prefix_is_typed = matrices_per_output == 1
-            || (matrices_per_output == 2
-                && dimensions.len() >= 4
-                && dimensions[dimensions.len() - 3] == 2);
-        if source_ids[0] == source_ids[1]
-            || execution_ids[0] == execution_ids[1]
-            || n == 0
-            || k == 0
-            || !n.is_multiple_of(128)
-            || !k.is_multiple_of(128)
-            || !matches!(matrices_per_output, 1 | 2)
-            || !source_matrix_count.is_multiple_of(u64::from(matrices_per_output))
-            || !fused_prefix_is_typed
-            || self.scratch_bytes()? == 0
-        {
-            return Err(invalid_plan(
-                "static block-FP8 group-128 transform has invalid identities, shape, fusion, or scratch demand",
-            ));
+        match self {
+            Self::BlockFp8ToMarlinFp8Group128 {
+                logical_dimensions,
+                matrices_per_output,
+                ..
+            } => {
+                if logical_dimensions.len() < 2 {
+                    return Err(invalid_plan(
+                        "static block-FP8 transform requires matrix dimensions",
+                    ));
+                }
+                let n = logical_dimensions[logical_dimensions.len() - 2];
+                let k = logical_dimensions[logical_dimensions.len() - 1];
+                let source_matrix_count = logical_dimensions[..logical_dimensions.len() - 2]
+                    .iter()
+                    .try_fold(1_u64, |count, extent| count.checked_mul(*extent))
+                    .ok_or_else(|| invalid_plan("static block-FP8 matrix count overflows u64"))?;
+                let fused_prefix_is_typed = *matrices_per_output == 1
+                    || (*matrices_per_output == 2
+                        && logical_dimensions.len() >= 4
+                        && logical_dimensions[logical_dimensions.len() - 3] == 2);
+                if n == 0
+                    || k == 0
+                    || !n.is_multiple_of(128)
+                    || !k.is_multiple_of(128)
+                    || !matches!(*matrices_per_output, 1 | 2)
+                    || !source_matrix_count.is_multiple_of(u64::from(*matrices_per_output))
+                    || !fused_prefix_is_typed
+                    || self.scratch_bytes()? == 0
+                {
+                    return Err(invalid_plan(
+                        "static block-FP8 group-128 transform has invalid shape, fusion, or scratch demand",
+                    ));
+                }
+            }
+            Self::GptOssMxfp4ToMarlin {
+                logical_dimensions, ..
+            } => {
+                let [experts, n, k] = logical_dimensions.as_slice() else {
+                    return Err(invalid_plan(
+                        "static GPT-OSS MXFP4 transform requires [E,N,K] dimensions",
+                    ));
+                };
+                if *experts == 0
+                    || *n == 0
+                    || *k == 0
+                    || !n.is_multiple_of(64)
+                    || !k.is_multiple_of(64)
+                    || self.scratch_bytes()? == 0
+                {
+                    return Err(invalid_plan(
+                        "static GPT-OSS MXFP4 transform requires positive E and 64-aligned N/K",
+                    ));
+                }
+            }
         }
         Ok(())
     }
