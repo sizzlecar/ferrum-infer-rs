@@ -2395,6 +2395,198 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE native artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn gpt_oss_mxfp4_marlin_moe_executes_official_down_with_physical_k_padding() {
+        const N: usize = 2880;
+        const LOGICAL_K: usize = 2880;
+        const PHYSICAL_K: usize = 2944;
+        const BATCH: usize = 1;
+        const MOE_BLOCK_SIZE: usize = 16;
+        const ACTIVE_FEATURES: [usize; 8] = [0, 127, 128, 511, 1024, 1537, 2048, 2815];
+
+        fn decode_e2m1(bits: u8) -> f32 {
+            const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let magnitude = MAGNITUDES[usize::from(bits & 0x07)];
+            if bits & 0x08 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+        let sms = usize::try_from(
+            context
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .expect("query CUDA SM count"),
+        )
+        .expect("CUDA SM count must be positive");
+
+        // The model contract remains [N=2880,K=2880]. Only the execution K is
+        // padded to 2944 so the native 128x64 tile is legal. Cross-tile
+        // nonzero values make this a numerical pipeline check instead of a
+        // zero-output geometry check that could hide a stuck K pipeline.
+        let input = (0..PHYSICAL_K)
+            .map(|feature| {
+                if feature < LOGICAL_K {
+                    bf16::from_f32((i32::try_from(feature % 17).unwrap() - 8) as f32 / 8.0)
+                } else {
+                    bf16::from_f32(0.0)
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut source_blocks = vec![0_u8; N * PHYSICAL_K / 2];
+        let groups_per_row = PHYSICAL_K / 32;
+        let logical_groups_per_row = LOGICAL_K / 32;
+        let mut source_scales = vec![0_u8; N * groups_per_row];
+        let bias = (0..N)
+            .map(|output| bf16::from_f32((output as i32 % 7 - 3) as f32 / 32.0))
+            .collect::<Vec<_>>();
+        let mut reference = vec![0.0_f32; N];
+        for output in 0..N {
+            source_scales
+                [output * groups_per_row..output * groups_per_row + logical_groups_per_row]
+                .fill(127);
+            let mut sum = bias[output].to_f32();
+            for (ordinal, feature) in ACTIVE_FEATURES.iter().copied().enumerate() {
+                let magnitude = 1 + ((output + ordinal) % 7) as u8;
+                let nibble = if (output + ordinal).is_multiple_of(3) {
+                    magnitude | 0x08
+                } else {
+                    magnitude
+                };
+                let byte = &mut source_blocks[output * (PHYSICAL_K / 2) + feature / 2];
+                if feature.is_multiple_of(2) {
+                    *byte = (*byte & 0xf0) | nibble;
+                } else {
+                    *byte = (*byte & 0x0f) | (nibble << 4);
+                }
+                sum += input[feature].to_f32() * decode_e2m1(nibble);
+            }
+            reference[output] = sum;
+        }
+        assert!(input[LOGICAL_K..].iter().all(|value| value.to_f32() == 0.0));
+        assert!(source_scales
+            .chunks_exact(groups_per_row)
+            .all(|row| row[logical_groups_per_row..]
+                .iter()
+                .all(|scale| *scale == 0)));
+
+        let gptq_words = transpose_mxfp4_expert_blocks_to_gptq_words(&source_blocks, N, PHYSICAL_K)
+            .expect("transpose padded official-shape MXFP4 nibbles");
+        let packed_weight = repack_gptq_to_marlin(&gptq_words, PHYSICAL_K, N);
+        let packed_scales = prepare_mxfp4_expert_scales_for_marlin(&source_scales, N, PHYSICAL_K)
+            .expect("prepare padded official-shape E8M0 scales");
+
+        let input_device: CudaSlice<bf16> = stream.clone_htod(&input).expect("upload input");
+        let weight_device: CudaSlice<i32> = stream
+            .clone_htod(&packed_weight)
+            .expect("upload official-shape MXFP4 weight");
+        let scales_device: CudaSlice<u8> = stream
+            .clone_htod(&packed_scales)
+            .expect("upload official-shape E8M0 scales");
+        let bias_device: CudaSlice<bf16> = stream.clone_htod(&bias).expect("upload bias");
+        let mut output_device: CudaSlice<bf16> = stream
+            .alloc_zeros(BATCH * N)
+            .expect("allocate official-shape output");
+        let mut reduce_device: CudaSlice<f32> = stream
+            .alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256)
+            .expect("allocate official-shape reduction scratch");
+
+        let mut sorted_token_ids = vec![BATCH as i32; MOE_BLOCK_SIZE];
+        sorted_token_ids[0] = 0;
+        let sorted_token_ids_device: CudaSlice<i32> = stream
+            .clone_htod(&sorted_token_ids)
+            .expect("upload padded sorted token ids");
+        let expert_ids_device: CudaSlice<i32> =
+            stream.clone_htod(&[0]).expect("upload expert block id");
+        let num_tokens_past_padded_device: CudaSlice<i32> = stream
+            .clone_htod(&[MOE_BLOCK_SIZE as i32])
+            .expect("upload padded token count");
+        let workspace: CudaSlice<i32> = stream
+            .alloc_zeros(N.div_ceil(128) * sms * 4)
+            .expect("allocate official-shape Marlin-MoE workspace");
+
+        {
+            let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
+            let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
+            let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
+            let (reduce_pointer, _reduce_guard) = reduce_device.device_ptr_mut(&stream);
+            let (bias_pointer, _bias_guard) = bias_device.device_ptr(&stream);
+            let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
+            let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+            let (sorted_pointer, _sorted_guard) = sorted_token_ids_device.device_ptr(&stream);
+            let (expert_pointer, _expert_guard) = expert_ids_device.device_ptr(&stream);
+            let (padded_pointer, _padded_guard) = num_tokens_past_padded_device.device_ptr(&stream);
+
+            launch_marlin_moe_mxfp4_bf16(
+                &stream,
+                MarlinMoeMxfp4Bf16LaunchArgs {
+                    weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+                    expert_count: 1,
+                    a: input_pointer,
+                    b: weight_pointer,
+                    c: output_pointer,
+                    c_tmp: Some(reduce_pointer),
+                    bias: bias_pointer,
+                    scales: scales_pointer,
+                    workspace: workspace_pointer,
+                    sorted_token_ids: sorted_pointer,
+                    expert_ids: expert_pointer,
+                    num_tokens_past_padded: padded_pointer,
+                    topk_weights: None,
+                    moe_block_size: MOE_BLOCK_SIZE as i32,
+                    top_k: 1,
+                    mul_topk_weights: false,
+                    is_ep: false,
+                    prob_m: BATCH as i32,
+                    prob_n: N as i32,
+                    prob_k: PHYSICAL_K as i32,
+                    group_size: 32,
+                    device_ordinal: 0,
+                    use_atomic_add: false,
+                    use_fp32_reduce: true,
+                },
+            )
+            .expect("launch official GPT-OSS 20B down geometry");
+            stream
+                .synchronize()
+                .expect("synchronize official GPT-OSS 20B down geometry");
+        }
+
+        let actual = stream
+            .clone_dtoh(&output_device)
+            .expect("download official-shape output");
+        let mut reference_squared = 0.0_f64;
+        let mut error_squared = 0.0_f64;
+        let mut non_finite = 0_usize;
+        for (actual, expected) in actual.iter().zip(reference.iter().copied()) {
+            let actual = actual.to_f32();
+            reference_squared += f64::from(expected) * f64::from(expected);
+            if actual.is_finite() {
+                let error = f64::from(actual - expected);
+                error_squared += error * error;
+            } else {
+                non_finite += 1;
+            }
+        }
+        let relative_l2 = error_squared.sqrt() / reference_squared.sqrt().max(1.0e-6);
+        assert_eq!(
+            non_finite, 0,
+            "padded official down geometry emitted NaN/Inf"
+        );
+        assert!(
+            relative_l2 <= 0.05,
+            "padded official down geometry relative L2 {relative_l2:.8} exceeds 0.05"
+        );
+        eprintln!(
+            "FERRUM GPTOSS MXFP4 OFFICIAL GEOMETRY PASS: M={BATCH} N={N} logical_K={LOGICAL_K} physical_K={PHYSICAL_K} rel_err={relative_l2:.8}"
+        );
+    }
+
+    #[test]
     #[ignore = "requires an sm89 CUDA host and the FP8 Marlin-MoE native artifact"]
     #[cfg(feature = "vllm-moe-marlin")]
     fn qwen36_a3_fp8_marlin_moe_ffi_matches_cpu_reference_for_four_cases() {

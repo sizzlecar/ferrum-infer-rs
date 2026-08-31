@@ -3,7 +3,7 @@
   "operator": "ferrum.cuda.vllm_paged_attention_v2",
   "source_package": {
     "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.67914b6e426584051d5b6ef5ef424fcbe0b9fc07981195d866e546cc1408aa8c",
+    "revision": "ferrum-native-cuda-v1+sha256.885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
     "sha256": "c8c7e5a8063162c2959e29122f1a88ccb14ac7789e8447199d14608d5dfac428"
   },
   "upstream_sources": [

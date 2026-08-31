@@ -8,18 +8,27 @@ extern "C" __global__ void gpt_oss_mxfp4_blocks_to_gptq_words(
     const uint32_t* __restrict__ source,
     uint32_t* __restrict__ destination,
     int rows_n,
-    int columns_k) {
-  const uint64_t packed_columns = static_cast<uint64_t>(columns_k) / 8;
-  const uint64_t count = static_cast<uint64_t>(rows_n) * packed_columns;
+    int logical_columns_k,
+    int execution_columns_k) {
+  const uint64_t logical_packed_columns =
+      static_cast<uint64_t>(logical_columns_k) / 8;
+  const uint64_t execution_packed_columns =
+      static_cast<uint64_t>(execution_columns_k) / 8;
+  const uint64_t count =
+      static_cast<uint64_t>(rows_n) * execution_packed_columns;
   const uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x +
                          static_cast<uint64_t>(threadIdx.x);
   if (index >= count) {
     return;
   }
-  const uint64_t row = index / packed_columns;
-  const uint64_t packed_column = index - row * packed_columns;
+  const uint64_t packed_column = index / static_cast<uint64_t>(rows_n);
+  const uint64_t row = index - packed_column * static_cast<uint64_t>(rows_n);
+  if (packed_column >= logical_packed_columns) {
+    destination[index] = 0;
+    return;
+  }
   destination[packed_column * static_cast<uint64_t>(rows_n) + row] =
-      source[index];
+      source[row * logical_packed_columns + packed_column];
 }
 
 // Map source E8M0 bytes [N, K / 32] directly into the scale layout consumed
@@ -30,10 +39,14 @@ extern "C" __global__ void gpt_oss_mxfp4_scales_to_marlin(
     const uint8_t* __restrict__ source,
     uint8_t* __restrict__ destination,
     int rows_n,
-    int columns_k) {
-  const uint64_t groups = static_cast<uint64_t>(columns_k) / 32;
+    int logical_columns_k,
+    int execution_columns_k) {
+  const uint64_t logical_groups =
+      static_cast<uint64_t>(logical_columns_k) / 32;
+  const uint64_t execution_groups =
+      static_cast<uint64_t>(execution_columns_k) / 32;
   const uint64_t rows = static_cast<uint64_t>(rows_n);
-  const uint64_t count = groups * rows;
+  const uint64_t count = execution_groups * rows;
   const uint64_t destination_index =
       static_cast<uint64_t>(blockIdx.x) * blockDim.x +
       static_cast<uint64_t>(threadIdx.x);
@@ -67,5 +80,7 @@ extern "C" __global__ void gpt_oss_mxfp4_scales_to_marlin(
 
   const uint64_t group = transposed_index / rows;
   const uint64_t row = transposed_index - group * rows;
-  destination[destination_index] = source[row * groups + group];
+  destination[destination_index] = group < logical_groups
+                                       ? source[row * logical_groups + group]
+                                       : uint8_t{0};
 }

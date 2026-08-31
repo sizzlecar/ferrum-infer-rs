@@ -2075,11 +2075,12 @@ struct BlockFp8Group128CudaTransform {
 struct GptOssMxfp4CudaTransform {
     expert_count: u64,
     size_n: i32,
-    size_k: i32,
-    expert_packed_bytes: u64,
-    expert_scale_bytes: u64,
-    expert_packed_host_bytes: usize,
-    expert_scale_host_bytes: usize,
+    logical_size_k: i32,
+    execution_size_k: i32,
+    execution_expert_packed_bytes: u64,
+    execution_expert_scale_bytes: u64,
+    source_expert_packed_host_bytes: usize,
+    source_expert_scale_host_bytes: usize,
     packed_grid: u32,
     scale_grid: u32,
 }
@@ -2560,69 +2561,131 @@ fn encode_gpt_oss_mxfp4_static_transform(
     runtime: &CudaDeviceRuntime,
     request: StaticWeightTransformRequest<'_, '_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, CudaDeviceRuntimeError> {
-    let (source_blocks_id, source_scales_id, packed_values_id, scales_id, logical_dimensions) =
-        match request.plan() {
-            StaticWeightTransformPlan::GptOssMxfp4ToMarlin {
-                source_blocks_id,
-                source_scales_id,
-                packed_values_id,
-                scales_id,
-                logical_dimensions,
-            } => (
-                source_blocks_id,
-                source_scales_id,
-                packed_values_id,
-                scales_id,
-                logical_dimensions,
-            ),
-            StaticWeightTransformPlan::BlockFp8ToMarlinFp8Group128 { .. } => {
-                return Err(CudaDeviceRuntimeError::contract(
-                    "CUDA GPT-OSS MXFP4 encoder received a block-FP8 transform plan",
-                ));
-            }
-        };
-    let [expert_count, size_n_u64, size_k_u64] = logical_dimensions.as_slice() else {
+    let (
+        source_blocks_id,
+        source_scales_id,
+        packed_values_id,
+        scales_id,
+        logical_dimensions,
+        execution_dimensions,
+    ) = match request.plan() {
+        StaticWeightTransformPlan::GptOssMxfp4ToMarlin {
+            source_blocks_id,
+            source_scales_id,
+            packed_values_id,
+            scales_id,
+            logical_dimensions,
+            execution_dimensions,
+        } => (
+            source_blocks_id,
+            source_scales_id,
+            packed_values_id,
+            scales_id,
+            logical_dimensions,
+            execution_dimensions,
+        ),
+        StaticWeightTransformPlan::BlockFp8ToMarlinFp8Group128 { .. } => {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA GPT-OSS MXFP4 encoder received a block-FP8 transform plan",
+            ));
+        }
+    };
+    let [expert_count, size_n_u64, logical_size_k_u64] = logical_dimensions.as_slice() else {
         return Err(CudaDeviceRuntimeError::contract(
             "CUDA GPT-OSS MXFP4 transform requires exact [E,N,K] dimensions",
         ));
     };
+    let [execution_expert_count, execution_size_n_u64, execution_size_k_u64] =
+        execution_dimensions.as_slice()
+    else {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA GPT-OSS MXFP4 transform requires exact [E,N,K] execution dimensions",
+        ));
+    };
     let expert_count = *expert_count;
     let size_n_u64 = *size_n_u64;
-    let size_k_u64 = *size_k_u64;
+    let logical_size_k_u64 = *logical_size_k_u64;
+    let execution_size_k_u64 = *execution_size_k_u64;
     if expert_count == 0
         || size_n_u64 == 0
-        || size_k_u64 == 0
+        || logical_size_k_u64 == 0
         || !size_n_u64.is_multiple_of(64)
-        || !size_k_u64.is_multiple_of(64)
+        || !logical_size_k_u64.is_multiple_of(64)
+        || execution_expert_count != &expert_count
+        || execution_size_n_u64 != &size_n_u64
+        || execution_size_k_u64 < logical_size_k_u64
+        || !execution_size_k_u64.is_multiple_of(64)
     {
         return Err(CudaDeviceRuntimeError::contract(
-            "CUDA GPT-OSS MXFP4 transform requires positive E and 64-aligned N/K",
+            "CUDA GPT-OSS MXFP4 transform requires matching logical/execution E,N and non-shrinking 64-aligned K",
         ));
     }
     let size_n = i32::try_from(size_n_u64)
         .map_err(|_| CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 N exceeds native i32"))?;
-    let size_k = i32::try_from(size_k_u64)
-        .map_err(|_| CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 K exceeds native i32"))?;
-    let expert_packed_bytes = size_n_u64
-        .checked_mul(size_k_u64)
+    let logical_size_k = i32::try_from(logical_size_k_u64).map_err(|_| {
+        CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 logical K exceeds native i32")
+    })?;
+    let execution_size_k = i32::try_from(execution_size_k_u64).map_err(|_| {
+        CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 execution K exceeds native i32")
+    })?;
+    let source_expert_packed_bytes = size_n_u64
+        .checked_mul(logical_size_k_u64)
         .and_then(|elements| elements.checked_div(2))
         .ok_or_else(|| {
             CudaDeviceRuntimeError::contract(
-                "CUDA GPT-OSS MXFP4 expert packed byte size overflows u64",
+                "CUDA GPT-OSS MXFP4 source expert packed byte size overflows u64",
             )
         })?;
-    let expert_scale_bytes = size_n_u64.checked_mul(size_k_u64 / 32).ok_or_else(|| {
-        CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 expert scale byte size overflows u64")
-    })?;
-    let packed_total_bytes = expert_packed_bytes
-        .checked_mul(expert_count)
+    let source_expert_scale_bytes =
+        size_n_u64
+            .checked_mul(logical_size_k_u64 / 32)
+            .ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "CUDA GPT-OSS MXFP4 source expert scale byte size overflows u64",
+                )
+            })?;
+    let execution_expert_packed_bytes = size_n_u64
+        .checked_mul(execution_size_k_u64)
+        .and_then(|elements| elements.checked_div(2))
         .ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 packed stack size overflows u64")
+            CudaDeviceRuntimeError::contract(
+                "CUDA GPT-OSS MXFP4 execution expert packed byte size overflows u64",
+            )
         })?;
-    let scales_total_bytes = expert_scale_bytes
+    let execution_expert_scale_bytes = size_n_u64
+        .checked_mul(execution_size_k_u64 / 32)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA GPT-OSS MXFP4 execution expert scale byte size overflows u64",
+            )
+        })?;
+    let source_packed_total_bytes = source_expert_packed_bytes
         .checked_mul(expert_count)
         .ok_or_else(|| {
-            CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 scale stack size overflows u64")
+            CudaDeviceRuntimeError::contract(
+                "CUDA GPT-OSS MXFP4 source packed stack size overflows u64",
+            )
+        })?;
+    let source_scales_total_bytes = source_expert_scale_bytes
+        .checked_mul(expert_count)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA GPT-OSS MXFP4 source scale stack size overflows u64",
+            )
+        })?;
+    let execution_packed_total_bytes = execution_expert_packed_bytes
+        .checked_mul(expert_count)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA GPT-OSS MXFP4 execution packed stack size overflows u64",
+            )
+        })?;
+    let execution_scales_total_bytes = execution_expert_scale_bytes
+        .checked_mul(expert_count)
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "CUDA GPT-OSS MXFP4 execution scale stack size overflows u64",
+            )
         })?;
 
     let sources = request.sources();
@@ -2638,13 +2701,15 @@ fn encode_gpt_oss_mxfp4_static_transform(
             "CUDA GPT-OSS MXFP4 transform source or destination identity/order differs from its plan",
         ));
     }
-    let expected_blocks_dimensions = [expert_count, size_n_u64, size_k_u64 / 32, 16];
-    let expected_scales_dimensions = [expert_count, size_n_u64, size_k_u64 / 32];
-    let expected_packed_dimensions = [expert_count, size_n_u64, size_k_u64 / 2];
-    if sources[0].dimensions() != expected_blocks_dimensions
-        || sources[1].dimensions() != expected_scales_dimensions
-        || destinations[0].component().dimensions != expected_packed_dimensions
-        || destinations[1].component().dimensions != expected_scales_dimensions
+    let expected_source_blocks_dimensions = [expert_count, size_n_u64, logical_size_k_u64 / 32, 16];
+    let expected_source_scales_dimensions = [expert_count, size_n_u64, logical_size_k_u64 / 32];
+    let expected_execution_packed_dimensions = [expert_count, size_n_u64, execution_size_k_u64 / 2];
+    let expected_execution_scales_dimensions =
+        [expert_count, size_n_u64, execution_size_k_u64 / 32];
+    if sources[0].dimensions() != expected_source_blocks_dimensions
+        || sources[1].dimensions() != expected_source_scales_dimensions
+        || destinations[0].component().dimensions != expected_execution_packed_dimensions
+        || destinations[1].component().dimensions != expected_execution_scales_dimensions
         || sources[0].element_type() != ElementType::U8
         || sources[1].element_type() != ElementType::U8
         || destinations[0].component().physical_element_type() != ElementType::U8
@@ -2654,18 +2719,18 @@ fn encode_gpt_oss_mxfp4_static_transform(
             "CUDA GPT-OSS MXFP4 transform shape or element type differs from the exact source/Marlin ABI",
         ));
     }
-    if sources[0].total_bytes() != packed_total_bytes
-        || sources[1].total_bytes() != scales_total_bytes
+    if sources[0].total_bytes() != source_packed_total_bytes
+        || sources[1].total_bytes() != source_scales_total_bytes
         || destinations[0]
             .component()
             .physical_bytes()
             .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?
-            != packed_total_bytes
+            != execution_packed_total_bytes
         || destinations[1]
             .component()
             .physical_bytes()
             .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?
-            != scales_total_bytes
+            != execution_scales_total_bytes
     {
         return Err(CudaDeviceRuntimeError::contract(
             "CUDA GPT-OSS MXFP4 transform component byte extents differ from the exact ABI",
@@ -2689,11 +2754,11 @@ fn encode_gpt_oss_mxfp4_static_transform(
         )
     })?;
     let packed_total_host_bytes = checked_usize(
-        packed_total_bytes,
+        source_packed_total_bytes,
         "CUDA GPT-OSS MXFP4 packed source byte size",
     )?;
     let scales_total_host_bytes = checked_usize(
-        scales_total_bytes,
+        source_scales_total_bytes,
         "CUDA GPT-OSS MXFP4 scale source byte size",
     )?;
     if block_segment.bytes().len() != packed_total_host_bytes
@@ -2732,7 +2797,7 @@ fn encode_gpt_oss_mxfp4_static_transform(
         .plan()
         .scratch_bytes()
         .map_err(|error| CudaDeviceRuntimeError::contract(error.to_string()))?;
-    if admitted_scratch_bytes != expert_packed_bytes
+    if admitted_scratch_bytes != execution_expert_packed_bytes
         || scratch.descriptor.size_bytes < admitted_scratch_bytes
     {
         return Err(CudaDeviceRuntimeError::contract(
@@ -2741,13 +2806,13 @@ fn encode_gpt_oss_mxfp4_static_transform(
     }
     let packed_end = checked_end(
         packed_destination.destination_offset_bytes(),
-        packed_total_bytes,
+        execution_packed_total_bytes,
         packed_destination.buffer().descriptor.size_bytes,
         "CUDA GPT-OSS MXFP4 packed destination",
     )?;
     let scales_end = checked_end(
         scales_destination.destination_offset_bytes(),
-        scales_total_bytes,
+        execution_scales_total_bytes,
         scales_destination.buffer().descriptor.size_bytes,
         "CUDA GPT-OSS MXFP4 scales destination",
     )?;
@@ -2760,26 +2825,27 @@ fn encode_gpt_oss_mxfp4_static_transform(
     let scratch_region = scratch.region(0..admitted_scratch_bytes)?;
     validate_static_transform_regions(&packed_region, &scales_region, &scratch_region)?;
 
-    let packed_word_count = expert_packed_bytes / 4;
+    let packed_word_count = execution_expert_packed_bytes / 4;
     let packed_grid = u32::try_from(packed_word_count.div_ceil(256)).map_err(|_| {
         CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 packed grid exceeds u32")
     })?;
-    let scale_grid = u32::try_from(expert_scale_bytes.div_ceil(256)).map_err(|_| {
+    let scale_grid = u32::try_from(execution_expert_scale_bytes.div_ceil(256)).map_err(|_| {
         CudaDeviceRuntimeError::contract("CUDA GPT-OSS MXFP4 scale grid exceeds u32")
     })?;
     let transform = GptOssMxfp4CudaTransform {
         expert_count,
         size_n,
-        size_k,
-        expert_packed_bytes,
-        expert_scale_bytes,
-        expert_packed_host_bytes: checked_usize(
-            expert_packed_bytes,
-            "CUDA GPT-OSS MXFP4 expert packed byte size",
+        logical_size_k,
+        execution_size_k,
+        execution_expert_packed_bytes,
+        execution_expert_scale_bytes,
+        source_expert_packed_host_bytes: checked_usize(
+            source_expert_packed_bytes,
+            "CUDA GPT-OSS MXFP4 source expert packed byte size",
         )?,
-        expert_scale_host_bytes: checked_usize(
-            expert_scale_bytes,
-            "CUDA GPT-OSS MXFP4 expert scale byte size",
+        source_expert_scale_host_bytes: checked_usize(
+            source_expert_scale_bytes,
+            "CUDA GPT-OSS MXFP4 source expert scale byte size",
         )?,
         packed_grid,
         scale_grid,
@@ -2800,14 +2866,14 @@ fn encode_gpt_oss_mxfp4_static_transform(
             debug_assert_eq!(regions.len(), 3);
             for expert in 0..transform.expert_count {
                 let packed_offset = expert
-                    .checked_mul(transform.expert_packed_bytes)
+                    .checked_mul(transform.execution_expert_packed_bytes)
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(
                             "CUDA GPT-OSS MXFP4 expert packed offset overflows",
                         )
                     })?;
                 let scale_offset = expert
-                    .checked_mul(transform.expert_scale_bytes)
+                    .checked_mul(transform.execution_expert_scale_bytes)
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(
                             "CUDA GPT-OSS MXFP4 expert scale offset overflows",
@@ -2835,14 +2901,14 @@ fn encode_gpt_oss_mxfp4_static_transform(
                     )
                 })?;
                 let block_start = expert_index
-                    .checked_mul(transform.expert_packed_host_bytes)
+                    .checked_mul(transform.source_expert_packed_host_bytes)
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(
                             "CUDA GPT-OSS MXFP4 host block offset overflows",
                         )
                     })?;
                 let block_end = block_start
-                    .checked_add(transform.expert_packed_host_bytes)
+                    .checked_add(transform.source_expert_packed_host_bytes)
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(
                             "CUDA GPT-OSS MXFP4 host block end overflows",
@@ -2863,7 +2929,8 @@ fn encode_gpt_oss_mxfp4_static_transform(
                 transpose.arg(&packed_pointer);
                 transpose.arg(&scratch_pointer);
                 transpose.arg(&transform.size_n);
-                transpose.arg(&transform.size_k);
+                transpose.arg(&transform.logical_size_k);
+                transpose.arg(&transform.execution_size_k);
                 unsafe {
                     transpose.launch(LaunchConfig {
                         grid_dim: (transform.packed_grid, 1, 1),
@@ -2879,7 +2946,7 @@ fn encode_gpt_oss_mxfp4_static_transform(
                         stream,
                         scratch_pointer,
                         packed_pointer,
-                        transform.size_k,
+                        transform.execution_size_k,
                         transform.size_n,
                     )
                 }
@@ -2890,14 +2957,14 @@ fn encode_gpt_oss_mxfp4_static_transform(
                 })?;
 
                 let scale_start = expert_index
-                    .checked_mul(transform.expert_scale_host_bytes)
+                    .checked_mul(transform.source_expert_scale_host_bytes)
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(
                             "CUDA GPT-OSS MXFP4 host scale offset overflows",
                         )
                     })?;
                 let scale_end = scale_start
-                    .checked_add(transform.expert_scale_host_bytes)
+                    .checked_add(transform.source_expert_scale_host_bytes)
                     .ok_or_else(|| {
                         CudaDeviceRuntimeError::contract(
                             "CUDA GPT-OSS MXFP4 host scale end overflows",
@@ -2917,7 +2984,8 @@ fn encode_gpt_oss_mxfp4_static_transform(
                 scales.arg(&scratch_pointer);
                 scales.arg(&scale_pointer);
                 scales.arg(&transform.size_n);
-                scales.arg(&transform.size_k);
+                scales.arg(&transform.logical_size_k);
+                scales.arg(&transform.execution_size_k);
                 unsafe {
                     scales.launch(LaunchConfig {
                         grid_dim: (transform.scale_grid, 1, 1),
