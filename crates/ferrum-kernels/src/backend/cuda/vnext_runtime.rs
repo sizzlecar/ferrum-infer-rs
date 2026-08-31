@@ -4185,10 +4185,150 @@ impl DeviceRuntime for CudaDeviceRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "vllm-marlin")]
+    use crate::marlin_repack::repack_gptq_to_marlin;
+    #[cfg(feature = "vllm-marlin")]
+    use crate::mxfp4_marlin_materializer::{
+        prepare_mxfp4_expert_scales_for_marlin, transpose_mxfp4_expert_blocks_to_gptq_words,
+    };
+    #[cfg(feature = "vllm-marlin")]
+    use cudarc::driver::DevicePtrMut;
     use ferrum_interfaces::vnext::DeviceCommandPhase;
 
     fn program_binding_write(offset: u64, payload: Vec<u8>) -> CudaProgramBindingWrite {
         CudaProgramBindingWrite::new(offset, payload.into_boxed_slice()).unwrap()
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the vLLM Marlin repack artifact"]
+    #[cfg(feature = "vllm-marlin")]
+    fn gpt_oss_mxfp4_runtime_materializer_two_expert_padding_matches_cpu_layout() {
+        const EXPERTS: usize = 2;
+        const N: usize = 2880;
+        const LOGICAL_K: usize = 2880;
+        const PHYSICAL_K: usize = 2944;
+
+        let logical_packed = N * LOGICAL_K / 2;
+        let physical_packed = N * PHYSICAL_K / 2;
+        let logical_scales = N * LOGICAL_K / 32;
+        let physical_scales = N * PHYSICAL_K / 32;
+        let blocks = (0..EXPERTS * logical_packed)
+            .map(|index| ((index * 13 + index / logical_packed * 97) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let scales = (0..EXPERTS * logical_scales)
+            .map(|index| 119 + ((index * 3 + index / logical_scales * 11) % 17) as u8)
+            .collect::<Vec<_>>();
+
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.default_stream();
+        let functions = Mxfp4MarlinPrepareFunctions::load(&context).unwrap();
+        let mut packed_device: CudaSlice<u8> =
+            stream.alloc_zeros(EXPERTS * physical_packed).unwrap();
+        let mut scales_device: CudaSlice<u8> =
+            stream.alloc_zeros(EXPERTS * physical_scales).unwrap();
+        let mut scratch_device: CudaSlice<u8> = stream.alloc_zeros(physical_packed).unwrap();
+        let n = N as i32;
+        let logical_k = LOGICAL_K as i32;
+        let physical_k = PHYSICAL_K as i32;
+        {
+            let (packed, _packed_guard) = packed_device.device_ptr_mut(&stream);
+            let (prepared_scales, _scales_guard) = scales_device.device_ptr_mut(&stream);
+            let (scratch, _scratch_guard) = scratch_device.device_ptr_mut(&stream);
+            for expert in 0..EXPERTS {
+                let expert_packed = packed + (expert * physical_packed) as u64;
+                let expert_scales = prepared_scales + (expert * physical_scales) as u64;
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(
+                        expert_packed,
+                        &blocks[expert * logical_packed..(expert + 1) * logical_packed],
+                        stream.cu_stream(),
+                    )
+                }
+                .unwrap();
+                let mut transpose = stream.launch_builder(&functions.blocks_to_gptq_words);
+                transpose.arg(&expert_packed);
+                transpose.arg(&scratch);
+                transpose.arg(&n);
+                transpose.arg(&logical_k);
+                transpose.arg(&physical_k);
+                unsafe {
+                    transpose.launch(LaunchConfig {
+                        grid_dim: (((physical_packed / 4) as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .unwrap();
+                unsafe {
+                    super::vllm_marlin::vllm_gptq_marlin_repack_raw(
+                        &stream,
+                        scratch,
+                        expert_packed,
+                        physical_k,
+                        n,
+                    )
+                }
+                .unwrap();
+                unsafe {
+                    cudarc::driver::result::memcpy_htod_async(
+                        scratch,
+                        &scales[expert * logical_scales..(expert + 1) * logical_scales],
+                        stream.cu_stream(),
+                    )
+                }
+                .unwrap();
+                let mut prepare = stream.launch_builder(&functions.scales_to_marlin);
+                prepare.arg(&scratch);
+                prepare.arg(&expert_scales);
+                prepare.arg(&n);
+                prepare.arg(&logical_k);
+                prepare.arg(&physical_k);
+                unsafe {
+                    prepare.launch(LaunchConfig {
+                        grid_dim: ((physical_scales as u32).div_ceil(256), 1, 1),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .unwrap();
+            }
+            stream.synchronize().unwrap();
+        }
+
+        let actual_packed = stream.clone_dtoh(&packed_device).unwrap();
+        let actual_scales = stream.clone_dtoh(&scales_device).unwrap();
+        for expert in 0..EXPERTS {
+            let mut padded_blocks = vec![0_u8; physical_packed];
+            let mut padded_scales = vec![0_u8; physical_scales];
+            for row in 0..N {
+                padded_blocks[row * PHYSICAL_K / 2..row * PHYSICAL_K / 2 + LOGICAL_K / 2]
+                    .copy_from_slice(
+                        &blocks[expert * logical_packed + row * LOGICAL_K / 2
+                            ..expert * logical_packed + (row + 1) * LOGICAL_K / 2],
+                    );
+                padded_scales[row * PHYSICAL_K / 32..row * PHYSICAL_K / 32 + LOGICAL_K / 32]
+                    .copy_from_slice(
+                        &scales[expert * logical_scales + row * LOGICAL_K / 32
+                            ..expert * logical_scales + (row + 1) * LOGICAL_K / 32],
+                    );
+            }
+            let words =
+                transpose_mxfp4_expert_blocks_to_gptq_words(&padded_blocks, N, PHYSICAL_K).unwrap();
+            let expected_packed = repack_gptq_to_marlin(&words, PHYSICAL_K, N)
+                .into_iter()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let expected_scales =
+                prepare_mxfp4_expert_scales_for_marlin(&padded_scales, N, PHYSICAL_K).unwrap();
+            assert_eq!(
+                &actual_packed[expert * physical_packed..(expert + 1) * physical_packed],
+                expected_packed.as_slice()
+            );
+            assert_eq!(
+                &actual_scales[expert * physical_scales..(expert + 1) * physical_scales],
+                expected_scales.as_slice()
+            );
+        }
     }
 
     #[test]
