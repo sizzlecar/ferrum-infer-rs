@@ -401,7 +401,7 @@ def run_logged_command(
         "hard_deadline_seconds": deadline_seconds,
         "exit_code": process.returncode,
         "timed_out": timed_out,
-        "worker_bounds": {"cargo_build_jobs": 2, "rust_test_threads": 1},
+        "worker_bounds": {"cargo_build_jobs": 2, "rust_test_threads": 8},
         "credential_values_recorded": False,
         "log": command_ref(log_path, artifact_root),
         "log_tail": sanitize_text(log_path.read_text(encoding="utf-8", errors="replace")[-4000:]),
@@ -469,7 +469,7 @@ def run_captured_command(
         "hard_deadline_seconds": deadline_seconds,
         "exit_code": exit_code,
         "timed_out": timed_out,
-        "worker_bounds": {"cargo_build_jobs": 2, "rust_test_threads": 1},
+        "worker_bounds": {"cargo_build_jobs": 2, "rust_test_threads": 8},
         "credential_values_recorded": False,
         "stdout": command_ref(stdout_path, artifact_root),
         "stderr": command_ref(stderr_path, artifact_root),
@@ -492,7 +492,7 @@ def require_command_pass(receipt: dict[str, Any], label: str) -> None:
 def base_cargo_environment(*, cargo_home: Path | None = None) -> dict[str, str]:
     environment = dict(os.environ)
     environment["CARGO_BUILD_JOBS"] = "2"
-    environment["RUST_TEST_THREADS"] = "1"
+    environment["RUST_TEST_THREADS"] = "8"
     environment["CARGO_TERM_COLOR"] = "never"
     environment.pop("CARGO_TARGET_DIR", None)
     if cargo_home is not None:
@@ -1362,7 +1362,7 @@ def validate_prepublish_manifest(path: Path) -> tuple[dict[str, Any], Path]:
     require(g10a["source"] == {key: candidate[key] for key in ("git_sha", "git_tree_sha", "dirty")}, "prepublish G10A release candidate differs")
     cargo = exact_fields(value["cargo"], {"version", "metadata", "worker_bounds"}, "prepublish.cargo")
     require(isinstance(cargo["version"], str) and cargo["version"].startswith("cargo "), "prepublish Cargo version invalid")
-    require(cargo["worker_bounds"] == {"cargo_build_jobs": 2, "rust_test_threads": 1}, "prepublish worker bounds differ")
+    require(cargo["worker_bounds"] == {"cargo_build_jobs": 2, "rust_test_threads": 8}, "prepublish worker bounds differ")
     validate_artifact_ref(cargo["metadata"], root=root, label="prepublish cargo metadata", nonempty=True)
     topology = exact_fields(value["topology"], {"algorithm", "crate_count", "graph", "graph_sha256", "order"}, "prepublish.topology")
     require(topology["algorithm"] == "kahn-lexicographic-v1", "prepublish topology algorithm differs")
@@ -1560,7 +1560,7 @@ def create_prepublish(args: argparse.Namespace) -> Path:
         "cargo": {
             "version": cargo_version,
             "metadata": artifact_ref(metadata_root / "cargo-metadata.json", root=out),
-            "worker_bounds": {"cargo_build_jobs": 2, "rust_test_threads": 1},
+            "worker_bounds": {"cargo_build_jobs": 2, "rust_test_threads": 8},
         },
         "topology": topology,
         "registry": registry,

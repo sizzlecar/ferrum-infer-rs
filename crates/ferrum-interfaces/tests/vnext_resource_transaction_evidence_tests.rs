@@ -315,7 +315,7 @@ fn abandon_callback_panic_during_unwind_is_contained(passed: &mut usize) {
     let status = Command::new(executable)
         .arg("resource_transaction_abandon_panic_child")
         .arg("--exact")
-        .arg("--test-threads=1")
+        .arg("--test-threads=8")
         .arg("--nocapture")
         .env("FERRUM_VNEXT_ABANDON_PANIC_CHILD", "1")
         .env("RUST_BACKTRACE", "0")
