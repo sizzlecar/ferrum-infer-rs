@@ -7,7 +7,7 @@ use crate::{
     chat_template::{
         render_chat_prompt_with_model_template_options,
         render_chat_prompt_with_tools_and_model_template, ChatTemplateOptions, ModelChatTemplate,
-        ModelReasoningProtocol,
+        ModelReasoningProtocol, ReasoningEffort,
     },
     model_registry::{LoraAdapterModel, ServedModelKind, ServedModelRegistry},
     openai::*,
@@ -3536,15 +3536,26 @@ fn chat_template_options_for_request(
     let Some(kwargs) = request.chat_template_kwargs.as_ref() else {
         return Ok(options);
     };
-    let Some(value) = kwargs.get("enable_thinking") else {
-        return Ok(options);
-    };
-    let Some(enable_thinking) = value.as_bool() else {
-        return Err(Error::invalid_request(
-            "chat_template_kwargs.enable_thinking must be a boolean",
-        ));
-    };
-    options.enable_thinking = Some(enable_thinking);
+    if let Some(value) = kwargs.get("enable_thinking") {
+        let Some(enable_thinking) = value.as_bool() else {
+            return Err(Error::invalid_request(
+                "chat_template_kwargs.enable_thinking must be a boolean",
+            ));
+        };
+        options.enable_thinking = Some(enable_thinking);
+    }
+    if let Some(value) = kwargs.get("reasoning_effort") {
+        let Some(reasoning_effort) = value.as_str() else {
+            return Err(Error::invalid_request(
+                "chat_template_kwargs.reasoning_effort must be one of: low, medium, high",
+            ));
+        };
+        options.reasoning_effort = Some(reasoning_effort.parse::<ReasoningEffort>().map_err(
+            |error| {
+                Error::invalid_request(format!("chat_template_kwargs.reasoning_effort: {error}"))
+            },
+        )?);
+    }
     Ok(options)
 }
 
@@ -9237,6 +9248,47 @@ mod tests {
                 .get(INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY),
             Some(&serde_json::json!([THINK_END_TAG, THINK_START_TAG]))
         );
+    }
+
+    #[tokio::test]
+    async fn chat_template_reasoning_effort_is_typed_and_rendered() {
+        let template = ModelChatTemplate::new(
+            "{% if reasoning_effort is defined %}Reasoning: {{ reasoning_effort }}{% else %}Reasoning: model-default{% endif %}",
+            "test-template",
+        );
+        let (router, engine) = router_with_capturing_llm_and_template(template);
+        let response = post_json(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"reasoning_effort": "low"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        assert_eq!(engine.last_request().prompt, "Reasoning: low");
+
+        for invalid in [json!("xhigh"), json!(1)] {
+            let response = post_json(
+                router.clone(),
+                "/v1/chat/completions",
+                json!({
+                    "model": "served-alias",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "chat_template_kwargs": {"reasoning_effort": invalid}
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
+            let body = response_json(response).await;
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("reasoning_effort"));
+        }
     }
 
     #[tokio::test]

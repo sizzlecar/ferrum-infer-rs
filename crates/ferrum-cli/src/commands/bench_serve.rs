@@ -23,6 +23,7 @@ use ferrum_bench_core::{
     TokenLengthStats, WarmupSummary, BENCHMARK_CELL_ID_HEADER, BENCHMARK_PHASE_HEADER,
     BENCHMARK_REPEAT_INDEX_HEADER, BENCHMARK_REQUEST_INDEX_HEADER, BENCHMARK_RUN_ID_HEADER,
 };
+use ferrum_server::chat_template::ReasoningEffort;
 use ferrum_types::Result;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde::Deserialize;
@@ -133,6 +134,10 @@ pub struct BenchServeCommand {
     /// Typed chat-template thinking control. Omitted from payloads unless set.
     #[arg(long, action = clap::ArgAction::Set)]
     pub enable_thinking: Option<bool>,
+
+    /// Model-owned reasoning level passed to the chat template when set.
+    #[arg(long, value_name = "LEVEL")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 
     /// Path to a ShareGPT-format JSONL file (`--dataset sharegpt`).
     /// Each line should be a `{"conversations": [{"from": "...", "value":
@@ -310,6 +315,7 @@ async fn stream_one(
     max_tokens: usize,
     ignore_eos: bool,
     enable_thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
     timeout_s: f64,
     correlation: BenchmarkRequestCorrelation,
 ) -> RequestRecord {
@@ -318,7 +324,14 @@ async fn stream_one(
         input_tokens,
         sha256: prompt_sha256,
     } = prompt;
-    let body = chat_completion_body(model, &text, max_tokens, ignore_eos, enable_thinking);
+    let body = chat_completion_body(
+        model,
+        &text,
+        max_tokens,
+        ignore_eos,
+        enable_thinking,
+        reasoning_effort,
+    );
     let start = Instant::now();
     let mut state = StreamState::for_prompt(
         start,
@@ -476,6 +489,7 @@ fn chat_completion_body(
     max_tokens: usize,
     ignore_eos: bool,
     enable_thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
 ) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
@@ -485,8 +499,21 @@ fn chat_completion_body(
         "stream_options": {"include_usage": true},
         "temperature": 0.0,
     });
+    let mut chat_template_kwargs = serde_json::Map::new();
     if let Some(enable_thinking) = enable_thinking {
-        body["chat_template_kwargs"] = serde_json::json!({"enable_thinking": enable_thinking});
+        chat_template_kwargs.insert(
+            "enable_thinking".to_string(),
+            serde_json::json!(enable_thinking),
+        );
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        chat_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            serde_json::json!(reasoning_effort),
+        );
+    }
+    if !chat_template_kwargs.is_empty() {
+        body["chat_template_kwargs"] = serde_json::Value::Object(chat_template_kwargs);
     }
     if ignore_eos {
         body["ignore_eos"] = serde_json::json!(true);
@@ -1149,6 +1176,7 @@ struct RunContext {
     max_out: usize,
     ignore_eos: bool,
     enable_thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
     timeout_s: f64,
     benchmark_run_id: Arc<String>,
 }
@@ -1239,6 +1267,7 @@ async fn run_closed_loop(
                     ctx_c.max_out,
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
+                    ctx_c.reasoning_effort,
                     ctx_c.timeout_s,
                     correlation,
                 )
@@ -1284,6 +1313,7 @@ async fn run_closed_loop(
                     ctx_c.max_out,
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
+                    ctx_c.reasoning_effort,
                     ctx_c.timeout_s,
                     correlation,
                 )
@@ -1328,6 +1358,7 @@ async fn run_open_loop(
                 ctx.max_out,
                 ctx.ignore_eos,
                 ctx.enable_thinking,
+                ctx.reasoning_effort,
                 ctx.timeout_s,
                 benchmark_request_correlation(
                     &ctx.benchmark_run_id,
@@ -1376,6 +1407,7 @@ async fn run_open_loop(
                     ctx_c.max_out,
                     ctx_c.ignore_eos,
                     ctx_c.enable_thinking,
+                    ctx_c.reasoning_effort,
                     ctx_c.timeout_s,
                     correlation,
                 )
@@ -1403,6 +1435,7 @@ impl RunContext {
             max_out: self.max_out,
             ignore_eos: self.ignore_eos,
             enable_thinking: self.enable_thinking,
+            reasoning_effort: self.reasoning_effort,
             timeout_s: self.timeout_s,
             benchmark_run_id: self.benchmark_run_id.clone(),
         }
@@ -1716,6 +1749,7 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         max_out: cmd.random_output_len,
         ignore_eos: cmd.ignore_eos,
         enable_thinking: cmd.enable_thinking,
+        reasoning_effort: cmd.reasoning_effort,
         timeout_s: cmd.timeout,
         benchmark_run_id: Arc::new(format!("bench-{}", Uuid::new_v4())),
     };
@@ -2087,7 +2121,7 @@ mod tests {
 
     #[test]
     fn chat_completion_body_omits_ignore_eos_by_default() {
-        let body = chat_completion_body("model", "prompt", 128, false, None);
+        let body = chat_completion_body("model", "prompt", 128, false, None, None);
         assert_eq!(body["model"], serde_json::json!("model"));
         assert_eq!(body["max_tokens"], serde_json::json!(128));
         assert_eq!(body["stream"], serde_json::json!(true));
@@ -2101,18 +2135,18 @@ mod tests {
 
     #[test]
     fn chat_completion_body_sends_ignore_eos_when_requested() {
-        let body = chat_completion_body("model", "prompt", 128, true, None);
+        let body = chat_completion_body("model", "prompt", 128, true, None, None);
         assert_eq!(body["ignore_eos"], serde_json::json!(true));
     }
 
     #[test]
     fn chat_completion_body_sends_typed_thinking_values() {
-        let disabled = chat_completion_body("model", "prompt", 128, false, Some(false));
+        let disabled = chat_completion_body("model", "prompt", 128, false, Some(false), None);
         assert_eq!(
             disabled["chat_template_kwargs"]["enable_thinking"],
             serde_json::json!(false)
         );
-        let enabled = chat_completion_body("model", "prompt", 128, false, Some(true));
+        let enabled = chat_completion_body("model", "prompt", 128, false, Some(true), None);
         assert_eq!(
             enabled["chat_template_kwargs"]["enable_thinking"],
             serde_json::json!(true)
@@ -2120,7 +2154,27 @@ mod tests {
     }
 
     #[test]
-    fn enable_thinking_cli_is_tri_state() {
+    fn chat_completion_body_sends_typed_reasoning_effort() {
+        let body = chat_completion_body(
+            "model",
+            "prompt",
+            128,
+            false,
+            Some(false),
+            Some(ReasoningEffort::Low),
+        );
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            body["chat_template_kwargs"]["reasoning_effort"],
+            serde_json::json!("low")
+        );
+    }
+
+    #[test]
+    fn thinking_and_reasoning_effort_cli_are_typed() {
         use clap::Parser as _;
 
         #[derive(clap::Parser)]
@@ -2140,6 +2194,7 @@ mod tests {
         ];
         let absent = TestCli::parse_from(base).command;
         assert_eq!(absent.enable_thinking, None);
+        assert_eq!(absent.reasoning_effort, None);
         assert_eq!(absent.http_connection_mode, BenchHttpConnectionMode::Pooled);
 
         let disabled =
@@ -2149,6 +2204,14 @@ mod tests {
         let enabled =
             TestCli::parse_from(base.into_iter().chain(["--enable-thinking", "true"])).command;
         assert_eq!(enabled.enable_thinking, Some(true));
+
+        let low =
+            TestCli::parse_from(base.into_iter().chain(["--reasoning-effort", "low"])).command;
+        assert_eq!(low.reasoning_effort, Some(ReasoningEffort::Low));
+        assert!(
+            TestCli::try_parse_from(base.into_iter().chain(["--reasoning-effort", "xhigh"]),)
+                .is_err()
+        );
 
         let metal =
             TestCli::parse_from(base.into_iter().chain(["--target-backend", "metal"])).command;
@@ -2495,6 +2558,7 @@ mod tests {
             random_output_len: 3,
             ignore_eos: false,
             enable_thinking: None,
+            reasoning_effort: None,
             sharegpt_path: None,
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
@@ -2690,6 +2754,7 @@ mod tests {
             random_output_len: 3,
             ignore_eos: false,
             enable_thinking: None,
+            reasoning_effort: None,
             sharegpt_path: None,
             shared_prefix_len: 1024,
             shared_suffix_len: 64,
@@ -2779,6 +2844,7 @@ mod tests {
             random_output_len: 3,
             ignore_eos: false,
             enable_thinking: None,
+            reasoning_effort: None,
             sharegpt_path: None,
             shared_prefix_len: 1024,
             shared_suffix_len: 64,

@@ -97,6 +97,7 @@ fn chat_template_goldens_match_transformers() {
         template.eos_token = meta.eos_token.clone();
         let options = ChatTemplateOptions {
             enable_thinking: meta.render_kwargs.enable_thinking,
+            reasoning_effort: None,
             now_override: meta.now.as_deref().map(|s| {
                 chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
                     .unwrap_or_else(|e| panic!("{}: bad meta.json now {s:?}: {e}", meta.model_id))
@@ -119,6 +120,7 @@ fn chat_template_goldens_match_transformers() {
                     .render_kwargs
                     .enable_thinking
                     .or(options.enable_thinking),
+                reasoning_effort: options.reasoning_effort,
                 now_override: options.now_override,
             };
 
