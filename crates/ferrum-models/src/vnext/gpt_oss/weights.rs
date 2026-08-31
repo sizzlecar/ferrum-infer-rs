@@ -717,7 +717,7 @@ mod tests {
     const CANARY_LM_HEAD_VALUE: f32 = 64.0;
     const E8M0_UNIT_SCALE: u8 = 127;
 
-    const FIXED_TINY_FILES: [(&str, &str); 6] = [
+    const FIXED_TINY_FILES: [(&str, &str); 7] = [
         (
             "config.json",
             "985ccbfe7bddb5a6dd1f217ea5c7d01a9615af53c0ee53262963aaf7e0797209",
@@ -741,6 +741,10 @@ mod tests {
         (
             "special_tokens_map.json",
             "8464cabd6eda239fe46ebf8ae63b46c417721784a961a022f6b59174a2cda0e2",
+        ),
+        (
+            "model.safetensors",
+            "9a94c6b13dccbe61223a871c60f1e5ce020b54d1e54e969ad8ef4813f2524211",
         ),
     ];
 
@@ -1379,6 +1383,17 @@ mod tests {
         assert_eq!(source_semantic.vocabulary_size, 201_088);
         assert!(source_semantic.tie_word_embeddings);
         assert_eq!(source_quantization.quant_method(), "mxfp4");
+        let source_prepared = super::super::prepare_from_model_dir(&source).unwrap();
+        assert_eq!(source_prepared.descriptor().architecture(), "gpt_oss");
+        assert_eq!(source_prepared.descriptor().hidden_size(), 32);
+        assert_eq!(source_prepared.descriptor().layer_count(), 2);
+        assert_eq!(source_prepared.descriptor().attention_head_dimension(), 32);
+        assert_eq!(source_prepared.descriptor().vocabulary_size(), 201_088);
+        assert_eq!(
+            source_prepared.family().weight_schema().format_id.as_str(),
+            "weight-format.safetensors.gpt-oss-mxfp4-source"
+        );
+        drop(source_prepared);
 
         let template = std::str::from_utf8(&fixed_files["chat_template.jinja"])
             .expect("fixed chat_template.jinja is UTF-8");
