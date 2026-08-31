@@ -1,18 +1,18 @@
 {
   "archive": {
-    "file_name": "ferrum-native-cuda-sources-a4.tar.gz",
+    "file_name": "ferrum-native-cuda-sources-a5.tar.gz",
     "format": "tar.gz",
-    "sha256": "569e638dd3de27d6fc29b05380c7bfb6c2e5ead368c690b1158db063cfded962",
-    "size_bytes": 119085
+    "sha256": "0fd25f432f54ab5d187608d84a9b7b55198976f17818f1656c9f2742023956c3",
+    "size_bytes": 119353
   },
-  "bundle_id": "ferrum-native-cuda-v1+sha256.df27bdb0c6d5fd5a33fe839a27eb21bb0202daaef024c69340e43203992fabeb",
+  "bundle_id": "ferrum-native-cuda-v1+sha256.67914b6e426584051d5b6ef5ef424fcbe0b9fc07981195d866e546cc1408aa8c",
   "distribution": {
-    "asset_name": "ferrum-native-cuda-sources-a4.tar.gz",
+    "asset_name": "ferrum-native-cuda-sources-a5.tar.gz",
     "kind": "github-release-asset",
     "repository": "sizzlecar/ferrum-infer-rs",
-    "tag": "ferrum-native-cuda12.4-sm89-v4"
+    "tag": "ferrum-native-cuda12.4-sm89-v5"
   },
-  "member_set_sha256": "df27bdb0c6d5fd5a33fe839a27eb21bb0202daaef024c69340e43203992fabeb",
+  "member_set_sha256": "67914b6e426584051d5b6ef5ef424fcbe0b9fc07981195d866e546cc1408aa8c",
   "members": [
     {
       "path": "kernels/marlin_cuda_kernel.cu",
@@ -91,8 +91,8 @@
     },
     {
       "path": "kernels/vllm_marlin_moe/kernel_instantiations.cu",
-      "sha256": "93ee2740062f1c537731843103eb284f37e72ac3a5c24623bb8450eebbd173f5",
-      "size_bytes": 9546
+      "sha256": "f99c6c861d88441760a3650c8868717671e71aca893fa04a1a08b78e66e6f4ae",
+      "size_bytes": 11307
     },
     {
       "path": "kernels/vllm_marlin_moe/marlin_template.h",
@@ -101,8 +101,8 @@
     },
     {
       "path": "kernels/vllm_marlin_moe/ops.cu",
-      "sha256": "45bb7e3ccd09e9cf80ec13106d4fdca31a939e5d9a2edb72935ee8e2a2352ac5",
-      "size_bytes": 58376
+      "sha256": "de76457a0d87912e86b1ba1ac28701b16008e134e1f3d6e380f1d9776c43a8b4",
+      "size_bytes": 60705
     },
     {
       "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
