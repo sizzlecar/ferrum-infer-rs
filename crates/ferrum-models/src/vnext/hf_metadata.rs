@@ -6,7 +6,7 @@ use ferrum_interfaces::vnext::{
     ModelSemanticMetadata, SpecialTokenCollision, SpecialTokenCollisionPolicy,
     SpecialTokenMetadata, SpecialTokenRole, TemplateMetadata,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 pub(super) fn parse_hf_model_semantic_metadata(
@@ -26,6 +26,36 @@ pub(super) fn parse_hf_model_semantic_metadata(
             template: template.to_owned(),
             source_file: "tokenizer_config.json".to_owned(),
             sha256: format!("{:x}", Sha256::digest(tokenizer_config_bytes)),
+        },
+        special_tokens,
+    })
+}
+
+pub(super) fn parse_hf_model_semantic_metadata_with_external_template(
+    model_config: &Value,
+    tokenizer_config_bytes: &[u8],
+    chat_template_bytes: &[u8],
+    generation_config_bytes: &[u8],
+) -> Result<ModelSemanticMetadata, String> {
+    let tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
+        .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
+    let generation_config: Value = serde_json::from_slice(generation_config_bytes)
+        .map_err(|error| format!("parse generation_config.json: {error}"))?;
+    let generation_config = generation_config
+        .as_object()
+        .ok_or_else(|| "generation_config.json root must be an object".to_owned())?;
+    let template = std::str::from_utf8(chat_template_bytes)
+        .map_err(|error| format!("chat_template.jinja is not UTF-8: {error}"))?;
+    if template.is_empty() {
+        return Err("chat_template.jinja must be non-empty".to_owned());
+    }
+    let special_tokens =
+        parse_special_tokens_with_generation(model_config, &tokenizer_config, generation_config)?;
+    Ok(ModelSemanticMetadata {
+        template: TemplateMetadata {
+            template: template.to_owned(),
+            source_file: "chat_template.jinja".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(chat_template_bytes)),
         },
         special_tokens,
     })
@@ -65,6 +95,50 @@ fn parse_special_tokens(
         pad_token_id,
         collision_policy,
     })
+}
+
+fn parse_special_tokens_with_generation(
+    model_config: &Value,
+    tokenizer_config: &Value,
+    generation_config: &Map<String, Value>,
+) -> Result<SpecialTokenMetadata, String> {
+    let bos_token_id = generation_token_id(generation_config, "bos_token_id", tokenizer_config)?
+        .or(token_id(model_config, tokenizer_config, "bos_token")?);
+    let pad_token_id = generation_token_id(generation_config, "pad_token_id", tokenizer_config)?
+        .or(token_id(model_config, tokenizer_config, "pad_token")?);
+    let eos_value = generation_config
+        .get("eos_token_id")
+        .ok_or_else(|| "generation_config.json missing eos_token_id".to_owned())?;
+    let eos_values = eos_value
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(eos_value));
+    let eos_token_ids = eos_values
+        .iter()
+        .map(|value| resolve_token_id(value, tokenizer_config))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if eos_token_ids.is_empty() {
+        return Err("generation_config.json resolved EOS token set is empty".to_owned());
+    }
+    let collision_policy = collision_policy(bos_token_id, &eos_token_ids, pad_token_id)?;
+    Ok(SpecialTokenMetadata {
+        bos_token_id,
+        eos_token_ids,
+        pad_token_id,
+        collision_policy,
+    })
+}
+
+fn generation_token_id(
+    generation_config: &Map<String, Value>,
+    field: &str,
+    tokenizer_config: &Value,
+) -> Result<Option<u32>, String> {
+    generation_config
+        .get(field)
+        .filter(|value| !value.is_null())
+        .map(|value| resolve_token_id(value, tokenizer_config))
+        .transpose()
 }
 
 fn token_id(
@@ -176,5 +250,51 @@ mod tests {
             BTreeSet::from([2])
         );
         assert!(parse_hf_model_semantic_metadata(&model, br#"{"eos_token_id":2}"#).is_err());
+    }
+
+    #[test]
+    fn external_harmony_template_uses_generation_terminal_set() {
+        let model = json!({"eos_token_id": 200002, "pad_token_id": 199999});
+        let tokenizer = br#"{"chat_template":null}"#;
+        let generation = br#"{
+            "bos_token_id": 199998,
+            "eos_token_id": [200002, 199999, 200012],
+            "pad_token_id": 199999
+        }"#;
+        let template = b"{{ messages }}<|start|>assistant<|channel|>final<|message|>";
+        let metadata = parse_hf_model_semantic_metadata_with_external_template(
+            &model, tokenizer, template, generation,
+        )
+        .unwrap();
+
+        assert_eq!(metadata.template.source_file, "chat_template.jinja");
+        assert_eq!(metadata.template.template.as_bytes(), template);
+        assert_eq!(
+            metadata.template.sha256,
+            format!("{:x}", Sha256::digest(template))
+        );
+        assert_eq!(metadata.special_tokens.bos_token_id, Some(199998));
+        assert_eq!(metadata.special_tokens.pad_token_id, Some(199999));
+        assert_eq!(
+            metadata.special_tokens.eos_token_ids,
+            BTreeSet::from([199999, 200002, 200012])
+        );
+        assert!(metadata
+            .special_tokens
+            .collision_policy
+            .allows(SpecialTokenRole::Eos, SpecialTokenRole::Pad));
+    }
+
+    #[test]
+    fn external_template_metadata_fails_closed_without_generation_eos() {
+        let model = json!({"eos_token_id": 200002});
+        let error = parse_hf_model_semantic_metadata_with_external_template(
+            &model,
+            br#"{}"#,
+            b"{{ messages }}",
+            br#"{"bos_token_id":199998}"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("generation_config.json missing eos_token_id"));
     }
 }

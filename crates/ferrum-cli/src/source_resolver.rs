@@ -833,7 +833,7 @@ pub fn load_prepared_product_chat_template(
     prepared: &ferrum_models::vnext::PreparedProductionModel,
 ) -> Result<ModelChatTemplate> {
     let metadata = &prepared.family().metadata().template;
-    let selected = load_product_chat_template_source(prepared.sources(), &metadata.source_file)
+    let mut selected = load_product_chat_template_source(prepared.sources(), &metadata.source_file)
         .ok_or_else(|| {
             FerrumError::model(format!(
                 "typed product chat template source is unavailable: {}",
@@ -845,6 +845,7 @@ pub fn load_prepared_product_chat_template(
             "typed product chat template bytes differ from the prepared family",
         ));
     }
+    selected.output_protocol = prepared.descriptor().output_protocol();
     Ok(selected)
 }
 

@@ -729,11 +729,20 @@ impl SequenceState {
             })
             .transpose()?
             .flatten();
-        let request_generated_control_token_texts = request
+        let mut request_generated_control_token_texts = request
             .api_request
             .as_ref()
             .map(ferrum_types::ApiRequest::generated_control_token_texts)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_vec();
+        request_generated_control_token_texts.extend_from_slice(
+            request
+                .sampling_params
+                .model_output_protocol
+                .generated_control_token_texts(),
+        );
+        request_generated_control_token_texts.sort_unstable();
+        request_generated_control_token_texts.dedup();
         let (
             forbidden_token_ids,
             model_greedy_forbidden_token_ids,
@@ -742,7 +751,7 @@ impl SequenceState {
         ) = resolve_sampling_token_constraints(
             tokenizer.as_ref(),
             &stop_token_ids,
-            request_generated_control_token_texts,
+            &request_generated_control_token_texts,
         );
         let mut initial_forbidden_token_ids = HashSet::new();
         let initial_forbidden_token_texts = request

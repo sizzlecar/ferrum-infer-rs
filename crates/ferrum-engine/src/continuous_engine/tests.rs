@@ -12435,6 +12435,46 @@ fn tool_protocol_allows_only_its_added_tokens_for_auto_calls() {
 }
 
 #[test]
+fn harmony_protocol_allows_only_its_typed_generation_controls() {
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
+        6,
+        &[
+            ("normal", 0),
+            ("<s>", 1),
+            ("<unk>", 2),
+            ("</s>", 3),
+            ("ok", 4),
+            ("x", 5),
+            ("<|channel|>", 7),
+            ("<|message|>", 8),
+            ("<|fim_prefix|>", 9),
+        ],
+    ));
+    let mut request = policy_request();
+    request.sampling_params.model_output_protocol =
+        ferrum_types::ModelOutputProtocol::HarmonyGptOss;
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(0)],
+        Some(tokenizer),
+        Some(10),
+    );
+
+    assert!(state.allowed_extended_token_ids.contains(&7));
+    assert!(state.allowed_extended_token_ids.contains(&8));
+    assert!(!state.allowed_extended_token_ids.contains(&9));
+    let mut logits = vec![f32::NEG_INFINITY; 10];
+    logits[5] = 1.0;
+    logits[7] = 90.0;
+    logits[9] = 100.0;
+    let token = state
+        .sample_and_commit_with_processors(&mut logits)
+        .unwrap();
+    assert_eq!(token.get(), 7);
+    assert_eq!(logits[9], f32::NEG_INFINITY);
+}
+
+#[test]
 fn tool_protocol_does_not_widen_sampling_when_tool_choice_is_none() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(
         6,

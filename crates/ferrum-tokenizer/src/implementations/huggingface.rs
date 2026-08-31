@@ -2,7 +2,7 @@
 
 use crate::{IncrementalTokenizer, Tokenizer, TokenizerFactory, TokenizerInfo, TokenizerType};
 use async_trait::async_trait;
-use ferrum_types::{Result, SpecialTokens, TokenId};
+use ferrum_types::{ModelOutputProtocol, Result, SpecialTokens, TokenId};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -17,13 +17,13 @@ pub struct HuggingFaceTokenizer {
     info: TokenizerInfo,
     id_to_token: Vec<Option<String>>,
     byte_level_decoder: bool,
-    /// Reasoning-marker token ids mapped to the canonical tag emitted in
-    /// their place. Some vocabs mark think tags `special: true`
+    /// Semantic-marker token ids mapped to the canonical text emitted in
+    /// their place. Some vocabs mark protocol controls `special: true`
     /// (Magistral's `[THINK]`/`[/THINK]`), so a skip-special decode would
-    /// silently drop them and the thinking text would leak into content.
-    /// Decode preserves these ids and normalizes every dialect to
-    /// `<think>`/`</think>`, which is what the serving layer splits on.
-    think_markers: Vec<(u32, &'static str)>,
+    /// silently drop them before the product response parser sees them.
+    /// Think dialects are normalized to `<think>`/`</think>`; typed output
+    /// protocol markers retain their exact wire text.
+    semantic_markers: Vec<(u32, &'static str)>,
     /// Incremental decode cache for efficiency
     decode_cache: RwLock<DecodeCache>,
 }
@@ -37,11 +37,19 @@ const THINK_MARKER_DIALECTS: [(&str, &'static str); 4] = [
     ("[/THINK]", "</think>"),
 ];
 
-fn probe_think_markers(tokenizer: &HfTokenizer) -> Vec<(u32, &'static str)> {
-    THINK_MARKER_DIALECTS
+fn probe_semantic_markers(tokenizer: &HfTokenizer) -> Vec<(u32, &'static str)> {
+    let mut markers: Vec<_> = THINK_MARKER_DIALECTS
         .iter()
         .filter_map(|(text, canonical)| tokenizer.token_to_id(text).map(|id| (id, *canonical)))
-        .collect()
+        .collect();
+
+    markers.extend(
+        ModelOutputProtocol::HarmonyGptOss
+            .preserved_special_token_texts()
+            .iter()
+            .filter_map(|text| tokenizer.token_to_id(text).map(|id| (id, *text))),
+    );
+    markers
 }
 
 /// Incremental decoding state
@@ -123,7 +131,7 @@ impl HuggingFaceTokenizer {
             vocab_size
         );
 
-        let think_markers = probe_think_markers(&tokenizer);
+        let semantic_markers = probe_semantic_markers(&tokenizer);
         let byte_level_decoder = tokenizer.get_decoder().is_some_and(decoder_uses_byte_level);
 
         Ok(Self {
@@ -132,7 +140,7 @@ impl HuggingFaceTokenizer {
             info,
             id_to_token,
             byte_level_decoder,
-            think_markers,
+            semantic_markers,
             decode_cache: RwLock::new(DecodeCache::new(1000)),
         })
     }
@@ -230,19 +238,21 @@ impl Tokenizer for HuggingFaceTokenizer {
     fn decode(&self, tokens: &[TokenId], skip_special: bool) -> Result<String> {
         let token_ids: Vec<u32> = tokens.iter().map(|t| t.get()).collect();
 
-        // Skip-special decode must not swallow reasoning markers: split at
+        // Skip-special decode must not swallow semantic markers: split at
         // marker ids, decode the segments, and splice the canonical tags
         // back in. The common no-marker case stays a single decode call.
         if skip_special
-            && !self.think_markers.is_empty()
+            && !self.semantic_markers.is_empty()
             && token_ids
                 .iter()
-                .any(|id| self.think_markers.iter().any(|(mid, _)| mid == id))
+                .any(|id| self.semantic_markers.iter().any(|(mid, _)| mid == id))
         {
             let mut out = String::new();
             let mut segment: Vec<u32> = Vec::with_capacity(token_ids.len());
             for id in &token_ids {
-                if let Some((_, canonical)) = self.think_markers.iter().find(|(mid, _)| mid == id) {
+                if let Some((_, canonical)) =
+                    self.semantic_markers.iter().find(|(mid, _)| mid == id)
+                {
                     if !segment.is_empty() {
                         out.push_str(&self.tokenizer.decode(&segment, true).map_err(|e| {
                             ferrum_types::FerrumError::tokenizer(format!("Decoding failed: {}", e))
@@ -1294,6 +1304,33 @@ mod tests {
         let text = loaded.decode(&tokens, true).unwrap();
 
         assert_eq!(text, "<think>hello</think>world");
+    }
+
+    #[tokio::test]
+    async fn skip_special_decode_preserves_typed_harmony_markers_only() {
+        let harmony_markers = ModelOutputProtocol::HarmonyGptOss.preserved_special_token_texts();
+        let mut specials = harmony_markers.to_vec();
+        specials.push("<|endoftext|>");
+        let tokenizer = tiny_tokenizer_with_specials(&specials);
+
+        let mut token_ids = vec![tokenizer.token_to_id("hello").unwrap()];
+        token_ids.extend(
+            harmony_markers
+                .iter()
+                .map(|marker| tokenizer.token_to_id(marker).unwrap()),
+        );
+        token_ids.push(tokenizer.token_to_id("world").unwrap());
+        token_ids.push(tokenizer.token_to_id("<|endoftext|>").unwrap());
+
+        let loaded = HuggingFaceTokenizer::new(tokenizer).await.unwrap();
+        let tokens: Vec<TokenId> = token_ids.into_iter().map(TokenId::new).collect();
+        let text = loaded.decode(&tokens, true).unwrap();
+
+        assert_eq!(
+            text,
+            format!("hello{}world", harmony_markers.concat()),
+            "the typed Harmony markers must survive while unrelated special tokens stay skipped"
+        );
     }
 
     #[tokio::test]
