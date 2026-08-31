@@ -414,6 +414,32 @@ extern "C" {
         use_atomic_add: i32,
         use_fp32_reduce: i32,
     ) -> i32;
+
+    fn ferrum_vllm_marlin_moe_mxfp4_bf16(
+        a: *const std::ffi::c_void,        // [size_m, size_k] bf16
+        b: *const std::ffi::c_void,        // [num_experts, ...] E2M1 Marlin-packed nibbles
+        c: *mut std::ffi::c_void,          // [size_m * top_k, size_n] bf16
+        c_tmp: *mut std::ffi::c_void,      // fp32 scratch (or null)
+        b_bias: *const std::ffi::c_void,   // [num_experts, size_n] bf16
+        b_scales: *const std::ffi::c_void, // [num_experts, size_k / 32, size_n] E8M0 bytes
+        workspace: *mut std::ffi::c_void,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_past_padded: *const i32,
+        topk_weights: *const f32,
+        moe_block_size: i32,
+        top_k: i32,
+        mul_topk_weights: i32,
+        is_ep: i32,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        group_size: i32, // exactly 32 for E2M1 + E8M0 MXFP4
+        dev: i32,
+        stream: cudarc::driver::sys::CUstream,
+        use_atomic_add: i32,
+        use_fp32_reduce: i32,
+    ) -> i32;
 }
 
 #[cfg(feature = "vllm-moe-marlin")]
@@ -1242,6 +1268,223 @@ impl MarlinMoeRawLaunchArgs {
     }
 }
 
+/// Native MXFP4 encoding accepted by the BF16 Marlin-MoE entrypoint.
+///
+/// The packed weight contains two E2M1 values per byte and uses one E8M0
+/// scale byte for every 32 values along K. Keeping this separate from
+/// `MarlinMoeF16WeightType` prevents the existing FP16 U4/E4M3 ABI from
+/// accidentally selecting the BF16-only entrypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarlinMoeMxfp4WeightType {
+    E2M1E8M0,
+}
+
+/// Raw, allocation-agnostic arguments for BF16 x MXFP4 Marlin-MoE.
+///
+/// `a`, `c`, and `bias` must point to BF16 data. `b` is Marlin-packed E2M1
+/// nibble data and `scales` is the corresponding group-32 E8M0 byte data.
+/// The owning provider must retain every allocation until work enqueued on
+/// `stream` has completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarlinMoeMxfp4Bf16LaunchArgs {
+    pub(crate) weight_type: MarlinMoeMxfp4WeightType,
+    pub(crate) expert_count: i32,
+    pub(crate) a: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) b: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c_tmp: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) bias: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) scales: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) workspace: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) sorted_token_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) expert_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) num_tokens_past_padded: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) topk_weights: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) moe_block_size: i32,
+    pub(crate) top_k: i32,
+    pub(crate) mul_topk_weights: bool,
+    pub(crate) is_ep: bool,
+    pub(crate) prob_m: i32,
+    pub(crate) prob_n: i32,
+    pub(crate) prob_k: i32,
+    pub(crate) group_size: i32,
+    pub(crate) device_ordinal: i32,
+    pub(crate) use_atomic_add: bool,
+    pub(crate) use_fp32_reduce: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarlinMoeMxfp4Bf16RequiredBytes {
+    a: u64,
+    b: u64,
+    c: u64,
+    c_tmp: Option<u64>,
+    bias: u64,
+    scales: u64,
+    topk_weights: Option<u64>,
+}
+
+impl MarlinMoeMxfp4Bf16LaunchArgs {
+    fn validate(&self) -> candle_core::Result<MarlinMoeMxfp4Bf16RequiredBytes> {
+        validate_marlin_moe_pointer("a", self.a, 16)?;
+        validate_marlin_moe_pointer("b", self.b, 16)?;
+        validate_marlin_moe_pointer("c", self.c, 16)?;
+        validate_marlin_moe_pointer("bias", self.bias, 16)?;
+        validate_marlin_moe_pointer("scales", self.scales, 16)?;
+        validate_marlin_moe_pointer("workspace", self.workspace, 4)?;
+        validate_marlin_moe_pointer("sorted_token_ids", self.sorted_token_ids, 4)?;
+        validate_marlin_moe_pointer("expert_ids", self.expert_ids, 4)?;
+        validate_marlin_moe_pointer("num_tokens_past_padded", self.num_tokens_past_padded, 4)?;
+        if let Some(pointer) = self.c_tmp {
+            validate_marlin_moe_pointer("c_tmp", pointer, 16)?;
+        }
+        if let Some(pointer) = self.topk_weights {
+            validate_marlin_moe_pointer("topk_weights", pointer, 4)?;
+        }
+
+        if self.expert_count <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 expert_count must be positive, got {}",
+                self.expert_count
+            )));
+        }
+        if self.prob_m <= 0 || self.prob_n <= 0 || self.prob_k <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 BF16 prob_m, prob_n, and prob_k must be positive, got [{}, {}, {}]",
+                self.prob_m, self.prob_n, self.prob_k
+            )));
+        }
+        if !matches!(self.moe_block_size, 8 | 16 | 32 | 48 | 64) {
+            return Err(invalid_marlin_moe_args(format!(
+                "unsupported moe_block_size {}; expected one of 8, 16, 32, 48, 64",
+                self.moe_block_size
+            )));
+        }
+        if self.top_k <= 0 || self.top_k > self.expert_count {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 top_k must be in 1..=expert_count, got top_k={} expert_count={}",
+                self.top_k, self.expert_count
+            )));
+        }
+        let output_rows = self.prob_m.checked_mul(self.top_k).ok_or_else(|| {
+            invalid_marlin_moe_args(
+                "MXFP4 prob_m * top_k overflows the kernel's i32 output-row domain",
+            )
+        })?;
+        if self.prob_n % 64 != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 prob_n {} must be divisible by the Marlin minimum thread width 64",
+                self.prob_n
+            )));
+        }
+        let expected_group_size = match self.weight_type {
+            MarlinMoeMxfp4WeightType::E2M1E8M0 => 32,
+        };
+        if self.group_size != expected_group_size {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 E2M1/E8M0 group_size must be exactly {expected_group_size}, got {}",
+                self.group_size,
+            )));
+        }
+        if self.prob_k % expected_group_size != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 prob_k {} must be divisible by group_size {expected_group_size}",
+                self.prob_k,
+            )));
+        }
+        if self.device_ordinal < 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "device_ordinal must be non-negative, got {}",
+                self.device_ordinal
+            )));
+        }
+        if self.mul_topk_weights && self.topk_weights.is_none() {
+            return Err(invalid_marlin_moe_args(
+                "mul_topk_weights requires a non-null topk_weights pointer",
+            ));
+        }
+        if self.use_atomic_add == self.use_fp32_reduce {
+            return Err(invalid_marlin_moe_args(
+                "exactly one of use_atomic_add and use_fp32_reduce must be enabled",
+            ));
+        }
+        if self.use_fp32_reduce != self.c_tmp.is_some() {
+            return Err(invalid_marlin_moe_args(
+                "use_fp32_reduce must exactly match the c_tmp pointer",
+            ));
+        }
+
+        let experts = self.expert_count as u64;
+        let m = self.prob_m as u64;
+        let n = self.prob_n as u64;
+        let k = self.prob_k as u64;
+        let output_rows = output_rows as u64;
+        let required = MarlinMoeMxfp4Bf16RequiredBytes {
+            a: checked_marlin_moe_bytes("MXFP4 BF16 input [M,K]", &[m, k, 2])?,
+            b: checked_marlin_moe_bytes(
+                "MXFP4 E2M1 packed weight [E,N,K/2]",
+                &[experts, n, k / 2],
+            )?,
+            c: checked_marlin_moe_bytes("MXFP4 BF16 output [M*top_k,N]", &[output_rows, n, 2])?,
+            c_tmp: self
+                .c_tmp
+                .map(|_| {
+                    checked_marlin_moe_bytes(
+                        "MXFP4 FP32 reduction scratch [M*top_k,N]",
+                        &[output_rows, n, 4],
+                    )
+                })
+                .transpose()?,
+            bias: checked_marlin_moe_bytes("MXFP4 BF16 bias [E,N]", &[experts, n, 2])?,
+            scales: checked_marlin_moe_bytes(
+                "MXFP4 E8M0 scales [E,K/32,N]",
+                &[experts, k / 32, n],
+            )?,
+            topk_weights: self
+                .topk_weights
+                .map(|_| {
+                    checked_marlin_moe_bytes("MXFP4 top-k weights [M,top_k]", &[output_rows, 4])
+                })
+                .transpose()?,
+        };
+
+        validate_marlin_moe_span("a", self.a, required.a)?;
+        validate_marlin_moe_span("b", self.b, required.b)?;
+        validate_marlin_moe_span("c", self.c, required.c)?;
+        validate_marlin_moe_span("bias", self.bias, required.bias)?;
+        validate_marlin_moe_span("scales", self.scales, required.scales)?;
+        if let (Some(pointer), Some(bytes)) = (self.c_tmp, required.c_tmp) {
+            validate_marlin_moe_span("c_tmp", pointer, bytes)?;
+        }
+        if let (Some(pointer), Some(bytes)) = (self.topk_weights, required.topk_weights) {
+            validate_marlin_moe_span("topk_weights", pointer, bytes)?;
+        }
+        Ok(required)
+    }
+}
+
+fn checked_marlin_moe_bytes(label: &str, factors: &[u64]) -> candle_core::Result<u64> {
+    factors.iter().try_fold(1_u64, |bytes, factor| {
+        bytes.checked_mul(*factor).ok_or_else(|| {
+            invalid_marlin_moe_args(format!("{label} byte size overflows the u64 device domain"))
+        })
+    })
+}
+
+fn validate_marlin_moe_span(
+    name: &str,
+    pointer: cudarc::driver::sys::CUdeviceptr,
+    bytes: u64,
+) -> candle_core::Result<()> {
+    debug_assert!(bytes > 0);
+    if pointer.checked_add(bytes - 1).is_none() {
+        return Err(invalid_marlin_moe_args(format!(
+            "{name} pointer range overflows the u64 device domain"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_marlin_moe_pointer(
     name: &str,
     pointer: cudarc::driver::sys::CUdeviceptr,
@@ -1341,6 +1584,61 @@ pub(crate) fn launch_marlin_moe_vllm_raw(
         )));
     }
     Ok(())
+}
+
+/// Validate and enqueue the BF16 x MXFP4 Marlin-MoE native entrypoint.
+#[cfg(feature = "vllm-moe-marlin")]
+pub(crate) fn launch_marlin_moe_mxfp4_bf16(
+    stream: &CudaStream,
+    args: MarlinMoeMxfp4Bf16LaunchArgs,
+) -> candle_core::Result<()> {
+    let _required = args.validate()?;
+    let ret = unsafe {
+        ferrum_vllm_marlin_moe_mxfp4_bf16(
+            args.a as *const _,
+            args.b as *const _,
+            args.c as *mut _,
+            args.c_tmp.unwrap_or_default() as *mut _,
+            args.bias as *const _,
+            args.scales as *const _,
+            args.workspace as *mut _,
+            args.sorted_token_ids as *const i32,
+            args.expert_ids as *const i32,
+            args.num_tokens_past_padded as *const i32,
+            args.topk_weights.unwrap_or_default() as *const f32,
+            args.moe_block_size,
+            args.top_k,
+            i32::from(args.mul_topk_weights),
+            i32::from(args.is_ep),
+            args.prob_m,
+            args.prob_n,
+            args.prob_k,
+            args.group_size,
+            args.device_ordinal,
+            stream.cu_stream(),
+            i32::from(args.use_atomic_add),
+            i32::from(args.use_fp32_reduce),
+        )
+    };
+    if ret != 0 {
+        let (stage, cuda_status) = marlin_moe_ffi_status(ret);
+        return Err(candle_core::Error::Msg(format!(
+            "ferrum_vllm_marlin_moe_mxfp4_bf16 failed at {stage}: \
+             cuda_status={cuda_status}, ret={ret} (m={}, n={}, k={}, experts={})",
+            args.prob_m, args.prob_n, args.prob_k, args.expert_count
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vllm-moe-marlin"))]
+pub(crate) fn launch_marlin_moe_mxfp4_bf16(
+    _stream: &CudaStream,
+    _args: MarlinMoeMxfp4Bf16LaunchArgs,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "vLLM MXFP4 BF16 Marlin-MoE not built — compile with --features vllm-moe-marlin".into(),
+    ))
 }
 
 #[cfg(not(feature = "vllm-moe-marlin"))]
@@ -1502,8 +1800,9 @@ mod tests {
     use super::launch_marlin_moe_vllm_raw;
     use super::{
         marlin_moe_ffi_status, marlin_profile_bucket_from_label, should_zero_workspace,
-        CudaMarlinRuntimeConfig, MarlinMoeF16WeightType, MarlinMoeRawLaunchArgs,
-        MarlinProfileBucket, MarlinProfileBucketStats,
+        CudaMarlinRuntimeConfig, MarlinMoeF16WeightType, MarlinMoeMxfp4Bf16LaunchArgs,
+        MarlinMoeMxfp4WeightType, MarlinMoeRawLaunchArgs, MarlinProfileBucket,
+        MarlinProfileBucketStats,
     };
     #[cfg(feature = "vllm-moe-marlin")]
     use crate::marlin_repack::prepare_block_fp8_weight_for_fp8_marlin;
@@ -1541,6 +1840,146 @@ mod tests {
             use_atomic_add: true,
             use_fp32_reduce: false,
         }
+    }
+
+    fn valid_marlin_moe_mxfp4_bf16_args() -> MarlinMoeMxfp4Bf16LaunchArgs {
+        MarlinMoeMxfp4Bf16LaunchArgs {
+            weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+            expert_count: 4,
+            a: 0x1000,
+            b: 0x2000,
+            c: 0x3000,
+            c_tmp: None,
+            bias: 0x4000,
+            scales: 0x5000,
+            workspace: 0x6000,
+            sorted_token_ids: 0x7000,
+            expert_ids: 0x8000,
+            num_tokens_past_padded: 0x9000,
+            topk_weights: None,
+            moe_block_size: 16,
+            top_k: 2,
+            mul_topk_weights: false,
+            is_ep: false,
+            prob_m: 4,
+            prob_n: 512,
+            prob_k: 256,
+            group_size: 32,
+            device_ordinal: 0,
+            use_atomic_add: true,
+            use_fp32_reduce: false,
+        }
+    }
+
+    fn assert_invalid_marlin_moe_mxfp4_bf16_args(
+        args: MarlinMoeMxfp4Bf16LaunchArgs,
+        expected: &str,
+    ) {
+        let error = args.validate().expect_err("launch arguments must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error}"
+        );
+    }
+
+    #[test]
+    fn marlin_moe_mxfp4_bf16_args_compute_required_buffer_shapes() {
+        let required = valid_marlin_moe_mxfp4_bf16_args().validate().unwrap();
+        assert_eq!(required.a, 2_048);
+        assert_eq!(required.b, 262_144);
+        assert_eq!(required.c, 8_192);
+        assert_eq!(required.c_tmp, None);
+        assert_eq!(required.bias, 4_096);
+        assert_eq!(required.scales, 16_384);
+        assert_eq!(required.topk_weights, None);
+
+        let mut fp32_reduce = valid_marlin_moe_mxfp4_bf16_args();
+        fp32_reduce.c_tmp = Some(0xa000);
+        fp32_reduce.topk_weights = Some(0xb000);
+        fp32_reduce.mul_topk_weights = true;
+        fp32_reduce.use_atomic_add = false;
+        fp32_reduce.use_fp32_reduce = true;
+        let required = fp32_reduce.validate().unwrap();
+        assert_eq!(required.c_tmp, Some(16_384));
+        assert_eq!(required.topk_weights, Some(32));
+    }
+
+    #[test]
+    fn marlin_moe_mxfp4_bf16_args_reject_invalid_pointers() {
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.bias = 0;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "bias pointer must be non-null");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.scales += 2;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "scales pointer");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.b = u64::MAX - 15;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "b pointer range overflows");
+    }
+
+    #[test]
+    fn marlin_moe_mxfp4_bf16_args_reject_invalid_shapes_and_overflow() {
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.group_size = 128;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "group_size must be exactly 32");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.prob_k = 240;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "must be divisible by group_size 32");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.prob_n = 96;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "must be divisible");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.top_k = 5;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "1..=expert_count");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.prob_m = i32::MAX;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "prob_m * top_k overflows");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.expert_count = i32::MAX;
+        args.top_k = 1;
+        args.prob_m = 1;
+        args.prob_n = i32::MAX - i32::MAX.rem_euclid(64);
+        args.prob_k = i32::MAX - i32::MAX.rem_euclid(32);
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "packed weight");
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    #[test]
+    fn marlin_moe_mxfp4_bf16_extern_abi_matches_locked_export() {
+        type ExpectedAbi = unsafe extern "C" fn(
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *const i32,
+            *const i32,
+            *const i32,
+            *const f32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            cudarc::driver::sys::CUstream,
+            i32,
+            i32,
+        ) -> i32;
+
+        let _: ExpectedAbi = super::ferrum_vllm_marlin_moe_mxfp4_bf16;
     }
 
     #[test]

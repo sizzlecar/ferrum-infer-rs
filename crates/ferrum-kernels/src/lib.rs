@@ -44,6 +44,7 @@ pub use stacked_expert::StackedExpertGgufLinear;
 pub mod marlin_expert_stack;
 pub mod marlin_fp8_materializer;
 pub mod marlin_repack;
+pub mod mxfp4_marlin_materializer;
 pub use marlin_expert_stack::MarlinExpertStack;
 
 pub mod quant_linear;
