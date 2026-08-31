@@ -588,6 +588,7 @@ impl FloatByteCodec for f32 {
     }
 }
 
+#[cfg(test)]
 fn write_float(bytes: &mut [u8], element_type: ElementType, index: usize, value: f32) {
     let offset = index * element_type.size_bytes() as usize;
     match element_type {
