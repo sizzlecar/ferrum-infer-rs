@@ -282,6 +282,7 @@ mod tests {
         });
         started_receiver.await.unwrap();
         cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
 
         let queued_worker = Arc::clone(&worker);
         let queued = tokio::spawn(async move {
@@ -309,6 +310,7 @@ mod tests {
         blocked_started_receiver.await.unwrap();
         tokio::task::yield_now().await;
         blocked.abort();
+        assert!(blocked.await.unwrap_err().is_cancelled());
         assert_eq!(worker.metrics_snapshot()["scheduled_tasks"], 2);
         assert_eq!(worker.pending_tasks(), 2);
 
