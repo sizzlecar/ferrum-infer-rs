@@ -346,7 +346,9 @@ fn direct_attention_bindings_do_not_rebuild_compute_commands() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("encode_reusable_attention_bindings(invocation)"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
-    assert!(CAUSAL_ATTENTION_SOURCE.contains("encode_reusable_attention_bindings(invocation)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(
+        "encode_reusable_attention_bindings(\n            invocation,\n            self.semantics,\n            self.descriptor.operation_id().as_str(),\n        )"
+    ));
 
     for source in [RECURRENT_ATTENTION_SOURCE, CAUSAL_ATTENTION_SOURCE] {
         let binding_only = source
