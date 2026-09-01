@@ -28,15 +28,15 @@ use ferrum_bench_core::{
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    has_unclosed_thinking_block, parse_harmony_response, parse_reasoning_response,
-    parse_reasoning_response_started_in_think, EngineMetrics, EngineStatus, FerrumConfigBuilder,
-    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
-    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, ParsedReasoningResponse,
-    Priority, ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler,
-    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
-    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
-    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
-    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    has_unclosed_thinking_block, parse_harmony_response, parse_length_truncated_harmony_response,
+    parse_reasoning_response, parse_reasoning_response_started_in_think, EngineMetrics,
+    EngineStatus, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent, FinishReason,
+    InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol,
+    ParsedReasoningResponse, Priority, ProcessMemoryObservation, ProcessMemorySample,
+    ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
+    ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent,
+    ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart,
+    TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG, THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
@@ -2337,6 +2337,7 @@ fn parse_chat_model_output(
     protocol: ModelOutputProtocol,
     text: &str,
     started_in_think: bool,
+    finish_reason: FinishReason,
 ) -> std::result::Result<ParsedChatModelOutput, ServerError> {
     match protocol {
         ModelOutputProtocol::Text => Ok(ParsedChatModelOutput {
@@ -2348,7 +2349,12 @@ fn parse_chat_model_output(
             harmony_response: None,
         }),
         ModelOutputProtocol::HarmonyGptOss => {
-            let parsed = parse_harmony_response(text).map_err(|error| {
+            let parsed = if finish_reason == FinishReason::Length {
+                parse_length_truncated_harmony_response(text)
+            } else {
+                parse_harmony_response(text)
+            }
+            .map_err(|error| {
                 ServerError::InternalError(format!(
                     "model output did not satisfy the GPT-OSS Harmony protocol: {error}"
                 ))
@@ -2591,6 +2597,7 @@ async fn handle_chat_completions_stream(
                             model_output_protocol,
                             &current_text,
                             started_in_think,
+                            terminal_finish_reason,
                         ) {
                             Ok(parsed) => parsed,
                             Err(error) => {
@@ -2975,8 +2982,12 @@ async fn handle_chat_completions_sync(
             // here; malformed output must fail the response contract below.
             let stop_sequences = openai_request.stop.clone().unwrap_or_default();
             let content = strip_after_stop(&output_text, &stop_sequences);
-            let parsed_model_output =
-                parse_chat_model_output(model_output_protocol, &content, started_in_think)?;
+            let parsed_model_output = parse_chat_model_output(
+                model_output_protocol,
+                &content,
+                started_in_think,
+                finish_reason,
+            )?;
             let parsed = parsed_model_output.visible;
             let visible_content =
                 normalize_structured_response_content(&openai_request, &parsed.content);
@@ -5517,6 +5528,7 @@ mod tests {
             "<|channel|>analysis<|message|>Reason.<|end|>\
              <|start|>assistant<|channel|>final<|message|>Answer.<|return|>",
             false,
+            FinishReason::Stop,
         )
         .unwrap();
         assert_eq!(parsed.visible.content, "Answer.");
@@ -5532,6 +5544,7 @@ mod tests {
              <|start|>assistant<|channel|>commentary to=functions.weather\
              <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>",
             false,
+            FinishReason::Stop,
         )
         .unwrap();
         let response = parsed.harmony_response.unwrap();
@@ -5543,6 +5556,28 @@ mod tests {
             "{\"city\":\"Paris\"}"
         );
         assert!(response.message.tool_calls[0].id.starts_with("call_"));
+    }
+
+    #[test]
+    fn gpt_oss_harmony_accepts_missing_text_terminal_only_for_length() {
+        let output = "<|channel|>analysis<|message|>Still reasoning";
+        let parsed = parse_chat_model_output(
+            ModelOutputProtocol::HarmonyGptOss,
+            output,
+            false,
+            FinishReason::Length,
+        )
+        .unwrap();
+        assert_eq!(parsed.visible.reasoning.as_deref(), Some("Still reasoning"));
+        assert!(parsed.visible.content.is_empty());
+
+        assert!(parse_chat_model_output(
+            ModelOutputProtocol::HarmonyGptOss,
+            output,
+            false,
+            FinishReason::Stop,
+        )
+        .is_err());
     }
 
     #[tokio::test]
