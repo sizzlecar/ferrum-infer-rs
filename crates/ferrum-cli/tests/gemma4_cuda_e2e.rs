@@ -31,6 +31,7 @@ const GLOBAL_HEAD_DIM: usize = 512;
 const VOCABULARY_SIZE: usize = 256;
 const INPUT_TOKEN_ID: usize = 5;
 const MAX_LIVE_CHILDREN: usize = 1;
+const PACKED_SERVE_CONCURRENCY: usize = 8;
 const RUN_DEADLINE: Duration = Duration::from_secs(120);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(180);
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
@@ -363,6 +364,46 @@ fn parse_stream(body: &str) -> (usize, String, u64) {
         }
     }
     (done_count, content, completion_tokens)
+}
+
+async fn stream_chat(chat_url: String) -> Result<(reqwest::StatusCode, String), String> {
+    let response = http_client()
+        .post(chat_url)
+        .json(&json!({
+            "model": MODEL_NAME,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 2,
+            "temperature": 0.0,
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("stream request failed: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("read stream body: {error}"))?;
+    Ok((status, body))
+}
+
+fn assert_stream_response(label: &str, status: reqwest::StatusCode, body: &str) {
+    assert_eq!(status, 200, "{label} returned non-200: {body}");
+    let (done_count, content, completion_tokens) = parse_stream(body);
+    assert_eq!(
+        done_count, 1,
+        "{label} must contain exactly one [DONE]: {body}"
+    );
+    assert!(
+        !content.trim().is_empty(),
+        "{label} streamed empty content: {body}"
+    );
+    assert!(
+        completion_tokens > 0,
+        "{label} usage has no completion tokens: {body}"
+    );
+    assert_clean_logs(label, body);
 }
 
 fn bf16_constant(shape: &[usize], bits: u16) -> FixtureTensor {
@@ -726,42 +767,24 @@ async fn gemma4_tiny_cuda_run_and_serve_e2e() {
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
 
     let server = ServerFixture::spawn(&model_dir, fixture.path()).await;
-    let response = http_client()
-        .post(server.chat_url())
-        .json(&json!({
-            "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "hello"}],
-            "max_tokens": 2,
-            "temperature": 0.0,
-            "stream": true,
-            "stream_options": {"include_usage": true}
-        }))
-        .send()
+    let (status, body) = stream_chat(server.chat_url())
         .await
-        .unwrap_or_else(|error| panic!("stream request failed: {error}; {}", server.logs()));
-    assert_eq!(
-        response.status(),
-        200,
-        "stream request returned non-200; {}",
-        server.logs()
-    );
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|error| panic!("read stream body: {error}; {}", server.logs()));
-    let (done_count, content, completion_tokens) = parse_stream(&body);
-    assert_eq!(done_count, 1, "SSE must contain exactly one [DONE]: {body}");
-    assert!(
-        !content.trim().is_empty(),
-        "serve streamed empty content: {body}; {}",
-        server.logs()
-    );
-    assert!(
-        completion_tokens > 0,
-        "serve stream usage has no completion tokens: {body}; {}",
-        server.logs()
-    );
-    assert_clean_logs("ferrum serve stream", &body);
+        .unwrap_or_else(|error| panic!("{error}; {}", server.logs()));
+    assert_stream_response("ferrum serve c=1 stream", status, &body);
+
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..PACKED_SERVE_CONCURRENCY {
+        requests.spawn(stream_chat(server.chat_url()));
+    }
+    let mut completed = 0;
+    while let Some(result) = requests.join_next().await {
+        let (status, body) = result
+            .unwrap_or_else(|error| panic!("c=8 stream task failed: {error}; {}", server.logs()))
+            .unwrap_or_else(|error| panic!("{error}; {}", server.logs()));
+        assert_stream_response("ferrum serve c=8 stream", status, &body);
+        completed += 1;
+    }
+    assert_eq!(completed, PACKED_SERVE_CONCURRENCY);
     assert_clean_logs("ferrum serve logs", &server.logs());
     drop(server);
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
