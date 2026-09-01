@@ -451,7 +451,7 @@ fn insert_layer(tensors: &mut BTreeMap<String, FixtureTensor>, layer: usize, ful
     }
     tensors.insert(
         format!("{prefix}.layer_scalar"),
-        bf16_constant(&[1], 0x3f80),
+        bf16_constant(&[1], if full_attention { 0x3f40 } else { 0x3f00 }),
     );
 
     insert_quantized_projection(

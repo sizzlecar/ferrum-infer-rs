@@ -146,6 +146,11 @@ GEMMA4_GEGLU_OPERATION_ID = "operation.dense_geglu_tanh"
 GEMMA4_GEGLU_PROVIDER_ID = "provider.cuda.dense_geglu_tanh.f16.cublas"
 GEMMA4_SOFTCAP_OPERATION_ID = "operation.logit_softcap"
 GEMMA4_SOFTCAP_PROVIDER_ID = "provider.cuda.logit_softcap.f16"
+GEMMA4_LAYER_SCALE_OPERATION_ID = "operation.constant_scale"
+GEMMA4_LAYER_SCALE_PROVIDER_ID = "provider.cuda.constant_scale.f16"
+GEMMA4_LAYER_SCALE_PAYLOAD_SHA256 = (
+    "a158e1fdcd581cfff78b3c0cb960ffd81b5025f7de6003d3233ee38b0e1fb494"
+)
 GEMMA4_MULTIMODAL_TENSORS = frozenset(
     {
         "model.embed_audio.embedding_projection.weight",
@@ -564,7 +569,7 @@ def validate_version(value: Any, label: str) -> tuple[int, int]:
     return major, minor
 
 
-def gemma4_quant_operation_tensor_sets() -> dict[str, set[str]]:
+def gemma4_operation_tensor_sets() -> dict[str, set[str]]:
     attention: set[str] = set()
     geglu: set[str] = set()
     for layer_index in range(48):
@@ -582,6 +587,10 @@ def gemma4_quant_operation_tensor_sets() -> dict[str, set[str]]:
     return {
         GEMMA4_ATTENTION_OPERATION_ID: attention,
         GEMMA4_GEGLU_OPERATION_ID: geglu,
+        GEMMA4_LAYER_SCALE_OPERATION_ID: {
+            f"model.language_model.layers.{layer_index}.layer_scalar"
+            for layer_index in range(48)
+        },
         GEMMA4_SOFTCAP_OPERATION_ID: set(),
     }
 
@@ -591,10 +600,6 @@ def gemma4_non_executed_tensor_contract() -> dict[str, str]:
         name: "text_only_multimodal_component" for name in GEMMA4_MULTIMODAL_TENSORS
     }
     contract["lm_head.weight"] = "tied_projection_duplicate"
-    for layer_index in range(48):
-        contract[f"model.language_model.layers.{layer_index}.layer_scalar"] = (
-            "compile_time_unit_layer_scale"
-        )
     return contract
 
 
@@ -801,8 +806,25 @@ def validate_gemma4_tensor_contract(
         )
     require(
         disposition_counts
-        == {"execution_eligible": 1274, "typed_non_executed": 60, "rejected": 0},
-        "Gemma 4 source partition must be execution=1274, typed_non_executed=60, rejected=0",
+        == {"execution_eligible": 1322, "typed_non_executed": 12, "rejected": 0},
+        "Gemma 4 source partition must be execution=1322, typed_non_executed=12, rejected=0",
+    )
+    layer_scalars = {
+        name
+        for name, tensor in tensor_by_name.items()
+        if name.endswith(".layer_scalar")
+        and tensor["disposition"] == "execution_eligible"
+        and tensor["quantized"] is False
+        and tensor["dtype"] == "BF16"
+        and tensor["shape"] == [1]
+    }
+    require(
+        layer_scalars
+        == {
+            f"model.language_model.layers.{layer_index}.layer_scalar"
+            for layer_index in range(48)
+        },
+        "Gemma 4 layer scalars must be 48 execution-eligible BF16[1] tensors",
     )
     require(len(tensor_by_name) == 1334, "Gemma 4 source inventory must contain 1334 tensors")
 
@@ -812,10 +834,10 @@ def validate_gemma4_operation_contract(
     operations: dict[str, dict[str, Any]],
     coverage: dict[str, dict[str, Any]],
 ) -> None:
-    expected_tensor_sets = gemma4_quant_operation_tensor_sets()
+    expected_tensor_sets = gemma4_operation_tensor_sets()
     require(
         set(operations) == set(expected_tensor_sets),
-        "Gemma 4 expected operation set must cover attention, GeGLU, and logit softcap",
+        "Gemma 4 expected operation set must cover attention, GeGLU, layer scale, and logit softcap",
     )
     for operation_id, expected_tensors in expected_tensor_sets.items():
         require(
@@ -826,6 +848,7 @@ def validate_gemma4_operation_contract(
     expected_providers = {
         GEMMA4_ATTENTION_OPERATION_ID: GEMMA4_ATTENTION_PROVIDER_ID,
         GEMMA4_GEGLU_OPERATION_ID: GEMMA4_GEGLU_PROVIDER_ID,
+        GEMMA4_LAYER_SCALE_OPERATION_ID: GEMMA4_LAYER_SCALE_PROVIDER_ID,
         GEMMA4_SOFTCAP_OPERATION_ID: GEMMA4_SOFTCAP_PROVIDER_ID,
     }
     require(
@@ -844,7 +867,8 @@ def validate_gemma4_operation_contract(
             f"Gemma 4 {operation_id} contract/provider version mismatch",
         )
         require(
-            cell[GEMMA4_CT_COVERAGE_COUNT_FIELD] == len(expected_tensors),
+            cell[GEMMA4_CT_COVERAGE_COUNT_FIELD]
+            == sum(name.endswith(".weight_packed") for name in expected_tensors),
             f"Gemma 4 {operation_id} compressed-tensors W4 bundle count mismatch",
         )
         require(
@@ -897,6 +921,16 @@ def validate_gemma4_operation_contract(
             "layer_count": 48,
             "activation": "gelu_pytorch_tanh",
         },
+        "layer_scale": {
+            "operation_id": GEMMA4_LAYER_SCALE_OPERATION_ID,
+            "provider_id": GEMMA4_LAYER_SCALE_PROVIDER_ID,
+            "placement": "after_layer_residual",
+            "layer_count": 48,
+            "source_dtype": "BF16",
+            "source_shape": [1],
+            "materialization": "compile_time_positive_canonical_rational",
+            "ordered_payload_sha256": GEMMA4_LAYER_SCALE_PAYLOAD_SHA256,
+        },
         "logits": {
             "operation_id": GEMMA4_SOFTCAP_OPERATION_ID,
             "provider_id": GEMMA4_SOFTCAP_PROVIDER_ID,
@@ -905,7 +939,7 @@ def validate_gemma4_operation_contract(
     }
     require(
         semantics == expected_semantics,
-        "Gemma 4 sliding/full attention, GeGLU, or logit softcap semantics mismatch",
+        "Gemma 4 sliding/full attention, GeGLU, layer-scale, or logit softcap semantics mismatch",
     )
 
 
@@ -1124,6 +1158,11 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
     operation_ids: set[str] = set()
     operation_by_id: dict[str, dict[str, Any]] = {}
     operation_tensor_union: set[str] = set()
+    execution_eligible = {
+        name
+        for name, tensor in tensor_by_name.items()
+        if tensor["disposition"] == "execution_eligible"
+    }
     for index, raw in enumerate(operations):
         operation = as_object(raw, f"source_lock.expected_operations[{index}]")
         required_keys(operation, {"operation_id", "tensor_names"}, "expected operation")
@@ -1138,8 +1177,16 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
                 and operation_id == GEMMA4_SOFTCAP_OPERATION_ID,
                 f"expected operation {operation_id} has no tensors",
             )
-        require(set(names).issubset(execution_quant), f"expected operation {operation_id} has unknown tensors")
-        operation_tensor_union.update(names)
+        allowed_tensors = (
+            execution_eligible
+            if checkpoint_id == GEMMA4_CHECKPOINT_ID
+            else execution_quant
+        )
+        require(
+            set(names).issubset(allowed_tensors),
+            f"expected operation {operation_id} has unknown tensors",
+        )
+        operation_tensor_union.update(set(names) & execution_quant)
     require(operation_tensor_union == execution_quant, "expected operation tensor union is incomplete")
     coverage = as_list(lock["coverage_matrix"], "source_lock.coverage_matrix")
     covered_ops: set[str] = set()
@@ -2716,6 +2763,16 @@ def synthetic_gemma4_operation_semantics() -> dict[str, Any]:
             "layer_count": 48,
             "activation": "gelu_pytorch_tanh",
         },
+        "layer_scale": {
+            "operation_id": GEMMA4_LAYER_SCALE_OPERATION_ID,
+            "provider_id": GEMMA4_LAYER_SCALE_PROVIDER_ID,
+            "placement": "after_layer_residual",
+            "layer_count": 48,
+            "source_dtype": "BF16",
+            "source_shape": [1],
+            "materialization": "compile_time_positive_canonical_rational",
+            "ordered_payload_sha256": GEMMA4_LAYER_SCALE_PAYLOAD_SHA256,
+        },
         "logits": {
             "operation_id": GEMMA4_SOFTCAP_OPERATION_ID,
             "provider_id": GEMMA4_SOFTCAP_PROVIDER_ID,
@@ -2834,9 +2891,8 @@ def synthetic_gemma4_m0_tensors() -> list[dict[str, Any]]:
                 "name": f"{prefix}.layer_scalar",
                 "dtype": "BF16",
                 "shape": [1],
-                "disposition": "typed_non_executed",
+                "disposition": "execution_eligible",
                 "quantized": False,
-                "classification_reason": "compile_time_unit_layer_scale",
             }
         )
 
@@ -2891,9 +2947,12 @@ def synthetic_pass_documents(
         numeric_shapes = [(128, 64), (64, 64)]
     elif checkpoint_id == GEMMA4_CHECKPOINT_ID:
         gemma_tensors = synthetic_gemma4_m0_tensors()
-        gemma_operation_tensors = gemma4_quant_operation_tensor_sets()
+        gemma_operation_tensors = gemma4_operation_tensor_sets()
         expected_tensors = sorted(
-            set().union(*gemma_operation_tensors.values())
+            name
+            for tensor_names in gemma_operation_tensors.values()
+            for name in tensor_names
+            if name.endswith(".weight_packed")
         )
         expected_operations = [
             {
@@ -3124,8 +3183,8 @@ def synthetic_pass_documents(
         source_lock["operation_semantics"] = synthetic_gemma4_operation_semantics()
         source_lock["tensors"] = gemma_tensors
         source_lock["partition_counts"] = {
-            "execution_eligible": 1274,
-            "typed_non_executed": 60,
+            "execution_eligible": 1322,
+            "typed_non_executed": 12,
             "rejected": 0,
             "unknown": 0,
             "total": 1334,
@@ -3133,6 +3192,7 @@ def synthetic_pass_documents(
         gemma_providers = {
             GEMMA4_ATTENTION_OPERATION_ID: GEMMA4_ATTENTION_PROVIDER_ID,
             GEMMA4_GEGLU_OPERATION_ID: GEMMA4_GEGLU_PROVIDER_ID,
+            GEMMA4_LAYER_SCALE_OPERATION_ID: GEMMA4_LAYER_SCALE_PROVIDER_ID,
             GEMMA4_SOFTCAP_OPERATION_ID: GEMMA4_SOFTCAP_PROVIDER_ID,
         }
         source_lock["coverage_matrix"] = [
@@ -3141,13 +3201,15 @@ def synthetic_pass_documents(
                 "operation_version": {"major": 1, "minor": 0},
                 "provider_id": gemma_providers[operation_id],
                 "provider_version": {"major": 1, "minor": 0},
-                GEMMA4_CT_COVERAGE_COUNT_FIELD: len(tensor_names),
+                GEMMA4_CT_COVERAGE_COUNT_FIELD: sum(
+                    name.endswith(".weight_packed") for name in tensor_names
+                ),
                 "existing_execution_provider_acceptance": True,
                 "covered": True,
                 "missing_boundaries": [],
             }
             for operation_id, tensor_names in sorted(
-                gemma4_quant_operation_tensor_sets().items()
+                gemma4_operation_tensor_sets().items()
             )
         ]
         source_lock["quality_vector"] = {
@@ -3688,6 +3750,24 @@ def run_self_test() -> None:
             "typed non-executed classification mismatch",
         )
 
+        c_bad_layer_scale_partition = json.loads(json.dumps(c_source_lock))
+        c_layer_scalar = next(
+            tensor
+            for tensor in c_bad_layer_scale_partition["tensors"]
+            if tensor["name"].endswith(".layer_scalar")
+        )
+        c_layer_scalar["disposition"] = "typed_non_executed"
+        c_layer_scalar["classification_reason"] = "compile_time_layer_scale"
+        expect_failure(
+            "C Gemma 4 layer scalar execution partition",
+            lambda: validate_m0(
+                c_bad_layer_scale_partition,
+                GEMMA4_CHECKPOINT_ID,
+                require_covered=True,
+            ),
+            "typed text-only partition is incomplete or contains unknown tensors",
+        )
+
         c_bad_coverage = json.loads(json.dumps(c_source_lock))
         c_bad_coverage["coverage_matrix"][0][GEMMA4_CT_COVERAGE_COUNT_FIELD] += 1
         expect_failure(
@@ -3709,7 +3789,7 @@ def run_self_test() -> None:
                 GEMMA4_CHECKPOINT_ID,
                 require_covered=True,
             ),
-            "sliding/full attention, GeGLU, or logit softcap semantics mismatch",
+            "sliding/full attention, GeGLU, layer-scale, or logit softcap semantics mismatch",
         )
 
         b_bad_architecture = json.loads(

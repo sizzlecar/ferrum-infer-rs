@@ -37,7 +37,7 @@ pub(super) fn build_semantic_program(
     }
 
     let layer_count = usize::try_from(semantic.layer_count).unwrap_or_default();
-    let mut nodes = Vec::with_capacity(layer_count.saturating_mul(5).saturating_add(6));
+    let mut nodes = Vec::with_capacity(layer_count.saturating_mul(6).saturating_add(6));
     let mut states = Vec::with_capacity(layer_count);
 
     let input_tokens = value_id("value.input.token_ids")?;
@@ -214,15 +214,28 @@ pub(super) fn build_semantic_program(
             ]),
         });
 
-        let layer_output = value_id(format!("value.layer.{layer_index}.output"))?;
+        let unscaled_layer_output = value_id(format!("value.layer.{layer_index}.output.unscaled"))?;
         nodes.push(ProgramNode {
             id: node_id(format!("node.layer.{layer_index}.residual"))?,
             operation_id: operation_id(RESIDUAL_ADD_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::tokens(attention_output.clone(), 0),
             inputs: vec![attention_output, post_feedforward],
-            outputs: vec![layer_output.clone()],
+            outputs: vec![unscaled_layer_output.clone()],
             attributes: BTreeMap::from([attribute("hidden_size", semantic.hidden_size)?]),
+        });
+        let layer_output = value_id(format!("value.layer.{layer_index}.output"))?;
+        nodes.push(ProgramNode {
+            id: node_id(format!("node.layer.{layer_index}.scale"))?,
+            operation_id: operation_id(CONSTANT_SCALE_OPERATION_ID)?,
+            required_version: ContractVersion::new(1, 0),
+            work: ProgramNodeWorkSpec::tokens(unscaled_layer_output.clone(), 0),
+            inputs: vec![unscaled_layer_output],
+            outputs: vec![layer_output.clone()],
+            attributes: BTreeMap::from([
+                attribute("hidden_size", semantic.hidden_size)?,
+                attribute("scale", manifest.layer_scale(layer_index)?)?,
+            ]),
         });
         hidden = layer_output;
     }
