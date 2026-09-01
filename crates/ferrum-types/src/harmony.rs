@@ -95,6 +95,15 @@ fn parse_harmony_response_internal(
                 ));
             }
 
+            if allow_missing_text_terminal && is_length_truncated_followup_envelope(first.remaining)
+            {
+                return Ok(ParsedHarmonyResponse {
+                    reasoning_content: Some(first.payload.to_string()),
+                    content: String::new(),
+                    tool_call: None,
+                });
+            }
+
             let second = parse_message(first.remaining, false, allow_missing_text_terminal)?;
             match second.channel {
                 HarmonyChannel::Final => {
@@ -208,10 +217,10 @@ fn parse_message(
             ));
         };
 
-    let message_offset = after_channel_marker
-        .find(MESSAGE)
-        .ok_or_else(|| invalid_harmony("channel header was not followed by a message marker"))?;
-    let channel_header = &after_channel_marker[..message_offset];
+    let message_offset = after_channel_marker.find(MESSAGE);
+    let channel_header = message_offset
+        .map(|offset| &after_channel_marker[..offset])
+        .unwrap_or(after_channel_marker);
     let (channel, channel_recipient, content_type) = parse_channel_header(channel_header)?;
     let recipient = match (role_recipient, channel_recipient) {
         (Some(_), Some(_)) => {
@@ -221,6 +230,26 @@ fn parse_message(
         }
         (Some(recipient), None) | (None, Some(recipient)) => Some(recipient),
         (None, None) => None,
+    };
+
+    let Some(message_offset) = message_offset else {
+        if allow_missing_terminal
+            && matches!(channel, HarmonyChannel::Analysis | HarmonyChannel::Final)
+            && recipient.is_none()
+            && content_type.is_none()
+        {
+            return Ok(ParsedMessage {
+                channel,
+                recipient,
+                content_type,
+                payload: "",
+                terminal: None,
+                remaining: "",
+            });
+        }
+        return Err(invalid_harmony(
+            "channel header was not followed by a message marker",
+        ));
     };
 
     let after_message = &after_channel_marker[message_offset + MESSAGE.len()..];
@@ -263,6 +292,11 @@ fn parse_message(
         terminal,
         remaining,
     })
+}
+
+fn is_length_truncated_followup_envelope(output: &str) -> bool {
+    output == concat!("<|start|>", "assistant")
+        || output == concat!("<|start|>", "assistant", "<|channel|>")
 }
 
 fn parse_role_header(header: &str) -> Result<Option<&str>> {
@@ -461,6 +495,8 @@ mod tests {
     #[test]
     fn parses_length_truncated_text_messages_without_weakening_strict_parser() {
         for (output, reasoning, content) in [
+            ("<|channel|>final", None, ""),
+            ("<|channel|>analysis", Some(""), ""),
             (
                 "<|channel|>final<|message|>Partial answer",
                 None,
@@ -473,6 +509,12 @@ mod tests {
             ),
             (
                 "<|channel|>analysis<|message|>Reason.<|end|>",
+                Some("Reason."),
+                "",
+            ),
+            (
+                "<|channel|>analysis<|message|>Reason.<|end|>\
+                 <|start|>assistant<|channel|>final",
                 Some("Reason."),
                 "",
             ),
@@ -492,6 +534,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_length_truncation_between_followup_envelope_markers() {
+        for output in [
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant",
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>",
+        ] {
+            assert!(parse_harmony_response(output).is_err());
+            let parsed = parse_length_truncated_harmony_response(output).unwrap();
+            assert_eq!(parsed.reasoning_content.as_deref(), Some("Reason."));
+            assert!(parsed.content.is_empty());
+            assert!(parsed.tool_call.is_none());
+        }
+    }
+
+    #[test]
     fn length_truncation_keeps_tool_calls_and_control_markers_fail_closed() {
         for output in [
             "<|channel|>analysis<|message|>Reason.<|end|>\
@@ -499,6 +557,15 @@ mod tests {
              <|constrain|>json<|message|>{\"city\":\"Paris\"}",
             "<|channel|>final<|message|>leak <|bogus|>",
             "<|channel|>final<|message|>incomplete <|",
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.weather\
+             <|constrain|>json",
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>final<|mess",
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>fina",
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant to=functions.weather<|channel|>final",
         ] {
             assert!(
                 parse_length_truncated_harmony_response(output).is_err(),
