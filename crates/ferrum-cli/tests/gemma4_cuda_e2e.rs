@@ -433,6 +433,36 @@ fn maximum_profile_participants(profile: &str) -> usize {
         .unwrap_or(0)
 }
 
+fn packed_native_work_summary(
+    profile: &str,
+    participant_count: usize,
+) -> Vec<(String, usize, u64)> {
+    let mut summary = BTreeMap::<String, (usize, u64)>::new();
+    for event in profile
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["phase"] == "vnext.device_native_work")
+        .filter(|event| {
+            event["shape"]["participant_count"].as_u64() == u64::try_from(participant_count).ok()
+                && event["attributes"]["batching_form"] == "packed"
+        })
+    {
+        let Some(operation) = event["attributes"]["native_op_id"].as_str() else {
+            continue;
+        };
+        let timing = summary.entry(operation.to_owned()).or_default();
+        timing.0 += 1;
+        timing.1 += event["shape"]["device_elapsed_ns"].as_u64().unwrap_or(0);
+    }
+    let mut summary = summary
+        .into_iter()
+        .map(|(operation, (samples, elapsed_ns))| (operation, samples, elapsed_ns))
+        .collect::<Vec<_>>();
+    summary.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
+    summary
+}
+
 async fn wait_for_profile_participants(server: &ServerFixture, expected: usize) -> usize {
     let started = Instant::now();
     loop {
@@ -869,6 +899,14 @@ async fn gemma4_tiny_cuda_run_and_serve_e2e() {
         server.profile()
     );
     eprintln!("GEMMA4 CUDA E2E max_profile_participants={maximum_participants}");
+    let native_work = packed_native_work_summary(&server.profile(), 32);
+    assert!(
+        native_work
+            .iter()
+            .any(|(operation, _, _)| operation == "vnext.causal_attention.token_major_fallback"),
+        "profile never observed packed Gemma4 attention work: {native_work:?}"
+    );
+    eprintln!("GEMMA4 CUDA E2E c=32 packed_native_work={native_work:?}");
     assert_clean_logs("ferrum serve logs", &server.logs());
     drop(server);
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
