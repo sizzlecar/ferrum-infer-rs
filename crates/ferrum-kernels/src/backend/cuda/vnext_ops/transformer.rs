@@ -59,6 +59,9 @@ use moe_weights::{
 
 mod attention;
 mod causal_attention;
+mod gpt_oss_attention;
+#[cfg(feature = "vllm-moe-marlin")]
+mod gpt_oss_moe;
 #[cfg(feature = "vllm-marlin")]
 mod marlin_fp8_weights;
 #[cfg(feature = "vllm-moe-marlin")]
@@ -74,6 +77,9 @@ mod moe_workspace;
 
 pub(super) use attention::CudaGatedDeltaRecurrentAttentionProvider;
 pub(super) use causal_attention::CudaCausalPagedAttentionProvider;
+pub(super) use gpt_oss_attention::CudaGptOssCausalPagedAttentionProvider;
+#[cfg(feature = "vllm-moe-marlin")]
+pub(super) use gpt_oss_moe::CudaGptOssRoutedClampedSwiGluMoeProvider;
 #[cfg(feature = "vllm-moe-marlin")]
 pub(super) use moe::CudaRoutedSharedSwiGluMoeProvider;
 #[cfg(feature = "vllm-moe-marlin")]

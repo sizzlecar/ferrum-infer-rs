@@ -729,11 +729,20 @@ impl SequenceState {
             })
             .transpose()?
             .flatten();
-        let request_generated_control_token_texts = request
+        let mut request_generated_control_token_texts = request
             .api_request
             .as_ref()
             .map(ferrum_types::ApiRequest::generated_control_token_texts)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_vec();
+        request_generated_control_token_texts.extend_from_slice(
+            request
+                .sampling_params
+                .model_output_protocol
+                .generated_control_token_texts(),
+        );
+        request_generated_control_token_texts.sort_unstable();
+        request_generated_control_token_texts.dedup();
         let (
             forbidden_token_ids,
             model_greedy_forbidden_token_ids,
@@ -742,7 +751,7 @@ impl SequenceState {
         ) = resolve_sampling_token_constraints(
             tokenizer.as_ref(),
             &stop_token_ids,
-            request_generated_control_token_texts,
+            &request_generated_control_token_texts,
         );
         let mut initial_forbidden_token_ids = HashSet::new();
         let initial_forbidden_token_texts = request
@@ -1619,6 +1628,35 @@ impl SequenceState {
             return Some(FinishReason::Length);
         }
         None
+    }
+
+    /// Return whether the just-committed token belongs in the incremental
+    /// response stream.
+    ///
+    /// Ordinary stop/EOS tokens remain engine-owned and are never exposed.
+    /// Harmony is different: `<|call|>` and `<|return|>` are both model EOS
+    /// tokens and required wire-protocol terminators, so its typed response
+    /// parser must observe the decoded marker before completion is published.
+    pub(in crate::continuous_engine) fn should_stream_generated_token(
+        &self,
+        tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
+        token: TokenId,
+        stop_reason: Option<FinishReason>,
+    ) -> bool {
+        match stop_reason {
+            Some(FinishReason::Error) => false,
+            Some(FinishReason::Stop | FinishReason::EOS) => {
+                self.sampling_params.model_output_protocol
+                    == ferrum_types::ModelOutputProtocol::HarmonyGptOss
+                    && tokenizer.is_some_and(|tokenizer| {
+                        ["<|call|>", "<|return|>"]
+                            .into_iter()
+                            .filter_map(|marker| tokenizer.token_id(marker))
+                            .any(|terminal| terminal == token)
+                    })
+            }
+            _ => true,
+        }
     }
 
     /// Cheap stop check for tests and callers that do not have tokenizer

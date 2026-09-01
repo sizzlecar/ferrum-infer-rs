@@ -5,10 +5,65 @@ fn sampling_params_defaults_and_greedy() {
     let d = SamplingParams::default();
     assert_eq!(d.temperature, 1.0);
     assert!(d.top_p <= 1.0 && d.top_p > 0.0);
+    assert_eq!(d.model_output_protocol, ModelOutputProtocol::Text);
 
     let g = SamplingParams::greedy();
     assert_eq!(g.temperature, 0.0);
     assert!(g.top_k.is_none());
+    assert_eq!(g.model_output_protocol, ModelOutputProtocol::Text);
+}
+
+#[test]
+fn harmony_output_protocol_has_exact_typed_control_tokens() {
+    assert_eq!(
+        ModelOutputProtocol::HarmonyGptOss.generated_control_token_texts(),
+        &[
+            "<|channel|>",
+            "<|message|>",
+            "<|start|>",
+            "<|end|>",
+            "<|constrain|>",
+        ]
+    );
+    assert_eq!(
+        ModelOutputProtocol::HarmonyGptOss.preserved_special_token_texts(),
+        &[
+            "<|channel|>",
+            "<|message|>",
+            "<|start|>",
+            "<|end|>",
+            "<|constrain|>",
+            "<|call|>",
+            "<|return|>",
+        ]
+    );
+    assert!(ModelOutputProtocol::Text
+        .generated_control_token_texts()
+        .is_empty());
+    assert!(ModelOutputProtocol::Text
+        .preserved_special_token_texts()
+        .is_empty());
+}
+
+#[test]
+fn model_output_protocol_is_backward_compatible_and_round_trips() {
+    let mut legacy = serde_json::to_value(SamplingParams::default()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("model_output_protocol");
+    let decoded: SamplingParams = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.model_output_protocol, ModelOutputProtocol::Text);
+
+    let mut params = SamplingParams::default();
+    params.model_output_protocol = ModelOutputProtocol::HarmonyGptOss;
+    let encoded = serde_json::to_value(&params).unwrap();
+    assert_eq!(encoded["model_output_protocol"], "harmony_gpt_oss");
+    let decoded: SamplingParams = serde_json::from_value(encoded).unwrap();
+    assert_eq!(
+        decoded.model_output_protocol,
+        ModelOutputProtocol::HarmonyGptOss
+    );
 }
 
 #[test]

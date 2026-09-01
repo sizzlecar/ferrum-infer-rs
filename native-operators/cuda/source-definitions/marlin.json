@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.marlin",
   "source_package_kind": "ferrum-native-source-bundle",
-  "source_package_revision": "ferrum-native-cuda-v1+sha256.df27bdb0c6d5fd5a33fe839a27eb21bb0202daaef024c69340e43203992fabeb",
+  "source_package_revision": "ferrum-native-cuda-v1+sha256.885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
   "upstream_sources": [
     {
       "repository": "https://github.com/IST-DASLab/marlin.git",

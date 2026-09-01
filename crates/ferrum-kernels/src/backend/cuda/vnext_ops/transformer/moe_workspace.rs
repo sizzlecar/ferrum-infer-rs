@@ -75,6 +75,7 @@ impl MoeWorkspaceLayout {
             experts_per_token,
             hidden_size,
             routed_intermediate_size,
+            routed_intermediate_size,
             Some(shared_intermediate_size),
             multiprocessor_count,
         )
@@ -94,6 +95,29 @@ impl MoeWorkspaceLayout {
             experts_per_token,
             hidden_size,
             routed_intermediate_size,
+            routed_intermediate_size,
+            None,
+            multiprocessor_count,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn routed_only_with_activation_width(
+        tokens: u64,
+        expert_count: u64,
+        experts_per_token: u64,
+        hidden_size: u64,
+        routed_intermediate_size: u64,
+        routed_activation_width: u64,
+        multiprocessor_count: u64,
+    ) -> Result<Self, String> {
+        Self::build(
+            tokens,
+            expert_count,
+            experts_per_token,
+            hidden_size,
+            routed_intermediate_size,
+            routed_activation_width,
             None,
             multiprocessor_count,
         )
@@ -106,6 +130,7 @@ impl MoeWorkspaceLayout {
         experts_per_token: u64,
         hidden_size: u64,
         routed_intermediate_size: u64,
+        routed_activation_width: u64,
         shared_intermediate_size: Option<u64>,
         multiprocessor_count: u64,
     ) -> Result<Self, String> {
@@ -115,6 +140,7 @@ impl MoeWorkspaceLayout {
             experts_per_token,
             hidden_size,
             routed_intermediate_size,
+            routed_activation_width,
             shared_intermediate_size,
             multiprocessor_count,
         )?;
@@ -174,11 +200,7 @@ impl MoeWorkspaceLayout {
             "MoE routed gate/up",
         )?)?;
         let routed_activation = cursor.allocate(elements_bytes(
-            checked_mul(
-                pair_count,
-                routed_intermediate_size,
-                "MoE routed activation",
-            )?,
+            checked_mul(pair_count, routed_activation_width, "MoE routed activation")?,
             F16_BYTES,
             "MoE routed activation",
         )?)?;
@@ -220,6 +242,7 @@ impl MoeWorkspaceLayout {
             experts_per_token,
             hidden_size,
             routed_intermediate_size,
+            routed_activation_width,
             shared_intermediate_size,
             multiprocessor_count,
         )?;
@@ -275,6 +298,7 @@ pub(super) fn workspace_formula_terms(
         experts_per_token,
         hidden_size,
         routed_intermediate_size,
+        routed_intermediate_size,
         Some(shared_intermediate_size),
         multiprocessor_count,
     )
@@ -292,6 +316,26 @@ pub(super) fn routed_workspace_formula_terms(
         experts_per_token,
         hidden_size,
         routed_intermediate_size,
+        routed_intermediate_size,
+        None,
+        multiprocessor_count,
+    )
+}
+
+pub(super) fn routed_workspace_formula_terms_with_activation_width(
+    expert_count: u64,
+    experts_per_token: u64,
+    hidden_size: u64,
+    routed_intermediate_size: u64,
+    routed_activation_width: u64,
+    multiprocessor_count: u64,
+) -> Result<(u64, u64), String> {
+    workspace_formula_terms_for(
+        expert_count,
+        experts_per_token,
+        hidden_size,
+        routed_intermediate_size,
+        routed_activation_width,
         None,
         multiprocessor_count,
     )
@@ -303,6 +347,7 @@ fn workspace_formula_terms_for(
     experts_per_token: u64,
     hidden_size: u64,
     routed_intermediate_size: u64,
+    routed_activation_width: u64,
     shared_intermediate_size: Option<u64>,
     multiprocessor_count: u64,
 ) -> Result<(u64, u64), String> {
@@ -312,6 +357,7 @@ fn workspace_formula_terms_for(
         experts_per_token,
         hidden_size,
         routed_intermediate_size,
+        routed_activation_width,
         shared_intermediate_size,
         multiprocessor_count,
     )?;
@@ -360,7 +406,7 @@ fn workspace_formula_terms_for(
         .and_then(|value| value.checked_mul(F16_BYTES))
         .ok_or_else(|| "MoE routed gate/up bytes per token overflow u64".to_owned())?;
     let routed_activation_bytes = experts_per_token
-        .checked_mul(routed_intermediate_size)
+        .checked_mul(routed_activation_width)
         .and_then(|value| value.checked_mul(F16_BYTES))
         .ok_or_else(|| "MoE routed activation bytes per token overflow u64".to_owned())?;
     let routed_down_bytes = experts_per_token
@@ -411,6 +457,7 @@ fn validate_shape(
     experts_per_token: u64,
     hidden_size: u64,
     routed_intermediate_size: u64,
+    routed_activation_width: u64,
     shared_intermediate_size: Option<u64>,
     multiprocessor_count: u64,
 ) -> Result<(), String> {
@@ -422,6 +469,7 @@ fn validate_shape(
         || experts_per_token > MAX_ROUTER_TOP_K
         || hidden_size == 0
         || routed_intermediate_size == 0
+        || routed_activation_width < routed_intermediate_size
         || shared_intermediate_size.is_some_and(|size| size == 0)
         || multiprocessor_count == 0
     {
@@ -430,10 +478,11 @@ fn validate_shape(
     let gate_up_width = checked_mul(routed_intermediate_size, 2, "MoE gate/up width")?;
     if !hidden_size.is_multiple_of(MARLIN_MIN_THREAD_N)
         || !routed_intermediate_size.is_multiple_of(MARLIN_MIN_THREAD_N)
+        || !routed_activation_width.is_multiple_of(MARLIN_MIN_THREAD_N)
         || !gate_up_width.is_multiple_of(MARLIN_MIN_THREAD_N)
     {
         return Err(format!(
-            "CUDA Marlin-MoE H={hidden_size}, R={routed_intermediate_size} must be divisible by {MARLIN_MIN_THREAD_N}"
+            "CUDA Marlin-MoE H={hidden_size}, R={routed_intermediate_size}, activation={routed_activation_width} must preserve R and be divisible by {MARLIN_MIN_THREAD_N}"
         ));
     }
     Ok(())
@@ -538,6 +587,28 @@ mod tests {
             assert!(shared.shared().is_some());
             assert!(layout.total_bytes < shared.total_bytes);
         }
+    }
+
+    #[test]
+    fn routed_only_workspace_can_separate_logical_gate_up_and_physical_activation_widths() {
+        let logical = MoeWorkspaceLayout::routed_only(8, 32, 4, 2880, 2880, 46).unwrap();
+        let padded =
+            MoeWorkspaceLayout::routed_only_with_activation_width(8, 32, 4, 2880, 2880, 2944, 46)
+                .unwrap();
+        assert_eq!(padded.routed_gate_up, logical.routed_gate_up);
+        assert_eq!(padded.routed_activation.length_bytes(), 8 * 4 * 2944 * 2);
+        assert_eq!(
+            padded.routed_activation.length_bytes() - logical.routed_activation.length_bytes(),
+            8 * 4 * 64 * 2
+        );
+        let (fixed, per_token) =
+            routed_workspace_formula_terms_with_activation_width(32, 4, 2880, 2880, 2944, 46)
+                .unwrap();
+        assert!(padded.total_bytes <= fixed + per_token * 8);
+        assert!(MoeWorkspaceLayout::routed_only_with_activation_width(
+            1, 32, 4, 2880, 2880, 2816, 46,
+        )
+        .is_err());
     }
 
     #[test]

@@ -63,6 +63,14 @@ pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID: &str =
     "operation.causal_paged_attention.f32-master";
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID: &str =
     "capability.operation.causal_paged_attention.f32-master";
+pub const GPT_OSS_CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str =
+    "operation.gpt_oss.causal_paged_attention";
+pub const GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
+    "capability.operation.gpt_oss.causal_paged_attention.f16";
+pub const GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_OPERATION_ID: &str =
+    "operation.gpt_oss.routed_clamped_swiglu_moe";
+pub const GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_MXFP4_BF16_CAPABILITY_ID: &str =
+    "capability.operation.gpt_oss.routed_clamped_swiglu_moe.mxfp4_bf16";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatedDeltaDecayParameterization {
@@ -794,6 +802,98 @@ pub fn routed_swiglu_moe_contract() -> Result<StandardOperationContract, VNextEr
     Ok(StandardOperationContract { descriptor })
 }
 
+/// GPT-OSS top-K routed experts with the model's clamped, interleaved SwiGLU.
+///
+/// Expert matrices are logical BF16 tensors at this boundary. Their checkpoint
+/// packing, sidecar scales, and any execution repack remain exclusively in the
+/// weight materializer/provider contracts. `gate_up_features` is explicit
+/// because the generic tensor contract has no derived-dimension expression;
+/// callers and providers must bind it to exactly twice `intermediate_size`.
+/// With `gate_up_interleaved=true`, even rows are gate rows and odd rows are up
+/// rows in the logical `[E, 2*I, H]` tensor; no implicit reshape is permitted.
+pub fn gpt_oss_routed_clamped_swiglu_moe_contract() -> Result<StandardOperationContract, VNextError>
+{
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("expert_count"), symbol("hidden_size")],
+                [ElementType::Bf16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("expert_count")],
+                [ElementType::Bf16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![
+                    symbol("expert_count"),
+                    symbol("gate_up_features"),
+                    symbol("hidden_size"),
+                ],
+                [ElementType::Bf16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("expert_count"), symbol("gate_up_features")],
+                [ElementType::Bf16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![
+                    symbol("expert_count"),
+                    symbol("hidden_size"),
+                    symbol("intermediate_size"),
+                ],
+                [ElementType::Bf16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("expert_count"), symbol("hidden_size")],
+                [ElementType::Bf16],
+                TensorAccess::Read,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("expert_count")?,
+            unsigned_attribute("experts_per_token")?,
+            unsigned_attribute("intermediate_size")?,
+            unsigned_attribute("gate_up_features")?,
+            true_bool_attribute("normalize_topk")?,
+            exact_rational_attribute("swiglu_limit", 7, 1)?,
+            true_bool_attribute("gate_up_interleaved")?,
+            true_bool_attribute("down_bias_before_route_reduction")?,
+        ]))?,
+        resources: ResourceRequirements {
+            minimum_value_alignment_bytes: 16,
+            scratch: ResourcePresenceRequirement::Required,
+            binding: ResourcePresenceRequirement::Forbidden,
+            persistent: ResourcePresenceRequirement::Forbidden,
+        },
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(
+            GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_MXFP4_BF16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
 pub fn residual_add_contract() -> Result<StandardOperationContract, VNextError> {
     residual_add_contract_with_types(
         RESIDUAL_ADD_OPERATION_ID,
@@ -1076,6 +1176,115 @@ fn causal_paged_attention_contract_with_hidden(
     Ok(StandardOperationContract { descriptor })
 }
 
+/// GPT-OSS causal attention including input normalization, biased Q/K/V/O
+/// projections, per-query-head attention sinks, YaRN RoPE, KV update, output
+/// projection, and the attention residual. A zero `sliding_window_tokens`
+/// selects full causal attention; a positive value selects the typed local
+/// window. KV paging and kernel fusion remain provider concerns.
+pub fn gpt_oss_causal_paged_attention_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(GPT_OSS_CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("query_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size"), symbol("query_features")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("query_features")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("query_heads")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![exact(2), symbol("kv_heads"), symbol("head_dim")],
+                [ElementType::F16],
+                TensorAccess::ReadWrite,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor_with_alias(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+            AliasPolicy::MayAlias { tensor_index: 0 },
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("query_heads")?,
+            unsigned_attribute("kv_heads")?,
+            unsigned_attribute("head_dim")?,
+            unsigned_attribute("query_features")?,
+            unsigned_attribute("kv_features")?,
+            unsigned_attribute("rope_dim")?,
+            unsigned_attribute("maximum_context_tokens")?,
+            positive_rational_attribute("rope_theta")?,
+            positive_rational_attribute("yarn_factor")?,
+            unsigned_attribute("yarn_original_context_tokens")?,
+            positive_rational_attribute("yarn_beta_fast")?,
+            positive_rational_attribute("yarn_beta_slow")?,
+            false_bool_attribute("yarn_truncate")?,
+            nonnegative_unsigned_attribute("sliding_window_tokens")?,
+            true_bool_attribute("causal")?,
+            positive_epsilon_attribute("epsilon")?,
+            nonnegative_unsigned_attribute("layer_index")?,
+        ]))?,
+        resources: causal_attention_resources(),
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(
+            GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
 fn contiguous_tensor(
     dimensions: Vec<DimensionConstraint>,
     element_types: impl IntoIterator<Item = ElementType>,
@@ -1253,6 +1462,36 @@ fn true_bool_attribute(name: &str) -> Result<(AttributeId, AttributeSpec), VNext
             value_kind: AttributeValueKind::Bool,
             required: true,
             constraint: AttributeConstraint::BoolEquals(true),
+        },
+    ))
+}
+
+fn false_bool_attribute(name: &str) -> Result<(AttributeId, AttributeSpec), VNextError> {
+    Ok((
+        AttributeId::new(name)?,
+        AttributeSpec {
+            value_kind: AttributeValueKind::Bool,
+            required: true,
+            constraint: AttributeConstraint::BoolEquals(false),
+        },
+    ))
+}
+
+fn exact_rational_attribute(
+    name: &str,
+    numerator: i64,
+    denominator: u64,
+) -> Result<(AttributeId, AttributeSpec), VNextError> {
+    let value = CanonicalRational::new(numerator, denominator)?;
+    Ok((
+        AttributeId::new(name)?,
+        AttributeSpec {
+            value_kind: AttributeValueKind::Rational,
+            required: true,
+            constraint: AttributeConstraint::RationalRange {
+                minimum: value,
+                maximum: value,
+            },
         },
     ))
 }
@@ -1681,6 +1920,271 @@ mod tests {
             .attributes
             .entries()
             .contains_key(&AttributeId::new("shared_intermediate_size").unwrap()));
+        assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
+        contract
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
+    }
+
+    #[test]
+    fn gpt_oss_routed_clamped_swiglu_contract_has_exact_logical_bf16_abi() {
+        let contract = gpt_oss_routed_clamped_swiglu_moe_contract().unwrap();
+        let descriptor = contract.descriptor();
+
+        assert_eq!(
+            descriptor.id.as_str(),
+            GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_OPERATION_ID
+        );
+        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(descriptor.inputs.len(), 7);
+        assert_eq!(
+            descriptor.inputs[0].dimensions(),
+            &[symbol("tokens"), symbol("hidden_size")]
+        );
+        assert_eq!(
+            descriptor.inputs[1].dimensions(),
+            &[symbol("expert_count"), symbol("hidden_size")]
+        );
+        assert_eq!(descriptor.inputs[2].dimensions(), &[symbol("expert_count")]);
+        assert_eq!(
+            descriptor.inputs[3].dimensions(),
+            &[
+                symbol("expert_count"),
+                symbol("gate_up_features"),
+                symbol("hidden_size"),
+            ]
+        );
+        assert_eq!(
+            descriptor.inputs[4].dimensions(),
+            &[symbol("expert_count"), symbol("gate_up_features")]
+        );
+        assert_eq!(
+            descriptor.inputs[5].dimensions(),
+            &[
+                symbol("expert_count"),
+                symbol("hidden_size"),
+                symbol("intermediate_size"),
+            ]
+        );
+        assert_eq!(
+            descriptor.inputs[6].dimensions(),
+            &[symbol("expert_count"), symbol("hidden_size")]
+        );
+        assert_eq!(
+            descriptor.inputs[0].element_types(),
+            &BTreeSet::from([ElementType::F16])
+        );
+        for input in &descriptor.inputs[1..] {
+            assert_eq!(input.element_types(), &BTreeSet::from([ElementType::Bf16]));
+        }
+        assert!(descriptor
+            .inputs
+            .iter()
+            .all(|input| input.access() == TensorAccess::Read));
+        assert_eq!(
+            descriptor.outputs[0].dimensions(),
+            &[symbol("tokens"), symbol("hidden_size")]
+        );
+        assert_eq!(
+            descriptor.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F16])
+        );
+        assert_eq!(descriptor.outputs[0].alias(), &AliasPolicy::NoAlias);
+
+        assert_eq!(
+            descriptor
+                .attributes
+                .entries()
+                .keys()
+                .map(AttributeId::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "down_bias_before_route_reduction",
+                "expert_count",
+                "experts_per_token",
+                "gate_up_features",
+                "gate_up_interleaved",
+                "hidden_size",
+                "intermediate_size",
+                "normalize_topk",
+                "swiglu_limit",
+            ])
+        );
+        for attribute in [
+            "normalize_topk",
+            "gate_up_interleaved",
+            "down_bias_before_route_reduction",
+        ] {
+            assert_eq!(
+                descriptor
+                    .attributes
+                    .entries()
+                    .get(&AttributeId::new(attribute).unwrap())
+                    .unwrap()
+                    .constraint,
+                AttributeConstraint::BoolEquals(true)
+            );
+        }
+        let seven = CanonicalRational::new(7, 1).unwrap();
+        assert_eq!(
+            descriptor
+                .attributes
+                .entries()
+                .get(&AttributeId::new("swiglu_limit").unwrap())
+                .unwrap()
+                .constraint,
+            AttributeConstraint::RationalRange {
+                minimum: seven,
+                maximum: seven,
+            }
+        );
+        assert_eq!(
+            descriptor.resources.scratch,
+            ResourcePresenceRequirement::Required
+        );
+        assert_eq!(
+            descriptor.resources.binding,
+            ResourcePresenceRequirement::Forbidden
+        );
+        assert_eq!(
+            descriptor.resources.persistent,
+            ResourcePresenceRequirement::Forbidden
+        );
+        assert_eq!(
+            descriptor.provider.required_capabilities,
+            BTreeSet::from([CapabilityId::new(
+                GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_MXFP4_BF16_CAPABILITY_ID
+            )
+            .unwrap()])
+        );
+        assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
+        contract
+            .validate_signature(&descriptor.inputs, &descriptor.outputs)
+            .unwrap();
+    }
+
+    #[test]
+    fn gpt_oss_causal_attention_contract_has_exact_bias_sink_and_yarn_abi() {
+        let contract = gpt_oss_causal_paged_attention_contract().unwrap();
+        let descriptor = contract.descriptor();
+
+        assert_eq!(
+            descriptor.id.as_str(),
+            GPT_OSS_CAUSAL_PAGED_ATTENTION_OPERATION_ID
+        );
+        assert_eq!(descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(descriptor.inputs.len(), 12);
+        let expected_dimensions = [
+            vec![symbol("tokens"), symbol("hidden_size")],
+            vec![symbol("hidden_size")],
+            vec![symbol("query_features"), symbol("hidden_size")],
+            vec![symbol("kv_features"), symbol("hidden_size")],
+            vec![symbol("kv_features"), symbol("hidden_size")],
+            vec![symbol("hidden_size"), symbol("query_features")],
+            vec![symbol("query_features")],
+            vec![symbol("kv_features")],
+            vec![symbol("kv_features")],
+            vec![symbol("hidden_size")],
+            vec![symbol("query_heads")],
+            vec![exact(2), symbol("kv_heads"), symbol("head_dim")],
+        ];
+        for (input, expected) in descriptor.inputs.iter().zip(expected_dimensions) {
+            assert_eq!(input.dimensions(), expected);
+            assert_eq!(input.element_types(), &BTreeSet::from([ElementType::F16]));
+        }
+        assert!(descriptor.inputs[..11]
+            .iter()
+            .all(|input| input.access() == TensorAccess::Read));
+        assert_eq!(descriptor.inputs[11].access(), TensorAccess::ReadWrite);
+        assert_eq!(
+            descriptor.outputs[0].dimensions(),
+            &[symbol("tokens"), symbol("hidden_size")]
+        );
+        assert_eq!(
+            descriptor.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F16])
+        );
+        assert_eq!(
+            descriptor.outputs[0].alias(),
+            &AliasPolicy::MayAlias { tensor_index: 0 }
+        );
+
+        assert_eq!(
+            descriptor
+                .attributes
+                .entries()
+                .keys()
+                .map(AttributeId::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "causal",
+                "epsilon",
+                "head_dim",
+                "hidden_size",
+                "kv_features",
+                "kv_heads",
+                "layer_index",
+                "maximum_context_tokens",
+                "query_features",
+                "query_heads",
+                "rope_dim",
+                "rope_theta",
+                "sliding_window_tokens",
+                "yarn_beta_fast",
+                "yarn_beta_slow",
+                "yarn_factor",
+                "yarn_original_context_tokens",
+                "yarn_truncate",
+            ])
+        );
+        assert_eq!(
+            descriptor
+                .attributes
+                .entries()
+                .get(&AttributeId::new("yarn_truncate").unwrap())
+                .unwrap()
+                .constraint,
+            AttributeConstraint::BoolEquals(false)
+        );
+        assert_eq!(
+            descriptor
+                .attributes
+                .entries()
+                .get(&AttributeId::new("causal").unwrap())
+                .unwrap()
+                .constraint,
+            AttributeConstraint::BoolEquals(true)
+        );
+        assert_eq!(
+            descriptor
+                .attributes
+                .entries()
+                .get(&AttributeId::new("sliding_window_tokens").unwrap())
+                .unwrap()
+                .constraint,
+            AttributeConstraint::UnsignedRange {
+                minimum: 0,
+                maximum: u32::MAX as u64,
+            }
+        );
+        assert_eq!(
+            descriptor.resources.scratch,
+            ResourcePresenceRequirement::Required
+        );
+        assert_eq!(
+            descriptor.resources.binding,
+            ResourcePresenceRequirement::Required
+        );
+        assert_eq!(
+            descriptor.resources.persistent,
+            ResourcePresenceRequirement::Forbidden
+        );
+        assert_eq!(
+            descriptor.provider.required_capabilities,
+            BTreeSet::from([
+                CapabilityId::new(GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID).unwrap()
+            ])
+        );
         assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
         contract
             .validate_signature(&descriptor.inputs, &descriptor.outputs)

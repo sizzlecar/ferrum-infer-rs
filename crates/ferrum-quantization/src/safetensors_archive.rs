@@ -13,6 +13,9 @@ use half::{bf16, f16};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
+const MAX_DENSE_TRANSCODE_WORKERS: usize = 8;
+const PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 struct TensorMeta {
     shard: usize,
@@ -353,6 +356,10 @@ pub(crate) fn transcode_dense_bytes<'source>(
         });
     }
 
+    if affine.is_none() {
+        return transcode_float_bytes(bytes, source, destination, external_name).map(Cow::Owned);
+    }
+
     let element_count = bytes.len() / source.size_bytes() as usize;
     let mut materialized = Vec::with_capacity(element_count * destination.size_bytes() as usize);
     let affine = affine.map(|(scale, bias)| {
@@ -385,6 +392,217 @@ pub(crate) fn transcode_dense_bytes<'source>(
         }
     }
     Ok(Cow::Owned(materialized))
+}
+
+fn transcode_float_bytes(
+    bytes: &[u8],
+    source: ElementType,
+    destination: ElementType,
+    external_name: &str,
+) -> std::result::Result<Vec<u8>, VNextError> {
+    match (source, destination) {
+        (ElementType::F16, ElementType::F16) => {
+            transcode_float_bytes_typed::<f16, f16>(bytes, source, destination, external_name)
+        }
+        (ElementType::F16, ElementType::Bf16) => {
+            transcode_float_bytes_typed::<f16, bf16>(bytes, source, destination, external_name)
+        }
+        (ElementType::F16, ElementType::F32) => {
+            transcode_float_bytes_typed::<f16, f32>(bytes, source, destination, external_name)
+        }
+        (ElementType::Bf16, ElementType::F16) => {
+            transcode_float_bytes_typed::<bf16, f16>(bytes, source, destination, external_name)
+        }
+        (ElementType::Bf16, ElementType::Bf16) => {
+            transcode_float_bytes_typed::<bf16, bf16>(bytes, source, destination, external_name)
+        }
+        (ElementType::Bf16, ElementType::F32) => {
+            transcode_float_bytes_typed::<bf16, f32>(bytes, source, destination, external_name)
+        }
+        (ElementType::F32, ElementType::F16) => {
+            transcode_float_bytes_typed::<f32, f16>(bytes, source, destination, external_name)
+        }
+        (ElementType::F32, ElementType::Bf16) => {
+            transcode_float_bytes_typed::<f32, bf16>(bytes, source, destination, external_name)
+        }
+        (ElementType::F32, ElementType::F32) => {
+            transcode_float_bytes_typed::<f32, f32>(bytes, source, destination, external_name)
+        }
+        _ => unreachable!("non-floating element types were rejected before transcoding"),
+    }
+}
+
+fn transcode_float_bytes_typed<Source: FloatByteCodec, Destination: FloatByteCodec>(
+    bytes: &[u8],
+    source: ElementType,
+    destination: ElementType,
+    external_name: &str,
+) -> std::result::Result<Vec<u8>, VNextError> {
+    debug_assert_eq!(Source::WIDTH, source.size_bytes() as usize);
+    debug_assert_eq!(Destination::WIDTH, destination.size_bytes() as usize);
+    debug_assert!(bytes.len().is_multiple_of(Source::WIDTH));
+    let element_count = bytes.len() / Source::WIDTH;
+    let output_bytes = element_count.checked_mul(Destination::WIDTH).ok_or_else(|| {
+        VNextError::InvalidExecutionPlan {
+            reason: format!(
+                "tensor {external_name:?} {source:?}-to-{destination:?} materialization size overflow"
+            ),
+        }
+    })?;
+    let mut materialized = Vec::new();
+    materialized
+        .try_reserve_exact(output_bytes)
+        .map_err(|_| VNextError::InvalidExecutionPlan {
+            reason: format!(
+                "tensor {external_name:?} {source:?}-to-{destination:?} materialization cannot reserve {output_bytes} bytes"
+            ),
+        })?;
+    materialized.resize(output_bytes, 0);
+
+    let worker_count = bounded_dense_transcode_worker_count(element_count);
+    if worker_count == 1 {
+        transcode_float_partition::<Source, Destination>(bytes, &mut materialized);
+        return Ok(materialized);
+    }
+
+    let elements_per_worker = element_count.div_ceil(worker_count);
+    std::thread::scope(|scope| -> std::result::Result<(), VNextError> {
+        let mut remaining_output = materialized.as_mut_slice();
+        let mut handles = Vec::with_capacity(worker_count);
+        let mut spawn_error = None;
+        for worker in 0..worker_count {
+            let start = worker * elements_per_worker;
+            let end = (start + elements_per_worker).min(element_count);
+            if start == end {
+                break;
+            }
+            let output_chunk_bytes = (end - start) * Destination::WIDTH;
+            let (output, tail) = remaining_output.split_at_mut(output_chunk_bytes);
+            remaining_output = tail;
+            let input = &bytes[start * Source::WIDTH..end * Source::WIDTH];
+            match std::thread::Builder::new()
+                .name(format!("dense-float-transcode-{worker}"))
+                .spawn_scoped(scope, move || {
+                    transcode_float_partition::<Source, Destination>(input, output)
+                }) {
+                Ok(handle) => handles.push((worker, handle)),
+                Err(error) => {
+                    spawn_error = Some((worker, error.to_string()));
+                    break;
+                }
+            }
+        }
+
+        let mut panic_worker = None;
+        for (worker, handle) in handles {
+            if handle.join().is_err() && panic_worker.is_none() {
+                panic_worker = Some(worker);
+            }
+        }
+        if let Some((worker, reason)) = spawn_error {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "tensor {external_name:?} {source:?}-to-{destination:?} worker {worker}/{worker_count} could not start: {reason}"
+                ),
+            });
+        }
+        if let Some(worker) = panic_worker {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason: format!(
+                    "tensor {external_name:?} {source:?}-to-{destination:?} worker {worker}/{worker_count} panicked"
+                ),
+            });
+        }
+        Ok(())
+    })?;
+    Ok(materialized)
+}
+
+fn bounded_dense_transcode_worker_count(element_count: usize) -> usize {
+    if element_count < PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(MAX_DENSE_TRANSCODE_WORKERS)
+        .min(element_count.max(1))
+}
+
+fn transcode_float_partition<Source: FloatByteCodec, Destination: FloatByteCodec>(
+    input: &[u8],
+    output: &mut [u8],
+) {
+    debug_assert!(input.len().is_multiple_of(Source::WIDTH));
+    debug_assert_eq!(
+        output.len(),
+        input.len() / Source::WIDTH * Destination::WIDTH
+    );
+    for (source, destination) in input
+        .chunks_exact(Source::WIDTH)
+        .zip(output.chunks_exact_mut(Destination::WIDTH))
+    {
+        Destination::encode(Source::decode(source), destination);
+    }
+}
+
+trait FloatByteCodec {
+    const WIDTH: usize;
+
+    fn decode(bytes: &[u8]) -> f32;
+    fn encode(value: f32, bytes: &mut [u8]);
+}
+
+impl FloatByteCodec for f16 {
+    const WIDTH: usize = 2;
+
+    fn decode(bytes: &[u8]) -> f32 {
+        f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+    }
+
+    fn encode(value: f32, bytes: &mut [u8]) {
+        bytes.copy_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
+    }
+}
+
+impl FloatByteCodec for bf16 {
+    const WIDTH: usize = 2;
+
+    fn decode(bytes: &[u8]) -> f32 {
+        bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32()
+    }
+
+    fn encode(value: f32, bytes: &mut [u8]) {
+        bytes.copy_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes());
+    }
+}
+
+impl FloatByteCodec for f32 {
+    const WIDTH: usize = 4;
+
+    fn decode(bytes: &[u8]) -> f32 {
+        f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+    }
+
+    fn encode(value: f32, bytes: &mut [u8]) {
+        bytes.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+fn write_float(bytes: &mut [u8], element_type: ElementType, index: usize, value: f32) {
+    let offset = index * element_type.size_bytes() as usize;
+    match element_type {
+        ElementType::F16 => {
+            bytes[offset..offset + 2]
+                .copy_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
+        }
+        ElementType::Bf16 => {
+            bytes[offset..offset + 2]
+                .copy_from_slice(&bf16::from_f32(value).to_bits().to_le_bytes());
+        }
+        ElementType::F32 => bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes()),
+        _ => unreachable!("non-floating destination was rejected before encoding"),
+    }
 }
 
 fn read_float(bytes: &[u8], element_type: ElementType, index: usize) -> f32 {
@@ -543,6 +761,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(converted.as_ref(), expected);
+    }
+
+    #[test]
+    fn parallel_float_transcode_matches_scalar_for_supported_pairs() {
+        let bf16_bytes = (0_u16..=u16::MAX)
+            .cycle()
+            .take(PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS)
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let actual = transcode_dense_bytes(
+            &bf16_bytes,
+            ElementType::Bf16,
+            ElementType::F16,
+            "large.weight",
+            None,
+        )
+        .unwrap();
+        let expected = bf16_bytes
+            .chunks_exact(2)
+            .flat_map(|source| {
+                let value = bf16::from_bits(u16::from_le_bytes([source[0], source[1]])).to_f32();
+                f16::from_f32(value).to_bits().to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual.as_ref(), expected);
+
+        let f16_bytes = (0_u16..=u16::MAX)
+            .cycle()
+            .take(PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS)
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let f32_bytes = (0..PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS)
+            .flat_map(|index| {
+                let value =
+                    (index as f32 - PARALLEL_DENSE_TRANSCODE_MIN_ELEMENTS as f32 / 2.0) / 17.0;
+                value.to_le_bytes()
+            })
+            .collect::<Vec<_>>();
+        for (source, bytes) in [
+            (ElementType::F16, f16_bytes.as_slice()),
+            (ElementType::Bf16, bf16_bytes.as_slice()),
+            (ElementType::F32, f32_bytes.as_slice()),
+        ] {
+            for destination in [ElementType::F16, ElementType::Bf16, ElementType::F32] {
+                if source == destination {
+                    continue;
+                }
+                let actual =
+                    transcode_dense_bytes(bytes, source, destination, "large.weight", None)
+                        .unwrap();
+                let element_count = bytes.len() / source.size_bytes() as usize;
+                let mut expected = vec![0; element_count * destination.size_bytes() as usize];
+                for index in 0..element_count {
+                    write_float(
+                        &mut expected,
+                        destination,
+                        index,
+                        read_float(bytes, source, index),
+                    );
+                }
+                assert_eq!(actual.as_ref(), expected, "{source:?} -> {destination:?}");
+            }
+        }
+
+        assert_eq!(bounded_dense_transcode_worker_count(0), 1);
+        let workers = bounded_dense_transcode_worker_count(usize::MAX);
+        assert!((1..=MAX_DENSE_TRANSCODE_WORKERS).contains(&workers));
     }
 
     #[test]

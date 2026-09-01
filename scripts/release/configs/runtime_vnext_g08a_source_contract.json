@@ -40,7 +40,7 @@
       "path": "crates/ferrum-models/src/vnext/qwen35.rs",
       "classification": "reviewed-provider",
       "owner": "ferrum-models/vnext::qwen35",
-      "reviewed_at_git_sha": "187b20f5e58e24c4631cb00fc061d25252945dec",
+      "reviewed_at_git_sha": "6afda388bcbf9fd7c39be65a10f811df8ba318f2",
       "reason": "The typed family provider is reviewed function by function below."
         }
     ],
@@ -54,7 +54,7 @@
         {
             "path": "crates/ferrum-models/src/vnext/mod.rs",
             "owner": "ferrum-models/vnext-product-registry",
-            "reviewed_at_git_sha": "4a6e2c8e52da4dd4b2a802a4e581b7a8544647a8",
+            "reviewed_at_git_sha": "8471bd98f1d15ffc255ba0dcfb6581fd919be35e",
             "reason": "The product registry owns the unique Qwen3.5 metadata-to-provider route and the explicit legacy migration ledger."
         }
     ],
@@ -198,7 +198,7 @@
         "path": "crates/ferrum-interfaces/src/vnext/model.rs",
         "name": "ModelFamilyProvider",
         "owner": "ferrum-interfaces/vnext-model-contract",
-        "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
+        "reviewed_at_git_sha": "a95db32bcf1f4ec2359df83ab683b27460b08cbf",
     "required_methods": [
       "family_id",
       "external_metadata_ids",
@@ -226,9 +226,9 @@
 	        "family_registration": {
             "path": "crates/ferrum-models/src/vnext/mod.rs",
             "symbol": "qwen35_family_registration",
-            "line_hint": 78,
+            "line_hint": 88,
             "owner": "ferrum-models/vnext-product-registry",
-            "reviewed_at_git_sha": "4a6e2c8e52da4dd4b2a802a4e581b7a8544647a8",
+            "reviewed_at_git_sha": "8471bd98f1d15ffc255ba0dcfb6581fd919be35e",
             "required_fragments": [
                 "Qwen35FamilyProvider::new",
                 "TypedFamilyRegistration::new"
@@ -237,9 +237,9 @@
 	        "registration_resolution": {
 	            "path": "crates/ferrum-models/src/vnext/mod.rs",
 	            "symbol": "resolve_registered_model",
-	            "line_hint": 759,
+	            "line_hint": 788,
 	            "owner": "ferrum-models/vnext-product-registry",
-	            "reviewed_at_git_sha": "4a6e2c8e52da4dd4b2a802a4e581b7a8544647a8",
+	            "reviewed_at_git_sha": "8471bd98f1d15ffc255ba0dcfb6581fd919be35e",
 	            "required_fragments": [
 	                "MODEL_LOADERS.iter",
 	                "LEGACY_MODELS",
@@ -264,7 +264,7 @@
             "symbol": "create_vnext_executor",
             "line_hint": 29,
             "owner": "ferrum-engine/product-composition",
-            "reviewed_at_git_sha": "cb65d9ce6b951c06aaaba144555ce579be56dec2",
+            "reviewed_at_git_sha": "15618f56b6a03d74c9a96bea1d04057591b205fb",
             "required_fragments": [
                 "PreparedProductionModel",
                 "VNextModelExecutor::from_runtime_composition"

@@ -118,7 +118,7 @@ impl EngineInner {
                 );
 
                 let stop_reason = self.stop_reason_for_request(request_id);
-                if self.should_stream_generated_token(stop_reason) {
+                if self.should_stream_generated_token(request_id, first_token, stop_reason) {
                     self.send_stream_update(request_id, first_token).await;
                 }
                 if let Some(reason) = stop_reason {
@@ -358,7 +358,7 @@ impl EngineInner {
         );
 
         let stop_reason = self.stop_reason_for_request(request_id);
-        if self.should_stream_generated_token(stop_reason) {
+        if self.should_stream_generated_token(request_id, first_token, stop_reason) {
             self.send_stream_update(request_id, first_token).await;
         }
         if let Some(reason) = stop_reason {
@@ -692,7 +692,7 @@ impl EngineInner {
         counter!("ferrum.engine.prefills_total").increment(1);
 
         let stop_reason = self.stop_reason_for_request(request_id);
-        if self.should_stream_generated_token(stop_reason) {
+        if self.should_stream_generated_token(request_id, first_token, stop_reason) {
             self.send_stream_update(request_id, first_token).await;
         }
         if let Some(reason) = stop_reason {
@@ -1057,7 +1057,7 @@ impl EngineInner {
                     self.prefix_cache_hits.fetch_add(1, Ordering::Relaxed);
                     counter!("ferrum.engine.prefix_cache_hits").increment(1);
                     let stop_reason = self.stop_reason_for_request(rid);
-                    if self.should_stream_generated_token(stop_reason) {
+                    if self.should_stream_generated_token(rid, first_token, stop_reason) {
                         self.send_stream_update(rid, first_token).await;
                     }
                     if let Some(reason) = stop_reason {
@@ -1252,7 +1252,7 @@ impl EngineInner {
             counter!("ferrum.engine.prefill_tokens_total").increment(num_tokens as u64);
             counter!("ferrum.engine.prefills_total").increment(1);
             let stop_reason = self.stop_reason_for_request(&rid);
-            if self.should_stream_generated_token(stop_reason) {
+            if self.should_stream_generated_token(&rid, first_token, stop_reason) {
                 self.send_stream_update(&rid, first_token).await;
             }
             if let Some(reason) = stop_reason {

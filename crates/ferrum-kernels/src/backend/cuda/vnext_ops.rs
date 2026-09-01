@@ -7,10 +7,10 @@ use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, dense_linear_contract, dense_swiglu_contract,
-    gated_delta_recurrent_attention_contract, last_token_dense_linear_contract,
-    last_token_masked_argmax_contract, residual_add_contract, rms_norm_contract,
-    token_embedding_contract, AttributeId, BatchedOperationInvocation, CapabilityCatalog,
-    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceId,
+    gated_delta_recurrent_attention_contract, gpt_oss_causal_paged_attention_contract,
+    last_token_dense_linear_contract, last_token_masked_argmax_contract, residual_add_contract,
+    rms_norm_contract, token_embedding_contract, AttributeId, BatchedOperationInvocation,
+    CapabilityCatalog, CapabilityId, ContractVersion, DeviceBatchingForm, DeviceId,
     DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DynamicStorageAllocator,
     DynamicStorageProfile, DynamicStorageRequirement, DynamicStorageView, ElementType,
     EncodedDeviceOperation, EngineProviderDescriptor, OperationContract, OperationFailure,
@@ -24,7 +24,8 @@ use ferrum_interfaces::vnext::{
     WeightMaterializerSelection, CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
     DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID, DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
+    GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
     RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
@@ -32,7 +33,8 @@ use ferrum_interfaces::vnext::{
 };
 #[cfg(feature = "vllm-moe-marlin")]
 use ferrum_interfaces::vnext::{
-    routed_shared_swiglu_moe_contract, routed_swiglu_moe_contract,
+    gpt_oss_routed_clamped_swiglu_moe_contract, routed_shared_swiglu_moe_contract,
+    routed_swiglu_moe_contract, GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_MXFP4_BF16_CAPABILITY_ID,
     ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID, ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID,
 };
 use ferrum_types::{
@@ -84,6 +86,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/gpt_oss_attention.rs").as_bytes(),
         crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
         crate::ptx::ARGMAX_ROWS.as_bytes(),
         crate::ptx::RMS_NORM.as_bytes(),
@@ -93,6 +96,7 @@ pub fn cuda_vnext_runtime_config(
         crate::ptx::LINEAR_ATTENTION.as_bytes(),
         crate::ptx::GATED_DELTA_RULE.as_bytes(),
         crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
+        crate::ptx::GPT_OSS_ATTENTION.as_bytes(),
     ];
     #[cfg(feature = "vllm-moe-marlin")]
     let fingerprint_parts = {
@@ -103,16 +107,22 @@ pub fn cuda_vnext_runtime_config(
             include_str!("vnext_ops/transformer/moe_routed.rs").as_bytes(),
             include_str!("vnext_ops/transformer/moe_weights.rs").as_bytes(),
             include_str!("vnext_ops/transformer/moe_workspace.rs").as_bytes(),
+            include_str!("vnext_ops/transformer/gpt_oss_moe.rs").as_bytes(),
             crate::ptx::MOE_ROUTER.as_bytes(),
             crate::ptx::MOE_ALIGN_BLOCK_SIZE_PAIR_IDS.as_bytes(),
             crate::ptx::MOE_COMBINE.as_bytes(),
+            crate::ptx::GPT_OSS_MOE.as_bytes(),
         ]);
         fingerprint_parts
     };
     #[cfg(feature = "vllm-marlin")]
     let fingerprint_parts = {
         let mut fingerprint_parts = fingerprint_parts;
-        fingerprint_parts.push(include_str!("../../marlin_fp8_materializer.rs").as_bytes());
+        fingerprint_parts.extend([
+            include_str!("../../marlin_fp8_materializer.rs").as_bytes(),
+            include_str!("../../mxfp4_marlin_materializer.rs").as_bytes(),
+            crate::ptx::MXFP4_MARLIN_PREPARE.as_bytes(),
+        ]);
         fingerprint_parts
     };
     let capabilities = cuda_vnext_capabilities()?;
@@ -155,6 +165,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RESIDUAL_ADD_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+        GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
     ]
     .into_iter()
@@ -167,6 +178,9 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
             ROUTED_SHARED_SWIGLU_MOE_F16_CAPABILITY_ID,
         )?);
         capabilities.insert(CapabilityId::new(ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID)?);
+        capabilities.insert(CapabilityId::new(
+            GPT_OSS_ROUTED_CLAMPED_SWIGLU_MOE_MXFP4_BF16_CAPABILITY_ID,
+        )?);
         capabilities
     };
     #[cfg(feature = "vllm-marlin")]
@@ -201,6 +215,14 @@ fn cuda_weight_materializer_selection(
     let quantization_formats = family.weight_schema().quantization_formats();
     let has_block_fp8_quantization = quantization_formats.contains(&block_fp8_quantization);
     let has_block_fp8_weight_format = family.weight_schema().format_id == block_fp8_weight_format;
+    let mxfp4_weight_format = WeightFormatId::new(
+        crate::mxfp4_marlin_materializer::GPT_OSS_MXFP4_SOURCE_WEIGHT_FORMAT_ID,
+    )?;
+    let mxfp4_quantization = QuantizationFormatId::new(
+        crate::mxfp4_marlin_materializer::GPT_OSS_MXFP4_SOURCE_QUANTIZATION_FORMAT_ID,
+    )?;
+    let has_mxfp4_quantization = quantization_formats.contains(&mxfp4_quantization);
+    let has_mxfp4_weight_format = family.weight_schema().format_id == mxfp4_weight_format;
 
     if has_block_fp8_weight_format != has_block_fp8_quantization
         || (has_block_fp8_weight_format
@@ -211,11 +233,44 @@ fn cuda_weight_materializer_selection(
                 .to_owned(),
         });
     }
+    if has_mxfp4_weight_format != has_mxfp4_quantization
+        || (has_mxfp4_weight_format && quantization_formats != BTreeSet::from([mxfp4_quantization]))
+    {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: "CUDA GPT-OSS MXFP4 source format and typed quantization schema disagree"
+                .to_owned(),
+        });
+    }
+    if has_block_fp8_weight_format && has_mxfp4_weight_format {
+        return Err(VNextError::InvalidExecutionPlan {
+            reason: "CUDA source schema cannot require block-FP8 and GPT-OSS MXFP4 materializers together"
+                .to_owned(),
+        });
+    }
 
-    if !has_block_fp8_weight_format {
+    if !has_block_fp8_weight_format && !has_mxfp4_weight_format {
         return Ok(WeightMaterializerSelection::exact(
             WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)?,
         ));
+    }
+
+    if has_mxfp4_weight_format {
+        #[cfg(feature = "vllm-moe-marlin")]
+        {
+            return Ok(WeightMaterializerSelection::exact(
+                WeightMaterializerId::new(
+                    crate::mxfp4_marlin_materializer::GPT_OSS_MXFP4_TO_MARLIN_WEIGHT_MATERIALIZER_ID,
+                )?,
+            ));
+        }
+        #[cfg(not(feature = "vllm-moe-marlin"))]
+        {
+            return Err(VNextError::InvalidExecutionPlan {
+                reason:
+                    "CUDA GPT-OSS MXFP4 source requires the compiled vllm-moe-marlin materializer"
+                        .to_owned(),
+            });
+        }
     }
 
     #[cfg(feature = "vllm-marlin")]
@@ -272,6 +327,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(residual_add_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
+        Box::new(gpt_oss_causal_paged_attention_contract().map_err(contract_error)?),
     ];
     #[cfg(feature = "vllm-moe-marlin")]
     let contracts = {
@@ -281,6 +337,9 @@ pub fn cuda_vnext_operation_registry(
         ));
         contracts.push(Box::new(
             routed_swiglu_moe_contract().map_err(contract_error)?,
+        ));
+        contracts.push(Box::new(
+            gpt_oss_routed_clamped_swiglu_moe_contract().map_err(contract_error)?,
         ));
         contracts
     };
@@ -298,6 +357,9 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaCausalPagedAttentionProvider::new(
             runtime,
             runtime.attention_execution_policy(),
+        )?),
+        Box::new(transformer::CudaGptOssCausalPagedAttentionProvider::new(
+            runtime,
         )?),
     ];
     #[cfg(feature = "vllm-marlin")]
@@ -320,6 +382,9 @@ pub fn cuda_vnext_operation_registry(
         providers.push(Box::new(transformer::CudaRoutedSwiGluMoeProvider::new(
             runtime,
         )?));
+        providers.push(Box::new(
+            transformer::CudaGptOssRoutedClampedSwiGluMoeProvider::new(runtime)?,
+        ));
         providers
     };
     OperationRuntimeRegistry::new(contracts, providers).map_err(contract_error)
@@ -355,13 +420,24 @@ impl CudaVNextComposition {
         let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
         let registry = cuda_vnext_operation_registry(&runtime)?;
         #[cfg(feature = "vllm-marlin")]
-        let weight_materializers = WeightMaterializerRegistry::new(vec![
+        let weight_materializers = vec![
             crate::marlin_fp8_materializer::marlin_fp8_weight_materializer()
                 .map_err(contract_error)?,
             crate::marlin_fp8_materializer::block_fp8_to_marlin_fp8_weight_materializer()
                 .map_err(contract_error)?,
-        ])
-        .map_err(contract_error)?;
+        ];
+        #[cfg(feature = "vllm-moe-marlin")]
+        let weight_materializers = {
+            let mut weight_materializers = weight_materializers;
+            weight_materializers.push(
+                crate::mxfp4_marlin_materializer::gpt_oss_mxfp4_to_marlin_weight_materializer()
+                    .map_err(contract_error)?,
+            );
+            weight_materializers
+        };
+        #[cfg(feature = "vllm-marlin")]
+        let weight_materializers =
+            WeightMaterializerRegistry::new(weight_materializers).map_err(contract_error)?;
         #[cfg(not(feature = "vllm-marlin"))]
         let weight_materializers =
             WeightMaterializerRegistry::identity_only().map_err(contract_error)?;
