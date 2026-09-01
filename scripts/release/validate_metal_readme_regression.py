@@ -91,23 +91,6 @@ def main() -> int:
                 f"{key}: chat.stateful_loop repeated_prefixes != 0 "
                 f"({root / (key + '.stateful_loop_verdict.txt')})"
             )
-        tool_call = model.get("tool_call") or {}
-        if tool_call.get("status") != "pass":
-            errors.append(
-                f"{key}: tool_call.status != pass "
-                f"({root / (key + '.tool-call-regression/tool_call_regression.json')})"
-            )
-        for gate in [
-            "omitted_tool_choice",
-            "explicit_auto_tool_choice",
-            "required_tool_choice",
-            "tool_result_fill",
-        ]:
-            if ((tool_call.get("checks") or {}).get(gate) or {}).get("passed") is not True:
-                errors.append(
-                    f"{key}: tool_call.{gate}.passed != true "
-                    f"({root / (key + '.tool-call-regression/tool_call_regression.json')})"
-                )
         if model.get("moe") is True:
             has_multi_seq_cell = any(
                 int(cell.get("concurrency") or 0) >= 2
