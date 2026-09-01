@@ -295,7 +295,8 @@ fn parse_message(
 }
 
 fn is_length_truncated_followup_envelope(output: &str) -> bool {
-    output == concat!("<|start|>", "assistant")
+    output == START
+        || output == concat!("<|start|>", "assistant")
         || output == concat!("<|start|>", "assistant", "<|channel|>")
 }
 
@@ -536,6 +537,8 @@ mod tests {
     #[test]
     fn parses_length_truncation_between_followup_envelope_markers() {
         for output in [
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>",
             "<|channel|>analysis<|message|>Reason.<|end|>\
              <|start|>assistant",
             "<|channel|>analysis<|message|>Reason.<|end|>\
