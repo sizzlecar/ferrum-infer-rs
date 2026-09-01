@@ -28,10 +28,13 @@ const HIDDEN_SIZE: usize = 512;
 const INTERMEDIATE_SIZE: usize = 512;
 const LOCAL_HEAD_DIM: usize = 256;
 const GLOBAL_HEAD_DIM: usize = 512;
+const QUERY_HEADS: usize = 16;
+const LOCAL_KV_HEADS: usize = 8;
+const GLOBAL_KV_HEADS: usize = 1;
 const VOCABULARY_SIZE: usize = 256;
 const INPUT_TOKEN_ID: usize = 5;
 const MAX_LIVE_CHILDREN: usize = 1;
-const PACKED_SERVE_CONCURRENCY: usize = 8;
+const PACKED_SERVE_CONCURRENCIES: [usize; 2] = [8, 32];
 const RUN_DEADLINE: Duration = Duration::from_secs(120);
 const STARTUP_DEADLINE: Duration = Duration::from_secs(180);
 const REQUEST_DEADLINE: Duration = Duration::from_secs(120);
@@ -388,7 +391,7 @@ async fn stream_chat(chat_url: String) -> Result<(reqwest::StatusCode, String), 
     Ok((status, body))
 }
 
-fn assert_stream_response(label: &str, status: reqwest::StatusCode, body: &str) {
+fn assert_stream_response(label: &str, status: reqwest::StatusCode, body: &str) -> (String, u64) {
     assert_eq!(status, 200, "{label} returned non-200: {body}");
     let (done_count, content, completion_tokens) = parse_stream(body);
     assert_eq!(
@@ -404,6 +407,7 @@ fn assert_stream_response(label: &str, status: reqwest::StatusCode, body: &str) 
         "{label} usage has no completion tokens: {body}"
     );
     assert_clean_logs(label, body);
+    (content, completion_tokens)
 }
 
 fn bf16_constant(shape: &[usize], bits: u16) -> FixtureTensor {
@@ -439,19 +443,20 @@ fn insert_quantized_projection(
     );
     assert!(k.is_multiple_of(32), "projection K must be group32");
 
-    // compressed-tensors pack-quantized symmetric INT4 stores signed zero as
-    // biased nibble 8. Eight identical nibbles therefore form 0x88888888.
+    // compressed-tensors pack-quantized symmetric INT4 uses biased nibble 8
+    // for zero. Alternating 8/9 nibbles plus a 2^-6 scale keeps this fixture
+    // numerically bounded while ensuring attention projections are non-zero.
     tensors.insert(
         format!("{stem}.weight_packed"),
         FixtureTensor {
             dtype: Dtype::I32,
             shape: vec![n, k / 8],
-            bytes: vec![0x88; n * k / 2],
+            bytes: vec![0x98; n * k / 2],
         },
     );
     tensors.insert(
         format!("{stem}.weight_scale"),
-        bf16_constant(&[n, k / 32], 0x3f80),
+        bf16_constant(&[n, k / 32], 0x3c80),
     );
     tensors.insert(
         format!("{stem}.weight_shape"),
@@ -473,6 +478,13 @@ fn insert_layer(tensors: &mut BTreeMap<String, FixtureTensor>, layer: usize, ful
     } else {
         LOCAL_HEAD_DIM
     };
+    let kv_heads = if full_attention {
+        GLOBAL_KV_HEADS
+    } else {
+        LOCAL_KV_HEADS
+    };
+    let query_features = QUERY_HEADS * head_dim;
+    let kv_features = kv_heads * head_dim;
     for suffix in [
         "input_layernorm.weight",
         "post_attention_layernorm.weight",
@@ -498,20 +510,20 @@ fn insert_layer(tensors: &mut BTreeMap<String, FixtureTensor>, layer: usize, ful
     insert_quantized_projection(
         tensors,
         format!("{prefix}.self_attn.q_proj"),
-        head_dim,
+        query_features,
         HIDDEN_SIZE,
     );
     insert_quantized_projection(
         tensors,
         format!("{prefix}.self_attn.k_proj"),
-        head_dim,
+        kv_features,
         HIDDEN_SIZE,
     );
     if !full_attention {
         insert_quantized_projection(
             tensors,
             format!("{prefix}.self_attn.v_proj"),
-            head_dim,
+            kv_features,
             HIDDEN_SIZE,
         );
     }
@@ -519,7 +531,7 @@ fn insert_layer(tensors: &mut BTreeMap<String, FixtureTensor>, layer: usize, ful
         tensors,
         format!("{prefix}.self_attn.o_proj"),
         HIDDEN_SIZE,
-        head_dim,
+        query_features,
     );
     for projection in ["gate_proj", "up_proj"] {
         insert_quantized_projection(
@@ -572,7 +584,7 @@ fn write_tokenizer(model_dir: &Path) {
             "bos_token_id": 3,
             "eos_token_id": 2,
             "pad_token_id": 1,
-            "model_max_length": 128,
+            "model_max_length": 1024,
             "chat_template": null
         }))
         .unwrap(),
@@ -656,14 +668,14 @@ fn write_config(model_dir: &Path) {
             "hidden_size_per_layer_input": 0,
             "intermediate_size": INTERMEDIATE_SIZE,
             "layer_types": ["sliding_attention", "full_attention"],
-            "max_position_embeddings": 128,
+            "max_position_embeddings": 1024,
             "model_type": "gemma4_unified_text",
             "moe_intermediate_size": null,
-            "num_attention_heads": 1,
+            "num_attention_heads": QUERY_HEADS,
             "num_experts": null,
-            "num_global_key_value_heads": 1,
+            "num_global_key_value_heads": GLOBAL_KV_HEADS,
             "num_hidden_layers": 2,
-            "num_key_value_heads": 1,
+            "num_key_value_heads": LOCAL_KV_HEADS,
             "num_kv_shared_layers": 0,
             "rms_norm_eps": 0.000001,
             "rope_parameters": {
@@ -677,7 +689,7 @@ fn write_config(model_dir: &Path) {
                     "rope_type": "default"
                 }
             },
-            "sliding_window": 32,
+            "sliding_window": 1024,
             "tie_word_embeddings": true,
             "top_k_experts": null,
             "use_bidirectional_attention": "vision",
@@ -767,24 +779,54 @@ async fn gemma4_tiny_cuda_run_and_serve_e2e() {
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
 
     let server = ServerFixture::spawn(&model_dir, fixture.path()).await;
+    let c1_started = Instant::now();
     let (status, body) = stream_chat(server.chat_url())
         .await
         .unwrap_or_else(|error| panic!("{error}; {}", server.logs()));
-    assert_stream_response("ferrum serve c=1 stream", status, &body);
+    let (expected_content, expected_completion_tokens) =
+        assert_stream_response("ferrum serve c=1 stream", status, &body);
+    eprintln!(
+        "GEMMA4 CUDA E2E c=1 elapsed_ms={}",
+        c1_started.elapsed().as_millis()
+    );
 
-    let mut requests = tokio::task::JoinSet::new();
-    for _ in 0..PACKED_SERVE_CONCURRENCY {
-        requests.spawn(stream_chat(server.chat_url()));
+    for concurrency in PACKED_SERVE_CONCURRENCIES {
+        let batch_started = Instant::now();
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..concurrency {
+            requests.spawn(stream_chat(server.chat_url()));
+        }
+        let mut completed = 0;
+        while let Some(result) = requests.join_next().await {
+            let (status, body) = result
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "c={concurrency} stream task failed: {error}; {}",
+                        server.logs()
+                    )
+                })
+                .unwrap_or_else(|error| panic!("{error}; {}", server.logs()));
+            let (content, completion_tokens) = assert_stream_response(
+                &format!("ferrum serve c={concurrency} stream"),
+                status,
+                &body,
+            );
+            assert_eq!(
+                content, expected_content,
+                "c={concurrency} packed output differs from c=1 scalar output"
+            );
+            assert_eq!(
+                completion_tokens, expected_completion_tokens,
+                "c={concurrency} packed usage differs from c=1 scalar usage"
+            );
+            completed += 1;
+        }
+        assert_eq!(completed, concurrency);
+        eprintln!(
+            "GEMMA4 CUDA E2E c={concurrency} elapsed_ms={}",
+            batch_started.elapsed().as_millis()
+        );
     }
-    let mut completed = 0;
-    while let Some(result) = requests.join_next().await {
-        let (status, body) = result
-            .unwrap_or_else(|error| panic!("c=8 stream task failed: {error}; {}", server.logs()))
-            .unwrap_or_else(|error| panic!("{error}; {}", server.logs()));
-        assert_stream_response("ferrum serve c=8 stream", status, &body);
-        completed += 1;
-    }
-    assert_eq!(completed, PACKED_SERVE_CONCURRENCY);
     assert_clean_logs("ferrum serve logs", &server.logs());
     drop(server);
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
