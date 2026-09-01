@@ -70,6 +70,7 @@ const GEMMA4_ESTIMATOR_ID: &str = "resource-estimator.cuda.gemma4_causal_paged_a
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str = "vnext_causal_prepare_f16";
 const ATTENTION_FUNCTION: &str = "vnext_causal_attention_f16";
+const GROUPED_ATTENTION_FUNCTION: &str = "vnext_causal_attention_grouped_f16";
 const VARLEN_ADDRESSED_FUNCTION: &str = "vnext_paged_varlen_attn_vllm_addressed_f16";
 const VARLEN_TILED_ADDRESSED_FUNCTION: &str = "vnext_paged_varlen_attn_vllm_tiled_q4_addressed_f16";
 const ATTENTION_GATE_FUNCTION: &str = "qwen35_apply_attention_gate_f16";
@@ -92,6 +93,9 @@ const BINDING_CONTROL_WORDS: usize = 6;
 const BINDING_CONTROL_BYTES: u64 = (BINDING_CONTROL_WORDS * std::mem::size_of::<i32>()) as u64;
 const BINDING_SEQUENCE_LENGTH_OFFSET: u64 = 3 * std::mem::size_of::<i32>() as u64;
 const WARP_THREADS: u32 = 32;
+const GROUPED_FALLBACK_DEFAULT_KV_TILE_TOKENS: u64 = 16;
+const GROUPED_FALLBACK_GEMMA_LOCAL_KV_TILE_TOKENS: u64 = 32;
+const MAXIMUM_GROUPED_QUERY_HEADS_PER_KV: u32 = 16;
 const MAXIMUM_HEAD_DIM: u64 = 512;
 const MAXIMUM_STANDARD_HEAD_DIM: u64 = 256;
 const MAXIMUM_VARLEN_HEAD_DIM: u64 = 256;
@@ -157,6 +161,7 @@ struct CausalAttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     attention: CudaFunction,
+    grouped_attention: CudaFunction,
     varlen_addressed: CudaFunction,
     varlen_tiled_addressed: CudaFunction,
     attention_gate: CudaFunction,
@@ -416,6 +421,11 @@ impl CudaCausalPagedAttentionProvider {
                 "causal attention prepare",
             )?,
             attention: load_function(&attention_module, ATTENTION_FUNCTION, "causal attention")?,
+            grouped_attention: load_function(
+                &attention_module,
+                GROUPED_ATTENTION_FUNCTION,
+                "causal grouped-query attention",
+            )?,
             varlen_addressed: load_function(
                 &varlen_module,
                 VARLEN_ADDRESSED_FUNCTION,
@@ -1642,7 +1652,9 @@ struct PackedCausalAttentionLaunch {
 #[derive(Debug, Clone, Copy)]
 struct PackedFallbackLaunch {
     token_grid: u64,
+    packed_token_grid: u64,
     participant_grid: u32,
+    participant_count_i32: i32,
     binding_slot_bytes: u64,
     path: CausalAttentionKernelPath,
 }
@@ -1665,10 +1677,19 @@ fn packed_fallback_launch(
         .map(|launch| launch.tokens)
         .max()
         .ok_or_else(|| "packed causal fallback has no token grid".to_owned())?;
+    let packed_token_grid = launches.iter().try_fold(0_u64, |total, launch| {
+        total
+            .checked_add(launch.tokens)
+            .ok_or_else(|| "packed causal fallback token grid overflows".to_owned())
+    })?;
+    let participant_grid = u32::try_from(launches.len())
+        .map_err(|_| "packed causal fallback participant grid exceeds u32".to_owned())?;
     Ok(Some(PackedFallbackLaunch {
         token_grid,
-        participant_grid: u32::try_from(launches.len())
-            .map_err(|_| "packed causal fallback participant grid exceeds u32".to_owned())?,
+        packed_token_grid,
+        participant_grid,
+        participant_count_i32: i32::try_from(participant_grid)
+            .map_err(|_| "packed causal fallback participant count exceeds i32".to_owned())?,
         binding_slot_bytes: binding_layout.slot_bytes,
         path: first.path,
     }))
@@ -2490,7 +2511,7 @@ fn enqueue_packed_attention(
         )?;
         launch_fallback_attention(
             stream,
-            &functions.attention,
+            functions,
             scratch_pointer(scratch_base, layout.query)?,
             query_raw,
             control,
@@ -2968,29 +2989,11 @@ fn launch_selected_attention(
 ) -> Result<(), CudaDeviceRuntimeError> {
     match launch.path {
         CausalAttentionKernelPath::TokenMajorFallback => launch_fallback_attention(
-            stream,
-            &functions.attention,
-            query,
-            query_raw,
-            control,
-            page_table,
-            output,
-            launch,
-            shape,
-            0,
+            stream, functions, query, query_raw, control, page_table, output, launch, shape, 0,
             None,
         ),
         CausalAttentionKernelPath::VllmAddressedFallback => launch_fallback_attention(
-            stream,
-            &functions.attention,
-            query,
-            query_raw,
-            control,
-            page_table,
-            output,
-            launch,
-            shape,
-            1,
+            stream, functions, query, query_raw, control, page_table, output, launch, shape, 1,
             None,
         ),
         CausalAttentionKernelPath::VllmAddressedVarlen => launch_addressed_varlen_attention(
@@ -3188,7 +3191,7 @@ fn launch_attention_gate(
 #[allow(clippy::too_many_arguments)]
 fn launch_fallback_attention(
     stream: &CudaStream,
-    function: &CudaFunction,
+    functions: &CausalAttentionFunctions,
     query: u64,
     query_raw: u64,
     control: u64,
@@ -3199,11 +3202,28 @@ fn launch_fallback_attention(
     kv_layout: i32,
     packed: Option<PackedFallbackLaunch>,
 ) -> Result<(), CudaDeviceRuntimeError> {
+    if let Some(block_threads) = grouped_fallback_block_threads(shape) {
+        return launch_grouped_fallback_attention(
+            stream,
+            &functions.grouped_attention,
+            query,
+            query_raw,
+            control,
+            page_table,
+            output,
+            launch,
+            shape,
+            kv_layout,
+            packed,
+            block_threads,
+        );
+    }
+
     let page_elements = checked_i32_runtime(
         VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
         "causal page elements",
     )?;
-    let mut builder = stream.launch_builder(function);
+    let mut builder = stream.launch_builder(&functions.attention);
     let pointers = [query, query_raw, control, page_table, output];
     for pointer in &pointers {
         builder.arg(pointer);
@@ -3241,6 +3261,103 @@ fn launch_fallback_attention(
     }
     .map(|_| ())
     .map_err(|error| CudaDeviceRuntimeError::driver("causal attention launch", error))
+}
+
+fn grouped_fallback_block_threads(shape: CudaCausalAttentionShape) -> Option<u32> {
+    if shape.query_heads <= 0
+        || shape.key_value_heads <= 0
+        || shape.query_heads % shape.key_value_heads != 0
+    {
+        return None;
+    }
+    let queries_per_kv = u32::try_from(shape.query_heads / shape.key_value_heads).ok()?;
+    if queries_per_kv == 0 || queries_per_kv > MAXIMUM_GROUPED_QUERY_HEADS_PER_KV {
+        return None;
+    }
+    queries_per_kv.checked_mul(WARP_THREADS)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_grouped_fallback_attention(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    query: u64,
+    query_raw: u64,
+    control: u64,
+    page_table: u64,
+    output: u64,
+    launch: CausalAttentionLaunch,
+    shape: CudaCausalAttentionShape,
+    kv_layout: i32,
+    packed: Option<PackedFallbackLaunch>,
+    block_threads: u32,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let page_elements = checked_i32_runtime(
+        VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
+        "causal grouped-query page elements",
+    )?;
+    let mut builder = stream.launch_builder(function);
+    let pointers = [query, query_raw, control, page_table, output];
+    for pointer in &pointers {
+        builder.arg(pointer);
+    }
+    let dimensions = [
+        page_elements,
+        kv_layout,
+        shape.query_heads,
+        shape.key_value_heads,
+        shape.head_dim,
+        shape.query_projection_features,
+        0,
+    ];
+    for dimension in &dimensions {
+        builder.arg(dimension);
+    }
+    builder.arg(&shape.attention_scale);
+    builder.arg(&shape.sliding_window_tokens);
+    let binding_slot_bytes = packed.map_or(0, |packed| packed.binding_slot_bytes);
+    let participant_count = packed.map_or(1, |packed| packed.participant_count_i32);
+    builder.arg(&binding_slot_bytes);
+    builder.arg(&participant_count);
+
+    let token_grid = packed.map_or(launch.tokens, |packed| packed.packed_token_grid);
+    let head_dim = u64::try_from(shape.head_dim).map_err(|_| {
+        CudaDeviceRuntimeError::contract("causal grouped-query head dimension is negative")
+    })?;
+    let kv_tile_tokens = if shape.head_dim == 256 && shape.sliding_window_tokens == 1_024 {
+        GROUPED_FALLBACK_GEMMA_LOCAL_KV_TILE_TOKENS
+    } else {
+        GROUPED_FALLBACK_DEFAULT_KV_TILE_TOKENS
+    };
+    let shared_mem_bytes = kv_tile_tokens
+        .checked_mul(head_dim)
+        .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "causal grouped-query attention shared memory overflows",
+            )
+        })?;
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (
+                checked_u32_runtime(token_grid, "causal grouped-query token grid")?,
+                u32::try_from(shape.key_value_heads).map_err(|_| {
+                    CudaDeviceRuntimeError::contract(
+                        "causal grouped-query KV-head grid exceeds u32",
+                    )
+                })?,
+                1,
+            ),
+            block_dim: (block_threads, 1, 1),
+            shared_mem_bytes: checked_u32_runtime(
+                shared_mem_bytes,
+                "causal grouped-query shared memory",
+            )?,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| CudaDeviceRuntimeError::driver("causal grouped-query attention launch", error))
 }
 
 fn launch_rms_norm(
@@ -4419,9 +4536,28 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(packed.token_grid, 4);
+        assert_eq!(packed.packed_token_grid, 5);
         assert_eq!(packed.participant_grid, 2);
+        assert_eq!(packed.participant_count_i32, 2);
         assert_eq!(packed.binding_slot_bytes, 256);
         assert_eq!(packed.path, CausalAttentionKernelPath::TokenMajorFallback);
+
+        let local = CausalAttentionShape::from_attributes_for(
+            &gemma4_attributes(false),
+            CausalAttentionSemantics::Gemma4,
+        )
+        .unwrap()
+        .cuda_shape()
+        .unwrap();
+        let global = CausalAttentionShape::from_attributes_for(
+            &gemma4_attributes(true),
+            CausalAttentionSemantics::Gemma4,
+        )
+        .unwrap()
+        .cuda_shape()
+        .unwrap();
+        assert_eq!(grouped_fallback_block_threads(local), Some(64));
+        assert_eq!(grouped_fallback_block_threads(global), Some(512));
 
         assert!(packed_fallback_launch(
             &[

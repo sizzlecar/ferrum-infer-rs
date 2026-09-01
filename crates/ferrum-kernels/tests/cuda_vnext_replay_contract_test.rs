@@ -446,6 +446,7 @@ fn causal_fallback_packs_prepare_and_attention_across_participants() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("Some(packed_fallback)"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("packed_fallback.path.uses_vllm_layout()"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("participant_grid"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("packed_token_grid"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("binding_slot_bytes"));
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int participant = blockIdx.z"));
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_participant_control("));
@@ -456,6 +457,18 @@ fn causal_fallback_packs_prepare_and_attention_across_participants() {
         .contains("(long long)packed_token * query_projection_stride"));
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
         .contains("(long long)packed_token * query_heads + query_head"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("GROUPED_ATTENTION_FUNCTION"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("grouped_fallback_block_threads"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("packed.packed_token_grid"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("shape.key_value_heads"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_causal_attention_grouped_f16"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_packed_participant("));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int packed_token = (int)blockIdx.x"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int kv_head = (int)blockIdx.y"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int queries_per_kv"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("extern __shared__ __half grouped_kv_tile[]"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("VNEXT_GROUPED_GEMMA_LOCAL_KV_TILE_TOKENS"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("VNEXT_GROUPED_DEFAULT_KV_TILE_TOKENS"));
 }
 
 #[test]
