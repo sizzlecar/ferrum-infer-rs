@@ -1506,6 +1506,17 @@ impl ExecutionPlan {
             .iter()
             .cloned()
             .collect::<BTreeSet<_>>();
+        let mut product_io_resources = nodes
+            .iter()
+            .flat_map(|node| node.values())
+            .filter(|binding| {
+                program_inputs.contains(binding.value_id())
+                    || program_outputs.contains(binding.value_id())
+            })
+            .flat_map(|binding| binding.storage().components())
+            .map(|component| component.resource_id().clone())
+            .collect::<BTreeSet<_>>();
+        product_io_resources.extend(retained_completion_resources.iter().cloned());
         let state_initializations = family
             .program()
             .states()
@@ -1575,8 +1586,7 @@ impl ExecutionPlan {
                         token_projection,
                         maximum_active_sequences,
                         maximum_scheduled_tokens,
-                        &program_inputs,
-                        &program_outputs,
+                        product_io_resources.contains(component.resource_id()),
                     )?;
                     let initialization = state_initializations
                         .get(binding.value_id())
@@ -1864,8 +1874,7 @@ impl ExecutionPlan {
         token_projection: Option<(u64, u64)>,
         maximum_active_sequences: u32,
         maximum_scheduled_tokens: u64,
-        program_inputs: &BTreeSet<ProgramValueId>,
-        program_outputs: &BTreeSet<ProgramValueId>,
+        is_product_io_resource: bool,
     ) -> Result<ValueResourceDemand, VNextError> {
         if family
             .program()
@@ -1886,8 +1895,6 @@ impl ExecutionPlan {
                     "non-state value `{value_id}` is not backed by activation memory"
                 )));
             }
-            let is_product_io =
-                program_inputs.contains(value_id) || program_outputs.contains(value_id);
             let lifetime = AllocationLifetime::Step;
             if let Some((bytes_per_token, canonical_tokens)) = token_projection {
                 if bytes_per_token == 0 || canonical_tokens == 0 {
@@ -1906,7 +1913,7 @@ impl ExecutionPlan {
                     maximum_tokens,
                 });
             }
-            if is_product_io {
+            if is_product_io_resource {
                 return Ok(ValueResourceDemand::ParticipantFixed {
                     lifetime,
                     maximum_participants: maximum_active_sequences,

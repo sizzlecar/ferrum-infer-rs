@@ -115,6 +115,24 @@ HOT_DIRECT_ENV_READ_CLASSIFICATIONS = (
         "read_phase": "test-only",
         "reason": "ignored real-model Qwen3.5 MoE GGUF test input, never read by product code",
     },
+    {
+        "path": "crates/ferrum-models/src/vnext/gpt_oss/weights.rs",
+        "call": "std::env::var_os",
+        "env_name": "FERRUM_GPT_OSS_TINY_SOURCE",
+        "expected_count": 1,
+        "classification": "ignored_real_model_test_fixture",
+        "read_phase": "test-only",
+        "reason": "ignored fixed-revision GPT-OSS canary source, never read by product code",
+    },
+    {
+        "path": "crates/ferrum-models/src/vnext/gpt_oss/weights.rs",
+        "call": "std::env::var_os",
+        "env_name": "FERRUM_GPT_OSS_CANARY_OUT",
+        "expected_count": 1,
+        "classification": "ignored_real_model_test_fixture",
+        "read_phase": "test-only",
+        "reason": "ignored GPT-OSS canary output path, never read by product code",
+    },
 )
 
 PROCESS_ENV_WRITE_CLASSIFICATIONS = (

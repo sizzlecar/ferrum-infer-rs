@@ -25,10 +25,16 @@ pub(super) const COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID: &str =
     "weight-format.safetensors.compressed-tensors-marlin-int4";
 pub(super) const COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID: &str =
     "quantization.marlin.compressed-tensors-int4-asymmetric";
+pub(super) const COMPRESSED_TENSORS_MARLIN_SYMMETRIC_WEIGHT_FORMAT_ID: &str =
+    "weight-format.safetensors.compressed-tensors-marlin-int4-symmetric";
+pub(super) const COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID: &str =
+    "quantization.marlin.compressed-tensors-int4-symmetric";
 pub(in crate::backend::cuda::vnext_ops) const GPTQ_MARLIN_CAPABILITY_ID: &str =
     "capability.kernel.cuda.marlin.gptq-int4-w4a16";
 pub(in crate::backend::cuda::vnext_ops) const COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID: &str =
     "capability.kernel.cuda.marlin.compressed-tensors-int4-asymmetric-w4a16";
+pub(in crate::backend::cuda::vnext_ops) const COMPRESSED_TENSORS_MARLIN_SYMMETRIC_CAPABILITY_ID:
+    &str = "capability.kernel.cuda.marlin.compressed-tensors-int4-symmetric-w4a16";
 const MARLIN_REGION_ALIGNMENT_BYTES: u64 = 16;
 
 /// Retained, expert-major physical regions accepted by the CUDA Marlin-MoE
@@ -46,7 +52,8 @@ pub(super) struct CudaMarlinMoeWeight {
     weight_type: MarlinMoeF16WeightType,
 }
 
-pub(super) type CudaMarlinGptqMatrixWeight = CudaMarlinMoeWeight;
+pub(super) type CudaMarlinSymmetricInt4MatrixWeight = CudaMarlinMoeWeight;
+pub(super) type CudaMarlinGptqMatrixWeight = CudaMarlinSymmetricInt4MatrixWeight;
 
 pub(super) struct CudaMarlinCompressedTensorsMatrixWeight {
     packed_region: CudaBufferRegion,
@@ -232,7 +239,7 @@ pub(super) fn resolve_gptq_marlin_matrix_weight(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     binding: &ResolvedValueBinding,
     logical_dimensions: &[u64],
-) -> Result<CudaMarlinGptqMatrixWeight, String> {
+) -> Result<CudaMarlinSymmetricInt4MatrixWeight, String> {
     let [output_features, input_features] = logical_dimensions else {
         return Err(
             "CUDA GPTQ-Marlin projection must have exactly two logical dimensions [N, K]"
@@ -245,6 +252,39 @@ pub(super) fn resolve_gptq_marlin_matrix_weight(
         "CUDA GPTQ-Marlin projection",
     )?;
     resolve_gptq_marlin_weight(participant, binding, logical_dimensions)
+}
+
+/// Resolve one exact rank-2 compressed-tensors symmetric INT4 projection.
+///
+/// The source materializer has already converted the checkpoint's signed
+/// INT4 codes into Marlin's U4B8 tiled ABI. No zero-point region exists or is
+/// synthesized for this format.
+pub(super) fn resolve_compressed_tensors_symmetric_marlin_matrix_weight(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+    binding: &ResolvedValueBinding,
+    logical_dimensions: &[u64],
+) -> Result<CudaMarlinGptqMatrixWeight, String> {
+    let [output_features, input_features] = logical_dimensions else {
+        return Err(
+            "CUDA compressed-tensors symmetric Marlin projection must have exactly two logical dimensions [N, K]"
+                .to_owned(),
+        );
+    };
+    validate_marlin_thread_tile(
+        *output_features,
+        *input_features,
+        "CUDA compressed-tensors symmetric Marlin projection",
+    )?;
+    let weight = binding.weight().ok_or_else(|| {
+        "CUDA compressed-tensors symmetric Marlin weight lacks its typed physical layout".to_owned()
+    })?;
+    let metadata = validate_compressed_tensors_symmetric_marlin_contract(
+        weight,
+        binding.tensor().dimensions(),
+        binding.tensor().element_type(),
+        logical_dimensions,
+    )?;
+    resolve_marlin_moe_weight_from_metadata(participant, binding, metadata)
 }
 
 /// Resolve one exact rank-2 compressed-tensors asymmetric INT4 projection.
@@ -626,11 +666,64 @@ fn resolve_marlin_moe_weight_from_metadata(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SymmetricMarlinInt4Source {
+    Gptq,
+    CompressedTensors,
+}
+
+impl SymmetricMarlinInt4Source {
+    const fn quantization_format_id(self) -> &'static str {
+        match self {
+            Self::Gptq => GPTQ_MARLIN_QUANTIZATION_FORMAT_ID,
+            Self::CompressedTensors => COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Gptq => "GPTQ-Marlin",
+            Self::CompressedTensors => "compressed-tensors symmetric Marlin",
+        }
+    }
+}
+
 fn validate_gptq_marlin_moe_contract(
     weight: &ResolvedWeightBinding,
     bound_logical_dimensions: &[u64],
     logical_element_type: ElementType,
     caller_logical_dimensions: &[u64],
+) -> Result<MarlinMoeWeightMetadata, String> {
+    validate_symmetric_marlin_int4_contract(
+        weight,
+        bound_logical_dimensions,
+        logical_element_type,
+        caller_logical_dimensions,
+        SymmetricMarlinInt4Source::Gptq,
+    )
+}
+
+fn validate_compressed_tensors_symmetric_marlin_contract(
+    weight: &ResolvedWeightBinding,
+    bound_logical_dimensions: &[u64],
+    logical_element_type: ElementType,
+    caller_logical_dimensions: &[u64],
+) -> Result<MarlinMoeWeightMetadata, String> {
+    validate_symmetric_marlin_int4_contract(
+        weight,
+        bound_logical_dimensions,
+        logical_element_type,
+        caller_logical_dimensions,
+        SymmetricMarlinInt4Source::CompressedTensors,
+    )
+}
+
+fn validate_symmetric_marlin_int4_contract(
+    weight: &ResolvedWeightBinding,
+    bound_logical_dimensions: &[u64],
+    logical_element_type: ElementType,
+    caller_logical_dimensions: &[u64],
+    source: SymmetricMarlinInt4Source,
 ) -> Result<MarlinMoeWeightMetadata, String> {
     if caller_logical_dimensions != bound_logical_dimensions {
         return Err(format!(
@@ -640,7 +733,10 @@ fn validate_gptq_marlin_moe_contract(
     if bound_logical_dimensions.len() < 2
         || bound_logical_dimensions.iter().any(|extent| *extent == 0)
     {
-        return Err("CUDA GPTQ-Marlin logical shape must end in a non-empty matrix".to_owned());
+        return Err(format!(
+            "CUDA {} logical shape must end in a non-empty matrix",
+            source.label()
+        ));
     }
     if logical_element_type != ElementType::F16 {
         return Err(format!(
@@ -735,19 +831,24 @@ fn validate_gptq_marlin_moe_contract(
     quantization
         .validate()
         .map_err(|error| format!("CUDA Marlin-MoE quantization ABI is invalid: {error}"))?;
-    let group_size = quantization
-        .grouping
-        .fixed_size()
-        .ok_or_else(|| "CUDA Marlin-MoE requires fixed-size GPTQ quantization groups".to_owned())?;
-    if quantization.format_id.as_str() != GPTQ_MARLIN_QUANTIZATION_FORMAT_ID
+    let group_size = quantization.grouping.fixed_size().ok_or_else(|| {
+        "CUDA Marlin-MoE requires fixed-size symmetric INT4 quantization groups".to_owned()
+    })?;
+    if quantization.format_id.as_str() != source.quantization_format_id()
         || quantization.bits_per_weight != 4
         || quantization.packing != QuantizationPacking::Tiled
         || quantization.scale_type != ElementType::F16
         || quantization.zero_point_type.is_some()
     {
         return Err(format!(
-            "CUDA Marlin-MoE packed component `{}` is not symmetric tiled GPTQ-Marlin INT4 with F16 scales",
-            packed_component.component_id()
+            "CUDA Marlin-MoE packed component `{}` is not {} group-quantized symmetric tiled INT4 with F16 scales",
+            packed_component.component_id(),
+            source.label(),
+        ));
+    }
+    if source == SymmetricMarlinInt4Source::CompressedTensors && group_size != 32 {
+        return Err(format!(
+            "CUDA compressed-tensors symmetric Marlin requires group size 32, got {group_size}"
         ));
     }
     if !matches!(
@@ -1314,6 +1415,29 @@ mod tests {
         schema
     }
 
+    fn valid_symmetric_compressed_tensors_matrix_schema() -> WeightSchema {
+        let mut schema = valid_matrix_schema();
+        schema.format_id =
+            WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_SYMMETRIC_WEIGHT_FORMAT_ID).unwrap();
+        schema.layout_id =
+            WeightLayoutId::new("weight-layout.test.compressed-tensors-symmetric-marlin-matrix")
+                .unwrap();
+        schema.components[0].external_names = vec![
+            "projection.weight_packed".to_owned(),
+            "projection.weight_shape".to_owned(),
+        ];
+        let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
+            unreachable!();
+        };
+        spec.format_id =
+            QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID)
+                .unwrap();
+        spec.grouping = QuantizationGrouping::fixed(32);
+        schema.components[1].external_names = vec!["projection.weight_scale".to_owned()];
+        schema.components[1].dimensions = vec![64, 4];
+        schema
+    }
+
     fn valid_fp8_schema(gate_up: bool) -> WeightSchema {
         let packed_id = id("component.fp8_packed");
         let scales_id = id("component.fp8_scales");
@@ -1412,6 +1536,19 @@ mod tests {
     fn validate(schema: &WeightSchema) -> Result<MarlinMoeWeightMetadata, String> {
         validate_gptq_marlin_moe_contract(
             &resolved(schema),
+            &schema.tensors[0].dimensions,
+            schema.tensors[0].logical_element_type,
+            &schema.tensors[0].dimensions,
+        )
+    }
+
+    fn validate_symmetric_compressed_tensors(
+        schema: &WeightSchema,
+    ) -> Result<MarlinMoeWeightMetadata, String> {
+        let resolved = ResolvedWeightBinding::from_schema(schema, &schema.tensors[0].id)
+            .map_err(|error| error.to_string())?;
+        validate_compressed_tensors_symmetric_marlin_contract(
+            &resolved,
             &schema.tensors[0].dimensions,
             schema.tensors[0].logical_element_type,
             &schema.tensors[0].dimensions,
@@ -1531,6 +1668,68 @@ mod tests {
         assert_eq!(metadata.expert_count, 1);
         assert_eq!(metadata.packed_expert_stride_bytes, 4096);
         assert_eq!(metadata.scales_expert_stride_bytes, 128);
+    }
+
+    #[test]
+    fn accepts_exact_symmetric_compressed_tensors_projection_as_marlin_u4b8() {
+        let metadata = validate_symmetric_compressed_tensors(
+            &valid_symmetric_compressed_tensors_matrix_schema(),
+        )
+        .unwrap();
+        assert_eq!(metadata.logical_dimensions, [64, 128]);
+        assert_eq!(metadata.packed_physical_dimensions, [64, 64]);
+        assert_eq!(metadata.scales_physical_dimensions, [64, 4]);
+        assert_eq!(metadata.group_size, 32);
+        assert_eq!(metadata.weight_type, MarlinMoeF16WeightType::U4B8);
+    }
+
+    #[test]
+    fn symmetric_compressed_tensors_projection_rejects_zero_points_and_abi_drift() {
+        let mut wrong_group = valid_symmetric_compressed_tensors_matrix_schema();
+        let WeightEncoding::Quantized(spec) = &mut wrong_group.components[0].encoding else {
+            unreachable!();
+        };
+        spec.grouping = QuantizationGrouping::fixed(64);
+        wrong_group.components[1].dimensions = vec![64, 2];
+        let error = validate_symmetric_compressed_tensors(&wrong_group).unwrap_err();
+        assert!(error.contains("requires group size 32"), "{error}");
+
+        let mut wrong_scales = valid_symmetric_compressed_tensors_matrix_schema();
+        wrong_scales.components[1].dimensions = vec![64, 2];
+        let error = validate_symmetric_compressed_tensors(&wrong_scales).unwrap_err();
+        assert!(error.contains("component.a_scales"), "{error}");
+        assert!(error.contains("contiguous shape"), "{error}");
+
+        let mut zero_point = valid_symmetric_compressed_tensors_matrix_schema();
+        let zero_points_id = id("component.symmetric.zero_points");
+        let WeightEncoding::Quantized(spec) = &mut zero_point.components[0].encoding else {
+            unreachable!();
+        };
+        spec.zero_point_type = Some(ElementType::I32);
+        zero_point.components.push(WeightComponentSpec {
+            id: zero_points_id.clone(),
+            role: WeightComponentRole::ZeroPoints,
+            external_names: vec!["projection.weight_zero_point".to_owned()],
+            dimensions: vec![4, 8],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::I32,
+            },
+            required: true,
+        });
+        let PhysicalWeightLayout::Quantized {
+            zero_points,
+            zero_point_packed_dimensions,
+            ..
+        } = &mut zero_point.tensors[0].physical_layout
+        else {
+            unreachable!();
+        };
+        *zero_points = Some(PhysicalWeightComponentBinding::exact_contiguous(
+            zero_points_id,
+        ));
+        *zero_point_packed_dimensions = Some(vec![4, 8]);
+        let error = validate_symmetric_compressed_tensors(&zero_point).unwrap_err();
+        assert!(error.contains("forbids zero-point"), "{error}");
     }
 
     #[test]

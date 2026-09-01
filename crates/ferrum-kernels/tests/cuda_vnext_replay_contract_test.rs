@@ -1,5 +1,6 @@
 const CAUSAL_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/causal_attention.rs");
+const CAUSAL_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/vnext_causal_attention.cu");
 const RECURRENT_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/attention.rs");
 const TRANSFORMER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer.rs");
@@ -9,9 +10,79 @@ const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
 const GATED_DELTA_KERNEL_SOURCE: &str = include_str!("../kernels/gated_delta_rule.cu");
 const ARGMAX_KERNEL_SOURCE: &str = include_str!("../kernels/argmax_rows.cu");
+const FUSED_SILU_MUL_KERNEL_SOURCE: &str = include_str!("../kernels/fused_silu_mul.cu");
 const MOE_PROVIDER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer/moe.rs");
 const MOE_ROUTER_KERNEL_SOURCE: &str = include_str!("../kernels/moe_router.cu");
 const BUILD_SCRIPT_SOURCE: &str = include_str!("../build.rs");
+
+#[test]
+fn gemma_simple_ops_are_registered_replayable_and_fail_closed() {
+    for capability in [
+        "DENSE_GEGLU_TANH_F16_CAPABILITY_ID",
+        "CONSTANT_SCALE_F16_CAPABILITY_ID",
+        "LOGIT_SOFTCAP_F16_CAPABILITY_ID",
+    ] {
+        assert!(VNEXT_OPS_SOURCE.contains(capability));
+    }
+    for contract in [
+        "dense_geglu_tanh_contract()",
+        "constant_scale_contract()",
+        "logit_softcap_contract()",
+    ] {
+        assert!(VNEXT_OPS_SOURCE.matches(contract).count() >= 1);
+    }
+    for provider in [
+        "CudaDenseGeGluTanhProvider::new(runtime)",
+        "CudaConstantScaleProvider::new(runtime)",
+        "CudaLogitSoftcapProvider::new(runtime)",
+    ] {
+        assert!(VNEXT_OPS_SOURCE.contains(provider));
+    }
+
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("fused_gelu_tanh_mul_f16("));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("const __half* __restrict__ gate"));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("const __half* __restrict__ up"));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("logit_softcap_inplace_f16("));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("cap * tanhf(value / cap)"));
+    assert!(
+        TRANSFORMER_SOURCE.contains("dense GeGLU input {ordinal} has no physical weight layout")
+    );
+
+    let scale = TRANSFORMER_SOURCE
+        .split("fn encode_constant_scale(")
+        .nth(1)
+        .expect("constant-scale encoder")
+        .split("fn encode_logit_softcap(")
+        .next()
+        .expect("bounded constant-scale encoder");
+    assert!(scale.contains("same_physical_region(&input, &output)"));
+    assert!(scale.contains(".f32(scale)"));
+    assert!(scale.contains("replayable_operation("));
+
+    let softcap = TRANSFORMER_SOURCE
+        .split("fn encode_logit_softcap(")
+        .nth(1)
+        .expect("logit-softcap encoder")
+        .split("fn encode_residual_add(")
+        .next()
+        .expect("bounded logit-softcap encoder");
+    assert!(softcap.contains("same_physical_region(&input_region, &output_region)"));
+    assert!(softcap.contains(".f32(cap)"));
+    assert!(softcap.contains("for region in regions"));
+    assert!(softcap.contains("replayable_operation("));
+
+    let geglu = TRANSFORMER_SOURCE
+        .split("fn encode_dense_geglu_tanh(")
+        .nth(1)
+        .expect("dense GeGLU encoder")
+        .split("fn encode_constant_scale(")
+        .next()
+        .expect("bounded dense GeGLU encoder");
+    assert!(geglu.contains("dense_geglu_projection(&invocation)?"));
+    assert!(geglu.contains("launch_planar_gelu_tanh_mul("));
+    assert!(geglu.contains("replayable_operation_with_blas("));
+    assert!(!geglu.contains("fused_gelu_tanh_mul_interleaved_f16"));
+}
 
 #[test]
 fn vnext_masked_argmax_preserves_logits_and_binds_typed_scratch() {
@@ -215,8 +286,11 @@ fn replay_identity_does_not_enable_full_profile_tool_correlation() {
 #[test]
 fn causal_replay_identity_uses_a_partition_capacity_envelope() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("CausalAttentionReplayTopology"));
-    assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStableDecode"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStable"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("ExactShapeEager"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(
+        "CausalAttentionKernelPath::VllmAddressedFallback => shape.maximum_context_tokens"
+    ));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("is_partition_stable"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("partition_stable &= topology.is_partition_stable();"));
     assert!(
@@ -276,7 +350,9 @@ fn direct_attention_bindings_do_not_rebuild_compute_commands() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
     assert!(RECURRENT_ATTENTION_SOURCE.contains("encode_reusable_attention_bindings(invocation)"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
-    assert!(CAUSAL_ATTENTION_SOURCE.contains("encode_reusable_attention_bindings(invocation)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(
+        "encode_reusable_attention_bindings(\n            invocation,\n            self.semantics,\n            self.descriptor.operation_id().as_str(),\n        )"
+    ));
 
     for source in [RECURRENT_ATTENTION_SOURCE, CAUSAL_ATTENTION_SOURCE] {
         let binding_only = source
@@ -361,6 +437,39 @@ fn causal_attention_packs_shared_wave_projections_and_residual() {
     assert!(!token_offset.contains("aligned_bytes("));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("\"packed causal attention Q GEMM\""));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("\"packed causal attention output GEMM\""));
+}
+
+#[test]
+fn causal_fallback_packs_prepare_and_attention_across_participants() {
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("struct PackedFallbackLaunch"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("fn packed_fallback_launch("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("Some(packed_fallback)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("packed_fallback.path.uses_vllm_layout()"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("participant_grid"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("packed_token_grid"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("binding_slot_bytes"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int participant = blockIdx.z"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_participant_control("));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
+        .contains("(unsigned long long)participant * binding_slot_bytes"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("binding_slot_bytes == 0 ? 0 : control[4]"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
+        .contains("(long long)packed_token * query_projection_stride"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
+        .contains("(long long)packed_token * query_heads + query_head"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("GROUPED_ATTENTION_FUNCTION"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("grouped_fallback_block_threads"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("if packed.is_some()"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("packed.packed_token_grid"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("shape.key_value_heads"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_causal_attention_grouped_f16"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_packed_participant("));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int packed_token = (int)blockIdx.x"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int kv_head = (int)blockIdx.y"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int queries_per_kv"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("extern __shared__ __half grouped_kv_tile[]"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("VNEXT_GROUPED_GEMMA_LOCAL_KV_TILE_TOKENS"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("VNEXT_GROUPED_DEFAULT_KV_TILE_TOKENS"));
 }
 
 #[test]
