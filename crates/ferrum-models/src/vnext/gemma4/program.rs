@@ -6,7 +6,7 @@ use ferrum_interfaces::vnext::{
     ProgramValueId, ResolvedTensorLayout, SemanticValue, StateCapacityDemand, StateId,
     StateInitialization, StateLifetime, StateSpec, VNextError, WeightReference,
     CONSTANT_SCALE_OPERATION_ID, DENSE_GEGLU_TANH_OPERATION_ID,
-    GEMMA4_CAUSAL_PAGED_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
+    HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, LOGIT_SOFTCAP_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID,
     RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
@@ -113,7 +113,7 @@ pub(super) fn build_semantic_program(
         };
         nodes.push(ProgramNode {
             id: node_id(format!("node.layer.{layer_index}.attention"))?,
-            operation_id: operation_id(GEMMA4_CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
+            operation_id: operation_id(HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
             required_version: ContractVersion::new(1, 0),
             work: ProgramNodeWorkSpec::tokens(hidden.clone(), 0),
             inputs: vec![
