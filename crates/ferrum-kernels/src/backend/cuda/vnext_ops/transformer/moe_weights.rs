@@ -1690,6 +1690,7 @@ mod tests {
             unreachable!();
         };
         spec.grouping = QuantizationGrouping::fixed(64);
+        wrong_group.components[1].dimensions = vec![64, 2];
         let error = validate_symmetric_compressed_tensors(&wrong_group).unwrap_err();
         assert!(error.contains("requires group size 32"), "{error}");
 
