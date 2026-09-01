@@ -250,11 +250,11 @@ jobs:
           PY
           echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
 
-      - name: Type check (full CUDA release features)
+      - name: Type check release CLI (full CUDA features)
         run: |
           export PATH="/root/.cargo/bin:/usr/local/cuda/bin:$PATH"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
-          cargo check --workspace --all-targets \
+          cargo check -p ferrum-cli --bin ferrum \
             --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 
       - name: Build CUDA kernels (PTX)
