@@ -1,5 +1,6 @@
 const CAUSAL_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/causal_attention.rs");
+const CAUSAL_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/vnext_causal_attention.cu");
 const RECURRENT_ATTENTION_SOURCE: &str =
     include_str!("../src/backend/cuda/vnext_ops/transformer/attention.rs");
 const TRANSFORMER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer.rs");
@@ -285,8 +286,11 @@ fn replay_identity_does_not_enable_full_profile_tool_correlation() {
 #[test]
 fn causal_replay_identity_uses_a_partition_capacity_envelope() {
     assert!(CAUSAL_ATTENTION_SOURCE.contains("CausalAttentionReplayTopology"));
-    assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStableDecode"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("PartitionStable"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("ExactShapeEager"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains(
+        "CausalAttentionKernelPath::VllmAddressedFallback => shape.maximum_context_tokens"
+    ));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("is_partition_stable"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("partition_stable &= topology.is_partition_stable();"));
     assert!(
@@ -433,6 +437,25 @@ fn causal_attention_packs_shared_wave_projections_and_residual() {
     assert!(!token_offset.contains("aligned_bytes("));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("\"packed causal attention Q GEMM\""));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("\"packed causal attention output GEMM\""));
+}
+
+#[test]
+fn causal_fallback_packs_prepare_and_attention_across_participants() {
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("struct PackedFallbackLaunch"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("fn packed_fallback_launch("));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("Some(packed_fallback)"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("packed_fallback.path.uses_vllm_layout()"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("participant_grid"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("binding_slot_bytes"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("const int participant = blockIdx.z"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_participant_control("));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
+        .contains("(unsigned long long)participant * binding_slot_bytes"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("binding_slot_bytes == 0 ? 0 : control[4]"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
+        .contains("(long long)packed_token * query_projection_stride"));
+    assert!(CAUSAL_ATTENTION_KERNEL_SOURCE
+        .contains("(long long)packed_token * query_heads + query_head"));
 }
 
 #[test]

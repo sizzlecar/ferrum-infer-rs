@@ -86,7 +86,9 @@ const COMPUTE_VLLM_DECODE_V2_OPERATION: &str =
 const COMPUTE_MIXED_OPERATION: &str = "vnext.causal_attention.mixed_native_paths";
 const SCRATCH_ALIGNMENT: u64 = 16;
 const POINTER_BYTES: u64 = std::mem::size_of::<u64>() as u64;
-const BINDING_CONTROL_WORDS: usize = 4;
+// table entries, source start, active tokens, sequence tokens, packed token
+// start, and one reserved word keep the following u64 page table aligned.
+const BINDING_CONTROL_WORDS: usize = 6;
 const BINDING_CONTROL_BYTES: u64 = (BINDING_CONTROL_WORDS * std::mem::size_of::<i32>()) as u64;
 const BINDING_SEQUENCE_LENGTH_OFFSET: u64 = 3 * std::mem::size_of::<i32>() as u64;
 const WARP_THREADS: u32 = 32;
@@ -781,6 +783,10 @@ impl CausalAttentionKernelPath {
     fn uses_vllm_layout(self) -> bool {
         !matches!(self, Self::TokenMajorFallback)
     }
+
+    fn is_fallback(self) -> bool {
+        matches!(self, Self::TokenMajorFallback | Self::VllmAddressedFallback)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -805,8 +811,8 @@ impl CausalAttentionReplayEnvelope {
                 .map(|capacity| capacity.min(shape.maximum_context_tokens))
                 .ok_or_else(|| "causal attention replay sequence capacity overflows".to_owned())?,
             CausalAttentionKernelPath::TokenMajorFallback
-            | CausalAttentionKernelPath::VllmAddressedFallback
-            | CausalAttentionKernelPath::VllmAddressedVarlen
+            | CausalAttentionKernelPath::VllmAddressedFallback => shape.maximum_context_tokens,
+            CausalAttentionKernelPath::VllmAddressedVarlen
             | CausalAttentionKernelPath::VllmAddressedVarlenTiled => sequence_tokens,
         };
         if sequence_tokens == 0
@@ -827,7 +833,7 @@ impl CausalAttentionReplayEnvelope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CausalAttentionReplayTopology {
-    PartitionStableDecode(CausalAttentionReplayEnvelope),
+    PartitionStable(CausalAttentionReplayEnvelope),
     ExactShapeEager(CausalAttentionReplayEnvelope),
 }
 
@@ -839,13 +845,11 @@ impl CausalAttentionReplayTopology {
     ) -> Result<Self, String> {
         let envelope = CausalAttentionReplayEnvelope::new(shape, path, sequence_tokens)?;
         Ok(match path {
-            CausalAttentionKernelPath::VllmAddressedDecodeV1
-            | CausalAttentionKernelPath::VllmAddressedDecodeV2 => {
-                Self::PartitionStableDecode(envelope)
-            }
             CausalAttentionKernelPath::TokenMajorFallback
             | CausalAttentionKernelPath::VllmAddressedFallback
-            | CausalAttentionKernelPath::VllmAddressedVarlen
+            | CausalAttentionKernelPath::VllmAddressedDecodeV1
+            | CausalAttentionKernelPath::VllmAddressedDecodeV2 => Self::PartitionStable(envelope),
+            CausalAttentionKernelPath::VllmAddressedVarlen
             | CausalAttentionKernelPath::VllmAddressedVarlenTiled => {
                 Self::ExactShapeEager(envelope)
             }
@@ -854,12 +858,12 @@ impl CausalAttentionReplayTopology {
 
     const fn envelope(self) -> CausalAttentionReplayEnvelope {
         match self {
-            Self::PartitionStableDecode(envelope) | Self::ExactShapeEager(envelope) => envelope,
+            Self::PartitionStable(envelope) | Self::ExactShapeEager(envelope) => envelope,
         }
     }
 
     const fn is_partition_stable(self) -> bool {
-        matches!(self, Self::PartitionStableDecode(_))
+        matches!(self, Self::PartitionStable(_))
     }
 }
 
@@ -1636,6 +1640,41 @@ struct PackedCausalAttentionLaunch {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct PackedFallbackLaunch {
+    token_grid: u64,
+    participant_grid: u32,
+    binding_slot_bytes: u64,
+    path: CausalAttentionKernelPath,
+}
+
+fn packed_fallback_launch(
+    launches: &[CausalAttentionLaunch],
+    binding_layout: BindingLayout,
+) -> Result<Option<PackedFallbackLaunch>, String> {
+    let Some(first) = launches.first() else {
+        return Err("packed causal attention has no participants".to_owned());
+    };
+    if launches.len() <= 1
+        || !first.path.is_fallback()
+        || launches.iter().any(|launch| launch.path != first.path)
+    {
+        return Ok(None);
+    }
+    let token_grid = launches
+        .iter()
+        .map(|launch| launch.tokens)
+        .max()
+        .ok_or_else(|| "packed causal fallback has no token grid".to_owned())?;
+    Ok(Some(PackedFallbackLaunch {
+        token_grid,
+        participant_grid: u32::try_from(launches.len())
+            .map_err(|_| "packed causal fallback participant grid exceeds u32".to_owned())?,
+        binding_slot_bytes: binding_layout.slot_bytes,
+        path: first.path,
+    }))
+}
+
+#[derive(Debug, Clone, Copy)]
 struct CausalAttentionBinding {
     first_page_region: usize,
     page_count: usize,
@@ -1855,6 +1894,7 @@ fn encode_attention(
             position_start,
             tokens_i32,
             sequence_tokens_i32,
+            checked_i32(packed_range.start, "causal attention packed token start")?,
             &pages,
         )?);
         let page_count = pages.len();
@@ -2067,8 +2107,18 @@ fn encode_attention(
         move |stream: &CudaStream, blas: &CudaBlas, regions: &[CudaBufferRegion]| {
             if let Some(packed) = packed {
                 enqueue_packed_attention(
-                    stream, blas, &functions, projection, shape, cuda, layout, shared, packed,
-                    &launches, regions,
+                    stream,
+                    blas,
+                    &functions,
+                    projection,
+                    shape,
+                    cuda,
+                    layout,
+                    binding_layout,
+                    shared,
+                    packed,
+                    &launches,
+                    regions,
                 )?;
             } else {
                 for launch in &launches {
@@ -2127,6 +2177,16 @@ fn physical_dispatch_count(
     post_attention_norm: bool,
     packed: bool,
 ) -> u64 {
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    let packed_fallback = packed
+        && paths.len() > 1
+        && paths.first().is_some_and(|path| path.is_fallback())
+        && paths.iter().all(|path| Some(path) == paths.first());
+    if packed_fallback {
+        return (6 + u64::from(post_attention_norm))
+            .saturating_add(2)
+            .saturating_add(if output_gate { paths.len() as u64 } else { 0 });
+    }
     paths.into_iter().fold(
         if packed {
             6 + u64::from(post_attention_norm)
@@ -2206,6 +2266,7 @@ fn encode_reusable_attention_bindings(
     {
         let tokens = token_range.immediate_tokens();
         let source = token_range.source_token_range();
+        let packed_range = token_range.immediate_token_range();
         if source.end > token_range.full_input_tokens()
             || token_range.full_input_tokens() > shape.maximum_context_tokens
         {
@@ -2235,6 +2296,7 @@ fn encode_reusable_attention_bindings(
             checked_i32(source.start, "causal attention source position")?,
             checked_i32(tokens, "causal attention participant token count")?,
             checked_i32(source.end, "causal attention sequence token count")?,
+            checked_i32(packed_range.start, "causal attention packed token start")?,
             &pages,
         )?;
         writes.push(
@@ -2332,6 +2394,7 @@ fn enqueue_packed_attention(
     logical: CausalAttentionShape,
     cuda: CudaCausalAttentionShape,
     layout: ScratchLayout,
+    binding_layout: BindingLayout,
     shared: SharedRegions,
     packed: PackedCausalAttentionLaunch,
     launches: &[CausalAttentionLaunch],
@@ -2401,54 +2464,108 @@ fn enqueue_packed_attention(
         )?;
     }
 
-    for launch in launches {
-        let control = scratch_pointer(binding.device_ptr(), launch.binding_offset)?;
+    if let Some(packed_fallback) = packed_fallback_launch(launches, binding_layout)
+        .map_err(CudaDeviceRuntimeError::contract)?
+    {
+        let launch = launches[0];
+        let control = binding.device_ptr();
         let page_table = control.checked_add(BINDING_CONTROL_BYTES).ok_or_else(|| {
             CudaDeviceRuntimeError::contract("packed causal attention page-table pointer overflows")
         })?;
-        let participant_query_raw = scratch_pointer(scratch_base, launch.packed_query_raw)?;
-        let participant_key_raw = scratch_pointer(scratch_base, launch.packed_key_raw)?;
-        let participant_value_raw = scratch_pointer(scratch_base, launch.packed_value_raw)?;
-        let participant_query = scratch_pointer(scratch_base, launch.packed_query)?;
-        let participant_context = scratch_pointer(scratch_base, launch.packed_context)?;
-
         launch_prepare(
             stream,
             &functions.prepare,
-            participant_query_raw,
-            participant_key_raw,
-            participant_value_raw,
+            query_raw,
+            key_raw,
+            value_raw,
             regions[shared.query_norm].device_ptr(),
             regions[shared.key_norm].device_ptr(),
-            participant_query,
+            scratch_pointer(scratch_base, layout.query)?,
             control,
             page_table,
-            *launch,
+            launch,
             cuda,
-            i32::from(launch.path.uses_vllm_layout()),
+            i32::from(packed_fallback.path.uses_vllm_layout()),
+            Some(packed_fallback),
         )?;
-        launch_selected_attention(
+        launch_fallback_attention(
             stream,
-            functions,
-            participant_query,
-            participant_query_raw,
+            &functions.attention,
+            scratch_pointer(scratch_base, layout.query)?,
+            query_raw,
             control,
             page_table,
-            participant_context,
-            *launch,
+            context,
+            launch,
             cuda,
-            layout,
-            scratch_base,
+            i32::from(packed_fallback.path.uses_vllm_layout()),
+            Some(packed_fallback),
         )?;
         if logical.output_gate {
-            launch_attention_gate(
+            for launch in launches {
+                launch_attention_gate(
+                    stream,
+                    &functions.attention_gate,
+                    scratch_pointer(scratch_base, launch.packed_context)?,
+                    scratch_pointer(scratch_base, launch.packed_query_raw)?,
+                    *launch,
+                    cuda,
+                )?;
+            }
+        }
+    } else {
+        for launch in launches {
+            let control = scratch_pointer(binding.device_ptr(), launch.binding_offset)?;
+            let page_table = control.checked_add(BINDING_CONTROL_BYTES).ok_or_else(|| {
+                CudaDeviceRuntimeError::contract(
+                    "packed causal attention page-table pointer overflows",
+                )
+            })?;
+            let participant_query_raw = scratch_pointer(scratch_base, launch.packed_query_raw)?;
+            let participant_key_raw = scratch_pointer(scratch_base, launch.packed_key_raw)?;
+            let participant_value_raw = scratch_pointer(scratch_base, launch.packed_value_raw)?;
+            let participant_query = scratch_pointer(scratch_base, launch.packed_query)?;
+            let participant_context = scratch_pointer(scratch_base, launch.packed_context)?;
+
+            launch_prepare(
                 stream,
-                &functions.attention_gate,
-                participant_context,
+                &functions.prepare,
                 participant_query_raw,
+                participant_key_raw,
+                participant_value_raw,
+                regions[shared.query_norm].device_ptr(),
+                regions[shared.key_norm].device_ptr(),
+                participant_query,
+                control,
+                page_table,
                 *launch,
                 cuda,
+                i32::from(launch.path.uses_vllm_layout()),
+                None,
             )?;
+            launch_selected_attention(
+                stream,
+                functions,
+                participant_query,
+                participant_query_raw,
+                control,
+                page_table,
+                participant_context,
+                *launch,
+                cuda,
+                layout,
+                scratch_base,
+            )?;
+            if logical.output_gate {
+                launch_attention_gate(
+                    stream,
+                    &functions.attention_gate,
+                    participant_context,
+                    participant_query_raw,
+                    *launch,
+                    cuda,
+                )?;
+            }
         }
     }
 
@@ -2598,6 +2715,7 @@ fn enqueue_attention(
         launch,
         cuda,
         i32::from(launch.path.uses_vllm_layout()),
+        None,
     )?;
     launch_selected_attention(
         stream,
@@ -2772,6 +2890,7 @@ fn launch_prepare(
     launch: CausalAttentionLaunch,
     shape: CudaCausalAttentionShape,
     kv_layout: i32,
+    packed: Option<PackedFallbackLaunch>,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let page_elements = checked_i32_runtime(
         VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
@@ -2812,14 +2931,18 @@ fn launch_prepare(
     builder.arg(&shape.rope_theta);
     builder.arg(&shape.rope_interleaved);
     builder.arg(&shape.value_rms_norm);
+    let binding_slot_bytes = packed.map_or(0, |packed| packed.binding_slot_bytes);
+    builder.arg(&binding_slot_bytes);
+    let token_grid = packed.map_or(launch.tokens, |packed| packed.token_grid);
+    let participant_grid = packed.map_or(1, |packed| packed.participant_grid);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (
-                checked_u32_runtime(launch.tokens, "causal prepare token grid")?,
+                checked_u32_runtime(token_grid, "causal prepare token grid")?,
                 u32::try_from(combined_heads).map_err(|_| {
                     CudaDeviceRuntimeError::contract("causal prepare head grid exceeds u32")
                 })?,
-                1,
+                participant_grid,
             ),
             block_dim: (WARP_THREADS, 1, 1),
             shared_mem_bytes: 0,
@@ -2855,6 +2978,7 @@ fn launch_selected_attention(
             launch,
             shape,
             0,
+            None,
         ),
         CausalAttentionKernelPath::VllmAddressedFallback => launch_fallback_attention(
             stream,
@@ -2867,6 +2991,7 @@ fn launch_selected_attention(
             launch,
             shape,
             1,
+            None,
         ),
         CausalAttentionKernelPath::VllmAddressedVarlen => launch_addressed_varlen_attention(
             stream,
@@ -3072,6 +3197,7 @@ fn launch_fallback_attention(
     launch: CausalAttentionLaunch,
     shape: CudaCausalAttentionShape,
     kv_layout: i32,
+    packed: Option<PackedFallbackLaunch>,
 ) -> Result<(), CudaDeviceRuntimeError> {
     let page_elements = checked_i32_runtime(
         VNEXT_KV_PAGE_BYTES / ElementType::F16.size_bytes(),
@@ -3096,14 +3222,18 @@ fn launch_fallback_attention(
     }
     builder.arg(&shape.attention_scale);
     builder.arg(&shape.sliding_window_tokens);
+    let binding_slot_bytes = packed.map_or(0, |packed| packed.binding_slot_bytes);
+    builder.arg(&binding_slot_bytes);
+    let token_grid = packed.map_or(launch.tokens, |packed| packed.token_grid);
+    let participant_grid = packed.map_or(1, |packed| packed.participant_grid);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (
-                checked_u32_runtime(launch.tokens, "causal attention token grid")?,
+                checked_u32_runtime(token_grid, "causal attention token grid")?,
                 u32::try_from(shape.query_heads).map_err(|_| {
                     CudaDeviceRuntimeError::contract("causal attention head grid exceeds u32")
                 })?,
-                1,
+                participant_grid,
             ),
             block_dim: (WARP_THREADS, 1, 1),
             shared_mem_bytes: 0,
@@ -3252,6 +3382,7 @@ fn binding_payload(
     position_start: i32,
     active_tokens: i32,
     sequence_tokens: i32,
+    packed_token_start: i32,
     pages: &[CudaBufferRegion],
 ) -> Result<Box<[u8]>, String> {
     let page_addresses = pages
@@ -3267,6 +3398,8 @@ fn binding_payload(
         position_start,
         active_tokens,
         sequence_tokens,
+        packed_token_start,
+        0,
     ] {
         payload.extend_from_slice(&value.to_ne_bytes());
     }
@@ -4212,6 +4345,8 @@ mod tests {
     fn packed_dispatch_count_keeps_only_sequence_local_work_per_participant() {
         let v1 = CausalAttentionKernelPath::VllmAddressedDecodeV1;
         let v2 = CausalAttentionKernelPath::VllmAddressedDecodeV2;
+        let token_fallback = CausalAttentionKernelPath::TokenMajorFallback;
+        let addressed_fallback = CausalAttentionKernelPath::VllmAddressedFallback;
 
         assert_eq!(physical_dispatch_count([v1], false, false, false), 8);
         assert_eq!(physical_dispatch_count([v1; 4], false, false, false), 32);
@@ -4222,6 +4357,90 @@ mod tests {
         assert_eq!(physical_dispatch_count([v2; 32], true, false, true), 134);
         assert_eq!(physical_dispatch_count([v1], false, true, false), 9);
         assert_eq!(physical_dispatch_count([v1; 4], false, true, true), 15);
+        assert_eq!(
+            physical_dispatch_count([token_fallback; 4], false, false, false),
+            32
+        );
+        assert_eq!(
+            physical_dispatch_count([token_fallback; 4], false, false, true),
+            8
+        );
+        assert_eq!(
+            physical_dispatch_count([token_fallback; 32], false, true, true),
+            9
+        );
+        assert_eq!(
+            physical_dispatch_count([addressed_fallback; 32], true, false, true),
+            40
+        );
+        assert_eq!(
+            physical_dispatch_count([token_fallback, addressed_fallback], false, false, true,),
+            10
+        );
+    }
+
+    #[test]
+    fn packed_fallback_launch_requires_one_shared_fallback_path() {
+        let layout = BindingLayout {
+            required_bytes: 1_024,
+            slot_bytes: 256,
+        };
+        let launch = |path, tokens| CausalAttentionLaunch {
+            input_region: 0,
+            output_region: 1,
+            binding_offset: 0,
+            packed_token_start: 0,
+            packed_query_raw: 0,
+            packed_key_raw: 0,
+            packed_value_raw: 0,
+            packed_query: 0,
+            packed_context: 0,
+            tokens,
+            tokens_i32: tokens as i32,
+            sequence_tokens: tokens,
+            sequence_tokens_i32: tokens as i32,
+            table_entries_i32: 1,
+            replay_topology: CausalAttentionReplayTopology::PartitionStable(
+                CausalAttentionReplayEnvelope {
+                    sequence_capacity_tokens: tokens,
+                    table_capacity_entries: 1,
+                },
+            ),
+            path,
+        };
+
+        let packed = packed_fallback_launch(
+            &[
+                launch(CausalAttentionKernelPath::TokenMajorFallback, 1),
+                launch(CausalAttentionKernelPath::TokenMajorFallback, 4),
+            ],
+            layout,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(packed.token_grid, 4);
+        assert_eq!(packed.participant_grid, 2);
+        assert_eq!(packed.binding_slot_bytes, 256);
+        assert_eq!(packed.path, CausalAttentionKernelPath::TokenMajorFallback);
+
+        assert!(packed_fallback_launch(
+            &[
+                launch(CausalAttentionKernelPath::TokenMajorFallback, 1),
+                launch(CausalAttentionKernelPath::VllmAddressedFallback, 1),
+            ],
+            layout,
+        )
+        .unwrap()
+        .is_none());
+        assert!(packed_fallback_launch(
+            &[
+                launch(CausalAttentionKernelPath::VllmAddressedDecodeV1, 1),
+                launch(CausalAttentionKernelPath::VllmAddressedDecodeV1, 1),
+            ],
+            layout,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -4354,7 +4573,7 @@ mod tests {
 
         let payload_bytes =
             BINDING_CONTROL_BYTES + u64::try_from(after.len()).unwrap() * POINTER_BYTES;
-        assert_eq!(payload_bytes, 416);
+        assert_eq!(payload_bytes, 424);
         assert!(payload_bytes <= qwen35.binding_slot_bytes().unwrap());
     }
 
@@ -4436,7 +4655,7 @@ mod tests {
 
     #[cfg(feature = "vllm-paged-attn-v2")]
     #[test]
-    fn exact_shape_attention_paths_are_explicit_eager_boundaries() {
+    fn varlen_paths_are_eager_while_portable_fallback_is_replayable() {
         let shape = goal_shape(16, 2, 256, 4_096);
         let topology = |rows: &[(u64, u64)]| {
             reusable_attention_topology_from_rows(
@@ -4461,7 +4680,7 @@ mod tests {
             topology(&[(1, 64), (8, 64)]),
             ReusableExecutionTopology::EagerBoundary
         );
-        assert_eq!(
+        assert!(matches!(
             reusable_attention_topology_from_rows(
                 AttentionExecutionPolicy::Portable,
                 shape,
@@ -4472,12 +4691,12 @@ mod tests {
                 })),
             )
             .unwrap(),
-            ReusableExecutionTopology::EagerBoundary
-        );
+            ReusableExecutionTopology::Dynamic(_)
+        ));
     }
 
     #[test]
-    fn only_partition_stable_decode_topologies_are_replayable() {
+    fn decode_and_fallback_topologies_are_partition_stable() {
         let shape = goal_shape(32, 4, 128, 32_768);
         for path in [
             CausalAttentionKernelPath::VllmAddressedDecodeV1,
@@ -4498,12 +4717,49 @@ mod tests {
         for path in [
             CausalAttentionKernelPath::TokenMajorFallback,
             CausalAttentionKernelPath::VllmAddressedFallback,
+        ] {
+            let topology = CausalAttentionReplayTopology::new(shape, path, 64).unwrap();
+            assert!(topology.is_partition_stable());
+            assert_eq!(
+                topology.envelope().sequence_capacity_tokens,
+                shape.maximum_context_tokens
+            );
+        }
+
+        for path in [
             CausalAttentionKernelPath::VllmAddressedVarlen,
             CausalAttentionKernelPath::VllmAddressedVarlenTiled,
         ] {
             assert!(!CausalAttentionReplayTopology::new(shape, path, 64)
                 .unwrap()
                 .is_partition_stable());
+        }
+    }
+
+    #[test]
+    fn gemma4_fallback_replay_fingerprint_is_stable_across_sequence_frontiers() {
+        let fingerprint = |shape, sequence_tokens| match reusable_attention_topology_from_rows(
+            AttentionExecutionPolicy::NativeAdaptive,
+            shape,
+            1,
+            std::iter::once(Ok(CausalAttentionTopologyRow {
+                active_tokens: 1,
+                sequence_tokens,
+            })),
+        )
+        .unwrap()
+        {
+            ReusableExecutionTopology::Dynamic(fingerprint) => fingerprint,
+            topology => panic!("Gemma4 fallback must be replayable, got {topology:?}"),
+        };
+
+        for full_attention in [false, true] {
+            let shape = CausalAttentionShape::from_attributes_for(
+                &gemma4_attributes(full_attention),
+                CausalAttentionSemantics::Gemma4,
+            )
+            .unwrap();
+            assert_eq!(fingerprint(shape, 64), fingerprint(shape, 2_048));
         }
     }
 
