@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    hf_metadata::parse_hf_model_semantic_metadata, CausalLanguageModelDescriptor,
-    PreparedProductionModel, ProductionModelSourceBundle, ProductionWeightArtifact,
+    hf_metadata::parse_hf_model_semantic_metadata_with_external_template,
+    CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
+    ProductionWeightArtifact,
 };
 
 mod config;
@@ -58,7 +59,7 @@ impl Gemma4FamilyProvider {
             .map_err(|reason| invalid_config("semantic", reason))?;
         config.weights.validate(&config.semantic)?;
         if config.metadata.template.template.is_empty()
-            || config.metadata.template.source_file != "tokenizer_config.json"
+            || config.metadata.template.source_file != "chat_template.jinja"
             || config.metadata.special_tokens.eos_token_ids.is_empty()
         {
             return Err(invalid_config(
@@ -154,12 +155,23 @@ pub(super) fn prepare_from_sources(
     sources: Arc<ProductionModelSourceBundle>,
 ) -> ferrum_types::Result<PreparedProductionModel> {
     let tokenizer_config = sources.tokenizer_config_json().ok_or_else(|| {
-        ferrum_types::FerrumError::model("tokenizer source missing tokenizer_config.json")
+        ferrum_types::FerrumError::model("Gemma 4 source missing tokenizer_config.json")
+    })?;
+    let chat_template = sources.chat_template_jinja().ok_or_else(|| {
+        ferrum_types::FerrumError::model("Gemma 4 source missing chat_template.jinja")
+    })?;
+    let generation_config = sources.generation_config_json().ok_or_else(|| {
+        ferrum_types::FerrumError::model("Gemma 4 source missing generation_config.json")
     })?;
     let model_config: Value = serde_json::from_slice(sources.config_json())
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    let metadata = parse_hf_model_semantic_metadata(&model_config, tokenizer_config)
-        .map_err(ferrum_types::FerrumError::model)?;
+    let metadata = parse_hf_model_semantic_metadata_with_external_template(
+        &model_config,
+        tokenizer_config,
+        chat_template,
+        generation_config,
+    )
+    .map_err(ferrum_types::FerrumError::model)?;
     let semantic = Gemma4SemanticConfig::parse(sources.config_json())
         .map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {

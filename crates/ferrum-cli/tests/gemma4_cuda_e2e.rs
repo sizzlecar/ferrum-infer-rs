@@ -532,11 +532,26 @@ fn write_tokenizer(model_dir: &Path) {
             "eos_token_id": 2,
             "pad_token_id": 1,
             "model_max_length": 128,
-            "chat_template": "{%- for message in messages -%}{{ message['content'] }}{%- endfor -%}"
+            "chat_template": null
         }))
         .unwrap(),
     )
     .expect("write tokenizer_config.json");
+    fs::write(
+        model_dir.join("chat_template.jinja"),
+        "{%- for message in messages -%}{{ message['content'] }}{%- endfor -%}",
+    )
+    .expect("write chat_template.jinja");
+    fs::write(
+        model_dir.join("generation_config.json"),
+        serde_json::to_vec_pretty(&json!({
+            "bos_token_id": 3,
+            "eos_token_id": 2,
+            "pad_token_id": 1
+        }))
+        .unwrap(),
+    )
+    .expect("write generation_config.json");
 }
 
 fn write_config(model_dir: &Path) {
