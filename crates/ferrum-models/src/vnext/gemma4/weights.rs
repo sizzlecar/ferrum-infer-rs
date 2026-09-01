@@ -1,12 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ferrum_interfaces::vnext::{
-    ContractVersion, ElementType, PhysicalWeightComponentBinding, PhysicalWeightLayout,
-    PhysicalWeightPadding, ProgramValueId, QuantizationFormatId, QuantizationGrouping,
-    QuantizationPacking, QuantizationSpec, VNextError, WeightComponentRole, WeightComponentSpec,
-    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightSchema, WeightTensorSpec,
+    CanonicalRational, ContractVersion, ElementType, PhysicalWeightComponentBinding,
+    PhysicalWeightLayout, PhysicalWeightPadding, ProgramValueId, QuantizationFormatId,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec, VNextError, WeightComponentRole,
+    WeightComponentSpec, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, WeightSchema,
+    WeightTensorSpec,
 };
 use ferrum_quantization::{SafetensorsArchive, COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID};
+use half::bf16;
 use safetensors::Dtype;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,7 +57,6 @@ enum Gemma4SourceDtype {
 #[serde(rename_all = "snake_case")]
 enum Gemma4NonExecutedReason {
     TiedProjectionDuplicate,
-    CompileTimeUnitLayerScale,
     TextOnlyMultimodalComponent,
 }
 
@@ -77,6 +78,7 @@ pub(super) struct Gemma4WeightManifest {
     execution_source_tensor_count: u64,
     execution_quantized_weight_count: u64,
     structure_fingerprint: String,
+    layer_scales: Vec<CanonicalRational>,
     non_executed_tensors: Vec<Gemma4NonExecutedTensor>,
 }
 
@@ -129,7 +131,7 @@ impl Gemma4WeightManifest {
             }
         }
         validate_shape_sidecar_payloads(archive, semantic)?;
-        validate_unit_layer_scalars(archive, semantic)?;
+        let layer_scales = load_layer_scales(archive, semantic)?;
 
         let structure_fingerprint = structure_fingerprint(archive)?;
         let execution_quantized_weight_count = quantized_weight_count(semantic)?;
@@ -140,6 +142,7 @@ impl Gemma4WeightManifest {
                 .map_err(|_| "Gemma 4 execution tensor count exceeds u64".to_owned())?,
             execution_quantized_weight_count,
             structure_fingerprint,
+            layer_scales,
             non_executed_tensors,
         };
         manifest
@@ -198,12 +201,6 @@ impl Gemma4WeightManifest {
                         "tied lm_head duplicate has the wrong shape",
                     ));
                 }
-                Gemma4NonExecutedReason::CompileTimeUnitLayerScale if tensor.dimensions != [1] => {
-                    return Err(invalid_config(
-                        "weights.non_executed_tensors",
-                        "compile-time layer scalar must have shape [1]",
-                    ));
-                }
                 _ => {}
             }
         }
@@ -216,6 +213,8 @@ impl Gemma4WeightManifest {
             || self.execution_quantized_weight_count
                 != quantized_weight_count(semantic)
                     .map_err(|reason| invalid_config("weights", reason))?
+            || self.layer_scales.len() != semantic.layer_types.len()
+            || self.layer_scales.iter().any(|scale| scale.numerator() <= 0)
             || self.structure_fingerprint.len() != 64
             || !self
                 .structure_fingerprint
@@ -228,6 +227,22 @@ impl Gemma4WeightManifest {
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn layer_scale(&self, layer_index: u32) -> Result<CanonicalRational, VNextError> {
+        self.layer_scales
+            .get(
+                usize::try_from(layer_index).map_err(|_| {
+                    invalid_config("weights.layer_scales", "layer index exceeds usize")
+                })?,
+            )
+            .copied()
+            .ok_or_else(|| {
+                invalid_config(
+                    "weights.layer_scales",
+                    format!("missing scale for layer {layer_index}"),
+                )
+            })
     }
 
     pub(super) fn weight_schema(
@@ -476,6 +491,12 @@ fn expected_execution_tensors(
         let layer_index = u32::try_from(index).map_err(|_| "layer index exceeds u32".to_owned())?;
         let prefix = format!("model.language_model.layers.{layer_index}");
         let head_dim = semantic.head_dim(layer_type);
+        insert_expected(
+            &mut expected,
+            format!("{prefix}.layer_scalar"),
+            Dtype::BF16,
+            vec![1],
+        )?;
         for (suffix, dimensions) in [
             ("input_layernorm.weight", vec![semantic.hidden_size]),
             (
@@ -601,15 +622,12 @@ fn insert_expected(
     Ok(())
 }
 
-fn owned_expected_non_executed_names(semantic: &Gemma4SemanticConfig) -> BTreeSet<String> {
+fn owned_expected_non_executed_names(_semantic: &Gemma4SemanticConfig) -> BTreeSet<String> {
     let mut names = MULTIMODAL_TENSOR_NAMES
         .iter()
         .map(|name| (*name).to_owned())
         .collect::<BTreeSet<_>>();
     names.insert("lm_head.weight".to_owned());
-    for index in 0..semantic.layer_count {
-        names.insert(format!("model.language_model.layers.{index}.layer_scalar"));
-    }
     names
 }
 
@@ -644,19 +662,10 @@ fn load_non_executed_tensors(
 
 fn non_executed_reason(
     name: &str,
-    semantic: &Gemma4SemanticConfig,
+    _semantic: &Gemma4SemanticConfig,
 ) -> Result<Gemma4NonExecutedReason, String> {
     if name == "lm_head.weight" {
         return Ok(Gemma4NonExecutedReason::TiedProjectionDuplicate);
-    }
-    if let Some(index) = name
-        .strip_prefix("model.language_model.layers.")
-        .and_then(|value| value.strip_suffix(".layer_scalar"))
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        if index < semantic.layer_count {
-            return Ok(Gemma4NonExecutedReason::CompileTimeUnitLayerScale);
-        }
     }
     if MULTIMODAL_TENSOR_NAMES.contains(&name) {
         return Ok(Gemma4NonExecutedReason::TextOnlyMultimodalComponent);
@@ -691,21 +700,33 @@ fn validate_shape_sidecar_payloads(
     Ok(())
 }
 
-fn validate_unit_layer_scalars(
+fn load_layer_scales(
     archive: &SafetensorsArchive,
     semantic: &Gemma4SemanticConfig,
-) -> Result<(), String> {
+) -> Result<Vec<CanonicalRational>, String> {
+    let mut scales = Vec::with_capacity(semantic.layer_types.len());
     for index in 0..semantic.layer_count {
         let name = format!("model.language_model.layers.{index}.layer_scalar");
         let tensor = archive.tensor(&name).map_err(|error| error.to_string())?;
-        if tensor.dtype() != Dtype::BF16 || tensor.shape() != [1] || tensor.bytes() != [0x80, 0x3f]
-        {
+        if tensor.dtype() != Dtype::BF16 || tensor.shape() != [1] || tensor.bytes().len() != 2 {
             return Err(format!(
-                "{name} must be the typed BF16 scalar 1.0 before it may be folded into the program"
+                "{name} must be one typed BF16 scalar before it may be compiled into the program"
             ));
         }
+        let value =
+            bf16::from_bits(u16::from_le_bytes([tensor.bytes()[0], tensor.bytes()[1]])).to_f32();
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!(
+                "{name} must be a positive finite BF16 scalar, got {value:?}"
+            ));
+        }
+        scales.push(
+            CanonicalRational::from_decimal_str(&value.to_string()).map_err(|error| {
+                format!("{name} cannot be represented as a typed program scale: {error}")
+            })?,
+        );
     }
-    Ok(())
+    Ok(scales)
 }
 
 fn structure_fingerprint(archive: &SafetensorsArchive) -> Result<String, String> {
@@ -782,7 +803,18 @@ mod tests {
         let mut views = expected
             .into_iter()
             .map(|(name, tensor)| {
-                let view = zero_view(tensor.dtype, &tensor.dimensions);
+                let view = if let Some(index) = name
+                    .strip_prefix("model.language_model.layers.")
+                    .and_then(|value| value.strip_suffix(".layer_scalar"))
+                    .and_then(|value| value.parse::<usize>().ok())
+                {
+                    let bits = bf16::from_f32(if index.is_multiple_of(2) { 0.5 } else { 0.75 })
+                        .to_bits()
+                        .to_le_bytes();
+                    view(tensor.dtype, &tensor.dimensions, bits.to_vec())
+                } else {
+                    zero_view(tensor.dtype, &tensor.dimensions)
+                };
                 (name, view)
             })
             .collect::<BTreeMap<_, _>>();
@@ -839,9 +871,16 @@ mod tests {
         let (_directory, archive) = write_archive(fixture_views(&semantic));
         let manifest = Gemma4WeightManifest::load(&archive, &semantic).unwrap();
         assert_eq!(manifest.tensor_count, 67);
-        assert_eq!(manifest.execution_source_tensor_count, 53);
+        assert_eq!(manifest.execution_source_tensor_count, 55);
         assert_eq!(manifest.execution_quantized_weight_count, 13);
-        assert_eq!(manifest.non_executed_tensors.len(), 14);
+        assert_eq!(manifest.non_executed_tensors.len(), 12);
+        assert_eq!(
+            manifest.layer_scales,
+            vec![
+                CanonicalRational::new(1, 2).unwrap(),
+                CanonicalRational::new(3, 4).unwrap(),
+            ]
+        );
 
         let schema = manifest.weight_schema(&semantic).unwrap();
         assert_eq!(schema.components.len(), 40);
@@ -856,6 +895,55 @@ mod tests {
             .tensors
             .iter()
             .any(|tensor| tensor.id.as_str() == "weight.layer.1.self_attn_v"));
+
+        let program = super::super::program::build_semantic_program(
+            &ModelFamilyId::new(super::super::FAMILY_ID).unwrap(),
+            &semantic,
+            &manifest,
+        )
+        .unwrap();
+        let nodes = &program.blocks()[0].nodes;
+        for (layer_index, expected_scale) in [
+            CanonicalRational::new(1, 2).unwrap(),
+            CanonicalRational::new(3, 4).unwrap(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let residual_index = nodes
+                .iter()
+                .position(|node| node.id.as_str() == format!("node.layer.{layer_index}.residual"))
+                .unwrap();
+            let scale = &nodes[residual_index + 1];
+            assert_eq!(scale.id.as_str(), format!("node.layer.{layer_index}.scale"));
+            assert_eq!(
+                scale.operation_id.as_str(),
+                ferrum_interfaces::vnext::CONSTANT_SCALE_OPERATION_ID
+            );
+            assert_eq!(scale.inputs, nodes[residual_index].outputs);
+            assert_eq!(
+                scale
+                    .attributes
+                    .iter()
+                    .find(|(id, _)| id.as_str() == "scale")
+                    .map(|(_, value)| value),
+                Some(&ferrum_interfaces::vnext::SemanticValue::Rational(
+                    expected_scale
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn non_positive_layer_scale_fails_before_allocation() {
+        let semantic = tiny_semantic_config();
+        let mut views = fixture_views(&semantic);
+        let name = "model.language_model.layers.0.layer_scalar";
+        views.insert(name.to_owned(), view(Dtype::BF16, &[1], vec![0, 0]));
+        let (_directory, archive) = write_archive(views);
+        let error = Gemma4WeightManifest::load(&archive, &semantic).unwrap_err();
+        assert!(error.contains(name), "{error}");
+        assert!(error.contains("positive finite BF16 scalar"), "{error}");
     }
 
     #[test]
