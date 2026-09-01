@@ -135,6 +135,7 @@ struct ServerFixture {
     child: BoundedChild,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
+    profile_path: PathBuf,
 }
 
 impl ServerFixture {
@@ -143,6 +144,7 @@ impl ServerFixture {
         let url = format!("http://127.0.0.1:{port}");
         let stdout_path = log_root.join("serve.stdout.log");
         let stderr_path = log_root.join("serve.stderr.log");
+        let profile_path = log_root.join("serve.profile.jsonl");
         let stdout = File::create(&stdout_path).expect("create serve stdout log");
         let stderr = File::create(&stderr_path).expect("create serve stderr log");
         let mut command = Command::new(ferrum_bin());
@@ -151,6 +153,10 @@ impl ServerFixture {
             .args(["--backend", "cuda"])
             .args(["--disable-thinking", "--port", &port.to_string()])
             .args(["--served-model-name", MODEL_NAME])
+            .args(["--max-num-seqs", "32", "--max-num-batched-tokens", "64"])
+            .args(["--profile-detail", "replay", "--profile-jsonl"])
+            .arg(&profile_path)
+            .args(["--profile-concurrency", "32"])
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
@@ -194,6 +200,7 @@ impl ServerFixture {
             child,
             stdout_path,
             stderr_path,
+            profile_path,
         }
     }
 
@@ -207,6 +214,10 @@ impl ServerFixture {
             read_log(&self.stdout_path),
             read_log(&self.stderr_path)
         )
+    }
+
+    fn profile(&self) -> String {
+        read_log(&self.profile_path)
     }
 }
 
@@ -408,6 +419,29 @@ fn assert_stream_response(label: &str, status: reqwest::StatusCode, body: &str) 
     );
     assert_clean_logs(label, body);
     (content, completion_tokens)
+}
+
+fn maximum_profile_participants(profile: &str) -> usize {
+    profile
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["phase"] == "vnext.device_physical_submission")
+        .filter_map(|event| event["shape"]["participant_count"].as_u64())
+        .filter_map(|count| usize::try_from(count).ok())
+        .max()
+        .unwrap_or(0)
+}
+
+async fn wait_for_profile_participants(server: &ServerFixture, expected: usize) -> usize {
+    let started = Instant::now();
+    loop {
+        let maximum = maximum_profile_participants(&server.profile());
+        if maximum >= expected || started.elapsed() >= Duration::from_secs(5) {
+            return maximum;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn bf16_constant(shape: &[usize], bits: u16) -> FixtureTensor {
@@ -827,6 +861,14 @@ async fn gemma4_tiny_cuda_run_and_serve_e2e() {
             batch_started.elapsed().as_millis()
         );
     }
+    let maximum_participants = wait_for_profile_participants(&server, 32).await;
+    assert_eq!(
+        maximum_participants,
+        32,
+        "profile never observed a true c=32 physical submission: {}",
+        server.profile()
+    );
+    eprintln!("GEMMA4 CUDA E2E max_profile_participants={maximum_participants}");
     assert_clean_logs("ferrum serve logs", &server.logs());
     drop(server);
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
