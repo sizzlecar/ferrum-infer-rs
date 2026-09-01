@@ -208,6 +208,7 @@ def run_cli_gate(root: Path, ferrum_bin: Path, model: str, repo: Path) -> dict[s
         "512",
         "--output-format",
         "jsonl",
+        "--disable-thinking",
     ]
     p = run(cmd, cwd=repo, input_text=input_text, timeout=900)
     write(root / "run.command.json", json.dumps(cmd, indent=2) + "\n")
@@ -224,7 +225,11 @@ def run_cli_gate(root: Path, ferrum_bin: Path, model: str, repo: Path) -> dict[s
 
 def serve_correctness(root: Path, model: str, port: int) -> dict[str, Any]:
     base = f"http://127.0.0.1:{port}"
-    common = {"model": model, "temperature": 0}
+    common = {
+        "model": model,
+        "temperature": 0,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
     checks: dict[str, Any] = {}
 
     s1, b1 = post(
@@ -372,6 +377,8 @@ def run_bench_gate(
         str(out),
         "--tag",
         "cuda-llama-dense",
+        "--enable-thinking",
+        "false",
     ]
     p = run(cmd, cwd=repo, timeout=3600)
     write(root / "bench-serve.command.json", json.dumps(cmd, indent=2) + "\n")
@@ -466,6 +473,7 @@ def main() -> int:
                 str(root / "serve.effective_config.json"),
                 "--decision-trace-jsonl",
                 str(root / "serve.decision_trace.jsonl"),
+                "--disable-thinking",
             ]
             if cfg.get("max_model_len") is not None:
                 serve_cmd.extend(["--max-model-len", str(cfg["max_model_len"])])
@@ -492,12 +500,14 @@ def main() -> int:
             f"http://127.0.0.1:{port}",
             model,
             root / "tool-call-regression",
+            enable_thinking=False,
         )
         checks["concurrency_quality_regression"] = run_concurrency_quality_regression(
             f"http://127.0.0.1:{port}",
             model,
             root / "concurrency-quality-regression",
             [int(c) for c in cfg.get("concurrency_cells", [1, 4, 16, 32])],
+            enable_thinking=False,
         )
         checks["bench_serve"] = run_bench_gate(root, ferrum_bin, model, tokenizer_dir, port, cfg, repo)
 

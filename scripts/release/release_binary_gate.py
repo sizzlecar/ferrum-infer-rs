@@ -121,7 +121,9 @@ def cli_gate(bin_path: Path, model: str, out: Path) -> dict:
         "/bye",
         "",
     ])
-    p = run([str(bin_path), "run", model], input=text, timeout=180)
+    cmd = [str(bin_path), "run", model, "--disable-thinking"]
+    p = run(cmd, input=text, timeout=180)
+    (out / "cli.command.json").write_text(json.dumps(cmd, indent=2) + "\n")
     (out / "cli.stdout").write_text(p.stdout, errors="replace")
     (out / "cli.stderr").write_text(p.stderr, errors="replace")
     assert_no_bad_patterns("cli output", p.stdout + "\n" + p.stderr)
@@ -129,7 +131,12 @@ def cli_gate(bin_path: Path, model: str, out: Path) -> dict:
     ok = p.returncode == 0 and "ferrum-blue" in combined and "579" in combined
     if not ok:
         raise RuntimeError("CLI gate failed: expected ferrum-blue and 579")
-    return {"passed": True, "has_context": True, "has_math": True}
+    return {
+        "passed": True,
+        "has_context": True,
+        "has_math": True,
+        "disable_thinking": True,
+    }
 
 
 def post(base: str, payload: dict, timeout: int = 120) -> tuple[int, str]:
@@ -155,20 +162,40 @@ def wait_health(port: int) -> None:
 
 def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port: int, api_extra: bool) -> dict:
     log = out / "serve.log"
+    serve_cmd = [
+        str(bin_path),
+        "serve",
+        model_path,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--disable-thinking",
+    ]
+    (out / "serve.command.json").write_text(json.dumps(serve_cmd, indent=2) + "\n")
     with log.open("wb") as f:
-        proc = subprocess.Popen([str(bin_path), "serve", model_path, "--host", "127.0.0.1", "--port", str(port)], stdout=f, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(serve_cmd, stdout=f, stderr=subprocess.STDOUT)
     try:
         wait_health(port)
-        common = {"model": model_name, "temperature": 0}
+        common = {
+            "model": model_name,
+            "temperature": 0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
         s1, b1 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "123+456 等于多少？只输出数字"}], "max_tokens": 256})
         c1 = json.loads(b1)["choices"][0]["message"].get("content", "") if s1 == 200 else b1
         s2, b2 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "本轮短语是 ferrum-blue。只回答 OK"}, {"role": "assistant", "content": "OK"}, {"role": "user", "content": "第一条用户消息里的 ferrum 开头短语是什么？只输出短语，不要输出 OK"}], "max_tokens": 256})
         c2 = json.loads(b2)["choices"][0]["message"].get("content", "") if s2 == 200 else b2
-        s3, b3 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "写一个一万字介绍"}], "max_tokens": 10240})
+        s3, b3 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "写一个一万字介绍"}], "max_tokens": 1000000})
         assert_no_bad_patterns("serve math response", c1)
         assert_no_bad_patterns("serve multiturn response", c2)
         assert_no_bad_patterns("serve boundary response", b3)
-        result = {"math": [s1, c1], "multiturn": [s2, c2], "boundary_status": s3}
+        result = {
+            "math": [s1, c1],
+            "multiturn": [s2, c2],
+            "boundary_status": s3,
+            "disable_thinking": True,
+        }
         if s1 != 200 or "579" not in c1:
             raise RuntimeError("serve math gate failed")
         if s2 != 200 or "ferrum-blue" not in c2:
@@ -188,9 +215,9 @@ def serve_gate(bin_path: Path, model_path: str, model_name: str, out: Path, port
             assert_no_bad_patterns("serve tool-call response", b5)
             if s5 != 200 or choice.get("finish_reason") != "tool_calls" or "123+456" not in json.dumps(choice, ensure_ascii=False):
                 raise RuntimeError("tool call gate failed")
-            s6, b6 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "请用一句话解释 String::from"}], "stream": True, "max_tokens": 256})
+            s6, b6 = post(f"http://127.0.0.1:{port}", {**common, "messages": [{"role": "user", "content": "请用一句话解释 String::from"}], "stream": True, "stream_options": {"include_usage": True}, "max_tokens": 256})
             assert_no_bad_patterns("serve stream response", b6)
-            if s6 != 200 or b6.count("data: [DONE]") != 1 or '"content"' not in b6:
+            if s6 != 200 or b6.count("data: [DONE]") != 1 or '"content"' not in b6 or '"usage"' not in b6:
                 raise RuntimeError("stream gate failed")
             result.update({"strict_json": [s4, msg], "tool_call": [s5, choice.get("finish_reason")], "stream": [s6, b6.count("data: [DONE]")]})
         return result
