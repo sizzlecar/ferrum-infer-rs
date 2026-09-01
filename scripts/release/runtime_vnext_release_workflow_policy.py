@@ -19,7 +19,7 @@ PASS_PREFIX = "FERRUM RELEASE WORKFLOW POLICY PASS"
 SELFTEST_PASS_LINE = "FERRUM RELEASE WORKFLOW POLICY SELFTEST PASS"
 PREPROMOTION_READY_PREFIX = "FERRUM PREPROMOTION MANIFEST CONSUMPTION READY"
 STAGING_VERSION = "0.8.4"
-STAGING_RC_TAG = "v0.8.4-rc.1"
+STAGING_RC_TAG = "v0.8.4-rc.2"
 STAGING_LABEL = "v0.8.4-rc"
 EXPECTED_VERSION = "0.8.0"
 EXPECTED_TAG = "v0.8.0"
@@ -337,22 +337,22 @@ def validate_cuda_workflow(document: dict[str, Any]) -> None:
     )
     cache_prefix = (
         "stage-v0.8.4-linux-x86_64-cuda-sm89-"
-        "cuda12.4-native-765f845a-cargo-"
+        "cuda12.4-native-d4cdfe88-cargo-"
     )
     require(
         cache_with.get("key")
         == cache_prefix + "${{ hashFiles('**/Cargo.lock') }}"
         and cache_with.get("restore-keys") == cache_prefix,
-        "release-cuda.yml cache key must bind CUDA 12.4 and native set 765f845a",
+        "release-cuda.yml cache key must bind CUDA 12.4 and native set d4cdfe88",
     )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_URL")
-        == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v2/native-operator-set-cuda12.4-sm89-v2.tar.zst",
+        == "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst",
         "release-cuda.yml native operator set URL is not frozen",
     )
     require(
         env.get("NATIVE_OPERATOR_SET_ARCHIVE_SHA256")
-        == "765f845ae20c305edc10b31650339f8a2782e9e56687c8bda3f8e843a50c636b",
+        == "d4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e",
         "release-cuda.yml native operator set SHA256 is not frozen",
     )
     scripts = "\n".join(
@@ -845,8 +845,8 @@ def run_selftest(texts: dict[str, str]) -> None:
     cuda_cache_mismatch = dict(texts)
     cuda_cache_mismatch["release-cuda.yml"] = _replace_once(
         cuda_cache_mismatch["release-cuda.yml"],
-        "cuda12.4-native-765f845a-cargo-${{ hashFiles('**/Cargo.lock') }}",
-        "cuda12.6-native-765f845a-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda12.4-native-d4cdfe88-cargo-${{ hashFiles('**/Cargo.lock') }}",
+        "cuda12.6-native-d4cdfe88-cargo-${{ hashFiles('**/Cargo.lock') }}",
         "cuda-cache-toolchain-mismatch",
     )
     _expect_policy_failure(

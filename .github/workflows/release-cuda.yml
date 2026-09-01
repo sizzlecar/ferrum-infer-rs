@@ -10,7 +10,7 @@ on:
       release_candidate_tag:
         description: Annotated RC tag whose peeled commit is release_candidate_sha
         required: true
-        default: v0.8.4-rc.1
+        default: v0.8.4-rc.2
         type: string
       staging_label:
         description: Immutable artifact label; this does not create a tag or release
@@ -38,8 +38,8 @@ env:
   CUDA_COMPUTE_CAP: 89
   # Build-time, content-addressed component. The staged ferrum binary links
   # these operators statically and performs no runtime download.
-  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v2/native-operator-set-cuda12.4-sm89-v2.tar.zst
-  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 765f845ae20c305edc10b31650339f8a2782e9e56687c8bda3f8e843a50c636b
+  NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst
+  NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e
 
 jobs:
   linux-x86_64-cuda-sm89:
@@ -96,7 +96,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v2.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v6.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -137,8 +137,8 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: stage-v0.8.4-linux-x86_64-cuda-sm89-cuda12.4-native-765f845a-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: stage-v0.8.4-linux-x86_64-cuda-sm89-cuda12.4-native-765f845a-cargo-
+          key: stage-v0.8.4-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.4-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-
 
       - name: Build release CUDA sm89 binary exactly once
         run: |
