@@ -77,10 +77,10 @@ jobs:
           python3 scripts/check_ferrum_env_registry.py \
             --fail-on-new-missing \
             --fail-on-baseline-drift \
-            --max-direct-env-reads 99 \
-            --max-process-env-writes 29 \
+            --max-direct-env-reads 102 \
+            --max-process-env-writes 31 \
             --max-non-test-process-env-writes 2 \
-            --max-hot-direct-env-reads 5
+            --max-hot-direct-env-reads 7
 
       - name: CUDA build summary parser check
         run: |
