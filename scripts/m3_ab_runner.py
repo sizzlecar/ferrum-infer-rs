@@ -253,6 +253,10 @@ class Runner:
         preset = self.config.get("preset")
         if preset and preset not in RUNTIME_PRESET_ENV:
             raise SystemExit(f"unknown runtime preset: {preset}")
+        if "enable_thinking" in self.config and not isinstance(
+            self.config["enable_thinking"], bool
+        ):
+            raise SystemExit("enable_thinking must be a boolean when set")
         profile = self.config.get("profile", {})
         if profile and not isinstance(profile, dict):
             raise SystemExit("profile must be an object when set")
@@ -553,6 +557,16 @@ class Runner:
             "validation_checklist": self.validation_checklist(),
             "preflight": preflight,
             "runtime_preset": self.config.get("preset"),
+            "enable_thinking": self.configured_enable_thinking(),
+            "request_options": (
+                {
+                    "chat_template_kwargs": {
+                        "enable_thinking": self.configured_enable_thinking()
+                    }
+                }
+                if self.configured_enable_thinking() is not None
+                else {}
+            ),
             "cases": [],
             "summary_json": str(self.out_root / "summary.json"),
         }
@@ -928,6 +942,30 @@ class Runner:
             args.extend(["--profile-commit-sha", str(git_head)])
         return args
 
+    def configured_enable_thinking(self) -> bool | None:
+        value = self.config.get("enable_thinking")
+        return value if isinstance(value, bool) else None
+
+    def thinking_server_args(self) -> list[str]:
+        enabled = self.configured_enable_thinking()
+        if enabled is True:
+            return ["--enable-thinking"]
+        if enabled is False:
+            return ["--disable-thinking"]
+        return []
+
+    def thinking_bench_args(self) -> list[str]:
+        enabled = self.configured_enable_thinking()
+        if enabled is None:
+            return []
+        return ["--enable-thinking", str(enabled).lower()]
+
+    def apply_thinking_control(self, payload: dict[str, Any]) -> dict[str, Any]:
+        enabled = self.configured_enable_thinking()
+        if enabled is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": enabled}
+        return payload
+
     def start_server(
         self,
         case: dict[str, Any],
@@ -951,6 +989,7 @@ class Runner:
         ]
         if self.config.get("preset"):
             cmd.extend(["--runtime-preset", str(self.config["preset"])])
+        cmd.extend(self.thinking_server_args())
         cmd.extend(profile_args)
         self.server_proc = subprocess.Popen(
             cmd,
@@ -1108,6 +1147,10 @@ class Runner:
         raise RuntimeError(f"server health timeout on port {port}: {last_error}")
 
     def post_chat(self, port: int, payload: dict[str, Any], out_path: Path) -> dict[str, Any]:
+        request_path = out_path.with_name(f"{out_path.stem}.request.json")
+        request_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        )
         data = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             f"http://127.0.0.1:{port}/v1/chat/completions",
@@ -1132,12 +1175,12 @@ class Runner:
         gate_config = self.config.get("gates", {})
         gate_max_tokens = int(gate_config.get("max_tokens", 128))
         if gate_config.get("paris", True):
-            payload = {
+            payload = self.apply_thinking_control({
                 "model": self.hf_model,
                 "messages": [{"role": "user", "content": "What is the capital of France?"}],
                 "max_tokens": gate_max_tokens,
                 "temperature": 0.0,
-            }
+            })
             data = self.post_chat(port, payload, paths.case_dir / "paris.json")
             choice = data.get("choices", [{}])[0]
             content = choice.get("message", {}).get("content", "")
@@ -1156,7 +1199,7 @@ class Runner:
                 raise RuntimeError("Paris gate failed")
 
         if gate_config.get("multi_turn", False):
-            payload = {
+            payload = self.apply_thinking_control({
                 "model": self.hf_model,
                 "messages": [
                     {"role": "user", "content": "What is the capital of France?"},
@@ -1165,7 +1208,7 @@ class Runner:
                 ],
                 "max_tokens": gate_max_tokens,
                 "temperature": 0.0,
-            }
+            })
             data = self.post_chat(port, payload, paths.case_dir / "multiturn.json")
             choice = data.get("choices", [{}])[0]
             content = choice.get("message", {}).get("content", "")
@@ -1184,7 +1227,7 @@ class Runner:
                 raise RuntimeError("multi-turn Paris gate failed")
 
         if gate_config.get("multi_turn_3round", False):
-            payload = {
+            payload = self.apply_thinking_control({
                 "model": self.hf_model,
                 "messages": [
                     {"role": "user", "content": "What is the capital of France?"},
@@ -1195,7 +1238,7 @@ class Runner:
                 ],
                 "max_tokens": gate_max_tokens,
                 "temperature": 0.0,
-            }
+            })
             data = self.post_chat(port, payload, paths.case_dir / "multiturn_3round.json")
             choice = data.get("choices", [{}])[0]
             content = choice.get("message", {}).get("content", "")
@@ -1215,7 +1258,12 @@ class Runner:
 
         if gate_config.get("tool_call", False):
             out = paths.case_dir / "tool-call-regression"
-            result = run_tool_call_regression(f"http://127.0.0.1:{port}", self.hf_model, out)
+            result = run_tool_call_regression(
+                f"http://127.0.0.1:{port}",
+                self.hf_model,
+                out,
+                enable_thinking=self.configured_enable_thinking(),
+            )
             ok = result.get("status") == "pass"
             gates.append(
                 {
@@ -1237,6 +1285,7 @@ class Runner:
                 out,
                 [concurrency],
                 timeout=int(gate_config.get("quality_timeout_s", 180)),
+                enable_thinking=self.configured_enable_thinking(),
             )
             ok = result.get("status") == "pass"
             gates.append(
@@ -1284,6 +1333,7 @@ class Runner:
         ]
         if int(self.config.get("repeats", 1)) >= 3 or self.config.get("require_ci", False):
             cmd.append("--require-ci")
+        cmd.extend(self.thinking_bench_args())
         with paths.bench_log.open("w") as log:
             subprocess.run(cmd, text=True, stdout=log, stderr=subprocess.STDOUT, check=True)
 
@@ -1421,6 +1471,16 @@ class Runner:
             "binary_sha256": self.run_manifest.get("preflight", {}).get("binary_sha256"),
             "features": self.config.get("features", ""),
             "runtime_preset": self.config.get("preset"),
+            "enable_thinking": self.configured_enable_thinking(),
+            "request_options": (
+                {
+                    "chat_template_kwargs": {
+                        "enable_thinking": self.configured_enable_thinking()
+                    }
+                }
+                if self.configured_enable_thinking() is not None
+                else {}
+            ),
             "env_hash": case_env_hash,
             "runtime_config_snapshot": runtime_config_snapshot,
             "preset_env": self.preset_env(),
@@ -1635,12 +1695,36 @@ def self_test() -> None:
             "out_root": str(root / "out"),
             "model_dir": str(root / "model"),
             "bin": sys.executable,
+            "enable_thinking": False,
             "base_env": {"FERRUM_MOE_GRAPH": "1", "HF_HOME": "/tmp/hf"},
             "cases": [{"name": "a", "env": {"FERRUM_FA_LAYOUT_VARLEN": "1"}}],
         }
         (root / "model").mkdir()
         runner = Runner(cfg)
         runner.validate()
+        assert runner.configured_enable_thinking() is False
+        assert runner.thinking_server_args() == ["--disable-thinking"]
+        assert runner.thinking_bench_args() == ["--enable-thinking", "false"]
+        controlled_payload = runner.apply_thinking_control({"model": "fixture"})
+        assert controlled_payload["chat_template_kwargs"] == {"enable_thinking": False}
+        legacy_cfg = dict(cfg)
+        legacy_cfg.pop("enable_thinking")
+        legacy_runner = Runner(legacy_cfg)
+        legacy_runner.validate()
+        assert legacy_runner.configured_enable_thinking() is None
+        assert legacy_runner.thinking_server_args() == []
+        assert legacy_runner.thinking_bench_args() == []
+        for invalid in ("false", 0, None):
+            invalid_cfg = {**cfg, "enable_thinking": invalid}
+            try:
+                Runner(invalid_cfg).validate()
+                raise AssertionError(f"invalid enable_thinking={invalid!r} should fail")
+            except SystemExit as exc:
+                assert "enable_thinking must be a boolean" in str(exc)
+        config_root = Path(__file__).resolve().parent / "release" / "configs"
+        for config_name in ("g0_cuda4090_smoke.json", "g0_cuda4090_full.json"):
+            release_cfg = load_json(config_root / config_name)
+            assert release_cfg.get("enable_thinking") is False
         env = runner.case_env_only(cfg["cases"][0])
         assert env == {
             "FERRUM_FA_LAYOUT_VARLEN": "1",
