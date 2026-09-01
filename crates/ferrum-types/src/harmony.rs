@@ -44,11 +44,27 @@ pub struct ParsedHarmonyResponse {
 /// The first message may omit `<|start|>assistant` because that prefix is
 /// normally already present at the end of the rendered generation prompt.
 pub fn parse_harmony_response(output: &str) -> Result<ParsedHarmonyResponse> {
-    let first = parse_message(output, true)?;
+    parse_harmony_response_internal(output, false)
+}
+
+/// Parse a Harmony response that the engine stopped at its token limit.
+///
+/// A length stop may legitimately omit the terminal token from an analysis or
+/// final text message. Tool calls remain fail-closed and still require a
+/// complete `<|call|>` envelope.
+pub fn parse_length_truncated_harmony_response(output: &str) -> Result<ParsedHarmonyResponse> {
+    parse_harmony_response_internal(output, true)
+}
+
+fn parse_harmony_response_internal(
+    output: &str,
+    allow_missing_text_terminal: bool,
+) -> Result<ParsedHarmonyResponse> {
+    let first = parse_message(output, true, allow_missing_text_terminal)?;
     match first.channel {
         HarmonyChannel::Final => {
             validate_plain_message(&first, "final")?;
-            require_terminal(&first, HarmonyTerminal::Return)?;
+            require_text_terminal(&first, HarmonyTerminal::Return, allow_missing_text_terminal)?;
             require_no_trailing_output(&first)?;
             Ok(ParsedHarmonyResponse {
                 reasoning_content: None,
@@ -58,18 +74,36 @@ pub fn parse_harmony_response(output: &str) -> Result<ParsedHarmonyResponse> {
         }
         HarmonyChannel::Analysis => {
             validate_plain_message(&first, "analysis")?;
+            if first.terminal.is_none() && allow_missing_text_terminal {
+                return Ok(ParsedHarmonyResponse {
+                    reasoning_content: Some(first.payload.to_string()),
+                    content: String::new(),
+                    tool_call: None,
+                });
+            }
             require_terminal(&first, HarmonyTerminal::End)?;
             if first.remaining.is_empty() {
+                if allow_missing_text_terminal {
+                    return Ok(ParsedHarmonyResponse {
+                        reasoning_content: Some(first.payload.to_string()),
+                        content: String::new(),
+                        tool_call: None,
+                    });
+                }
                 return Err(invalid_harmony(
                     "analysis message was not followed by a terminal final answer or tool call",
                 ));
             }
 
-            let second = parse_message(first.remaining, false)?;
+            let second = parse_message(first.remaining, false, allow_missing_text_terminal)?;
             match second.channel {
                 HarmonyChannel::Final => {
                     validate_plain_message(&second, "final")?;
-                    require_terminal(&second, HarmonyTerminal::Return)?;
+                    require_text_terminal(
+                        &second,
+                        HarmonyTerminal::Return,
+                        allow_missing_text_terminal,
+                    )?;
                     require_no_trailing_output(&second)?;
                     Ok(ParsedHarmonyResponse {
                         reasoning_content: Some(first.payload.to_string()),
@@ -141,11 +175,15 @@ struct ParsedMessage<'a> {
     recipient: Option<&'a str>,
     content_type: Option<&'a str>,
     payload: &'a str,
-    terminal: HarmonyTerminal,
+    terminal: Option<HarmonyTerminal>,
     remaining: &'a str,
 }
 
-fn parse_message(output: &str, first: bool) -> Result<ParsedMessage<'_>> {
+fn parse_message(
+    output: &str,
+    first: bool,
+    allow_missing_terminal: bool,
+) -> Result<ParsedMessage<'_>> {
     if output.is_empty() {
         return Err(invalid_harmony("Harmony output is empty"));
     }
@@ -186,18 +224,31 @@ fn parse_message(output: &str, first: bool) -> Result<ParsedMessage<'_>> {
     };
 
     let after_message = &after_channel_marker[message_offset + MESSAGE.len()..];
-    let terminal_offset = after_message
-        .find("<|")
-        .ok_or_else(|| invalid_harmony("message is missing a terminal control token"))?;
+    let Some(terminal_offset) = after_message.find("<|") else {
+        reject_raw_marker(after_message, "message payload")?;
+        if !allow_missing_terminal {
+            return Err(invalid_harmony(
+                "message is missing a terminal control token",
+            ));
+        }
+        return Ok(ParsedMessage {
+            channel,
+            recipient,
+            content_type,
+            payload: after_message,
+            terminal: None,
+            remaining: "",
+        });
+    };
     let payload = &after_message[..terminal_offset];
     reject_raw_marker(payload, "message payload")?;
     let terminal_and_remaining = &after_message[terminal_offset..];
     let (terminal, remaining) = if let Some(remaining) = terminal_and_remaining.strip_prefix(END) {
-        (HarmonyTerminal::End, remaining)
+        (Some(HarmonyTerminal::End), remaining)
     } else if let Some(remaining) = terminal_and_remaining.strip_prefix(CALL) {
-        (HarmonyTerminal::Call, remaining)
+        (Some(HarmonyTerminal::Call), remaining)
     } else if let Some(remaining) = terminal_and_remaining.strip_prefix(RETURN) {
-        (HarmonyTerminal::Return, remaining)
+        (Some(HarmonyTerminal::Return), remaining)
     } else {
         return Err(invalid_harmony(
             "message payload contains an unknown or misplaced raw control marker",
@@ -317,7 +368,7 @@ fn validate_plain_message(message: &ParsedMessage<'_>, channel: &str) -> Result<
 }
 
 fn require_terminal(message: &ParsedMessage<'_>, expected: HarmonyTerminal) -> Result<()> {
-    if message.terminal != expected {
+    if message.terminal != Some(expected) {
         return Err(invalid_harmony(format!(
             "{} channel must end with {}, got {}",
             match message.channel {
@@ -326,10 +377,24 @@ fn require_terminal(message: &ParsedMessage<'_>, expected: HarmonyTerminal) -> R
                 HarmonyChannel::Final => "final",
             },
             expected.text(),
-            message.terminal.text(),
+            message
+                .terminal
+                .map(HarmonyTerminal::text)
+                .unwrap_or("no terminal token"),
         )));
     }
     Ok(())
+}
+
+fn require_text_terminal(
+    message: &ParsedMessage<'_>,
+    expected: HarmonyTerminal,
+    allow_missing: bool,
+) -> Result<()> {
+    if allow_missing && message.terminal.is_none() {
+        return Ok(());
+    }
+    require_terminal(message, expected)
 }
 
 fn require_no_trailing_output(message: &ParsedMessage<'_>) -> Result<()> {
@@ -391,6 +456,55 @@ mod tests {
         );
         assert_eq!(parsed.content, "Paris.");
         assert_eq!(parsed.tool_call, None);
+    }
+
+    #[test]
+    fn parses_length_truncated_text_messages_without_weakening_strict_parser() {
+        for (output, reasoning, content) in [
+            (
+                "<|channel|>final<|message|>Partial answer",
+                None,
+                "Partial answer",
+            ),
+            (
+                "<|channel|>analysis<|message|>Partial reasoning",
+                Some("Partial reasoning"),
+                "",
+            ),
+            (
+                "<|channel|>analysis<|message|>Reason.<|end|>",
+                Some("Reason."),
+                "",
+            ),
+            (
+                "<|channel|>analysis<|message|>Reason.<|end|>\
+                 <|start|>assistant<|channel|>final<|message|>Partial answer",
+                Some("Reason."),
+                "Partial answer",
+            ),
+        ] {
+            assert!(parse_harmony_response(output).is_err());
+            let parsed = parse_length_truncated_harmony_response(output).unwrap();
+            assert_eq!(parsed.reasoning_content.as_deref(), reasoning);
+            assert_eq!(parsed.content, content);
+            assert!(parsed.tool_call.is_none());
+        }
+    }
+
+    #[test]
+    fn length_truncation_keeps_tool_calls_and_control_markers_fail_closed() {
+        for output in [
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.weather\
+             <|constrain|>json<|message|>{\"city\":\"Paris\"}",
+            "<|channel|>final<|message|>leak <|bogus|>",
+            "<|channel|>final<|message|>incomplete <|",
+        ] {
+            assert!(
+                parse_length_truncated_harmony_response(output).is_err(),
+                "accepted {output:?}"
+            );
+        }
     }
 
     #[test]

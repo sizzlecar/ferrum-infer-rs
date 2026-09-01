@@ -8,12 +8,13 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    has_unclosed_thinking_block, parse_harmony_response, parse_reasoning_response_for_prompt,
-    FerrumConfigBuilder, FerrumError, FinishReason, InferenceRequest, InferenceResponse,
-    ModelCapabilities, ModelOutputProtocol, ParsedReasoningResponse, Priority, RequestId,
-    ResolvedFerrumConfig, ResponseCompletionBoundary, Result, RuntimeConfigEntry,
-    RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams, StreamChunk, TokenUsage,
-    WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG, THINK_START_TAG,
+    has_unclosed_thinking_block, parse_harmony_response, parse_length_truncated_harmony_response,
+    parse_reasoning_response_for_prompt, FerrumConfigBuilder, FerrumError, FinishReason,
+    InferenceRequest, InferenceResponse, ModelCapabilities, ModelOutputProtocol,
+    ParsedReasoningResponse, Priority, RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary,
+    Result, RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams,
+    StreamChunk, TokenUsage, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG,
+    THINK_START_TAG,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -358,6 +359,7 @@ fn parse_run_model_output(
     protocol: ModelOutputProtocol,
     text: &str,
     prompt_opened_thinking: bool,
+    finish_reason: Option<FinishReason>,
 ) -> Result<ParsedReasoningResponse> {
     match protocol {
         ModelOutputProtocol::Text => Ok(parse_reasoning_response_for_prompt(
@@ -365,7 +367,11 @@ fn parse_run_model_output(
             prompt_opened_thinking,
         )),
         ModelOutputProtocol::HarmonyGptOss => {
-            let parsed = parse_harmony_response(text)?;
+            let parsed = if finish_reason == Some(FinishReason::Length) {
+                parse_length_truncated_harmony_response(text)?
+            } else {
+                parse_harmony_response(text)?
+            };
             if parsed.tool_call.is_some() {
                 return Err(FerrumError::invalid_format(
                     "GPT-OSS emitted a Harmony tool call for `ferrum run`, which has no tool executor",
@@ -1314,8 +1320,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             )));
         }
         let raw_response = display_response_text(&raw_text);
-        let parsed =
-            parse_run_model_output(model_output_protocol, &raw_response, prompt_opened_thinking)?;
+        let parsed = parse_run_model_output(
+            model_output_protocol,
+            &raw_response,
+            prompt_opened_thinking,
+            finish_reason,
+        )?;
         let content = display_response_text(&parsed.content);
         let reasoning = parsed
             .reasoning
@@ -1671,6 +1681,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     model_output_protocol,
                     &raw_response,
                     prompt_opened_thinking,
+                    finish_reason,
                 )?;
                 let clean_response = display_response_text(&parsed.content);
                 let reasoning = (format == OutputFormat::Jsonl)
@@ -3799,6 +3810,7 @@ mod tests {
             "<|channel|>analysis<|message|>Reason.<|end|>\
              <|start|>assistant<|channel|>final<|message|>Answer.<|return|>",
             false,
+            Some(FinishReason::Stop),
         )
         .unwrap();
         assert_eq!(parsed.content, "Answer.");
@@ -3814,9 +3826,22 @@ mod tests {
              <|start|>assistant<|channel|>commentary to=functions.weather\
              <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>",
             false,
+            Some(FinishReason::Stop),
         )
         .unwrap_err();
         assert!(error.to_string().contains("has no tool executor"));
+    }
+
+    #[test]
+    fn gpt_oss_run_accepts_length_truncated_harmony_text() {
+        let parsed = parse_run_model_output(
+            ModelOutputProtocol::HarmonyGptOss,
+            "<|channel|>final<|message|>Partial answer",
+            false,
+            Some(FinishReason::Length),
+        )
+        .unwrap();
+        assert_eq!(parsed.content, "Partial answer");
     }
 
     #[test]
