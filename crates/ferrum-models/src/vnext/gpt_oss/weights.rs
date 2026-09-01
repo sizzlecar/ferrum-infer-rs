@@ -684,7 +684,7 @@ fn hash_header(hasher: &mut Sha256, name: &str, element_type: ElementType, dimen
 mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, BTreeSet, HashMap};
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -1095,9 +1095,9 @@ mod tests {
         }
     }
 
-    fn required_absolute_env_path(name: &str) -> PathBuf {
-        let value = std::env::var_os(name)
-            .unwrap_or_else(|| panic!("required environment variable {name} is not set"));
+    fn required_absolute_env_path(name: &str, value: Option<OsString>) -> PathBuf {
+        let value =
+            value.unwrap_or_else(|| panic!("required environment variable {name} is not set"));
         assert!(!value.is_empty(), "environment variable {name} is empty");
         let path = PathBuf::from(value);
         assert!(
@@ -1365,7 +1365,10 @@ mod tests {
     #[test]
     #[ignore = "requires fixed tiny-random/gpt-oss-mxfp4 snapshot and explicit output path"]
     fn derives_fixed_tiny_random_gpt_oss_native_mxfp4_canary_for_cuda_e2e() {
-        let source_input = required_absolute_env_path(GPT_OSS_TINY_SOURCE_ENV);
+        let source_input = required_absolute_env_path(
+            GPT_OSS_TINY_SOURCE_ENV,
+            std::env::var_os("FERRUM_GPT_OSS_TINY_SOURCE"),
+        );
         let source = std::fs::canonicalize(&source_input).unwrap_or_else(|error| {
             panic!("canonicalize fixed tiny GPT-OSS source {source_input:?}: {error}")
         });
@@ -1444,7 +1447,10 @@ mod tests {
         let mut generation_config_bytes = serde_json::to_vec_pretty(&generation_config).unwrap();
         generation_config_bytes.push(b'\n');
 
-        let output_input = required_absolute_env_path(GPT_OSS_CANARY_OUT_ENV);
+        let output_input = required_absolute_env_path(
+            GPT_OSS_CANARY_OUT_ENV,
+            std::env::var_os("FERRUM_GPT_OSS_CANARY_OUT"),
+        );
         assert_ne!(
             output_input, source_input,
             "canary output must differ from source"
