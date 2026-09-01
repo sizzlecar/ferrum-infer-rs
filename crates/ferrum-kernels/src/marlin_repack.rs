@@ -15,6 +15,13 @@ const FP8_E4M3_MAX: f32 = 448.0;
 const FP8_F16_EXPONENT_BIAS_SCALE: f32 = 256.0;
 const MAX_BLOCK_FP8_PREPARE_WORKERS: usize = 8;
 
+/// Marlin's one-group output-channel fragment order. The native kernels use
+/// this order for per-channel scales and bias vectors alike.
+pub(crate) const MARLIN_CHANNEL_PERMUTATION: [usize; 32] = [
+    0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6, 7,
+    14, 15, 22, 23, 30, 31,
+];
+
 /// Host-prepared Marlin W8A16 storage for one logical `[N, K]` F16 matrix.
 ///
 /// `packed_values` is the 16-by-64 Marlin tile ABI, stored as little-endian
@@ -782,10 +789,6 @@ fn prepare_block_fp8_weight_for_fp8_marlin_with_parallelism(
         },
     )?;
 
-    const CHANNEL_SCALE_PERMUTATION: [usize; 32] = [
-        0, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21, 28, 29, 6,
-        7, 14, 15, 22, 23, 30, 31,
-    ];
     let mut scales = Vec::new();
     scales
         .try_reserve_exact(n)
@@ -794,8 +797,8 @@ fn prepare_block_fp8_weight_for_fp8_marlin_with_parallelism(
             elements: n,
         })?;
     scales.resize(n, half::f16::ZERO);
-    for chunk_start in (0..n).step_by(CHANNEL_SCALE_PERMUTATION.len()) {
-        for (destination, source) in CHANNEL_SCALE_PERMUTATION.iter().copied().enumerate() {
+    for chunk_start in (0..n).step_by(MARLIN_CHANNEL_PERMUTATION.len()) {
+        for (destination, source) in MARLIN_CHANNEL_PERMUTATION.iter().copied().enumerate() {
             let output = chunk_start + source;
             let raw_scale = raw_scales[output];
             let scale = half::f16::from_f32(raw_scale * FP8_F16_EXPONENT_BIAS_SCALE);
@@ -1180,9 +1183,7 @@ pub fn repack_scales_to_marlin(
             .flat_map(|row| (0..8).map(move |column| row + 8 * column))
             .collect()
     } else {
-        (0..4)
-            .flat_map(|row| [0, 1, 8, 9, 16, 17, 24, 25].map(move |column| 2 * row + column))
-            .collect()
+        MARLIN_CHANNEL_PERMUTATION.to_vec()
     };
 
     let total = group_count * n;

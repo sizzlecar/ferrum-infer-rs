@@ -714,6 +714,49 @@ pub fn vllm_gptq_marlin_repack(
     Ok(())
 }
 
+/// Repack one already-staged GPTQ-compatible INT4 matrix by raw device
+/// address. Static weight initialization owns subregions rather than typed
+/// `CudaSlice`s, so this is the checked pointer-level counterpart of
+/// [`vllm_gptq_marlin_repack`].
+pub(crate) unsafe fn vllm_gptq_marlin_repack_raw(
+    stream: &cudarc::driver::CudaStream,
+    qweight_in: u64,
+    qweight_out: u64,
+    size_k: i32,
+    size_n: i32,
+) -> candle_core::Result<()> {
+    if qweight_in == 0
+        || qweight_out == 0
+        || qweight_in % 4 != 0
+        || qweight_out % 4 != 0
+        || size_k <= 0
+        || size_n <= 0
+        || size_k % 64 != 0
+        || size_n % 64 != 0
+    {
+        return Err(candle_core::Error::Msg(format!(
+            "vLLM GPTQ Marlin raw repack requires non-null aligned pointers and positive 64-aligned K/N (K={size_k}, N={size_n})"
+        )));
+    }
+    let ret = ferrum_vllm_gptq_marlin_repack(
+        qweight_in as *const _,
+        std::ptr::null(),
+        qweight_out as *mut _,
+        size_k,
+        size_n,
+        4,
+        0,
+        0,
+        stream.cu_stream(),
+    );
+    if ret != 0 {
+        return Err(candle_core::Error::Msg(format!(
+            "vllm gptq_marlin_repack failed: ret={ret} (size_k={size_k}, size_n={size_n})"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_vllm_fp8_marlin_repack_raw_bits(
     input_elements: usize,
     output_elements: usize,

@@ -93,7 +93,7 @@ impl QuantizationSpec {
             || !self.grouping.is_valid()
             || !matches!(
                 self.scale_type,
-                ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                ElementType::U8 | ElementType::F16 | ElementType::Bf16 | ElementType::F32
             )
             || self.zero_point_type.is_some_and(|element_type| {
                 !matches!(

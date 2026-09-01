@@ -3,7 +3,7 @@
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package": {
     "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.df27bdb0c6d5fd5a33fe839a27eb21bb0202daaef024c69340e43203992fabeb",
+    "revision": "ferrum-native-cuda-v1+sha256.885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
     "sha256": "b5d8d16c1c08c3b8b68bdae8066a649043d1eff1ca74905bfbd035e1d30dafda"
   },
   "upstream_sources": [

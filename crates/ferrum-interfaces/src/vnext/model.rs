@@ -195,7 +195,10 @@ impl WeightSchema {
                 WeightComponentRole::Scales => matches!(
                     component.encoding,
                     WeightEncoding::Dense {
-                        element_type: ElementType::F16 | ElementType::Bf16 | ElementType::F32
+                        element_type: ElementType::U8
+                            | ElementType::F16
+                            | ElementType::Bf16
+                            | ElementType::F32
                     }
                 ),
                 WeightComponentRole::ZeroPoints

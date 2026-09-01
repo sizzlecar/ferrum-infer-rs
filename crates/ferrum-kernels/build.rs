@@ -79,6 +79,9 @@ const CORE_PTX_KERNELS: &[&str] = &[
     "kernels/gated_delta_rule.cu",
     "kernels/linear_attention.cu",
     "kernels/vnext_causal_attention.cu",
+    "kernels/mxfp4_marlin_prepare.cu",
+    "kernels/gpt_oss_attention.cu",
+    "kernels/gpt_oss_moe.cu",
     "kernels/qwen35_paged_qkv.cu",
 ];
 

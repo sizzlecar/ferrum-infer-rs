@@ -122,11 +122,28 @@ impl EngineInner {
         }
     }
 
-    pub(super) fn should_stream_generated_token(&self, stop_reason: Option<FinishReason>) -> bool {
-        !matches!(
+    pub(super) fn should_stream_generated_token(
+        &self,
+        request_id: &RequestId,
+        token: TokenId,
+        stop_reason: Option<FinishReason>,
+    ) -> bool {
+        if !matches!(
             stop_reason,
-            Some(FinishReason::Stop) | Some(FinishReason::EOS) | Some(FinishReason::Error)
-        )
+            Some(FinishReason::Stop) | Some(FinishReason::EOS)
+        ) {
+            return !matches!(stop_reason, Some(FinishReason::Error));
+        }
+        self.sequences
+            .read()
+            .get(request_id)
+            .is_some_and(|sequence| {
+                sequence.should_stream_generated_token(
+                    Some(self.tokenizer.as_ref()),
+                    token,
+                    stop_reason,
+                )
+            })
     }
 
     pub(super) async fn send_stream_update(&self, request_id: &RequestId, token: TokenId) {

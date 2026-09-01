@@ -414,6 +414,32 @@ extern "C" {
         use_atomic_add: i32,
         use_fp32_reduce: i32,
     ) -> i32;
+
+    fn ferrum_vllm_marlin_moe_mxfp4_bf16(
+        a: *const std::ffi::c_void,        // [size_m, size_k] bf16
+        b: *const std::ffi::c_void,        // [num_experts, ...] E2M1 Marlin-packed nibbles
+        c: *mut std::ffi::c_void,          // [size_m * top_k, size_n] bf16
+        c_tmp: *mut std::ffi::c_void,      // fp32 scratch (or null)
+        b_bias: *const std::ffi::c_void,   // [num_experts, size_n] bf16
+        b_scales: *const std::ffi::c_void, // [num_experts, size_k / 32, size_n] E8M0 bytes
+        workspace: *mut std::ffi::c_void,
+        sorted_token_ids: *const i32,
+        expert_ids: *const i32,
+        num_tokens_past_padded: *const i32,
+        topk_weights: *const f32,
+        moe_block_size: i32,
+        top_k: i32,
+        mul_topk_weights: i32,
+        is_ep: i32,
+        prob_m: i32,
+        prob_n: i32,
+        prob_k: i32,
+        group_size: i32, // exactly 32 for E2M1 + E8M0 MXFP4
+        dev: i32,
+        stream: cudarc::driver::sys::CUstream,
+        use_atomic_add: i32,
+        use_fp32_reduce: i32,
+    ) -> i32;
 }
 
 #[cfg(feature = "vllm-moe-marlin")]
@@ -1242,6 +1268,223 @@ impl MarlinMoeRawLaunchArgs {
     }
 }
 
+/// Native MXFP4 encoding accepted by the BF16 Marlin-MoE entrypoint.
+///
+/// The packed weight contains two E2M1 values per byte and uses one E8M0
+/// scale byte for every 32 values along K. Keeping this separate from
+/// `MarlinMoeF16WeightType` prevents the existing FP16 U4/E4M3 ABI from
+/// accidentally selecting the BF16-only entrypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarlinMoeMxfp4WeightType {
+    E2M1E8M0,
+}
+
+/// Raw, allocation-agnostic arguments for BF16 x MXFP4 Marlin-MoE.
+///
+/// `a`, `c`, and `bias` must point to BF16 data. `b` is Marlin-packed E2M1
+/// nibble data and `scales` is the corresponding group-32 E8M0 byte data.
+/// The owning provider must retain every allocation until work enqueued on
+/// `stream` has completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarlinMoeMxfp4Bf16LaunchArgs {
+    pub(crate) weight_type: MarlinMoeMxfp4WeightType,
+    pub(crate) expert_count: i32,
+    pub(crate) a: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) b: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) c_tmp: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) bias: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) scales: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) workspace: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) sorted_token_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) expert_ids: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) num_tokens_past_padded: cudarc::driver::sys::CUdeviceptr,
+    pub(crate) topk_weights: Option<cudarc::driver::sys::CUdeviceptr>,
+    pub(crate) moe_block_size: i32,
+    pub(crate) top_k: i32,
+    pub(crate) mul_topk_weights: bool,
+    pub(crate) is_ep: bool,
+    pub(crate) prob_m: i32,
+    pub(crate) prob_n: i32,
+    pub(crate) prob_k: i32,
+    pub(crate) group_size: i32,
+    pub(crate) device_ordinal: i32,
+    pub(crate) use_atomic_add: bool,
+    pub(crate) use_fp32_reduce: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarlinMoeMxfp4Bf16RequiredBytes {
+    a: u64,
+    b: u64,
+    c: u64,
+    c_tmp: Option<u64>,
+    bias: u64,
+    scales: u64,
+    topk_weights: Option<u64>,
+}
+
+impl MarlinMoeMxfp4Bf16LaunchArgs {
+    fn validate(&self) -> candle_core::Result<MarlinMoeMxfp4Bf16RequiredBytes> {
+        validate_marlin_moe_pointer("a", self.a, 16)?;
+        validate_marlin_moe_pointer("b", self.b, 16)?;
+        validate_marlin_moe_pointer("c", self.c, 16)?;
+        validate_marlin_moe_pointer("bias", self.bias, 16)?;
+        validate_marlin_moe_pointer("scales", self.scales, 16)?;
+        validate_marlin_moe_pointer("workspace", self.workspace, 4)?;
+        validate_marlin_moe_pointer("sorted_token_ids", self.sorted_token_ids, 4)?;
+        validate_marlin_moe_pointer("expert_ids", self.expert_ids, 4)?;
+        validate_marlin_moe_pointer("num_tokens_past_padded", self.num_tokens_past_padded, 4)?;
+        if let Some(pointer) = self.c_tmp {
+            validate_marlin_moe_pointer("c_tmp", pointer, 16)?;
+        }
+        if let Some(pointer) = self.topk_weights {
+            validate_marlin_moe_pointer("topk_weights", pointer, 4)?;
+        }
+
+        if self.expert_count <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 expert_count must be positive, got {}",
+                self.expert_count
+            )));
+        }
+        if self.prob_m <= 0 || self.prob_n <= 0 || self.prob_k <= 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 BF16 prob_m, prob_n, and prob_k must be positive, got [{}, {}, {}]",
+                self.prob_m, self.prob_n, self.prob_k
+            )));
+        }
+        if !matches!(self.moe_block_size, 8 | 16 | 32 | 48 | 64) {
+            return Err(invalid_marlin_moe_args(format!(
+                "unsupported moe_block_size {}; expected one of 8, 16, 32, 48, 64",
+                self.moe_block_size
+            )));
+        }
+        if self.top_k <= 0 || self.top_k > self.expert_count {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 top_k must be in 1..=expert_count, got top_k={} expert_count={}",
+                self.top_k, self.expert_count
+            )));
+        }
+        let output_rows = self.prob_m.checked_mul(self.top_k).ok_or_else(|| {
+            invalid_marlin_moe_args(
+                "MXFP4 prob_m * top_k overflows the kernel's i32 output-row domain",
+            )
+        })?;
+        if self.prob_n % 64 != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 prob_n {} must be divisible by the Marlin minimum thread width 64",
+                self.prob_n
+            )));
+        }
+        let expected_group_size = match self.weight_type {
+            MarlinMoeMxfp4WeightType::E2M1E8M0 => 32,
+        };
+        if self.group_size != expected_group_size {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 E2M1/E8M0 group_size must be exactly {expected_group_size}, got {}",
+                self.group_size,
+            )));
+        }
+        if self.prob_k % expected_group_size != 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "MXFP4 prob_k {} must be divisible by group_size {expected_group_size}",
+                self.prob_k,
+            )));
+        }
+        if self.device_ordinal < 0 {
+            return Err(invalid_marlin_moe_args(format!(
+                "device_ordinal must be non-negative, got {}",
+                self.device_ordinal
+            )));
+        }
+        if self.mul_topk_weights && self.topk_weights.is_none() {
+            return Err(invalid_marlin_moe_args(
+                "mul_topk_weights requires a non-null topk_weights pointer",
+            ));
+        }
+        if self.use_atomic_add == self.use_fp32_reduce {
+            return Err(invalid_marlin_moe_args(
+                "exactly one of use_atomic_add and use_fp32_reduce must be enabled",
+            ));
+        }
+        if self.use_fp32_reduce != self.c_tmp.is_some() {
+            return Err(invalid_marlin_moe_args(
+                "use_fp32_reduce must exactly match the c_tmp pointer",
+            ));
+        }
+
+        let experts = self.expert_count as u64;
+        let m = self.prob_m as u64;
+        let n = self.prob_n as u64;
+        let k = self.prob_k as u64;
+        let output_rows = output_rows as u64;
+        let required = MarlinMoeMxfp4Bf16RequiredBytes {
+            a: checked_marlin_moe_bytes("MXFP4 BF16 input [M,K]", &[m, k, 2])?,
+            b: checked_marlin_moe_bytes(
+                "MXFP4 E2M1 packed weight [E,N,K/2]",
+                &[experts, n, k / 2],
+            )?,
+            c: checked_marlin_moe_bytes("MXFP4 BF16 output [M*top_k,N]", &[output_rows, n, 2])?,
+            c_tmp: self
+                .c_tmp
+                .map(|_| {
+                    checked_marlin_moe_bytes(
+                        "MXFP4 FP32 reduction scratch [M*top_k,N]",
+                        &[output_rows, n, 4],
+                    )
+                })
+                .transpose()?,
+            bias: checked_marlin_moe_bytes("MXFP4 BF16 bias [E,N]", &[experts, n, 2])?,
+            scales: checked_marlin_moe_bytes(
+                "MXFP4 E8M0 scales [E,K/32,N]",
+                &[experts, k / 32, n],
+            )?,
+            topk_weights: self
+                .topk_weights
+                .map(|_| {
+                    checked_marlin_moe_bytes("MXFP4 top-k weights [M,top_k]", &[output_rows, 4])
+                })
+                .transpose()?,
+        };
+
+        validate_marlin_moe_span("a", self.a, required.a)?;
+        validate_marlin_moe_span("b", self.b, required.b)?;
+        validate_marlin_moe_span("c", self.c, required.c)?;
+        validate_marlin_moe_span("bias", self.bias, required.bias)?;
+        validate_marlin_moe_span("scales", self.scales, required.scales)?;
+        if let (Some(pointer), Some(bytes)) = (self.c_tmp, required.c_tmp) {
+            validate_marlin_moe_span("c_tmp", pointer, bytes)?;
+        }
+        if let (Some(pointer), Some(bytes)) = (self.topk_weights, required.topk_weights) {
+            validate_marlin_moe_span("topk_weights", pointer, bytes)?;
+        }
+        Ok(required)
+    }
+}
+
+fn checked_marlin_moe_bytes(label: &str, factors: &[u64]) -> candle_core::Result<u64> {
+    factors.iter().try_fold(1_u64, |bytes, factor| {
+        bytes.checked_mul(*factor).ok_or_else(|| {
+            invalid_marlin_moe_args(format!("{label} byte size overflows the u64 device domain"))
+        })
+    })
+}
+
+fn validate_marlin_moe_span(
+    name: &str,
+    pointer: cudarc::driver::sys::CUdeviceptr,
+    bytes: u64,
+) -> candle_core::Result<()> {
+    debug_assert!(bytes > 0);
+    if pointer.checked_add(bytes - 1).is_none() {
+        return Err(invalid_marlin_moe_args(format!(
+            "{name} pointer range overflows the u64 device domain"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_marlin_moe_pointer(
     name: &str,
     pointer: cudarc::driver::sys::CUdeviceptr,
@@ -1341,6 +1584,61 @@ pub(crate) fn launch_marlin_moe_vllm_raw(
         )));
     }
     Ok(())
+}
+
+/// Validate and enqueue the BF16 x MXFP4 Marlin-MoE native entrypoint.
+#[cfg(feature = "vllm-moe-marlin")]
+pub(crate) fn launch_marlin_moe_mxfp4_bf16(
+    stream: &CudaStream,
+    args: MarlinMoeMxfp4Bf16LaunchArgs,
+) -> candle_core::Result<()> {
+    let _required = args.validate()?;
+    let ret = unsafe {
+        ferrum_vllm_marlin_moe_mxfp4_bf16(
+            args.a as *const _,
+            args.b as *const _,
+            args.c as *mut _,
+            args.c_tmp.unwrap_or_default() as *mut _,
+            args.bias as *const _,
+            args.scales as *const _,
+            args.workspace as *mut _,
+            args.sorted_token_ids as *const i32,
+            args.expert_ids as *const i32,
+            args.num_tokens_past_padded as *const i32,
+            args.topk_weights.unwrap_or_default() as *const f32,
+            args.moe_block_size,
+            args.top_k,
+            i32::from(args.mul_topk_weights),
+            i32::from(args.is_ep),
+            args.prob_m,
+            args.prob_n,
+            args.prob_k,
+            args.group_size,
+            args.device_ordinal,
+            stream.cu_stream(),
+            i32::from(args.use_atomic_add),
+            i32::from(args.use_fp32_reduce),
+        )
+    };
+    if ret != 0 {
+        let (stage, cuda_status) = marlin_moe_ffi_status(ret);
+        return Err(candle_core::Error::Msg(format!(
+            "ferrum_vllm_marlin_moe_mxfp4_bf16 failed at {stage}: \
+             cuda_status={cuda_status}, ret={ret} (m={}, n={}, k={}, experts={})",
+            args.prob_m, args.prob_n, args.prob_k, args.expert_count
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "vllm-moe-marlin"))]
+pub(crate) fn launch_marlin_moe_mxfp4_bf16(
+    _stream: &CudaStream,
+    _args: MarlinMoeMxfp4Bf16LaunchArgs,
+) -> candle_core::Result<()> {
+    Err(candle_core::Error::Msg(
+        "vLLM MXFP4 BF16 Marlin-MoE not built — compile with --features vllm-moe-marlin".into(),
+    ))
 }
 
 #[cfg(not(feature = "vllm-moe-marlin"))]
@@ -1499,20 +1797,38 @@ pub use crate::marlin_repack::{
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "vllm-moe-marlin")]
-    use super::launch_marlin_moe_vllm_raw;
+    use super::{
+        configure_vllm_moe_profile_sink, launch_marlin_moe_mxfp4_bf16, launch_marlin_moe_vllm_raw,
+    };
     use super::{
         marlin_moe_ffi_status, marlin_profile_bucket_from_label, should_zero_workspace,
-        CudaMarlinRuntimeConfig, MarlinMoeF16WeightType, MarlinMoeRawLaunchArgs,
-        MarlinProfileBucket, MarlinProfileBucketStats,
+        CudaMarlinRuntimeConfig, MarlinMoeF16WeightType, MarlinMoeMxfp4Bf16LaunchArgs,
+        MarlinMoeMxfp4WeightType, MarlinMoeRawLaunchArgs, MarlinProfileBucket,
+        MarlinProfileBucketStats,
     };
     #[cfg(feature = "vllm-moe-marlin")]
-    use crate::marlin_repack::prepare_block_fp8_weight_for_fp8_marlin;
+    use crate::marlin_repack::{prepare_block_fp8_weight_for_fp8_marlin, repack_gptq_to_marlin};
+    #[cfg(feature = "vllm-moe-marlin")]
+    use crate::mxfp4_marlin_materializer::{
+        permute_mxfp4_marlin_bias_bf16, prepare_mxfp4_expert_scales_for_marlin,
+        transpose_mxfp4_expert_blocks_to_gptq_words,
+    };
     #[cfg(feature = "vllm-moe-marlin")]
     use cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT;
     #[cfg(feature = "vllm-moe-marlin")]
-    use cudarc::driver::{CudaContext, CudaSlice, DevicePtr, DevicePtrMut};
+    use cudarc::driver::{
+        CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg,
+    };
+    #[cfg(feature = "vllm-moe-marlin")]
+    use cudarc::nvrtc::Ptx;
+    #[cfg(feature = "vllm-moe-marlin")]
+    use ferrum_bench_core::{ProfileMetadata, ProfileSinkConfig};
     #[cfg(feature = "vllm-moe-marlin")]
     use half::{bf16, f16};
+    #[cfg(feature = "vllm-moe-marlin")]
+    use sha2::{Digest, Sha256};
+    #[cfg(feature = "vllm-moe-marlin")]
+    use std::sync::Arc;
 
     fn valid_marlin_moe_raw_args() -> MarlinMoeRawLaunchArgs {
         MarlinMoeRawLaunchArgs {
@@ -1541,6 +1857,354 @@ mod tests {
             use_atomic_add: true,
             use_fp32_reduce: false,
         }
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn prepare_mxfp4_marlin_bias(bias: &[bf16], expert_count: usize, n: usize) -> Vec<bf16> {
+        let source_bytes = bias
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .collect::<Vec<_>>();
+        let prepared = permute_mxfp4_marlin_bias_bf16(&source_bytes, expert_count, n)
+            .expect("prepare MXFP4 Marlin P32 bias");
+        assert_eq!(prepared.len(), source_bytes.len());
+        prepared
+            .chunks_exact(2)
+            .map(|bytes| bf16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])))
+            .collect()
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn assert_gpt_oss_mxfp4_two_expert_source_reference(
+        context: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        input_device: &CudaSlice<bf16>,
+        input: &[bf16],
+        n: usize,
+        logical_k: usize,
+        physical_k: usize,
+    ) -> f64 {
+        const EXPERTS: usize = 2;
+        const ROWS: usize = 4;
+        const MOE_BLOCK_SIZE: usize = 16;
+        const E2M1: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+
+        assert_eq!(input.len(), ROWS * physical_k);
+        let packed_bytes = n * physical_k / 2;
+        let scale_bytes = n * (physical_k / 32);
+        let logical_groups = logical_k / 32;
+        let physical_groups = physical_k / 32;
+        let mut blocks = vec![0_u8; EXPERTS * packed_bytes];
+        let mut scales = vec![0_u8; EXPERTS * scale_bytes];
+        let mut bias = vec![bf16::ZERO; EXPERTS * n];
+
+        for expert in 0..EXPERTS {
+            for output in 0..n {
+                bias[expert * n + output] = bf16::from_f32(
+                    (i32::try_from((expert * 5 + output) % 13).unwrap() - 6) as f32 / 64.0,
+                );
+                for group in 0..logical_groups {
+                    scales[expert * scale_bytes + output * physical_groups + group] =
+                        125 + ((expert * 3 + output + group * 2) % 5) as u8;
+                    let feature = group * 32 + (expert * 11 + output * 3 + group * 5) % 32;
+                    let mut nibble = 1 + ((expert + output + group) % 7) as u8;
+                    if (expert + output + group).is_multiple_of(3) {
+                        nibble |= 0x08;
+                    }
+                    let byte = &mut blocks
+                        [expert * packed_bytes + output * (physical_k / 2) + feature / 2];
+                    if feature.is_multiple_of(2) {
+                        *byte |= nibble;
+                    } else {
+                        *byte |= nibble << 4;
+                    }
+                }
+            }
+        }
+        assert!(scales.chunks_exact(physical_groups).all(|row| {
+            row[..logical_groups]
+                .windows(2)
+                .any(|pair| pair[0] != pair[1])
+                && row[logical_groups..].iter().all(|scale| *scale == 0)
+        }));
+
+        let mut reference = vec![0.0_f32; ROWS * n];
+        for row in 0..ROWS {
+            let expert = row % EXPERTS;
+            for output in 0..n {
+                let mut sum = bias[expert * n + output].to_f32();
+                for group in 0..logical_groups {
+                    let feature = group * 32 + (expert * 11 + output * 3 + group * 5) % 32;
+                    let packed =
+                        blocks[expert * packed_bytes + output * (physical_k / 2) + feature / 2];
+                    let nibble = if feature.is_multiple_of(2) {
+                        packed & 0x0f
+                    } else {
+                        packed >> 4
+                    };
+                    let mut weight = E2M1[usize::from(nibble & 0x07)];
+                    if nibble & 0x08 != 0 {
+                        weight = -weight;
+                    }
+                    let exponent =
+                        i32::from(scales[expert * scale_bytes + output * physical_groups + group])
+                            - 127;
+                    sum += input[row * physical_k + feature].to_f32()
+                        * weight
+                        * 2.0_f32.powi(exponent);
+                }
+                reference[row * n + output] = sum;
+            }
+        }
+
+        let mut packed_weight = Vec::with_capacity(EXPERTS * packed_bytes / 4);
+        let mut packed_scales = Vec::with_capacity(EXPERTS * scale_bytes);
+        for expert in 0..EXPERTS {
+            let raw = &blocks[expert * packed_bytes..(expert + 1) * packed_bytes];
+            let words = transpose_mxfp4_expert_blocks_to_gptq_words(raw, n, physical_k)
+                .expect("transpose source MXFP4 expert");
+            packed_weight.extend(repack_gptq_to_marlin(&words, physical_k, n));
+            packed_scales.extend(
+                prepare_mxfp4_expert_scales_for_marlin(
+                    &scales[expert * scale_bytes..(expert + 1) * scale_bytes],
+                    n,
+                    physical_k,
+                )
+                .expect("prepare source E8M0 expert scales"),
+            );
+        }
+        assert_eq!(packed_weight.len() * 4, EXPERTS * packed_bytes);
+        assert_eq!(packed_scales.len(), EXPERTS * scale_bytes);
+
+        let weight_device: CudaSlice<i32> = stream.clone_htod(&packed_weight).unwrap();
+        let scales_device: CudaSlice<u8> = stream.clone_htod(&packed_scales).unwrap();
+        let prepared_bias = prepare_mxfp4_marlin_bias(&bias, EXPERTS, n);
+        let bias_device: CudaSlice<bf16> = stream.clone_htod(&prepared_bias).unwrap();
+        let mut output_device: CudaSlice<bf16> = stream.alloc_zeros(ROWS * n).unwrap();
+        let sms = usize::try_from(
+            context
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut reduce_device: CudaSlice<f32> =
+            stream.alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256).unwrap();
+        let mut sorted = vec![ROWS as i32; EXPERTS * MOE_BLOCK_SIZE];
+        sorted[0] = 0;
+        sorted[1] = 2;
+        sorted[MOE_BLOCK_SIZE] = 1;
+        sorted[MOE_BLOCK_SIZE + 1] = 3;
+        let sorted_device: CudaSlice<i32> = stream.clone_htod(&sorted).unwrap();
+        let expert_device: CudaSlice<i32> = stream.clone_htod(&[0, 1]).unwrap();
+        let padded_device: CudaSlice<i32> = stream
+            .clone_htod(&[(EXPERTS * MOE_BLOCK_SIZE) as i32])
+            .unwrap();
+        let workspace: CudaSlice<i32> = stream.alloc_zeros(n.div_ceil(128) * sms * 4).unwrap();
+
+        {
+            let (a, _a_guard) = input_device.device_ptr(stream);
+            let (b, _b_guard) = weight_device.device_ptr(stream);
+            let (c, _c_guard) = output_device.device_ptr_mut(stream);
+            let (c_tmp, _c_tmp_guard) = reduce_device.device_ptr_mut(stream);
+            let (bias, _bias_guard) = bias_device.device_ptr(stream);
+            let (scales, _scales_guard) = scales_device.device_ptr(stream);
+            let (workspace, _workspace_guard) = workspace.device_ptr(stream);
+            let (sorted, _sorted_guard) = sorted_device.device_ptr(stream);
+            let (experts, _experts_guard) = expert_device.device_ptr(stream);
+            let (padded, _padded_guard) = padded_device.device_ptr(stream);
+            launch_marlin_moe_mxfp4_bf16(
+                stream,
+                MarlinMoeMxfp4Bf16LaunchArgs {
+                    weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+                    expert_count: EXPERTS as i32,
+                    a,
+                    b,
+                    c,
+                    c_tmp: Some(c_tmp),
+                    bias,
+                    scales,
+                    workspace,
+                    sorted_token_ids: sorted,
+                    expert_ids: experts,
+                    num_tokens_past_padded: padded,
+                    topk_weights: None,
+                    moe_block_size: MOE_BLOCK_SIZE as i32,
+                    top_k: 1,
+                    mul_topk_weights: false,
+                    is_ep: false,
+                    prob_m: ROWS as i32,
+                    prob_n: n as i32,
+                    prob_k: physical_k as i32,
+                    group_size: 32,
+                    device_ordinal: 0,
+                    use_atomic_add: false,
+                    use_fp32_reduce: true,
+                },
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+        }
+
+        let actual = stream.clone_dtoh(&output_device).unwrap();
+        let mut maximum_relative_l2 = 0.0_f64;
+        for row in 0..ROWS {
+            let expected = &reference[row * n..(row + 1) * n];
+            let observed = &actual[row * n..(row + 1) * n];
+            let reference_l2 = expected
+                .iter()
+                .map(|value| f64::from(*value).powi(2))
+                .sum::<f64>();
+            let error_l2 = observed
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| f64::from(actual.to_f32() - expected).powi(2))
+                .sum::<f64>();
+            assert!(observed.iter().all(|value| value.to_f32().is_finite()));
+            let relative_l2 = error_l2.sqrt() / reference_l2.sqrt().max(1.0e-6);
+            assert!(relative_l2 <= 0.05, "row={row} relL2={relative_l2:.8}");
+            maximum_relative_l2 = maximum_relative_l2.max(relative_l2);
+        }
+        maximum_relative_l2
+    }
+
+    fn valid_marlin_moe_mxfp4_bf16_args() -> MarlinMoeMxfp4Bf16LaunchArgs {
+        MarlinMoeMxfp4Bf16LaunchArgs {
+            weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+            expert_count: 4,
+            a: 0x1000,
+            b: 0x2000,
+            c: 0x3000,
+            c_tmp: None,
+            bias: 0x4000,
+            scales: 0x5000,
+            workspace: 0x6000,
+            sorted_token_ids: 0x7000,
+            expert_ids: 0x8000,
+            num_tokens_past_padded: 0x9000,
+            topk_weights: None,
+            moe_block_size: 16,
+            top_k: 2,
+            mul_topk_weights: false,
+            is_ep: false,
+            prob_m: 4,
+            prob_n: 512,
+            prob_k: 256,
+            group_size: 32,
+            device_ordinal: 0,
+            use_atomic_add: true,
+            use_fp32_reduce: false,
+        }
+    }
+
+    fn assert_invalid_marlin_moe_mxfp4_bf16_args(
+        args: MarlinMoeMxfp4Bf16LaunchArgs,
+        expected: &str,
+    ) {
+        let error = args.validate().expect_err("launch arguments must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error}"
+        );
+    }
+
+    #[test]
+    fn marlin_moe_mxfp4_bf16_args_compute_required_buffer_shapes() {
+        let required = valid_marlin_moe_mxfp4_bf16_args().validate().unwrap();
+        assert_eq!(required.a, 2_048);
+        assert_eq!(required.b, 262_144);
+        assert_eq!(required.c, 8_192);
+        assert_eq!(required.c_tmp, None);
+        assert_eq!(required.bias, 4_096);
+        assert_eq!(required.scales, 16_384);
+        assert_eq!(required.topk_weights, None);
+
+        let mut fp32_reduce = valid_marlin_moe_mxfp4_bf16_args();
+        fp32_reduce.c_tmp = Some(0xa000);
+        fp32_reduce.topk_weights = Some(0xb000);
+        fp32_reduce.mul_topk_weights = true;
+        fp32_reduce.use_atomic_add = false;
+        fp32_reduce.use_fp32_reduce = true;
+        let required = fp32_reduce.validate().unwrap();
+        assert_eq!(required.c_tmp, Some(16_384));
+        assert_eq!(required.topk_weights, Some(32));
+    }
+
+    #[test]
+    fn marlin_moe_mxfp4_bf16_args_reject_invalid_pointers() {
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.bias = 0;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "bias pointer must be non-null");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.scales += 2;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "scales pointer");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.b = u64::MAX - 15;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "b pointer range overflows");
+    }
+
+    #[test]
+    fn marlin_moe_mxfp4_bf16_args_reject_invalid_shapes_and_overflow() {
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.group_size = 128;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "group_size must be exactly 32");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.prob_k = 240;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "must be divisible by group_size 32");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.prob_n = 96;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "must be divisible");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.top_k = 5;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "1..=expert_count");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.prob_m = i32::MAX;
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "prob_m * top_k overflows");
+
+        let mut args = valid_marlin_moe_mxfp4_bf16_args();
+        args.expert_count = i32::MAX;
+        args.top_k = 1;
+        args.prob_m = 1;
+        args.prob_n = i32::MAX - i32::MAX.rem_euclid(64);
+        args.prob_k = i32::MAX - i32::MAX.rem_euclid(32);
+        assert_invalid_marlin_moe_mxfp4_bf16_args(args, "packed weight");
+    }
+
+    #[cfg(feature = "vllm-moe-marlin")]
+    #[test]
+    fn marlin_moe_mxfp4_bf16_extern_abi_matches_locked_export() {
+        type ExpectedAbi = unsafe extern "C" fn(
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *const std::ffi::c_void,
+            *const std::ffi::c_void,
+            *mut std::ffi::c_void,
+            *const i32,
+            *const i32,
+            *const i32,
+            *const f32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            cudarc::driver::sys::CUstream,
+            i32,
+            i32,
+        ) -> i32;
+
+        let _: ExpectedAbi = super::ferrum_vllm_marlin_moe_mxfp4_bf16;
     }
 
     #[test]
@@ -1689,6 +2353,700 @@ mod tests {
         args.zero_points = Some(0xa000);
         args.has_zero_points = true;
         assert_invalid_marlin_moe_args(args, "E4M3 forbids zero points");
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE native artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn gpt_oss_mxfp4_marlin_bias_p32_two_experts_matches_logical_source() {
+        const EXPERTS: usize = 2;
+        const ROWS: usize = 2;
+        const N: usize = 64;
+        const K: usize = 128;
+        const MOE_BLOCK_SIZE: usize = 16;
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+        let sms = usize::try_from(
+            context
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .expect("query CUDA SM count"),
+        )
+        .expect("CUDA SM count must be positive");
+        let input_device: CudaSlice<bf16> = stream
+            .alloc_zeros(ROWS * K)
+            .expect("allocate zero MXFP4 input");
+        let weight_device: CudaSlice<i32> = stream
+            .alloc_zeros(EXPERTS * N * K / 8)
+            .expect("allocate zero MXFP4 weights");
+        let neutral_scales = vec![127_u8; EXPERTS * N * (K / 32)];
+        let scales_device: CudaSlice<u8> = stream
+            .clone_htod(&neutral_scales)
+            .expect("upload neutral MXFP4 scales");
+        let logical_bias = (0..EXPERTS)
+            .flat_map(|expert| {
+                (0..N).map(move |output| {
+                    let magnitude = (output + 1) as f32;
+                    bf16::from_f32(if expert == 0 { -magnitude } else { magnitude })
+                })
+            })
+            .collect::<Vec<_>>();
+        let prepared_bias = prepare_mxfp4_marlin_bias(&logical_bias, EXPERTS, N);
+        let bias_device: CudaSlice<bf16> = stream
+            .clone_htod(&prepared_bias)
+            .expect("upload P32 MXFP4 bias");
+        let mut output_device: CudaSlice<bf16> =
+            stream.alloc_zeros(ROWS * N).expect("allocate MXFP4 output");
+        let mut reduce_device: CudaSlice<f32> = stream
+            .alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256)
+            .expect("allocate MXFP4 reduction scratch");
+        let mut sorted = vec![ROWS as i32; EXPERTS * MOE_BLOCK_SIZE];
+        sorted[0] = 0;
+        sorted[MOE_BLOCK_SIZE] = 1;
+        let sorted_device: CudaSlice<i32> = stream.clone_htod(&sorted).unwrap();
+        let expert_device: CudaSlice<i32> = stream.clone_htod(&[0, 1]).unwrap();
+        let padded_device: CudaSlice<i32> = stream
+            .clone_htod(&[(EXPERTS * MOE_BLOCK_SIZE) as i32])
+            .unwrap();
+        let workspace: CudaSlice<i32> = stream.alloc_zeros(sms * 4).unwrap();
+
+        {
+            let (a, _a_guard) = input_device.device_ptr(&stream);
+            let (b, _b_guard) = weight_device.device_ptr(&stream);
+            let (c, _c_guard) = output_device.device_ptr_mut(&stream);
+            let (c_tmp, _c_tmp_guard) = reduce_device.device_ptr_mut(&stream);
+            let (bias, _bias_guard) = bias_device.device_ptr(&stream);
+            let (scales, _scales_guard) = scales_device.device_ptr(&stream);
+            let (workspace, _workspace_guard) = workspace.device_ptr(&stream);
+            let (sorted, _sorted_guard) = sorted_device.device_ptr(&stream);
+            let (experts, _experts_guard) = expert_device.device_ptr(&stream);
+            let (padded, _padded_guard) = padded_device.device_ptr(&stream);
+            launch_marlin_moe_mxfp4_bf16(
+                &stream,
+                MarlinMoeMxfp4Bf16LaunchArgs {
+                    weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+                    expert_count: EXPERTS as i32,
+                    a,
+                    b,
+                    c,
+                    c_tmp: Some(c_tmp),
+                    bias,
+                    scales,
+                    workspace,
+                    sorted_token_ids: sorted,
+                    expert_ids: experts,
+                    num_tokens_past_padded: padded,
+                    topk_weights: None,
+                    moe_block_size: MOE_BLOCK_SIZE as i32,
+                    top_k: 1,
+                    mul_topk_weights: false,
+                    is_ep: false,
+                    prob_m: ROWS as i32,
+                    prob_n: N as i32,
+                    prob_k: K as i32,
+                    group_size: 32,
+                    device_ordinal: 0,
+                    use_atomic_add: false,
+                    use_fp32_reduce: true,
+                },
+            )
+            .expect("launch MXFP4 bias-only Marlin-MoE");
+            stream.synchronize().expect("synchronize bias-only launch");
+        }
+
+        let actual = stream
+            .clone_dtoh(&output_device)
+            .expect("download bias-only output");
+        for row in 0..ROWS {
+            for output in 0..N {
+                assert_eq!(
+                    actual[row * N + output].to_bits(),
+                    logical_bias[row * N + output].to_bits(),
+                    "row={row} expert={row} output={output}"
+                );
+            }
+        }
+        eprintln!("FERRUM GPTOSS MXFP4 MARLIN BIAS P32 E2 M2 PASS: N={N} K={K}");
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE native artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn gpt_oss_mxfp4_marlin_moe_bf16_ffi_matches_source_reference_for_four_cases() {
+        const MOE_BLOCK_SIZE: usize = 16;
+        const LCG_MULTIPLIER: u64 = 0x5851_f42d_4c95_7f2d;
+        const LCG_INCREMENT: u64 = 0x1405_7b7e_f767_814f;
+        const ROOT_SEED: u64 = 0x4750_544f_5353_4d58;
+        const SHAPE_SEED_XOR: u64 = 0x9e37_79b9_7f4a_7c15;
+        const WEIGHT_SEED_XOR: u64 = 0x5745_4947_4854_5f31;
+        const SCALE_SEED_XOR: u64 = 0x5343_414c_455f_5f31;
+        const ACTIVATION_SEED_XOR: u64 = 0x4143_5449_5641_5445;
+        const QUALITY_VECTOR_DEFINITION: &str = concat!(
+            "gpt-oss-mxfp4-marlin-moe-v1;",
+            "cases=gate-up-512x256-b1,b4|down-256x512-b1,b4;",
+            "root_seed=0x4750544f53534d58;",
+            "lcg=0x5851f42d4c957f2d+0x14057b7ef767814f;",
+            "stream_xors=0x9e3779b97f4a7c15,0x5745494748545f31,",
+            "0x5343414c455f5f31,0x4143544956415445;",
+            "activation=bf16[-1,1];source=e2m1-low-nibble-first/e8m0-group32;",
+            "decode=e2m1-table[0,0.5,1,1.5,2,3,4,6]*2^(e8m0-127);",
+            "bias=bf16;accumulator=f32;output=bf16;",
+            "reference=source-decoded-matmul-plus-bias;",
+            "relative_l2_max=0.05;nan=0;inf=0",
+        );
+        const QUALITY_VECTOR_DIGEST: &str =
+            "7b8d4908cbee9c68aa4ff4c47c5e883bf76788250cfbb334603dbbd746218b21";
+        const CASES: [(&str, usize, usize, usize, usize); 4] = [
+            ("gate-up-512x256-batch-1", 0, 512, 256, 1),
+            ("gate-up-512x256-batch-4", 0, 512, 256, 4),
+            ("down-256x512-batch-1", 1, 256, 512, 1),
+            ("down-256x512-batch-4", 1, 256, 512, 4),
+        ];
+
+        fn next(state: &mut u64) -> u64 {
+            *state = state
+                .wrapping_mul(LCG_MULTIPLIER)
+                .wrapping_add(LCG_INCREMENT);
+            *state
+        }
+
+        fn stream_seed(shape_index: usize, stream_xor: u64) -> u64 {
+            let mut state = ROOT_SEED
+                ^ (u64::try_from(shape_index + 1)
+                    .expect("shape index fits u64")
+                    .wrapping_mul(SHAPE_SEED_XOR))
+                ^ stream_xor;
+            next(&mut state)
+        }
+
+        fn decode_e2m1(bits: u8) -> f32 {
+            const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let magnitude = MAGNITUDES[usize::from(bits & 0x07)];
+            if bits & 0x08 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(QUALITY_VECTOR_DEFINITION.as_bytes())),
+            QUALITY_VECTOR_DIGEST,
+            "GPT-OSS MXFP4 quality-vector definition changed without a digest update"
+        );
+        let sms = usize::try_from(
+            context
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .expect("query CUDA SM count"),
+        )
+        .expect("CUDA SM count must be positive");
+
+        for (case_id, shape_index, n, k, batch) in CASES {
+            let mut activation_state = stream_seed(shape_index, ACTIVATION_SEED_XOR);
+            let input = (0..batch * k)
+                .map(|_| {
+                    let signed = i32::try_from(next(&mut activation_state) % 129)
+                        .expect("activation residue fits i32")
+                        - 64;
+                    bf16::from_f32(signed as f32 / 64.0)
+                })
+                .collect::<Vec<_>>();
+
+            let mut weight_state = stream_seed(shape_index, WEIGHT_SEED_XOR);
+            let source_blocks = (0..n * k / 2)
+                .map(|_| {
+                    let even =
+                        u8::try_from(next(&mut weight_state) & 0x0f).expect("E2M1 nibble fits u8");
+                    let odd =
+                        u8::try_from(next(&mut weight_state) & 0x0f).expect("E2M1 nibble fits u8");
+                    even | (odd << 4)
+                })
+                .collect::<Vec<_>>();
+
+            let groups_per_row = k / 32;
+            let mut scale_state = stream_seed(shape_index, SCALE_SEED_XOR);
+            let source_scales = (0..n * groups_per_row)
+                .map(|_| {
+                    125_u8
+                        + u8::try_from(next(&mut scale_state) % 5).expect("E8M0 scale tier fits u8")
+                })
+                .collect::<Vec<_>>();
+            let bias = (0..n)
+                .map(|output| bf16::from_f32((output as i32 % 7 - 3) as f32 / 32.0))
+                .collect::<Vec<_>>();
+
+            let mut reference = vec![0.0_f32; batch * n];
+            for row in 0..batch {
+                for output in 0..n {
+                    let mut sum = bias[output].to_f32();
+                    for input_feature in 0..k {
+                        let packed = source_blocks[output * (k / 2) + input_feature / 2];
+                        let nibble = if input_feature.is_multiple_of(2) {
+                            packed & 0x0f
+                        } else {
+                            packed >> 4
+                        };
+                        let exponent =
+                            i32::from(source_scales[output * groups_per_row + input_feature / 32])
+                                - 127;
+                        let decoded_weight = decode_e2m1(nibble) * 2.0_f32.powi(exponent);
+                        sum += input[row * k + input_feature].to_f32() * decoded_weight;
+                    }
+                    reference[row * n + output] = sum;
+                }
+            }
+
+            let gptq_words = transpose_mxfp4_expert_blocks_to_gptq_words(&source_blocks, n, k)
+                .expect("transpose source MXFP4 nibbles");
+            let packed_weight = repack_gptq_to_marlin(&gptq_words, k, n);
+            let packed_scales = prepare_mxfp4_expert_scales_for_marlin(&source_scales, n, k)
+                .expect("prepare source E8M0 scales");
+
+            let input_device: CudaSlice<bf16> = stream.clone_htod(&input).expect("upload input");
+            let weight_device: CudaSlice<i32> = stream
+                .clone_htod(&packed_weight)
+                .expect("upload packed MXFP4 weight");
+            let scales_device: CudaSlice<u8> = stream
+                .clone_htod(&packed_scales)
+                .expect("upload packed E8M0 scales");
+            let prepared_bias = prepare_mxfp4_marlin_bias(&bias, 1, n);
+            let bias_device: CudaSlice<bf16> =
+                stream.clone_htod(&prepared_bias).expect("upload P32 bias");
+            let mut output_device: CudaSlice<bf16> = stream
+                .alloc_zeros(batch * n)
+                .expect("allocate MXFP4 output");
+            // Match the production MoE workspace bound: every resident SM may
+            // own four 16-row, 256-column FP32 reduction tiles. The native
+            // kernel indexes this fixed arena, not merely the logical [M,N]
+            // output extent.
+            let mut reduce_device: CudaSlice<f32> = stream
+                .alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256)
+                .expect("allocate MXFP4 reduction scratch");
+
+            let mut sorted_token_ids = vec![i32::try_from(batch).unwrap(); MOE_BLOCK_SIZE];
+            for (token, sorted) in sorted_token_ids.iter_mut().take(batch).enumerate() {
+                *sorted = i32::try_from(token).expect("token index fits i32");
+            }
+            let sorted_token_ids_device: CudaSlice<i32> = stream
+                .clone_htod(&sorted_token_ids)
+                .expect("upload padded sorted token ids");
+            let expert_ids_device: CudaSlice<i32> =
+                stream.clone_htod(&[0]).expect("upload expert block id");
+            let num_tokens_past_padded_device: CudaSlice<i32> = stream
+                .clone_htod(&[i32::try_from(MOE_BLOCK_SIZE).unwrap()])
+                .expect("upload padded token count");
+            let workspace: CudaSlice<i32> = stream
+                .alloc_zeros(n.div_ceil(128) * sms * 4)
+                .expect("allocate Marlin-MoE workspace");
+
+            {
+                let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
+                let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
+                let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
+                let (reduce_pointer, _reduce_guard) = reduce_device.device_ptr_mut(&stream);
+                let (bias_pointer, _bias_guard) = bias_device.device_ptr(&stream);
+                let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
+                let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+                let (sorted_pointer, _sorted_guard) = sorted_token_ids_device.device_ptr(&stream);
+                let (expert_pointer, _expert_guard) = expert_ids_device.device_ptr(&stream);
+                let (padded_pointer, _padded_guard) =
+                    num_tokens_past_padded_device.device_ptr(&stream);
+
+                launch_marlin_moe_mxfp4_bf16(
+                    &stream,
+                    MarlinMoeMxfp4Bf16LaunchArgs {
+                        weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+                        expert_count: 1,
+                        a: input_pointer,
+                        b: weight_pointer,
+                        c: output_pointer,
+                        c_tmp: Some(reduce_pointer),
+                        bias: bias_pointer,
+                        scales: scales_pointer,
+                        workspace: workspace_pointer,
+                        sorted_token_ids: sorted_pointer,
+                        expert_ids: expert_pointer,
+                        num_tokens_past_padded: padded_pointer,
+                        topk_weights: None,
+                        moe_block_size: i32::try_from(MOE_BLOCK_SIZE).unwrap(),
+                        top_k: 1,
+                        mul_topk_weights: false,
+                        is_ep: false,
+                        prob_m: i32::try_from(batch).unwrap(),
+                        prob_n: i32::try_from(n).unwrap(),
+                        prob_k: i32::try_from(k).unwrap(),
+                        group_size: 32,
+                        device_ordinal: 0,
+                        use_atomic_add: false,
+                        use_fp32_reduce: true,
+                    },
+                )
+                .expect("launch GPT-OSS MXFP4 Marlin-MoE");
+                stream
+                    .synchronize()
+                    .expect("synchronize GPT-OSS MXFP4 Marlin-MoE");
+            }
+
+            let actual = stream
+                .clone_dtoh(&output_device)
+                .expect("download GPT-OSS MXFP4 output");
+            let mut reference_squared = 0.0_f64;
+            let mut error_squared = 0.0_f64;
+            let mut nan_count = 0_usize;
+            let mut infinity_count = 0_usize;
+            for (actual, expected) in actual.iter().zip(reference.iter().copied()) {
+                let actual = actual.to_f32();
+                reference_squared += f64::from(expected) * f64::from(expected);
+                if actual.is_nan() {
+                    nan_count += 1;
+                } else if actual.is_infinite() {
+                    infinity_count += 1;
+                } else {
+                    let error = f64::from(actual - expected);
+                    error_squared += error * error;
+                }
+            }
+            let relative_l2 = if nan_count == 0 && infinity_count == 0 {
+                error_squared.sqrt() / reference_squared.sqrt().max(1.0e-6)
+            } else {
+                f64::INFINITY
+            };
+
+            eprintln!(
+                "GPT_OSS_MXFP4_MARLIN_MOE_FFI_FIXTURE name={case_id} \
+                 quality_vector_digest={QUALITY_VECTOR_DIGEST} \
+                 rel_err={relative_l2:.8} nan_count={nan_count} \
+                 infinity_count={infinity_count}"
+            );
+            assert_eq!(nan_count, 0, "{case_id} emitted NaN");
+            assert_eq!(infinity_count, 0, "{case_id} emitted Inf");
+            assert!(
+                relative_l2 <= 0.05,
+                "{case_id} rel_err={relative_l2:.8} exceeds 0.05"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE native artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn gpt_oss_mxfp4_marlin_moe_executes_official_down_with_physical_k_padding() {
+        const N: usize = 2880;
+        const LOGICAL_K: usize = 2880;
+        const PHYSICAL_K: usize = 2944;
+        const BATCH: usize = 1;
+        const MOE_BLOCK_SIZE: usize = 16;
+        const ACTIVE_FEATURES: [usize; 8] = [0, 127, 128, 511, 1024, 1537, 2048, 2815];
+
+        fn decode_e2m1(bits: u8) -> f32 {
+            const MAGNITUDES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+            let magnitude = MAGNITUDES[usize::from(bits & 0x07)];
+            if bits & 0x08 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            }
+        }
+
+        let context = CudaContext::new(0).expect("CUDA context");
+        let stream = context.default_stream();
+        let sms = usize::try_from(
+            context
+                .attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+                .expect("query CUDA SM count"),
+        )
+        .expect("CUDA SM count must be positive");
+
+        // The model contract remains [N=2880,K=2880]. Only the execution K is
+        // padded to 2944 so the native 128x64 tile is legal. Cross-tile
+        // nonzero values make this a numerical pipeline check instead of a
+        // zero-output geometry check that could hide a stuck K pipeline.
+        let input = (0..PHYSICAL_K)
+            .map(|feature| {
+                if feature < LOGICAL_K {
+                    bf16::from_f32((i32::try_from(feature % 17).unwrap() - 8) as f32 / 8.0)
+                } else {
+                    bf16::from_f32(0.0)
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut source_blocks = vec![0_u8; N * PHYSICAL_K / 2];
+        let groups_per_row = PHYSICAL_K / 32;
+        let logical_groups_per_row = LOGICAL_K / 32;
+        let mut source_scales = vec![0_u8; N * groups_per_row];
+        let bias = (0..N)
+            .map(|output| bf16::from_f32((output as i32 % 7 - 3) as f32 / 32.0))
+            .collect::<Vec<_>>();
+        let mut reference = vec![0.0_f32; N];
+        for output in 0..N {
+            source_scales
+                [output * groups_per_row..output * groups_per_row + logical_groups_per_row]
+                .fill(127);
+            let mut sum = bias[output].to_f32();
+            for (ordinal, feature) in ACTIVE_FEATURES.iter().copied().enumerate() {
+                let magnitude = 1 + ((output + ordinal) % 7) as u8;
+                let nibble = if (output + ordinal).is_multiple_of(3) {
+                    magnitude | 0x08
+                } else {
+                    magnitude
+                };
+                let byte = &mut source_blocks[output * (PHYSICAL_K / 2) + feature / 2];
+                if feature.is_multiple_of(2) {
+                    *byte = (*byte & 0xf0) | nibble;
+                } else {
+                    *byte = (*byte & 0x0f) | (nibble << 4);
+                }
+                sum += input[feature].to_f32() * decode_e2m1(nibble);
+            }
+            reference[output] = sum;
+        }
+        assert!(input[LOGICAL_K..].iter().all(|value| value.to_f32() == 0.0));
+        assert!(source_scales
+            .chunks_exact(groups_per_row)
+            .all(|row| row[logical_groups_per_row..]
+                .iter()
+                .all(|scale| *scale == 0)));
+
+        let gptq_words = transpose_mxfp4_expert_blocks_to_gptq_words(&source_blocks, N, PHYSICAL_K)
+            .expect("transpose padded official-shape MXFP4 nibbles");
+        let packed_weight = repack_gptq_to_marlin(&gptq_words, PHYSICAL_K, N);
+        let packed_scales = prepare_mxfp4_expert_scales_for_marlin(&source_scales, N, PHYSICAL_K)
+            .expect("prepare padded official-shape E8M0 scales");
+
+        let input_device: CudaSlice<bf16> = stream.clone_htod(&input).expect("upload input");
+        let weight_device: CudaSlice<i32> = stream
+            .clone_htod(&packed_weight)
+            .expect("upload official-shape MXFP4 weight");
+        let scales_device: CudaSlice<u8> = stream
+            .clone_htod(&packed_scales)
+            .expect("upload official-shape E8M0 scales");
+        let prepared_bias = prepare_mxfp4_marlin_bias(&bias, 1, N);
+        let bias_device: CudaSlice<bf16> =
+            stream.clone_htod(&prepared_bias).expect("upload P32 bias");
+        let mut output_device: CudaSlice<bf16> = stream
+            .alloc_zeros(BATCH * N)
+            .expect("allocate official-shape output");
+        let mut reduce_device: CudaSlice<f32> = stream
+            .alloc_zeros(sms * 4 * MOE_BLOCK_SIZE * 256)
+            .expect("allocate official-shape reduction scratch");
+
+        let mut sorted_token_ids = vec![BATCH as i32; MOE_BLOCK_SIZE];
+        sorted_token_ids[0] = 0;
+        let sorted_token_ids_device: CudaSlice<i32> = stream
+            .clone_htod(&sorted_token_ids)
+            .expect("upload padded sorted token ids");
+        let expert_ids_device: CudaSlice<i32> =
+            stream.clone_htod(&[0]).expect("upload expert block id");
+        let num_tokens_past_padded_device: CudaSlice<i32> = stream
+            .clone_htod(&[MOE_BLOCK_SIZE as i32])
+            .expect("upload padded token count");
+        let workspace: CudaSlice<i32> = stream
+            .alloc_zeros(N.div_ceil(128) * sms * 4)
+            .expect("allocate official-shape Marlin-MoE workspace");
+
+        {
+            let (input_pointer, _input_guard) = input_device.device_ptr(&stream);
+            let (weight_pointer, _weight_guard) = weight_device.device_ptr(&stream);
+            let (output_pointer, _output_guard) = output_device.device_ptr_mut(&stream);
+            let (reduce_pointer, _reduce_guard) = reduce_device.device_ptr_mut(&stream);
+            let (bias_pointer, _bias_guard) = bias_device.device_ptr(&stream);
+            let (scales_pointer, _scales_guard) = scales_device.device_ptr(&stream);
+            let (workspace_pointer, _workspace_guard) = workspace.device_ptr(&stream);
+            let (sorted_pointer, _sorted_guard) = sorted_token_ids_device.device_ptr(&stream);
+            let (expert_pointer, _expert_guard) = expert_ids_device.device_ptr(&stream);
+            let (padded_pointer, _padded_guard) = num_tokens_past_padded_device.device_ptr(&stream);
+
+            launch_marlin_moe_mxfp4_bf16(
+                &stream,
+                MarlinMoeMxfp4Bf16LaunchArgs {
+                    weight_type: MarlinMoeMxfp4WeightType::E2M1E8M0,
+                    expert_count: 1,
+                    a: input_pointer,
+                    b: weight_pointer,
+                    c: output_pointer,
+                    c_tmp: Some(reduce_pointer),
+                    bias: bias_pointer,
+                    scales: scales_pointer,
+                    workspace: workspace_pointer,
+                    sorted_token_ids: sorted_pointer,
+                    expert_ids: expert_pointer,
+                    num_tokens_past_padded: padded_pointer,
+                    topk_weights: None,
+                    moe_block_size: MOE_BLOCK_SIZE as i32,
+                    top_k: 1,
+                    mul_topk_weights: false,
+                    is_ep: false,
+                    prob_m: BATCH as i32,
+                    prob_n: N as i32,
+                    prob_k: PHYSICAL_K as i32,
+                    group_size: 32,
+                    device_ordinal: 0,
+                    use_atomic_add: false,
+                    use_fp32_reduce: true,
+                },
+            )
+            .expect("launch official GPT-OSS 20B down geometry");
+            stream
+                .synchronize()
+                .expect("synchronize official GPT-OSS 20B down geometry");
+        }
+
+        let actual = stream
+            .clone_dtoh(&output_device)
+            .expect("download official-shape output");
+        let mut reference_squared = 0.0_f64;
+        let mut error_squared = 0.0_f64;
+        let mut non_finite = 0_usize;
+        for (actual, expected) in actual.iter().zip(reference.iter().copied()) {
+            let actual = actual.to_f32();
+            reference_squared += f64::from(expected) * f64::from(expected);
+            if actual.is_finite() {
+                let error = f64::from(actual - expected);
+                error_squared += error * error;
+            } else {
+                non_finite += 1;
+            }
+        }
+        let relative_l2 = error_squared.sqrt() / reference_squared.sqrt().max(1.0e-6);
+        assert_eq!(
+            non_finite, 0,
+            "padded official down geometry emitted NaN/Inf"
+        );
+        assert!(
+            relative_l2 <= 0.05,
+            "padded official down geometry relative L2 {relative_l2:.8} exceeds 0.05"
+        );
+        eprintln!(
+            "FERRUM GPTOSS MXFP4 OFFICIAL GEOMETRY PASS: M={BATCH} N={N} logical_K={LOGICAL_K} physical_K={PHYSICAL_K} rel_err={relative_l2:.8}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE A6 artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn gpt_oss_mxfp4_official_down_two_experts_four_rows_uses_128x64_and_matches_source() {
+        const N: usize = 2880;
+        const LOGICAL_K: usize = 2880;
+        const PHYSICAL_K: usize = 2944;
+        const ROWS: usize = 4;
+
+        std::env::set_var("FERRUM_VLLM_MOE_LOG_CONFIG", "1");
+        for name in [
+            "FERRUM_VLLM_MOE_LOG_CONFIG_MIN_PAIRS",
+            "FERRUM_VLLM_MOE_LOG_CONFIG_MAX_PAIRS",
+            "FERRUM_VLLM_MOE_THREAD_K",
+            "FERRUM_VLLM_MOE_THREAD_N",
+        ] {
+            std::env::remove_var(name);
+        }
+        let profile_path = std::env::temp_dir().join(format!(
+            "ferrum-gptoss-down-{}-config.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&profile_path);
+        configure_vllm_moe_profile_sink(&ProfileSinkConfig::enabled(
+            profile_path.clone(),
+            ProfileMetadata::default(),
+        ))
+        .unwrap();
+
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.default_stream();
+        let gate_up = (0..ROWS * LOGICAL_K * 2)
+            .map(|index| bf16::from_f32((index as i32 % 23 - 11) as f32 / 16.0))
+            .collect::<Vec<_>>();
+        let gate_up_device: CudaSlice<bf16> = stream.clone_htod(&gate_up).unwrap();
+        let mut input_device: CudaSlice<bf16> = stream.alloc_zeros(ROWS * PHYSICAL_K).unwrap();
+        let module = context
+            .load_module(Ptx::from_src(crate::ptx::GPT_OSS_MOE.to_owned()))
+            .unwrap();
+        let function = module
+            .load_function("gpt_oss_clamped_swiglu_interleaved_bf16")
+            .unwrap();
+        {
+            let (gate_up, _gate_up_guard) = gate_up_device.device_ptr(&stream);
+            let (input, _input_guard) = input_device.device_ptr_mut(&stream);
+            let logical_k = LOGICAL_K as i32;
+            let physical_k = PHYSICAL_K as i32;
+            let elements = (ROWS * PHYSICAL_K) as i64;
+            let limit = 7.0_f32;
+            let mut launch = stream.launch_builder(&function);
+            launch.arg(&gate_up);
+            launch.arg(&input);
+            launch.arg(&logical_k);
+            launch.arg(&physical_k);
+            launch.arg(&elements);
+            launch.arg(&limit);
+            unsafe {
+                launch.launch(LaunchConfig {
+                    grid_dim: ((elements as u32).div_ceil(256), 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .unwrap();
+            stream.synchronize().unwrap();
+        }
+        let input = stream.clone_dtoh(&input_device).unwrap();
+        assert!(input
+            .chunks_exact(PHYSICAL_K)
+            .all(|row| row[LOGICAL_K..].iter().all(|value| value.to_f32() == 0.0)));
+        let relative_l2 = assert_gpt_oss_mxfp4_two_expert_source_reference(
+            &context,
+            &stream,
+            &input_device,
+            &input,
+            N,
+            LOGICAL_K,
+            PHYSICAL_K,
+        );
+
+        let profile = std::fs::read_to_string(&profile_path).unwrap();
+        let selected = profile
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| {
+                event["event"] == "vllm_moe_config"
+                    && event["shape"]["prob_m"] == ROWS as i64
+                    && event["shape"]["prob_n"] == N as i64
+                    && event["shape"]["prob_k"] == PHYSICAL_K as i64
+            })
+            .expect("native event for official padded down shape");
+        assert_eq!(selected["shape"]["thread_k"], 128);
+        assert_eq!(selected["shape"]["thread_n"], 64);
+        configure_vllm_moe_profile_sink(&ProfileSinkConfig::disabled()).unwrap();
+        let _ = std::fs::remove_file(profile_path);
+        eprintln!(
+            "FERRUM GPTOSS MXFP4 DOWN E2 M4 PASS: N={N} logical_K={LOGICAL_K} physical_K={PHYSICAL_K} rel_err={relative_l2:.8}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires an sm89 CUDA host and the GPT-OSS MXFP4 Marlin-MoE artifact"]
+    #[cfg(feature = "vllm-moe-marlin")]
+    fn gpt_oss_mxfp4_official_gate_up_two_experts_four_rows_matches_source() {
+        const N: usize = 5760;
+        const K: usize = 2880;
+        const ROWS: usize = 4;
+
+        let context = CudaContext::new(0).unwrap();
+        let stream = context.default_stream();
+        let input = (0..ROWS * K)
+            .map(|index| bf16::from_f32((index as i32 % 29 - 14) as f32 / 16.0))
+            .collect::<Vec<_>>();
+        let input_device: CudaSlice<bf16> = stream.clone_htod(&input).unwrap();
+        let relative_l2 = assert_gpt_oss_mxfp4_two_expert_source_reference(
+            &context,
+            &stream,
+            &input_device,
+            &input,
+            N,
+            K,
+            K,
+        );
+        eprintln!("FERRUM GPTOSS MXFP4 GATE_UP E2 M4 PASS: N={N} K={K} rel_err={relative_l2:.8}");
     }
 
     #[test]

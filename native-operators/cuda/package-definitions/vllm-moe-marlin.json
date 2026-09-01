@@ -8,6 +8,13 @@
   ],
   "provider_bindings": [
     {
+      "operation_id": "operation.gpt_oss.routed_clamped_swiglu_moe",
+      "provider_id": "provider.cuda.gpt_oss.routed_clamped_swiglu_moe.mxfp4_bf16",
+      "entrypoints": [
+        "ferrum_vllm_marlin_moe_mxfp4_bf16"
+      ]
+    },
+    {
       "operation_id": "operation.routed_shared_swiglu_moe",
       "provider_id": "provider.cuda.routed_shared_swiglu_moe.f16.gptq_marlin",
       "entrypoints": [
@@ -33,6 +40,7 @@
     "ferrum_vllm_marlin_moe_clear_profile_config",
     "ferrum_vllm_marlin_moe_f16",
     "ferrum_vllm_marlin_moe_fp8_f16",
+    "ferrum_vllm_marlin_moe_mxfp4_bf16",
     "ferrum_vllm_marlin_moe_set_profile_config"
   ],
   "license_files": [

@@ -61,6 +61,7 @@ impl CudaNativeBuildUnit {
                 "ferrum_vllm_marlin_moe_clear_profile_config",
                 "ferrum_vllm_marlin_moe_f16",
                 "ferrum_vllm_marlin_moe_fp8_f16",
+                "ferrum_vllm_marlin_moe_mxfp4_bf16",
                 "ferrum_vllm_marlin_moe_set_profile_config",
             ],
             Self::VllmPagedAttentionV2 => &[

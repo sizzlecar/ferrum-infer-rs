@@ -24,7 +24,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_DIR = REPO_ROOT / "scripts/release/schemas/vnext_model_adoption"
 SCHEMA_VERSION = 1
-VALIDATOR_VERSION = "1.2.0"
+VALIDATOR_VERSION = "1.3.0"
 RECEIPT_SCHEMAS = {
     "model-lock.json": "model-lock-v1.schema.json",
     "validation.json": "validation-v1.schema.json",
@@ -91,8 +91,39 @@ PAID_BENCH_SWEEP_CHECKPOINTS = {
     "gpt-oss-20b-mxfp4",
     "gemma4-12b-w4a16-ct",
 }
-LEGACY_VALIDATOR_VERSION_CHECKPOINTS: set[str] = set()
+LEGACY_VALIDATOR_VERSION_CHECKPOINTS = {
+    "qwen38-27b-fp8",
+    "qwen36-27b-fp8",
+    "qwen36-35b-a3b-fp8",
+}
 PAID_BENCH_CONCURRENCY_CELLS = {1, 8, 32}
+GPT_OSS_CHECKPOINT_ID = "gpt-oss-20b-mxfp4"
+GPT_OSS_ARCHITECTURE = "GptOssForCausalLM"
+GPT_OSS_FAMILY_ID = "family.gpt_oss.routed_moe"
+GPT_OSS_NATIVE_MXFP4_FORMAT = (
+    "quantization.safetensors.mxfp4-e2m1-e8m0-group32-lsb-even"
+)
+GPT_OSS_SOURCE_CANARY_REPOSITORY = "tiny-random/gpt-oss-mxfp4"
+GPT_OSS_SOURCE_CANARY_REVISION = "27b6ad8040614834e65239f102de94bc459f48e5"
+GPT_OSS_SOURCE_CANARY_MODEL_SHA256 = (
+    "9a94c6b13dccbe61223a871c60f1e5ce020b54d1e54e969ad8ef4813f2524211"
+)
+GPT_OSS_SOURCE_CANARY_E2E_REASON = (
+    "source_metadata_missing_harmony_call_eos_and_provider_geometry_64_tile"
+)
+GPT_OSS_DERIVED_CANARY_GENERATOR_ID = "ferrum.gpt_oss.native-mxfp4-canary"
+GPT_OSS_DERIVED_CANARY_GENERATOR_VERSION = "2"
+GPT_OSS_CANARY_OPERATION_ID = "operation.gpt_oss.routed_clamped_swiglu_moe"
+GPT_OSS_CANARY_PROVIDER_ID = (
+    "provider.cuda.gpt_oss.routed_clamped_swiglu_moe.mxfp4_bf16"
+)
+GPT_OSS_CANARY_QUANT_TENSORS = (
+    "model.layers.0.mlp.experts.gate_up_proj_blocks",
+    "model.layers.0.mlp.experts.down_proj_blocks",
+    "model.layers.1.mlp.experts.gate_up_proj_blocks",
+    "model.layers.1.mlp.experts.down_proj_blocks",
+)
+GPT_OSS_CANARY_ATTRIBUTION_COUNT = 5
 QWEN38_REGRESSION_CHECKPOINT_ID = "qwen38-27b-fp8"
 QWEN38_REGRESSION_ATTRIBUTION_COUNT = 403
 QWEN38_REGRESSION_ATTRIBUTION_DENOMINATOR = (
@@ -128,6 +159,16 @@ M1_RUST_CONTRACTS = {
         "qwen36-35b-a3b-fp8-expert-scale-grid-drift": (
             "vnext::qwen35::tests::"
             "rejects_block_fp8_moe_sidecar_or_grid_drift_before_allocation"
+        ),
+    },
+    GPT_OSS_CHECKPOINT_ID: {
+        "gpt-oss-mxfp4-wrong-recipe": (
+            "vnext::gpt_oss::config::tests::"
+            "wrong_mxfp4_recipe_or_dense_exclusions_fail_closed"
+        ),
+        "gpt-oss-mxfp4-tensor-layout-drift": (
+            "vnext::gpt_oss::weights::tests::"
+            "dtype_shape_and_unknown_tensor_drift_fail_before_allocation"
         ),
     },
 }
@@ -173,6 +214,15 @@ def sha256_file(path: Path) -> str:
 def canonical_sha256(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return sha256_bytes(encoded)
+
+
+def gpt_oss_canary_attribution_denominator() -> str:
+    return canonical_sha256(
+        {
+            "operations": [GPT_OSS_CANARY_OPERATION_ID],
+            "quant_tensors": sorted(GPT_OSS_CANARY_QUANT_TENSORS),
+        }
+    )
 
 
 def as_object(value: Any, label: str) -> dict[str, Any]:
@@ -491,7 +541,14 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
     require(identity.get("repository") == repo, "source_lock identity repository mismatch")
     require(identity.get("revision") == revision, "source_lock identity revision mismatch")
     non_empty_string(identity.get("license"), "source_lock.identity.license")
-    non_empty_string(identity.get("architecture"), "source_lock.identity.architecture")
+    architecture = non_empty_string(
+        identity.get("architecture"), "source_lock.identity.architecture"
+    )
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        require(
+            architecture == GPT_OSS_ARCHITECTURE,
+            "GPT-OSS source_lock architecture mismatch",
+        )
     checks = as_object(lock["lock_checks"], "source_lock.lock_checks")
     expected_checks = {"config", "tokenizer", "template", "index", "shards"}
     require(set(checks) == expected_checks, "source_lock lock_checks set mismatch")
@@ -592,6 +649,58 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
                 (tensor["shape"][1] + 127) // 128,
             ]
             require(sidecar["shape"] == expected_scale_shape, f"{name} scale_inv block grid mismatch")
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        require(bool(execution_quant), "GPT-OSS source lock has no execution MXFP4 tensors")
+        for name in sorted(execution_quant):
+            tensor = tensor_by_name[name]
+            require(name.endswith("_blocks"), f"{name} must be an MXFP4 *_blocks tensor")
+            require(tensor["dtype"] == "U8", f"{name} MXFP4 blocks dtype must be U8")
+            layout = as_object(tensor["source_layout"], f"{name}.source_layout")
+            require(
+                layout.get("format") == GPT_OSS_NATIVE_MXFP4_FORMAT,
+                f"{name} MXFP4 source format mismatch",
+            )
+            require(layout.get("group_size") == 32, f"{name} MXFP4 group_size must be 32")
+            require(
+                layout.get("packing_order") == "lsb_even",
+                f"{name} MXFP4 packing_order must be lsb_even",
+            )
+            sidecars = as_list(layout["sidecars"], f"{name}.source_layout.sidecars")
+            require(len(sidecars) == 1, f"{name} must have exactly one E8M0 scale sidecar")
+            sidecar = as_object(sidecars[0], f"{name} E8M0 scale sidecar")
+            expected_scale_name = f"{name.removesuffix('_blocks')}_scales"
+            require(
+                sidecar["role"] == "e8m0_scale",
+                f"{name} sidecar role must be e8m0_scale",
+            )
+            require(
+                sidecar["tensor_name"] == expected_scale_name,
+                f"{name} E8M0 sidecar name mismatch",
+            )
+            require(sidecar["dtype"] == "U8", f"{name} E8M0 sidecar dtype must be U8")
+            require(
+                tensor["shape"][-1] == 16,
+                f"{name} packed MXFP4 group must end in 16 bytes",
+            )
+            require(
+                sidecar["shape"] == tensor["shape"][:-1],
+                f"{name} E8M0 sidecar shape mismatch",
+            )
+            require(
+                tensor_by_name[expected_scale_name]["quantized"] is False,
+                f"{name} E8M0 sidecar must be non-quantized U8 storage",
+            )
+        dense_exclusions = [
+            tensor
+            for tensor in tensor_by_name.values()
+            if tensor["disposition"] == "execution_eligible"
+            and tensor["quantized"] is False
+            and tensor["dtype"] in {"BF16", "F16"}
+        ]
+        require(
+            bool(dense_exclusions),
+            "GPT-OSS source lock requires BF16/F16 non-quantized execution exclusions",
+        )
     counts = as_object(lock["partition_counts"], "source_lock.partition_counts")
     expected_count_keys = {*disposition_counts, "unknown", "total"}
     require(set(counts) == expected_count_keys, "partition_counts fields mismatch")
@@ -622,6 +731,11 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
     covered_ops: set[str] = set()
     coverage_ops: list[str] = []
     coverage_pairs: set[tuple[str, str]] = set()
+    source_pair_count_field = (
+        "source_mxfp4_pair_count"
+        if checkpoint_id == GPT_OSS_CHECKPOINT_ID
+        else "source_fp8_pair_count"
+    )
     for index, raw in enumerate(coverage):
         cell = as_object(raw, f"source_lock.coverage_matrix[{index}]")
         require(
@@ -631,7 +745,7 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
                 "operation_version",
                 "provider_id",
                 "provider_version",
-                "source_fp8_pair_count",
+                source_pair_count_field,
                 "existing_execution_provider_acceptance",
                 "covered",
                 "missing_boundaries",
@@ -647,12 +761,12 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
         pair = (operation_id, provider_id)
         require(pair not in coverage_pairs, f"duplicate coverage cell {pair}")
         coverage_pairs.add(pair)
-        pair_count = cell["source_fp8_pair_count"]
+        pair_count = cell[source_pair_count_field]
         require(
             isinstance(pair_count, int)
             and not isinstance(pair_count, bool)
             and pair_count >= 0,
-            f"coverage {operation_id}.source_fp8_pair_count must be a non-negative integer",
+            f"coverage {operation_id}.{source_pair_count_field} must be a non-negative integer",
         )
         require(
             isinstance(cell["existing_execution_provider_acceptance"], bool),
@@ -869,7 +983,281 @@ def command_argv(value: Any, label: str) -> list[str]:
     return argv
 
 
-def validate_m2(value: Any, out_dir: Path) -> None:
+def validate_complete_canary_attribution(value: Any, label: str) -> None:
+    attribution = as_object(value, label)
+    fields = {
+        "expected_item_count",
+        "attributed_item_count",
+        "percent",
+        "denominator_sha256",
+    }
+    required_keys(attribution, fields, label)
+    require(set(attribution) == fields, f"{label} field set mismatch")
+    expected_count = positive_int(
+        attribution["expected_item_count"], f"{label}.expected_item_count"
+    )
+    attributed_count = positive_int(
+        attribution["attributed_item_count"], f"{label}.attributed_item_count"
+    )
+    require(
+        attributed_count == expected_count,
+        f"{label} is not 100%",
+    )
+    require(
+        finite_number(attribution["percent"], f"{label}.percent") == 100.0,
+        f"{label}.percent must be 100",
+    )
+    validate_sha(attribution["denominator_sha256"], f"{label}.denominator_sha256")
+
+
+def validate_gpt_oss_source_canary(value: Any) -> dict[str, Any]:
+    label = "M2 GPT-OSS same_arch_source"
+    canary = as_object(value, label)
+    fields = {
+        "source_kind",
+        "repository",
+        "revision",
+        "model_sha256",
+        "architecture",
+        "quantization_format",
+        "typed_ingestion",
+        "product_e2e",
+    }
+    required_keys(canary, fields, label)
+    require(set(canary) == fields, f"{label} field set mismatch")
+    require(canary["source_kind"] == "same_arch_source", f"{label} source_kind mismatch")
+    require(
+        canary["repository"] == GPT_OSS_SOURCE_CANARY_REPOSITORY,
+        f"{label} repository mismatch",
+    )
+    require(
+        canary["revision"] == GPT_OSS_SOURCE_CANARY_REVISION,
+        f"{label} revision mismatch",
+    )
+    source_model_sha256 = validate_sha(canary["model_sha256"], f"{label}.model_sha256")
+    require(
+        source_model_sha256 == GPT_OSS_SOURCE_CANARY_MODEL_SHA256,
+        f"{label} model digest mismatch",
+    )
+    require(
+        canary["architecture"] == GPT_OSS_ARCHITECTURE,
+        f"{label} architecture mismatch",
+    )
+    require(
+        canary["quantization_format"] == GPT_OSS_NATIVE_MXFP4_FORMAT,
+        f"{label} quantization format mismatch",
+    )
+    typed_ingestion = as_object(canary["typed_ingestion"], f"{label}.typed_ingestion")
+    typed_fields = {
+        "config_accepted",
+        "weight_schema_accepted",
+        "expected_family_id",
+        "full_prepare_status",
+        "reason_code",
+    }
+    required_keys(typed_ingestion, typed_fields, f"{label}.typed_ingestion")
+    require(
+        set(typed_ingestion) == typed_fields,
+        f"{label}.typed_ingestion field set mismatch",
+    )
+    require(
+        typed_ingestion["config_accepted"] is True,
+        f"{label} typed config was not accepted",
+    )
+    require(
+        typed_ingestion["expected_family_id"] == GPT_OSS_FAMILY_ID,
+        f"{label} expected family mismatch",
+    )
+    require(
+        typed_ingestion["weight_schema_accepted"] is True,
+        f"{label} weight schema was not accepted",
+    )
+    require(
+        typed_ingestion["full_prepare_status"] == "not_applicable",
+        f"{label} immutable source full prepare status mismatch",
+    )
+    require(
+        typed_ingestion["reason_code"]
+        == "source_metadata_missing_harmony_call_eos",
+        f"{label} immutable source prepare reason mismatch",
+    )
+    product_e2e = as_object(canary["product_e2e"], f"{label}.product_e2e")
+    product_fields = {"status", "reason_code", "reason"}
+    required_keys(product_e2e, product_fields, f"{label}.product_e2e")
+    require(
+        set(product_e2e) == product_fields,
+        f"{label}.product_e2e field set mismatch",
+    )
+    require(
+        product_e2e["status"] == "not_applicable",
+        f"{label} product E2E status must be not_applicable",
+    )
+    require(
+        product_e2e["reason_code"] == GPT_OSS_SOURCE_CANARY_E2E_REASON,
+        f"{label} product E2E reason code mismatch",
+    )
+    non_empty_string(product_e2e["reason"], f"{label}.product_e2e.reason")
+    return {"model_sha256": source_model_sha256}
+
+
+def validate_gpt_oss_derived_canary(value: Any, source: dict[str, Any]) -> None:
+    label = "M2 GPT-OSS target_format_derived"
+    canary = as_object(value, label)
+    fields = {
+        "source_kind",
+        "model_sha256",
+        "architecture",
+        "quantization_format",
+        "derivation",
+        "run",
+        "serve_argv",
+        "serve_non_stream",
+        "serve_stream",
+        "provider_attribution",
+    }
+    required_keys(canary, fields, label)
+    require(set(canary) == fields, f"{label} field set mismatch")
+    require(
+        canary["source_kind"] == "target_format_derived",
+        f"{label} source_kind mismatch",
+    )
+    derived_model_sha256 = validate_sha(
+        canary["model_sha256"], f"{label}.model_sha256"
+    )
+    require(
+        derived_model_sha256 != source["model_sha256"],
+        f"{label} output model digest must differ from the source canary",
+    )
+    require(
+        canary["architecture"] == GPT_OSS_ARCHITECTURE,
+        f"{label} architecture mismatch",
+    )
+    require(
+        canary["quantization_format"] == GPT_OSS_NATIVE_MXFP4_FORMAT,
+        f"{label} quantization format mismatch",
+    )
+
+    derivation = as_object(canary["derivation"], f"{label}.derivation")
+    derivation_fields = {
+        "deterministic",
+        "generator_id",
+        "generator_version",
+        "source_model_sha256",
+        "output_model_sha256",
+    }
+    required_keys(derivation, derivation_fields, f"{label}.derivation")
+    require(
+        set(derivation) == derivation_fields,
+        f"{label}.derivation field set mismatch",
+    )
+    require(derivation["deterministic"] is True, f"{label} derivation is not deterministic")
+    require(
+        derivation["generator_id"] == GPT_OSS_DERIVED_CANARY_GENERATOR_ID,
+        f"{label} derivation generator id mismatch",
+    )
+    require(
+        derivation["generator_version"] == GPT_OSS_DERIVED_CANARY_GENERATOR_VERSION,
+        f"{label} derivation generator version mismatch",
+    )
+    require(
+        validate_sha(
+            derivation["source_model_sha256"],
+            f"{label}.derivation.source_model_sha256",
+        )
+        == source["model_sha256"],
+        f"{label} derivation source model digest mismatch",
+    )
+    require(
+        validate_sha(
+            derivation["output_model_sha256"],
+            f"{label}.derivation.output_model_sha256",
+        )
+        == derived_model_sha256,
+        f"{label} derivation output model digest mismatch",
+    )
+
+    run = as_object(canary["run"], f"{label}.run")
+    run_fields = {"argv", "exit_code", "assistant_nonempty", "marker_matched"}
+    required_keys(run, run_fields, f"{label}.run")
+    require(set(run) == run_fields, f"{label}.run field set mismatch")
+    run_argv = argv_contains_subcommand(run["argv"], "run", f"{label}.run.argv")
+    require(
+        Path(run_argv[0]).name == "ferrum",
+        f"{label}.run.argv[0] basename must be ferrum",
+    )
+    require(
+        isinstance(run["exit_code"], int)
+        and not isinstance(run["exit_code"], bool)
+        and run["exit_code"] == 0,
+        f"{label} ferrum run failed",
+    )
+    require(run["assistant_nonempty"] is True, f"{label} run assistant is empty")
+    require(run["marker_matched"] is True, f"{label} run marker did not match")
+
+    serve_argv = argv_contains_subcommand(
+        canary["serve_argv"], "serve", f"{label}.serve_argv"
+    )
+    require(
+        Path(serve_argv[0]).name == "ferrum",
+        f"{label}.serve_argv[0] basename must be ferrum",
+    )
+    non_stream = as_object(canary["serve_non_stream"], f"{label}.serve_non_stream")
+    non_stream_fields = {"http_status", "json_parseable", "assistant_nonempty"}
+    required_keys(non_stream, non_stream_fields, f"{label}.serve_non_stream")
+    require(
+        set(non_stream) == non_stream_fields,
+        f"{label}.serve_non_stream field set mismatch",
+    )
+    require(non_stream["http_status"] == 200, f"{label} non-stream HTTP status must be 200")
+    require(non_stream["json_parseable"] is True, f"{label} non-stream response is not JSON")
+    require(non_stream["assistant_nonempty"] is True, f"{label} non-stream assistant is empty")
+
+    stream = as_object(canary["serve_stream"], f"{label}.serve_stream")
+    stream_fields = {"http_status", "done_count", "usage_chunk_count", "output_tokens"}
+    required_keys(stream, stream_fields, f"{label}.serve_stream")
+    require(set(stream) == stream_fields, f"{label}.serve_stream field set mismatch")
+    require(stream["http_status"] == 200, f"{label} stream HTTP status must be 200")
+    require(
+        positive_int(stream["done_count"], f"{label}.serve_stream.done_count") == 1,
+        f"{label} stream must have exactly one [DONE]",
+    )
+    require(
+        positive_int(
+            stream["usage_chunk_count"], f"{label}.serve_stream.usage_chunk_count"
+        )
+        == 1,
+        f"{label} stream must have exactly one usage chunk",
+    )
+    positive_int(stream["output_tokens"], f"{label}.serve_stream.output_tokens")
+    validate_complete_canary_attribution(
+        canary["provider_attribution"], f"{label}.provider_attribution"
+    )
+    attribution = as_object(
+        canary["provider_attribution"], f"{label}.provider_attribution"
+    )
+    require(
+        attribution["expected_item_count"] == GPT_OSS_CANARY_ATTRIBUTION_COUNT
+        and attribution["attributed_item_count"] == GPT_OSS_CANARY_ATTRIBUTION_COUNT,
+        f"{label} provider attribution must cover exactly four MXFP4 tensors and one operation",
+    )
+    require(
+        attribution["denominator_sha256"]
+        == gpt_oss_canary_attribution_denominator(),
+        f"{label} provider attribution denominator mismatch",
+    )
+
+
+def validate_gpt_oss_m2_canaries(value: Any) -> None:
+    canaries = as_object(value, "M2 GPT-OSS canaries")
+    require(
+        set(canaries) == {"same_arch_source", "target_format_derived"},
+        "M2 GPT-OSS canary set mismatch",
+    )
+    source = validate_gpt_oss_source_canary(canaries["same_arch_source"])
+    validate_gpt_oss_derived_canary(canaries["target_format_derived"], source)
+
+
+def validate_m2(value: Any, checkpoint_id: str, out_dir: Path) -> None:
     section = as_object(value, "validation.json.local_path")
     require(section.get("candidate_frozen") is True, "M2 candidate_frozen must be true")
     build = command_argv(section.get("release_build"), "M2 release_build")
@@ -901,6 +1289,8 @@ def validate_m2(value: Any, out_dir: Path) -> None:
     pass_line = non_empty_string(unit.get("pass_line"), "M2 unit_gate.pass_line")
     require(pass_line.startswith("FERRUM GATE unit PASS: "), "M2 unit gate PASS line mismatch")
     verify_reference(unit.get("artifact"), "M2 unit_gate.artifact", out_dir)
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        validate_gpt_oss_m2_canaries(section.get("canaries"))
 
 
 def validate_numeric_case(case: Any, label: str) -> tuple[tuple[int, int], int]:
@@ -1056,20 +1446,81 @@ def validate_hardware(value: Any, label: str = "product.json.hardware") -> dict[
     return gpu
 
 
+def validate_gpt_oss_hardware(value: Any) -> None:
+    gpu = validate_hardware(value)
+    gpu_name = non_empty_string(gpu["name"], "GPT-OSS product GPU name")
+    require(
+        "rtx 4090" in gpu_name.lower(),
+        "GPT-OSS product evidence must use one RTX 4090",
+    )
+    require(
+        positive_int(gpu["memory_bytes"], "GPT-OSS product GPU memory_bytes")
+        >= 24_000_000_000,
+        "GPT-OSS product RTX 4090 must expose at least 24,000,000,000 bytes",
+    )
+
+
+def validate_gpt_oss_harmony_tool_call(value: Any) -> None:
+    label = "M4 GPT-OSS harmony_tool_call"
+    case = as_object(value, label)
+    fields = {
+        "case_id",
+        "protocol",
+        "tool_choice",
+        "http_status",
+        "json_parseable",
+        "finish_reason",
+        "tool_call_count",
+        "tool_type",
+        "tool_name",
+        "arguments",
+        "raw_harmony_marker_count",
+    }
+    required_keys(case, fields, label)
+    require(set(case) == fields, f"{label} field set mismatch")
+    require(case["case_id"] == "harmony-weather-paris", f"{label} case_id mismatch")
+    require(case["protocol"] == "harmony", f"{label} protocol mismatch")
+    require(case["tool_choice"] == "required", f"{label} tool_choice must be required")
+    require(case["http_status"] == 200, f"{label} HTTP status must be 200")
+    require(case["json_parseable"] is True, f"{label} response is not JSON")
+    require(
+        case["finish_reason"] == "tool_calls",
+        f"{label} finish_reason must be tool_calls",
+    )
+    require(
+        positive_int(case["tool_call_count"], f"{label}.tool_call_count") == 1,
+        f"{label} must contain exactly one tool call",
+    )
+    require(case["tool_type"] == "function", f"{label} tool type must be function")
+    require(case["tool_name"] == "get_weather", f"{label} tool name mismatch")
+    arguments = as_object(case["arguments"], f"{label}.arguments")
+    require(arguments == {"city": "Paris"}, f"{label} objective arguments mismatch")
+    raw_marker_count = case["raw_harmony_marker_count"]
+    require(
+        isinstance(raw_marker_count, int)
+        and not isinstance(raw_marker_count, bool)
+        and raw_marker_count == 0,
+        f"{label} exposed raw Harmony control markers",
+    )
+
+
 def validate_m4(value: Any, checkpoint_id: str) -> None:
     section = as_object(value, "product.json.product_checks")
+    required = {
+        "load_to_ready_seconds",
+        "shared_identity",
+        "run",
+        "serve_argv",
+        "serve_non_stream",
+        "serve_stream",
+        "stability_c2",
+        "errors",
+    }
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        required.add("harmony_tool_call")
     required_keys(
         section,
-        {
-            "load_to_ready_seconds",
-            "shared_identity",
-            "run",
-            "serve_argv",
-            "serve_non_stream",
-            "serve_stream",
-            "stability_c2",
-            "errors",
-        },
+        required,
         "M4",
     )
     load_time = finite_number(section["load_to_ready_seconds"], "M4 load_to_ready_seconds")
@@ -1090,12 +1541,23 @@ def validate_m4(value: Any, checkpoint_id: str) -> None:
     for field in identity_fields:
         non_empty_string(run_identity[field], f"M4 run identity {field}")
     require(run_identity == serve_identity, "M4 run and serve identities differ")
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        require(
+            run_identity["prepared_family_id"] == GPT_OSS_FAMILY_ID,
+            "GPT-OSS M4 prepared family mismatch",
+        )
     run = as_object(section["run"], "M4 run")
     run_argv = argv_contains_subcommand(run.get("argv"), "run", "M4 run.argv")
     require(run.get("exit_code") == 0, "M4 ferrum run failed")
     require(run.get("assistant_nonempty") is True, "M4 ferrum run assistant is empty")
     require(run.get("marker_matched") is True, "M4 ferrum run marker did not match")
     serve_argv = argv_contains_subcommand(section["serve_argv"], "serve", "M4 serve_argv")
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        require(Path(run_argv[0]).name == "ferrum", "GPT-OSS M4 run executable must be ferrum")
+        require(
+            Path(serve_argv[0]).name == "ferrum",
+            "GPT-OSS M4 serve executable must be ferrum",
+        )
     if checkpoint_id.startswith("qwen3"):
         require("--disable-thinking" in run_argv, "Qwen M4 run must use --disable-thinking")
     non_stream = as_object(section["serve_non_stream"], "M4 serve_non_stream")
@@ -1107,6 +1569,8 @@ def validate_m4(value: Any, checkpoint_id: str) -> None:
     require(stream.get("done_count") == 1, "M4 stream must have exactly one [DONE]")
     require(stream.get("usage_chunk_count") == 1, "M4 stream must have exactly one usage chunk")
     positive_int(stream.get("output_tokens"), "M4 stream output_tokens")
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        validate_gpt_oss_harmony_tool_call(section["harmony_tool_call"])
     if checkpoint_id.startswith("qwen3"):
         for label, request in [("non-stream", non_stream), ("stream", stream)]:
             kwargs = as_object(request.get("chat_template_kwargs"), f"M4 {label} chat_template_kwargs")
@@ -1191,6 +1655,11 @@ def validate_paid_bench_sweep(
         label,
     )
     argv = argv_contains_subcommand(section["bench_argv"], "bench-serve", f"{label}.bench_argv")
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        require(
+            Path(argv[0]).name == "ferrum",
+            f"{label} GPT-OSS bench executable must be ferrum",
+        )
     require("--fail-on-error" in argv, f"{label} bench must use --fail-on-error")
     require("--require-ci" in argv, f"{label} bench must use --require-ci")
     require(
@@ -1476,7 +1945,7 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
         verify_reference(reference, f"manifest.receipts.{filename}", out_dir)
     allowed_validator_versions = {VALIDATOR_VERSION}
     if checkpoint_id in LEGACY_VALIDATOR_VERSION_CHECKPOINTS:
-        allowed_validator_versions.add("1.1.0")
+        allowed_validator_versions.add("1.2.0")
     require(
         manifest["validator_version"] in allowed_validator_versions,
         "manifest validator_version mismatch",
@@ -1495,12 +1964,17 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
     if stages["M1"]["status"] == "pass":
         validate_m1(receipts["validation.json"]["fail_closed"], checkpoint_id, out_dir)
     if stages["M2"]["status"] == "pass":
-        validate_m2(receipts["validation.json"]["local_path"], out_dir)
+        validate_m2(
+            receipts["validation.json"]["local_path"], checkpoint_id, out_dir
+        )
     if stages["M3"]["status"] == "pass":
         require(m0_result is not None, "M3 cannot pass without a valid M0")
         validate_m3(receipts["validation.json"]["numeric_approval"], checkpoint_id, m0_result, out_dir)
     if stages["M4"]["status"] == "pass":
-        validate_hardware(receipts["product.json"]["hardware"])
+        if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+            validate_gpt_oss_hardware(receipts["product.json"]["hardware"])
+        else:
+            validate_hardware(receipts["product.json"]["hardware"])
         require(bool(receipts["product.json"]["effective_config"]), "M4 effective_config must not be empty")
         validate_m4(receipts["product.json"]["product_checks"], checkpoint_id)
     if stages["M5"]["status"] == "pass":
@@ -1606,20 +2080,162 @@ def synthetic_paid_usability(
     }
 
 
+def synthetic_gpt_oss_m2_canaries() -> dict[str, Any]:
+    source_model_sha256 = GPT_OSS_SOURCE_CANARY_MODEL_SHA256
+    derived_model_sha256 = "7" * 64
+    return {
+        "same_arch_source": {
+            "source_kind": "same_arch_source",
+            "repository": GPT_OSS_SOURCE_CANARY_REPOSITORY,
+            "revision": GPT_OSS_SOURCE_CANARY_REVISION,
+            "model_sha256": source_model_sha256,
+            "architecture": GPT_OSS_ARCHITECTURE,
+            "quantization_format": GPT_OSS_NATIVE_MXFP4_FORMAT,
+            "typed_ingestion": {
+                "config_accepted": True,
+                "weight_schema_accepted": True,
+                "expected_family_id": GPT_OSS_FAMILY_ID,
+                "full_prepare_status": "not_applicable",
+                "reason_code": "source_metadata_missing_harmony_call_eos",
+            },
+            "product_e2e": {
+                "status": "not_applicable",
+                "reason_code": GPT_OSS_SOURCE_CANARY_E2E_REASON,
+                "reason": (
+                    "immutable source omits Harmony CALL from generation EOS and "
+                    "H32/head_dim32 cannot enter the production 64-tile provider"
+                ),
+            },
+        },
+        "target_format_derived": {
+            "source_kind": "target_format_derived",
+            "model_sha256": derived_model_sha256,
+            "architecture": GPT_OSS_ARCHITECTURE,
+            "quantization_format": GPT_OSS_NATIVE_MXFP4_FORMAT,
+            "derivation": {
+                "deterministic": True,
+                "generator_id": GPT_OSS_DERIVED_CANARY_GENERATOR_ID,
+                "generator_version": GPT_OSS_DERIVED_CANARY_GENERATOR_VERSION,
+                "source_model_sha256": source_model_sha256,
+                "output_model_sha256": derived_model_sha256,
+            },
+            "run": {
+                "argv": ["ferrum", "run"],
+                "exit_code": 0,
+                "assistant_nonempty": True,
+                "marker_matched": True,
+            },
+            "serve_argv": ["ferrum", "serve"],
+            "serve_non_stream": {
+                "http_status": 200,
+                "json_parseable": True,
+                "assistant_nonempty": True,
+            },
+            "serve_stream": {
+                "http_status": 200,
+                "done_count": 1,
+                "usage_chunk_count": 1,
+                "output_tokens": 16,
+            },
+            "provider_attribution": {
+                "expected_item_count": GPT_OSS_CANARY_ATTRIBUTION_COUNT,
+                "attributed_item_count": GPT_OSS_CANARY_ATTRIBUTION_COUNT,
+                "percent": 100.0,
+                "denominator_sha256": gpt_oss_canary_attribution_denominator(),
+            },
+        },
+    }
+
+
+def synthetic_gpt_oss_m0_tensors() -> list[dict[str, Any]]:
+    tensors: list[dict[str, Any]] = []
+    for name in GPT_OSS_CANARY_QUANT_TENSORS:
+        rows = 128 if "gate_up" in name else 64
+        blocks_shape = [32, rows, 2, 16]
+        scales_shape = blocks_shape[:-1]
+        scales_name = f"{name.removesuffix('_blocks')}_scales"
+        tensors.append(
+            {
+                "name": name,
+                "dtype": "U8",
+                "shape": blocks_shape,
+                "disposition": "execution_eligible",
+                "quantized": True,
+                "source_layout": {
+                    "format": GPT_OSS_NATIVE_MXFP4_FORMAT,
+                    "group_size": 32,
+                    "packing_order": "lsb_even",
+                    "sidecars": [
+                        {
+                            "role": "e8m0_scale",
+                            "tensor_name": scales_name,
+                            "dtype": "U8",
+                            "shape": scales_shape,
+                        }
+                    ],
+                },
+            }
+        )
+        tensors.append(
+            {
+                "name": scales_name,
+                "dtype": "U8",
+                "shape": scales_shape,
+                "disposition": "execution_eligible",
+                "quantized": False,
+            }
+        )
+    tensors.append(
+        {
+            "name": "model.embed_tokens.weight",
+            "dtype": "BF16",
+            "shape": [201_088, 64],
+            "disposition": "execution_eligible",
+            "quantized": False,
+        }
+    )
+    return tensors
+
+
 def synthetic_pass_documents(
     out_dir: Path,
     checkpoint_id: str = "qwen38-27b-fp8",
 ) -> dict[str, dict[str, Any]]:
     unit_manifest = out_dir.parent / f"{out_dir.name}-upstream" / "unit.gate.json"
     write_json(unit_manifest, {"status": "pass"})
-    expected_tensors = ["model.layers.0.q_proj.weight", "model.layers.0.o_proj.weight"]
-    expected_operations = [
-        {"operation_id": "op.q_proj", "tensor_names": [expected_tensors[0]]},
-        {"operation_id": "op.o_proj", "tensor_names": [expected_tensors[1]]},
+    qwen_expected_tensors = [
+        "model.layers.0.q_proj.weight",
+        "model.layers.0.o_proj.weight",
     ]
-    denominator = canonical_sha256(
-        {"operations": ["op.o_proj", "op.q_proj"], "quant_tensors": sorted(expected_tensors)}
-    )
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        expected_tensors = list(GPT_OSS_CANARY_QUANT_TENSORS)
+        expected_operations = [
+            {
+                "operation_id": GPT_OSS_CANARY_OPERATION_ID,
+                "tensor_names": expected_tensors,
+            }
+        ]
+        denominator = gpt_oss_canary_attribution_denominator()
+        reference_semantics = (
+            "matmul after native E2M1 values are decoded with E8M0 group-32 scales"
+        )
+        numeric_shapes = [(128, 64), (64, 64)]
+    else:
+        expected_tensors = qwen_expected_tensors
+        expected_operations = [
+            {"operation_id": "op.q_proj", "tensor_names": [expected_tensors[0]]},
+            {"operation_id": "op.o_proj", "tensor_names": [expected_tensors[1]]},
+        ]
+        denominator = canonical_sha256(
+            {
+                "operations": ["op.o_proj", "op.q_proj"],
+                "quant_tensors": sorted(expected_tensors),
+            }
+        )
+        reference_semantics = (
+            "matmul after source values are decoded with locked scales/layout"
+        )
+        numeric_shapes = [(128, 128), (256, 128)]
     digests = {
         "checkpoint_content_digest": "a" * 64,
         "source_schema_fingerprint": "b" * 64,
@@ -1637,7 +2253,11 @@ def synthetic_pass_documents(
                 "architecture": (
                     "Qwen3_5MoeForConditionalGeneration"
                     if checkpoint_id == "qwen36-35b-a3b-fp8"
-                    else "Qwen3_5ForConditionalGeneration"
+                    else (
+                        GPT_OSS_ARCHITECTURE
+                        if checkpoint_id == GPT_OSS_CHECKPOINT_ID
+                        else "Qwen3_5ForConditionalGeneration"
+                    )
                 ),
             },
             "lock_checks": {
@@ -1656,7 +2276,7 @@ def synthetic_pass_documents(
             ],
             "tensors": [
                 {
-                    "name": expected_tensors[0],
+                    "name": qwen_expected_tensors[0],
                     "dtype": "F8_E4M3",
                     "shape": [128, 128],
                     "disposition": "execution_eligible",
@@ -1675,7 +2295,7 @@ def synthetic_pass_documents(
                     },
                 },
                 {
-                    "name": expected_tensors[1],
+                    "name": qwen_expected_tensors[1],
                     "dtype": "F8_E4M3",
                     "shape": [256, 128],
                     "disposition": "execution_eligible",
@@ -1750,7 +2370,7 @@ def synthetic_pass_documents(
             "quality_vector": {
                 "generator_semantics": "seeded exact source block-FP8 fixtures",
                 "input_semantics": "two shapes by two activation batches",
-                "reference_semantics": "matmul after source values are decoded with locked scales/layout",
+                "reference_semantics": reference_semantics,
             },
             "digests": digests,
             "memory_estimate": {
@@ -1760,6 +2380,33 @@ def synthetic_pass_documents(
             },
         },
     }
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        source_lock = model_lock["source_lock"]
+        source_lock["tensors"] = synthetic_gpt_oss_m0_tensors()
+        source_lock["partition_counts"] = {
+            "execution_eligible": 9,
+            "typed_non_executed": 0,
+            "rejected": 0,
+            "unknown": 0,
+            "total": 9,
+        }
+        source_lock["coverage_matrix"] = [
+            {
+                "operation_id": GPT_OSS_CANARY_OPERATION_ID,
+                "operation_version": {"major": 1, "minor": 0},
+                "provider_id": GPT_OSS_CANARY_PROVIDER_ID,
+                "provider_version": {"major": 1, "minor": 0},
+                "source_mxfp4_pair_count": 4,
+                "existing_execution_provider_acceptance": True,
+                "covered": True,
+                "missing_boundaries": [],
+            }
+        ]
+        source_lock["quality_vector"] = {
+            "generator_semantics": "seeded native E2M1/E8M0 group-32 fixtures",
+            "input_semantics": "two expert projection shapes by two activation batches",
+            "reference_semantics": reference_semantics,
+        }
     m1_root = out_dir.parent / f"{out_dir.name}-upstream" / "m1"
     m1_root.mkdir(parents=True, exist_ok=True)
     cargo_path = (m1_root / "cargo").resolve()
@@ -1892,7 +2539,7 @@ def synthetic_pass_documents(
         "numeric_approval": {
             "mode": "full",
             "quality_vector_digest": digests["quality_vector_digest"],
-            "reference_semantics": "matmul after source values are decoded with locked scales/layout",
+            "reference_semantics": reference_semantics,
             "cases": [
                 {
                     "case_id": f"shape-{shape[0]}-{shape[1]}-batch-{batch}",
@@ -1902,12 +2549,16 @@ def synthetic_pass_documents(
                     "nan_count": 0,
                     "inf_count": 0,
                 }
-                for shape in [(128, 128), (256, 128)]
+                for shape in numeric_shapes
                 for batch in [1, 4]
             ],
             "approval": {
                 "approved": True,
-                "materializer_id": "weight-materializer.cuda.block-fp8",
+                "materializer_id": (
+                    "weight-materializer.cuda.gpt-oss-mxfp4-to-marlin"
+                    if checkpoint_id == GPT_OSS_CHECKPOINT_ID
+                    else "weight-materializer.cuda.block-fp8"
+                ),
                 "materializer_version": "1.0.0",
                 "implementation_fingerprint": "f" * 64,
                 "source_schema_fingerprint": digests["source_schema_fingerprint"],
@@ -1922,12 +2573,24 @@ def synthetic_pass_documents(
         },
     }
     validation["references"] = [reference_for(unit_manifest), *m1_references]
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        validation["local_path"]["canaries"] = synthetic_gpt_oss_m2_canaries()
+    family_id = (
+        GPT_OSS_FAMILY_ID
+        if checkpoint_id == GPT_OSS_CHECKPOINT_ID
+        else "family.qwen3_5.hybrid"
+    )
+    product_gpu = (
+        {"name": "NVIDIA GeForce RTX 4090", "memory_bytes": 24_000_000_000}
+        if checkpoint_id == GPT_OSS_CHECKPOINT_ID
+        else {"name": "NVIDIA L40S", "memory_bytes": 48_000_000_000}
+    )
     product = {
         **synthetic_envelope("product", checkpoint_id),
         "binary_sha256": "e" * 64,
         "hardware": {
             "gpu_count": 1,
-            "gpus": [{"name": "NVIDIA L40S", "memory_bytes": 48_000_000_000}],
+            "gpus": [product_gpu],
             "driver_version": "synthetic-driver",
             "cuda_runtime": "synthetic-cuda",
         },
@@ -1937,14 +2600,14 @@ def synthetic_pass_documents(
             "load_to_ready_seconds": 500.0,
             "shared_identity": {
                 "run": {
-                    "prepared_family_id": "family.qwen3_5.hybrid",
+                    "prepared_family_id": family_id,
                     "plan_fingerprint": "plan-fixture",
                     "weight_decision_fingerprint": "weight-fixture",
                     "tokenizer_digest": "tokenizer-fixture",
                     "chat_template_digest": "template-fixture",
                 },
                 "serve": {
-                    "prepared_family_id": "family.qwen3_5.hybrid",
+                    "prepared_family_id": family_id,
                     "plan_fingerprint": "plan-fixture",
                     "weight_decision_fingerprint": "weight-fixture",
                     "tokenizer_digest": "tokenizer-fixture",
@@ -2010,10 +2673,28 @@ def synthetic_pass_documents(
             "fallback_counts": {key: 0 for key in sorted(FALLBACK_KEYS)},
         },
     }
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        product_checks = product["product_checks"]
+        product_checks["run"]["argv"] = ["ferrum", "run"]
+        product_checks["serve_non_stream"].pop("chat_template_kwargs")
+        product_checks["serve_stream"].pop("chat_template_kwargs")
+        product_checks["harmony_tool_call"] = {
+            "case_id": "harmony-weather-paris",
+            "protocol": "harmony",
+            "tool_choice": "required",
+            "http_status": 200,
+            "json_parseable": True,
+            "finish_reason": "tool_calls",
+            "tool_call_count": 1,
+            "tool_type": "function",
+            "tool_name": "get_weather",
+            "arguments": {"city": "Paris"},
+            "raw_harmony_marker_count": 0,
+        }
     if checkpoint_id in PAID_BENCH_SWEEP_CHECKPOINTS:
         product["usability"] = synthetic_paid_usability(
             checkpoint_id,
-            expected_attribution_count=4,
+            expected_attribution_count=len(expected_tensors) + len(expected_operations),
             attribution_denominator=denominator,
         )
     if checkpoint_id == "qwen36-35b-a3b-fp8":
@@ -2108,8 +2789,12 @@ def run_self_test() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-vnext-adoption-selftest-") as raw:
         root = Path(raw)
 
-        def blocked_documents(path: Path, reason: tuple[str, str]) -> dict[str, dict[str, Any]]:
-            documents = synthetic_pass_documents(path)
+        def blocked_documents(
+            path: Path,
+            reason: tuple[str, str],
+            checkpoint_id: str = "qwen38-27b-fp8",
+        ) -> dict[str, dict[str, Any]]:
+            documents = synthetic_pass_documents(path, checkpoint_id)
             for stage, (filename, section) in STAGE_SECTIONS.items():
                 documents[filename]["milestones"][stage] = {
                     "status": "not_run",
@@ -2130,6 +2815,25 @@ def run_self_test() -> None:
         expected = expected_terminal_line("PASS", "qwen38-27b-fp8", passing)
         require(validate_package("qwen38-27b-fp8", passing) == expected, "synthetic PASS line mismatch")
 
+        for checkpoint_id in [
+            "qwen38-27b-fp8",
+            "qwen36-27b-fp8",
+            "qwen36-35b-a3b-fp8",
+        ]:
+            legacy_validator = root / f"{checkpoint_id}-v1.2-pass"
+            legacy_docs = synthetic_pass_documents(legacy_validator, checkpoint_id)
+            write_synthetic_package(legacy_validator, legacy_docs)
+            legacy_manifest = load_json(legacy_validator / "manifest.json")
+            legacy_manifest["validator_version"] = "1.2.0"
+            write_json(legacy_validator / "manifest.json", legacy_manifest)
+            legacy_expected = expected_terminal_line(
+                "PASS", checkpoint_id, legacy_validator
+            )
+            require(
+                validate_package(checkpoint_id, legacy_validator) == legacy_expected,
+                f"{checkpoint_id} validator 1.2 compatibility drifted",
+            )
+
         a3_passing = root / "a3-pass"
         a3_pass_docs = synthetic_pass_documents(a3_passing, "qwen36-35b-a3b-fp8")
         write_synthetic_package(a3_passing, a3_pass_docs)
@@ -2137,6 +2841,165 @@ def run_self_test() -> None:
         require(
             validate_package("qwen36-35b-a3b-fp8", a3_passing) == a3_expected,
             "synthetic A3 PASS line mismatch",
+        )
+
+        b_passing = root / "b-pass"
+        b_pass_docs = synthetic_pass_documents(b_passing, GPT_OSS_CHECKPOINT_ID)
+        write_synthetic_package(b_passing, b_pass_docs)
+        b_expected = expected_terminal_line("PASS", GPT_OSS_CHECKPOINT_ID, b_passing)
+        require(
+            validate_package(GPT_OSS_CHECKPOINT_ID, b_passing) == b_expected,
+            "synthetic B PASS line mismatch",
+        )
+
+        b_bad_architecture = json.loads(
+            json.dumps(b_pass_docs["model-lock.json"]["source_lock"])
+        )
+        b_bad_architecture["identity"]["architecture"] = "Qwen3_5ForConditionalGeneration"
+        expect_failure(
+            "B M0 architecture",
+            lambda: validate_m0(
+                b_bad_architecture, GPT_OSS_CHECKPOINT_ID, require_covered=True
+            ),
+            "GPT-OSS source_lock architecture mismatch",
+        )
+
+        b_bad_layout = json.loads(
+            json.dumps(b_pass_docs["model-lock.json"]["source_lock"])
+        )
+        b_bad_layout["tensors"][0]["source_layout"]["packing_order"] = "msb_even"
+        expect_failure(
+            "B M0 MXFP4 packing",
+            lambda: validate_m0(
+                b_bad_layout, GPT_OSS_CHECKPOINT_ID, require_covered=True
+            ),
+            "MXFP4 packing_order must be lsb_even",
+        )
+
+        b_bad_hardware = json.loads(json.dumps(b_pass_docs["product.json"]["hardware"]))
+        b_bad_hardware["gpus"][0]["name"] = "NVIDIA L40S"
+        expect_failure(
+            "B RTX 4090 binding",
+            lambda: validate_gpt_oss_hardware(b_bad_hardware),
+            "must use one RTX 4090",
+        )
+
+        b_bad_family = json.loads(
+            json.dumps(b_pass_docs["product.json"]["product_checks"])
+        )
+        for entrypoint in ["run", "serve"]:
+            b_bad_family["shared_identity"][entrypoint]["prepared_family_id"] = (
+                "family.qwen3_5.hybrid"
+            )
+        expect_failure(
+            "B prepared family binding",
+            lambda: validate_m4(b_bad_family, GPT_OSS_CHECKPOINT_ID),
+            "GPT-OSS M4 prepared family mismatch",
+        )
+
+        b_bad_source_sha = synthetic_gpt_oss_m2_canaries()["same_arch_source"]
+        b_bad_source_sha["model_sha256"] = "6" * 64
+        expect_failure(
+            "B source canary model digest",
+            lambda: validate_gpt_oss_source_canary(b_bad_source_sha),
+            "model digest mismatch",
+        )
+
+        b_bad_argv = synthetic_gpt_oss_m2_canaries()["target_format_derived"]
+        b_bad_argv["run"]["argv"][0] = "python3"
+        expect_failure(
+            "B derived ferrum argv",
+            lambda: validate_gpt_oss_derived_canary(
+                b_bad_argv, {"model_sha256": GPT_OSS_SOURCE_CANARY_MODEL_SHA256}
+            ),
+            "argv[0] basename must be ferrum",
+        )
+
+        b_bad_attribution = synthetic_gpt_oss_m2_canaries()["target_format_derived"]
+        b_bad_attribution["provider_attribution"]["expected_item_count"] = 1
+        b_bad_attribution["provider_attribution"]["attributed_item_count"] = 1
+        expect_failure(
+            "B fixed provider attribution count",
+            lambda: validate_gpt_oss_derived_canary(
+                b_bad_attribution,
+                {"model_sha256": GPT_OSS_SOURCE_CANARY_MODEL_SHA256},
+            ),
+            "must cover exactly four MXFP4 tensors and one operation",
+        )
+
+        b_bad_denominator = synthetic_gpt_oss_m2_canaries()["target_format_derived"]
+        b_bad_denominator["provider_attribution"]["denominator_sha256"] = "8" * 64
+        expect_failure(
+            "B fixed provider attribution denominator",
+            lambda: validate_gpt_oss_derived_canary(
+                b_bad_denominator,
+                {"model_sha256": GPT_OSS_SOURCE_CANARY_MODEL_SHA256},
+            ),
+            "provider attribution denominator mismatch",
+        )
+
+        b_legacy_validator = root / "b-v1.2-rejected"
+        b_legacy_docs = synthetic_pass_documents(
+            b_legacy_validator, GPT_OSS_CHECKPOINT_ID
+        )
+        write_synthetic_package(b_legacy_validator, b_legacy_docs)
+        b_legacy_manifest = load_json(b_legacy_validator / "manifest.json")
+        b_legacy_manifest["validator_version"] = "1.2.0"
+        write_json(b_legacy_validator / "manifest.json", b_legacy_manifest)
+        expect_failure(
+            "B validator 1.3 requirement",
+            lambda: validate_package(
+                GPT_OSS_CHECKPOINT_ID, b_legacy_validator, write_log=False
+            ),
+            "manifest validator_version mismatch",
+        )
+
+        b_missing_derived = root / "b-missing-derived-canary"
+        b_missing_derived_docs = synthetic_pass_documents(
+            b_missing_derived, GPT_OSS_CHECKPOINT_ID
+        )
+        del b_missing_derived_docs["validation.json"]["local_path"]["canaries"][
+            "target_format_derived"
+        ]
+        write_synthetic_package(b_missing_derived, b_missing_derived_docs)
+        expect_failure(
+            "B missing target-format derived canary",
+            lambda: validate_package(
+                GPT_OSS_CHECKPOINT_ID, b_missing_derived, write_log=False
+            ),
+            "M2 GPT-OSS canary set mismatch",
+        )
+
+        b_missing_provider = root / "b-missing-derived-provider-attribution"
+        b_missing_provider_docs = synthetic_pass_documents(
+            b_missing_provider, GPT_OSS_CHECKPOINT_ID
+        )
+        del b_missing_provider_docs["validation.json"]["local_path"]["canaries"][
+            "target_format_derived"
+        ]["provider_attribution"]
+        write_synthetic_package(b_missing_provider, b_missing_provider_docs)
+        expect_failure(
+            "B missing derived provider attribution",
+            lambda: validate_package(
+                GPT_OSS_CHECKPOINT_ID, b_missing_provider, write_log=False
+            ),
+            "missing fields: ['provider_attribution']",
+        )
+
+        b_missing_harmony = root / "b-missing-harmony-tool-call"
+        b_missing_harmony_docs = synthetic_pass_documents(
+            b_missing_harmony, GPT_OSS_CHECKPOINT_ID
+        )
+        del b_missing_harmony_docs["product.json"]["product_checks"][
+            "harmony_tool_call"
+        ]
+        write_synthetic_package(b_missing_harmony, b_missing_harmony_docs)
+        expect_failure(
+            "B missing Harmony tool-call objective",
+            lambda: validate_package(
+                GPT_OSS_CHECKPOINT_ID, b_missing_harmony, write_log=False
+            ),
+            "M4 missing fields: ['harmony_tool_call']",
         )
 
         a3_missing_c8 = root / "a3-missing-c8"
@@ -2291,6 +3154,25 @@ def run_self_test() -> None:
         require(
             validate_package("qwen38-27b-fp8", rejected, write_log=False) == rejected_line,
             "synthetic REJECT line mismatch",
+        )
+
+        b_rejected = root / "b-rejected"
+        b_rejected_docs = blocked_documents(
+            b_rejected, reason, GPT_OSS_CHECKPOINT_ID
+        )
+        b_rejected_docs["model-lock.json"]["milestones"]["M0"]["status"] = "fail"
+        write_synthetic_package(
+            b_rejected, b_rejected_docs, status="REJECT", reason=reason
+        )
+        b_rejected_line = expected_terminal_line(
+            "REJECT", GPT_OSS_CHECKPOINT_ID, b_rejected
+        )
+        require(
+            validate_package(
+                GPT_OSS_CHECKPOINT_ID, b_rejected, write_log=False
+            )
+            == b_rejected_line,
+            "synthetic B REJECT line mismatch",
         )
 
         split_reason = root / "split-reason"

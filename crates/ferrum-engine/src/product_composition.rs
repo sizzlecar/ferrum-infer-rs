@@ -198,12 +198,12 @@ fn generation_defaults(
         .special_tokens
         .eos_token_ids
         .clone();
-    let collision_policy = if token_ids.is_empty() {
-        StopTokenCollisionPolicy::require_distinct()
-    } else {
-        StopTokenCollisionPolicy::new(BTreeSet::from([SpecialTokenRole::Eos]))
-            .map_err(|error| FerrumError::config(error.to_string()))?
-    };
+    let special_tokens = &prepared.family().metadata().special_tokens;
+    let collision_policy = stop_collision_policy(
+        &token_ids,
+        special_tokens.bos_token_id,
+        special_tokens.pad_token_id,
+    )?;
     let stop = StopPolicy {
         maximum_output_tokens,
         token_ids,
@@ -218,6 +218,25 @@ fn generation_defaults(
         },
     };
     Ok((sampling, stop, structured_output))
+}
+
+fn stop_collision_policy(
+    token_ids: &BTreeSet<u32>,
+    bos_token_id: Option<u32>,
+    pad_token_id: Option<u32>,
+) -> Result<StopTokenCollisionPolicy> {
+    let mut model_roles = BTreeSet::new();
+    if !token_ids.is_empty() {
+        model_roles.insert(SpecialTokenRole::Eos);
+    }
+    if bos_token_id.is_some_and(|token_id| token_ids.contains(&token_id)) {
+        model_roles.insert(SpecialTokenRole::Bos);
+    }
+    if pad_token_id.is_some_and(|token_id| token_ids.contains(&token_id)) {
+        model_roles.insert(SpecialTokenRole::Pad);
+    }
+    StopTokenCollisionPolicy::new(model_roles)
+        .map_err(|error| FerrumError::config(error.to_string()))
 }
 
 fn validate_representable_sampling(params: &SamplingParams) -> Result<()> {
@@ -444,5 +463,22 @@ mod tests {
         let value = rational_from_f32(0.000_001, "test").unwrap();
         assert_eq!(value.numerator(), 1);
         assert_eq!(value.denominator(), 1_000_000);
+    }
+
+    #[test]
+    fn stop_collision_policy_includes_every_model_role_aliased_by_default_eos() {
+        let token_ids = BTreeSet::from([10, 20]);
+        let policy = stop_collision_policy(&token_ids, Some(10), Some(20)).unwrap();
+        assert_eq!(
+            policy.allowed_model_roles(),
+            &BTreeSet::from([
+                SpecialTokenRole::Bos,
+                SpecialTokenRole::Eos,
+                SpecialTokenRole::Pad,
+            ])
+        );
+
+        let distinct = stop_collision_policy(&BTreeSet::new(), Some(10), Some(20)).unwrap();
+        assert!(distinct.allowed_model_roles().is_empty());
     }
 }

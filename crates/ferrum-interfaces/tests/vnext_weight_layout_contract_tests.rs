@@ -301,6 +301,94 @@ fn whole_axis_quantization_keeps_one_abi_across_matrix_shapes() {
         .unwrap();
 }
 
+fn mxfp4_e2m1_e8m0_schema() -> WeightSchema {
+    let quantization = QuantizationSpec {
+        format_id: id("quantization.safetensors.mxfp4-e2m1-e8m0-group32-lsb-even"),
+        bits_per_weight: 4,
+        grouping: QuantizationGrouping::fixed(32),
+        packing: QuantizationPacking::Interleaved,
+        scale_type: ElementType::U8,
+        zero_point_type: None,
+    };
+    WeightSchema {
+        format_id: id("weight-format.safetensors.gpt-oss-mxfp4"),
+        layout_id: id("weight-layout.mxfp4-expert-stack"),
+        version: ContractVersion::new(1, 0),
+        components: vec![
+            WeightComponentSpec {
+                id: id("component.mxfp4.blocks"),
+                role: WeightComponentRole::PackedValues,
+                external_names: vec!["model.layers.0.mlp.experts.gate_up_proj_blocks".to_owned()],
+                dimensions: vec![2, 4, 2, 16],
+                encoding: WeightEncoding::Quantized(quantization),
+                required: true,
+            },
+            WeightComponentSpec {
+                id: id("component.mxfp4.scales"),
+                role: WeightComponentRole::Scales,
+                external_names: vec!["model.layers.0.mlp.experts.gate_up_proj_scales".to_owned()],
+                dimensions: vec![2, 4, 2],
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::U8,
+                },
+                required: true,
+            },
+        ],
+        tensors: vec![WeightTensorSpec {
+            id: id("weight.mxfp4.gate-up"),
+            dimensions: vec![2, 4, 64],
+            logical_element_type: ElementType::Bf16,
+            physical_layout: PhysicalWeightLayout::Quantized {
+                packed_values: exact_component("component.mxfp4.blocks"),
+                packed_dimensions: vec![2, 4, 2, 16],
+                scales: exact_component("component.mxfp4.scales"),
+                zero_points: None,
+                zero_point_packed_dimensions: None,
+                axis_indices: None,
+                permutation: None,
+                codebook: None,
+                group_axis: 2,
+                group_padding: PhysicalWeightPadding::Exact,
+            },
+            required: true,
+        }],
+    }
+}
+
+#[test]
+fn separate_u8_e8m0_scales_are_a_typed_quantization_abi() {
+    let schema = mxfp4_e2m1_e8m0_schema();
+    schema.validate(&id("family.gpt-oss")).unwrap();
+    assert_eq!(
+        schema.physical_bytes(&id("weight.mxfp4.gate-up")).unwrap(),
+        2 * 4 * 2 * 16 + 2 * 4 * 2
+    );
+    assert_eq!(
+        schema.quantization_formats(),
+        BTreeSet::from([id(
+            "quantization.safetensors.mxfp4-e2m1-e8m0-group32-lsb-even"
+        )])
+    );
+
+    let wire = serde_json::to_value(&schema).unwrap();
+    assert_eq!(
+        wire["components"][0]["encoding"]["quantized"]["scale_type"],
+        json!("u8")
+    );
+    let restored: WeightSchema = serde_json::from_value(wire).unwrap();
+    restored.validate(&id("family.gpt-oss-wire")).unwrap();
+
+    let mut signed_scale_storage = schema;
+    signed_scale_storage.components[1].encoding = WeightEncoding::Dense {
+        element_type: ElementType::I8,
+    };
+    assert!(signed_scale_storage
+        .validate(&id("family.gpt-oss-signed-scales"))
+        .unwrap_err()
+        .to_string()
+        .contains("incompatible with its structural role"));
+}
+
 fn block_grid_quantized_schema() -> WeightSchema {
     let quantization = QuantizationSpec {
         format_id: id("quantization.fp8-e4m3.block-grid"),
