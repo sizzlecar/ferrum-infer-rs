@@ -8,7 +8,7 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, constant_scale_contract, dense_geglu_tanh_contract,
     dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
-    gemma4_causal_paged_attention_contract, gpt_oss_causal_paged_attention_contract,
+    gpt_oss_causal_paged_attention_contract, hybrid_vnorm_causal_paged_attention_contract,
     last_token_dense_linear_contract, last_token_masked_argmax_contract, logit_softcap_contract,
     residual_add_contract, rms_norm_contract, token_embedding_contract, AttributeId,
     BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion,
@@ -27,8 +27,8 @@ use ferrum_interfaces::vnext::{
     DENSE_GEGLU_TANH_F16_CAPABILITY_ID, DENSE_LINEAR_F16_CAPABILITY_ID,
     DENSE_SWIGLU_F16_CAPABILITY_ID, DEVICE_NATIVE_ADAPTIVE_ATTENTION_CAPABILITY_ID,
     DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID, GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-    GEMMA4_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-    GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
+    GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+    HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
     LOGIT_SOFTCAP_F16_CAPABILITY_ID, RESIDUAL_ADD_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID,
@@ -171,7 +171,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         RESIDUAL_ADD_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
-        GEMMA4_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+        HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
     ]
@@ -340,7 +340,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(residual_add_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
-        Box::new(gemma4_causal_paged_attention_contract().map_err(contract_error)?),
+        Box::new(hybrid_vnorm_causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(gpt_oss_causal_paged_attention_contract().map_err(contract_error)?),
     ];
     #[cfg(feature = "vllm-moe-marlin")]
@@ -378,8 +378,8 @@ pub fn cuda_vnext_operation_registry(
         Box::new(transformer::CudaCausalPagedAttentionProvider::new_gemma4(
             runtime,
             runtime.attention_execution_policy(),
-            &gemma4_causal_paged_attention_contract().map_err(contract_error)?,
-            GEMMA4_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+            &hybrid_vnorm_causal_paged_attention_contract().map_err(contract_error)?,
+            HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         )?),
         Box::new(transformer::CudaGptOssCausalPagedAttentionProvider::new(
             runtime,

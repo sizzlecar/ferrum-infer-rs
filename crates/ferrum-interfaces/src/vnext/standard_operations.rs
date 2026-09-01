@@ -65,10 +65,10 @@ pub const GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION: &str =
 pub const CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str = "operation.causal_paged_attention";
 pub const CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
     "capability.operation.causal_paged_attention.f16";
-pub const GEMMA4_CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str =
-    "operation.gemma4_causal_paged_attention";
-pub const GEMMA4_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
-    "capability.operation.gemma4_causal_paged_attention.f16";
+pub const HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str =
+    "operation.hybrid_vnorm_causal_paged_attention";
+pub const HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
+    "capability.operation.hybrid_vnorm_causal_paged_attention.f16";
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID: &str =
     "operation.causal_paged_attention.f32-master";
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID: &str =
@@ -671,7 +671,7 @@ pub fn dense_swiglu_contract() -> Result<StandardOperationContract, VNextError> 
     Ok(StandardOperationContract { descriptor })
 }
 
-/// Dense GeGLU using the tanh approximation from the Gemma family.
+/// Dense GeGLU using the tanh approximation of GELU.
 ///
 /// Gate and up projections remain independent logical weights at this
 /// boundary. Physical packing or quantization is a provider concern and must
@@ -1315,7 +1315,7 @@ fn causal_paged_attention_contract_with_hidden(
     Ok(StandardOperationContract { descriptor })
 }
 
-/// Gemma 4 Unified text attention.
+/// Hybrid causal attention with value normalization and optional K-as-V.
 ///
 /// In addition to the shared causal attention pipeline, this contract makes
 /// the hybrid-layer semantics explicit: the active rotary width and its
@@ -1323,9 +1323,10 @@ fn causal_paged_attention_contract_with_hidden(
 /// local layers carry a sliding window, values use weightless RMSNorm, full
 /// layers may bind K as V, and post-attention RMSNorm is applied before the
 /// residual is added.
-pub fn gemma4_causal_paged_attention_contract() -> Result<StandardOperationContract, VNextError> {
+pub fn hybrid_vnorm_causal_paged_attention_contract(
+) -> Result<StandardOperationContract, VNextError> {
     let descriptor = OperationDescriptor {
-        id: OperationId::new(GEMMA4_CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
+        id: OperationId::new(HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
         version: ContractVersion::new(1, 0),
         inputs: vec![
             contiguous_tensor(
@@ -1409,7 +1410,7 @@ pub fn gemma4_causal_paged_attention_contract() -> Result<StandardOperationContr
         resources: causal_attention_resources(),
         oracle: f16_reference_tolerance()?,
         provider: provider_requirement(
-            GEMMA4_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+            HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
             ContractVersion::new(1, 0),
         )?,
         profile_phase: ProfilePhase::Forward,
@@ -2050,7 +2051,7 @@ mod tests {
     }
 
     #[test]
-    fn gemma_simple_ops_have_typed_shapes_attributes_and_aliasing() {
+    fn hybrid_vnorm_simple_ops_have_typed_shapes_attributes_and_aliasing() {
         let geglu = dense_geglu_tanh_contract().unwrap();
         let geglu_descriptor = geglu.descriptor();
         assert_eq!(geglu_descriptor.id.as_str(), DENSE_GEGLU_TANH_OPERATION_ID);
