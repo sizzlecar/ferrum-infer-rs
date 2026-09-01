@@ -10,7 +10,7 @@ on:
       release_candidate_tag:
         description: Annotated RC tag whose peeled commit is release_candidate_sha
         required: true
-        default: v0.8.4-rc.2
+        default: v0.8.4-rc.3
         type: string
       staging_label:
         description: Immutable artifact label; this does not create a tag or release
