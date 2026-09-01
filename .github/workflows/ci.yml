@@ -212,8 +212,8 @@ jobs:
       CUDA_COMPUTE_CAP: "89"
       # Build-time, content-addressed component. The resulting ferrum binary
       # links these operators statically and performs no runtime download.
-      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v2/native-operator-set-cuda12.4-sm89-v2.tar.zst
-      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: 765f845ae20c305edc10b31650339f8a2782e9e56687c8bda3f8e843a50c636b
+      NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst
+      NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e
     steps:
       - name: Install deps
         run: |
@@ -228,7 +228,7 @@ jobs:
 
       - name: Materialize pinned CUDA native operator set
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v2.tar.zst"
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v6.tar.zst"
           root="$RUNNER_TEMP/ferrum-native-operator-set"
           curl --fail --location --retry 5 --retry-all-errors \
             --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
@@ -250,11 +250,12 @@ jobs:
           PY
           echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
 
-      - name: Type check (--features cuda)
+      - name: Type check (full CUDA release features)
         run: |
           export PATH="/root/.cargo/bin:/usr/local/cuda/bin:$PATH"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
-          cargo check --workspace --all-targets --features cuda
+          cargo check --workspace --all-targets \
+            --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 
       - name: Build CUDA kernels (PTX)
         if: github.event_name == 'workflow_dispatch' && github.event.inputs.build_ptx == 'true'
