@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::vnext::{
     PreparedModelFamily, ResolvedModelPlan, StaticInitializationReceipt, VNextError,
-    WeightComponentRole, WeightEncoding, WeightId,
+    WeightComponentRole, WeightEncoding, WeightId, IDENTITY_WEIGHT_MATERIALIZER_ID,
 };
 
 use super::foundation::canonical_fingerprint;
@@ -328,6 +328,15 @@ impl StaticProviderAttributionWitness {
         let plan = resolved.execution_plan();
         let payload = plan.payload();
         let execution_weights = payload.execution_weights();
+        // The v1 witness assumes one operation owner per source tensor. The
+        // identity path can legally reuse a tied quantized embedding for both
+        // token embedding and logits, so this optional witness must not block
+        // startup on that path. Other exact materializers still emit it.
+        if execution_weights.materializer_id().as_str() == IDENTITY_WEIGHT_MATERIALIZER_ID
+            && execution_weights.approximate_quality_approval().is_none()
+        {
+            return Ok(None);
+        }
         let Some(denominator) =
             QuantizedProviderAttributionDenominator::from_prepared_family(family)?
         else {

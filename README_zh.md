@@ -29,14 +29,25 @@ brew install ferrum-cuda
 ferrum doctor
 ```
 
-直接运行模型：
+只执行与你的平台对应的命令。`doctor` 只显示模型来源映射，不下载权重，也不启动推理引擎。
+
+### macOS Apple Silicon
+
+首次运行会下载约 **2.55 GiB**。下载耗时取决于本机到 Hugging Face 的网络链路；看到进度输出后
+再判断进程是否卡住。
 
 ```bash
-# macOS Metal（GGUF）
-ferrum run qwen3.5:4b-q4_k_m
+ferrum doctor qwen3.5:4b-q4_k_m
+ferrum run qwen3.5:4b-q4_k_m --disable-thinking
+```
 
-# Linux CUDA（safetensors）
-ferrum run qwen3.5:4b
+### Linux NVIDIA CUDA
+
+首次运行会下载约 **8.7 GiB** 的仓库权重。
+
+```bash
+ferrum doctor qwen3.5:4b
+ferrum run qwen3.5:4b --disable-thinking
 ```
 
 Ferrum 不会静默选择模型。`run` 必须提供 MODEL；`serve` 必须提供 `--model`，
@@ -46,18 +57,23 @@ Ferrum 不会静默选择模型。`run` 必须提供 MODEL；`serve` 必须提�
 
 ```bash
 # macOS Metal
-ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --port 8000
+ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000
 
 # Linux CUDA
-ferrum serve --model qwen3.5:4b --served-model-name ferrum --port 8000
+ferrum serve --model qwen3.5:4b --served-model-name ferrum --disable-thinking --port 8000
 
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"ferrum","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
 ```
 
-`ferrum doctor <MODEL>` 只解析模型来源并打印下一条 `run`、`serve` 命令，
-不会下载模型或启动推理 engine。
+正常时请求会返回 HTTP 200 和非空的 assistant 回答。
+
+快速开始默认使用 `--disable-thinking`，让首次回答简短直接。删除该参数即可恢复模型模板默认的
+推理行为；HTTP 请求也可以通过 `chat_template_kwargs.enable_thinking` 覆盖服务端默认值。
+
+`ferrum doctor <MODEL>` 会解析模型来源并打印下一条 `run`、`serve` 命令，
+不会下载模型或启动推理引擎。
 
 ## 功能
 
@@ -124,27 +140,30 @@ brew install ferrum-cuda
 
 ```bash
 # Linux x86_64 CUDA sm89
-curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz | tar xz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
 
 # macOS Apple Silicon Metal
-curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz.sha256
+shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
+tar -xzf ferrum-macos-aarch64.tar.gz
 ./ferrum --version
 ```
 
-从 crates.io 安装：
+从 crates.io 安装 Metal build：
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.2 --locked --features metal
-
-# NVIDIA CUDA
-cargo install ferrum-cli --version 0.8.2 --locked \
-  --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+cargo install ferrum-cli --version 0.8.4 --locked --features metal
 ```
 
 官方预编译 CUDA 资产的目标为 `sm89`。CUDA 安装需要兼容的 NVIDIA driver、
-CUDA runtime 和 NCCL runtime。
+CUDA runtime 和 NCCL runtime。CUDA 源码构建还需要与 Ferrum 匹配的
+native-operator set，因此受支持的安装路径是预编译 CUDA tarball 或 Homebrew formula。
 
 ## 架构
 

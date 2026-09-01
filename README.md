@@ -29,14 +29,27 @@ Inspect the installed binary before downloading weights:
 ferrum doctor
 ```
 
-Run a model directly:
+Use the commands for your platform. `doctor` shows the model-source mapping
+without downloading weights or starting the inference engine.
+
+### macOS Apple Silicon
+
+The first run downloads about **2.55 GiB**. Download time depends on your route
+to Hugging Face; wait for the progress output before treating the process as
+hung.
 
 ```bash
-# macOS Metal (GGUF)
-ferrum run qwen3.5:4b-q4_k_m
+ferrum doctor qwen3.5:4b-q4_k_m
+ferrum run qwen3.5:4b-q4_k_m --disable-thinking
+```
 
-# Linux CUDA (safetensors)
-ferrum run qwen3.5:4b
+### Linux NVIDIA CUDA
+
+The first run downloads about **8.7 GiB** of repository weights.
+
+```bash
+ferrum doctor qwen3.5:4b
+ferrum run qwen3.5:4b --disable-thinking
 ```
 
 Ferrum does not silently select a model. `run` requires MODEL, and `serve`
@@ -46,20 +59,22 @@ Serve the same model through an OpenAI-compatible API:
 
 ```bash
 # macOS Metal
-ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --port 8000
+ferrum serve --model qwen3.5:4b-q4_k_m --served-model-name ferrum --disable-thinking --port 8000
 
 # Linux CUDA
-ferrum serve --model qwen3.5:4b --served-model-name ferrum --port 8000
+ferrum serve --model qwen3.5:4b --served-model-name ferrum --disable-thinking --port 8000
 
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"ferrum","messages":[{"role":"user","content":"Hello"}]}'
+  -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
 ```
 
-For a short direct answer from a model whose template enables reasoning by
-default, add `--disable-thinking` to `ferrum run` or `ferrum serve`. Omitting
-the flag preserves the model template's default; an HTTP request can override
-the server default with `chat_template_kwargs.enable_thinking`.
+A working request returns HTTP 200 with a non-empty assistant response.
+
+The Quick Start uses `--disable-thinking` so the first response is short and
+direct. Omit the flag to preserve the model template's default reasoning
+behavior; an HTTP request can override the server default with
+`chat_template_kwargs.enable_thinking`.
 
 `ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
 commands without downloading the model or starting an inference engine.
@@ -129,27 +144,31 @@ Prebuilt release tarballs:
 
 ```bash
 # Linux x86_64 CUDA sm89
-curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz | tar xz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
 
 # macOS Apple Silicon Metal
-curl -L https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz | tar xz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz.sha256
+shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
+tar -xzf ferrum-macos-aarch64.tar.gz
 ./ferrum --version
 ```
 
-Install from crates.io:
+Install the Metal build from crates.io:
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.3 --locked --features metal
-
-# NVIDIA CUDA
-cargo install ferrum-cli --version 0.8.3 --locked \
-  --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
+cargo install ferrum-cli --version 0.8.4 --locked --features metal
 ```
 
 The official prebuilt CUDA asset targets `sm89`. CUDA installation requires a
 compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host.
+CUDA source builds also require Ferrum's matching native-operator set, so use
+the prebuilt CUDA tarball or Homebrew formula for the supported install path.
 
 ## Architecture
 
