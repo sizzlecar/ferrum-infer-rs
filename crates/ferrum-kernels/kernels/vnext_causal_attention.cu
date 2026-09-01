@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 #define VNEXT_WARP_SIZE 32
-#define VNEXT_MAX_HEAD_CHUNKS 8
+#define VNEXT_MAX_HEAD_CHUNKS 16
 #define VNEXT_VLLM_BLOCK_TOKENS 16
 #define VNEXT_VLLM_K_PACK 8
 
@@ -188,12 +188,14 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const int kv_heads,
     const int head_dim,
     const int rope_dim,
+    const int rope_frequency_denominator,
     const int query_projection_stride,
     const int query_head_stride,
     const int kv_projection_stride,
     const float epsilon,
     const float rope_theta,
-    const int rope_interleaved) {
+    const int rope_interleaved,
+    const int value_rms_norm) {
   const int page_count = control[0];
   const int position_start = control[1];
   const int tokens = control[2];
@@ -215,14 +217,28 @@ extern "C" __global__ void vnext_causal_prepare_f16(
   if (!is_query && !is_key) {
     const __half* source =
         value_raw + (long long)token * kv_projection_stride + head * head_dim;
+    float norm_scale = 1.0f;
+    if (value_rms_norm != 0) {
+      float sum_squares = 0.0f;
+      for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+        const float value = __half2float(source[dim]);
+        sum_squares += value * value;
+      }
+      sum_squares = warp_reduce_sum(sum_squares);
+      norm_scale = rsqrtf(sum_squares / (float)head_dim + epsilon);
+    }
     for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+      const __half value =
+          value_rms_norm != 0
+              ? __float2half(__half2float(source[dim]) * norm_scale)
+              : source[dim];
       if (kv_layout != 0) {
         vnext_store_vllm_kv(page_pointers, page_count, absolute_position, 1,
-                            head, dim, kv_heads, head_dim, source[dim]);
+                            head, dim, kv_heads, head_dim, value);
       } else {
         vnext_store_kv(page_pointers, page_count, page_elements,
                        absolute_position, 1, head, dim, kv_heads, head_dim,
-                       source[dim]);
+                       value);
       }
     }
     return;
@@ -244,6 +260,7 @@ extern "C" __global__ void vnext_causal_prepare_f16(
   sum_squares = warp_reduce_sum(sum_squares);
   const float norm_scale = rsqrtf(sum_squares / (float)head_dim + epsilon);
   const int half_rope = rope_dim / 2;
+  const int neox_half = head_dim / 2;
 
   if (rope_interleaved != 0) {
     for (int pair = lane; pair < half_rope; pair += VNEXT_WARP_SIZE) {
@@ -253,7 +270,8 @@ extern "C" __global__ void vnext_causal_prepare_f16(
                        __half2float(weight[low]);
       const float x1 = __half2float(source[high]) * norm_scale *
                        __half2float(weight[high]);
-      const float exponent = -(2.0f * pair) / (float)rope_dim;
+      const float exponent =
+          -(2.0f * pair) / (float)rope_frequency_denominator;
       const float angle =
           absolute_position * powf(rope_theta, exponent);
       float sine = 0.0f;
@@ -271,12 +289,18 @@ extern "C" __global__ void vnext_causal_prepare_f16(
   } else {
     for (int pair = lane; pair < half_rope; pair += VNEXT_WARP_SIZE) {
       const int low = pair;
-      const int high = pair + half_rope;
+      // Gemma 4 proportional partial RoPE pads the inactive frequencies to
+      // head_dim/2 and then applies the standard NeoX half split. Therefore
+      // an active pair mixes [pair, pair + head_dim/2], not
+      // [pair, pair + rope_dim/2]. Full-width RoPE is unchanged because the
+      // two offsets are equal in that case.
+      const int high = pair + neox_half;
       const float x0 = __half2float(source[low]) * norm_scale *
                        __half2float(weight[low]);
       const float x1 = __half2float(source[high]) * norm_scale *
                        __half2float(weight[high]);
-      const float exponent = -(2.0f * pair) / (float)rope_dim;
+      const float exponent =
+          -(2.0f * pair) / (float)rope_frequency_denominator;
       const float angle =
           absolute_position * powf(rope_theta, exponent);
       float sine = 0.0f;
@@ -293,7 +317,15 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     }
   }
 
-  for (int dim = rope_dim + lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+  for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+    const bool rotated = rope_interleaved != 0
+                             ? dim < rope_dim
+                             : dim < half_rope ||
+                                   (dim >= neox_half &&
+                                    dim < neox_half + half_rope);
+    if (rotated) {
+      continue;
+    }
     const float value = __half2float(source[dim]) * norm_scale *
                         __half2float(weight[dim]);
     vnext_store_prepared_value(
@@ -315,7 +347,9 @@ extern "C" __global__ void vnext_causal_attention_f16(
     const int kv_heads,
     const int head_dim,
     const int query_projection_stride,
-    const int output_gate) {
+    const int output_gate,
+    const float attention_scale,
+    const int sliding_window) {
   const int page_count = control[0];
   const int position_start = control[1];
   const int tokens = control[2];
@@ -343,8 +377,11 @@ extern "C" __global__ void vnext_causal_attention_f16(
 
   float running_max = -CUDART_INF_F;
   float running_sum = 0.0f;
-  const float attention_scale = rsqrtf((float)head_dim);
-  for (int key_position = 0; key_position <= absolute_position;
+  const int key_start =
+      sliding_window > 0
+          ? max(0, absolute_position - sliding_window + 1)
+          : 0;
+  for (int key_position = key_start; key_position <= absolute_position;
        ++key_position) {
     float partial_dot = 0.0f;
 #pragma unroll

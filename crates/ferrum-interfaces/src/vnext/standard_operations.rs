@@ -37,6 +37,12 @@ pub const DENSE_LINEAR_OPERATION_ID: &str = "operation.dense_linear";
 pub const DENSE_LINEAR_F16_CAPABILITY_ID: &str = "capability.operation.dense_linear.f16";
 pub const DENSE_SWIGLU_OPERATION_ID: &str = "operation.dense_swiglu";
 pub const DENSE_SWIGLU_F16_CAPABILITY_ID: &str = "capability.operation.dense_swiglu.f16";
+pub const DENSE_GEGLU_TANH_OPERATION_ID: &str = "operation.dense_geglu_tanh";
+pub const DENSE_GEGLU_TANH_F16_CAPABILITY_ID: &str = "capability.operation.dense_geglu_tanh.f16";
+pub const CONSTANT_SCALE_OPERATION_ID: &str = "operation.constant_scale";
+pub const CONSTANT_SCALE_F16_CAPABILITY_ID: &str = "capability.operation.constant_scale.f16";
+pub const LOGIT_SOFTCAP_OPERATION_ID: &str = "operation.logit_softcap";
+pub const LOGIT_SOFTCAP_F16_CAPABILITY_ID: &str = "capability.operation.logit_softcap.f16";
 pub const ROUTED_SWIGLU_MOE_OPERATION_ID: &str = "operation.routed_swiglu_moe";
 pub const ROUTED_SWIGLU_MOE_F16_CAPABILITY_ID: &str = "capability.operation.routed_swiglu_moe.f16";
 pub const ROUTED_SHARED_SWIGLU_MOE_OPERATION_ID: &str = "operation.routed_shared_swiglu_moe";
@@ -59,6 +65,10 @@ pub const GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION: &str =
 pub const CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str = "operation.causal_paged_attention";
 pub const CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
     "capability.operation.causal_paged_attention.f16";
+pub const GEMMA4_CAUSAL_PAGED_ATTENTION_OPERATION_ID: &str =
+    "operation.gemma4_causal_paged_attention";
+pub const GEMMA4_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID: &str =
+    "capability.operation.gemma4_causal_paged_attention.f16";
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_OPERATION_ID: &str =
     "operation.causal_paged_attention.f32-master";
 pub const CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID: &str =
@@ -661,6 +671,135 @@ pub fn dense_swiglu_contract() -> Result<StandardOperationContract, VNextError> 
     Ok(StandardOperationContract { descriptor })
 }
 
+/// Dense GeGLU using the tanh approximation from the Gemma family.
+///
+/// Gate and up projections remain independent logical weights at this
+/// boundary. Physical packing or quantization is a provider concern and must
+/// never be inferred from the operation signature.
+pub fn dense_geglu_tanh_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(DENSE_GEGLU_TANH_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                intermediate_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                intermediate_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                hidden_intermediate_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("intermediate_size")?,
+        ]))?,
+        resources: ResourceRequirements {
+            minimum_value_alignment_bytes: 16,
+            scratch: ResourcePresenceRequirement::Required,
+            binding: ResourcePresenceRequirement::Forbidden,
+            persistent: ResourcePresenceRequirement::Forbidden,
+        },
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(
+            DENSE_GEGLU_TANH_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Multiplies a token-major F16 hidden tensor by one positive compile-time
+/// rational. The output must exactly alias the input so the operation cannot
+/// silently materialize an extra residual-sized buffer.
+pub fn constant_scale_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(CONSTANT_SCALE_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![contiguous_tensor(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Read,
+        )?],
+        outputs: vec![contiguous_tensor_with_alias(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+            AliasPolicy::MustAlias { tensor_index: 0 },
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            positive_rational_attribute("scale")?,
+        ]))?,
+        resources: no_auxiliary_resources(),
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(
+            CONSTANT_SCALE_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
+/// Applies `cap * tanh(logit / cap)` to one final-position vocabulary row.
+/// The output is deliberately in-place so samplers consume the semantically
+/// capped logits without retaining a second vocabulary-sized allocation.
+pub fn logit_softcap_contract() -> Result<StandardOperationContract, VNextError> {
+    let dimensions = vec![
+        DimensionConstraint::Exact(1),
+        DimensionConstraint::Symbol("vocab_size".to_owned()),
+    ];
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(LOGIT_SOFTCAP_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![contiguous_tensor(
+            dimensions.clone(),
+            [ElementType::F16],
+            TensorAccess::Read,
+        )?],
+        outputs: vec![contiguous_tensor_with_alias(
+            dimensions,
+            [ElementType::F16],
+            TensorAccess::Write,
+            AliasPolicy::MustAlias { tensor_index: 0 },
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("vocab_size")?,
+            positive_rational_attribute("cap")?,
+        ]))?,
+        resources: no_auxiliary_resources(),
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(
+            LOGIT_SOFTCAP_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
 /// A routed SwiGLU expert set plus one sigmoid-gated shared SwiGLU expert.
 ///
 /// The operation boundary intentionally owns routing, routed expert execution,
@@ -1176,6 +1315,109 @@ fn causal_paged_attention_contract_with_hidden(
     Ok(StandardOperationContract { descriptor })
 }
 
+/// Gemma 4 Unified text attention.
+///
+/// In addition to the shared causal attention pipeline, this contract makes
+/// the hybrid-layer semantics explicit: the active rotary width and its
+/// frequency denominator are independent, attention uses a typed scale,
+/// local layers carry a sliding window, values use weightless RMSNorm, full
+/// layers may bind K as V, and post-attention RMSNorm is applied before the
+/// residual is added.
+pub fn gemma4_causal_paged_attention_contract() -> Result<StandardOperationContract, VNextError> {
+    let descriptor = OperationDescriptor {
+        id: OperationId::new(GEMMA4_CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,
+        version: ContractVersion::new(1, 0),
+        inputs: vec![
+            contiguous_tensor(
+                token_hidden_dimensions(),
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("query_projection_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("kv_features"), symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size"), symbol("query_features")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("head_dim")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![symbol("head_dim")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+            contiguous_tensor(
+                vec![exact(2), symbol("key_value_heads"), symbol("head_dim")],
+                [ElementType::F16],
+                TensorAccess::ReadWrite,
+            )?,
+            contiguous_tensor(
+                vec![symbol("hidden_size")],
+                [ElementType::F16],
+                TensorAccess::Read,
+            )?,
+        ],
+        outputs: vec![contiguous_tensor_with_alias(
+            token_hidden_dimensions(),
+            [ElementType::F16],
+            TensorAccess::Write,
+            AliasPolicy::MayAlias { tensor_index: 0 },
+        )?],
+        attributes: AttributeSchema::new(BTreeMap::from([
+            unsigned_attribute("hidden_size")?,
+            unsigned_attribute("query_heads")?,
+            unsigned_attribute("key_value_heads")?,
+            unsigned_attribute("head_dim")?,
+            unsigned_attribute("query_features")?,
+            unsigned_attribute("query_projection_features")?,
+            unsigned_attribute("kv_features")?,
+            unsigned_attribute("rope_dim")?,
+            unsigned_attribute("rope_frequency_denominator")?,
+            unsigned_attribute("maximum_context_tokens")?,
+            positive_rational_attribute("rope_theta")?,
+            unconstrained_bool_attribute("rope_interleaved")?,
+            positive_rational_attribute("attention_scale")?,
+            nonnegative_unsigned_attribute("sliding_window_tokens")?,
+            true_bool_attribute("value_rms_norm")?,
+            unconstrained_bool_attribute("attention_k_eq_v")?,
+            true_bool_attribute("causal")?,
+            positive_epsilon_attribute("epsilon")?,
+            nonnegative_unsigned_attribute("layer_index")?,
+        ]))?,
+        resources: causal_attention_resources(),
+        oracle: f16_reference_tolerance()?,
+        provider: provider_requirement(
+            GEMMA4_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+            ContractVersion::new(1, 0),
+        )?,
+        profile_phase: ProfilePhase::Forward,
+    };
+    descriptor.validate()?;
+    Ok(StandardOperationContract { descriptor })
+}
+
 /// GPT-OSS causal attention including input normalization, biased Q/K/V/O
 /// projections, per-query-head attention sinks, YaRN RoPE, KV update, output
 /// projection, and the attention residual. A zero `sliding_window_tokens`
@@ -1318,6 +1560,13 @@ fn token_hidden_dimensions() -> Vec<DimensionConstraint> {
 fn packed_gate_up_dimensions() -> Vec<DimensionConstraint> {
     vec![
         DimensionConstraint::Exact(2),
+        DimensionConstraint::Symbol("intermediate_size".to_owned()),
+        DimensionConstraint::Symbol("hidden_size".to_owned()),
+    ]
+}
+
+fn intermediate_hidden_dimensions() -> Vec<DimensionConstraint> {
+    vec![
         DimensionConstraint::Symbol("intermediate_size".to_owned()),
         DimensionConstraint::Symbol("hidden_size".to_owned()),
     ]
@@ -1798,6 +2047,101 @@ mod tests {
             contracts[3].descriptor().outputs[0].alias(),
             &AliasPolicy::MayAlias { tensor_index: 0 }
         );
+    }
+
+    #[test]
+    fn gemma_simple_ops_have_typed_shapes_attributes_and_aliasing() {
+        let geglu = dense_geglu_tanh_contract().unwrap();
+        let geglu_descriptor = geglu.descriptor();
+        assert_eq!(geglu_descriptor.id.as_str(), DENSE_GEGLU_TANH_OPERATION_ID);
+        assert_eq!(geglu_descriptor.version, ContractVersion::new(1, 0));
+        assert_eq!(geglu_descriptor.inputs.len(), 4);
+        assert_eq!(
+            geglu_descriptor.inputs[0].dimensions(),
+            &[symbol("tokens"), symbol("hidden_size")]
+        );
+        for projection in [&geglu_descriptor.inputs[1], &geglu_descriptor.inputs[2]] {
+            assert_eq!(
+                projection.dimensions(),
+                &[symbol("intermediate_size"), symbol("hidden_size")]
+            );
+        }
+        assert_eq!(
+            geglu_descriptor.inputs[3].dimensions(),
+            &[symbol("hidden_size"), symbol("intermediate_size")]
+        );
+        assert_eq!(
+            geglu_descriptor.outputs[0].dimensions(),
+            &[symbol("tokens"), symbol("hidden_size")]
+        );
+        assert_eq!(
+            geglu_descriptor.outputs[0].element_types(),
+            &BTreeSet::from([ElementType::F16])
+        );
+        assert_eq!(
+            geglu_descriptor.resources.scratch,
+            ResourcePresenceRequirement::Required
+        );
+        assert_eq!(
+            geglu_descriptor.provider.required_capabilities,
+            BTreeSet::from([CapabilityId::new(DENSE_GEGLU_TANH_F16_CAPABILITY_ID).unwrap()])
+        );
+
+        let scale = constant_scale_contract().unwrap();
+        let scale_descriptor = scale.descriptor();
+        assert_eq!(scale_descriptor.id.as_str(), CONSTANT_SCALE_OPERATION_ID);
+        assert_eq!(scale_descriptor.inputs.len(), 1);
+        assert_eq!(
+            scale_descriptor.outputs[0].alias(),
+            &AliasPolicy::MustAlias { tensor_index: 0 }
+        );
+        assert!(scale_descriptor
+            .attributes
+            .entries()
+            .contains_key(&AttributeId::new("scale").unwrap()));
+        assert_eq!(scale_descriptor.resources, no_auxiliary_resources());
+
+        let softcap = logit_softcap_contract().unwrap();
+        let softcap_descriptor = softcap.descriptor();
+        assert_eq!(softcap_descriptor.id.as_str(), LOGIT_SOFTCAP_OPERATION_ID);
+        assert_eq!(
+            softcap_descriptor.inputs[0].dimensions(),
+            &[exact(1), symbol("vocab_size")]
+        );
+        assert_eq!(
+            softcap_descriptor.outputs[0].alias(),
+            &AliasPolicy::MustAlias { tensor_index: 0 }
+        );
+        assert!(softcap_descriptor
+            .attributes
+            .entries()
+            .contains_key(&AttributeId::new("cap").unwrap()));
+        assert_eq!(softcap_descriptor.resources, no_auxiliary_resources());
+
+        for (descriptor, attribute) in [(scale_descriptor, "scale"), (softcap_descriptor, "cap")] {
+            let AttributeConstraint::RationalRange { minimum, maximum } = &descriptor
+                .attributes
+                .entries()
+                .get(&AttributeId::new(attribute).unwrap())
+                .unwrap()
+                .constraint
+            else {
+                panic!("{attribute} must have a typed rational range");
+            };
+            assert!(minimum.numerator() > 0);
+            assert!(maximum >= minimum);
+        }
+
+        for contract in [&geglu, &scale, &softcap] {
+            let descriptor = contract.descriptor();
+            assert_eq!(descriptor.fingerprint().unwrap().len(), 64);
+            contract
+                .validate_signature(&descriptor.inputs, &descriptor.outputs)
+                .unwrap();
+            assert!(contract
+                .validate_signature(&[], &descriptor.outputs)
+                .is_err());
+        }
     }
 
     #[test]

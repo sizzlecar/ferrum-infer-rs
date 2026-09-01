@@ -24,7 +24,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCHEMA_DIR = REPO_ROOT / "scripts/release/schemas/vnext_model_adoption"
 SCHEMA_VERSION = 1
-VALIDATOR_VERSION = "1.3.0"
+VALIDATOR_VERSION = "1.4.0"
 RECEIPT_SCHEMAS = {
     "model-lock.json": "model-lock-v1.schema.json",
     "validation.json": "validation-v1.schema.json",
@@ -96,6 +96,12 @@ LEGACY_VALIDATOR_VERSION_CHECKPOINTS = {
     "qwen36-27b-fp8",
     "qwen36-35b-a3b-fp8",
 }
+PRE_GEMMA_VALIDATOR_VERSION_CHECKPOINTS = {
+    "qwen38-27b-fp8",
+    "qwen36-27b-fp8",
+    "qwen36-35b-a3b-fp8",
+    "gpt-oss-20b-mxfp4",
+}
 PAID_BENCH_CONCURRENCY_CELLS = {1, 8, 32}
 GPT_OSS_CHECKPOINT_ID = "gpt-oss-20b-mxfp4"
 GPT_OSS_ARCHITECTURE = "GptOssForCausalLM"
@@ -124,6 +130,37 @@ GPT_OSS_CANARY_QUANT_TENSORS = (
     "model.layers.1.mlp.experts.down_proj_blocks",
 )
 GPT_OSS_CANARY_ATTRIBUTION_COUNT = 5
+GEMMA4_CHECKPOINT_ID = "gemma4-12b-w4a16-ct"
+GEMMA4_ARCHITECTURE = "Gemma4UnifiedForConditionalGeneration"
+GEMMA4_FAMILY_ID = "family.gemma4_unified.text"
+GEMMA4_MODEL_TYPE = "gemma4_unified"
+GEMMA4_TEXT_MODEL_TYPE = "gemma4_unified_text"
+GEMMA4_CT_SOURCE_FORMAT = (
+    "quantization.safetensors.compressed-tensors-pack-quantized-int4-symmetric-group32"
+)
+GEMMA4_CT_PACKING_ORDER = "signed-int4-bias8-low-nibble-first"
+GEMMA4_CT_COVERAGE_COUNT_FIELD = "source_compressed_tensors_w4_bundle_count"
+GEMMA4_ATTENTION_OPERATION_ID = "operation.gemma4_causal_paged_attention"
+GEMMA4_ATTENTION_PROVIDER_ID = "provider.cuda.gemma4_causal_paged_attention.f16"
+GEMMA4_GEGLU_OPERATION_ID = "operation.dense_geglu_tanh"
+GEMMA4_GEGLU_PROVIDER_ID = "provider.cuda.dense_geglu_tanh.f16.cublas"
+GEMMA4_SOFTCAP_OPERATION_ID = "operation.logit_softcap"
+GEMMA4_SOFTCAP_PROVIDER_ID = "provider.cuda.logit_softcap.f16"
+GEMMA4_MULTIMODAL_TENSORS = frozenset(
+    {
+        "model.embed_audio.embedding_projection.weight",
+        "model.embed_vision.embedding_projection.weight",
+        "model.vision_embedder.patch_dense.bias",
+        "model.vision_embedder.patch_dense.weight",
+        "model.vision_embedder.patch_ln1.bias",
+        "model.vision_embedder.patch_ln1.weight",
+        "model.vision_embedder.patch_ln2.bias",
+        "model.vision_embedder.patch_ln2.weight",
+        "model.vision_embedder.pos_embedding",
+        "model.vision_embedder.pos_norm.bias",
+        "model.vision_embedder.pos_norm.weight",
+    }
+)
 QWEN38_REGRESSION_CHECKPOINT_ID = "qwen38-27b-fp8"
 QWEN38_REGRESSION_ATTRIBUTION_COUNT = 403
 QWEN38_REGRESSION_ATTRIBUTION_DENOMINATOR = (
@@ -169,6 +206,16 @@ M1_RUST_CONTRACTS = {
         "gpt-oss-mxfp4-tensor-layout-drift": (
             "vnext::gpt_oss::weights::tests::"
             "dtype_shape_and_unknown_tensor_drift_fail_before_allocation"
+        ),
+    },
+    GEMMA4_CHECKPOINT_ID: {
+        "gemma4-w4a16-ct-wrong-recipe": (
+            "vnext::gemma4::config::tests::"
+            "wrong_compressed_tensors_recipe_fails_closed_before_allocation"
+        ),
+        "gemma4-w4a16-ct-tensor-sidecar-drift": (
+            "vnext::gemma4::weights::tests::"
+            "dtype_shape_and_sidecar_drift_fail_before_allocation"
         ),
     },
 }
@@ -517,23 +564,373 @@ def validate_version(value: Any, label: str) -> tuple[int, int]:
     return major, minor
 
 
+def gemma4_quant_operation_tensor_sets() -> dict[str, set[str]]:
+    attention: set[str] = set()
+    geglu: set[str] = set()
+    for layer_index in range(48):
+        prefix = f"model.language_model.layers.{layer_index}"
+        attention_roles = ["q_proj", "k_proj", "o_proj"]
+        if (layer_index + 1) % 6 != 0:
+            attention_roles.append("v_proj")
+        attention.update(
+            f"{prefix}.self_attn.{role}.weight_packed" for role in attention_roles
+        )
+        geglu.update(
+            f"{prefix}.mlp.{role}.weight_packed"
+            for role in ["gate_proj", "up_proj", "down_proj"]
+        )
+    return {
+        GEMMA4_ATTENTION_OPERATION_ID: attention,
+        GEMMA4_GEGLU_OPERATION_ID: geglu,
+        GEMMA4_SOFTCAP_OPERATION_ID: set(),
+    }
+
+
+def gemma4_non_executed_tensor_contract() -> dict[str, str]:
+    contract = {
+        name: "text_only_multimodal_component" for name in GEMMA4_MULTIMODAL_TENSORS
+    }
+    contract["lm_head.weight"] = "tied_projection_duplicate"
+    for layer_index in range(48):
+        contract[f"model.language_model.layers.{layer_index}.layer_scalar"] = (
+            "compile_time_unit_layer_scale"
+        )
+    return contract
+
+
+def validate_gemma4_identity(identity: dict[str, Any]) -> None:
+    require(
+        identity.get("architecture") == GEMMA4_ARCHITECTURE,
+        "Gemma 4 source_lock architecture mismatch",
+    )
+    require(
+        identity.get("family_id") == GEMMA4_FAMILY_ID,
+        "Gemma 4 source_lock family mismatch",
+    )
+    require(
+        identity.get("model_type") == GEMMA4_MODEL_TYPE,
+        "Gemma 4 source_lock model_type mismatch",
+    )
+    require(
+        identity.get("text_model_type") == GEMMA4_TEXT_MODEL_TYPE,
+        "Gemma 4 source_lock text_model_type mismatch",
+    )
+    require(
+        identity.get("license") == "apache-2.0",
+        "Gemma 4 source_lock license mismatch",
+    )
+
+
+def validate_gemma4_quantization_recipe(value: Any) -> None:
+    label = "Gemma 4 quantization_recipe"
+    recipe = as_object(value, label)
+    fields = {
+        "format",
+        "quant_method",
+        "quantization_status",
+        "version",
+        "group_size",
+        "num_bits",
+        "symmetric",
+        "dynamic",
+        "strategy",
+        "weight_type",
+        "targets",
+        "activation_quantization",
+        "zero_point",
+        "ignored_modules",
+    }
+    require(set(recipe) == fields, f"{label} field set mismatch")
+    require(recipe["format"] == "pack-quantized", f"{label} format mismatch")
+    require(
+        recipe["quant_method"] == "compressed-tensors",
+        f"{label} quant_method mismatch",
+    )
+    require(
+        recipe["quantization_status"] == "compressed",
+        f"{label} quantization_status mismatch",
+    )
+    non_empty_string(recipe["version"], f"{label}.version")
+    require(recipe["group_size"] == 32, f"{label} group_size must be 32")
+    require(recipe["num_bits"] == 4, f"{label} num_bits must be 4")
+    require(recipe["symmetric"] is True, f"{label} symmetric must be true")
+    require(recipe["dynamic"] is False, f"{label} dynamic must be false")
+    require(recipe["strategy"] == "group", f"{label} strategy mismatch")
+    require(recipe["weight_type"] == "int", f"{label} weight_type mismatch")
+    require(recipe["targets"] == ["Linear"], f"{label} targets must be exactly Linear")
+    require(
+        recipe["activation_quantization"] is False,
+        f"{label} must not quantize activations",
+    )
+    require(recipe["zero_point"] is False, f"{label} must not use zero points")
+    ignored = as_list(recipe["ignored_modules"], f"{label}.ignored_modules")
+    require(
+        all(isinstance(item, str) and item for item in ignored)
+        and len(ignored) == len(set(ignored)),
+        f"{label}.ignored_modules is invalid",
+    )
+    required_ignored = {
+        "lm_head",
+        "model.embed_vision.patch_dense",
+        "model.embed_vision.multimodal_embedder.embedding_projection",
+        "model.embed_audio.embedding_projection",
+    }
+    require(
+        required_ignored.issubset(set(ignored)),
+        f"{label} dense exclusion set is incomplete",
+    )
+
+
+def validate_gemma4_text_only_capability(value: Any) -> None:
+    label = "Gemma 4 text_only_capability"
+    capability = as_object(value, label)
+    expected = {
+        "mode": "typed_text_only",
+        "scheduled_modalities": ["text"],
+        "multimodal_request_policy": "typed_reject",
+        "multimodal_tensor_count": len(GEMMA4_MULTIMODAL_TENSORS),
+    }
+    require(capability == expected, f"{label} mismatch")
+
+
+def validate_gemma4_tensor_contract(
+    tensor_by_name: dict[str, dict[str, Any]],
+    execution_quant: set[str],
+    disposition_counts: dict[str, int],
+) -> None:
+    require(
+        len(execution_quant) == 328,
+        "Gemma 4 must inventory exactly 328 execution quantized weights",
+    )
+    all_quantized = {
+        name for name, tensor in tensor_by_name.items() if tensor["quantized"] is True
+    }
+    require(
+        all_quantized == execution_quant,
+        "Gemma 4 quantized tensors must all be execution-eligible W4 weights",
+    )
+    require(
+        not any(name.endswith(".weight_zero_point") for name in tensor_by_name),
+        "Gemma 4 symmetric W4 source must not contain zero-point tensors",
+    )
+    for name in sorted(execution_quant):
+        tensor = tensor_by_name[name]
+        require(name.endswith(".weight_packed"), f"{name} must be a weight_packed tensor")
+        require(tensor["dtype"] == "I32", f"{name} packed dtype must be I32")
+        packed_shape = tensor["shape"]
+        require(
+            len(packed_shape) == 2
+            and packed_shape[0] % 64 == 0
+            and packed_shape[1] % 4 == 0,
+            f"{name} packed shape is not aligned for group32 Marlin materialization",
+        )
+        layout = as_object(tensor["source_layout"], f"{name}.source_layout")
+        require(
+            set(layout)
+            == {
+                "format",
+                "group_size",
+                "num_bits",
+                "symmetric",
+                "packing_order",
+                "sidecars",
+            },
+            f"{name}.source_layout field set mismatch",
+        )
+        require(layout["format"] == GEMMA4_CT_SOURCE_FORMAT, f"{name} CT format mismatch")
+        require(layout["group_size"] == 32, f"{name} CT group_size must be 32")
+        require(layout["num_bits"] == 4, f"{name} CT num_bits must be 4")
+        require(layout["symmetric"] is True, f"{name} CT symmetric must be true")
+        require(
+            layout["packing_order"] == GEMMA4_CT_PACKING_ORDER,
+            f"{name} CT packing order mismatch",
+        )
+        sidecars = {
+            sidecar["role"]: sidecar
+            for sidecar in as_list(layout["sidecars"], f"{name}.source_layout.sidecars")
+        }
+        require(
+            set(sidecars) == {"scale", "logical_shape"} and len(sidecars) == 2,
+            f"{name} must have exactly scale and logical_shape sidecars",
+        )
+        stem = name.removesuffix(".weight_packed")
+        expected_scale_shape = [packed_shape[0], packed_shape[1] // 4]
+        require(
+            sidecars["scale"]
+            == {
+                "role": "scale",
+                "tensor_name": f"{stem}.weight_scale",
+                "dtype": "BF16",
+                "shape": expected_scale_shape,
+            },
+            f"{name} scale sidecar mismatch",
+        )
+        require(
+            sidecars["logical_shape"]
+            == {
+                "role": "logical_shape",
+                "tensor_name": f"{stem}.weight_shape",
+                "dtype": "I64",
+                "shape": [2],
+            },
+            f"{name} logical shape sidecar mismatch",
+        )
+        for role in ["scale", "logical_shape"]:
+            sidecar_tensor = tensor_by_name[sidecars[role]["tensor_name"]]
+            require(
+                sidecar_tensor["quantized"] is False,
+                f"{name} {role} sidecar must be non-quantized storage",
+            )
+
+    non_executed_contract = gemma4_non_executed_tensor_contract()
+    actual_non_executed = {
+        name
+        for name, tensor in tensor_by_name.items()
+        if tensor["disposition"] == "typed_non_executed"
+    }
+    require(
+        actual_non_executed == set(non_executed_contract),
+        "Gemma 4 typed text-only partition is incomplete or contains unknown tensors",
+    )
+    for name, reason in non_executed_contract.items():
+        tensor = tensor_by_name[name]
+        require(
+            tensor["quantized"] is False
+            and tensor.get("classification_reason") == reason,
+            f"Gemma 4 typed non-executed classification mismatch for {name}",
+        )
+    require(
+        disposition_counts
+        == {"execution_eligible": 1274, "typed_non_executed": 60, "rejected": 0},
+        "Gemma 4 source partition must be execution=1274, typed_non_executed=60, rejected=0",
+    )
+    require(len(tensor_by_name) == 1334, "Gemma 4 source inventory must contain 1334 tensors")
+
+
+def validate_gemma4_operation_contract(
+    value: Any,
+    operations: dict[str, dict[str, Any]],
+    coverage: dict[str, dict[str, Any]],
+) -> None:
+    expected_tensor_sets = gemma4_quant_operation_tensor_sets()
+    require(
+        set(operations) == set(expected_tensor_sets),
+        "Gemma 4 expected operation set must cover attention, GeGLU, and logit softcap",
+    )
+    for operation_id, expected_tensors in expected_tensor_sets.items():
+        require(
+            set(operations[operation_id]["tensor_names"]) == expected_tensors,
+            f"Gemma 4 {operation_id} tensor coverage mismatch",
+        )
+
+    expected_providers = {
+        GEMMA4_ATTENTION_OPERATION_ID: GEMMA4_ATTENTION_PROVIDER_ID,
+        GEMMA4_GEGLU_OPERATION_ID: GEMMA4_GEGLU_PROVIDER_ID,
+        GEMMA4_SOFTCAP_OPERATION_ID: GEMMA4_SOFTCAP_PROVIDER_ID,
+    }
+    require(
+        set(coverage) == set(expected_tensor_sets),
+        "Gemma 4 provider coverage matrix is incomplete",
+    )
+    for operation_id, expected_tensors in expected_tensor_sets.items():
+        cell = coverage[operation_id]
+        require(
+            cell["provider_id"] == expected_providers[operation_id],
+            f"Gemma 4 {operation_id} provider mismatch",
+        )
+        require(
+            cell["operation_version"] == {"major": 1, "minor": 0}
+            and cell["provider_version"] == {"major": 1, "minor": 0},
+            f"Gemma 4 {operation_id} contract/provider version mismatch",
+        )
+        require(
+            cell[GEMMA4_CT_COVERAGE_COUNT_FIELD] == len(expected_tensors),
+            f"Gemma 4 {operation_id} compressed-tensors W4 bundle count mismatch",
+        )
+        require(
+            cell["existing_execution_provider_acceptance"] is True
+            and cell["covered"] is True
+            and cell["missing_boundaries"] == [],
+            f"Gemma 4 {operation_id} provider is not fully covered",
+        )
+
+    semantics = as_object(value, "Gemma 4 operation_semantics")
+    expected_semantics = {
+        "attention": {
+            "operation_id": GEMMA4_ATTENTION_OPERATION_ID,
+            "provider_id": GEMMA4_ATTENTION_PROVIDER_ID,
+            "variants": {
+                "sliding": {
+                    "layer_count": 40,
+                    "query_heads": 16,
+                    "key_value_heads": 8,
+                    "head_dim": 256,
+                    "window_tokens": 1024,
+                    "rope_type": "default",
+                    "rope_theta": 10_000,
+                    "rope_dim": 256,
+                    "rope_frequency_denominator": 256,
+                    "attention_scale": "1/1",
+                    "value_rms_norm": True,
+                    "attention_k_eq_v": False,
+                },
+                "full": {
+                    "layer_count": 8,
+                    "query_heads": 16,
+                    "key_value_heads": 1,
+                    "head_dim": 512,
+                    "window_tokens": 0,
+                    "rope_type": "proportional",
+                    "rope_theta": 1_000_000,
+                    "partial_rotary_factor": "1/4",
+                    "rope_dim": 128,
+                    "rope_frequency_denominator": 512,
+                    "attention_scale": "1/1",
+                    "value_rms_norm": True,
+                    "attention_k_eq_v": True,
+                },
+            },
+        },
+        "feed_forward": {
+            "operation_id": GEMMA4_GEGLU_OPERATION_ID,
+            "provider_id": GEMMA4_GEGLU_PROVIDER_ID,
+            "layer_count": 48,
+            "activation": "gelu_pytorch_tanh",
+        },
+        "logits": {
+            "operation_id": GEMMA4_SOFTCAP_OPERATION_ID,
+            "provider_id": GEMMA4_SOFTCAP_PROVIDER_ID,
+            "cap": 30,
+        },
+    }
+    require(
+        semantics == expected_semantics,
+        "Gemma 4 sliding/full attention, GeGLU, or logit softcap semantics mismatch",
+    )
+
+
 def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) -> dict[str, Any]:
     lock = as_object(source_lock, "model-lock.json.source_lock")
+    required_source_fields = {
+        "identity",
+        "lock_checks",
+        "files",
+        "tensors",
+        "partition_counts",
+        "expected_quant_tensors",
+        "expected_operations",
+        "coverage_matrix",
+        "quality_vector",
+        "digests",
+        "memory_estimate",
+    }
+    if checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        required_source_fields.update(
+            {"quantization_recipe", "text_only_capability", "operation_semantics"}
+        )
     required_keys(
         lock,
-        {
-            "identity",
-            "lock_checks",
-            "files",
-            "tensors",
-            "partition_counts",
-            "expected_quant_tensors",
-            "expected_operations",
-            "coverage_matrix",
-            "quality_vector",
-            "digests",
-            "memory_estimate",
-        },
+        required_source_fields,
         "source_lock",
     )
     identity = as_object(lock["identity"], "source_lock.identity")
@@ -549,6 +946,10 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
             architecture == GPT_OSS_ARCHITECTURE,
             "GPT-OSS source_lock architecture mismatch",
         )
+    elif checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        validate_gemma4_identity(identity)
+        validate_gemma4_quantization_recipe(lock["quantization_recipe"])
+        validate_gemma4_text_only_capability(lock["text_only_capability"])
     checks = as_object(lock["lock_checks"], "source_lock.lock_checks")
     expected_checks = {"config", "tokenizer", "template", "index", "shards"}
     require(set(checks) == expected_checks, "source_lock lock_checks set mismatch")
@@ -701,6 +1102,12 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
             bool(dense_exclusions),
             "GPT-OSS source lock requires BF16/F16 non-quantized execution exclusions",
         )
+    elif checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        validate_gemma4_tensor_contract(
+            tensor_by_name,
+            execution_quant,
+            disposition_counts,
+        )
     counts = as_object(lock["partition_counts"], "source_lock.partition_counts")
     expected_count_keys = {*disposition_counts, "unknown", "total"}
     require(set(counts) == expected_count_keys, "partition_counts fields mismatch")
@@ -715,6 +1122,7 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
     operations = as_list(lock["expected_operations"], "source_lock.expected_operations")
     require(bool(operations), "expected_operations must not be empty")
     operation_ids: set[str] = set()
+    operation_by_id: dict[str, dict[str, Any]] = {}
     operation_tensor_union: set[str] = set()
     for index, raw in enumerate(operations):
         operation = as_object(raw, f"source_lock.expected_operations[{index}]")
@@ -722,8 +1130,14 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
         operation_id = non_empty_string(operation["operation_id"], "expected operation id")
         require(operation_id not in operation_ids, f"duplicate expected operation {operation_id}")
         operation_ids.add(operation_id)
+        operation_by_id[operation_id] = operation
         names = as_list(operation["tensor_names"], f"expected operation {operation_id}.tensor_names")
-        require(bool(names), f"expected operation {operation_id} has no tensors")
+        if not names:
+            require(
+                checkpoint_id == GEMMA4_CHECKPOINT_ID
+                and operation_id == GEMMA4_SOFTCAP_OPERATION_ID,
+                f"expected operation {operation_id} has no tensors",
+            )
         require(set(names).issubset(execution_quant), f"expected operation {operation_id} has unknown tensors")
         operation_tensor_union.update(names)
     require(operation_tensor_union == execution_quant, "expected operation tensor union is incomplete")
@@ -731,11 +1145,13 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
     covered_ops: set[str] = set()
     coverage_ops: list[str] = []
     coverage_pairs: set[tuple[str, str]] = set()
-    source_pair_count_field = (
-        "source_mxfp4_pair_count"
-        if checkpoint_id == GPT_OSS_CHECKPOINT_ID
-        else "source_fp8_pair_count"
-    )
+    coverage_by_operation: dict[str, dict[str, Any]] = {}
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        source_pair_count_field = "source_mxfp4_pair_count"
+    elif checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        source_pair_count_field = GEMMA4_CT_COVERAGE_COUNT_FIELD
+    else:
+        source_pair_count_field = "source_fp8_pair_count"
     for index, raw in enumerate(coverage):
         cell = as_object(raw, f"source_lock.coverage_matrix[{index}]")
         require(
@@ -755,6 +1171,7 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
         operation_id = non_empty_string(cell["operation_id"], "coverage operation id")
         require(operation_id in operation_ids, f"coverage has unexpected operation {operation_id}")
         coverage_ops.append(operation_id)
+        coverage_by_operation[operation_id] = cell
         validate_version(cell["operation_version"], f"coverage {operation_id}.operation_version")
         provider_id = non_empty_string(cell["provider_id"], "coverage provider id")
         validate_version(cell["provider_version"], f"coverage {operation_id}.provider_version")
@@ -791,8 +1208,19 @@ def validate_m0(source_lock: Any, checkpoint_id: str, *, require_covered: bool) 
         if cell["covered"]:
             covered_ops.add(operation_id)
     require(set(coverage_ops) == operation_ids, "coverage matrix is incomplete")
+    if checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        require(
+            len(coverage_ops) == len(operation_ids),
+            "Gemma 4 provider coverage matrix must contain exactly one cell per operation",
+        )
     if require_covered:
         require(covered_ops == operation_ids, "PASS requires provider coverage for every expected operation")
+    if checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        validate_gemma4_operation_contract(
+            lock["operation_semantics"],
+            operation_by_id,
+            coverage_by_operation,
+        )
     quality = as_object(lock["quality_vector"], "source_lock.quality_vector")
     for key in ["generator_semantics", "input_semantics", "reference_semantics"]:
         non_empty_string(quality.get(key), f"source_lock.quality_vector.{key}")
@@ -1546,6 +1974,11 @@ def validate_m4(value: Any, checkpoint_id: str) -> None:
             run_identity["prepared_family_id"] == GPT_OSS_FAMILY_ID,
             "GPT-OSS M4 prepared family mismatch",
         )
+    elif checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        require(
+            run_identity["prepared_family_id"] == GEMMA4_FAMILY_ID,
+            "Gemma 4 M4 prepared family mismatch",
+        )
     run = as_object(section["run"], "M4 run")
     run_argv = argv_contains_subcommand(run.get("argv"), "run", "M4 run.argv")
     require(run.get("exit_code") == 0, "M4 ferrum run failed")
@@ -1944,6 +2377,8 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
         require(reference["path"] == filename, f"manifest receipt path must be exactly {filename}")
         verify_reference(reference, f"manifest.receipts.{filename}", out_dir)
     allowed_validator_versions = {VALIDATOR_VERSION}
+    if checkpoint_id in PRE_GEMMA_VALIDATOR_VERSION_CHECKPOINTS:
+        allowed_validator_versions.add("1.3.0")
     if checkpoint_id in LEGACY_VALIDATOR_VERSION_CHECKPOINTS:
         allowed_validator_versions.add("1.2.0")
     require(
@@ -1974,8 +2409,25 @@ def validate_package(checkpoint_id: str, out_dir: Path, *, write_log: bool = Tru
         if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
             validate_gpt_oss_hardware(receipts["product.json"]["hardware"])
         else:
-            validate_hardware(receipts["product.json"]["hardware"])
-        require(bool(receipts["product.json"]["effective_config"]), "M4 effective_config must not be empty")
+            gpu = validate_hardware(receipts["product.json"]["hardware"])
+            if checkpoint_id == GEMMA4_CHECKPOINT_ID:
+                require(
+                    positive_int(gpu["memory_bytes"], "Gemma 4 product GPU memory_bytes")
+                    >= 16_000_000_000,
+                    "Gemma 4 product GPU must expose at least 16,000,000,000 bytes",
+                )
+        effective_config = as_object(
+            receipts["product.json"]["effective_config"],
+            "product.json.effective_config",
+        )
+        require(bool(effective_config), "M4 effective_config must not be empty")
+        if checkpoint_id == GEMMA4_CHECKPOINT_ID:
+            require(
+                effective_config.get("backend") == "cuda"
+                and effective_config.get("text_only") is True
+                and effective_config.get("multimodal_request_policy") == "typed_reject",
+                "Gemma 4 product effective_config must select typed CUDA text-only rejection",
+            )
         validate_m4(receipts["product.json"]["product_checks"], checkpoint_id)
     if stages["M5"]["status"] == "pass":
         require(m0_result is not None, "M5 cannot pass without a valid M0")
@@ -2197,6 +2649,222 @@ def synthetic_gpt_oss_m0_tensors() -> list[dict[str, Any]]:
     return tensors
 
 
+def synthetic_gemma4_quantization_recipe() -> dict[str, Any]:
+    return {
+        "format": "pack-quantized",
+        "quant_method": "compressed-tensors",
+        "quantization_status": "compressed",
+        "version": "0.12.2",
+        "group_size": 32,
+        "num_bits": 4,
+        "symmetric": True,
+        "dynamic": False,
+        "strategy": "group",
+        "weight_type": "int",
+        "targets": ["Linear"],
+        "activation_quantization": False,
+        "zero_point": False,
+        "ignored_modules": [
+            "lm_head",
+            "model.embed_audio.embedding_projection",
+            "model.embed_vision.multimodal_embedder.embedding_projection",
+            "model.embed_vision.patch_dense",
+        ],
+    }
+
+
+def synthetic_gemma4_operation_semantics() -> dict[str, Any]:
+    return {
+        "attention": {
+            "operation_id": GEMMA4_ATTENTION_OPERATION_ID,
+            "provider_id": GEMMA4_ATTENTION_PROVIDER_ID,
+            "variants": {
+                "sliding": {
+                    "layer_count": 40,
+                    "query_heads": 16,
+                    "key_value_heads": 8,
+                    "head_dim": 256,
+                    "window_tokens": 1024,
+                    "rope_type": "default",
+                    "rope_theta": 10_000,
+                    "rope_dim": 256,
+                    "rope_frequency_denominator": 256,
+                    "attention_scale": "1/1",
+                    "value_rms_norm": True,
+                    "attention_k_eq_v": False,
+                },
+                "full": {
+                    "layer_count": 8,
+                    "query_heads": 16,
+                    "key_value_heads": 1,
+                    "head_dim": 512,
+                    "window_tokens": 0,
+                    "rope_type": "proportional",
+                    "rope_theta": 1_000_000,
+                    "partial_rotary_factor": "1/4",
+                    "rope_dim": 128,
+                    "rope_frequency_denominator": 512,
+                    "attention_scale": "1/1",
+                    "value_rms_norm": True,
+                    "attention_k_eq_v": True,
+                },
+            },
+        },
+        "feed_forward": {
+            "operation_id": GEMMA4_GEGLU_OPERATION_ID,
+            "provider_id": GEMMA4_GEGLU_PROVIDER_ID,
+            "layer_count": 48,
+            "activation": "gelu_pytorch_tanh",
+        },
+        "logits": {
+            "operation_id": GEMMA4_SOFTCAP_OPERATION_ID,
+            "provider_id": GEMMA4_SOFTCAP_PROVIDER_ID,
+            "cap": 30,
+        },
+    }
+
+
+def synthetic_gemma4_m0_tensors() -> list[dict[str, Any]]:
+    tensors: list[dict[str, Any]] = [
+        {
+            "name": "model.language_model.embed_tokens.weight",
+            "dtype": "BF16",
+            "shape": [262_144, 3_840],
+            "disposition": "execution_eligible",
+            "quantized": False,
+        },
+        {
+            "name": "model.language_model.norm.weight",
+            "dtype": "BF16",
+            "shape": [3_840],
+            "disposition": "execution_eligible",
+            "quantized": False,
+        },
+    ]
+
+    def append_dense(name: str, shape: list[int]) -> None:
+        tensors.append(
+            {
+                "name": name,
+                "dtype": "BF16",
+                "shape": shape,
+                "disposition": "execution_eligible",
+                "quantized": False,
+            }
+        )
+
+    def append_quantized(stem: str, logical_shape: tuple[int, int]) -> None:
+        n, k = logical_shape
+        packed_name = f"{stem}.weight_packed"
+        scale_name = f"{stem}.weight_scale"
+        shape_name = f"{stem}.weight_shape"
+        scale_shape = [n, k // 32]
+        tensors.extend(
+            [
+                {
+                    "name": packed_name,
+                    "dtype": "I32",
+                    "shape": [n, k // 8],
+                    "disposition": "execution_eligible",
+                    "quantized": True,
+                    "source_layout": {
+                        "format": GEMMA4_CT_SOURCE_FORMAT,
+                        "group_size": 32,
+                        "num_bits": 4,
+                        "symmetric": True,
+                        "packing_order": GEMMA4_CT_PACKING_ORDER,
+                        "sidecars": [
+                            {
+                                "role": "scale",
+                                "tensor_name": scale_name,
+                                "dtype": "BF16",
+                                "shape": scale_shape,
+                            },
+                            {
+                                "role": "logical_shape",
+                                "tensor_name": shape_name,
+                                "dtype": "I64",
+                                "shape": [2],
+                            },
+                        ],
+                    },
+                },
+                {
+                    "name": scale_name,
+                    "dtype": "BF16",
+                    "shape": scale_shape,
+                    "disposition": "execution_eligible",
+                    "quantized": False,
+                },
+                {
+                    "name": shape_name,
+                    "dtype": "I64",
+                    "shape": [2],
+                    "disposition": "execution_eligible",
+                    "quantized": False,
+                },
+            ]
+        )
+
+    for layer_index in range(48):
+        full_attention = (layer_index + 1) % 6 == 0
+        head_dim = 512 if full_attention else 256
+        query_features = 16 * head_dim
+        kv_features = head_dim if full_attention else 8 * head_dim
+        prefix = f"model.language_model.layers.{layer_index}"
+        for suffix, shape in [
+            ("input_layernorm.weight", [3_840]),
+            ("post_attention_layernorm.weight", [3_840]),
+            ("pre_feedforward_layernorm.weight", [3_840]),
+            ("post_feedforward_layernorm.weight", [3_840]),
+            ("self_attn.q_norm.weight", [head_dim]),
+            ("self_attn.k_norm.weight", [head_dim]),
+        ]:
+            append_dense(f"{prefix}.{suffix}", shape)
+        append_quantized(f"{prefix}.self_attn.q_proj", (query_features, 3_840))
+        append_quantized(f"{prefix}.self_attn.k_proj", (kv_features, 3_840))
+        if not full_attention:
+            append_quantized(f"{prefix}.self_attn.v_proj", (kv_features, 3_840))
+        append_quantized(f"{prefix}.self_attn.o_proj", (3_840, query_features))
+        append_quantized(f"{prefix}.mlp.gate_proj", (15_360, 3_840))
+        append_quantized(f"{prefix}.mlp.up_proj", (15_360, 3_840))
+        append_quantized(f"{prefix}.mlp.down_proj", (3_840, 15_360))
+        tensors.append(
+            {
+                "name": f"{prefix}.layer_scalar",
+                "dtype": "BF16",
+                "shape": [1],
+                "disposition": "typed_non_executed",
+                "quantized": False,
+                "classification_reason": "compile_time_unit_layer_scale",
+            }
+        )
+
+    tensors.append(
+        {
+            "name": "lm_head.weight",
+            "dtype": "BF16",
+            "shape": [262_144, 3_840],
+            "disposition": "typed_non_executed",
+            "quantized": False,
+            "classification_reason": "tied_projection_duplicate",
+        }
+    )
+    tensors.extend(
+        {
+            "name": name,
+            "dtype": "BF16",
+            "shape": [1],
+            "disposition": "typed_non_executed",
+            "quantized": False,
+            "classification_reason": "text_only_multimodal_component",
+        }
+        for name in sorted(GEMMA4_MULTIMODAL_TENSORS)
+    )
+    require(len(tensors) == 1334, "synthetic Gemma 4 tensor inventory drifted")
+    return tensors
+
+
 def synthetic_pass_documents(
     out_dir: Path,
     checkpoint_id: str = "qwen38-27b-fp8",
@@ -2207,6 +2875,7 @@ def synthetic_pass_documents(
         "model.layers.0.q_proj.weight",
         "model.layers.0.o_proj.weight",
     ]
+    gemma_tensors: list[dict[str, Any]] | None = None
     if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
         expected_tensors = list(GPT_OSS_CANARY_QUANT_TENSORS)
         expected_operations = [
@@ -2220,6 +2889,30 @@ def synthetic_pass_documents(
             "matmul after native E2M1 values are decoded with E8M0 group-32 scales"
         )
         numeric_shapes = [(128, 64), (64, 64)]
+    elif checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        gemma_tensors = synthetic_gemma4_m0_tensors()
+        gemma_operation_tensors = gemma4_quant_operation_tensor_sets()
+        expected_tensors = sorted(
+            set().union(*gemma_operation_tensors.values())
+        )
+        expected_operations = [
+            {
+                "operation_id": operation_id,
+                "tensor_names": sorted(tensor_names),
+            }
+            for operation_id, tensor_names in sorted(gemma_operation_tensors.items())
+        ]
+        denominator = canonical_sha256(
+            {
+                "operations": sorted(gemma_operation_tensors),
+                "quant_tensors": expected_tensors,
+            }
+        )
+        reference_semantics = (
+            "matmul after compressed-tensors signed INT4 values are decoded with "
+            "locked symmetric BF16 group-32 scales"
+        )
+        numeric_shapes = [(4_096, 3_840), (15_360, 3_840)]
     else:
         expected_tensors = qwen_expected_tensors
         expected_operations = [
@@ -2256,7 +2949,11 @@ def synthetic_pass_documents(
                     else (
                         GPT_OSS_ARCHITECTURE
                         if checkpoint_id == GPT_OSS_CHECKPOINT_ID
-                        else "Qwen3_5ForConditionalGeneration"
+                        else (
+                            GEMMA4_ARCHITECTURE
+                            if checkpoint_id == GEMMA4_CHECKPOINT_ID
+                            else "Qwen3_5ForConditionalGeneration"
+                        )
                     )
                 ),
             },
@@ -2405,6 +3102,57 @@ def synthetic_pass_documents(
         source_lock["quality_vector"] = {
             "generator_semantics": "seeded native E2M1/E8M0 group-32 fixtures",
             "input_semantics": "two expert projection shapes by two activation batches",
+            "reference_semantics": reference_semantics,
+        }
+    elif checkpoint_id == GEMMA4_CHECKPOINT_ID:
+        require(gemma_tensors is not None, "synthetic Gemma 4 tensor fixture is missing")
+        source_lock = model_lock["source_lock"]
+        source_lock["identity"].update(
+            {
+                "family_id": GEMMA4_FAMILY_ID,
+                "model_type": GEMMA4_MODEL_TYPE,
+                "text_model_type": GEMMA4_TEXT_MODEL_TYPE,
+            }
+        )
+        source_lock["quantization_recipe"] = synthetic_gemma4_quantization_recipe()
+        source_lock["text_only_capability"] = {
+            "mode": "typed_text_only",
+            "scheduled_modalities": ["text"],
+            "multimodal_request_policy": "typed_reject",
+            "multimodal_tensor_count": 11,
+        }
+        source_lock["operation_semantics"] = synthetic_gemma4_operation_semantics()
+        source_lock["tensors"] = gemma_tensors
+        source_lock["partition_counts"] = {
+            "execution_eligible": 1274,
+            "typed_non_executed": 60,
+            "rejected": 0,
+            "unknown": 0,
+            "total": 1334,
+        }
+        gemma_providers = {
+            GEMMA4_ATTENTION_OPERATION_ID: GEMMA4_ATTENTION_PROVIDER_ID,
+            GEMMA4_GEGLU_OPERATION_ID: GEMMA4_GEGLU_PROVIDER_ID,
+            GEMMA4_SOFTCAP_OPERATION_ID: GEMMA4_SOFTCAP_PROVIDER_ID,
+        }
+        source_lock["coverage_matrix"] = [
+            {
+                "operation_id": operation_id,
+                "operation_version": {"major": 1, "minor": 0},
+                "provider_id": gemma_providers[operation_id],
+                "provider_version": {"major": 1, "minor": 0},
+                GEMMA4_CT_COVERAGE_COUNT_FIELD: len(tensor_names),
+                "existing_execution_provider_acceptance": True,
+                "covered": True,
+                "missing_boundaries": [],
+            }
+            for operation_id, tensor_names in sorted(
+                gemma4_quant_operation_tensor_sets().items()
+            )
+        ]
+        source_lock["quality_vector"] = {
+            "generator_semantics": "seeded signed INT4 compressed-tensors group-32 fixtures",
+            "input_semantics": "two dense projection shapes by two activation batches",
             "reference_semantics": reference_semantics,
         }
     m1_root = out_dir.parent / f"{out_dir.name}-upstream" / "m1"
@@ -2557,7 +3305,11 @@ def synthetic_pass_documents(
                 "materializer_id": (
                     "weight-materializer.cuda.gpt-oss-mxfp4-to-marlin"
                     if checkpoint_id == GPT_OSS_CHECKPOINT_ID
-                    else "weight-materializer.cuda.block-fp8"
+                    else (
+                        "weight-materializer.cuda.compressed-tensors-int4-symmetric-to-marlin"
+                        if checkpoint_id == GEMMA4_CHECKPOINT_ID
+                        else "weight-materializer.cuda.block-fp8"
+                    )
                 ),
                 "materializer_version": "1.0.0",
                 "implementation_fingerprint": "f" * 64,
@@ -2578,11 +3330,15 @@ def synthetic_pass_documents(
     family_id = (
         GPT_OSS_FAMILY_ID
         if checkpoint_id == GPT_OSS_CHECKPOINT_ID
-        else "family.qwen3_5.hybrid"
+        else (
+            GEMMA4_FAMILY_ID
+            if checkpoint_id == GEMMA4_CHECKPOINT_ID
+            else "family.qwen3_5.hybrid"
+        )
     )
     product_gpu = (
         {"name": "NVIDIA GeForce RTX 4090", "memory_bytes": 24_000_000_000}
-        if checkpoint_id == GPT_OSS_CHECKPOINT_ID
+        if checkpoint_id in {GPT_OSS_CHECKPOINT_ID, GEMMA4_CHECKPOINT_ID}
         else {"name": "NVIDIA L40S", "memory_bytes": 48_000_000_000}
     )
     product = {
@@ -2594,7 +3350,15 @@ def synthetic_pass_documents(
             "driver_version": "synthetic-driver",
             "cuda_runtime": "synthetic-cuda",
         },
-        "effective_config": {"backend": "cuda", "text_only": True},
+        "effective_config": {
+            "backend": "cuda",
+            "text_only": True,
+            **(
+                {"multimodal_request_policy": "typed_reject"}
+                if checkpoint_id == GEMMA4_CHECKPOINT_ID
+                else {}
+            ),
+        },
         "milestones": {"M4": {"status": "pass"}, "M5": {"status": "pass"}},
         "product_checks": {
             "load_to_ready_seconds": 500.0,
@@ -2673,11 +3437,13 @@ def synthetic_pass_documents(
             "fallback_counts": {key: 0 for key in sorted(FALLBACK_KEYS)},
         },
     }
-    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+    if checkpoint_id in {GPT_OSS_CHECKPOINT_ID, GEMMA4_CHECKPOINT_ID}:
         product_checks = product["product_checks"]
         product_checks["run"]["argv"] = ["ferrum", "run"]
         product_checks["serve_non_stream"].pop("chat_template_kwargs")
         product_checks["serve_stream"].pop("chat_template_kwargs")
+    if checkpoint_id == GPT_OSS_CHECKPOINT_ID:
+        product_checks = product["product_checks"]
         product_checks["harmony_tool_call"] = {
             "case_id": "harmony-weather-paris",
             "protocol": "harmony",
@@ -2850,6 +3616,100 @@ def run_self_test() -> None:
         require(
             validate_package(GPT_OSS_CHECKPOINT_ID, b_passing) == b_expected,
             "synthetic B PASS line mismatch",
+        )
+
+        b_v13 = root / "b-v1.3-pass"
+        b_v13_docs = synthetic_pass_documents(b_v13, GPT_OSS_CHECKPOINT_ID)
+        write_synthetic_package(b_v13, b_v13_docs)
+        b_v13_manifest = load_json(b_v13 / "manifest.json")
+        b_v13_manifest["validator_version"] = "1.3.0"
+        write_json(b_v13 / "manifest.json", b_v13_manifest)
+        require(
+            validate_package(GPT_OSS_CHECKPOINT_ID, b_v13)
+            == expected_terminal_line("PASS", GPT_OSS_CHECKPOINT_ID, b_v13),
+            "GPT-OSS validator 1.3 compatibility drifted",
+        )
+
+        c_passing = root / "c-pass"
+        c_pass_docs = synthetic_pass_documents(c_passing, GEMMA4_CHECKPOINT_ID)
+        write_synthetic_package(c_passing, c_pass_docs)
+        c_expected = expected_terminal_line("PASS", GEMMA4_CHECKPOINT_ID, c_passing)
+        require(
+            validate_package(GEMMA4_CHECKPOINT_ID, c_passing) == c_expected,
+            "synthetic Gemma 4 C PASS line mismatch",
+        )
+
+        c_source_lock = c_pass_docs["model-lock.json"]["source_lock"]
+        c_bad_family = json.loads(json.dumps(c_source_lock))
+        c_bad_family["identity"]["family_id"] = "family.gemma3.legacy"
+        expect_failure(
+            "C Gemma 4 family identity",
+            lambda: validate_m0(
+                c_bad_family, GEMMA4_CHECKPOINT_ID, require_covered=True
+            ),
+            "Gemma 4 source_lock family mismatch",
+        )
+
+        c_bad_recipe = json.loads(json.dumps(c_source_lock))
+        c_bad_recipe["quantization_recipe"]["symmetric"] = False
+        expect_failure(
+            "C Gemma 4 compressed-tensors recipe",
+            lambda: validate_m0(
+                c_bad_recipe, GEMMA4_CHECKPOINT_ID, require_covered=True
+            ),
+            "symmetric must be true",
+        )
+
+        c_bad_layout = json.loads(json.dumps(c_source_lock))
+        c_packed = next(
+            tensor for tensor in c_bad_layout["tensors"] if tensor["quantized"]
+        )
+        c_packed["source_layout"]["packing_order"] = "msb-first"
+        expect_failure(
+            "C Gemma 4 packed layout",
+            lambda: validate_m0(
+                c_bad_layout, GEMMA4_CHECKPOINT_ID, require_covered=True
+            ),
+            "CT packing order mismatch",
+        )
+
+        c_bad_text_only = json.loads(json.dumps(c_source_lock))
+        c_multimodal = next(
+            tensor
+            for tensor in c_bad_text_only["tensors"]
+            if tensor["name"] in GEMMA4_MULTIMODAL_TENSORS
+        )
+        c_multimodal["classification_reason"] = "ignored_by_filename"
+        expect_failure(
+            "C Gemma 4 typed text-only partition",
+            lambda: validate_m0(
+                c_bad_text_only, GEMMA4_CHECKPOINT_ID, require_covered=True
+            ),
+            "typed non-executed classification mismatch",
+        )
+
+        c_bad_coverage = json.loads(json.dumps(c_source_lock))
+        c_bad_coverage["coverage_matrix"][0][GEMMA4_CT_COVERAGE_COUNT_FIELD] += 1
+        expect_failure(
+            "C Gemma 4 CT coverage count",
+            lambda: validate_m0(
+                c_bad_coverage, GEMMA4_CHECKPOINT_ID, require_covered=True
+            ),
+            "compressed-tensors W4 bundle count mismatch",
+        )
+
+        c_bad_operation_semantics = json.loads(json.dumps(c_source_lock))
+        c_bad_operation_semantics["operation_semantics"]["attention"]["variants"][
+            "sliding"
+        ]["window_tokens"] = 0
+        expect_failure(
+            "C Gemma 4 sliding/full operation semantics",
+            lambda: validate_m0(
+                c_bad_operation_semantics,
+                GEMMA4_CHECKPOINT_ID,
+                require_covered=True,
+            ),
+            "sliding/full attention, GeGLU, or logit softcap semantics mismatch",
         )
 
         b_bad_architecture = json.loads(

@@ -1,9 +1,9 @@
 //! Exact compressed-tensors W4 adapter for the Marlin physical ABI.
 //!
 //! The supported checkpoint subset is intentionally narrow: pack-quantized
-//! INT4 weights, fixed group size, asymmetric zero points, and no activation
-//! quantization. Repacking is cold-path CPU work performed while static plan
-//! resources are initialized.
+//! INT4 weights, fixed group size, optional format-typed asymmetric zero
+//! points, and no activation quantization. Repacking is cold-path CPU work
+//! performed while static plan resources are initialized.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -24,6 +24,19 @@ use crate::safetensors_archive::{transcode_dense_bytes, SafetensorsArchive, Safe
 
 pub const COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID: &str =
     "quantization.marlin.compressed-tensors-int4-asymmetric";
+pub const COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID: &str =
+    "quantization.marlin.compressed-tensors-int4-symmetric";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompressedTensorsInt4Mode {
+    Asymmetric,
+    Symmetric,
+}
+
+struct ValidatedQuantization {
+    group_size: usize,
+    mode: CompressedTensorsInt4Mode,
+}
 
 /// Mmap-backed safetensors archive with an exact compressed-tensors-to-Marlin
 /// adapter. Dense components keep the archive's zero-copy/transcode behavior.
@@ -49,7 +62,8 @@ impl CompressedTensorsMarlinSafetensorsSource {
         component: &WeightComponentSpec,
         quantization: &QuantizationSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
-        let group_size = validate_quantization(component, quantization)?;
+        let validated = validate_quantization(component, quantization)?;
+        let group_size = validated.group_size;
         let [packed_name, shape_name] = component.external_names.as_slice() else {
             return Err(invalid_component(
                 component,
@@ -63,6 +77,14 @@ impl CompressedTensorsMarlinSafetensorsSource {
             return Err(invalid_component(
                 component,
                 "packed values and shape metadata must share one compressed-tensors stem",
+            ));
+        }
+        if validated.mode == CompressedTensorsInt4Mode::Symmetric
+            && self.archive.contains(&format!("{stem}.weight_zero_point"))
+        {
+            return Err(invalid_component(
+                component,
+                "symmetric compressed-tensors must not provide weight_zero_point",
             ));
         }
         let packed = self.tensor(component, packed_name)?;
@@ -103,6 +125,12 @@ impl CompressedTensorsMarlinSafetensorsSource {
                 gptq_words[packed_input * n + output] = source[output * (k / 8) + packed_input];
             }
         }
+        // compressed-tensors pack-quantized INT4 adds the signed-domain bias
+        // of eight before packing and stores the first input in the low
+        // nibble. Those codes are already Marlin U4B8 codes, so symmetric
+        // weights need only the [N, K/8] -> [K/8, N] transpose above and the
+        // normal Marlin tile permutation. Applying another bias/XOR here
+        // would corrupt the signed-domain meaning of every symmetric code.
         let expected_bytes = usize::try_from(component.physical_bytes()?)
             .map_err(|_| invalid_component(component, "packed byte count exceeds address space"))?;
         let mut bytes = vec![0_u8; expected_bytes];
@@ -136,7 +164,39 @@ impl CompressedTensorsMarlinSafetensorsSource {
                 "scale source must end with .weight_scale",
             ));
         }
+        let stem = external_name
+            .strip_suffix(".weight_scale")
+            .unwrap_or_default();
+        if stem.is_empty() {
+            return Err(invalid_component(
+                component,
+                "scale source must have a non-empty compressed-tensors stem",
+            ));
+        }
         let tensor = self.tensor(component, external_name)?;
+        // Scale components are dense and therefore do not carry the packed
+        // component's QuantizationSpec. Absence of the same-stem zero-point
+        // sidecar is the physical symmetric-bundle discriminator. Keep the
+        // established asymmetric transcode path unchanged, but require the
+        // exact BF16[N, K/32] header for a zero-point-free bundle.
+        if !self.archive.contains(&format!("{stem}.weight_zero_point")) {
+            let shape = self.tensor(component, &format!("{stem}.weight_shape"))?;
+            let (shape_n, shape_k) = validate_shape_metadata(component, &shape)?;
+            if tensor.dtype() != Dtype::BF16
+                || !shape_k.is_multiple_of(32)
+                || tensor.shape() != [shape_n as u64, (shape_k / 32) as u64]
+            {
+                return Err(invalid_component(
+                    component,
+                    format!(
+                        "symmetric weight_scale must be BF16[{shape_n}, {}], got {:?} {:?}",
+                        shape_k / 32,
+                        tensor.dtype(),
+                        tensor.shape()
+                    ),
+                ));
+            }
+        }
         let [n, groups] = tensor.shape() else {
             return Err(invalid_component(
                 component,
@@ -293,7 +353,7 @@ impl WeightComponentSource for CompressedTensorsMarlinSafetensorsSource {
 fn validate_quantization(
     component: &WeightComponentSpec,
     quantization: &QuantizationSpec,
-) -> std::result::Result<usize, VNextError> {
+) -> std::result::Result<ValidatedQuantization, VNextError> {
     quantization.validate()?;
     let Some(group_size) = quantization.grouping.fixed_size() else {
         return Err(invalid_component(
@@ -301,18 +361,47 @@ fn validate_quantization(
             "compressed-tensors requires fixed-size groups",
         ));
     };
-    if quantization.format_id.as_str() != COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID
-        || quantization.bits_per_weight != 4
-        || quantization.scale_type != ElementType::F16
-        || quantization.zero_point_type != Some(ElementType::I32)
-    {
-        return Err(invalid_component(
-            component,
-            "compressed-tensors requires asymmetric INT4 Marlin packing with F16 scales and packed I32 zero points",
-        ));
-    }
-    usize::try_from(group_size)
-        .map_err(|_| invalid_component(component, "group size exceeds address space"))
+    let mode = match quantization.format_id.as_str() {
+        COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID
+            if quantization.bits_per_weight == 4
+                && quantization.scale_type == ElementType::F16
+                && quantization.zero_point_type == Some(ElementType::I32) =>
+        {
+            CompressedTensorsInt4Mode::Asymmetric
+        }
+        COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID
+            if quantization.bits_per_weight == 4
+                && group_size == 32
+                && quantization.packing == ferrum_interfaces::vnext::QuantizationPacking::Tiled
+                && quantization.scale_type == ElementType::F16
+                && quantization.zero_point_type.is_none() =>
+        {
+            CompressedTensorsInt4Mode::Symmetric
+        }
+        COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID => {
+            return Err(invalid_component(
+                component,
+                "asymmetric compressed-tensors requires INT4 Marlin packing with F16 scales and packed I32 zero points",
+            ));
+        }
+        COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID => {
+            return Err(invalid_component(
+                component,
+                "symmetric compressed-tensors requires group32 INT4 tiled Marlin packing with F16 scales and no zero points",
+            ));
+        }
+        _ => {
+            return Err(invalid_component(
+                component,
+                "compressed-tensors quantization format id is unsupported",
+            ));
+        }
+    };
+    Ok(ValidatedQuantization {
+        group_size: usize::try_from(group_size)
+            .map_err(|_| invalid_component(component, "group size exceeds address space"))?,
+        mode,
+    })
 }
 
 fn has_unit_prefix_and_tail(dimensions: &[u64], tail: &[u64; 2]) -> bool {
@@ -430,6 +519,15 @@ mod tests {
     }
 
     fn write_fixture() -> Fixture {
+        write_fixture_with_options(true, Dtype::BF16)
+    }
+
+    fn write_symmetric_fixture() -> Fixture {
+        write_fixture_with_options(false, Dtype::BF16)
+    }
+
+    fn write_fixture_with_options(include_zero_points: bool, scale_dtype: Dtype) -> Fixture {
+        assert!(matches!(scale_dtype, Dtype::BF16 | Dtype::F16));
         let directory = tempdir().unwrap();
         let n = 64_usize;
         let k = 128_usize;
@@ -469,7 +567,13 @@ mod tests {
             .collect::<Vec<_>>();
         let scale_bytes = scales
             .iter()
-            .flat_map(|value| value.to_bits().to_le_bytes())
+            .flat_map(|value| {
+                if scale_dtype == Dtype::BF16 {
+                    value.to_bits().to_le_bytes()
+                } else {
+                    f16::from_f32(value.to_f32()).to_bits().to_le_bytes()
+                }
+            })
             .collect::<Vec<_>>();
         let zero_point_bytes = zero_points
             .iter()
@@ -479,24 +583,26 @@ mod tests {
             .into_iter()
             .flat_map(i64::to_le_bytes)
             .collect::<Vec<_>>();
-        let views = BTreeMap::from([
+        let mut views = BTreeMap::from([
             (
                 format!("{STEM}.weight_packed"),
                 TensorView::new(Dtype::I32, vec![n, k / 8], &packed_bytes).unwrap(),
             ),
             (
                 format!("{STEM}.weight_scale"),
-                TensorView::new(Dtype::BF16, vec![n, groups], &scale_bytes).unwrap(),
+                TensorView::new(scale_dtype, vec![n, groups], &scale_bytes).unwrap(),
             ),
             (
                 format!("{STEM}.weight_shape"),
                 TensorView::new(Dtype::I64, vec![2], &shape_bytes).unwrap(),
             ),
-            (
+        ]);
+        if include_zero_points {
+            views.insert(
                 format!("{STEM}.weight_zero_point"),
                 TensorView::new(Dtype::I32, vec![n / 8, groups], &zero_point_bytes).unwrap(),
-            ),
-        ]);
+            );
+        }
         serialize_to_file(views, &None, &directory.path().join("model.safetensors")).unwrap();
         Fixture {
             directory,
@@ -517,6 +623,20 @@ mod tests {
             packing: QuantizationPacking::Tiled,
             scale_type: ElementType::F16,
             zero_point_type: Some(ElementType::I32),
+        }
+    }
+
+    fn symmetric_quantization() -> QuantizationSpec {
+        QuantizationSpec {
+            format_id: QuantizationFormatId::new(
+                COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID,
+            )
+            .unwrap(),
+            bits_per_weight: 4,
+            grouping: QuantizationGrouping::fixed(32),
+            packing: QuantizationPacking::Tiled,
+            scale_type: ElementType::F16,
+            zero_point_type: None,
         }
     }
 
@@ -595,6 +715,205 @@ mod tests {
         .flat_map(i32::to_le_bytes)
         .collect::<Vec<_>>();
         assert_eq!(zero_points_payload.bytes(), expected_zero_points);
+    }
+
+    #[test]
+    fn repacks_symmetric_group32_codes_as_marlin_u4b8_without_a_zero_point() {
+        let fixture = write_symmetric_fixture();
+        let source =
+            CompressedTensorsMarlinSafetensorsSource::open(fixture.directory.path()).unwrap();
+        assert!(!source
+            .archive()
+            .contains(&format!("{STEM}.weight_zero_point")));
+
+        // pack_to_int32 stores signed q in the biased code domain q + 8 and
+        // puts input lane zero in the low nibble. Check the fixture itself so
+        // the expected Marlin bytes below catch any accidental second bias.
+        let expected_first_word = (0..8).fold(0_u32, |word, lane| {
+            let signed = ((lane * 5 + 1) % 16) as i32 - 8;
+            word | ((signed + 8) as u32) << (lane * 4)
+        });
+        assert_eq!(fixture.packed[0] as u32, expected_first_word);
+
+        let packed_component = WeightComponentSpec {
+            id: WeightId::new("component.q.symmetric.packed").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec![
+                format!("{STEM}.weight_packed"),
+                format!("{STEM}.weight_shape"),
+            ],
+            dimensions: vec![fixture.n as u64, (fixture.k / 2) as u64],
+            encoding: WeightEncoding::Quantized(symmetric_quantization()),
+            required: true,
+        };
+        let packed_payload = source.component(&packed_component).unwrap();
+        let mut direct_u4b8_words = vec![0_i32; fixture.packed.len()];
+        for output in 0..fixture.n {
+            for packed_input in 0..fixture.k / 8 {
+                direct_u4b8_words[packed_input * fixture.n + output] =
+                    fixture.packed[output * (fixture.k / 8) + packed_input];
+            }
+        }
+        let mut expected_packed = vec![0_u8; fixture.n * fixture.k / 2];
+        repack_gptq_to_marlin_bytes_into(
+            &direct_u4b8_words,
+            fixture.k,
+            fixture.n,
+            &mut expected_packed,
+        );
+        assert_eq!(packed_payload.bytes(), expected_packed);
+        assert_eq!(packed_payload.element_type(), ElementType::U8);
+
+        let scales_component = WeightComponentSpec {
+            id: WeightId::new("component.q.symmetric.scales").unwrap(),
+            role: WeightComponentRole::Scales,
+            external_names: vec![format!("{STEM}.weight_scale")],
+            dimensions: vec![fixture.n as u64, fixture.groups as u64],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+            required: true,
+        };
+        let scales_payload = source.component(&scales_component).unwrap();
+        let mut group_major = vec![f16::ZERO; fixture.scales.len()];
+        for output in 0..fixture.n {
+            for group in 0..fixture.groups {
+                group_major[group * fixture.n + output] =
+                    f16::from_f32(fixture.scales[output * fixture.groups + group].to_f32());
+            }
+        }
+        let expected_scales = encode_f16(repack_scales_to_marlin(
+            &group_major,
+            fixture.groups,
+            fixture.n,
+            1,
+        ));
+        assert_eq!(scales_payload.bytes(), expected_scales.as_ref());
+        assert_eq!(scales_payload.element_type(), ElementType::F16);
+
+        let zero_points_component = WeightComponentSpec {
+            id: WeightId::new("component.q.symmetric.zero_points").unwrap(),
+            role: WeightComponentRole::ZeroPoints,
+            external_names: vec![format!("{STEM}.weight_zero_point")],
+            dimensions: vec![fixture.groups as u64, (fixture.n / 8) as u64],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::I32,
+            },
+            required: true,
+        };
+        let error = source
+            .component(&zero_points_component)
+            .err()
+            .expect("symmetric source must not synthesize zero points");
+        assert!(
+            error.to_string().contains("absent from safetensors"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_drifted_symmetric_metadata_and_zero_point_components() {
+        let fixture = write_symmetric_fixture();
+        let source =
+            CompressedTensorsMarlinSafetensorsSource::open(fixture.directory.path()).unwrap();
+        let component = |quantization| WeightComponentSpec {
+            id: WeightId::new("component.q.symmetric.packed").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec![
+                format!("{STEM}.weight_packed"),
+                format!("{STEM}.weight_shape"),
+            ],
+            dimensions: vec![fixture.n as u64, (fixture.k / 2) as u64],
+            encoding: WeightEncoding::Quantized(quantization),
+            required: true,
+        };
+
+        let mut wrong_group = symmetric_quantization();
+        wrong_group.grouping = QuantizationGrouping::fixed(64);
+        let error = source
+            .component(&component(wrong_group))
+            .err()
+            .expect("wrong symmetric group metadata must be rejected");
+        assert!(error.to_string().contains("requires group32"), "{error}");
+
+        let mut fake_zero_point = symmetric_quantization();
+        fake_zero_point.zero_point_type = Some(ElementType::I32);
+        let error = source
+            .component(&component(fake_zero_point))
+            .err()
+            .expect("symmetric zero-point metadata must be rejected");
+        assert!(error.to_string().contains("no zero points"), "{error}");
+
+        let f16_symmetric_fixture = write_fixture_with_options(false, Dtype::F16);
+        let f16_symmetric_source =
+            CompressedTensorsMarlinSafetensorsSource::open(f16_symmetric_fixture.directory.path())
+                .unwrap();
+        let scale_component = WeightComponentSpec {
+            id: WeightId::new("component.q.symmetric.scales").unwrap(),
+            role: WeightComponentRole::Scales,
+            external_names: vec![format!("{STEM}.weight_scale")],
+            dimensions: vec![
+                f16_symmetric_fixture.n as u64,
+                f16_symmetric_fixture.groups as u64,
+            ],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+            required: true,
+        };
+        let error = f16_symmetric_source
+            .component(&scale_component)
+            .err()
+            .expect("symmetric F16 source scale must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("symmetric weight_scale must be BF16"),
+            "{error}"
+        );
+
+        let f16_asymmetric_fixture = write_fixture_with_options(true, Dtype::F16);
+        let f16_asymmetric_source =
+            CompressedTensorsMarlinSafetensorsSource::open(f16_asymmetric_fixture.directory.path())
+                .unwrap();
+        let scale_component = WeightComponentSpec {
+            dimensions: vec![
+                f16_asymmetric_fixture.n as u64,
+                f16_asymmetric_fixture.groups as u64,
+            ],
+            ..scale_component
+        };
+        assert!(f16_asymmetric_source.component(&scale_component).is_ok());
+
+        let fixture_with_zero_point = write_fixture();
+        let source_with_zero_point = CompressedTensorsMarlinSafetensorsSource::open(
+            fixture_with_zero_point.directory.path(),
+        )
+        .unwrap();
+        let packed_component = WeightComponentSpec {
+            id: WeightId::new("component.q.symmetric.packed").unwrap(),
+            role: WeightComponentRole::PackedValues,
+            external_names: vec![
+                format!("{STEM}.weight_packed"),
+                format!("{STEM}.weight_shape"),
+            ],
+            dimensions: vec![
+                fixture_with_zero_point.n as u64,
+                (fixture_with_zero_point.k / 2) as u64,
+            ],
+            encoding: WeightEncoding::Quantized(symmetric_quantization()),
+            required: true,
+        };
+        let error = source_with_zero_point
+            .component(&packed_component)
+            .err()
+            .expect("symmetric physical zero point must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("must not provide weight_zero_point"),
+            "{error}"
+        );
     }
 
     #[test]
