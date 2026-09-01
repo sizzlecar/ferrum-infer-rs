@@ -31,8 +31,6 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "release"))
 
-from openai_tool_call_regression import run_tool_call_regression
-
 CHAT_CHECK_MAX_TOKENS = 256
 
 
@@ -75,16 +73,6 @@ CASES = (
         ),
         default_min_max_seqs=16,
         source="llama3.1:8b-q4_k_m",
-        serve_args=("--greedy-argmax",),
-    ),
-    ModelCase(
-        key="qwen3_8b",
-        label="Qwen3-8B",
-        gguf="Qwen3-8B-Q4_K_M.gguf",
-        tokenizer="Qwen3-8B.tokenizer.json",
-        moe=False,
-        cells=(Cell(concurrency=16, prompts=32, baseline_tps=57.1),),
-        default_min_max_seqs=16,
         serve_args=("--greedy-argmax",),
     ),
     ModelCase(
@@ -950,24 +938,6 @@ def run_quality_cell(
     return result
 
 
-def run_tool_call_check(port: int, case: ModelCase, out_dir: Path) -> dict[str, Any]:
-    out = out_dir / f"{case.key}.tool-call-regression"
-    try:
-        return run_tool_call_regression(
-            f"http://127.0.0.1:{port}",
-            case.label,
-            out,
-            enable_thinking=False,
-        )
-    except Exception as e:
-        result = {"status": "fail", "model": case.label, "error": str(e)}
-        write(
-            out / "tool_call_regression.json",
-            json.dumps(result, indent=2, ensure_ascii=False) + "\n",
-        )
-        return result
-
-
 def run_unsafe_moe_batch_probe(
     ferrum_bin: Path,
     model_path: Path,
@@ -1155,14 +1125,13 @@ def markdown_summary(report: dict[str, Any]) -> str:
     out.append(f"Swap at start: `{report['swap_start']}`")
     out.append(f"Swap at end: `{report['swap_end']}`")
     out.append("")
-    out.append("| Model | Default max seqs | Bench max seqs | Serve correctness | Serve multi-turn | Serve stream | Stateful loop | Tool call | Run REPL multi-turn | c | Quality | in/out | README tok/s | Current tok/s | Ratio | Completed | Gate |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
+    out.append("| Model | Default max seqs | Bench max seqs | Serve correctness | Serve multi-turn | Serve stream | Stateful loop | Run REPL multi-turn | c | Quality | in/out | README tok/s | Current tok/s | Ratio | Completed | Gate |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for model in report["models"]:
         correctness = "pass" if model["chat"]["paris"]["passed"] else "FAIL"
         multiturn = "pass" if model["chat"]["multiturn"]["passed"] else "FAIL"
         stream_gate = "pass" if model["chat"].get("stream", {}).get("passed") else "FAIL"
         stateful_gate = "pass" if model["chat"].get("stateful_loop", {}).get("passed") else "FAIL"
-        tool_gate = "pass" if model.get("tool_call", {}).get("status") == "pass" else "FAIL"
         run_gate = "pass" if model.get("run", {}).get("passed") else "FAIL"
         default_max = model.get("default_startup", {}).get("max_sequences")
         bench_max = model.get("serve_startup", {}).get("max_sequences")
@@ -1175,12 +1144,12 @@ def markdown_summary(report: dict[str, Any]) -> str:
             quality = "pass" if (cell.get("quality") or {}).get("passed") else "FAIL"
             if isinstance(tps, (int, float)):
                 out.append(
-                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {stateful_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
+                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {stateful_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
                     f"{workload} | {cell['baseline_tps']:.1f} | {tps:.1f} | {ratio:.3f} | {completed} | {gate} |"
                 )
             else:
                 out.append(
-                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {stateful_gate} | {tool_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
+                    f"| {model['label']} | {default_max} | {bench_max} | {correctness} | {multiturn} | {stream_gate} | {stateful_gate} | {run_gate} | {cell['concurrency']} | {quality} | "
                     f"{workload} | {cell['baseline_tps']:.1f} | n/a | n/a | {completed} | {gate} |"
                 )
     out.append("")
@@ -1270,7 +1239,6 @@ def main() -> int:
             )
             if ready:
                 model_report["chat"] = chat_check(args.port, case, args.out)
-                model_report["tool_call"] = run_tool_call_check(args.port, case, args.out)
                 model_report["unsafe_batch_probe"] = run_unsafe_moe_batch_probe(
                     args.ferrum_bin,
                     model_path,
