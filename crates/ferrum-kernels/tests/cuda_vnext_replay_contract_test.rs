@@ -459,6 +459,7 @@ fn causal_fallback_packs_prepare_and_attention_across_participants() {
         .contains("(long long)packed_token * query_heads + query_head"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("GROUPED_ATTENTION_FUNCTION"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("grouped_fallback_block_threads"));
+    assert!(CAUSAL_ATTENTION_SOURCE.contains("if packed.is_some()"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("packed.packed_token_grid"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("shape.key_value_heads"));
     assert!(CAUSAL_ATTENTION_KERNEL_SOURCE.contains("vnext_causal_attention_grouped_f16"));
