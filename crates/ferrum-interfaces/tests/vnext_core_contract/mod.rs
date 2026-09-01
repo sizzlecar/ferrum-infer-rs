@@ -1582,7 +1582,11 @@ impl ModelFamilyProvider for GraphFamily {
         })?;
         if !matches!(
             config.scenario.as_str(),
-            "alias" | "alias_late_consumer" | "state_chain" | "state_read_only"
+            "alias"
+                | "alias_late_consumer"
+                | "alias_terminal_intermediate"
+                | "state_chain"
+                | "state_read_only"
         ) {
             return Err(VNextError::InvalidModelConfig {
                 family_id: self.family_id().to_string(),
@@ -1663,6 +1667,24 @@ impl ModelFamilyProvider for GraphFamily {
                 Vec::new(),
                 id("value.late"),
             ),
+            "alias_terminal_intermediate" => {
+                let mut terminal =
+                    node("node.alias", "operation.graph.alias", "value.alias", false);
+                terminal.inputs[0] = id("value.intermediate");
+                (
+                    vec![
+                        node(
+                            "node.producer",
+                            "operation.graph.consume",
+                            "value.intermediate",
+                            false,
+                        ),
+                        terminal,
+                    ],
+                    Vec::new(),
+                    id("value.alias"),
+                )
+            }
             "state_chain" => (
                 vec![
                     node(
