@@ -9,9 +9,79 @@ const REPLAY_SOURCE: &str = include_str!("../src/backend/cuda/vnext_replay.rs");
 const LINEAR_ATTENTION_KERNEL_SOURCE: &str = include_str!("../kernels/linear_attention.cu");
 const GATED_DELTA_KERNEL_SOURCE: &str = include_str!("../kernels/gated_delta_rule.cu");
 const ARGMAX_KERNEL_SOURCE: &str = include_str!("../kernels/argmax_rows.cu");
+const FUSED_SILU_MUL_KERNEL_SOURCE: &str = include_str!("../kernels/fused_silu_mul.cu");
 const MOE_PROVIDER_SOURCE: &str = include_str!("../src/backend/cuda/vnext_ops/transformer/moe.rs");
 const MOE_ROUTER_KERNEL_SOURCE: &str = include_str!("../kernels/moe_router.cu");
 const BUILD_SCRIPT_SOURCE: &str = include_str!("../build.rs");
+
+#[test]
+fn gemma_simple_ops_are_registered_replayable_and_fail_closed() {
+    for capability in [
+        "DENSE_GEGLU_TANH_F16_CAPABILITY_ID",
+        "CONSTANT_SCALE_F16_CAPABILITY_ID",
+        "LOGIT_SOFTCAP_F16_CAPABILITY_ID",
+    ] {
+        assert!(VNEXT_OPS_SOURCE.contains(capability));
+    }
+    for contract in [
+        "dense_geglu_tanh_contract()",
+        "constant_scale_contract()",
+        "logit_softcap_contract()",
+    ] {
+        assert!(VNEXT_OPS_SOURCE.matches(contract).count() >= 1);
+    }
+    for provider in [
+        "CudaDenseGeGluTanhProvider::new(runtime)",
+        "CudaConstantScaleProvider::new(runtime)",
+        "CudaLogitSoftcapProvider::new(runtime)",
+    ] {
+        assert!(VNEXT_OPS_SOURCE.contains(provider));
+    }
+
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("fused_gelu_tanh_mul_f16("));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("const __half* __restrict__ gate"));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("const __half* __restrict__ up"));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("logit_softcap_inplace_f16("));
+    assert!(FUSED_SILU_MUL_KERNEL_SOURCE.contains("cap * tanhf(value / cap)"));
+    assert!(
+        TRANSFORMER_SOURCE.contains("dense GeGLU input {ordinal} has no physical weight layout")
+    );
+
+    let scale = TRANSFORMER_SOURCE
+        .split("fn encode_constant_scale(")
+        .nth(1)
+        .expect("constant-scale encoder")
+        .split("fn encode_logit_softcap(")
+        .next()
+        .expect("bounded constant-scale encoder");
+    assert!(scale.contains("same_physical_region(&input, &output)"));
+    assert!(scale.contains(".f32(scale)"));
+    assert!(scale.contains("replayable_operation("));
+
+    let softcap = TRANSFORMER_SOURCE
+        .split("fn encode_logit_softcap(")
+        .nth(1)
+        .expect("logit-softcap encoder")
+        .split("fn encode_residual_add(")
+        .next()
+        .expect("bounded logit-softcap encoder");
+    assert!(softcap.contains("same_physical_region(&input_region, &output_region)"));
+    assert!(softcap.contains(".f32(cap)"));
+    assert!(softcap.contains("for region in regions"));
+    assert!(softcap.contains("replayable_operation("));
+
+    let geglu = TRANSFORMER_SOURCE
+        .split("fn encode_dense_geglu_tanh(")
+        .nth(1)
+        .expect("dense GeGLU encoder")
+        .split("fn encode_constant_scale(")
+        .next()
+        .expect("bounded dense GeGLU encoder");
+    assert!(geglu.contains("dense_geglu_projection(&invocation)?"));
+    assert!(geglu.contains("launch_planar_gelu_tanh_mul("));
+    assert!(geglu.contains("replayable_operation_with_blas("));
+    assert!(!geglu.contains("fused_gelu_tanh_mul_interleaved_f16"));
+}
 
 #[test]
 fn vnext_masked_argmax_preserves_logits_and_binds_typed_scratch() {

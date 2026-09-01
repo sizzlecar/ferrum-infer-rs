@@ -19,6 +19,7 @@ use ferrum_types::{
 };
 use serde_json::Value;
 
+pub mod gemma4;
 pub mod gpt_oss;
 mod hf_metadata;
 pub mod qwen35;
@@ -46,6 +47,14 @@ struct ModelLoaderRegistration {
 }
 
 const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
+    ModelLoaderRegistration {
+        external_metadata_ids: &[gemma4::EXTERNAL_METADATA_ID],
+        gguf_architectures: &[],
+        execution_kind: ProductionExecutionKind::CausalLanguage,
+        validate_semantic_config: gemma4::validate_semantic_config,
+        prepare: gemma4::prepare_from_sources,
+        create_family_registration: gemma4::family_registration,
+    },
     ModelLoaderRegistration {
         external_metadata_ids: &[gpt_oss::EXTERNAL_METADATA_ID],
         gguf_architectures: &[],

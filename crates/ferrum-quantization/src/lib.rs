@@ -35,6 +35,7 @@ pub use block_fp8_safetensors_source::{
 };
 pub use compressed_tensors_marlin_source::{
     CompressedTensorsMarlinSafetensorsSource, COMPRESSED_TENSORS_MARLIN_INT4_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_INT4_SYMMETRIC_FORMAT_ID,
 };
 pub use dense::DenseLinear;
 pub use gguf::{GgufFile, GgufLinear, GgufLoader, GgufWeightComponentSource};

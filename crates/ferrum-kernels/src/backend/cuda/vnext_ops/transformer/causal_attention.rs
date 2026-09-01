@@ -19,7 +19,7 @@ use ferrum_interfaces::vnext::{
     ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
     ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
     ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
-    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
 };
 use ferrum_types::{AttentionExecutionPolicy, CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS};
 use sha2::{Digest, Sha256};
@@ -29,8 +29,13 @@ use super::{attach_invocation_binding, ensure_estimator_request, estimate, launc
 use super::{
     marlin_fp8_weights::resolve_marlin_fp8_weight,
     moe_weights::{
-        resolve_compressed_tensors_marlin_matrix_weight, resolve_gptq_marlin_matrix_weight,
-        COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        resolve_compressed_tensors_marlin_matrix_weight,
+        resolve_compressed_tensors_symmetric_marlin_matrix_weight,
+        resolve_gptq_marlin_matrix_weight, COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID,
+        COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        COMPRESSED_TENSORS_MARLIN_SYMMETRIC_CAPABILITY_ID,
+        COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID,
+        COMPRESSED_TENSORS_MARLIN_SYMMETRIC_WEIGHT_FORMAT_ID,
         COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID, GPTQ_MARLIN_CAPABILITY_ID,
         GPTQ_MARLIN_QUANTIZATION_FORMAT_ID, GPTQ_MARLIN_WEIGHT_FORMAT_ID,
     },
@@ -60,6 +65,8 @@ use crate::marlin_fp8_materializer::{
 
 const PROVIDER_ID: &str = "provider.cuda.causal_paged_attention.f16";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.causal_paged_attention.f16";
+const GEMMA4_PROVIDER_ID: &str = "provider.cuda.gemma4_causal_paged_attention.f16";
+const GEMMA4_ESTIMATOR_ID: &str = "resource-estimator.cuda.gemma4_causal_paged_attention.f16";
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str = "vnext_causal_prepare_f16";
 const ATTENTION_FUNCTION: &str = "vnext_causal_attention_f16";
@@ -83,7 +90,9 @@ const BINDING_CONTROL_WORDS: usize = 4;
 const BINDING_CONTROL_BYTES: u64 = (BINDING_CONTROL_WORDS * std::mem::size_of::<i32>()) as u64;
 const BINDING_SEQUENCE_LENGTH_OFFSET: u64 = 3 * std::mem::size_of::<i32>() as u64;
 const WARP_THREADS: u32 = 32;
-const MAXIMUM_HEAD_DIM: u64 = 256;
+const MAXIMUM_HEAD_DIM: u64 = 512;
+const MAXIMUM_STANDARD_HEAD_DIM: u64 = 256;
+const MAXIMUM_VARLEN_HEAD_DIM: u64 = 256;
 const VLLM_BLOCK_TOKENS: u64 = 16;
 const VLLM_PARTITION_TOKENS: u64 = CUDA_NATIVE_ADAPTIVE_V1_MAX_SEQUENCE_TOKENS;
 const VARLEN_DEFAULT_SHARED_LIMIT_BYTES: u64 = 48 * 1024;
@@ -96,8 +105,49 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     descriptor: OperationProviderDescriptor,
     functions: CausalAttentionFunctions,
     attention_policy: AttentionExecutionPolicy,
+    semantics: CausalAttentionSemantics,
     #[cfg(feature = "vllm-marlin")]
     projection_runtime: MarlinProjectionRuntime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CausalAttentionSemantics {
+    Standard,
+    Gemma4,
+}
+
+impl CausalAttentionSemantics {
+    const fn provider_id(self) -> &'static str {
+        match self {
+            Self::Standard => PROVIDER_ID,
+            Self::Gemma4 => GEMMA4_PROVIDER_ID,
+        }
+    }
+
+    const fn estimator_id(self) -> &'static str {
+        match self {
+            Self::Standard => ESTIMATOR_ID,
+            Self::Gemma4 => GEMMA4_ESTIMATOR_ID,
+        }
+    }
+
+    const fn input_count(self) -> u32 {
+        match self {
+            Self::Standard => 9,
+            Self::Gemma4 => 10,
+        }
+    }
+
+    const fn has_post_attention_norm(self) -> bool {
+        matches!(self, Self::Gemma4)
+    }
+
+    const fn fingerprint_tag(self) -> &'static [u8] {
+        match self {
+            Self::Standard => b"standard-causal-attention-v2",
+            Self::Gemma4 => b"gemma4-causal-attention-v1",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -123,8 +173,49 @@ impl CudaCausalPagedAttentionProvider {
             ));
         }
         let contract = causal_paged_attention_contract().map_err(contract_error)?;
-        let capability =
-            CapabilityId::new(CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID).map_err(contract_error)?;
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &contract,
+            CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+            CausalAttentionSemantics::Standard,
+        )
+    }
+
+    /// Builds the CUDA provider for Gemma 4's sandwich-normalized attention.
+    ///
+    /// The contract and capability are supplied by the registration layer so
+    /// this implementation module does not depend on a model-family module.
+    /// The expected Gemma contract keeps the standard inputs 0..=8 and adds
+    /// post-attention RMSNorm weight at input 9.
+    pub(in crate::backend::cuda::vnext_ops) fn new_gemma4(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+        contract: &dyn OperationContract,
+        capability_id: &str,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            contract,
+            capability_id,
+            CausalAttentionSemantics::Gemma4,
+        )
+    }
+
+    fn new_for_contract(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+        contract: &dyn OperationContract,
+        capability_id: &str,
+        semantics: CausalAttentionSemantics,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        if !attention_policy.is_resolved() {
+            return Err(CudaDeviceRuntimeError::contract(
+                "CUDA causal attention policy must be resolved before provider construction",
+            ));
+        }
+        let capability = CapabilityId::new(capability_id).map_err(contract_error)?;
         if !runtime.descriptor().capabilities.contains(&capability) {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA runtime does not advertise causal paged attention",
@@ -152,6 +243,7 @@ impl CudaCausalPagedAttentionProvider {
             MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID.as_bytes(),
             GPTQ_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
             COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
+            COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID.as_bytes(),
         ]);
         #[cfg(feature = "vllm-paged-attn-v2")]
         provider_sources.extend([
@@ -159,9 +251,13 @@ impl CudaCausalPagedAttentionProvider {
             crate::native_ops::CUDA_NATIVE_SOURCE_BUNDLE_ID.as_bytes(),
         ]);
         provider_sources.push(attention_policy.as_runtime_value().as_bytes());
+        provider_sources.push(semantics.fingerprint_tag());
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
-        let estimator_fingerprint =
-            implementation_fingerprint(&[source.as_bytes(), ESTIMATOR_ID.as_bytes()]);
+        let estimator_fingerprint = implementation_fingerprint(&[
+            source.as_bytes(),
+            semantics.estimator_id().as_bytes(),
+            semantics.fingerprint_tag(),
+        ]);
         let mut provider_capabilities = BTreeSet::from([capability]);
         let mut accepted_weight_formats =
             BTreeSet::from([
@@ -207,6 +303,19 @@ impl CudaCausalPagedAttentionProvider {
                 ));
             }
             provider_capabilities.insert(compressed_tensors_capability);
+            let compressed_tensors_symmetric_capability =
+                CapabilityId::new(COMPRESSED_TENSORS_MARLIN_SYMMETRIC_CAPABILITY_ID)
+                    .map_err(contract_error)?;
+            if !runtime
+                .descriptor()
+                .capabilities
+                .contains(&compressed_tensors_symmetric_capability)
+            {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "CUDA runtime does not advertise causal-attention symmetric compressed-tensors Marlin",
+                ));
+            }
+            provider_capabilities.insert(compressed_tensors_symmetric_capability);
             accepted_weight_formats
                 .insert(WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?);
             accepted_weight_formats.insert(
@@ -217,6 +326,10 @@ impl CudaCausalPagedAttentionProvider {
                 .insert(WeightFormatId::new(GPTQ_MARLIN_WEIGHT_FORMAT_ID).map_err(contract_error)?);
             accepted_weight_formats.insert(
                 WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
+                    .map_err(contract_error)?,
+            );
+            accepted_weight_formats.insert(
+                WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_SYMMETRIC_WEIGHT_FORMAT_ID)
                     .map_err(contract_error)?,
             );
             accepted_quantization_formats.insert(
@@ -235,9 +348,15 @@ impl CudaCausalPagedAttentionProvider {
                 QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
                     .map_err(contract_error)?,
             );
+            accepted_quantization_formats.insert(
+                QuantizationFormatId::new(
+                    COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID,
+                )
+                .map_err(contract_error)?,
+            );
         }
         let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(PROVIDER_ID).map_err(contract_error)?,
+            ProviderId::new(semantics.provider_id()).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -250,8 +369,8 @@ impl CudaCausalPagedAttentionProvider {
             provider_capabilities,
             accepted_weight_formats,
             accepted_quantization_formats,
-            storage_bindings().map_err(contract_error)?,
-            ESTIMATOR_ID,
+            storage_bindings(semantics).map_err(contract_error)?,
+            semantics.estimator_id(),
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )
@@ -325,6 +444,7 @@ impl CudaCausalPagedAttentionProvider {
             descriptor,
             functions,
             attention_policy,
+            semantics,
             #[cfg(feature = "vllm-marlin")]
             projection_runtime: MarlinProjectionRuntime::query(runtime)?,
         })
@@ -341,7 +461,9 @@ fn load_function(
         .map_err(|error| CudaDeviceRuntimeError::driver(operation, error))
 }
 
-fn storage_bindings() -> Result<Vec<ProviderStorageBindingRequirement>, VNextError> {
+fn storage_bindings(
+    semantics: CausalAttentionSemantics,
+) -> Result<Vec<ProviderStorageBindingRequirement>, VNextError> {
     let paged = DynamicStorageRequirement::new(vec![DynamicStorageProfile::new(
         DynamicStorageAllocator::FixedBlockArena {
             block_bytes: VNEXT_KV_PAGE_BYTES,
@@ -350,7 +472,7 @@ fn storage_bindings() -> Result<Vec<ProviderStorageBindingRequirement>, VNextErr
             block_bytes: VNEXT_KV_PAGE_BYTES,
         },
     )?])?;
-    Ok((0..9)
+    Ok((0..semantics.input_count())
         .map(|ordinal| {
             ProviderStorageBindingRequirement::new(
                 ResolvedValueRole::Input,
@@ -382,10 +504,10 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
         ensure_estimator_request(
             &self.descriptor,
             &request,
-            CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+            self.descriptor.operation_id().as_str(),
         )?;
-        let shape =
-            CausalAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
+        let shape = CausalAttentionShape::from_attributes_for(request.attributes(), self.semantics)
+            .map_err(invalid_plan)?;
         #[cfg(feature = "vllm-marlin")]
         let projection = CausalProjection::from_values(request.values(), self.projection_runtime)
             .map_err(invalid_plan)?;
@@ -432,7 +554,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         &self,
         request: ReusableExecutionTopologyRequest<'_>,
     ) -> Result<ReusableExecutionTopology, VNextError> {
-        let mut values = (0..8)
+        let mut values = (0..self.semantics.input_count())
+            .filter(|ordinal| *ordinal != 8)
             .map(|ordinal| {
                 ReusableExecutionValueAddress::captured(ResolvedValueRole::Input, ordinal)
             })
@@ -453,7 +576,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
-        reusable_attention_topology(&request, self.attention_policy).map_err(invalid_plan)
+        reusable_attention_topology(&request, self.attention_policy, self.semantics)
+            .map_err(invalid_plan)
     }
 
     fn encode_selected(
@@ -465,6 +589,8 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             &self.functions,
             self.descriptor.provider_implementation_fingerprint(),
             self.attention_policy,
+            self.semantics,
+            self.descriptor.operation_id().as_str(),
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
             invocation,
@@ -486,7 +612,12 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_reusable_attention_bindings(invocation).map_err(|message| {
+        encode_reusable_attention_bindings(
+            invocation,
+            self.semantics,
+            self.descriptor.operation_id().as_str(),
+        )
+        .map_err(|message| {
             OperationFailure::new(
                 identity,
                 ProfilePhase::Forward,
@@ -509,11 +640,17 @@ struct CausalAttentionShape {
     query_projection_features: u64,
     kv_features: u64,
     rope_dim: u64,
+    rope_frequency_denominator: u64,
     maximum_context_tokens: u64,
     epsilon: f32,
     rope_theta: f32,
+    attention_scale: f32,
+    sliding_window_tokens: u64,
     rope_interleaved: bool,
     output_gate: bool,
+    value_rms_norm: bool,
+    attention_k_eq_v: bool,
+    post_attention_norm: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -576,6 +713,14 @@ impl CausalAttentionKernelPath {
                     Err("causal attention received an unresolved auto policy".to_owned())
                 }
             };
+        }
+        // The addressed varlen kernels currently support arbitrary scale but
+        // only head dimensions through 256 and full-prefix attention. Gemma 4
+        // local layers and 512-wide full layers therefore stay on the generic
+        // addressed fallback; this also keeps them away from the vLLM decode
+        // kernels whose scale and head-size ABI are fixed.
+        if !shape.addressed_varlen_supported() {
+            return Ok(Self::VllmAddressedFallback);
         }
         let score_bytes = sequence_tokens
             .checked_mul(std::mem::size_of::<f32>() as u64)
@@ -721,11 +866,9 @@ impl CausalAttentionReplayTopology {
 fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
     attention_policy: AttentionExecutionPolicy,
+    semantics: CausalAttentionSemantics,
 ) -> Result<ReusableExecutionTopology, String> {
-    if request.operation_id().as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID {
-        return Err("CUDA causal topology received another operation".to_owned());
-    }
-    let shape = CausalAttentionShape::from_attributes(request.attributes())?;
+    let shape = CausalAttentionShape::from_attributes_for(request.attributes(), semantics)?;
     let ranges = request.work_shape().participant_token_ranges();
     if ranges.is_empty() {
         return Err("CUDA causal topology has no participant token ranges".to_owned());
@@ -813,20 +956,63 @@ where
 
 impl CausalAttentionShape {
     fn from_attributes(attributes: &BTreeMap<AttributeId, SemanticValue>) -> Result<Self, String> {
+        Self::from_attributes_for(attributes, CausalAttentionSemantics::Standard)
+    }
+
+    fn from_attributes_for(
+        attributes: &BTreeMap<AttributeId, SemanticValue>,
+        semantics: CausalAttentionSemantics,
+    ) -> Result<Self, String> {
+        let head_dim = unsigned_attribute(attributes, "head_dim")?;
+        let rope_dim = unsigned_attribute(attributes, "rope_dim")?;
+        let (
+            rope_frequency_denominator,
+            attention_scale,
+            sliding_window_tokens,
+            output_gate,
+            value_rms_norm,
+            attention_k_eq_v,
+            post_attention_norm,
+        ) = match semantics {
+            CausalAttentionSemantics::Standard => (
+                rope_dim,
+                1.0_f32 / (head_dim as f32).sqrt(),
+                0,
+                bool_attribute(attributes, "output_gate")?,
+                false,
+                false,
+                false,
+            ),
+            CausalAttentionSemantics::Gemma4 => (
+                unsigned_attribute(attributes, "rope_frequency_denominator")?,
+                rational_attribute(attributes, "attention_scale")?,
+                unsigned_attribute(attributes, "sliding_window_tokens")?,
+                false,
+                bool_attribute(attributes, "value_rms_norm")?,
+                bool_attribute(attributes, "attention_k_eq_v")?,
+                true,
+            ),
+        };
         let shape = Self {
             hidden_size: unsigned_attribute(attributes, "hidden_size")?,
             query_heads: unsigned_attribute(attributes, "query_heads")?,
             key_value_heads: unsigned_attribute(attributes, "key_value_heads")?,
-            head_dim: unsigned_attribute(attributes, "head_dim")?,
+            head_dim,
             query_features: unsigned_attribute(attributes, "query_features")?,
             query_projection_features: unsigned_attribute(attributes, "query_projection_features")?,
             kv_features: unsigned_attribute(attributes, "kv_features")?,
-            rope_dim: unsigned_attribute(attributes, "rope_dim")?,
+            rope_dim,
+            rope_frequency_denominator,
             maximum_context_tokens: unsigned_attribute(attributes, "maximum_context_tokens")?,
             epsilon: rational_attribute(attributes, "epsilon")?,
             rope_theta: rational_attribute(attributes, "rope_theta")?,
+            attention_scale,
+            sliding_window_tokens,
             rope_interleaved: bool_attribute(attributes, "rope_interleaved")?,
-            output_gate: bool_attribute(attributes, "output_gate")?,
+            output_gate,
+            value_rms_norm,
+            attention_k_eq_v,
+            post_attention_norm,
         };
         if !bool_attribute(attributes, "causal")? {
             return Err("causal attention requires causal=true".to_owned());
@@ -848,7 +1034,10 @@ impl CausalAttentionShape {
             || shape.key_value_heads == 0
             || shape.head_dim == 0
             || shape.rope_dim == 0
+            || shape.rope_frequency_denominator == 0
             || shape.maximum_context_tokens == 0
+            || !shape.attention_scale.is_finite()
+            || shape.attention_scale <= 0.0
         {
             return Err("causal attention dimensions and context must be non-zero".to_owned());
         }
@@ -856,10 +1045,18 @@ impl CausalAttentionShape {
             shape.maximum_context_tokens,
             "causal attention maximum context",
         )?;
+        let maximum_head_dim = match semantics {
+            CausalAttentionSemantics::Standard => MAXIMUM_STANDARD_HEAD_DIM,
+            CausalAttentionSemantics::Gemma4 => MAXIMUM_HEAD_DIM,
+        };
         if shape.query_heads % shape.key_value_heads != 0
-            || shape.head_dim > MAXIMUM_HEAD_DIM
+            || shape.head_dim > maximum_head_dim
             || shape.rope_dim > shape.head_dim
             || shape.rope_dim % 2 != 0
+            || shape.rope_frequency_denominator < shape.rope_dim
+            || shape.rope_frequency_denominator > shape.head_dim
+            || shape.rope_frequency_denominator % 2 != 0
+            || shape.sliding_window_tokens > shape.maximum_context_tokens
             || shape.query_features != query_features
             || shape.kv_features != kv_features
             || shape.query_projection_features != query_projection_features
@@ -1008,7 +1205,14 @@ impl CausalAttentionShape {
     fn tiled_vllm_supported(self) -> Result<bool, String> {
         Ok(cfg!(feature = "vllm-paged-attn-v2")
             && matches!(self.kv_layout()?, CausalKvLayout::VllmBlocks16 { .. })
-            && matches!(self.head_dim, 128 | 256))
+            && matches!(self.head_dim, 128 | 256)
+            && self.sliding_window_tokens == 0
+            && self.attention_scale.to_bits()
+                == (1.0_f32 / (self.head_dim as f32).sqrt()).to_bits())
+    }
+
+    fn addressed_varlen_supported(self) -> bool {
+        self.head_dim <= MAXIMUM_VARLEN_HEAD_DIM && self.sliding_window_tokens == 0
     }
 
     fn cuda_shape(self) -> Result<CudaCausalAttentionShape, String> {
@@ -1024,10 +1228,20 @@ impl CausalAttentionShape {
             )?,
             kv_features: checked_i32(self.kv_features, "causal attention KV width")?,
             rope_dim: checked_i32(self.rope_dim, "causal attention RoPE width")?,
+            rope_frequency_denominator: checked_i32(
+                self.rope_frequency_denominator,
+                "causal attention RoPE frequency denominator",
+            )?,
             epsilon: self.epsilon,
             rope_theta: self.rope_theta,
+            attention_scale: self.attention_scale,
+            sliding_window_tokens: checked_i32(
+                self.sliding_window_tokens,
+                "causal attention sliding window",
+            )?,
             rope_interleaved: i32::from(self.rope_interleaved),
             output_gate: i32::from(self.output_gate),
+            value_rms_norm: i32::from(self.value_rms_norm),
         })
     }
 }
@@ -1042,10 +1256,14 @@ struct CudaCausalAttentionShape {
     query_projection_features: i32,
     kv_features: i32,
     rope_dim: i32,
+    rope_frequency_denominator: i32,
     epsilon: f32,
     rope_theta: f32,
+    attention_scale: f32,
+    sliding_window_tokens: i32,
     rope_interleaved: i32,
     output_gate: i32,
+    value_rms_norm: i32,
 }
 
 #[cfg(feature = "vllm-marlin")]
@@ -1055,6 +1273,7 @@ enum CausalProjectionWeightAbi {
     MarlinFp8,
     GptqMarlinInt4,
     CompressedTensorsMarlinInt4,
+    CompressedTensorsMarlinSymmetricInt4,
 }
 
 #[cfg(feature = "vllm-marlin")]
@@ -1075,6 +1294,9 @@ fn causal_projection_weight_abi(
         GPTQ_MARLIN_QUANTIZATION_FORMAT_ID => Ok(CausalProjectionWeightAbi::GptqMarlinInt4),
         COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID => {
             Ok(CausalProjectionWeightAbi::CompressedTensorsMarlinInt4)
+        }
+        COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID => {
+            Ok(CausalProjectionWeightAbi::CompressedTensorsMarlinSymmetricInt4)
         }
         unknown => Err(format!(
             "causal attention projection quantization format `{unknown}` is not admitted"
@@ -1101,7 +1323,8 @@ fn causal_projection_abi(
             CausalProjectionWeightAbi::F16 => {}
             CausalProjectionWeightAbi::MarlinFp8 => uses_fp8 = true,
             CausalProjectionWeightAbi::GptqMarlinInt4
-            | CausalProjectionWeightAbi::CompressedTensorsMarlinInt4 => uses_int4 = true,
+            | CausalProjectionWeightAbi::CompressedTensorsMarlinInt4
+            | CausalProjectionWeightAbi::CompressedTensorsMarlinSymmetricInt4 => uses_int4 = true,
         }
     }
     if uses_fp8 && uses_int4 {
@@ -1333,6 +1556,7 @@ struct SharedRegions {
     output_weight: SharedProjectionWeight,
     query_norm: usize,
     key_norm: usize,
+    post_attention_norm: Option<usize>,
     scratch: usize,
     binding: usize,
 }
@@ -1423,23 +1647,24 @@ fn encode_attention(
     functions: &CausalAttentionFunctions,
     provider_fingerprint: &str,
     attention_policy: AttentionExecutionPolicy,
+    semantics: CausalAttentionSemantics,
+    operation_id: &str,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
-    if invocation.participants().is_empty()
-        || invocation.operation().id.as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID
-    {
+    if invocation.participants().is_empty() || invocation.operation().id.as_str() != operation_id {
         return Err("CUDA causal attention received another or empty operation".to_owned());
     }
     let first = &invocation.participants()[0];
-    let shape = CausalAttentionShape::from_attributes(first.attributes())?;
+    let shape = CausalAttentionShape::from_attributes_for(first.attributes(), semantics)?;
     #[cfg(feature = "vllm-marlin")]
     let projection = CausalProjection::from_values(first.bindings(), projection_runtime)?;
     #[cfg(not(feature = "vllm-marlin"))]
     let projection = CausalProjection::F16;
-    validate_signature(first, shape)?;
+    validate_signature(first, shape, semantics)?;
     for participant in &invocation.participants()[1..] {
-        if CausalAttentionShape::from_attributes(participant.attributes())? != shape {
+        if CausalAttentionShape::from_attributes_for(participant.attributes(), semantics)? != shape
+        {
             return Err("CUDA causal attention participant attributes disagree".to_owned());
         }
         #[cfg(feature = "vllm-marlin")]
@@ -1450,7 +1675,7 @@ fn encode_attention(
                 "CUDA causal attention participants use different projection ABIs".to_owned(),
             );
         }
-        validate_signature(participant, shape)?;
+        validate_signature(participant, shape, semantics)?;
     }
     let program_binding = invocation.program_binding().cloned();
 
@@ -1494,6 +1719,10 @@ fn encode_attention(
         )?,
         query_norm: push_shared_weight(&mut compute_regions, &invocation, 6)?,
         key_norm: push_shared_weight(&mut compute_regions, &invocation, 7)?,
+        post_attention_norm: semantics
+            .has_post_attention_norm()
+            .then(|| push_shared_weight(&mut compute_regions, &invocation, 9))
+            .transpose()?,
         scratch: {
             let index = compute_regions.len();
             compute_regions.push(super::shared_scratch_region(
@@ -1750,6 +1979,7 @@ fn encode_attention(
     let compute_dispatch_count = physical_dispatch_count(
         launches.iter().map(|launch| launch.path),
         shape.output_gate,
+        shape.post_attention_norm,
         packed_enabled,
     );
     let replay_key = launches
@@ -1773,11 +2003,17 @@ fn encode_attention(
                 .u64(shape.query_projection_features)
                 .u64(shape.kv_features)
                 .u64(shape.rope_dim)
+                .u64(shape.rope_frequency_denominator)
                 .u64(shape.maximum_context_tokens)
                 .f32(shape.epsilon)
                 .f32(shape.rope_theta)
+                .f32(shape.attention_scale)
+                .u64(shape.sliding_window_tokens)
                 .boolean(shape.rope_interleaved)
                 .boolean(shape.output_gate)
+                .boolean(shape.value_rms_norm)
+                .boolean(shape.attention_k_eq_v)
+                .boolean(shape.post_attention_norm)
                 .u64(total_tokens)
                 .boolean(packed_enabled)
                 .u64(
@@ -1888,17 +2124,24 @@ fn encode_attention(
 fn physical_dispatch_count(
     paths: impl IntoIterator<Item = CausalAttentionKernelPath>,
     output_gate: bool,
+    post_attention_norm: bool,
     packed: bool,
 ) -> u64 {
-    paths
-        .into_iter()
-        .fold(if packed { 6 } else { 0 }, |total, path| {
+    paths.into_iter().fold(
+        if packed {
+            6 + u64::from(post_attention_norm)
+        } else {
+            0
+        },
+        |total, path| {
             total.saturating_add(
                 (if packed { 1 } else { 7 })
                     + path.attention_dispatch_count()
-                    + u64::from(output_gate),
+                    + u64::from(output_gate)
+                    + u64::from(post_attention_norm && !packed),
             )
-        })
+        },
+    )
 }
 
 fn validate_packed_token_ranges(
@@ -1924,16 +2167,19 @@ fn validate_packed_token_ranges(
 
 fn encode_reusable_attention_bindings(
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    semantics: CausalAttentionSemantics,
+    operation_id: &str,
 ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, String> {
-    if invocation.participants().is_empty()
-        || invocation.operation().id.as_str() != CAUSAL_PAGED_ATTENTION_OPERATION_ID
-    {
+    if invocation.participants().is_empty() || invocation.operation().id.as_str() != operation_id {
         return Err("CUDA causal attention received another or empty operation".to_owned());
     }
     let program_binding = invocation.program_binding().cloned().ok_or_else(|| {
         "CUDA causal direct execution requires a compiled program binding".to_owned()
     })?;
-    let shape = CausalAttentionShape::from_attributes(invocation.participants()[0].attributes())?;
+    let shape = CausalAttentionShape::from_attributes_for(
+        invocation.participants()[0].attributes(),
+        semantics,
+    )?;
     let total_tokens = invocation.work_shape().immediate_tokens();
     let participant_count = u32::try_from(invocation.participants().len())
         .map_err(|_| "CUDA causal attention participant count exceeds u32".to_owned())?;
@@ -2221,6 +2467,26 @@ fn enqueue_packed_attention(
         cuda.query_features,
         "packed causal attention output GEMM",
     )?;
+    let residual_branch = if logical.post_attention_norm {
+        let norm_region = shared.post_attention_norm.ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "packed Gemma4 causal attention lacks post-attention RMSNorm weight",
+            )
+        })?;
+        launch_rms_norm(
+            stream,
+            &functions.rms_norm,
+            projected,
+            regions[norm_region].device_ptr(),
+            normalized,
+            packed.tokens,
+            cuda.hidden_size,
+            cuda.epsilon,
+        )?;
+        normalized
+    } else {
+        projected
+    };
     let elements = packed
         .tokens
         .checked_mul(logical.hidden_size)
@@ -2230,7 +2496,7 @@ fn enqueue_packed_attention(
         &functions.residual_add,
         &functions.residual_add_inplace,
         input,
-        projected,
+        residual_branch,
         output,
         elements,
     )
@@ -2371,6 +2637,26 @@ fn enqueue_attention(
         cuda.query_features,
         "causal attention output GEMM",
     )?;
+    let residual_branch = if logical.post_attention_norm {
+        let norm_region = shared.post_attention_norm.ok_or_else(|| {
+            CudaDeviceRuntimeError::contract(
+                "Gemma4 causal attention lacks post-attention RMSNorm weight",
+            )
+        })?;
+        launch_rms_norm(
+            stream,
+            &functions.rms_norm,
+            projected,
+            regions[norm_region].device_ptr(),
+            normalized,
+            launch.tokens,
+            cuda.hidden_size,
+            cuda.epsilon,
+        )?;
+        normalized
+    } else {
+        projected
+    };
     let elements = launch
         .tokens
         .checked_mul(logical.hidden_size)
@@ -2380,7 +2666,7 @@ fn enqueue_attention(
         &functions.residual_add,
         &functions.residual_add_inplace,
         input,
-        projected,
+        residual_branch,
         output,
         elements,
     )
@@ -2514,6 +2800,7 @@ fn launch_prepare(
         shape.key_value_heads,
         shape.head_dim,
         shape.rope_dim,
+        shape.rope_frequency_denominator,
         shape.query_projection_features,
         query_head_stride,
         shape.kv_features,
@@ -2524,6 +2811,7 @@ fn launch_prepare(
     builder.arg(&shape.epsilon);
     builder.arg(&shape.rope_theta);
     builder.arg(&shape.rope_interleaved);
+    builder.arg(&shape.value_rms_norm);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (
@@ -2676,7 +2964,12 @@ fn launch_addressed_varlen_attention(
     shape: CudaCausalAttentionShape,
     tiled: bool,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    let scale = 1.0_f32 / (shape.head_dim as f32).sqrt();
+    if shape.sliding_window_tokens != 0 {
+        return Err(CudaDeviceRuntimeError::contract(
+            "addressed varlen attention does not admit a sliding window",
+        ));
+    }
+    let scale = shape.attention_scale;
     let score_rows = if tiled { VARLEN_TILED_QUERY_TOKENS } else { 1 };
     let shared_mem_bytes = launch
         .sequence_tokens
@@ -2801,6 +3094,8 @@ fn launch_fallback_attention(
     for dimension in &dimensions {
         builder.arg(dimension);
     }
+    builder.arg(&shape.attention_scale);
+    builder.arg(&shape.sliding_window_tokens);
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (
@@ -3040,6 +3335,7 @@ fn binding_addresses(
 fn validate_signature(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     shape: CausalAttentionShape,
+    semantics: CausalAttentionSemantics,
 ) -> Result<(), String> {
     let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
@@ -3047,7 +3343,7 @@ fn validate_signature(
     let [tokens, hidden_width] = hidden.tensor().dimensions() else {
         return Err("causal attention hidden input is not two-dimensional".to_owned());
     };
-    let expected = [
+    let mut expected = vec![
         (value(1)?, vec![shape.hidden_size]),
         (
             value(2)?,
@@ -3060,6 +3356,15 @@ fn validate_signature(
         (value(7)?, vec![shape.head_dim]),
         (value(8)?, vec![2, shape.key_value_heads, shape.head_dim]),
     ];
+    if semantics.has_post_attention_norm() {
+        expected.push((value(9)?, vec![shape.hidden_size]));
+    }
+    if shape.attention_k_eq_v && value(3)?.value_id() != value(4)?.value_id() {
+        return Err(
+            "causal attention attention_k_eq_v=true requires K and V to bind one typed value"
+                .to_owned(),
+        );
+    }
     if *tokens == 0
         || *hidden_width != shape.hidden_size
         || output.tensor().dimensions() != [*tokens, shape.hidden_size]
@@ -3197,6 +3502,60 @@ fn push_shared_projection_weight(
                 zero_points_region: Some(zero_points_region),
                 group_size,
                 weight_type: MarlinF16WeightType::U4,
+            });
+        }
+        if weight_abi == CausalProjectionWeightAbi::CompressedTensorsMarlinSymmetricInt4 {
+            let first = resolve_compressed_tensors_symmetric_marlin_matrix_weight(
+                first_participant,
+                first_binding,
+                logical_dimensions,
+            )?;
+            if first.logical_dimensions() != logical_dimensions
+                || first.logical_dimensions()
+                    != [*expected_output_features, *expected_input_features]
+            {
+                return Err(format!(
+                    "causal attention projection input {ordinal} resolved inconsistent symmetric compressed-tensors dimensions"
+                ));
+            }
+            for participant in &invocation.participants()[1..] {
+                let candidate = resolve_compressed_tensors_symmetric_marlin_matrix_weight(
+                    participant,
+                    binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?,
+                    logical_dimensions,
+                )?;
+                if candidate.logical_dimensions() != first.logical_dimensions()
+                    || candidate.packed_physical_dimensions() != first.packed_physical_dimensions()
+                    || candidate.scales_physical_dimensions() != first.scales_physical_dimensions()
+                    || candidate.group_size() != first.group_size()
+                    || !super::same_physical_region(
+                        first.packed_region(),
+                        candidate.packed_region(),
+                    )
+                    || !super::same_physical_region(
+                        first.scales_region(),
+                        candidate.scales_region(),
+                    )
+                {
+                    return Err(format!(
+                        "causal attention projection input {ordinal} is not one shared symmetric compressed-tensors Marlin matrix"
+                    ));
+                }
+            }
+            let group_size = i32::try_from(first.group_size()).map_err(|_| {
+                format!("causal attention projection input {ordinal} group size exceeds i32")
+            })?;
+            let [packed, scales] = first.into_regions();
+            let packed_region = regions.len();
+            regions.push(packed);
+            let scales_region = regions.len();
+            regions.push(scales);
+            return Ok(SharedProjectionWeight::Marlin {
+                packed_region,
+                scales_region,
+                zero_points_region: None,
+                group_size,
+                weight_type: MarlinF16WeightType::U4B8,
             });
         }
         if weight_abi == CausalProjectionWeightAbi::GptqMarlinInt4 {
@@ -3474,6 +3833,94 @@ mod tests {
         ])
     }
 
+    fn gemma4_attributes(full_attention: bool) -> BTreeMap<AttributeId, SemanticValue> {
+        let (key_value_heads, head_dim, rope_dim, rope_denominator, rope_theta, window, k_eq_v) =
+            if full_attention {
+                (1, 512, 128, 512, 1_000_000, 0, true)
+            } else {
+                (8, 256, 256, 256, 10_000, 1_024, false)
+            };
+        let query_heads = 16;
+        BTreeMap::from([
+            (
+                AttributeId::new("hidden_size").unwrap(),
+                SemanticValue::Unsigned(3_840),
+            ),
+            (
+                AttributeId::new("query_heads").unwrap(),
+                SemanticValue::Unsigned(query_heads),
+            ),
+            (
+                AttributeId::new("key_value_heads").unwrap(),
+                SemanticValue::Unsigned(key_value_heads),
+            ),
+            (
+                AttributeId::new("head_dim").unwrap(),
+                SemanticValue::Unsigned(head_dim),
+            ),
+            (
+                AttributeId::new("query_features").unwrap(),
+                SemanticValue::Unsigned(query_heads * head_dim),
+            ),
+            (
+                AttributeId::new("query_projection_features").unwrap(),
+                SemanticValue::Unsigned(query_heads * head_dim),
+            ),
+            (
+                AttributeId::new("kv_features").unwrap(),
+                SemanticValue::Unsigned(key_value_heads * head_dim),
+            ),
+            (
+                AttributeId::new("rope_dim").unwrap(),
+                SemanticValue::Unsigned(rope_dim),
+            ),
+            (
+                AttributeId::new("rope_frequency_denominator").unwrap(),
+                SemanticValue::Unsigned(rope_denominator),
+            ),
+            (
+                AttributeId::new("maximum_context_tokens").unwrap(),
+                SemanticValue::Unsigned(262_144),
+            ),
+            (
+                AttributeId::new("epsilon").unwrap(),
+                SemanticValue::Rational(CanonicalRational::new(1, 1_000_000).unwrap()),
+            ),
+            (
+                AttributeId::new("rope_theta").unwrap(),
+                SemanticValue::Rational(CanonicalRational::new(rope_theta, 1).unwrap()),
+            ),
+            (
+                AttributeId::new("attention_scale").unwrap(),
+                SemanticValue::Rational(CanonicalRational::new(1, 1).unwrap()),
+            ),
+            (
+                AttributeId::new("sliding_window_tokens").unwrap(),
+                SemanticValue::Unsigned(window),
+            ),
+            (
+                AttributeId::new("rope_interleaved").unwrap(),
+                SemanticValue::Bool(false),
+            ),
+            (
+                AttributeId::new("value_rms_norm").unwrap(),
+                SemanticValue::Bool(true),
+            ),
+            (
+                AttributeId::new("attention_k_eq_v").unwrap(),
+                SemanticValue::Bool(k_eq_v),
+            ),
+            (
+                AttributeId::new("causal").unwrap(),
+                SemanticValue::Bool(true),
+            ),
+            (
+                AttributeId::new("layer_index").unwrap(),
+                SemanticValue::Unsigned(0),
+            ),
+        ])
+    }
+
     fn goal_shape(
         query_heads: u64,
         key_value_heads: u64,
@@ -3491,11 +3938,17 @@ mod tests {
             query_projection_features: query_features,
             kv_features,
             rope_dim: head_dim,
+            rope_frequency_denominator: head_dim,
             maximum_context_tokens,
             epsilon: 1e-6,
             rope_theta: 10_000.0,
+            attention_scale: 1.0_f32 / (head_dim as f32).sqrt(),
+            sliding_window_tokens: 0,
             rope_interleaved: false,
             output_gate: false,
+            value_rms_norm: false,
+            attention_k_eq_v: false,
+            post_attention_norm: false,
         }
     }
 
@@ -3543,6 +3996,10 @@ mod tests {
                 COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
                 CausalProjectionWeightAbi::CompressedTensorsMarlinInt4,
             ),
+            (
+                COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID,
+                CausalProjectionWeightAbi::CompressedTensorsMarlinSymmetricInt4,
+            ),
         ] {
             assert_eq!(
                 causal_projection_weight_abi(&quantization_formats(&[format])).unwrap(),
@@ -3583,7 +4040,7 @@ mod tests {
         assert_eq!(
             causal_projection_abi([
                 CausalProjectionWeightAbi::GptqMarlinInt4,
-                CausalProjectionWeightAbi::CompressedTensorsMarlinInt4,
+                CausalProjectionWeightAbi::CompressedTensorsMarlinSymmetricInt4,
                 CausalProjectionWeightAbi::F16,
                 CausalProjectionWeightAbi::F16,
             ])
@@ -3756,13 +4213,15 @@ mod tests {
         let v1 = CausalAttentionKernelPath::VllmAddressedDecodeV1;
         let v2 = CausalAttentionKernelPath::VllmAddressedDecodeV2;
 
-        assert_eq!(physical_dispatch_count([v1], false, false), 8);
-        assert_eq!(physical_dispatch_count([v1; 4], false, false), 32);
-        assert_eq!(physical_dispatch_count([v1; 4], false, true), 14);
-        assert_eq!(physical_dispatch_count([v2; 4], true, false), 40);
-        assert_eq!(physical_dispatch_count([v2; 4], true, true), 22);
-        assert_eq!(physical_dispatch_count([v1; 32], true, true), 102);
-        assert_eq!(physical_dispatch_count([v2; 32], true, true), 134);
+        assert_eq!(physical_dispatch_count([v1], false, false, false), 8);
+        assert_eq!(physical_dispatch_count([v1; 4], false, false, false), 32);
+        assert_eq!(physical_dispatch_count([v1; 4], false, false, true), 14);
+        assert_eq!(physical_dispatch_count([v2; 4], true, false, false), 40);
+        assert_eq!(physical_dispatch_count([v2; 4], true, false, true), 22);
+        assert_eq!(physical_dispatch_count([v1; 32], true, false, true), 102);
+        assert_eq!(physical_dispatch_count([v2; 32], true, false, true), 134);
+        assert_eq!(physical_dispatch_count([v1], false, true, false), 9);
+        assert_eq!(physical_dispatch_count([v1; 4], false, true, true), 15);
     }
 
     #[test]
@@ -4123,5 +4582,115 @@ mod tests {
         assert_eq!(v2.operation(), COMPUTE_VLLM_DECODE_V2_OPERATION);
         assert_eq!(v1.native_kernel_id(), "vllm.paged_attention_v1.addressed");
         assert_eq!(v2.native_kernel_id(), "vllm.paged_attention_v2.addressed");
+    }
+
+    #[test]
+    fn gemma4_local_and_full_attention_are_typed_and_avoid_incompatible_native_paths() {
+        let local = CausalAttentionShape::from_attributes_for(
+            &gemma4_attributes(false),
+            CausalAttentionSemantics::Gemma4,
+        )
+        .unwrap();
+        assert_eq!(local.head_dim, 256);
+        assert_eq!(local.rope_dim, 256);
+        assert_eq!(local.rope_frequency_denominator, 256);
+        assert_eq!(local.attention_scale, 1.0);
+        assert_eq!(local.sliding_window_tokens, 1_024);
+        assert!(local.value_rms_norm);
+        assert!(local.post_attention_norm);
+        assert_eq!(local.kv_layout().unwrap(), CausalKvLayout::TokenMajorPages);
+        assert_eq!(
+            CausalAttentionKernelPath::select(
+                AttentionExecutionPolicy::NativeAdaptive,
+                local,
+                8,
+                2_048,
+            )
+            .unwrap(),
+            CausalAttentionKernelPath::TokenMajorFallback
+        );
+
+        let full = CausalAttentionShape::from_attributes_for(
+            &gemma4_attributes(true),
+            CausalAttentionSemantics::Gemma4,
+        )
+        .unwrap();
+        assert_eq!(full.head_dim, 512);
+        assert_eq!(full.rope_dim, 128);
+        assert_eq!(full.rope_frequency_denominator, 512);
+        assert!(full.attention_k_eq_v);
+        assert!(matches!(
+            full.kv_layout().unwrap(),
+            CausalKvLayout::VllmBlocks16 { .. }
+        ));
+        for active_tokens in [1, 8] {
+            assert_eq!(
+                CausalAttentionKernelPath::select(
+                    AttentionExecutionPolicy::NativeAdaptive,
+                    full,
+                    active_tokens,
+                    2_048,
+                )
+                .unwrap(),
+                CausalAttentionKernelPath::VllmAddressedFallback
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4_attention_rejects_missing_or_inconsistent_semantic_attributes() {
+        let mut missing_denominator = gemma4_attributes(true);
+        missing_denominator.remove(&AttributeId::new("rope_frequency_denominator").unwrap());
+        assert!(CausalAttentionShape::from_attributes_for(
+            &missing_denominator,
+            CausalAttentionSemantics::Gemma4,
+        )
+        .is_err());
+
+        let mut denominator_exceeds_head = gemma4_attributes(true);
+        denominator_exceeds_head.insert(
+            AttributeId::new("rope_frequency_denominator").unwrap(),
+            SemanticValue::Unsigned(1_024),
+        );
+        assert!(CausalAttentionShape::from_attributes_for(
+            &denominator_exceeds_head,
+            CausalAttentionSemantics::Gemma4,
+        )
+        .is_err());
+
+        let mut denominator_shorter_than_rope = gemma4_attributes(true);
+        denominator_shorter_than_rope.insert(
+            AttributeId::new("rope_frequency_denominator").unwrap(),
+            SemanticValue::Unsigned(64),
+        );
+        assert!(CausalAttentionShape::from_attributes_for(
+            &denominator_shorter_than_rope,
+            CausalAttentionSemantics::Gemma4,
+        )
+        .is_err());
+
+        let mut oversized_window = gemma4_attributes(false);
+        oversized_window.insert(
+            AttributeId::new("sliding_window_tokens").unwrap(),
+            SemanticValue::Unsigned(262_145),
+        );
+        assert!(CausalAttentionShape::from_attributes_for(
+            &oversized_window,
+            CausalAttentionSemantics::Gemma4,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn gemma4_cuda_source_carries_frequency_vnorm_window_and_512_fallback_contracts() {
+        let source = include_str!("../../../../../kernels/vnext_causal_attention.cu");
+        assert!(source.contains("#define VNEXT_MAX_HEAD_CHUNKS 16"));
+        assert!(source.contains("rope_frequency_denominator"));
+        assert!(source.contains("value_rms_norm"));
+        assert!(source.contains("absolute_position - sliding_window + 1"));
+        assert!(source.contains("const float attention_scale"));
+        assert!(source.contains("const int neox_half = head_dim / 2"));
+        assert!(source.contains("const int high = pair + neox_half"));
+        assert!(source.contains("dim < neox_half + half_rope"));
     }
 }
