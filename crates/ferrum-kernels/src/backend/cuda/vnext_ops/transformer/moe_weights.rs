@@ -1545,8 +1545,10 @@ mod tests {
     fn validate_symmetric_compressed_tensors(
         schema: &WeightSchema,
     ) -> Result<MarlinMoeWeightMetadata, String> {
+        let resolved = ResolvedWeightBinding::from_schema(schema, &schema.tensors[0].id)
+            .map_err(|error| error.to_string())?;
         validate_compressed_tensors_symmetric_marlin_contract(
-            &resolved(schema),
+            &resolved,
             &schema.tensors[0].dimensions,
             schema.tensors[0].logical_element_type,
             &schema.tensors[0].dimensions,
@@ -1694,7 +1696,8 @@ mod tests {
         let mut wrong_scales = valid_symmetric_compressed_tensors_matrix_schema();
         wrong_scales.components[1].dimensions = vec![64, 2];
         let error = validate_symmetric_compressed_tensors(&wrong_scales).unwrap_err();
-        assert!(error.contains("scales physical shape"), "{error}");
+        assert!(error.contains("component.a_scales"), "{error}");
+        assert!(error.contains("contiguous shape"), "{error}");
 
         let mut zero_point = valid_symmetric_compressed_tensors_matrix_schema();
         let zero_points_id = id("component.symmetric.zero_points");
