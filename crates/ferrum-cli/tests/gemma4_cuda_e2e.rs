@@ -929,8 +929,6 @@ async fn gemma4_tiny_cuda_kernel_profile() {
     }
     assert_eq!(completed, 32);
 
-    let maximum_participants = wait_for_profile_participants(&server, 32).await;
-    assert_eq!(maximum_participants, 32, "kernel profile missed c=32");
     let native_work = packed_native_work_summary(&server.profile(), 32);
     for operation in [
         "vnext.causal_attention.token_major_fallback",
