@@ -56,19 +56,21 @@ pub async fn execute(cmd: DoctorCommand, config: CliConfig) -> Result<()> {
         println!("No model was downloaded and no inference engine was started.");
         println!();
         println!("Next:");
-        println!("  ferrum run {model}");
-        println!("  ferrum serve --model {model} --served-model-name ferrum --port 8000");
+        println!("  ferrum run {model} --disable-thinking");
+        println!(
+            "  ferrum serve --model {model} --served-model-name ferrum --disable-thinking --port 8000"
+        );
     } else {
         println!("Recommended first model:");
         if cfg!(feature = "metal") {
             println!(
-                "  Metal: ferrum run {}",
+                "  Metal: ferrum run {} --disable-thinking",
                 crate::source_resolver::METAL_FIRST_SUCCESS_MODEL
             );
         }
         if cfg!(feature = "cuda") {
             println!(
-                "  CUDA:  ferrum run {}",
+                "  CUDA:  ferrum run {} --disable-thinking",
                 crate::source_resolver::CUDA_FIRST_SUCCESS_MODEL
             );
         }

@@ -18,7 +18,7 @@ use std::process;
 #[command(about = "Ferrum - Fast LLM Inference Engine")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(
-    long_about = "A high-performance LLM inference engine with Metal/CUDA acceleration.\n\nExamples:\n  ferrum doctor                                      # Inspect this binary\n  ferrum run qwen3.5:4b-q4_k_m                      # Metal chat\n  ferrum run qwen3.5:4b                             # CUDA chat\n  ferrum serve --model qwen3.5:4b --port 8000       # OpenAI-compatible server\n  ferrum list                                        # Show downloaded models"
+    long_about = "A high-performance LLM inference engine with Metal/CUDA acceleration.\n\nExamples:\n  ferrum doctor                                                   # Inspect this binary\n  ferrum run qwen3.5:4b-q4_k_m --disable-thinking                # Metal chat\n  ferrum run qwen3.5:4b --disable-thinking                       # CUDA chat\n  ferrum serve --model qwen3.5:4b --disable-thinking --port 8000 # OpenAI-compatible server\n  ferrum list                                                     # Show downloaded models"
 )]
 struct Cli {
     #[command(subcommand)]
