@@ -3202,21 +3202,27 @@ fn launch_fallback_attention(
     kv_layout: i32,
     packed: Option<PackedFallbackLaunch>,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    if let Some(block_threads) = grouped_fallback_block_threads(shape) {
-        return launch_grouped_fallback_attention(
-            stream,
-            &functions.grouped_attention,
-            query,
-            query_raw,
-            control,
-            page_table,
-            output,
-            launch,
-            shape,
-            kv_layout,
-            packed,
-            block_threads,
-        );
+    // A scalar launch already exposes its Q heads as independent blocks and
+    // has no cross-request dispatch overhead to amortize. Keep that latency
+    // path unchanged; group Q heads only when multiple packed participants can
+    // fill the wider KV-head grid and reuse each loaded K/V tile.
+    if packed.is_some() {
+        if let Some(block_threads) = grouped_fallback_block_threads(shape) {
+            return launch_grouped_fallback_attention(
+                stream,
+                &functions.grouped_attention,
+                query,
+                query_raw,
+                control,
+                page_table,
+                output,
+                launch,
+                shape,
+                kv_layout,
+                packed,
+                block_threads,
+            );
+        }
     }
 
     let page_elements = checked_i32_runtime(
