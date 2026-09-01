@@ -121,6 +121,16 @@ enum GraphAliasStorage {
     ExactWrongInput,
 }
 
+fn graph_activation_resource(value_id: &ProgramValueId) -> String {
+    format!(
+        "resource.graph.{}",
+        value_id
+            .as_str()
+            .strip_prefix("value.")
+            .expect("graph activation value prefix")
+    )
+}
+
 fn graph_value_binding(
     value_id: &str,
     role: ResolvedValueRole,
@@ -176,36 +186,39 @@ fn graph_node_bindings(
 ) -> Vec<ResolvedValueBinding> {
     match node.operation_id.as_str() {
         "operation.graph.alias" => {
+            let target_resource = graph_activation_resource(&node.inputs[0]);
+            let wrong_input_resource = graph_activation_resource(&node.inputs[1]);
+            let distinct_resource = graph_activation_resource(&node.outputs[0]);
             let (resource, offset) = match alias_storage {
-                GraphAliasStorage::Distinct => ("resource.graph.alias", 0),
-                GraphAliasStorage::ExactTarget => ("resource.graph.input.0", 0),
-                GraphAliasStorage::PartialTarget => ("resource.graph.input.0", 8),
-                GraphAliasStorage::ExactWrongInput => ("resource.graph.input.1", 0),
+                GraphAliasStorage::Distinct => (distinct_resource.as_str(), 0),
+                GraphAliasStorage::ExactTarget => (target_resource.as_str(), 0),
+                GraphAliasStorage::PartialTarget => (target_resource.as_str(), 8),
+                GraphAliasStorage::ExactWrongInput => (wrong_input_resource.as_str(), 0),
             };
             vec![
                 graph_value_binding(
-                    "value.input.0",
+                    node.inputs[0].as_str(),
                     ResolvedValueRole::Input,
                     0,
                     TensorAccess::Read,
                     AliasPolicy::NoAlias,
                     BufferUsage::Activations,
-                    "resource.graph.input.0",
+                    &target_resource,
                     0,
                 ),
                 graph_value_binding(
-                    "value.input.1",
+                    node.inputs[1].as_str(),
                     ResolvedValueRole::Input,
                     1,
                     TensorAccess::Read,
                     AliasPolicy::NoAlias,
                     BufferUsage::Activations,
-                    "resource.graph.input.1",
+                    &wrong_input_resource,
                     0,
                 ),
                 graph_weight_binding(2, weight_schema),
                 graph_value_binding(
-                    "value.alias",
+                    node.outputs[0].as_str(),
                     ResolvedValueRole::Output,
                     0,
                     TensorAccess::Write,
@@ -216,39 +229,44 @@ fn graph_node_bindings(
                 ),
             ]
         }
-        "operation.graph.consume" => vec![
-            graph_value_binding(
-                "value.input.0",
-                ResolvedValueRole::Input,
-                0,
-                TensorAccess::Read,
-                AliasPolicy::NoAlias,
-                BufferUsage::Activations,
-                "resource.graph.input.0",
-                0,
-            ),
-            graph_value_binding(
-                "value.input.1",
-                ResolvedValueRole::Input,
-                1,
-                TensorAccess::Read,
-                AliasPolicy::NoAlias,
-                BufferUsage::Activations,
-                "resource.graph.input.1",
-                0,
-            ),
-            graph_weight_binding(2, weight_schema),
-            graph_value_binding(
-                "value.late",
-                ResolvedValueRole::Output,
-                0,
-                TensorAccess::Write,
-                AliasPolicy::NoAlias,
-                BufferUsage::Activations,
-                "resource.graph.late",
-                0,
-            ),
-        ],
+        "operation.graph.consume" => {
+            let first_resource = graph_activation_resource(&node.inputs[0]);
+            let second_resource = graph_activation_resource(&node.inputs[1]);
+            let output_resource = graph_activation_resource(&node.outputs[0]);
+            vec![
+                graph_value_binding(
+                    node.inputs[0].as_str(),
+                    ResolvedValueRole::Input,
+                    0,
+                    TensorAccess::Read,
+                    AliasPolicy::NoAlias,
+                    BufferUsage::Activations,
+                    &first_resource,
+                    0,
+                ),
+                graph_value_binding(
+                    node.inputs[1].as_str(),
+                    ResolvedValueRole::Input,
+                    1,
+                    TensorAccess::Read,
+                    AliasPolicy::NoAlias,
+                    BufferUsage::Activations,
+                    &second_resource,
+                    0,
+                ),
+                graph_weight_binding(2, weight_schema),
+                graph_value_binding(
+                    node.outputs[0].as_str(),
+                    ResolvedValueRole::Output,
+                    0,
+                    TensorAccess::Write,
+                    AliasPolicy::NoAlias,
+                    BufferUsage::Activations,
+                    &output_resource,
+                    0,
+                ),
+            ]
+        }
         "operation.graph.state-read" | "operation.graph.state-rw" => {
             let state_access = if node.operation_id.as_str() == "operation.graph.state-read" {
                 TensorAccess::Read
@@ -389,6 +407,45 @@ fn execution_alias_must_alias_builds_exact_equivalence_and_single_allocation() {
         .filter(|descriptor| descriptor.base_resource_id().as_str() == "resource.graph.input.0")
         .count();
     assert_eq!(matching_static + matching_dynamic, 1);
+}
+
+#[test]
+fn execution_alias_terminal_output_promotes_the_shared_intermediate_resource() {
+    let fixture = graph_plan_fixture(
+        "alias_terminal_intermediate",
+        AliasPolicy::MustAlias { tensor_index: 0 },
+        GraphAliasStorage::ExactTarget,
+    )
+    .unwrap();
+    let terminal = &fixture.plan.payload().nodes()[1];
+    assert_eq!(terminal.exact_aliases().len(), 1);
+    assert_eq!(
+        terminal.exact_aliases()[0].input_value_id().as_str(),
+        "value.intermediate"
+    );
+    assert_eq!(
+        terminal.exact_aliases()[0].output_value_id().as_str(),
+        "value.alias"
+    );
+
+    let matching = fixture
+        .plan
+        .payload()
+        .memory()
+        .dynamic_descriptors()
+        .iter()
+        .filter(|descriptor| {
+            descriptor.base_resource_id().as_str() == "resource.graph.intermediate"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+    assert!(matches!(
+        matching[0].demand(),
+        DynamicResourceDemand::ActualSequences {
+            bytes_per_sequence: 16,
+            ..
+        }
+    ));
 }
 
 #[test]

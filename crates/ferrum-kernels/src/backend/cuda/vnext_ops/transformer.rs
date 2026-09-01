@@ -15,19 +15,24 @@ use cudarc::nvrtc::Ptx;
 #[cfg(feature = "vllm-marlin")]
 use ferrum_interfaces::vnext::PhysicalWeightLayout;
 use ferrum_interfaces::vnext::{
-    dense_linear_contract, dense_swiglu_contract, residual_add_contract, rms_norm_contract,
-    AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceBatchingForm,
-    DeviceRuntime, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
-    OperationContract, OperationFailure, OperationInvocation, OperationProvider,
-    OperationProviderDescriptor, OperationResourceEstimate, OperationResourceEstimateRequest,
-    OperationResourceEstimator, ProfilePhase, ProviderId, ProviderStorageBindingRequirement,
-    ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
-    ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
-    ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
-    ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, SemanticValue, VNextError,
-    WeightFormatId, DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID,
-    DENSE_SWIGLU_F16_CAPABILITY_ID, DENSE_SWIGLU_OPERATION_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_OPERATION_ID,
+    constant_scale_contract, dense_geglu_tanh_contract, dense_linear_contract,
+    dense_swiglu_contract, logit_softcap_contract, residual_add_contract, rms_norm_contract,
+    AttributeId, BatchedOperationInvocation, CanonicalRational, CapabilityId, ContractVersion,
+    DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
+    EncodedDeviceOperation, OperationContract, OperationFailure, OperationInvocation,
+    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
+    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
+    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
+    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
+    ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
+    ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
+    CONSTANT_SCALE_F16_CAPABILITY_ID, CONSTANT_SCALE_OPERATION_ID,
+    DENSE_GEGLU_TANH_F16_CAPABILITY_ID, DENSE_GEGLU_TANH_OPERATION_ID,
+    DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
+    DENSE_SWIGLU_OPERATION_ID, LOGIT_SOFTCAP_F16_CAPABILITY_ID, LOGIT_SOFTCAP_OPERATION_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
+    RMS_NORM_OPERATION_ID,
 };
 
 use super::super::vnext_runtime::{
@@ -54,7 +59,11 @@ use crate::marlin_fp8_materializer::{
 #[cfg(feature = "vllm-marlin")]
 use moe_weights::{
     resolve_compressed_tensors_marlin_layout, resolve_compressed_tensors_marlin_matrix_weight,
-    COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID, COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
+    resolve_compressed_tensors_symmetric_marlin_matrix_weight,
+    COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_SYMMETRIC_WEIGHT_FORMAT_ID,
+    COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID,
 };
 
 mod attention;
@@ -85,7 +94,10 @@ pub(super) use moe::CudaRoutedSharedSwiGluMoeProvider;
 #[cfg(feature = "vllm-moe-marlin")]
 pub(super) use moe_routed::CudaRoutedSwiGluMoeProvider;
 #[cfg(feature = "vllm-marlin")]
-pub(super) use moe_weights::{COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, GPTQ_MARLIN_CAPABILITY_ID};
+pub(super) use moe_weights::{
+    COMPRESSED_TENSORS_MARLIN_CAPABILITY_ID, COMPRESSED_TENSORS_MARLIN_SYMMETRIC_CAPABILITY_ID,
+    GPTQ_MARLIN_CAPABILITY_ID,
+};
 
 const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
 const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";
@@ -98,6 +110,12 @@ const MARLIN_FP8_DENSE_LINEAR_ESTIMATOR_ID: &str =
     "resource-estimator.cuda.dense_linear.f16.marlin-fp8-w8a16";
 const DENSE_SWIGLU_PROVIDER_ID: &str = "provider.cuda.dense_swiglu.f16.cublas";
 const DENSE_SWIGLU_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_swiglu.f16.cublas";
+const DENSE_GEGLU_TANH_PROVIDER_ID: &str = "provider.cuda.dense_geglu_tanh.f16.cublas";
+const DENSE_GEGLU_TANH_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_geglu_tanh.f16.cublas";
+const CONSTANT_SCALE_PROVIDER_ID: &str = "provider.cuda.constant_scale.f16";
+const CONSTANT_SCALE_ESTIMATOR_ID: &str = "resource-estimator.cuda.constant_scale.f16";
+const LOGIT_SOFTCAP_PROVIDER_ID: &str = "provider.cuda.logit_softcap.f16";
+const LOGIT_SOFTCAP_ESTIMATOR_ID: &str = "resource-estimator.cuda.logit_softcap.f16";
 const RESIDUAL_ADD_PROVIDER_ID: &str = "provider.cuda.residual_add.f16";
 const RESIDUAL_ADD_ESTIMATOR_ID: &str = "resource-estimator.cuda.residual_add.f16";
 
@@ -105,8 +123,12 @@ const RMS_NORM_FUNCTION_NAME: &str = "rms_norm_f16";
 const SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_interleaved_f16";
 #[cfg(feature = "vllm-marlin")]
 const PLANAR_SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_f16";
+const PLANAR_GELU_TANH_MUL_FUNCTION_NAME: &str = "fused_gelu_tanh_mul_f16";
+const SCALE_INPLACE_FUNCTION_NAME: &str = "scale_inplace_f16";
+const LOGIT_SOFTCAP_INPLACE_FUNCTION_NAME: &str = "logit_softcap_inplace_f16";
 const RESIDUAL_ADD_FUNCTION_NAME: &str = "residual_add_f16";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
+const GEGLU_SCRATCH_PARTS: u64 = 3;
 static CUDA_GEMM_ALPHA_F32: f32 = 1.0;
 static CUDA_GEMM_BETA_F32: f32 = 0.0;
 
@@ -667,6 +689,353 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
     }
 }
 
+/// Physical projection ABI implemented by the dense GeGLU provider.
+///
+/// Keep the dense and symmetric compressed-tensors paths distinct so neither
+/// can be accidentally executed with the other's physical weight ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DenseGeGluProjection {
+    F16,
+    #[cfg(feature = "vllm-marlin")]
+    CompressedTensorsSymmetricMarlin,
+}
+
+fn dense_geglu_projection_for_formats(
+    gate: &BTreeSet<QuantizationFormatId>,
+    up: &BTreeSet<QuantizationFormatId>,
+    down: &BTreeSet<QuantizationFormatId>,
+) -> Result<DenseGeGluProjection, String> {
+    let classify = |label: &str, formats: &BTreeSet<QuantizationFormatId>| {
+        if formats.is_empty() {
+            return Ok(DenseGeGluProjection::F16);
+        }
+        if formats.len() != 1 {
+            return Err(format!(
+                "dense GeGLU {label} has more than one quantization format"
+            ));
+        }
+        match formats.iter().next().map(|format| format.as_str()) {
+            #[cfg(feature = "vllm-marlin")]
+            Some(COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID) => {
+                Ok(DenseGeGluProjection::CompressedTensorsSymmetricMarlin)
+            }
+            Some(format) => Err(format!(
+                "dense GeGLU {label} uses unsupported quantization format `{format}`"
+            )),
+            None => unreachable!("non-empty quantization set has one entry"),
+        }
+    };
+    let gate = classify("gate", gate)?;
+    let up = classify("up", up)?;
+    let down = classify("down", down)?;
+    if gate != up || gate != down {
+        return Err(format!(
+            "dense GeGLU cannot mix {gate:?} gate, {up:?} up, and {down:?} down weights"
+        ));
+    }
+    Ok(gate)
+}
+
+fn participant_dense_geglu_projection(
+    participant: &OperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<DenseGeGluProjection, String> {
+    let formats = |ordinal| {
+        binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?
+            .weight()
+            .map(|weight| weight.quantization_formats())
+            .ok_or_else(|| format!("dense GeGLU input {ordinal} has no physical weight layout"))
+    };
+    dense_geglu_projection_for_formats(&formats(1)?, &formats(2)?, &formats(3)?)
+}
+
+fn dense_geglu_projection(
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<DenseGeGluProjection, String> {
+    let first = participant_dense_geglu_projection(&invocation.participants()[0])?;
+    for participant in &invocation.participants()[1..] {
+        if participant_dense_geglu_projection(participant)? != first {
+            return Err("dense GeGLU participants disagree on their projection ABI".to_owned());
+        }
+    }
+    Ok(first)
+}
+
+pub(super) struct CudaDenseGeGluTanhProvider {
+    descriptor: OperationProviderDescriptor,
+    gelu_tanh_mul: CudaFunction,
+    #[cfg(feature = "vllm-marlin")]
+    projection_runtime: MarlinProjectionRuntime,
+}
+
+impl CudaDenseGeGluTanhProvider {
+    pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = dense_geglu_tanh_contract().map_err(contract_error)?;
+        let provider_fingerprint = implementation_fingerprint(&[
+            include_str!("transformer.rs").as_bytes(),
+            crate::ptx::FUSED_SILU_MUL.as_bytes(),
+            PLANAR_GELU_TANH_MUL_FUNCTION_NAME.as_bytes(),
+            #[cfg(feature = "vllm-marlin")]
+            include_str!("transformer/moe_weights.rs").as_bytes(),
+            #[cfg(feature = "vllm-marlin")]
+            include_str!("../vllm_marlin.rs").as_bytes(),
+        ]);
+        #[cfg(not(feature = "vllm-marlin"))]
+        let descriptor = provider_descriptor(
+            runtime,
+            &contract,
+            DENSE_GEGLU_TANH_PROVIDER_ID,
+            DENSE_GEGLU_TANH_F16_CAPABILITY_ID,
+            DENSE_GEGLU_TANH_ESTIMATOR_ID,
+            contiguous_bindings(4),
+            provider_fingerprint,
+        )?;
+        #[cfg(feature = "vllm-marlin")]
+        let descriptor =
+            marlin_geglu_provider_descriptor(runtime, &contract, provider_fingerprint)?;
+        let module = runtime
+            .context()
+            .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
+            .map_err(|error| CudaDeviceRuntimeError::driver("GeGLU module load", error))?;
+        let gelu_tanh_mul = module
+            .load_function(PLANAR_GELU_TANH_MUL_FUNCTION_NAME)
+            .map_err(|error| CudaDeviceRuntimeError::driver("planar GeGLU function load", error))?;
+        #[cfg(feature = "vllm-marlin")]
+        let projection_runtime = MarlinProjectionRuntime::query(runtime)?;
+        Ok(Self {
+            descriptor,
+            gelu_tanh_mul,
+            #[cfg(feature = "vllm-marlin")]
+            projection_runtime,
+        })
+    }
+}
+
+impl OperationResourceEstimator for CudaDenseGeGluTanhProvider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        ensure_estimator_request(&self.descriptor, &request, DENSE_GEGLU_TANH_OPERATION_ID)?;
+        let intermediate_size =
+            unsigned_attribute(request.attributes(), "intermediate_size").map_err(invalid_plan)?;
+        let bytes_per_token = intermediate_size
+            .checked_mul(GEGLU_SCRATCH_PARTS)
+            .and_then(|elements| elements.checked_mul(ElementType::F16.size_bytes()))
+            .ok_or_else(|| invalid_plan("CUDA dense GeGLU scratch size overflows"))?;
+        #[cfg(not(feature = "vllm-marlin"))]
+        let formula = ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?;
+        #[cfg(feature = "vllm-marlin")]
+        let formula = ProviderWorkspaceSizeFormula::affine(
+            self.projection_runtime
+                .workspace_bytes()
+                .map_err(invalid_plan)?
+                .checked_add(VALUE_ALIGNMENT_BYTES - 1)
+                .ok_or_else(|| invalid_plan("CUDA dense GeGLU Marlin scratch overflows"))?,
+            0,
+            bytes_per_token,
+        )?;
+        let scratch = ProviderWorkspaceRequirement::from_formula(
+            formula,
+            VALUE_ALIGNMENT_BYTES,
+            ProviderWorkspaceScope::Invocation,
+            ProviderWorkspaceReusePolicy::OverwriteBeforeRead,
+            DynamicStorageRequirement::contiguous(),
+        )?;
+        Ok(estimate(
+            &self.descriptor,
+            request.input_fingerprint(),
+            Some(scratch),
+        ))
+    }
+}
+
+impl OperationProvider<CudaDeviceRuntime> for CudaDenseGeGluTanhProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(&request, 4, &[CapturedProviderWorkspace::Scratch])
+    }
+
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        let projection = dense_geglu_projection(&invocation).map_err(|message| {
+            provider_failure(identity.clone(), "cuda.dense_geglu_tanh.select", message)
+        })?;
+        match projection {
+            DenseGeGluProjection::F16 => encode_dense_geglu_tanh(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.gelu_tanh_mul,
+                invocation,
+            ),
+            #[cfg(feature = "vllm-marlin")]
+            DenseGeGluProjection::CompressedTensorsSymmetricMarlin => {
+                encode_compressed_tensors_symmetric_dense_geglu(
+                    self.descriptor.provider_implementation_fingerprint(),
+                    &self.gelu_tanh_mul,
+                    self.projection_runtime,
+                    invocation,
+                )
+            }
+        }
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| provider_failure(identity, "cuda.dense_geglu_tanh.encode", message))
+    }
+}
+
+pub(super) struct CudaConstantScaleProvider {
+    descriptor: OperationProviderDescriptor,
+    function: CudaFunction,
+}
+
+impl CudaConstantScaleProvider {
+    pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = constant_scale_contract().map_err(contract_error)?;
+        let descriptor = weightless_provider_descriptor(
+            runtime,
+            &contract,
+            CONSTANT_SCALE_PROVIDER_ID,
+            CONSTANT_SCALE_F16_CAPABILITY_ID,
+            CONSTANT_SCALE_ESTIMATOR_ID,
+            contiguous_bindings(1),
+            implementation_fingerprint(&[
+                include_str!("transformer.rs").as_bytes(),
+                crate::ptx::FUSED_SILU_MUL.as_bytes(),
+                SCALE_INPLACE_FUNCTION_NAME.as_bytes(),
+            ]),
+        )?;
+        let module = runtime
+            .context()
+            .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
+            .map_err(|error| CudaDeviceRuntimeError::driver("constant scale module load", error))?;
+        let function = module
+            .load_function(SCALE_INPLACE_FUNCTION_NAME)
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("constant scale function load", error)
+            })?;
+        Ok(Self {
+            descriptor,
+            function,
+        })
+    }
+}
+
+impl OperationResourceEstimator for CudaConstantScaleProvider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        estimate_without_workspace(&self.descriptor, &request, CONSTANT_SCALE_OPERATION_ID)
+    }
+}
+
+impl OperationProvider<CudaDeviceRuntime> for CudaConstantScaleProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(&request, 1, &[])
+    }
+
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_constant_scale(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.function,
+            invocation,
+        )
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| provider_failure(identity, "cuda.constant_scale.encode", message))
+    }
+}
+
+pub(super) struct CudaLogitSoftcapProvider {
+    descriptor: OperationProviderDescriptor,
+    function: CudaFunction,
+}
+
+impl CudaLogitSoftcapProvider {
+    pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = logit_softcap_contract().map_err(contract_error)?;
+        let descriptor = weightless_provider_descriptor(
+            runtime,
+            &contract,
+            LOGIT_SOFTCAP_PROVIDER_ID,
+            LOGIT_SOFTCAP_F16_CAPABILITY_ID,
+            LOGIT_SOFTCAP_ESTIMATOR_ID,
+            contiguous_bindings(1),
+            implementation_fingerprint(&[
+                include_str!("transformer.rs").as_bytes(),
+                crate::ptx::FUSED_SILU_MUL.as_bytes(),
+                LOGIT_SOFTCAP_INPLACE_FUNCTION_NAME.as_bytes(),
+            ]),
+        )?;
+        let module = runtime
+            .context()
+            .load_module(Ptx::from_src(crate::ptx::FUSED_SILU_MUL.to_owned()))
+            .map_err(|error| CudaDeviceRuntimeError::driver("logit softcap module load", error))?;
+        let function = module
+            .load_function(LOGIT_SOFTCAP_INPLACE_FUNCTION_NAME)
+            .map_err(|error| {
+                CudaDeviceRuntimeError::driver("logit softcap function load", error)
+            })?;
+        Ok(Self {
+            descriptor,
+            function,
+        })
+    }
+}
+
+impl OperationResourceEstimator for CudaLogitSoftcapProvider {
+    fn descriptor(&self) -> &OperationProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn estimate_resources(
+        &self,
+        request: OperationResourceEstimateRequest<'_>,
+    ) -> Result<OperationResourceEstimate, VNextError> {
+        estimate_without_workspace(&self.descriptor, &request, LOGIT_SOFTCAP_OPERATION_ID)
+    }
+}
+
+impl OperationProvider<CudaDeviceRuntime> for CudaLogitSoftcapProvider {
+    fn reusable_execution_topology(
+        &self,
+        request: ReusableExecutionTopologyRequest<'_>,
+    ) -> Result<ReusableExecutionTopology, VNextError> {
+        static_contiguous_reusable_topology(&request, 1, &[])
+    }
+
+    fn encode_selected(
+        &self,
+        invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
+        let identity = invocation.participants()[0].identity().clone();
+        encode_logit_softcap(
+            self.descriptor.provider_implementation_fingerprint(),
+            &self.function,
+            invocation,
+        )
+        .map(EncodedDeviceOperation::compute)
+        .map_err(|message| provider_failure(identity, "cuda.logit_softcap.encode", message))
+    }
+}
+
 pub(super) struct CudaResidualAddProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
@@ -747,6 +1116,50 @@ pub(super) fn provider_descriptor(
     bindings: Vec<ProviderStorageBindingRequirement>,
     provider_fingerprint: String,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    provider_descriptor_with_formats(
+        runtime,
+        contract,
+        provider_id,
+        capability_id,
+        estimator_id,
+        bindings,
+        BTreeSet::from([WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?]),
+        provider_fingerprint,
+    )
+}
+
+fn weightless_provider_descriptor(
+    runtime: &CudaDeviceRuntime,
+    contract: &dyn OperationContract,
+    provider_id: &str,
+    capability_id: &str,
+    estimator_id: &str,
+    bindings: Vec<ProviderStorageBindingRequirement>,
+    provider_fingerprint: String,
+) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    provider_descriptor_with_formats(
+        runtime,
+        contract,
+        provider_id,
+        capability_id,
+        estimator_id,
+        bindings,
+        BTreeSet::new(),
+        provider_fingerprint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_descriptor_with_formats(
+    runtime: &CudaDeviceRuntime,
+    contract: &dyn OperationContract,
+    provider_id: &str,
+    capability_id: &str,
+    estimator_id: &str,
+    bindings: Vec<ProviderStorageBindingRequirement>,
+    accepted_weight_formats: BTreeSet<WeightFormatId>,
+    provider_fingerprint: String,
+) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
     let capability = CapabilityId::new(capability_id).map_err(contract_error)?;
     if !runtime.descriptor().capabilities.contains(&capability) {
         return Err(CudaDeviceRuntimeError::contract(format!(
@@ -770,7 +1183,7 @@ pub(super) fn provider_descriptor(
         contract.descriptor().version,
         runtime.descriptor().id.clone(),
         BTreeSet::from([capability]),
-        BTreeSet::from([WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?]),
+        accepted_weight_formats,
         BTreeSet::new(),
         bindings,
         estimator_id,
@@ -846,6 +1259,63 @@ fn marlin_swiglu_provider_descriptor(
         ]),
         contiguous_bindings(3),
         DENSE_SWIGLU_ESTIMATOR_ID,
+        ContractVersion::new(2, 0),
+        estimator_fingerprint,
+    )
+    .map_err(contract_error)
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn marlin_geglu_provider_descriptor(
+    runtime: &CudaDeviceRuntime,
+    contract: &dyn OperationContract,
+    provider_fingerprint: String,
+) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
+    let operation_capability =
+        CapabilityId::new(DENSE_GEGLU_TANH_F16_CAPABILITY_ID).map_err(contract_error)?;
+    let marlin_capability = CapabilityId::new(COMPRESSED_TENSORS_MARLIN_SYMMETRIC_CAPABILITY_ID)
+        .map_err(contract_error)?;
+    if !runtime
+        .descriptor()
+        .capabilities
+        .contains(&operation_capability)
+        || !runtime
+            .descriptor()
+            .capabilities
+            .contains(&marlin_capability)
+    {
+        return Err(CudaDeviceRuntimeError::contract(
+            "CUDA runtime does not advertise dense-GeGLU symmetric compressed-tensors Marlin capabilities",
+        ));
+    }
+    let estimator_fingerprint = implementation_fingerprint(&[
+        include_str!("transformer.rs").as_bytes(),
+        DENSE_GEGLU_TANH_ESTIMATOR_ID.as_bytes(),
+        provider_fingerprint.as_bytes(),
+    ]);
+    OperationProviderDescriptor::new(
+        ProviderId::new(DENSE_GEGLU_TANH_PROVIDER_ID).map_err(contract_error)?,
+        contract.descriptor().id.clone(),
+        contract
+            .descriptor()
+            .fingerprint()
+            .map_err(contract_error)?,
+        provider_fingerprint,
+        ferrum_interfaces::vnext::ProviderExecutionSemantics::bitwise_eager_and_replay(),
+        contract.descriptor().version,
+        runtime.descriptor().id.clone(),
+        BTreeSet::from([operation_capability, marlin_capability]),
+        BTreeSet::from([
+            WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+            WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_SYMMETRIC_WEIGHT_FORMAT_ID)
+                .map_err(contract_error)?,
+        ]),
+        BTreeSet::from([QuantizationFormatId::new(
+            COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID,
+        )
+        .map_err(contract_error)?]),
+        contiguous_bindings(4),
+        DENSE_GEGLU_TANH_ESTIMATOR_ID,
         ContractVersion::new(2, 0),
         estimator_fingerprint,
     )
@@ -1729,6 +2199,295 @@ fn marlin_swiglu_scratch_layout(
     })
 }
 
+#[cfg(feature = "vllm-marlin")]
+#[derive(Debug, Clone, Copy)]
+struct SharedSymmetricCompressedTensorsWeight {
+    packed_region: usize,
+    scales_region: usize,
+    group_size: i32,
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn push_shared_symmetric_compressed_tensors_weight(
+    regions: &mut Vec<CudaBufferRegion>,
+    invocation: &BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    ordinal: u32,
+    logical_dimensions: &[u64],
+) -> Result<SharedSymmetricCompressedTensorsWeight, String> {
+    let resolve = |participant: &OperationInvocation<'_, CudaDeviceBuffer>| {
+        let value = binding(participant.bindings(), ResolvedValueRole::Input, ordinal)?;
+        resolve_compressed_tensors_symmetric_marlin_matrix_weight(
+            participant,
+            value,
+            logical_dimensions,
+        )
+    };
+    let first = resolve(&invocation.participants()[0])?;
+    if first.expert_count() != 1 {
+        return Err(format!(
+            "symmetric compressed-tensors GeGLU input {ordinal} is not one matrix"
+        ));
+    }
+    for participant in &invocation.participants()[1..] {
+        let candidate = resolve(participant)?;
+        if candidate.logical_dimensions() != first.logical_dimensions()
+            || candidate.packed_physical_dimensions() != first.packed_physical_dimensions()
+            || candidate.scales_physical_dimensions() != first.scales_physical_dimensions()
+            || candidate.expert_count() != first.expert_count()
+            || candidate.packed_expert_stride_bytes() != first.packed_expert_stride_bytes()
+            || candidate.scales_expert_stride_bytes() != first.scales_expert_stride_bytes()
+            || candidate.group_size() != first.group_size()
+            || candidate.weight_type() != first.weight_type()
+            || !same_physical_region(first.packed_region(), candidate.packed_region())
+            || !same_physical_region(first.scales_region(), candidate.scales_region())
+        {
+            return Err(format!(
+                "symmetric compressed-tensors GeGLU input {ordinal} is not shared by all participants"
+            ));
+        }
+    }
+    let group_size = first.group_size();
+    let [packed, scales] = first.into_regions();
+    let packed_region = regions.len();
+    regions.push(packed);
+    let scales_region = regions.len();
+    regions.push(scales);
+    Ok(SharedSymmetricCompressedTensorsWeight {
+        packed_region,
+        scales_region,
+        group_size,
+    })
+}
+
+#[cfg(feature = "vllm-marlin")]
+#[allow(clippy::too_many_arguments)]
+fn dense_geglu_marlin_replay_key(
+    provider_fingerprint: &str,
+    projection_runtime: MarlinProjectionRuntime,
+    gate_group_size: i32,
+    up_group_size: i32,
+    down_group_size: i32,
+    rows: i32,
+    hidden: i32,
+    intermediate: i32,
+    scratch: MarlinSwiGluScratchLayout,
+) -> crate::backend::cuda::vnext_replay::CudaCommandReplayKey {
+    CudaCommandReplayKeyBuilder::new(
+        provider_fingerprint,
+        "vnext_dense_geglu_tanh_compressed_tensors_symmetric_marlin",
+    )
+    .i32(projection_runtime.multiprocessor_count)
+    .i32(projection_runtime.device_ordinal)
+    .i32(gate_group_size)
+    .i32(up_group_size)
+    .i32(down_group_size)
+    .i32(rows)
+    .i32(hidden)
+    .i32(intermediate)
+    .u64(scratch.activation_elements)
+    .u64(scratch.activation_bytes)
+    .u64(scratch.workspace_offset)
+    .u64(scratch.workspace_bytes)
+    .u64(scratch.required_bytes)
+    .finish()
+}
+
+#[cfg(test)]
+mod gemma_simple_ops_tests {
+    use super::{
+        constant_scale_dimensions_match, dense_geglu_dimensions_match,
+        dense_geglu_projection_for_formats, dense_geglu_scratch_layout,
+        logit_softcap_dimensions_match, DenseGeGluProjection,
+    };
+    use ferrum_interfaces::vnext::QuantizationFormatId;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn dense_geglu_scratch_keeps_two_token_planes_disjoint() {
+        let layout = dense_geglu_scratch_layout(2, 3).unwrap();
+        assert_eq!(layout.activation_elements, 6);
+        assert_eq!(layout.activation_bytes, 12);
+        assert_eq!(layout.up_offset_bytes, 12);
+        assert_eq!(layout.activation_offset_bytes, 24);
+        assert_eq!(layout.required_bytes, 36);
+        assert!(dense_geglu_scratch_layout(u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn gemma_simple_provider_shapes_fail_closed() {
+        assert!(dense_geglu_dimensions_match(
+            &[2, 4],
+            &[6, 4],
+            &[6, 4],
+            &[4, 6],
+            &[2, 4],
+            4,
+            6,
+        ));
+        assert!(!dense_geglu_dimensions_match(
+            &[2, 4],
+            &[4, 6],
+            &[6, 4],
+            &[4, 6],
+            &[2, 4],
+            4,
+            6,
+        ));
+        assert!(!dense_geglu_dimensions_match(
+            &[2, 4],
+            &[6, 4],
+            &[6, 4],
+            &[4, 6],
+            &[1, 4],
+            4,
+            6,
+        ));
+
+        assert!(constant_scale_dimensions_match(&[2, 4], &[2, 4], 4));
+        assert!(!constant_scale_dimensions_match(&[2, 4], &[2, 5], 4));
+        assert!(logit_softcap_dimensions_match(&[1, 8], &[1, 8], 8));
+        assert!(!logit_softcap_dimensions_match(&[2, 8], &[2, 8], 8));
+        assert!(!logit_softcap_dimensions_match(&[1, 8], &[1, 7], 8));
+    }
+
+    #[test]
+    fn dense_geglu_quantization_classification_fails_closed() {
+        let dense = BTreeSet::new();
+        assert_eq!(
+            dense_geglu_projection_for_formats(&dense, &dense, &dense),
+            Ok(DenseGeGluProjection::F16)
+        );
+        let unknown = BTreeSet::from([QuantizationFormatId::new(
+            "quantization.test.symmetric-compressed-tensors",
+        )
+        .unwrap()]);
+        for (gate, up, down) in [
+            (&unknown, &unknown, &unknown),
+            (&unknown, &dense, &dense),
+            (&dense, &unknown, &dense),
+            (&dense, &dense, &unknown),
+        ] {
+            assert!(dense_geglu_projection_for_formats(gate, up, down).is_err());
+        }
+    }
+}
+
+#[cfg(all(test, feature = "vllm-marlin"))]
+mod dense_geglu_marlin_tests {
+    use super::{
+        dense_geglu_marlin_replay_key, dense_geglu_projection_for_formats,
+        marlin_swiglu_scratch_layout, DenseGeGluProjection, MarlinProjectionRuntime,
+        COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID, VALUE_ALIGNMENT_BYTES,
+    };
+    use ferrum_interfaces::vnext::QuantizationFormatId;
+    use std::collections::BTreeSet;
+
+    fn formats(values: &[&str]) -> BTreeSet<QuantizationFormatId> {
+        values
+            .iter()
+            .map(|value| QuantizationFormatId::new(*value).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn symmetric_compressed_tensors_geglu_classification_is_exact() {
+        let dense = BTreeSet::new();
+        let symmetric = formats(&[COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID]);
+        assert_eq!(
+            dense_geglu_projection_for_formats(&symmetric, &symmetric, &symmetric),
+            Ok(DenseGeGluProjection::CompressedTensorsSymmetricMarlin)
+        );
+        for (gate, up, down) in [
+            (&symmetric, &dense, &dense),
+            (&dense, &symmetric, &dense),
+            (&dense, &dense, &symmetric),
+            (&symmetric, &symmetric, &dense),
+        ] {
+            assert!(dense_geglu_projection_for_formats(gate, up, down).is_err());
+        }
+        let multiple = formats(&[
+            COMPRESSED_TENSORS_MARLIN_SYMMETRIC_QUANTIZATION_FORMAT_ID,
+            "quantization.test.other",
+        ]);
+        assert!(dense_geglu_projection_for_formats(&multiple, &multiple, &multiple).is_err());
+    }
+
+    #[test]
+    fn symmetric_compressed_tensors_geglu_uses_bounded_aligned_marlin_layout() {
+        for tokens in [1, 8, 32] {
+            let layout = marlin_swiglu_scratch_layout(tokens, 15_360, 512).unwrap();
+            assert_eq!(layout.activation_elements, tokens * 15_360);
+            assert_eq!(layout.activation_bytes, tokens * 15_360 * 2);
+            assert!(layout.workspace_offset >= layout.activation_bytes * 3);
+            assert_eq!(layout.workspace_offset % VALUE_ALIGNMENT_BYTES, 0);
+            assert_eq!(layout.required_bytes, layout.workspace_offset + 512);
+        }
+        assert!(marlin_swiglu_scratch_layout(u64::MAX, 2, 512).is_err());
+    }
+
+    #[test]
+    fn symmetric_compressed_tensors_geglu_replay_key_binds_execution_geometry() {
+        let runtime = MarlinProjectionRuntime {
+            multiprocessor_count: 128,
+            device_ordinal: 0,
+        };
+        let scratch = marlin_swiglu_scratch_layout(8, 15_360, 512).unwrap();
+        let key = dense_geglu_marlin_replay_key(
+            "provider-fingerprint",
+            runtime,
+            32,
+            32,
+            32,
+            8,
+            3_840,
+            15_360,
+            scratch,
+        );
+        assert_eq!(
+            key,
+            dense_geglu_marlin_replay_key(
+                "provider-fingerprint",
+                runtime,
+                32,
+                32,
+                32,
+                8,
+                3_840,
+                15_360,
+                scratch,
+            )
+        );
+        assert_ne!(
+            key,
+            dense_geglu_marlin_replay_key(
+                "provider-fingerprint",
+                runtime,
+                32,
+                32,
+                32,
+                32,
+                3_840,
+                15_360,
+                marlin_swiglu_scratch_layout(32, 15_360, 512).unwrap(),
+            )
+        );
+        assert_ne!(
+            key,
+            dense_geglu_marlin_replay_key(
+                "another-provider",
+                runtime,
+                32,
+                32,
+                32,
+                8,
+                3_840,
+                15_360,
+                scratch,
+            )
+        );
+    }
+}
+
 #[cfg(all(test, feature = "vllm-marlin"))]
 mod dense_swiglu_marlin_tests {
     use super::{
@@ -2500,6 +3259,549 @@ fn encode_dense_swiglu(
     .map_err(|error| error.to_string())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DenseGeGluScratchLayout {
+    activation_elements: u64,
+    activation_bytes: u64,
+    up_offset_bytes: u64,
+    activation_offset_bytes: u64,
+    required_bytes: u64,
+}
+
+fn dense_geglu_scratch_layout(
+    tokens: u64,
+    intermediate_size: u64,
+) -> Result<DenseGeGluScratchLayout, String> {
+    let activation_elements = tokens
+        .checked_mul(intermediate_size)
+        .ok_or_else(|| "dense GeGLU activation element count overflows".to_owned())?;
+    let activation_bytes = activation_elements
+        .checked_mul(ElementType::F16.size_bytes())
+        .ok_or_else(|| "dense GeGLU activation byte count overflows".to_owned())?;
+    let up_offset_bytes = activation_bytes;
+    let activation_offset_bytes = activation_bytes
+        .checked_mul(2)
+        .ok_or_else(|| "dense GeGLU activation offset overflows".to_owned())?;
+    let required_bytes = activation_bytes
+        .checked_mul(GEGLU_SCRATCH_PARTS)
+        .ok_or_else(|| "dense GeGLU scratch size overflows".to_owned())?;
+    Ok(DenseGeGluScratchLayout {
+        activation_elements,
+        activation_bytes,
+        up_offset_bytes,
+        activation_offset_bytes,
+        required_bytes,
+    })
+}
+
+#[cfg(feature = "vllm-marlin")]
+fn encode_compressed_tensors_symmetric_dense_geglu(
+    provider_fingerprint: &str,
+    gelu_tanh_mul: &CudaFunction,
+    projection_runtime: MarlinProjectionRuntime,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    ensure_invocation(&invocation, DENSE_GEGLU_TANH_OPERATION_ID)?;
+    if dense_geglu_projection(&invocation)?
+        != DenseGeGluProjection::CompressedTensorsSymmetricMarlin
+    {
+        return Err(
+            "symmetric compressed-tensors GeGLU encoder received another projection ABI".to_owned(),
+        );
+    }
+    let first = &invocation.participants()[0];
+    let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
+    let intermediate_size = unsigned_attribute(first.attributes(), "intermediate_size")?;
+    for participant in invocation.participants() {
+        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
+            || unsigned_attribute(participant.attributes(), "intermediate_size")?
+                != intermediate_size
+        {
+            return Err(
+                "symmetric compressed-tensors GeGLU participant attributes disagree".to_owned(),
+            );
+        }
+        validate_dense_geglu_tanh(
+            binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 2)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 3)?,
+            binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+            hidden_size,
+            intermediate_size,
+        )?;
+    }
+
+    let tokens = invocation.work_shape().immediate_tokens();
+    let scratch_layout = marlin_swiglu_scratch_layout(
+        tokens,
+        intermediate_size,
+        projection_runtime.workspace_bytes()?,
+    )?;
+    let mut regions = Vec::new();
+    let gate = push_shared_symmetric_compressed_tensors_weight(
+        &mut regions,
+        &invocation,
+        1,
+        &[intermediate_size, hidden_size],
+    )?;
+    let up = push_shared_symmetric_compressed_tensors_weight(
+        &mut regions,
+        &invocation,
+        2,
+        &[intermediate_size, hidden_size],
+    )?;
+    let down = push_shared_symmetric_compressed_tensors_weight(
+        &mut regions,
+        &invocation,
+        3,
+        &[hidden_size, intermediate_size],
+    )?;
+    let input_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let output_region = regions.len();
+    regions.push(shared_token_region(
+        &invocation,
+        ResolvedValueRole::Output,
+        0,
+        ElementType::F16,
+        tokens,
+    )?);
+    let scratch_region = regions.len();
+    regions.push(shared_scratch_region(
+        &invocation,
+        scratch_layout.required_bytes,
+    )?);
+
+    let rows = checked_i32(tokens, "symmetric compressed-tensors GeGLU token count")?;
+    let hidden = checked_i32(
+        hidden_size,
+        "symmetric compressed-tensors GeGLU hidden width",
+    )?;
+    let intermediate = checked_i32(
+        intermediate_size,
+        "symmetric compressed-tensors GeGLU intermediate width",
+    )?;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "symmetric compressed-tensors GeGLU participant count",
+    )?;
+    let gelu_tanh_mul = gelu_tanh_mul.clone();
+    let replay_key = dense_geglu_marlin_replay_key(
+        provider_fingerprint,
+        projection_runtime,
+        gate.group_size,
+        up.group_size,
+        down.group_size,
+        rows,
+        hidden,
+        intermediate,
+        scratch_layout,
+    );
+    CudaDeviceCommand::replayable_operation(
+        "vnext_dense_geglu_tanh_compressed_tensors_symmetric_marlin",
+        regions,
+        replay_key,
+        move |stream, regions| {
+            let scratch = &regions[scratch_region];
+            if scratch.length_bytes() < scratch_layout.required_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "symmetric compressed-tensors GeGLU scratch is smaller than admitted",
+                ));
+            }
+            let gate_output = scratch.device_ptr();
+            let up_output = gate_output
+                .checked_add(scratch_layout.activation_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "symmetric compressed-tensors GeGLU up pointer overflows",
+                    )
+                })?;
+            let activation = up_output
+                .checked_add(scratch_layout.activation_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "symmetric compressed-tensors GeGLU activation pointer overflows",
+                    )
+                })?;
+            let workspace = scratch
+                .device_ptr()
+                .checked_add(scratch_layout.workspace_offset)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "symmetric compressed-tensors GeGLU workspace pointer overflows",
+                    )
+                })?;
+            for (weight, output) in [(gate, gate_output), (up, up_output)] {
+                projection_runtime.launch(
+                    MarlinF16WeightType::U4B8,
+                    stream,
+                    regions[input_region].device_ptr(),
+                    regions[weight.packed_region].device_ptr(),
+                    regions[weight.scales_region].device_ptr(),
+                    None,
+                    output,
+                    workspace,
+                    scratch_layout.workspace_bytes,
+                    rows,
+                    intermediate,
+                    hidden,
+                    weight.group_size,
+                    "symmetric compressed-tensors GeGLU gate/up projection",
+                )?;
+            }
+            launch_planar_gelu_tanh_mul(
+                stream,
+                &gelu_tanh_mul,
+                gate_output,
+                up_output,
+                activation,
+                scratch_layout.activation_elements,
+            )?;
+            projection_runtime.launch(
+                MarlinF16WeightType::U4B8,
+                stream,
+                activation,
+                regions[down.packed_region].device_ptr(),
+                regions[down.scales_region].device_ptr(),
+                None,
+                regions[output_region].device_ptr(),
+                workspace,
+                scratch_layout.workspace_bytes,
+                rows,
+                hidden,
+                intermediate,
+                down.group_size,
+                "symmetric compressed-tensors GeGLU down projection",
+            )?;
+            Ok(())
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 4, 0)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn encode_dense_geglu_tanh(
+    provider_fingerprint: &str,
+    gelu_tanh_mul: &CudaFunction,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    ensure_invocation(&invocation, DENSE_GEGLU_TANH_OPERATION_ID)?;
+    if dense_geglu_projection(&invocation)? != DenseGeGluProjection::F16 {
+        return Err("dense F16 GeGLU encoder received another projection ABI".to_owned());
+    }
+    let first = &invocation.participants()[0];
+    let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
+    let intermediate_size = unsigned_attribute(first.attributes(), "intermediate_size")?;
+    for participant in invocation.participants() {
+        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
+            || unsigned_attribute(participant.attributes(), "intermediate_size")?
+                != intermediate_size
+        {
+            return Err("CUDA dense GeGLU participant attributes disagree".to_owned());
+        }
+        validate_dense_geglu_tanh(
+            binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 1)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 2)?,
+            binding(participant.bindings(), ResolvedValueRole::Input, 3)?,
+            binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+            hidden_size,
+            intermediate_size,
+        )?;
+    }
+
+    let token_count = invocation.work_shape().immediate_tokens();
+    let scratch_layout = dense_geglu_scratch_layout(token_count, intermediate_size)?;
+    let regions = vec![
+        shared_token_region(
+            &invocation,
+            ResolvedValueRole::Input,
+            0,
+            ElementType::F16,
+            token_count,
+        )?,
+        shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?,
+        shared_full_region(&invocation, ResolvedValueRole::Input, 2, ElementType::F16)?,
+        shared_full_region(&invocation, ResolvedValueRole::Input, 3, ElementType::F16)?,
+        shared_token_region(
+            &invocation,
+            ResolvedValueRole::Output,
+            0,
+            ElementType::F16,
+            token_count,
+        )?,
+        shared_scratch_region(&invocation, scratch_layout.required_bytes)?,
+    ];
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "dense GeGLU participant count",
+    )?;
+    let tokens = checked_i32(token_count, "dense GeGLU token count")?;
+    let hidden = checked_i32(hidden_size, "dense GeGLU hidden size")?;
+    let intermediate = checked_i32(intermediate_size, "dense GeGLU intermediate size")?;
+    let gelu_tanh_mul = gelu_tanh_mul.clone();
+    let replay_key =
+        CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_dense_geglu_tanh")
+            .i32(tokens)
+            .i32(hidden)
+            .i32(intermediate)
+            .u64(scratch_layout.activation_bytes)
+            .u64(scratch_layout.up_offset_bytes)
+            .u64(scratch_layout.activation_offset_bytes)
+            .u64(scratch_layout.required_bytes)
+            .finish();
+    CudaDeviceCommand::replayable_operation_with_blas(
+        "vnext_dense_geglu_tanh",
+        regions,
+        replay_key,
+        move |stream, blas, regions| {
+            let scratch = &regions[5];
+            if scratch.length_bytes() < scratch_layout.required_bytes {
+                return Err(CudaDeviceRuntimeError::contract(
+                    "vNext dense GeGLU scratch is smaller than its admitted estimate",
+                ));
+            }
+            let gate_output = scratch.device_ptr();
+            let up_output = gate_output
+                .checked_add(scratch_layout.up_offset_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract("vNext dense GeGLU up pointer overflows")
+                })?;
+            let activation = gate_output
+                .checked_add(scratch_layout.activation_offset_bytes)
+                .ok_or_else(|| {
+                    CudaDeviceRuntimeError::contract(
+                        "vNext dense GeGLU activation pointer overflows",
+                    )
+                })?;
+            for (weight_region, output, label) in [
+                (1_usize, gate_output, "vNext dense GeGLU gate GEMM"),
+                (2_usize, up_output, "vNext dense GeGLU up GEMM"),
+            ] {
+                launch_gemm_f16(
+                    blas,
+                    regions[0].device_ptr(),
+                    regions[weight_region].device_ptr(),
+                    output,
+                    tokens,
+                    intermediate,
+                    hidden,
+                    label,
+                )?;
+            }
+            launch_planar_gelu_tanh_mul(
+                stream,
+                &gelu_tanh_mul,
+                gate_output,
+                up_output,
+                activation,
+                scratch_layout.activation_elements,
+            )?;
+            launch_gemm_f16(
+                blas,
+                activation,
+                regions[3].device_ptr(),
+                regions[4].device_ptr(),
+                tokens,
+                hidden,
+                intermediate,
+                "vNext dense GeGLU down GEMM",
+            )?;
+            Ok(())
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(
+            DeviceBatchingForm::Packed,
+            participant_count,
+            token_count,
+            4,
+            0,
+        )
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn encode_constant_scale(
+    provider_fingerprint: &str,
+    function: &CudaFunction,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    ensure_invocation(&invocation, CONSTANT_SCALE_OPERATION_ID)?;
+    let first = &invocation.participants()[0];
+    let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
+    let scale_rational = canonical_rational_attribute(first.attributes(), "scale")?;
+    let scale = rational_attribute(first.attributes(), "scale")?;
+    for participant in invocation.participants() {
+        if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size
+            || canonical_rational_attribute(participant.attributes(), "scale")? != scale_rational
+        {
+            return Err("CUDA constant-scale participant attributes disagree".to_owned());
+        }
+        validate_constant_scale(
+            binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
+            binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
+            hidden_size,
+        )?;
+    }
+    let tokens = invocation.work_shape().immediate_tokens();
+    let elements = tokens
+        .checked_mul(hidden_size)
+        .ok_or_else(|| "CUDA constant-scale element count overflows".to_owned())?;
+    let input = shared_token_region(
+        &invocation,
+        ResolvedValueRole::Input,
+        0,
+        ElementType::F16,
+        tokens,
+    )?;
+    let output = shared_token_region(
+        &invocation,
+        ResolvedValueRole::Output,
+        0,
+        ElementType::F16,
+        tokens,
+    )?;
+    if !same_physical_region(&input, &output) {
+        return Err("CUDA constant-scale output does not exactly alias its input".to_owned());
+    }
+    let elements = checked_i32(elements, "constant-scale element count")?;
+    let grid_x = checked_u32(
+        u64::try_from(elements)
+            .map_err(|_| "constant-scale element count is negative".to_owned())?
+            .div_ceil(u64::from(THREADS_PER_BLOCK)),
+        "constant-scale launch grid",
+    )?;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "constant-scale participant count",
+    )?;
+    let function = function.clone();
+    let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_constant_scale")
+        .i32(elements)
+        .u32(grid_x)
+        .f32(scale)
+        .finish();
+    CudaDeviceCommand::replayable_operation(
+        "vnext_constant_scale",
+        vec![input],
+        replay_key,
+        move |stream, regions| {
+            let buffer = regions[0].device_ptr();
+            let mut builder = stream.launch_builder(&function);
+            builder.arg(&buffer);
+            builder.arg(&scale);
+            builder.arg(&elements);
+            unsafe {
+                builder.launch(LaunchConfig {
+                    grid_dim: (grid_x, 1, 1),
+                    block_dim: (THREADS_PER_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }
+            .map(|_| ())
+            .map_err(|error| CudaDeviceRuntimeError::driver("vNext constant-scale launch", error))
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(DeviceBatchingForm::Packed, participant_count, tokens, 1, 0)
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn encode_logit_softcap(
+    provider_fingerprint: &str,
+    function: &CudaFunction,
+    invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+) -> Result<CudaDeviceCommand, String> {
+    ensure_invocation(&invocation, LOGIT_SOFTCAP_OPERATION_ID)?;
+    let first = &invocation.participants()[0];
+    let vocabulary_size = unsigned_attribute(first.attributes(), "vocab_size")?;
+    let cap_rational = canonical_rational_attribute(first.attributes(), "cap")?;
+    let cap = rational_attribute(first.attributes(), "cap")?;
+    let mut regions = Vec::with_capacity(invocation.participants().len());
+    for participant in invocation.participants() {
+        if unsigned_attribute(participant.attributes(), "vocab_size")? != vocabulary_size
+            || canonical_rational_attribute(participant.attributes(), "cap")? != cap_rational
+        {
+            return Err("CUDA logit-softcap participant attributes disagree".to_owned());
+        }
+        let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
+        let output = binding(participant.bindings(), ResolvedValueRole::Output, 0)?;
+        validate_logit_softcap(input, output, vocabulary_size)?;
+        let input_region = contiguous_region(participant, input, ElementType::F16)?;
+        let output_region = contiguous_region(participant, output, ElementType::F16)?;
+        if !same_physical_region(&input_region, &output_region) {
+            return Err("CUDA logit-softcap output does not exactly alias its input".to_owned());
+        }
+        regions.push(input_region);
+    }
+    let elements = checked_i32(vocabulary_size, "logit-softcap vocabulary size")?;
+    let grid_x = checked_u32(
+        vocabulary_size.div_ceil(u64::from(THREADS_PER_BLOCK)),
+        "logit-softcap launch grid",
+    )?;
+    let participant_count = checked_u32(
+        invocation.participants().len() as u64,
+        "logit-softcap participant count",
+    )?;
+    let function = function.clone();
+    let replay_key = CudaCommandReplayKeyBuilder::new(provider_fingerprint, "vnext_logit_softcap")
+        .i32(elements)
+        .u32(grid_x)
+        .f32(cap)
+        .u32(participant_count)
+        .finish();
+    CudaDeviceCommand::replayable_operation(
+        "vnext_logit_softcap",
+        regions,
+        replay_key,
+        move |stream, regions| {
+            for region in regions {
+                let buffer = region.device_ptr();
+                let mut builder = stream.launch_builder(&function);
+                builder.arg(&buffer);
+                builder.arg(&cap);
+                builder.arg(&elements);
+                unsafe {
+                    builder.launch(LaunchConfig {
+                        grid_dim: (grid_x, 1, 1),
+                        block_dim: (THREADS_PER_BLOCK, 1, 1),
+                        shared_mem_bytes: 0,
+                    })
+                }
+                .map_err(|error| {
+                    CudaDeviceRuntimeError::driver("vNext logit-softcap launch", error)
+                })?;
+            }
+            Ok(())
+        },
+    )
+    .and_then(|command| {
+        command.with_work_attribution(
+            if participant_count == 1 {
+                DeviceBatchingForm::Scalar
+            } else {
+                DeviceBatchingForm::ParticipantLoop
+            },
+            participant_count,
+            u64::from(participant_count),
+            u64::from(participant_count),
+            0,
+        )
+    })
+    .map_err(|error| error.to_string())
+}
+
 fn encode_residual_add(
     provider_fingerprint: &str,
     function: &CudaFunction,
@@ -2699,6 +4001,35 @@ fn launch_planar_silu_mul(
     .map_err(|error| CudaDeviceRuntimeError::driver("Marlin SwiGLU activation launch", error))
 }
 
+fn launch_planar_gelu_tanh_mul(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    gate: cudarc::driver::sys::CUdeviceptr,
+    up: cudarc::driver::sys::CUdeviceptr,
+    output: cudarc::driver::sys::CUdeviceptr,
+    activation_elements: u64,
+) -> Result<(), CudaDeviceRuntimeError> {
+    let total = checked_i32_runtime(activation_elements, "dense GeGLU activation element count")?;
+    let grid_x = activation_elements
+        .div_ceil(u64::from(THREADS_PER_BLOCK))
+        .try_into()
+        .map_err(|_| CudaDeviceRuntimeError::contract("dense GeGLU launch grid exceeds u32"))?;
+    let mut builder = stream.launch_builder(function);
+    builder.arg(&gate);
+    builder.arg(&up);
+    builder.arg(&output);
+    builder.arg(&total);
+    unsafe {
+        builder.launch(LaunchConfig {
+            grid_dim: (grid_x, 1, 1),
+            block_dim: (THREADS_PER_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .map(|_| ())
+    .map_err(|error| CudaDeviceRuntimeError::driver("vNext dense GeGLU activation launch", error))
+}
+
 fn validate_rms_norm(
     input: &ResolvedValueBinding,
     weight: &ResolvedValueBinding,
@@ -2765,6 +4096,105 @@ fn validate_dense_swiglu(
         return Err("CUDA dense SwiGLU invocation differs from its resolved signature".to_owned());
     }
     Ok(*tokens)
+}
+
+fn dense_geglu_dimensions_match(
+    input: &[u64],
+    gate: &[u64],
+    up: &[u64],
+    down: &[u64],
+    output: &[u64],
+    hidden_size: u64,
+    intermediate_size: u64,
+) -> bool {
+    let [tokens, input_hidden] = input else {
+        return false;
+    };
+    *input_hidden == hidden_size
+        && gate == [intermediate_size, hidden_size]
+        && up == [intermediate_size, hidden_size]
+        && down == [hidden_size, intermediate_size]
+        && output == [*tokens, hidden_size]
+}
+
+fn validate_dense_geglu_tanh(
+    input: &ResolvedValueBinding,
+    gate: &ResolvedValueBinding,
+    up: &ResolvedValueBinding,
+    down: &ResolvedValueBinding,
+    output: &ResolvedValueBinding,
+    hidden_size: u64,
+    intermediate_size: u64,
+) -> Result<u64, String> {
+    if !dense_geglu_dimensions_match(
+        input.tensor().dimensions(),
+        gate.tensor().dimensions(),
+        up.tensor().dimensions(),
+        down.tensor().dimensions(),
+        output.tensor().dimensions(),
+        hidden_size,
+        intermediate_size,
+    ) || !f16_contiguous(input)
+        || !f16_contiguous(gate)
+        || !f16_contiguous(up)
+        || !f16_contiguous(down)
+        || !f16_contiguous(output)
+    {
+        return Err("CUDA dense GeGLU invocation differs from its resolved signature".to_owned());
+    }
+    Ok(input.tensor().dimensions()[0])
+}
+
+fn constant_scale_dimensions_match(input: &[u64], output: &[u64], hidden_size: u64) -> bool {
+    let [tokens, input_hidden] = input else {
+        return false;
+    };
+    *input_hidden == hidden_size && output == [*tokens, hidden_size]
+}
+
+fn validate_constant_scale(
+    input: &ResolvedValueBinding,
+    output: &ResolvedValueBinding,
+    hidden_size: u64,
+) -> Result<u64, String> {
+    if !constant_scale_dimensions_match(
+        input.tensor().dimensions(),
+        output.tensor().dimensions(),
+        hidden_size,
+    ) || !f16_contiguous(input)
+        || !f16_contiguous(output)
+        || input.storage() != output.storage()
+    {
+        return Err(
+            "CUDA constant-scale invocation differs from its resolved in-place signature"
+                .to_owned(),
+        );
+    }
+    Ok(input.tensor().dimensions()[0])
+}
+
+fn logit_softcap_dimensions_match(input: &[u64], output: &[u64], vocabulary_size: u64) -> bool {
+    input == [1, vocabulary_size] && output == [1, vocabulary_size]
+}
+
+fn validate_logit_softcap(
+    input: &ResolvedValueBinding,
+    output: &ResolvedValueBinding,
+    vocabulary_size: u64,
+) -> Result<(), String> {
+    if !logit_softcap_dimensions_match(
+        input.tensor().dimensions(),
+        output.tensor().dimensions(),
+        vocabulary_size,
+    ) || !f16_contiguous(input)
+        || !f16_contiguous(output)
+        || input.storage() != output.storage()
+    {
+        return Err(
+            "CUDA logit-softcap invocation differs from its resolved in-place signature".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_residual_add(
@@ -2973,14 +4403,7 @@ fn rational_attribute(
     attributes: &BTreeMap<AttributeId, SemanticValue>,
     name: &str,
 ) -> Result<f32, String> {
-    let rational = match attributes
-        .iter()
-        .find(|(attribute, _)| attribute.as_str() == name)
-        .map(|(_, value)| value)
-    {
-        Some(SemanticValue::Rational(value)) => *value,
-        _ => return Err(format!("CUDA provider lacks rational attribute {name:?}")),
-    };
+    let rational = canonical_rational_attribute(attributes, name)?;
     let value = rational.numerator() as f64 / rational.denominator() as f64;
     let value = value as f32;
     if !value.is_finite() || value <= 0.0 {
@@ -2989,6 +4412,20 @@ fn rational_attribute(
         ));
     }
     Ok(value)
+}
+
+fn canonical_rational_attribute(
+    attributes: &BTreeMap<AttributeId, SemanticValue>,
+    name: &str,
+) -> Result<CanonicalRational, String> {
+    match attributes
+        .iter()
+        .find(|(attribute, _)| attribute.as_str() == name)
+        .map(|(_, value)| value)
+    {
+        Some(SemanticValue::Rational(value)) => Ok(*value),
+        _ => Err(format!("CUDA provider lacks rational attribute {name:?}")),
+    }
 }
 
 fn checked_i32(value: u64, context: &str) -> Result<i32, String> {

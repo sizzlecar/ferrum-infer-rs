@@ -82,6 +82,25 @@ extern "C" __global__ void fused_gelu_tanh_mul_interleaved_f16(
     }
 }
 
+// Planar GeGLU variant for independent gate and up projections.
+// output[i] = gelu_tanh(gate[i]) * up[i].
+extern "C" __global__ void fused_gelu_tanh_mul_f16(
+    const __half* __restrict__ gate,
+    const __half* __restrict__ up,
+    __half* __restrict__ output,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float g = __half2float(gate[idx]);
+        float u = __half2float(up[idx]);
+        float inner = 0.7978845608f * (g + 0.044715f * g * g * g);
+        inner = fminf(fmaxf(inner, -9.5f), 9.5f);
+        float gelu_g = 0.5f * g * (1.0f + tanhf(inner));
+        output[idx] = __float2half(gelu_g * u);
+    }
+}
+
 // In-place scalar scale (Gemma embedding x sqrt(hidden)). The trait's
 // host-roundtrip default would rebuild the buffer as F32 and flip the
 // CUDA lane's f16 dtype — this kernel keeps it on-device and typed.
@@ -93,5 +112,19 @@ extern "C" __global__ void scale_inplace_f16(
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         buf[idx] = __float2half(__half2float(buf[idx]) * scale);
+    }
+}
+
+// In-place final-logit softcap used by Gemma-family output heads.
+// buf[i] = cap * tanh(buf[i] / cap).
+extern "C" __global__ void logit_softcap_inplace_f16(
+    __half* __restrict__ buf,
+    const float cap,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float value = __half2float(buf[idx]);
+        buf[idx] = __float2half(cap * tanhf(value / cap));
     }
 }

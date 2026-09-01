@@ -12,9 +12,55 @@
 #include <stdint.h>
 
 #define VNEXT_WARP_SIZE 32
-#define VNEXT_MAX_HEAD_CHUNKS 8
+#define VNEXT_MAX_HEAD_CHUNKS 16
 #define VNEXT_VLLM_BLOCK_TOKENS 16
 #define VNEXT_VLLM_K_PACK 8
+#define VNEXT_GROUPED_DEFAULT_KV_TILE_TOKENS 16
+#define VNEXT_GROUPED_GEMMA_LOCAL_KV_TILE_TOKENS 32
+
+// A non-zero binding stride selects packed multi-participant execution. Each
+// participant owns one binding slot containing six control words followed by
+// its aligned addressed page table. Control word four is its token-major
+// packed offset, so every block resolves its participant in O(1).
+__device__ __forceinline__ const int* vnext_participant_control(
+    const int* __restrict__ binding_base,
+    const unsigned long long binding_slot_bytes,
+    const int participant) {
+  const char* binding_bytes = reinterpret_cast<const char*>(binding_base);
+  return reinterpret_cast<const int*>(
+      binding_bytes + (unsigned long long)participant * binding_slot_bytes);
+}
+
+// Packed query rows are contiguous even when their owning sequences have
+// different active-token counts. Resolve a packed row with a bounded binary
+// search over the stable binding slots so grid.x can be the packed token axis;
+// grid.z remains available for a future KV segment/split-K axis.
+__device__ __forceinline__ int vnext_packed_participant(
+    const int* __restrict__ binding_base,
+    const unsigned long long binding_slot_bytes,
+    const int participant_count,
+    const int packed_token) {
+  int low = 0;
+  int high = participant_count;
+  while (low < high) {
+    const int middle = low + (high - low) / 2;
+    const int* middle_control = vnext_participant_control(
+        binding_base, binding_slot_bytes, middle);
+    if (middle_control[4] <= packed_token) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+  const int participant = low - 1;
+  if (participant < 0) return -1;
+  const int* participant_control = vnext_participant_control(
+      binding_base, binding_slot_bytes, participant);
+  const int local_token = packed_token - participant_control[4];
+  return local_token >= 0 && local_token < participant_control[2]
+             ? participant
+             : -1;
+}
 
 __device__ __forceinline__ __half* vnext_paged_element(
     const unsigned long long* __restrict__ page_pointers,
@@ -188,16 +234,29 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const int kv_heads,
     const int head_dim,
     const int rope_dim,
+    const int rope_frequency_denominator,
     const int query_projection_stride,
     const int query_head_stride,
     const int kv_projection_stride,
     const float epsilon,
     const float rope_theta,
-    const int rope_interleaved) {
+    const int rope_interleaved,
+    const int value_rms_norm,
+    const unsigned long long binding_slot_bytes) {
+  const int participant = blockIdx.z;
+  if (binding_slot_bytes != 0) {
+    control = vnext_participant_control(
+        control, binding_slot_bytes, participant);
+    page_pointers = reinterpret_cast<const unsigned long long*>(
+        reinterpret_cast<const char*>(page_pointers) +
+        (unsigned long long)participant * binding_slot_bytes);
+  }
+  const int packed_token_start = binding_slot_bytes == 0 ? 0 : control[4];
   const int page_count = control[0];
   const int position_start = control[1];
   const int tokens = control[2];
   const int token = blockIdx.x;
+  const int packed_token = packed_token_start + token;
   const int combined_head = blockIdx.y;
   const int lane = threadIdx.x;
   const int total_heads = query_heads + 2 * kv_heads;
@@ -214,15 +273,30 @@ extern "C" __global__ void vnext_causal_prepare_f16(
 
   if (!is_query && !is_key) {
     const __half* source =
-        value_raw + (long long)token * kv_projection_stride + head * head_dim;
+        value_raw + (long long)packed_token * kv_projection_stride +
+        head * head_dim;
+    float norm_scale = 1.0f;
+    if (value_rms_norm != 0) {
+      float sum_squares = 0.0f;
+      for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+        const float value = __half2float(source[dim]);
+        sum_squares += value * value;
+      }
+      sum_squares = warp_reduce_sum(sum_squares);
+      norm_scale = rsqrtf(sum_squares / (float)head_dim + epsilon);
+    }
     for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+      const __half value =
+          value_rms_norm != 0
+              ? __float2half(__half2float(source[dim]) * norm_scale)
+              : source[dim];
       if (kv_layout != 0) {
         vnext_store_vllm_kv(page_pointers, page_count, absolute_position, 1,
-                            head, dim, kv_heads, head_dim, source[dim]);
+                            head, dim, kv_heads, head_dim, value);
       } else {
         vnext_store_kv(page_pointers, page_count, page_elements,
                        absolute_position, 1, head, dim, kv_heads, head_dim,
-                       source[dim]);
+                       value);
       }
     }
     return;
@@ -230,10 +304,12 @@ extern "C" __global__ void vnext_causal_prepare_f16(
 
   const __half* source = is_query
                              ? query_raw +
-                                   (long long)token * query_projection_stride +
+                                   (long long)packed_token *
+                                       query_projection_stride +
                                    head * query_head_stride
                              : key_raw +
-                                   (long long)token * kv_projection_stride +
+                                   (long long)packed_token *
+                                       kv_projection_stride +
                                    head * head_dim;
   const __half* weight = is_query ? query_norm_weight : key_norm_weight;
   float sum_squares = 0.0f;
@@ -244,6 +320,7 @@ extern "C" __global__ void vnext_causal_prepare_f16(
   sum_squares = warp_reduce_sum(sum_squares);
   const float norm_scale = rsqrtf(sum_squares / (float)head_dim + epsilon);
   const int half_rope = rope_dim / 2;
+  const int neox_half = head_dim / 2;
 
   if (rope_interleaved != 0) {
     for (int pair = lane; pair < half_rope; pair += VNEXT_WARP_SIZE) {
@@ -253,7 +330,8 @@ extern "C" __global__ void vnext_causal_prepare_f16(
                        __half2float(weight[low]);
       const float x1 = __half2float(source[high]) * norm_scale *
                        __half2float(weight[high]);
-      const float exponent = -(2.0f * pair) / (float)rope_dim;
+      const float exponent =
+          -(2.0f * pair) / (float)rope_frequency_denominator;
       const float angle =
           absolute_position * powf(rope_theta, exponent);
       float sine = 0.0f;
@@ -261,22 +339,28 @@ extern "C" __global__ void vnext_causal_prepare_f16(
       sincosf(angle, &sine, &cosine);
       vnext_store_prepared_value(
           query, page_pointers, page_count, page_elements, kv_layout, is_query,
-          token, absolute_position, head, low, query_heads, kv_heads, head_dim,
-          x0 * cosine - x1 * sine);
+          packed_token, absolute_position, head, low, query_heads, kv_heads,
+          head_dim, x0 * cosine - x1 * sine);
       vnext_store_prepared_value(
           query, page_pointers, page_count, page_elements, kv_layout, is_query,
-          token, absolute_position, head, high, query_heads, kv_heads, head_dim,
-          x1 * cosine + x0 * sine);
+          packed_token, absolute_position, head, high, query_heads, kv_heads,
+          head_dim, x1 * cosine + x0 * sine);
     }
   } else {
     for (int pair = lane; pair < half_rope; pair += VNEXT_WARP_SIZE) {
       const int low = pair;
-      const int high = pair + half_rope;
+      // Gemma 4 proportional partial RoPE pads the inactive frequencies to
+      // head_dim/2 and then applies the standard NeoX half split. Therefore
+      // an active pair mixes [pair, pair + head_dim/2], not
+      // [pair, pair + rope_dim/2]. Full-width RoPE is unchanged because the
+      // two offsets are equal in that case.
+      const int high = pair + neox_half;
       const float x0 = __half2float(source[low]) * norm_scale *
                        __half2float(weight[low]);
       const float x1 = __half2float(source[high]) * norm_scale *
                        __half2float(weight[high]);
-      const float exponent = -(2.0f * pair) / (float)rope_dim;
+      const float exponent =
+          -(2.0f * pair) / (float)rope_frequency_denominator;
       const float angle =
           absolute_position * powf(rope_theta, exponent);
       float sine = 0.0f;
@@ -284,22 +368,30 @@ extern "C" __global__ void vnext_causal_prepare_f16(
       sincosf(angle, &sine, &cosine);
       vnext_store_prepared_value(
           query, page_pointers, page_count, page_elements, kv_layout, is_query,
-          token, absolute_position, head, low, query_heads, kv_heads, head_dim,
-          x0 * cosine - x1 * sine);
+          packed_token, absolute_position, head, low, query_heads, kv_heads,
+          head_dim, x0 * cosine - x1 * sine);
       vnext_store_prepared_value(
           query, page_pointers, page_count, page_elements, kv_layout, is_query,
-          token, absolute_position, head, high, query_heads, kv_heads, head_dim,
-          x1 * cosine + x0 * sine);
+          packed_token, absolute_position, head, high, query_heads, kv_heads,
+          head_dim, x1 * cosine + x0 * sine);
     }
   }
 
-  for (int dim = rope_dim + lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+  for (int dim = lane; dim < head_dim; dim += VNEXT_WARP_SIZE) {
+    const bool rotated = rope_interleaved != 0
+                             ? dim < rope_dim
+                             : dim < half_rope ||
+                                   (dim >= neox_half &&
+                                    dim < neox_half + half_rope);
+    if (rotated) {
+      continue;
+    }
     const float value = __half2float(source[dim]) * norm_scale *
                         __half2float(weight[dim]);
     vnext_store_prepared_value(
         query, page_pointers, page_count, page_elements, kv_layout, is_query,
-        token, absolute_position, head, dim, query_heads, kv_heads, head_dim,
-        value);
+        packed_token, absolute_position, head, dim, query_heads, kv_heads,
+        head_dim, value);
   }
 }
 
@@ -315,11 +407,24 @@ extern "C" __global__ void vnext_causal_attention_f16(
     const int kv_heads,
     const int head_dim,
     const int query_projection_stride,
-    const int output_gate) {
+    const int output_gate,
+    const float attention_scale,
+    const int sliding_window,
+    const unsigned long long binding_slot_bytes) {
+  const int participant = blockIdx.z;
+  if (binding_slot_bytes != 0) {
+    control = vnext_participant_control(
+        control, binding_slot_bytes, participant);
+    page_pointers = reinterpret_cast<const unsigned long long*>(
+        reinterpret_cast<const char*>(page_pointers) +
+        (unsigned long long)participant * binding_slot_bytes);
+  }
+  const int packed_token_start = binding_slot_bytes == 0 ? 0 : control[4];
   const int page_count = control[0];
   const int position_start = control[1];
   const int tokens = control[2];
   const int token = blockIdx.x;
+  const int packed_token = packed_token_start + token;
   const int query_head = blockIdx.y;
   const int lane = threadIdx.x;
   if (token >= tokens || query_head >= query_heads || lane >= VNEXT_WARP_SIZE)
@@ -335,16 +440,21 @@ extern "C" __global__ void vnext_causal_attention_f16(
     const int dim = lane + chunk * VNEXT_WARP_SIZE;
     query_values[chunk] =
         dim < head_dim
-            ? __half2float(query[((long long)token * query_heads + query_head) *
-                                 head_dim + dim])
+            ? __half2float(query[((long long)packed_token * query_heads +
+                                  query_head) *
+                                     head_dim +
+                                 dim])
             : 0.0f;
     accumulated[chunk] = 0.0f;
   }
 
   float running_max = -CUDART_INF_F;
   float running_sum = 0.0f;
-  const float attention_scale = rsqrtf((float)head_dim);
-  for (int key_position = 0; key_position <= absolute_position;
+  const int key_start =
+      sliding_window > 0
+          ? max(0, absolute_position - sliding_window + 1)
+          : 0;
+  for (int key_position = key_start; key_position <= absolute_position;
        ++key_position) {
     float partial_dot = 0.0f;
 #pragma unroll
@@ -393,13 +503,180 @@ extern "C" __global__ void vnext_causal_attention_f16(
       float value = accumulated[chunk] * inverse_sum;
       if (output_gate != 0) {
         const long long gate_index =
-            (long long)token * query_projection_stride +
+            (long long)packed_token * query_projection_stride +
             query_head * (2 * head_dim) + head_dim + dim;
         const float gate = __half2float(query_raw[gate_index]);
         value *= 1.0f / (1.0f + expf(-gate));
       }
-      output[((long long)token * query_heads + query_head) * head_dim + dim] =
-          __float2half(value);
+      output[((long long)packed_token * query_heads + query_head) * head_dim +
+             dim] = __float2half(value);
+    }
+  }
+}
+
+// Decode-oriented grouped-query fallback. One block owns one packed query
+// token and one KV head; its warps own the GQA query heads that share that KV
+// head. K/V are loaded once per tile into shared memory instead of once per Q
+// head. This follows the same packed-token/KV-head launch decomposition as
+// vLLM unified attention while retaining Ferrum's two supported cache layouts.
+extern "C" __global__ void vnext_causal_attention_grouped_f16(
+    const __half* __restrict__ query,
+    const __half* __restrict__ query_raw,
+    const int* __restrict__ control,
+    const unsigned long long* __restrict__ page_pointers,
+    __half* __restrict__ output,
+    const int page_elements,
+    const int kv_layout,
+    const int query_heads,
+    const int kv_heads,
+    const int head_dim,
+    const int query_projection_stride,
+    const int output_gate,
+    const float attention_scale,
+    const int sliding_window,
+    const unsigned long long binding_slot_bytes,
+    const int packed_participant_count) {
+  const int packed_token = (int)blockIdx.x;
+  int local_token = packed_token;
+  if (binding_slot_bytes != 0) {
+    const int participant = vnext_packed_participant(
+        control, binding_slot_bytes, packed_participant_count, packed_token);
+    if (participant < 0) return;
+    control = vnext_participant_control(
+        control, binding_slot_bytes, participant);
+    page_pointers = reinterpret_cast<const unsigned long long*>(
+        reinterpret_cast<const char*>(page_pointers) +
+        (unsigned long long)participant * binding_slot_bytes);
+    local_token = packed_token - control[4];
+  }
+
+  if (kv_heads <= 0 || query_heads % kv_heads != 0) return;
+  const int queries_per_kv = query_heads / kv_heads;
+  const int query_in_group = threadIdx.x / VNEXT_WARP_SIZE;
+  const int lane = threadIdx.x % VNEXT_WARP_SIZE;
+  const int kv_head = (int)blockIdx.y;
+  if (query_in_group >= queries_per_kv || kv_head >= kv_heads) return;
+
+  const int page_count = control[0];
+  const int position_start = control[1];
+  const int tokens = control[2];
+  if (local_token < 0 || local_token >= tokens) return;
+
+  const int query_head = kv_head * queries_per_kv + query_in_group;
+  const int absolute_position = position_start + local_token;
+  float query_values[VNEXT_MAX_HEAD_CHUNKS];
+  float accumulated[VNEXT_MAX_HEAD_CHUNKS];
+
+#pragma unroll
+  for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * VNEXT_WARP_SIZE;
+    query_values[chunk] =
+        dim < head_dim
+            ? __half2float(query[((long long)packed_token * query_heads +
+                                  query_head) *
+                                     head_dim +
+                                 dim])
+            : 0.0f;
+    accumulated[chunk] = 0.0f;
+  }
+
+  extern __shared__ __half grouped_kv_tile[];
+  const int kv_tile_tokens =
+      head_dim == 256 && sliding_window == 1024
+          ? VNEXT_GROUPED_GEMMA_LOCAL_KV_TILE_TOKENS
+          : VNEXT_GROUPED_DEFAULT_KV_TILE_TOKENS;
+  __half* shared_keys = grouped_kv_tile;
+  __half* shared_values =
+      grouped_kv_tile + kv_tile_tokens * head_dim;
+
+  float running_max = -CUDART_INF_F;
+  float running_sum = 0.0f;
+  const int key_start =
+      sliding_window > 0
+          ? max(0, absolute_position - sliding_window + 1)
+          : 0;
+  for (int tile_start = key_start; tile_start <= absolute_position;
+       tile_start += kv_tile_tokens) {
+    const int tile_tokens =
+        min(kv_tile_tokens, absolute_position - tile_start + 1);
+    const int tile_elements = tile_tokens * head_dim;
+    for (int element = threadIdx.x; element < tile_elements;
+         element += blockDim.x) {
+      const int tile_token = element / head_dim;
+      const int dim = element - tile_token * head_dim;
+      const int key_position = tile_start + tile_token;
+      const float key =
+          kv_layout != 0
+              ? vnext_load_vllm_kv(page_pointers, page_count, key_position, 0,
+                                   kv_head, dim, kv_heads, head_dim)
+              : vnext_load_kv(page_pointers, page_count, page_elements,
+                              key_position, 0, kv_head, dim, kv_heads,
+                              head_dim);
+      const float value =
+          kv_layout != 0
+              ? vnext_load_vllm_kv(page_pointers, page_count, key_position, 1,
+                                   kv_head, dim, kv_heads, head_dim)
+              : vnext_load_kv(page_pointers, page_count, page_elements,
+                              key_position, 1, kv_head, dim, kv_heads,
+                              head_dim);
+      shared_keys[element] = __float2half(key);
+      shared_values[element] = __float2half(value);
+    }
+    __syncthreads();
+
+    for (int tile_token = 0; tile_token < tile_tokens; ++tile_token) {
+      float partial_dot = 0.0f;
+#pragma unroll
+      for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+        const int dim = lane + chunk * VNEXT_WARP_SIZE;
+        if (dim < head_dim) {
+          partial_dot +=
+              query_values[chunk] *
+              __half2float(shared_keys[tile_token * head_dim + dim]);
+        }
+      }
+      const float score = warp_reduce_sum(partial_dot) * attention_scale;
+      const float next_max = fmaxf(running_max, score);
+      float previous_scale = 0.0f;
+      float value_scale = 0.0f;
+      if (lane == 0) {
+        previous_scale =
+            isinf(running_max) ? 0.0f : expf(running_max - next_max);
+        value_scale = expf(score - next_max);
+      }
+      previous_scale = __shfl_sync(0xffffffff, previous_scale, 0);
+      value_scale = __shfl_sync(0xffffffff, value_scale, 0);
+      running_sum = running_sum * previous_scale + value_scale;
+#pragma unroll
+      for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+        const int dim = lane + chunk * VNEXT_WARP_SIZE;
+        if (dim < head_dim) {
+          const float value = __half2float(
+              shared_values[tile_token * head_dim + dim]);
+          accumulated[chunk] = accumulated[chunk] * previous_scale +
+                               value * value_scale;
+        }
+      }
+      running_max = next_max;
+    }
+    __syncthreads();
+  }
+
+  const float inverse_sum = 1.0f / running_sum;
+#pragma unroll
+  for (int chunk = 0; chunk < VNEXT_MAX_HEAD_CHUNKS; ++chunk) {
+    const int dim = lane + chunk * VNEXT_WARP_SIZE;
+    if (dim < head_dim) {
+      float value = accumulated[chunk] * inverse_sum;
+      if (output_gate != 0) {
+        const long long gate_index =
+            (long long)packed_token * query_projection_stride +
+            query_head * (2 * head_dim) + head_dim + dim;
+        const float gate = __half2float(query_raw[gate_index]);
+        value *= 1.0f / (1.0f + expf(-gate));
+      }
+      output[((long long)packed_token * query_heads + query_head) * head_dim +
+             dim] = __float2half(value);
     }
   }
 }

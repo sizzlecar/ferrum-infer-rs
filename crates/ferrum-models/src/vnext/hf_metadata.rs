@@ -102,10 +102,16 @@ fn parse_special_tokens_with_generation(
     tokenizer_config: &Value,
     generation_config: &Map<String, Value>,
 ) -> Result<SpecialTokenMetadata, String> {
-    let bos_token_id = generation_token_id(generation_config, "bos_token_id", tokenizer_config)?
-        .or(token_id(model_config, tokenizer_config, "bos_token")?);
-    let pad_token_id = generation_token_id(generation_config, "pad_token_id", tokenizer_config)?
-        .or(token_id(model_config, tokenizer_config, "pad_token")?);
+    let bos_token_id =
+        match generation_token_id(generation_config, "bos_token_id", tokenizer_config)? {
+            Some(token_id) => Some(token_id),
+            None => token_id(model_config, tokenizer_config, "bos_token")?,
+        };
+    let pad_token_id =
+        match generation_token_id(generation_config, "pad_token_id", tokenizer_config)? {
+            Some(token_id) => Some(token_id),
+            None => token_id(model_config, tokenizer_config, "pad_token")?,
+        };
     let eos_value = generation_config
         .get("eos_token_id")
         .ok_or_else(|| "generation_config.json missing eos_token_id".to_owned())?;
@@ -255,7 +261,12 @@ mod tests {
     #[test]
     fn external_harmony_template_uses_generation_terminal_set() {
         let model = json!({"eos_token_id": 200002, "pad_token_id": 199999});
-        let tokenizer = br#"{"chat_template":null}"#;
+        let tokenizer = br#"{
+            "chat_template": null,
+            "bos_token": "<bos>",
+            "eos_token": "<eos>",
+            "pad_token": "<pad>"
+        }"#;
         let generation = br#"{
             "bos_token_id": 199998,
             "eos_token_id": [200002, 199999, 200012],
