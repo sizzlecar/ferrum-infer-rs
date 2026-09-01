@@ -139,7 +139,7 @@ struct ServerFixture {
 }
 
 impl ServerFixture {
-    async fn spawn(model_dir: &Path, log_root: &Path) -> Self {
+    async fn spawn(model_dir: &Path, log_root: &Path, profile_detail: &str) -> Self {
         let port = free_port();
         let url = format!("http://127.0.0.1:{port}");
         let stdout_path = log_root.join("serve.stdout.log");
@@ -154,7 +154,7 @@ impl ServerFixture {
             .args(["--disable-thinking", "--port", &port.to_string()])
             .args(["--served-model-name", MODEL_NAME])
             .args(["--max-num-seqs", "32", "--max-num-batched-tokens", "64"])
-            .args(["--profile-detail", "replay", "--profile-jsonl"])
+            .args(["--profile-detail", profile_detail, "--profile-jsonl"])
             .arg(&profile_path)
             .args(["--profile-concurrency", "32"])
             .env("NO_COLOR", "1")
@@ -842,7 +842,7 @@ async fn gemma4_tiny_cuda_run_and_serve_e2e() {
     run_entrypoint(&model_dir, fixture.path());
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
 
-    let server = ServerFixture::spawn(&model_dir, fixture.path()).await;
+    let server = ServerFixture::spawn(&model_dir, fixture.path(), "replay").await;
     let c1_started = Instant::now();
     let (status, body) = stream_chat(server.chat_url())
         .await
@@ -899,15 +899,55 @@ async fn gemma4_tiny_cuda_run_and_serve_e2e() {
         server.profile()
     );
     eprintln!("GEMMA4 CUDA E2E max_profile_participants={maximum_participants}");
-    let native_work = packed_native_work_summary(&server.profile(), 32);
-    assert!(
-        native_work
-            .iter()
-            .any(|(operation, _, _)| operation == "vnext.causal_attention.token_major_fallback"),
-        "profile never observed packed Gemma4 attention work: {native_work:?}"
-    );
-    eprintln!("GEMMA4 CUDA E2E c=32 packed_native_work={native_work:?}");
     assert_clean_logs("ferrum serve logs", &server.logs());
+    drop(server);
+    assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires a CUDA GPU and vllm-moe-marlin; run explicitly on panda-pad"]
+async fn gemma4_tiny_cuda_kernel_profile() {
+    assert!(
+        cfg!(all(feature = "cuda", feature = "vllm-moe-marlin")),
+        "build this test with --features cuda,vllm-moe-marlin,vllm-paged-attn-v2"
+    );
+    let (fixture, model_dir) = generate_fixture();
+    let server = ServerFixture::spawn(&model_dir, fixture.path(), "kernel").await;
+
+    let started = Instant::now();
+    let mut requests = tokio::task::JoinSet::new();
+    for _ in 0..32 {
+        requests.spawn(stream_chat(server.chat_url()));
+    }
+    let mut completed = 0;
+    while let Some(result) = requests.join_next().await {
+        let (status, body) = result
+            .unwrap_or_else(|error| panic!("c=32 stream task failed: {error}; {}", server.logs()))
+            .unwrap_or_else(|error| panic!("{error}; {}", server.logs()));
+        assert_stream_response("ferrum serve kernel profile c=32 stream", status, &body);
+        completed += 1;
+    }
+    assert_eq!(completed, 32);
+
+    let maximum_participants = wait_for_profile_participants(&server, 32).await;
+    assert_eq!(maximum_participants, 32, "kernel profile missed c=32");
+    let native_work = packed_native_work_summary(&server.profile(), 32);
+    for operation in [
+        "vnext.causal_attention.token_major_fallback",
+        "vnext.causal_attention.vllm_addressed_fallback",
+    ] {
+        assert!(
+            native_work
+                .iter()
+                .any(|(observed, _, _)| observed == operation),
+            "kernel profile missed packed {operation}: {native_work:?}"
+        );
+    }
+    eprintln!(
+        "GEMMA4 CUDA KERNEL PROFILE c=32 elapsed_ms={} packed_native_work={native_work:?}",
+        started.elapsed().as_millis()
+    );
+    assert_clean_logs("ferrum serve kernel profile logs", &server.logs());
     drop(server);
     assert_eq!(LIVE_CHILDREN.load(Ordering::Acquire), 0);
 }
