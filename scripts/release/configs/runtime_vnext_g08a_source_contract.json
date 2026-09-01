@@ -226,9 +226,9 @@
 	        "family_registration": {
             "path": "crates/ferrum-models/src/vnext/mod.rs",
             "symbol": "qwen35_family_registration",
-            "line_hint": 88,
+            "line_hint": 97,
             "owner": "ferrum-models/vnext-product-registry",
-            "reviewed_at_git_sha": "8471bd98f1d15ffc255ba0dcfb6581fd919be35e",
+            "reviewed_at_git_sha": "4e9b939f1d8e47a6d90a3fa811f8595ddcda59d9",
             "required_fragments": [
                 "Qwen35FamilyProvider::new",
                 "TypedFamilyRegistration::new"
@@ -237,9 +237,9 @@
 	        "registration_resolution": {
 	            "path": "crates/ferrum-models/src/vnext/mod.rs",
 	            "symbol": "resolve_registered_model",
-	            "line_hint": 788,
+	            "line_hint": 797,
 	            "owner": "ferrum-models/vnext-product-registry",
-	            "reviewed_at_git_sha": "8471bd98f1d15ffc255ba0dcfb6581fd919be35e",
+	            "reviewed_at_git_sha": "4e9b939f1d8e47a6d90a3fa811f8595ddcda59d9",
 	            "required_fragments": [
 	                "MODEL_LOADERS.iter",
 	                "LEGACY_MODELS",
