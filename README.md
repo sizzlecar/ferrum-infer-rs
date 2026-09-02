@@ -26,6 +26,8 @@ brew install ferrum-cuda
 Inspect the installed binary before downloading weights:
 
 ```bash
+ferrum --version
+ferrum --help
 ferrum doctor
 ```
 

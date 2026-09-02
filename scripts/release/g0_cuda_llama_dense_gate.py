@@ -8,8 +8,10 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -41,6 +43,7 @@ BENCH_QUALITY_COUNT_FIELDS = (
     "http_500_per_run",
     "panic_per_run",
 )
+RELEASE_CONCURRENCY_CELLS = {1, 4, 16, 32}
 
 
 def run(
@@ -91,6 +94,192 @@ def validate_bench_quality(report: dict[str, Any], *, label: str) -> dict[str, i
             raise RuntimeError(f"{label}: {field} total={total} values={values!r}")
         counts[field.removesuffix("_per_run")] = total
     return counts
+
+
+def validate_artifact(root: Path, *, expected_git_sha: str | None = None) -> dict[str, Any]:
+    """Read-only validation of a copied dense CUDA G0 artifact."""
+
+    root = root.resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise RuntimeError(f"dense artifact root is invalid: {root}")
+    gate_path = root / "gate.json"
+    metadata_path = root / "metadata.json"
+    if not gate_path.is_file() or gate_path.is_symlink() or not metadata_path.is_file() or metadata_path.is_symlink():
+        raise RuntimeError("dense gate/metadata artifact is missing")
+    gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if gate.get("status") != "pass" or gate.get("lane") != "g0_cuda4090_llama_dense":
+        raise RuntimeError("dense gate status/lane differs")
+    if metadata.get("model_architecture") != "llama_dense" or metadata.get("git_dirty") is not False:
+        raise RuntimeError("dense metadata architecture/dirty state differs")
+    git_sha = metadata.get("git_sha")
+    if not isinstance(git_sha, str) or re.fullmatch(r"[0-9a-f]{40}", git_sha) is None:
+        raise RuntimeError("dense metadata git SHA differs")
+    if expected_git_sha is not None and git_sha != expected_git_sha:
+        raise RuntimeError("dense metadata candidate differs")
+    binary_sha = metadata.get("binary_sha256")
+    if not isinstance(binary_sha, str) or re.fullmatch(r"[0-9a-f]{64}", binary_sha) is None:
+        raise RuntimeError("dense metadata binary SHA differs")
+    checks = gate.get("checks")
+    required_checks = {"run", "serve_health", "serve_capacity", "serve", "tool_call_regression", "concurrency_quality_regression", "bench_serve"}
+    if not isinstance(checks, dict) or set(checks) != required_checks:
+        raise RuntimeError("dense gate check denominator differs")
+    if checks["run"] != {"passed": True, "rc": 0, "has_context": True}:
+        raise RuntimeError("dense run receipt differs")
+    if checks["serve_health"].get("status") != 200 or checks["serve_health"].get("passed") is not True:
+        raise RuntimeError("dense health receipt differs")
+    capacity = checks["serve_capacity"]
+    if capacity.get("passed") is not True or capacity.get("max_sequences", 0) < capacity.get("required_concurrency", 1) or capacity.get("target_concurrency", 0) < capacity.get("required_concurrency", 1):
+        raise RuntimeError("dense serve capacity differs")
+    serve = checks["serve"]
+    if serve.get("math") != {"status": 200, "passed": True} or serve.get("multi_turn") != {"status": 200, "passed": True} or serve.get("stream_usage") != {"status": 200, "done_count": 1, "passed": True}:
+        raise RuntimeError("dense serve correctness differs")
+    if checks["tool_call_regression"].get("status") != "pass":
+        raise RuntimeError("dense tool-call regression differs")
+    cells = checks["concurrency_quality_regression"].get("cells")
+    required_cells = RELEASE_CONCURRENCY_CELLS
+    configured_cells = metadata.get("config", {}).get("concurrency_cells")
+    if not isinstance(configured_cells, list) or {int(value) for value in configured_cells} != required_cells or len(configured_cells) != len(required_cells):
+        raise RuntimeError("dense configured release matrix differs")
+    if not isinstance(cells, list) or {row.get("concurrency") for row in cells if isinstance(row, dict)} != required_cells or any(row.get("passed") is not True or row.get("crosstalk") != 0 or row.get("length_finishes") != 0 for row in cells):
+        raise RuntimeError("dense concurrency quality differs")
+    bench_rows = checks["bench_serve"].get("rows")
+    if not isinstance(bench_rows, list) or {row.get("concurrency") for row in bench_rows if isinstance(row, dict)} != required_cells:
+        raise RuntimeError("dense bench cell denominator differs")
+    for row in bench_rows:
+        if row.get("completed", 0) <= 0 or row.get("errored") != 0 or row.get("output_token_count_source") != "usage" or row.get("throughput_tok_s", 0) <= 0:
+            raise RuntimeError("dense bench correctness/performance receipt differs")
+        if any(row.get(field.removesuffix("_per_run"), 1) != 0 for field in BENCH_QUALITY_COUNT_FIELDS):
+            raise RuntimeError("dense bench quality count differs")
+    required_files = {
+        "run.command.json", "run.stdin", "run.stdout", "run.stderr",
+        "serve.command.json", "serve.log", "serve.health.json",
+        "serve.math.response.json", "serve.multiturn.response.json", "serve.stream.sse",
+        "serve.effective_config.json", "serve.decision_trace.jsonl",
+        "bench-serve.command.json", "bench-serve.stdout", "bench-serve.stderr", "bench-serve.json",
+    }
+    for name in required_files:
+        path = root / name
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError(f"dense evidence file is missing: {name}")
+    run_command = json.loads((root / "run.command.json").read_text())
+    serve_command = json.loads((root / "serve.command.json").read_text())
+    bench_command = json.loads((root / "bench-serve.command.json").read_text())
+    if "run" not in run_command or run_command.count("--disable-thinking") != 1:
+        raise RuntimeError("dense run command differs")
+    if "serve" not in serve_command or serve_command.count("--disable-thinking") != 1:
+        raise RuntimeError("dense serve command differs")
+    for option in ("--fail-on-error", "--require-ci", "--seed", "--n-repeats"):
+        if option not in bench_command:
+            raise RuntimeError(f"dense bench command lacks {option}")
+    def command_value(option: str) -> str:
+        positions = [index for index, value in enumerate(bench_command) if value == option]
+        if len(positions) != 1 or positions[0] + 1 >= len(bench_command):
+            raise RuntimeError(f"dense bench command {option} differs")
+        return str(bench_command[positions[0] + 1])
+    if command_value("--seed") != "9271":
+        raise RuntimeError("dense bench seed differs")
+    try:
+        repeats = int(command_value("--n-repeats"))
+    except ValueError as error:
+        raise RuntimeError("dense bench repeat count differs") from error
+    if repeats < 3:
+        raise RuntimeError("dense bench repeat count differs")
+    raw_reports = json.loads((root / "bench-serve.json").read_text())
+    if not isinstance(raw_reports, list) or len(raw_reports) != len(required_cells):
+        raise RuntimeError("dense raw bench report denominator differs")
+    raw_by_cell = {row.get("concurrency"): row for row in raw_reports if isinstance(row, dict)}
+    if set(raw_by_cell) != required_cells:
+        raise RuntimeError("dense raw bench release matrix differs")
+    gate_by_cell = {row["concurrency"]: row for row in bench_rows}
+    for concurrency in sorted(required_cells):
+        raw_row = raw_by_cell[concurrency]
+        gate_row = gate_by_cell[concurrency]
+        completed = raw_row.get("completed_per_run")
+        errored = raw_row.get("errored_per_run")
+        throughput = raw_row.get("output_throughput_tps")
+        if not isinstance(completed, list) or len(completed) != repeats or not all(type(value) is int and value >= 0 for value in completed):
+            raise RuntimeError("dense raw completed counts differ")
+        if not isinstance(errored, list) or len(errored) != repeats or not all(type(value) is int and value >= 0 for value in errored):
+            raise RuntimeError("dense raw errored counts differ")
+        if not isinstance(throughput, dict) or not isinstance(throughput.get("mean"), (int, float)):
+            raise RuntimeError("dense raw throughput differs")
+        if gate_row.get("completed") != sum(completed) or gate_row.get("errored") != sum(errored) or gate_row.get("throughput_tok_s") != throughput["mean"] or gate_row.get("output_token_count_source") != raw_row.get("output_token_count_source"):
+            raise RuntimeError("dense gate/raw bench summary differs")
+        for field in BENCH_QUALITY_COUNT_FIELDS:
+            raw_values = raw_row.get(field)
+            if not isinstance(raw_values, list) or len(raw_values) != repeats or not all(type(value) is int and value >= 0 for value in raw_values):
+                raise RuntimeError(f"dense raw {field} differs")
+            if gate_row.get(field.removesuffix("_per_run")) != sum(raw_values):
+                raise RuntimeError(f"dense gate/raw {field} differs")
+    for name in ("run.stdout", "run.stderr", "serve.log", "bench-serve.stdout", "bench-serve.stderr"):
+        assert_no_bad_patterns(name, (root / name).read_text(encoding="utf-8", errors="strict"))
+    return {"status": "pass", "git_sha": git_sha, "binary_sha256": binary_sha, "cells": sorted(required_cells)}
+
+
+def self_test() -> None:
+    source = Path(__file__).resolve().parents[2] / "docs/release/g0/0.7.7/cuda-llama-dense"
+    with tempfile.TemporaryDirectory(prefix="ferrum-dense-artifact-selftest-") as raw:
+        root = Path(raw) / "artifact"
+        shutil.copytree(source, root)
+        candidate = "a" * 40
+        metadata = json.loads((root / "metadata.json").read_text())
+        metadata["git_dirty"] = False
+        metadata["git_sha"] = candidate
+        write(root / "metadata.json", json.dumps(metadata, indent=2) + "\n")
+        for name in ("run.command.json", "serve.command.json"):
+            command = json.loads((root / name).read_text())
+            command.append("--disable-thinking")
+            write(root / name, json.dumps(command, indent=2) + "\n")
+        validate_artifact(root, expected_git_sha=candidate)
+        metadata = json.loads((root / "metadata.json").read_text())
+        original_cells = metadata["config"]["concurrency_cells"]
+        metadata["config"]["concurrency_cells"] = [1]
+        write(root / "metadata.json", json.dumps(metadata, indent=2) + "\n")
+        try:
+            validate_artifact(root, expected_git_sha=candidate)
+        except RuntimeError as error:
+            if "configured release matrix" not in str(error):
+                raise
+        else:
+            raise RuntimeError("dense c1-only matrix unexpectedly passed")
+        metadata["config"]["concurrency_cells"] = original_cells
+        write(root / "metadata.json", json.dumps(metadata, indent=2) + "\n")
+        bench_command_path = root / "bench-serve.command.json"
+        bench_command = json.loads(bench_command_path.read_text())
+        seed_position = bench_command.index("--seed") + 1
+        bench_command[seed_position] = "42"
+        write(bench_command_path, json.dumps(bench_command, indent=2) + "\n")
+        try:
+            validate_artifact(root, expected_git_sha=candidate)
+        except RuntimeError as error:
+            if "bench seed differs" not in str(error):
+                raise
+        else:
+            raise RuntimeError("dense wrong seed unexpectedly passed")
+        bench_command[seed_position] = "9271"
+        repeats_position = bench_command.index("--n-repeats") + 1
+        bench_command[repeats_position] = "2"
+        write(bench_command_path, json.dumps(bench_command, indent=2) + "\n")
+        try:
+            validate_artifact(root, expected_git_sha=candidate)
+        except RuntimeError as error:
+            if "repeat count differs" not in str(error):
+                raise
+        else:
+            raise RuntimeError("dense insufficient repeats unexpectedly passed")
+        bench_command[repeats_position] = "3"
+        write(bench_command_path, json.dumps(bench_command, indent=2) + "\n")
+        gate = json.loads((root / "gate.json").read_text())
+        gate["checks"]["bench_serve"]["rows"][0]["output_token_count_source"] = "estimated"
+        write(root / "gate.json", json.dumps(gate, indent=2) + "\n")
+        try:
+            validate_artifact(root, expected_git_sha=candidate)
+        except RuntimeError as error:
+            if "bench correctness/performance" not in str(error):
+                raise
+        else:
+            raise RuntimeError("dense tampered bench evidence unexpectedly passed")
 
 
 def sha256(path: Path) -> str | None:
@@ -426,13 +615,30 @@ def run_bench_gate(
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=Path, required=True)
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--config", type=Path)
+    ap.add_argument("--out", type=Path)
+    ap.add_argument("--validate-artifact", type=Path)
+    ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--ferrum-bin", type=Path, default=Path("./target/release/ferrum"))
     ap.add_argument("--model")
     ap.add_argument("--tokenizer")
     ap.add_argument("--port", type=int)
     args = ap.parse_args()
+
+    if args.self_test:
+        self_test()
+        print("G0 CUDA LLAMA DENSE ARTIFACT SELFTEST PASS")
+        return 0
+    if args.validate_artifact is not None:
+        try:
+            validate_artifact(args.validate_artifact)
+        except Exception as error:
+            print(f"G0 CUDA LLAMA DENSE ARTIFACT FAIL: {error}", file=sys.stderr)
+            return 1
+        print(f"G0 CUDA LLAMA DENSE ARTIFACT PASS: {args.validate_artifact}")
+        return 0
+    if args.config is None or args.out is None:
+        ap.error("--config and --out are required unless --validate-artifact is used")
 
     repo = Path(__file__).resolve().parents[2]
     cfg = json.loads(args.config.read_text())

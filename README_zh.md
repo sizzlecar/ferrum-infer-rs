@@ -26,6 +26,8 @@ brew install ferrum-cuda
 下载权重前先检查安装的二进制：
 
 ```bash
+ferrum --version
+ferrum --help
 ferrum doctor
 ```
 

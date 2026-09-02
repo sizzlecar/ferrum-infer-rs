@@ -18,6 +18,11 @@ BAD_PATTERNS = [
     "[PAD]",
 ]
 
+EXPECTED_MODEL_CELLS = {
+    "llama31_8b": {1, 8, 16},
+    "qwen3_30b_a3b": {16},
+}
+
 
 def fail(errors: list[str]) -> int:
     for err in errors:
@@ -28,6 +33,11 @@ def fail(errors: list[str]) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir", type=Path)
+    ap.add_argument(
+        "--require-release-matrix",
+        action="store_true",
+        help="require the canonical Metal release models and performance cells",
+    )
     args = ap.parse_args()
     root = args.out_dir
     summary = root / "summary.json"
@@ -35,7 +45,23 @@ def main() -> int:
         return fail([f"missing {summary}"])
     data = json.loads(summary.read_text())
     errors: list[str] = []
-    for model in data.get("models", []):
+    models = data.get("models")
+    if not isinstance(models, list):
+        errors.append("summary.models must be a list")
+        models = []
+    if not models:
+        errors.append("summary.models must not be empty")
+    model_keys = [model.get("key") for model in models if isinstance(model, dict)]
+    if len(model_keys) != len(models) or len(model_keys) != len(set(model_keys)):
+        errors.append("summary.models must contain unique keyed objects")
+    if args.require_release_matrix and set(model_keys) != set(EXPECTED_MODEL_CELLS):
+        errors.append(
+            "summary.models must contain exactly "
+            f"{sorted(EXPECTED_MODEL_CELLS)}, got {sorted(str(key) for key in model_keys)}"
+        )
+    for model in models:
+        if not isinstance(model, dict):
+            continue
         key = model.get("key", "<unknown>")
         default_startup = model.get("default_startup") or {}
         if default_startup.get("passed") is not True:
@@ -76,6 +102,18 @@ def main() -> int:
                 f"{key}: benchmark serve max_sequences {serve_max_sequences!r} < "
                 f"max cell concurrency {max_cell_concurrency} ({root / (key + '.effective_config.json')})"
             )
+        expected_cells = EXPECTED_MODEL_CELLS.get(key) if args.require_release_matrix else None
+        if expected_cells is not None:
+            actual_cells = [
+                cell.get("concurrency")
+                for cell in model.get("cells", [])
+                if isinstance(cell, dict)
+            ]
+            if len(actual_cells) != len(expected_cells) or set(actual_cells) != expected_cells:
+                errors.append(
+                    f"{key}: concurrency cells must be exactly {sorted(expected_cells)}, "
+                    f"got {actual_cells}"
+                )
         chat = model.get("chat") or {}
         for gate in ["paris", "multiturn", "stream", "stateful_loop"]:
             if (chat.get(gate) or {}).get("passed") is not True:
