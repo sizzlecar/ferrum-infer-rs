@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title desc">
+  <title id="title">Ferrum — Rust-native local LLM runtime</title>
+  <desc id="desc">Ferrum supports local LLM inference on Apple Silicon Metal and NVIDIA CUDA.</desc>
+  <rect width="1280" height="640" fill="#f4f5f2"/>
+  <circle cx="1130" cy="88" r="270" fill="#81d8a7" opacity=".12"/>
+  <circle cx="114" cy="606" r="310" fill="#f0682f" opacity=".10"/>
+  <g transform="translate(86 128) scale(4.5)">
+    <rect x="4" y="4" width="56" height="56" rx="13" fill="#0b0d0f"/>
+    <path d="M16 14H50L47 24H29V31H38L35 41H29V52H16Z" fill="#f0682f"/>
+    <path d="M38 31H50L47 41H35Z" fill="#81d8a7"/>
+  </g>
+  <text x="430" y="264" fill="#0b0d0f" font-family="Inter, Arial, Helvetica, sans-serif" font-size="92" font-weight="800" letter-spacing="14">FERRUM</text>
+  <text x="437" y="325" fill="#68706b" font-family="Inter, Arial, Helvetica, sans-serif" font-size="28" font-weight="500" letter-spacing="6">LOCAL LLM RUNTIME</text>
+  <line x1="437" y1="373" x2="1132" y2="373" stroke="#d8dcd7" stroke-width="2"/>
+  <text x="437" y="431" fill="#202423" font-family="Inter, Arial, Helvetica, sans-serif" font-size="27" font-weight="650">One Rust binary · Metal + CUDA</text>
+  <text x="437" y="478" fill="#68706b" font-family="Inter, Arial, Helvetica, sans-serif" font-size="23" font-weight="500">Run local models or serve an OpenAI-compatible API.</text>
+</svg>

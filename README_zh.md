@@ -1,4 +1,8 @@
-# ferrum-infer-rs
+<p align="center">
+  <a href="https://ferrum.pandaailabs.com/zh/">
+    <img src="assets/brand/ferrum-lockup.svg" alt="Ferrum — Local LLM Runtime" width="520">
+  </a>
+</p>
 
 [![Crates.io](https://img.shields.io/crates/v/ferrum-cli.svg)](https://crates.io/crates/ferrum-cli)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/sizzlecar/ferrum-infer-rs/blob/main/LICENSE)
