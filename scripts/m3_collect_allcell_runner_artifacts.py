@@ -481,7 +481,7 @@ def self_test() -> None:
                     "port": 18000 + cell,
                     "git_head": "abc",
                     "git_status_short": [],
-                    "binary_sha256": "sha256:bin",
+                    "binary_sha256": "sha256:" + "b" * 64,
                     "features": "cuda",
                     "runtime_preset": "m3_qwen3_30b_a3b_int4",
                     "env_hash": env_hash,
