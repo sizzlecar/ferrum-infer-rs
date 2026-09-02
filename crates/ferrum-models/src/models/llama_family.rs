@@ -1664,7 +1664,7 @@ pub struct LlamaFamilyModel<B: MoeLlmBackend, K: KvLayer<B> = KvFp16> {
     pub cfg: LlamaFamilyConfig,
     pub runtime_cfg: LlmRuntimeConfig,
 
-    /// Backend capabilities resolved once at construction (the GOAL's allowed
+    /// Backend capabilities resolved once at construction (the allowed
     /// "构造期 capability 决策一次"). Decode/prefill hot paths branch on these
     /// fields instead of calling `B::supports_*()` inline, so a capability gate
     /// can't silently rot in the forward code.
@@ -1870,7 +1870,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         let layer_source_start = stage.source_layers.start;
         let layer_source_end = stage.source_layers.end;
         let runtime_cfg = cfg.to_runtime();
-        // Construction-time capability resolution (GOAL-allowed): read once here
+        // Construction-time capability resolution: read once here
         // so the forward hot paths read self.* instead of B::supports_*().
         // Sandwich-norm families (Gemma 3) require the Gemma layer semantics
         // (GeGLU, post-attn/post-ffn norms, dual rope, per-layer windows)
@@ -2035,8 +2035,7 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         // swap). `FERRUM_KV_CAPACITY=N` overrides; clamp to the model's
         // declared max so we never lie to the model about its window.
         let model_max = self.cfg.max_seq_len;
-        // 512 in 0.7.2 — matches the value used in
-        // docs/bench/macos-2026-05-02 to get the published numbers.
+        // 512 in 0.7.2 keeps the default paged-KV allocation bounded.
         // pre-0.7.2 default of 4096 was safe only because paged-KV was
         // opt-in (pool wasn't allocated). With paged-KV now on by
         // default + MAX_SEQS=32, the pool occupies physical memory:
@@ -4123,9 +4122,8 @@ impl<B: MoeLlmBackend, K: KvLayer<B>> LlamaFamilyModel<B, K> {
         self.ensure_paged_kv_capacity_for_cache_id(&mut ctx, cache_id, target_len)
             .expect("paged KV dynamic grow");
 
-        // Graph capture is opt-in via FERRUM_CUDA_GRAPH=1. Replay is currently
-        // single-request-only on Blackwell + CUDA 12.8 (see
-        // docs/phase-e-cuda-status.md). In pure eager mode, we skip the
+        // Graph capture is opt-in via FERRUM_CUDA_GRAPH=1. In pure eager mode,
+        // we skip the
         // per-step device-state memcpy_htod trio entirely.
         const GRAPH_WARMUP: usize = 3;
         let use_host_residual_shadow = self.use_host_residual_shadow();

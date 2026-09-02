@@ -2,7 +2,7 @@
 //!
 //! This module is intentionally small and CPU-only. It gives the W3 release
 //! goal a Ferrum-owned single-layer implementation that can emit the same dump
-//! schema consumed by `scripts/release/w3_deltanet_s1_layer_compare.py`.
+//! schema consumed by offline layer-comparison tooling.
 //! Product model integration still belongs to the real W3 DeltaNet model path.
 
 use std::fs;

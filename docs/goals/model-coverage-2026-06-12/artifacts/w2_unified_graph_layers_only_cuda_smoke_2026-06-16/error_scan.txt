@@ -1,3 +1,0 @@
-# Error scan
-Patterns: CUDA_ERROR|illegal|OOM|out of memory|panic|<unk>|[PAD]|invalid utf|mojibake
-

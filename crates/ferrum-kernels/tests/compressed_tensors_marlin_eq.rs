@@ -38,9 +38,7 @@ const BLOCK_FP8_EXACT_PARITY_ARTIFACT_SCHEMA_ID: &str =
 const BLOCK_FP8_QUALITY_VECTOR_DIGEST: &str =
     "4c8b44a6a6e2ca803f6a3916b033a50a8a007cb2452a0e9246ed6c7f3cacbb51";
 const RELATIVE_L2_REPORT_DENOMINATOR: u64 = 100_000_000;
-const LOCKED_QUALITY_VECTOR_JSON: &str = include_str!(
-    "../../../scripts/release/configs/vnext_model_adoption/qwen38_27b_fp8_m3_quality_vector.json"
-);
+const LOCKED_QUALITY_VECTOR_JSON: &str = include_str!("fixtures/qwen38_fp8_m3_quality_vector.json");
 const QUALITY_VECTOR_PAYLOAD_KEYS: [&str; 10] = [
     "schema_version",
     "fixture_id",

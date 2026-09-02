@@ -2,9 +2,8 @@
 //! interpolation), `ScalarStats` (mean / stddev / CI95), and Student-t
 //! critical values for small-sample CI.
 //!
-//! See `docs/bench/PLAYBOOK.md` § 0.4 for the contract: `n_repeats < 3`
-//! must omit dispersion fields rather than emit zeros that look like
-//! "perfectly consistent" runs.
+//! The report contract requires at least three repeats before emitting
+//! dispersion fields.
 
 use serde::{Deserialize, Serialize};
 

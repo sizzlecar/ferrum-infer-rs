@@ -17,12 +17,8 @@ const KV_FEATURES: usize = KV_HEADS * HEAD_DIM;
 const TEST_PAGE_ELEMENTS: usize = 2 * KV_FEATURES;
 const CPU_OUTPUT_TOLERANCE_ID: &str =
     "runtime-vnext.metal.causal-attention.v2.operation.fp16.none.fixed-page-split";
-const CPU_OUTPUT_TOLERANCE_FINGERPRINT: &str =
-    "d30006c0535a3b3172ac88db66f75f07df6256e321509188bb0949c7a64a9fdb";
 const CPU_KV_STATE_TOLERANCE_ID: &str =
     "runtime-vnext.metal.causal-attention.v2.state.kv.fp16.none.fixed-page-split";
-const CPU_KV_STATE_TOLERANCE_FINGERPRINT: &str =
-    "aa2563e94a78b77ad6d1ab25c698eca89f7d54e00b8a25f429d0cf34e034c250";
 // This stricter diagnostic never substitutes for a catalog-bound release comparison.
 const SPLIT_CONTINUITY_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
 const CPU_KV_STATE_DIAGNOSTIC_MAX_ABS: f32 = 0.001;
@@ -96,7 +92,6 @@ fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_met
         &[TOKENS, QUERY_HEADS, HEAD_DIM],
         numerical_tolerance::LogicalDtype::Fp16,
         CPU_OUTPUT_TOLERANCE_ID,
-        CPU_OUTPUT_TOLERANCE_FINGERPRINT,
     )
     .expect("reviewed causal-attention numerical contract");
     assert_close(
@@ -113,7 +108,6 @@ fn fixed_page_attention_matches_cpu_and_preserves_split_decode_state_on_real_met
         &[TOKENS, 2, KV_HEADS, HEAD_DIM],
         numerical_tolerance::LogicalDtype::Fp16,
         CPU_KV_STATE_TOLERANCE_ID,
-        CPU_KV_STATE_TOLERANCE_FINGERPRINT,
     )
     .expect("reviewed causal KV-state numerical contract");
     assert_close(

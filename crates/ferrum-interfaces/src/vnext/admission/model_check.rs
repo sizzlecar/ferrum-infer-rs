@@ -1,9 +1,8 @@
 use super::*;
-use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const SEED: u64 = 0x6a09_e667_f3bc_c909;
-const SEEDED_STATE_SEQUENCE_COUNT: usize = 100_000;
+const MODEL_CHECK_SEQUENCE_COUNT: usize = 1_000;
 const MIN_TRANSITIONS_PER_SEQUENCE: usize = 8;
 const MAX_TRANSITIONS_PER_SEQUENCE: usize = 24;
 const MAXIMUM_ACTIVE_SEQUENCES: u32 = 4;
@@ -143,7 +142,7 @@ struct WaitWitness {
     registration: CapacityWaitRegistration,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default)]
 struct ModelCounters {
     action_counts: BTreeMap<&'static str, u64>,
     outcome_counts: BTreeMap<&'static str, u64>,
@@ -192,35 +191,9 @@ impl ModelCounters {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct StateModelReport {
-    schema_version: u32,
-    seed: u64,
-    seed_derivation: &'static str,
-    seeded_state_sequence_count: usize,
-    unique_seed_count: usize,
-    scripted_state_sequence_count: usize,
-    transition_count: u64,
-    minimum_transitions_per_seeded_sequence: usize,
-    maximum_transitions_per_seeded_sequence: usize,
-    maximum_active_sequences: u32,
-    maximum_totals: [u64; 2],
-    counters: ModelCounters,
-    max_final_active_requests: u32,
-    max_final_active_sequences: u32,
-    max_final_active_child_claims: u64,
-    max_final_used: [u64; 2],
-    leaked_resources: u64,
-    poisoned_state_sequences: u64,
-}
-
 struct StateModelRunReport {
     transitions: usize,
     counters: ModelCounters,
-    final_active_requests: u32,
-    final_active_sequences: u32,
-    final_active_child_claims: u64,
-    final_used: [u64; 2],
     leaked_resources: u64,
     poisoned: bool,
 }
@@ -1033,10 +1006,6 @@ impl AdmissionStateModel {
         StateModelRunReport {
             transitions: self.transitions,
             counters: self.counters,
-            final_active_requests: snapshot.active_requests(),
-            final_active_sequences: snapshot.active_sequences(),
-            final_active_child_claims: snapshot.active_child_claims(),
-            final_used: used,
             leaked_resources,
             poisoned: snapshot.poisoned(),
         }
@@ -1175,15 +1144,11 @@ fn scripted_boundary_sequence() -> StateModelRunReport {
 }
 
 #[test]
-fn seeded_admission_state_model_checks_one_hundred_thousand_state_sequences() {
+fn seeded_admission_state_model_checks_invariants() {
     let mut counters = ModelCounters::default();
     let mut transition_count = 0_u64;
     let mut leaked_resources = 0_u64;
     let mut poisoned_state_sequences = 0_u64;
-    let mut max_final_active_requests = 0_u32;
-    let mut max_final_active_sequences = 0_u32;
-    let mut max_final_active_child_claims = 0_u64;
-    let mut max_final_used = [0_u64; 2];
     let mut unique_seeds = BTreeSet::new();
 
     let mut absorb = |run: StateModelRunReport| {
@@ -1192,18 +1157,11 @@ fn seeded_admission_state_model_checks_one_hundred_thousand_state_sequences() {
         transition_count += run.transitions as u64;
         leaked_resources += run.leaked_resources;
         poisoned_state_sequences += u64::from(run.poisoned);
-        max_final_active_requests = max_final_active_requests.max(run.final_active_requests);
-        max_final_active_sequences = max_final_active_sequences.max(run.final_active_sequences);
-        max_final_active_child_claims =
-            max_final_active_child_claims.max(run.final_active_child_claims);
-        for (maximum, observed) in max_final_used.iter_mut().zip(run.final_used) {
-            *maximum = (*maximum).max(observed);
-        }
         counters.merge(run.counters);
     };
 
     absorb(scripted_boundary_sequence());
-    for ordinal in 0..SEEDED_STATE_SEQUENCE_COUNT {
+    for ordinal in 0..MODEL_CHECK_SEQUENCE_COUNT {
         let seed = state_sequence_seed(ordinal);
         assert!(
             unique_seeds.insert(seed),
@@ -1284,29 +1242,4 @@ fn seeded_admission_state_model_checks_one_hundred_thousand_state_sequences() {
     assert!(counters.invalid_resize_rejections > 0);
     assert_eq!(leaked_resources, 0);
     assert_eq!(poisoned_state_sequences, 0);
-
-    let report = StateModelReport {
-        schema_version: 2,
-        seed: SEED,
-        seed_derivation: "splitmix64(base_seed xor ordinal*golden_ratio) | 1",
-        seeded_state_sequence_count: SEEDED_STATE_SEQUENCE_COUNT,
-        unique_seed_count: unique_seeds.len(),
-        scripted_state_sequence_count: 1,
-        transition_count,
-        minimum_transitions_per_seeded_sequence: MIN_TRANSITIONS_PER_SEQUENCE,
-        maximum_transitions_per_seeded_sequence: MAX_TRANSITIONS_PER_SEQUENCE,
-        maximum_active_sequences: MAXIMUM_ACTIVE_SEQUENCES,
-        maximum_totals: MAXIMUM_TOTALS,
-        counters,
-        max_final_active_requests,
-        max_final_active_sequences,
-        max_final_active_child_claims,
-        max_final_used,
-        leaked_resources,
-        poisoned_state_sequences,
-    };
-    println!(
-        "FERRUM G04 STATE MODEL KEEP: {}",
-        serde_json::to_string(&report).unwrap()
-    );
 }

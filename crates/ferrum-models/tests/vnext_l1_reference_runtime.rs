@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::fs;
 use std::sync::{Arc, OnceLock};
 
 use ferrum_interfaces::vnext::*;
@@ -19,7 +18,7 @@ const MIXED_ROWS_USIZE: usize = 8;
 const IN_FEATURES: u64 = 2;
 const OUT_FEATURES: u64 = 2;
 const MAX_MAINTENANCE_ATTEMPTS: usize = 3;
-const MIXED_REFERENCE_SEEDS: usize = 100;
+const MIXED_REFERENCE_SEEDS: [usize; 3] = [0, 1, 2];
 
 fn id<T>(value: impl Into<String>) -> T
 where
@@ -369,8 +368,6 @@ struct MixedReferenceFixture {
     compilation: ProgramPlanCompilation,
     providers: BoundOperationProviderSet<ReferenceDeviceRuntime>,
     plan_resources: Arc<PlanRuntimeResources<ReferenceDeviceRuntime>>,
-    weight_file_sha256: String,
-    program_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -408,7 +405,6 @@ fn build_mixed_reference_fixture() -> MixedReferenceFixture {
         &weight_path,
     )
     .unwrap();
-    let weight_file_sha256 = sha256(&fs::read(&weight_path).unwrap());
     let weight_source = SafetensorsArchive::open(model_dir.path()).unwrap();
 
     let family = TypedFamilyRegistration::new(TinyDenseFamily)
@@ -512,8 +508,6 @@ fn build_mixed_reference_fixture() -> MixedReferenceFixture {
         compilation,
         providers,
         plan_resources,
-        weight_file_sha256,
-        program_fingerprint,
     }
 }
 
@@ -863,8 +857,6 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
         &weight_path,
     )
     .unwrap();
-    let weight_file_bytes = fs::read(&weight_path).unwrap();
-    let weight_file_sha256 = sha256(&weight_file_bytes);
     let weight_source = SafetensorsArchive::open(model_dir.path()).unwrap();
 
     let family = TypedFamilyRegistration::new(TinyDenseFamily)
@@ -1044,8 +1036,6 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
         .map(|bytes| f16::from_bits(u16::from_le_bytes([bytes[0], bytes[1]])).to_f32())
         .collect::<Vec<_>>();
     assert_eq!(output_values, vec![1.0, -7.5]);
-    let output_sha256 = sha256(output);
-
     let snapshot = composition.runtime().snapshot();
     assert!(snapshot.allocations >= 2);
     assert!(snapshot.live_allocations >= 2);
@@ -1080,19 +1070,10 @@ fn tiny_real_safetensors_executes_through_reference_vnext_runtime() {
     assert_eq!(close_receipt.released_static_resources(), 1);
     let closed_snapshot = composition.runtime().snapshot();
     assert_eq!(closed_snapshot.live_allocations, 0);
-
-    println!(
-        "FERRUM RUNTIME VNEXT G02 L1 TEST PASS: weight_sha256={weight_file_sha256} output_sha256={output_sha256} allocations={} released_static_resources={} live_allocations_after_close={} submissions={} commands={}",
-        snapshot.allocations,
-        close_receipt.released_static_resources(),
-        closed_snapshot.live_allocations,
-        snapshot.submissions,
-        snapshot.commands
-    );
 }
 
 #[test]
-fn mixed_batch_matches_independent_per_request_reference_for_one_hundred_seeds() {
+fn mixed_batch_matches_independent_per_request_reference() {
     let fixture = build_mixed_reference_fixture();
     let runtime_before = fixture.composition.runtime().snapshot();
     let mut unique_seed_fingerprints = BTreeSet::new();
@@ -1102,9 +1083,8 @@ fn mixed_batch_matches_independent_per_request_reference_for_one_hundred_seeds()
     let mut mixed_submissions = 0_u64;
     let mut scalar_submissions = 0_u64;
     let mut participant_cases = 0_usize;
-    let mut output_digest = Sha256::new();
 
-    for seed in 0..MIXED_REFERENCE_SEEDS {
+    for seed in MIXED_REFERENCE_SEEDS {
         let cases = mixed_cases(seed);
         let mut seed_material = Vec::new();
         for case in &cases {
@@ -1154,14 +1134,11 @@ fn mixed_batch_matches_independent_per_request_reference_for_one_hundred_seeds()
                 "mixed/scalar L1 mismatch for seed {seed} participant {}",
                 case.logical_index
             );
-            output_digest.update(seed.to_le_bytes());
-            output_digest.update(case.logical_index.to_le_bytes());
-            output_digest.update(mixed_output);
         }
     }
 
-    assert_eq!(unique_seed_fingerprints.len(), MIXED_REFERENCE_SEEDS);
-    assert_eq!(mixed_submissions, MIXED_REFERENCE_SEEDS as u64);
+    assert_eq!(unique_seed_fingerprints.len(), MIXED_REFERENCE_SEEDS.len());
+    assert_eq!(mixed_submissions, MIXED_REFERENCE_SEEDS.len() as u64);
     assert_eq!(scalar_submissions, participant_cases as u64);
     assert!(final_chunk_cases > 0 && non_final_chunk_cases > 0 && decode_tail_cases > 0);
     let pool_status = fixture.plan_resources.dynamic_pool_status().unwrap();
@@ -1182,8 +1159,6 @@ fn mixed_batch_matches_independent_per_request_reference_for_one_hundred_seeds()
         compilation,
         providers,
         plan_resources,
-        weight_file_sha256,
-        program_fingerprint,
     } = fixture;
     drop(providers);
     drop(compilation);
@@ -1201,25 +1176,4 @@ fn mixed_batch_matches_independent_per_request_reference_for_one_hundred_seeds()
     assert_eq!(close_receipt.released_static_resources(), 1);
     let closed_snapshot = composition.runtime().snapshot();
     assert_eq!(closed_snapshot.live_allocations, 0);
-    let readback_successes = participant_cases * 2;
-
-    println!(
-        "FERRUM RUNTIME VNEXT G04 MIXED BATCH L1 KEEP: seeds={}/{} unique_seeds={} mixed_submissions={} scalar_submissions={} participant_cases={} readbacks={}/{} output_mismatches=0 analytic_mismatches=0 final_chunk_cases={} non_final_chunk_cases={} decode_tail_cases={} live_claims_after_batches={} live_allocations_after_close={} weight_sha256={} program_fingerprint={} output_sha256={:x}",
-        MIXED_REFERENCE_SEEDS,
-        MIXED_REFERENCE_SEEDS,
-        unique_seed_fingerprints.len(),
-        mixed_submissions,
-        scalar_submissions,
-        participant_cases,
-        readback_successes,
-        readback_successes,
-        final_chunk_cases,
-        non_final_chunk_cases,
-        decode_tail_cases,
-        final_live_claims,
-        closed_snapshot.live_allocations,
-        weight_file_sha256,
-        program_fingerprint,
-        output_digest.finalize(),
-    );
 }

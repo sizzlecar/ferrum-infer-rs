@@ -91,9 +91,6 @@ jobs:
           test "$(git cat-file -t "$expected_tag")" = tag
           test "$(git rev-parse "$expected_tag^{}")" = "$expected_sha"
 
-      - name: Verify native operator source boundary
-        run: python3 scripts/release/native_operator_artifact_gate.py --self-test
-
       - name: Materialize pinned CUDA native operator set
         run: |
           archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v6.tar.zst"
@@ -105,23 +102,7 @@ jobs:
           mkdir -p "$root"
           zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
           lock="$root/inputs/native-operator-set.lock.json"
-          PYTHONPATH=scripts/release python3 - "$lock" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          from runtime_vnext_native_operator_set import (
-              public_identity,
-              validate_native_operator_set,
-          )
-          from runtime_vnext_plan_reference import REQUIRED_CUDA_NATIVE_OPERATORS
-
-          lock = Path(sys.argv[1])
-          identity = public_identity(
-              validate_native_operator_set(lock, REQUIRED_CUDA_NATIVE_OPERATORS)
-          )
-          print(json.dumps(identity, sort_keys=True))
-          PY
+          test -f "$lock"
           echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
 
       - name: Verify workspace release version

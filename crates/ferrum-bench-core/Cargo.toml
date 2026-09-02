@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Canonical bench schema + metric aggregation + variance + env_hash for ferrum's bench and bench-serve commands. Locked by docs/bench/PLAYBOOK.md § 7."
+description = "Canonical bench schema, metric aggregation, variance, and env_hash contracts for ferrum bench commands."
 
 [dependencies]
 ferrum-types = { workspace = true }

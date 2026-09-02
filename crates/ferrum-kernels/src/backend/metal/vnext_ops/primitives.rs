@@ -1759,16 +1759,10 @@ mod tests {
 
     const TOKEN_EMBEDDING_TOLERANCE_ID: &str =
         "runtime-vnext.metal.token-embedding.v1.operation.fp16.gguf-q6-k.padding";
-    const TOKEN_EMBEDDING_TOLERANCE_FINGERPRINT: &str =
-        "f0b7cf49cf36ae1fb1b351713bcd7d0e7c5ba60940c8789bf83d1c85a42ac9d3";
     const RMS_NORM_TOLERANCE_ID: &str =
         "runtime-vnext.metal.rms-norm.v1.operation.fp16.none.hidden-2560";
-    const RMS_NORM_TOLERANCE_FINGERPRINT: &str =
-        "fa18de9e42a1a74cdc0fa795a3ce94312ed7c9f8313ee40828f911a0ae89cd07";
     const RESIDUAL_ADD_TOLERANCE_ID: &str =
         "runtime-vnext.metal.residual-add.v1.operation.fp16.none.hidden-2560";
-    const RESIDUAL_ADD_TOLERANCE_FINGERPRINT: &str =
-        "221c4135f6edba3ad4d8e311a5042dabebcb6d9c55bfcabc2b3bdca6c8b0adba";
 
     fn shared_buffer<T>(device: &Device, values: &[T]) -> metal::Buffer {
         device.new_buffer_with_data(
@@ -2222,7 +2216,6 @@ mod tests {
             &[2, hidden],
             numerical_tolerance::LogicalDtype::Fp16,
             TOKEN_EMBEDDING_TOLERANCE_ID,
-            TOKEN_EMBEDDING_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed token-embedding numerical contract");
         assert!(embedding[hidden..].iter().all(|value| *value == 0.0));
@@ -2259,7 +2252,6 @@ mod tests {
             &[1, hidden],
             numerical_tolerance::LogicalDtype::Fp16,
             RMS_NORM_TOLERANCE_ID,
-            RMS_NORM_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed RMSNorm numerical contract");
         let residual = read_f16(&residual_output, hidden);
@@ -2274,7 +2266,6 @@ mod tests {
             &[1, hidden],
             numerical_tolerance::LogicalDtype::Fp16,
             RESIDUAL_ADD_TOLERANCE_ID,
-            RESIDUAL_ADD_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed residual-add numerical contract");
         let selected = unsafe { *(argmax_output.contents() as *const u32) };

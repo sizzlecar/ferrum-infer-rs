@@ -1,1 +1,0 @@
-RUN_SMOKE_PASS content='5' tokens=3

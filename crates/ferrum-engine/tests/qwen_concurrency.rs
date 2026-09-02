@@ -3,14 +3,15 @@ use ferrum_interfaces::engine::LlmInferenceEngine;
 use ferrum_types::{Device, EngineConfig, InferenceRequest, ModelId, SamplingParams};
 use std::{path::Path, sync::Arc, time::Duration};
 
-const DEFAULT_QWEN_05B_PATH: &str = "/Users/chejinxuan/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775";
 const QWEN_MODEL_ID: &str = "Qwen/Qwen2.5-0.5B-Instruct";
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires local Qwen2.5-0.5B model files"]
 async fn qwen_25_05b_requests_are_serialized_for_correctness() {
-    let model_path = std::env::var("FERRUM_QWEN_TEST_MODEL_PATH")
-        .unwrap_or_else(|_| DEFAULT_QWEN_05B_PATH.to_string());
+    let Ok(model_path) = std::env::var("FERRUM_QWEN_TEST_MODEL_PATH") else {
+        eprintln!("Skip qwen concurrency test: FERRUM_QWEN_TEST_MODEL_PATH is unset");
+        return;
+    };
 
     if !Path::new(&model_path).exists() {
         eprintln!(

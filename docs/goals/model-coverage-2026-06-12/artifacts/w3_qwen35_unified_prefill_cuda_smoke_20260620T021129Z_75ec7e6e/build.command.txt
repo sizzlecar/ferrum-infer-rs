@@ -1,1 +1,0 @@
-cargobuild--release-pferrum-cli--binferrum--featurescuda\,vllm-moe-marlin\,vllm-paged-attn-v2\,fa2-source
