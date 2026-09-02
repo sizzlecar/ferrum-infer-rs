@@ -26,7 +26,7 @@ import time
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 
@@ -7185,6 +7185,7 @@ def run_child(
         out_dir.parent.mkdir(parents=True, exist_ok=True)
         if out_dir.exists():
             raise GateError(f"delegated command requires a fresh --out directory: {out_dir}")
+    started_at = iso_now()
     started = time.monotonic()
     env = os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -7198,6 +7199,7 @@ def run_child(
         check=False,
     )
     duration = time.monotonic() - started
+    finished_at = iso_now()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "run_gate.child.stdout").write_text(proc.stdout, errors="replace")
     (out_dir / "run_gate.child.stderr").write_text(proc.stderr, errors="replace")
@@ -7205,7 +7207,12 @@ def run_child(
         json.dumps(
             {
                 "cmd": cmd,
-                "duration_sec": duration,
+                "cwd": str(REPO_ROOT),
+                "timeout_seconds": timeout,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_seconds": duration,
+                "returncode": proc.returncode,
                 "env_overrides": {"PYTHONDONTWRITEBYTECODE": "1"},
             },
             indent=2,
@@ -7238,6 +7245,104 @@ def child_execution_artifacts(out_dir: Path) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+G0_ARTIFACT_TREE_FORBIDDEN_PARTS = {
+    ".cache",
+    "cache",
+    "huggingface",
+    "hub",
+    "models",
+    "model-cache",
+}
+G0_ARTIFACT_TREE_FORBIDDEN_SUFFIXES = {
+    ".gguf",
+    ".safetensors",
+    ".pt",
+    ".pth",
+}
+
+
+def standard_g0_artifact_tree(out_dir: Path) -> dict[str, Any]:
+    """Inventory the exact portable evidence tree, excluding this outer manifest."""
+
+    root = out_dir.resolve()
+    require_gate(root.is_dir() and not out_dir.is_symlink(), f"standard G0 artifact root is invalid: {out_dir}")
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in sorted(out_dir.rglob("*"), key=lambda path: path.as_posix()):
+        require_gate(not candidate.is_symlink(), f"standard G0 artifact tree contains symlink: {candidate}")
+        resolved = candidate.resolve()
+        require_gate(resolved.is_relative_to(root), f"standard G0 artifact escapes its root: {candidate}")
+        if candidate.is_dir():
+            continue
+        require_gate(candidate.is_file(), f"standard G0 artifact is not regular: {candidate}")
+        relative = candidate.relative_to(out_dir).as_posix()
+        if relative == "gate.manifest.json":
+            continue
+        pure = PurePosixPath(relative)
+        require_gate(
+            not ({part.lower() for part in pure.parts} & G0_ARTIFACT_TREE_FORBIDDEN_PARTS)
+            and pure.suffix.lower() not in G0_ARTIFACT_TREE_FORBIDDEN_SUFFIXES,
+            f"standard G0 artifact tree contains model/cache bytes: {relative}",
+        )
+        require_gate(relative not in seen, f"duplicate standard G0 artifact path: {relative}")
+        seen.add(relative)
+        digest = sha256(candidate)
+        require_gate(digest is not None, f"cannot hash standard G0 artifact: {candidate}")
+        rows.append(
+            {"path": relative, "sha256": digest, "size_bytes": candidate.stat().st_size}
+        )
+    require_gate(rows, f"standard G0 artifact tree is empty: {out_dir}")
+    return {
+        "schema_version": 1,
+        "kind": "standard-g0-regular-file-tree",
+        "file_count": len(rows),
+        "total_size_bytes": sum(row["size_bytes"] for row in rows),
+        "files": rows,
+        "sha256": pretty_json_sha256(rows),
+    }
+
+
+STANDARD_G0_CHILD_MANIFESTS = {
+    "unit": "unit.gate.json",
+    "metal": "metal.gate.json",
+    "cuda-smoke": "g0_cuda4090_smoke.gate.json",
+    "cuda-full": "g0_cuda4090_full.gate.json",
+    "cuda-llama-dense": "g0_cuda4090_llama_dense.gate.json",
+    "metal-tarball": "gate.json",
+    "cuda-tarball": "gate.json",
+    "homebrew-metal": "gate.json",
+    "homebrew-cuda-fetch": "gate.json",
+}
+
+
+def standard_g0_child_artifacts(lane: str, out_dir: Path) -> dict[str, Any] | None:
+    """Bind standard G0 child bytes without changing their legacy schemas."""
+    filename = STANDARD_G0_CHILD_MANIFESTS.get(lane)
+    if filename is None:
+        return None
+    path = out_dir / filename
+    require_gate(path.is_file() and not path.is_symlink(), f"standard G0 child manifest is missing: {path}")
+    try:
+        child = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GateError(f"invalid standard G0 child manifest {path}: {exc}") from exc
+    require_gate(
+        isinstance(child, dict) and child.get("status") == "pass",
+        f"standard G0 child manifest status is not pass: {path}",
+    )
+    digest = sha256(path)
+    require_gate(digest is not None, f"cannot hash standard G0 child manifest: {path}")
+    return {
+        "kind": "standard-g0-child",
+        "child_manifest": {
+            "path": str(path),
+            "sha256": digest,
+            "size_bytes": path.stat().st_size,
+        },
+        "artifact_tree": standard_g0_artifact_tree(out_dir),
+    }
 
 
 def manifest(
@@ -8601,39 +8706,93 @@ def mutate_g00a_requested_revision_status(root: Path) -> None:
 
 
 def make_selftest_release_summary_artifact(root: Path) -> None:
-    for rel in [
-        "source-unit/unit.gate.json",
-        "source-metal/metal.gate.json",
-        "source-cuda-full/g0_cuda4090_full.gate.json",
-        "source-cuda-llama-dense/g0_cuda4090_llama_dense.gate.json",
-        "metal-tarball/gate.json",
-        "cuda-tarball/gate.json",
-        "homebrew-metal/gate.json",
-        "homebrew-cuda-fetch/gate.json",
-    ]:
-        write_selftest_json(root / rel, {"status": "pass"})
-    import validate_release_completion_manifest as completion_validator
-
-    completion_validator.make_selftest_manifest(
-        root / "_completion-fixture.json",
-        artifact_root=root,
+    fixtures = (
+        ("source-unit", "unit", "unit.gate.json", "lane", "unit", "G0 SOURCE unit PASS: "),
+        ("source-metal", "metal", "metal.gate.json", "lane", "metal", "G0 SOURCE metal PASS: "),
+        (
+            "source-cuda-full",
+            "cuda-full",
+            "g0_cuda4090_full.gate.json",
+            "lane",
+            "g0_cuda4090_full",
+            "G0 SOURCE g0_cuda4090_full PASS: ",
+        ),
+        (
+            "source-cuda-llama-dense",
+            "cuda-llama-dense",
+            "g0_cuda4090_llama_dense.gate.json",
+            "lane",
+            "g0_cuda4090_llama_dense",
+            "G0 SOURCE g0_cuda4090_llama_dense PASS: ",
+        ),
+        (
+            "metal-tarball",
+            "metal-tarball",
+            "gate.json",
+            "mode",
+            "metal-tarball",
+            "METAL TARBALL GATE PASS: ",
+        ),
+        (
+            "cuda-tarball",
+            "cuda-tarball",
+            "gate.json",
+            "mode",
+            "cuda-tarball",
+            "CUDA TARBALL GATE PASS: ",
+        ),
+        (
+            "homebrew-metal",
+            "homebrew-metal",
+            "gate.json",
+            "mode",
+            "homebrew-metal",
+            "HOMEBREW METAL GATE PASS: ",
+        ),
+        (
+            "homebrew-cuda-fetch",
+            "homebrew-cuda-fetch",
+            "gate.json",
+            "mode",
+            "homebrew-cuda-fetch",
+            "HOMEBREW CUDA FETCH GATE PASS: ",
+        ),
     )
-    return
-
-    for lane in (
-        "runtime-vnext-metal-three-model",
-        "runtime-vnext-cuda-three-model",
-        "runtime-vnext-published-assets",
-        "runtime-vnext-prepromotion",
-    ):
-        artifact = root / lane
+    for (
+        directory,
+        lane,
+        child_gate,
+        child_identity_field,
+        child_identity,
+        child_pass_prefix,
+    ) in fixtures:
+        artifact = root / directory
+        child_path = artifact / child_gate
+        write_selftest_json(
+            child_path,
+            {"status": "pass", child_identity_field: child_identity},
+        )
+        child_digest = sha256(child_path)
+        require_selftest(child_digest is not None, child_path)
         write_selftest_json(
             artifact / "gate.manifest.json",
             {
                 "status": "pass",
                 "lane": lane,
+                "child_returncode": 0,
+                "git_sha": "1" * 40,
+                "dirty_status": {"is_dirty": False, "status_short": []},
                 "artifact_dir": str(artifact),
                 "pass_line": f"FERRUM GATE {lane} PASS: {artifact}",
+                "child_pass_line": child_pass_prefix + str(artifact),
+                "child_artifacts": {
+                    "kind": "standard-g0-child",
+                    "child_manifest": {
+                        "path": str(child_path),
+                        "sha256": child_digest,
+                        "size_bytes": child_path.stat().st_size,
+                    },
+                },
             },
         )
 
@@ -11881,7 +12040,55 @@ def self_test() -> int:
 
         selftest_r3_goal_outer_serialization(root)
 
-        release_root = root / "release-root"
+        standard_child_root = root / "standard-g0-child-binding"
+        standard_child_path = standard_child_root / "metal.gate.json"
+        write_selftest_json(standard_child_path, {"status": "pass", "lane": "metal"})
+        standard_child = standard_g0_child_artifacts("metal", standard_child_root)
+        require_selftest(
+            isinstance(standard_child, dict)
+            and standard_child.get("kind") == "standard-g0-child"
+            and standard_child.get("child_manifest")
+            == {
+                "path": str(standard_child_path),
+                "sha256": sha256(standard_child_path),
+                "size_bytes": standard_child_path.stat().st_size,
+            },
+            standard_child,
+        )
+        tree = require_object(
+            standard_child.get("artifact_tree"), "selftest standard G0 artifact tree"
+        )
+        require_selftest(
+            tree.get("file_count") == 1
+            and tree.get("files", [{}])[0].get("path") == "metal.gate.json"
+            and tree.get("sha256") == pretty_json_sha256(tree["files"]),
+            tree,
+        )
+        require_selftest(
+            not (standard_child_root / "run_gate.public_asset_provenance.json").exists()
+            and not (standard_child_root / "run_gate.homebrew_provenance.json").exists(),
+            "standard child binding must not run a second download or Homebrew probe",
+        )
+        symlink = standard_child_root / "evidence-link"
+        symlink.symlink_to(standard_child_path.name)
+        try:
+            standard_g0_artifact_tree(standard_child_root)
+            raise AssertionError("standard G0 symlink unexpectedly passed")
+        except GateError as exc:
+            require_selftest("contains symlink" in str(exc), str(exc))
+        symlink.unlink()
+        forbidden_weight = standard_child_root / "model.safetensors"
+        forbidden_weight.write_bytes(b"not a real weight")
+        try:
+            standard_g0_artifact_tree(standard_child_root)
+            raise AssertionError("standard G0 model weight unexpectedly passed")
+        except GateError as exc:
+            require_selftest("model/cache bytes" in str(exc), str(exc))
+        forbidden_weight.unlink()
+
+        # Exercise the explicitly scoped 0.8.4 summary profile. Other release
+        # roots retain the historical Runtime vNext summary contract.
+        release_root = root / "0.8.4"
         make_selftest_release_summary_artifact(release_root)
         summary_out = root / "release-summary"
         summary = run_selftest_command(
@@ -12158,6 +12365,21 @@ def main() -> int:
             status = "fail"
         else:
             child_artifacts = verify_child_pass_line(lane_command, proc.stdout)
+            standard_binding = standard_g0_child_artifacts(args.lane, out_dir)
+            if standard_binding is not None:
+                if child_artifacts is None:
+                    child_artifacts = standard_binding
+                else:
+                    existing = child_artifacts.get("child_manifest")
+                    standard = standard_binding["child_manifest"]
+                    require_gate(
+                        isinstance(existing, dict)
+                        and existing.get("path") == standard["path"]
+                        and existing.get("sha256") == standard["sha256"],
+                        "standard G0 child binding differs from delegated provenance",
+                    )
+                    existing["size_bytes"] = standard["size_bytes"]
+                    child_artifacts["artifact_tree"] = standard_binding["artifact_tree"]
             child_pass_line = lane_command.expected_child_pass_line
             status = "pass"
     except (GateError, subprocess.TimeoutExpired) as exc:

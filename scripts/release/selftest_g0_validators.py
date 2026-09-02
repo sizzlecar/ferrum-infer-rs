@@ -327,43 +327,179 @@ def make_metal_artifact(root: Path) -> None:
             ]
         },
     )
-    (root / "qwen3_0_6b.server.stdout").write_text("server ready\n")
-    (root / "qwen3_0_6b.run.stdout").write_text("model answered normally\n")
+    data = json.loads((root / "summary.json").read_text())
+    template = data["models"][0]
+    template["default_startup"].update(
+        {"max_sequences": 16, "min_required_max_sequences": 16, "max_allowed_max_sequences": 16}
+    )
+    template["serve_startup"].update(
+        {"max_sequences": 16, "min_required_max_sequences": 16}
+    )
+
+    def model_fixture(key: str, concurrencies: tuple[int, ...]) -> dict[str, object]:
+        model = json.loads(json.dumps(template))
+        model["key"] = key
+        original_cell = model["cells"][0]
+        cells = []
+        for concurrency in concurrencies:
+            cell = json.loads(json.dumps(original_cell))
+            cell.update(
+                {
+                    "concurrency": concurrency,
+                    "prompts": concurrency,
+                    "completed": concurrency,
+                }
+            )
+            cell["quality"].update(
+                {
+                    "requests": concurrency,
+                    "status_200": concurrency,
+                    "marker_ok": concurrency,
+                    "square_ok": concurrency,
+                    "format_ok": concurrency,
+                }
+            )
+            cells.append(cell)
+        model["cells"] = cells
+        return model
+
+    data["models"] = [
+        model_fixture("llama31_8b", (1, 8, 16)),
+        model_fixture("qwen3_30b_a3b", (16,)),
+    ]
+    write_json(root / "summary.json", data)
+    for key in ("llama31_8b", "qwen3_30b_a3b"):
+        (root / f"{key}.server.stdout").write_text("server ready\n")
+        (root / f"{key}.run.stdout").write_text("model answered normally\n")
+
+
+def write_summary_gate_fixture(
+    root: Path,
+    directory: str,
+    lane: str,
+    child_gate: str,
+    child_identity_field: str,
+    child_identity: str,
+    child_pass_prefix: str,
+) -> None:
+    artifact = root / directory
+    child = {"status": "pass", child_identity_field: child_identity}
+    if lane == "unit":
+        child["source"] = {
+            "git_sha": "1" * 40,
+            "dirty_status": {"is_dirty": False, "status_short": []},
+        }
+    child_path = artifact / child_gate
+    write_json(child_path, child)
+    write_json(
+        artifact / "gate.manifest.json",
+        {
+            "status": "pass",
+            "lane": lane,
+            "child_returncode": 0,
+            "git_sha": "1" * 40,
+            "dirty_status": {"is_dirty": False, "status_short": []},
+            "artifact_dir": str(artifact),
+            "pass_line": f"FERRUM GATE {lane} PASS: {artifact}",
+            "child_pass_line": child_pass_prefix + str(artifact),
+            "child_artifacts": {
+                "kind": "standard-g0-child",
+                "child_manifest": {
+                    "path": str(child_path),
+                    "sha256": hashlib.sha256(child_path.read_bytes()).hexdigest(),
+                    "size_bytes": child_path.stat().st_size,
+                },
+            },
+        },
+    )
 
 
 def make_summary_artifact(root: Path) -> None:
-    for rel in [
+    fixtures = (
+        (
+            "source-unit",
+            "unit",
+            "unit.gate.json",
+            "lane",
+            "unit",
+            "G0 SOURCE unit PASS: ",
+        ),
+        (
+            "source-metal",
+            "metal",
+            "metal.gate.json",
+            "lane",
+            "metal",
+            "G0 SOURCE metal PASS: ",
+        ),
+        (
+            "source-cuda-full",
+            "cuda-full",
+            "g0_cuda4090_full.gate.json",
+            "lane",
+            "g0_cuda4090_full",
+            "G0 SOURCE g0_cuda4090_full PASS: ",
+        ),
+        (
+            "source-cuda-llama-dense",
+            "cuda-llama-dense",
+            "g0_cuda4090_llama_dense.gate.json",
+            "lane",
+            "g0_cuda4090_llama_dense",
+            "G0 SOURCE g0_cuda4090_llama_dense PASS: ",
+        ),
+        (
+            "metal-tarball",
+            "metal-tarball",
+            "gate.json",
+            "mode",
+            "metal-tarball",
+            "METAL TARBALL GATE PASS: ",
+        ),
+        (
+            "cuda-tarball",
+            "cuda-tarball",
+            "gate.json",
+            "mode",
+            "cuda-tarball",
+            "CUDA TARBALL GATE PASS: ",
+        ),
+        (
+            "homebrew-metal",
+            "homebrew-metal",
+            "gate.json",
+            "mode",
+            "homebrew-metal",
+            "HOMEBREW METAL GATE PASS: ",
+        ),
+        (
+            "homebrew-cuda-fetch",
+            "homebrew-cuda-fetch",
+            "gate.json",
+            "mode",
+            "homebrew-cuda-fetch",
+            "HOMEBREW CUDA FETCH GATE PASS: ",
+        ),
+    )
+    for fixture in fixtures:
+        write_summary_gate_fixture(root, *fixture)
+
+
+def make_legacy_summary_artifact(root: Path) -> None:
+    for relative in (
         "source-unit/unit.gate.json",
         "metal-tarball/gate.json",
         "cuda-tarball/gate.json",
         "homebrew-metal/gate.json",
         "homebrew-cuda-fetch/gate.json",
-    ]:
-        write_json(root / rel, {"status": "pass"})
+    ):
+        write_json(root / relative, {"status": "pass"})
     import validate_release_completion_manifest as completion_validator
 
     completion_validator.make_selftest_manifest(
         root / "_completion-fixture.json",
         artifact_root=root,
     )
-    return
-
-    for lane in [
-        "runtime-vnext-metal-three-model",
-        "runtime-vnext-cuda-three-model",
-        "runtime-vnext-published-assets",
-        "runtime-vnext-prepromotion",
-    ]:
-        artifact = root / lane
-        write_json(
-            artifact / "gate.manifest.json",
-            {
-                "status": "pass",
-                "lane": lane,
-                "artifact_dir": str(artifact),
-                "pass_line": f"FERRUM GATE {lane} PASS: {artifact}",
-            },
-        )
 
 
 def load_release_binary_gate():
@@ -388,18 +524,40 @@ def test_metal_validator() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-metal-gate-") as tmp:
         root = Path(tmp)
         make_metal_artifact(root)
-        ok = run([sys.executable, str(METAL_VALIDATOR), str(root)])
+        validator_command = [
+            sys.executable,
+            str(METAL_VALIDATOR),
+            str(root),
+            "--require-release-matrix",
+        ]
+        ok = run(validator_command)
         require(ok.returncode == 0, ok.stderr or ok.stdout)
         require("METAL README GATE PASS" in ok.stdout, ok.stdout)
 
         data = json.loads((root / "summary.json").read_text())
-        data["models"][0]["default_startup"]["max_allowed_max_sequences"] = 3
+        all_models = json.loads(json.dumps(data["models"]))
+        data["models"] = data["models"][:1]
+        write_json(root / "summary.json", data)
+        missing_model = run(validator_command)
+        require(missing_model.returncode != 0, "missing release model unexpectedly passed")
+        require("must contain exactly" in missing_model.stderr, missing_model.stderr)
+
+        data["models"] = json.loads(json.dumps(all_models))
+        saved_cells = data["models"][0]["cells"]
+        data["models"][0]["cells"] = []
+        write_json(root / "summary.json", data)
+        missing_cells = run(validator_command)
+        require(missing_cells.returncode != 0, "missing performance cells unexpectedly passed")
+        require("concurrency cells must be exactly" in missing_cells.stderr, missing_cells.stderr)
+
+        data["models"][0]["cells"] = saved_cells
+        data["models"][0]["default_startup"]["max_allowed_max_sequences"] = 15
         write_json(root / "summary.json", data)
         bad_default = run([sys.executable, str(METAL_VALIDATOR), str(root)])
         require(bad_default.returncode != 0, "unsafe default max_sequences unexpectedly passed")
-        require("default max_sequences 4 > allowed 3" in bad_default.stderr, bad_default.stderr)
+        require("default max_sequences 16 > allowed 15" in bad_default.stderr, bad_default.stderr)
 
-        data["models"][0]["default_startup"]["max_allowed_max_sequences"] = 4
+        data["models"][0]["default_startup"]["max_allowed_max_sequences"] = 16
         write_json(root / "summary.json", data)
         data["models"][0]["chat"]["stateful_loop"]["repeated_prefixes"] = 1
         write_json(root / "summary.json", data)
@@ -409,7 +567,7 @@ def test_metal_validator() -> None:
 
         data["models"][0]["chat"]["stateful_loop"]["repeated_prefixes"] = 0
         write_json(root / "summary.json", data)
-        (root / "qwen3_0_6b.run.stderr").write_text("thread panicked\n")
+        (root / "llama31_8b.run.stderr").write_text("thread panicked\n")
         bad = run([sys.executable, str(METAL_VALIDATOR), str(root)])
         require(bad.returncode != 0, "bad metal artifact unexpectedly passed")
         require("METAL README GATE FAIL" in bad.stderr, bad.stderr)
@@ -419,82 +577,248 @@ def test_summary_validator() -> None:
     with tempfile.TemporaryDirectory(prefix="ferrum-summary-gate-") as tmp:
         root = Path(tmp)
         make_summary_artifact(root)
-        ok = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
+        command = [
+            sys.executable,
+            str(SUMMARY_VALIDATOR),
+            str(root),
+            "--profile",
+            "v084",
+        ]
+        ok = run(command)
         require(ok.returncode == 0, ok.stderr or ok.stdout)
-        require("G0 RELEASE PASS" in ok.stdout, ok.stdout)
+        require(ok.stdout == f"G0 RELEASE PASS: {root}\n", ok.stdout)
         require((root / "g0_release_summary.json").is_file(), "missing summary output")
+        summary = json.loads((root / "g0_release_summary.json").read_text())
         require(
-            not (root / "source-metal/metal.gate.json").exists()
-            and not (root / "source-cuda-full/g0_cuda4090_full.gate.json").exists()
-            and not (
-                root
-                / "source-cuda-llama-dense/g0_cuda4090_llama_dense.gate.json"
-            ).exists(),
-            "summary fixture unexpectedly depends on legacy full accelerator gates",
+            set(summary["gates"])
+            == {
+                "source-unit/gate.manifest.json",
+                "source-metal/gate.manifest.json",
+                "source-cuda-full/gate.manifest.json",
+                "source-cuda-llama-dense/gate.manifest.json",
+                "metal-tarball/gate.manifest.json",
+                "cuda-tarball/gate.manifest.json",
+                "homebrew-metal/gate.manifest.json",
+                "homebrew-cuda-fetch/gate.manifest.json",
+            },
+            summary,
+        )
+        require(
+            summary["artifact_dir"] == str(root)
+            and summary["release_candidate_sha"] == "1" * 40
+            and summary["pass_line"] == f"G0 RELEASE PASS: {root}",
+            summary,
+        )
+        require("release" not in summary and "release_candidate" not in summary, summary)
+
+        legacy_root = root / "legacy-positive"
+        make_legacy_summary_artifact(legacy_root)
+        legacy_positive = run(
+            [
+                sys.executable,
+                str(SUMMARY_VALIDATOR),
+                str(legacy_root),
+                "--profile",
+                "legacy",
+            ]
+        )
+        require(
+            legacy_positive.returncode == 0
+            and legacy_positive.stdout == f"G0 RELEASE PASS: {legacy_root}\n",
+            legacy_positive.stderr or legacy_positive.stdout,
         )
 
-        sampled_gate = root / "vnext-g08-rc/gate.manifest.json"
-        held_sampled_gate = root / "vnext-g08-rc/gate.manifest.json.missing"
-        sampled_gate.rename(held_sampled_gate)
-        missing_sampled = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
-        require(
-            missing_sampled.returncode != 0,
-            "release summary without sampled correctness unexpectedly passed",
+        legacy_scope = run(
+            [
+                sys.executable,
+                str(SUMMARY_VALIDATOR),
+                str(root),
+                "--profile",
+                "legacy",
+            ]
         )
-        require("vnext-g08-rc" in missing_sampled.stderr, missing_sampled.stderr)
-        held_sampled_gate.rename(sampled_gate)
+        require(
+            legacy_scope.returncode != 0
+            and "vnext-g08-rc" in legacy_scope.stderr,
+            "legacy profile did not retain its Runtime vNext inputs",
+        )
 
-        write_json(root / "cuda-tarball/gate.json", {"status": "fail"})
-        bad = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
-        require(bad.returncode != 0, "bad release summary unexpectedly passed")
-        require("G0 RELEASE FAIL" in bad.stderr, bad.stderr)
+        metal_manifest = root / "source-metal/gate.manifest.json"
+        metal_doc = json.loads(metal_manifest.read_text())
+        metal_doc["git_sha"] = "2" * 40
+        write_json(metal_manifest, metal_doc)
+        mixed_candidate = run(command)
+        require(
+            mixed_candidate.returncode != 0,
+            "mixed release-candidate SHAs unexpectedly passed",
+        )
+        require(
+            "do not bind one clean candidate git SHA" in mixed_candidate.stderr,
+            mixed_candidate.stderr,
+        )
+        metal_doc["git_sha"] = "1" * 40
+        write_json(metal_manifest, metal_doc)
 
-        write_json(root / "cuda-tarball/gate.json", {"status": "pass"})
-        published = root / "runtime-vnext-published-assets/gate.manifest.json"
-        published_doc = json.loads(published.read_text())
-        published_doc["lane"] = "runtime-vnext-prepromotion"
-        write_json(published, published_doc)
-        wrong_lane = run([sys.executable, str(SUMMARY_VALIDATOR), str(root)])
-        require(wrong_lane.returncode != 0, "wrong vNext release lane unexpectedly passed")
+        metal_doc["dirty_status"] = {
+            "is_dirty": True,
+            "status_short": [" M README.md"],
+        }
+        write_json(metal_manifest, metal_doc)
+        dirty_candidate = run(command)
+        require(
+            dirty_candidate.returncode != 0,
+            "dirty release-candidate gate unexpectedly passed",
+        )
+        require("candidate checkout is dirty" in dirty_candidate.stderr, dirty_candidate.stderr)
+        metal_doc["dirty_status"] = {"is_dirty": False, "status_short": []}
+        write_json(metal_manifest, metal_doc)
+
+        unit_child_path = root / "source-unit/unit.gate.json"
+        unit_child = json.loads(unit_child_path.read_text())
+        unit_child["source"]["git_sha"] = "3" * 40
+        write_json(unit_child_path, unit_child)
+        unit_manifest_path = root / "source-unit/gate.manifest.json"
+        unit_manifest = json.loads(unit_manifest_path.read_text())
+        unit_binding = unit_manifest["child_artifacts"]["child_manifest"]
+        unit_binding["sha256"] = hashlib.sha256(unit_child_path.read_bytes()).hexdigest()
+        unit_binding["size_bytes"] = unit_child_path.stat().st_size
+        write_json(unit_manifest_path, unit_manifest)
+        stale_child = run(command)
+        require(stale_child.returncode != 0, "stale child provenance unexpectedly passed")
+        require("child gate candidate differs" in stale_child.stderr, stale_child.stderr)
+        unit_child["source"]["git_sha"] = "1" * 40
+        write_json(unit_child_path, unit_child)
+        unit_binding["sha256"] = hashlib.sha256(unit_child_path.read_bytes()).hexdigest()
+        unit_binding["size_bytes"] = unit_child_path.stat().st_size
+        write_json(unit_manifest_path, unit_manifest)
+
+        held_metal_manifest = metal_manifest.with_suffix(".json.missing")
+        metal_manifest.rename(held_metal_manifest)
+        missing_metal = run(command)
+        require(
+            missing_metal.returncode != 0,
+            "release summary without Metal source evidence unexpectedly passed",
+        )
+        require("metal-source" in missing_metal.stderr, missing_metal.stderr)
+        held_metal_manifest.rename(metal_manifest)
+
+        cuda_child_path = root / "cuda-tarball/gate.json"
+        cuda_child = json.loads(cuda_child_path.read_text())
+        cuda_child["status"] = "fail"
+        write_json(cuda_child_path, cuda_child)
+        bad_child = run(command)
+        require(bad_child.returncode != 0, "failed child gate unexpectedly passed")
+        require("child gate not pass" in bad_child.stderr, bad_child.stderr)
+        cuda_child["status"] = "pass"
+        write_json(cuda_child_path, cuda_child)
+        cuda_manifest_path = root / "cuda-tarball/gate.manifest.json"
+        cuda_manifest = json.loads(cuda_manifest_path.read_text())
+        cuda_binding = cuda_manifest["child_artifacts"]["child_manifest"]
+        cuda_binding["sha256"] = hashlib.sha256(cuda_child_path.read_bytes()).hexdigest()
+        cuda_binding["size_bytes"] = cuda_child_path.stat().st_size
+        write_json(cuda_manifest_path, cuda_manifest)
+
+        homebrew_manifest_path = root / "homebrew-metal/gate.manifest.json"
+        homebrew_manifest = json.loads(homebrew_manifest_path.read_text())
+        homebrew_manifest["lane"] = "cuda-tarball"
+        write_json(homebrew_manifest_path, homebrew_manifest)
+        wrong_lane = run(command)
+        require(wrong_lane.returncode != 0, "wrong release lane unexpectedly passed")
         require("gate lane differs" in wrong_lane.stderr, wrong_lane.stderr)
+        homebrew_manifest["lane"] = "homebrew-metal"
+        write_json(homebrew_manifest_path, homebrew_manifest)
 
-        published_doc["lane"] = "runtime-vnext-published-assets"
-        write_json(published, published_doc)
-        import validate_release_completion_manifest as completion_validator
+        metal_tarball_path = root / "metal-tarball/gate.manifest.json"
+        metal_tarball = json.loads(metal_tarball_path.read_text())
+        metal_tarball["pass_line"] = "WRONG PASS"
+        write_json(metal_tarball_path, metal_tarball)
+        wrong_outer_pass = run(command)
+        require(
+            wrong_outer_pass.returncode != 0,
+            "wrong outer PASS line unexpectedly passed",
+        )
+        require("gate pass line differs" in wrong_outer_pass.stderr, wrong_outer_pass.stderr)
+        metal_tarball["pass_line"] = (
+            f"FERRUM GATE metal-tarball PASS: {root / 'metal-tarball'}"
+        )
+        write_json(metal_tarball_path, metal_tarball)
 
-        g10b_child_path = root / "vnext-g10b/manifest.json"
-        g10b_child = json.loads(g10b_child_path.read_text())
-        g10b_child["release"]["prerelease"] = True
-        write_json(g10b_child_path, g10b_child)
-        g10b_outer_path = root / "vnext-g10b/gate.manifest.json"
-        g10b_outer = json.loads(g10b_outer_path.read_text())
-        g10b_outer["child_artifacts"]["child_manifest"] = (
-            completion_validator._fixture_ref(g10b_child_path)
-        )
-        write_json(g10b_outer_path, g10b_outer)
-        g10_child_path = root / "vnext-g10/manifest.json"
-        g10_child = json.loads(g10_child_path.read_text())
-        g10_child["release"]["prerelease"] = True
-        g10_child["inputs"]["g10b"] = completion_validator._fixture_ref(
-            g10b_child_path
-        )
-        write_json(g10_child_path, g10_child)
-        g10_outer_path = root / "vnext-g10/gate.manifest.json"
-        g10_outer = json.loads(g10_outer_path.read_text())
-        g10_outer["child_artifacts"]["child_manifest"] = (
-            completion_validator._fixture_ref(g10_child_path)
-        )
-        write_json(g10_outer_path, g10_outer)
-        prepromotion_summary = run(
-            [sys.executable, str(SUMMARY_VALIDATOR), str(root)]
+        cuda_full_path = root / "source-cuda-full/gate.manifest.json"
+        cuda_full = json.loads(cuda_full_path.read_text())
+        cuda_full["child_pass_line"] = "WRONG CHILD PASS"
+        write_json(cuda_full_path, cuda_full)
+        wrong_child_pass = run(command)
+        require(
+            wrong_child_pass.returncode != 0,
+            "wrong delegated child PASS line unexpectedly passed",
         )
         require(
-            prepromotion_summary.returncode != 0,
-            "prepromotion-only release summary unexpectedly passed",
+            "gate child pass line differs" in wrong_child_pass.stderr,
+            wrong_child_pass.stderr,
+        )
+        cuda_full["child_pass_line"] = (
+            f"G0 SOURCE g0_cuda4090_full PASS: {root / 'source-cuda-full'}"
+        )
+        write_json(cuda_full_path, cuda_full)
+
+        dense_path = root / "source-cuda-llama-dense/gate.manifest.json"
+        dense = json.loads(dense_path.read_text())
+        copied_from = "/remote/evidence/ferrum-0.8.4/source-cuda-llama-dense"
+        dense["artifact_dir"] = copied_from
+        dense["pass_line"] = (
+            f"FERRUM GATE cuda-llama-dense PASS: {copied_from}"
+        )
+        dense["child_pass_line"] = (
+            f"G0 SOURCE g0_cuda4090_llama_dense PASS: {copied_from}"
+        )
+        dense["child_artifacts"]["child_manifest"]["path"] = (
+            f"{copied_from}/g0_cuda4090_llama_dense.gate.json"
+        )
+        write_json(dense_path, dense)
+        copied_evidence = run(command)
+        require(
+            copied_evidence.returncode == 0,
+            copied_evidence.stderr or copied_evidence.stdout,
         )
         require(
-            "promotion is incomplete" in prepromotion_summary.stderr,
-            prepromotion_summary.stderr,
+            copied_evidence.stdout == f"G0 RELEASE PASS: {root}\n",
+            copied_evidence.stdout,
+        )
+
+        metal_outer_path = root / "source-metal/gate.manifest.json"
+        metal_outer = json.loads(metal_outer_path.read_text())
+        recorded_metal_child = metal_outer["child_artifacts"]["child_manifest"]["path"]
+        metal_outer["child_artifacts"]["child_manifest"]["path"] = (
+            "/substituted/location/metal.gate.json"
+        )
+        write_json(metal_outer_path, metal_outer)
+        wrong_child_path = run(command)
+        require(wrong_child_path.returncode != 0, "wrong recorded child path unexpectedly passed")
+        require(
+            "child manifest recorded path differs" in wrong_child_path.stderr,
+            wrong_child_path.stderr,
+        )
+        metal_outer["child_artifacts"]["child_manifest"]["path"] = recorded_metal_child
+        write_json(metal_outer_path, metal_outer)
+
+        substituted_path = root / "source-metal/metal.gate.json"
+        substituted = json.loads(substituted_path.read_text())
+        substituted["substituted"] = True
+        write_json(substituted_path, substituted)
+        substituted_outer_path = root / "source-metal/gate.manifest.json"
+        substituted_outer = json.loads(substituted_outer_path.read_text())
+        substituted_outer["child_artifacts"]["child_manifest"]["size_bytes"] = (
+            substituted_path.stat().st_size
+        )
+        write_json(substituted_outer_path, substituted_outer)
+        substituted_child = run(command)
+        require(
+            substituted_child.returncode != 0,
+            "substituted child manifest unexpectedly passed",
+        )
+        require(
+            "child manifest SHA256 differs" in substituted_child.stderr,
+            substituted_child.stderr,
         )
 
 

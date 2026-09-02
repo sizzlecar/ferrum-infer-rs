@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -294,11 +296,46 @@ def require_keys(where: str, value: dict[str, Any], required: set[str]) -> None:
         raise ValidationError(f"{where}: missing keys: {', '.join(missing)}")
 
 
+_RECORDED_ROOTS: dict[Path, Path | None] = {}
+
+
 def resolve(path: str, root: Path) -> Path:
     p = Path(path)
-    if p.is_absolute() or p.exists():
-        return p
-    return root / p
+    local_root = root.resolve()
+    if p.is_absolute():
+        recorded_root = _RECORDED_ROOTS.get(local_root)
+        if recorded_root is None:
+            if (
+                (p.exists() and p.is_file() and not p.is_symlink() and p.resolve().is_relative_to(local_root))
+                or (not p.exists() and p.parent.exists() and p.parent.resolve().is_relative_to(local_root))
+            ):
+                return p
+            raise ValidationError(f"absolute artifact path has no recorded-root binding: {p}")
+        try:
+            relative = p.relative_to(recorded_root)
+        except ValueError as exc:
+            raise ValidationError(
+                f"absolute artifact path escapes/mixes recorded root {recorded_root}: {p}"
+            ) from exc
+        mapped = root.joinpath(*relative.parts)
+        if mapped.is_symlink() or (mapped.exists() and (not mapped.is_file() or not mapped.resolve().is_relative_to(local_root))):
+            raise ValidationError(f"remapped artifact path is not a regular in-root file: {mapped}")
+        return mapped
+    candidate = root / p
+    if (
+        p.is_absolute()
+        or ".." in p.parts
+        or candidate.is_symlink()
+        or (
+            candidate.exists()
+            and (
+                not candidate.is_file()
+                or not candidate.resolve().is_relative_to(local_root)
+            )
+        )
+    ):
+        raise ValidationError(f"relative artifact path is not a regular in-root file: {p}")
+    return candidate
 
 
 def validate_runtime_snapshot(case_name: str, snapshot: dict[str, Any]) -> None:
@@ -1284,6 +1321,8 @@ def validate_case(
     require_bench: bool,
     require_profile_events: bool,
     summary: dict[str, Any],
+    expected_candidate_sha: str | None,
+    expected_binary_sha256: str | None,
 ) -> dict[str, Any]:
     if "manifest" not in case_ref:
         raise ValidationError("root manifest case is missing manifest path")
@@ -1293,6 +1332,17 @@ def validate_case(
     case = load_json(manifest_path)
     require_keys(f"{case_ref.get('name', manifest_path.name)} manifest", case, CASE_REQUIRED)
     validate_publishability(f"{case_ref.get('name', manifest_path.name)} manifest", case)
+
+    if expected_candidate_sha is not None:
+        if case.get("git_head") != expected_candidate_sha:
+            raise ValidationError(f"{case.get('name')}: git_head differs from expected candidate")
+        if case.get("git_status_short") != []:
+            raise ValidationError(f"{case.get('name')}: git_status_short is not clean")
+    binary_sha256 = case.get("binary_sha256")
+    if not isinstance(binary_sha256, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", binary_sha256) is None:
+        raise ValidationError(f"{case.get('name')}: binary_sha256 is invalid")
+    if expected_binary_sha256 is not None and binary_sha256 != expected_binary_sha256:
+        raise ValidationError(f"{case.get('name')}: binary_sha256 differs across cases")
 
     if case["status"] != "pass":
         raise ValidationError(f"{case['name']}: status is {case['status']!r}")
@@ -1401,13 +1451,38 @@ def validate_artifact(
     *,
     require_bench: bool,
     require_profile_events: bool,
+    expected_candidate_sha: str | None = None,
 ) -> dict[str, Any]:
+    root = root.resolve()
     root_manifest_path = root / "manifest.json"
     if not root_manifest_path.exists():
         raise ValidationError(f"root manifest missing: {root_manifest_path}")
     manifest = load_json(root_manifest_path)
     require_keys("root manifest", manifest, ROOT_REQUIRED)
     validate_publishability("root manifest", manifest)
+
+    if expected_candidate_sha is not None and re.fullmatch(r"[0-9a-f]{40}", expected_candidate_sha) is None:
+        raise ValidationError("expected candidate SHA must be 40 lowercase hexadecimal characters")
+    first_preflight = manifest.get("preflight", {}).get("first_child_preflight")
+    expected_binary_sha256: str | None = None
+    if expected_candidate_sha is not None:
+        if not isinstance(first_preflight, dict):
+            raise ValidationError("root preflight first_child_preflight is missing")
+        if first_preflight.get("git_head") != expected_candidate_sha:
+            raise ValidationError("root preflight git_head differs from expected candidate")
+        if first_preflight.get("git_status_short") != []:
+            raise ValidationError("root preflight git_status_short is not clean")
+        expected_binary_sha256 = first_preflight.get("binary_sha256")
+        if not isinstance(expected_binary_sha256, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", expected_binary_sha256) is None:
+            raise ValidationError("root preflight binary_sha256 is invalid")
+
+    summary_recorded = Path(str(manifest.get("summary_json", "")))
+    recorded_root: Path | None = None
+    if summary_recorded.is_absolute():
+        recorded_root = summary_recorded.parent
+        if root == recorded_root.resolve():
+            recorded_root = None
+    _RECORDED_ROOTS[root] = recorded_root
 
     summary_path = resolve(manifest["summary_json"], root)
     if not summary_path.exists():
@@ -1443,6 +1518,8 @@ def validate_artifact(
             require_bench=require_bench,
             require_profile_events=require_profile_events,
             summary=summary,
+            expected_candidate_sha=expected_candidate_sha,
+            expected_binary_sha256=expected_binary_sha256,
         )
         for case in cases
     ]
@@ -1463,10 +1540,14 @@ def self_test() -> None:
     with tempfile.TemporaryDirectory(dir=Path.cwd()) as td:
         root = Path(td).relative_to(Path.cwd())
         write_json(root / "summary.json", {"ok": True})
-        assert resolve(str(root / "summary.json"), root) == root / "summary.json"
+        assert resolve("summary.json", root) == root / "summary.json"
+        with tempfile.NamedTemporaryFile(dir=Path.cwd()) as outside:
+            assert resolve(Path(outside.name).name, root) == root / Path(outside.name).name
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
+        expected_candidate = "a" * 40
+        expected_binary = "sha256:" + "b" * 64
         effective_entries = [
             {
                 "key": "FERRUM_KV_DTYPE",
@@ -1647,9 +1728,9 @@ def self_test() -> None:
                 "not_publishable": False,
                 "not_publishable_reason": None,
                 "port": 1,
-                "git_head": "abc",
+                "git_head": expected_candidate,
                 "git_status_short": [],
-                "binary_sha256": "sha256:bin",
+                "binary_sha256": expected_binary,
                 "features": "cuda",
                 "runtime_preset": "preset",
                 "env_hash": "sha256:env",
@@ -1750,14 +1831,58 @@ def self_test() -> None:
                 "not_publishable": False,
                 "not_publishable_reason": None,
                 "validation_checklist": validation_checklist,
-                "preflight": {},
+                "preflight": {
+                    "first_child_preflight": {
+                        "git_head": expected_candidate,
+                        "git_status_short": [],
+                        "binary_sha256": expected_binary,
+                    }
+                },
                 "runtime_preset": "preset",
                 "cases": [{"name": "case", "manifest": str(case_dir / "manifest.json")}],
                 "summary_json": str(root / "summary.json"),
             },
         )
-        result = validate_artifact(root, require_bench=True, require_profile_events=False)
+        result = validate_artifact(
+            root,
+            require_bench=True,
+            require_profile_events=False,
+            expected_candidate_sha=expected_candidate,
+        )
         assert result["ok"]
+
+        root_manifest = load_json(root / "manifest.json")
+        root_manifest["preflight"]["first_child_preflight"]["git_head"] = "c" * 40
+        write_json(root / "manifest.json", root_manifest)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False, expected_candidate_sha=expected_candidate)
+        except ValidationError as exc:
+            assert "root preflight git_head" in str(exc)
+        else:
+            raise AssertionError("wrong root candidate unexpectedly passed")
+        root_manifest["preflight"]["first_child_preflight"]["git_head"] = expected_candidate
+        write_json(root / "manifest.json", root_manifest)
+
+        case_manifest = load_json(case_dir / "manifest.json")
+        case_manifest["git_status_short"] = [" M crates/ferrum-cli/src/main.rs"]
+        write_json(case_dir / "manifest.json", case_manifest)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False, expected_candidate_sha=expected_candidate)
+        except ValidationError as exc:
+            assert "git_status_short is not clean" in str(exc)
+        else:
+            raise AssertionError("dirty case candidate unexpectedly passed")
+        case_manifest["git_status_short"] = []
+        case_manifest["binary_sha256"] = "sha256:" + "d" * 64
+        write_json(case_dir / "manifest.json", case_manifest)
+        try:
+            validate_artifact(root, require_bench=True, require_profile_events=False, expected_candidate_sha=expected_candidate)
+        except ValidationError as exc:
+            assert "binary_sha256 differs across cases" in str(exc)
+        else:
+            raise AssertionError("mixed case binary unexpectedly passed")
+        case_manifest["binary_sha256"] = expected_binary
+        write_json(case_dir / "manifest.json", case_manifest)
 
         bad_bench = load_json(case_dir / "bench.json")
         bad_bench["bad_output_per_run"] = [1]
@@ -2060,6 +2185,37 @@ def self_test() -> None:
             assert "runtime_flags" in str(exc)
         else:
             raise AssertionError("invalid profile event unexpectedly passed")
+
+        with tempfile.TemporaryDirectory() as copied_parent:
+            copied = Path(copied_parent) / "copied-remote-artifact"
+            shutil.copytree(root, copied)
+            copied_result = validate_artifact(
+                copied, require_bench=True, require_profile_events=False
+            )
+            assert copied_result["ok"]
+
+            copied_manifest = load_json(copied / "manifest.json")
+            original_summary = copied_manifest["summary_json"]
+            copied_manifest["summary_json"] = "/different/recorded/root/summary.json"
+            write_json(copied / "manifest.json", copied_manifest)
+            try:
+                validate_artifact(copied, require_bench=True, require_profile_events=False)
+            except ValidationError as exc:
+                assert "escapes/mixes recorded root" in str(exc)
+            else:
+                raise AssertionError("mixed recorded root unexpectedly passed")
+            copied_manifest["summary_json"] = original_summary
+            write_json(copied / "manifest.json", copied_manifest)
+
+            copied_summary = copied / "summary.json"
+            copied_summary.unlink()
+            copied_summary.symlink_to(root / "summary.json")
+            try:
+                validate_artifact(copied, require_bench=True, require_profile_events=False)
+            except ValidationError as exc:
+                assert "not a regular in-root file" in str(exc)
+            else:
+                raise AssertionError("remapped symlink unexpectedly passed")
     print("m3_validate_runner_artifact self-test ok")
 
 
@@ -2069,6 +2225,7 @@ def main() -> None:
     parser.add_argument("--require-bench", action="store_true", default=True)
     parser.add_argument("--no-require-bench", dest="require_bench", action="store_false")
     parser.add_argument("--require-profile-events", action="store_true")
+    parser.add_argument("--expected-candidate-sha")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
@@ -2082,6 +2239,7 @@ def main() -> None:
             args.artifact,
             require_bench=args.require_bench,
             require_profile_events=args.require_profile_events,
+            expected_candidate_sha=args.expected_candidate_sha,
         )
     except ValidationError as exc:
         print(f"artifact validation failed: {exc}", flush=True)

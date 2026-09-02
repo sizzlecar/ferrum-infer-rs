@@ -100,6 +100,11 @@ PY
     scripts/release/validate_metal_readme_regression.py \
     scripts/release/release_binary_gate.py \
     scripts/release/g0_release_summary.py \
+    scripts/release/v084_crates_io_release.py \
+    scripts/release/v084_prerelease_download_gate.py \
+    scripts/release/v084_release_publish.py \
+    scripts/release/v084_release_goal_gate.py \
+    scripts/release/v084_workflow_native_gate.py \
     scripts/release/g0_cuda_llama_dense_gate.py \
     scripts/release/g0_cuda_llama33_70b_4bit_2x4090_gate.py \
     scripts/release/backend_runtime_preset_goal_gate.py \
@@ -164,6 +169,11 @@ PY
   bash -n scripts/release/g0_source_gate.sh | tee "$OUT_ROOT/g0-source-bashn.log"
   python3 scripts/release/selftest_g0_validators.py | tee "$OUT_ROOT/g0-validator-selftest.log"
   python3 scripts/release/selftest_g1_g3_g4_release_regression.py | tee "$OUT_ROOT/g1-g3-g4-validator-selftest.log"
+  python3 scripts/release/v084_crates_io_release.py --self-test | tee "$OUT_ROOT/v084-crates-io-selftest.log"
+  python3 scripts/release/v084_prerelease_download_gate.py --self-test | tee "$OUT_ROOT/v084-prerelease-download-selftest.log"
+  python3 scripts/release/v084_release_publish.py --self-test | tee "$OUT_ROOT/v084-release-publish-selftest.log"
+  python3 scripts/release/v084_release_goal_gate.py --self-test | tee "$OUT_ROOT/v084-release-goal-selftest.log"
+  python3 scripts/release/v084_workflow_native_gate.py --self-test | tee "$OUT_ROOT/v084-workflow-native-selftest.log"
   python3 - "$OUT_ROOT" "$unit_receipt" "$unit_stdout" "$unit_stderr" "$unit_source" <<'PY'
 import hashlib
 import json
@@ -403,7 +413,9 @@ run_metal() {
   cargo build --release -p ferrum-cli --features metal --tests | tee "$OUT_ROOT/metal-build.log"
   local metal_out="$OUT_ROOT/metal-readme"
   python3 scripts/metal_readme_regression.py --out "$metal_out" --ferrum-bin ./target/release/ferrum | tee "$OUT_ROOT/metal-runner.log"
-  python3 scripts/release/validate_metal_readme_regression.py "$metal_out" | tee "$OUT_ROOT/metal-validator.log"
+  python3 scripts/release/validate_metal_readme_regression.py \
+    "$metal_out" \
+    --require-release-matrix | tee "$OUT_ROOT/metal-validator.log"
   echo '{"status":"pass","lane":"metal","artifact":"metal-readme"}' > "$OUT_ROOT/metal.gate.json"
   pass metal
 }
