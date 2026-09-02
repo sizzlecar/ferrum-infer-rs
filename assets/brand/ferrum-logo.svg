@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
   <title id="title">Ferrum</title>
   <desc id="desc">An orange forward-cut F with a green acceleration cut on a black rounded square.</desc>
   <rect x="4" y="4" width="56" height="56" rx="13" fill="#0b0d0f"/>
