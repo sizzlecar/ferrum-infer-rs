@@ -174,10 +174,7 @@ extern "C" __global__ void paged_varlen_attn_f16(
 // Phase 1: each block scans 1/N of the kv_len for one (head, q_token, split).
 // Stores partial output (unnormalized) + local m + local l for online merge.
 //
-// Microbench (RTX 4090, scripts/microbench_split_k.cu) shows this wins
-// big at low concurrency (c=4 +103% kv_len=384, c=1 +801% kv_len=4096)
-// and modest at c=16+ long context (kv_len>=768 → +6-16%). Marginal/neg
-// at c=16 short kv_len.
+// Intended for under-occupied grids at low concurrency or long context.
 //
 // Output layout (caller-allocated):
 //   partial_out : [M_total, num_q_heads, num_splits, head_dim]  (float32)

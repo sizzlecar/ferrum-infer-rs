@@ -164,10 +164,10 @@ impl BackendGraph for CudaBackend {
         // capture directly in relaxed mode. Bare-Rust cudarc reproducer
         // confirms this configuration works on Blackwell + CUDA 13
         // (`cudarc_graph_no_event_tracking` test). The full ferrum bench
-        // path still SIGSEGVs though — remaining delta is likely one of
+        // path may still fail — remaining delta is likely one of
         // PTX module load timing, cuBLAS workspace interaction, or a
         // specific kernel's use of constant memory that doesn't survive
-        // capture. See `docs/phase-e-cuda-status.md` graph section.
+        // capture.
         ctx.stream
             .begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .map_err(|e| FerrumError::unsupported(format!("begin_capture: {e}")))?;

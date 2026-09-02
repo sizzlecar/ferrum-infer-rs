@@ -1,3 +1,0 @@
-Traceback (most recent call last):
-  File "<stdin>", line 14, in <module>
-TypeError: '<' not supported between instances of 'dict' and 'dict'

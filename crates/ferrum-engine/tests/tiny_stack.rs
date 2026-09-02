@@ -7,8 +7,7 @@
 //! sequences, streaming, concurrency, cancellation) that the heavyweight
 //! Metal-only CLI integration suites historically caught only at nightly.
 //!
-//! Test names are pinned by `scripts/release/test_arch_goal_gate.py`
-//! (`REQUIRED_SCENARIO_TESTS`); renaming one fails Gate B1.
+//! Test names are part of the integration-test contract and remain stable.
 
 use std::sync::Arc;
 

@@ -1,7 +1,6 @@
 //! Poisson arrival-time generation for open-loop benchmarking.
 //!
-//! See `docs/bench/PLAYBOOK.md` § 2 Scenario A: goodput is only
-//! meaningful under open-loop arrivals. We sample inter-arrival times
+//! Goodput is only meaningful under open-loop arrivals. We sample inter-arrival times
 //! from an `Exp(rate)` distribution via inverse-CDF transform, which
 //! gives a Poisson process at the given rate (requests/second).
 //!

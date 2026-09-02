@@ -1073,13 +1073,10 @@ mod tests {
 
     #[test]
     fn registered_semantic_preflight_accepts_reference_dense_and_moe_configs() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../docs/goals/model-coverage-2026-06-12/artifacts/\
-             w3_hf_config_probe_20260617T131209Z_f97c1d6f",
-        );
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         for name in [
-            "dense_min_reference.config.json",
-            "moe_shared_expert_reference.config.json",
+            "qwen35_dense_min_reference.config.json",
+            "qwen35_moe_shared_expert_reference.config.json",
         ] {
             let raw = fs::read(root.join(name)).unwrap();
             validate_registered_model_semantics(&raw)

@@ -1,8 +1,0 @@
-{
-  "content": "5\n",
-  "finish_reason": "stop",
-  "completion_tokens": 3,
-  "usage_present": true,
-  "bad_output": false,
-  "pass": true
-}

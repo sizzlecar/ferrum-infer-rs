@@ -3760,7 +3760,7 @@ pub(super) fn default_stream() -> Arc<CudaStream> {
         // replay cuGraphLaunch dereferenced a stale event pointer → SIGSEGV
         // inside libcuda.so. Flipping this here means all weight loads go
         // in cleanly, and the graph captured later sees no stray event
-        // dependencies. Bare C++ reproducers (scripts/graph_repro{,_v2}.cu)
+        // dependencies. Standalone C++ reproducers
         // work because they never enable event tracking in the first place.
         unsafe {
             ctx.disable_event_tracking();

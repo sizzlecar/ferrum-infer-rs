@@ -1,2 +1,0 @@
-[tail-profile] starting Ferrum serve with FERRUM_DECODE_OP_PROFILE=1
-tail profile diagnostic failed; see analysis/profile_summary.json

@@ -1,5 +1,0 @@
-stop_poll_1 stopped running
-stop_poll_2 stopped running
-stop_poll_3 stopped running
-stop_poll_4 stopped running
-stop_poll_5 stopped exited

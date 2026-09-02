@@ -6,8 +6,7 @@ use std::path::PathBuf;
 #[test]
 fn legacy_backend_methods_are_mapped_82_of_82() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let map_path = manifest_dir
-        .join("../../docs/goals/runtime-vnext-0.8.0-2026-07-10/G01A_LEGACY_CONTRACT_MAP.json");
+    let map_path = manifest_dir.join("tests/fixtures/vnext_legacy_contract_map.json");
     let map: Value = serde_json::from_slice(&fs::read(map_path).unwrap()).unwrap();
     assert_eq!(map["schema_version"], 1);
     assert_eq!(map["source"]["category"], "backend_trait_method");

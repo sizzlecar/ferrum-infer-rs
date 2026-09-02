@@ -1,1 +1,0 @@
-PUT state=stopped https://console.vast.ai/api/v0/instances/41422823/
