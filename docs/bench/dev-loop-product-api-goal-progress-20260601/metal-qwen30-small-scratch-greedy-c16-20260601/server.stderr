@@ -1,1 +1,0 @@
-Error: Configuration error: invalid auto config: FERRUM_GREEDY_ARGMAX: invalid override: GPU argmax requires CUDA backend

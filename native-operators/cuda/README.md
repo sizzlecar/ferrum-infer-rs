@@ -12,15 +12,9 @@ source-bundles/ferrum-native-cuda-v1.json
 ```
 
 The bundle manifest pins the archive SHA256, every member SHA256, upstream
-repositories, revisions, and licenses. Materialize it outside the Git worktree:
-
-```bash
-python3 scripts/release/native_operator_source_bundle.py materialize \
-  --manifest native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json \
-  --out /tmp/ferrum-native-cuda-v1
-```
-
-Then use `ferrum-native-ops-builder` with that external source root. The builder
+repositories, revisions, and licenses. Unpack the corresponding release asset
+outside the Git worktree, then use `ferrum-native-ops-builder` with that
+external source root. The builder
 is the only supported source compilation path. It creates source locks,
 reproducible build receipts, packages, and the artifact-set lock consumed by
 `FERRUM_NATIVE_OPERATOR_SET_LOCK`.

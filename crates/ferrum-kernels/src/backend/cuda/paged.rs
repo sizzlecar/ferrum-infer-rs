@@ -962,10 +962,8 @@ impl BackendPagedKv for CudaBackend {
             return Ok(());
         }
 
-        // Auto-tune: split-K helps under-occupied grids — low concurrency
-        // OR long context. Microbench (scripts/microbench_split_k.cu)
-        // shows c=1/kv=4096 9× speedup, c=4/kv=384 +103%, c=16/kv=384
-        // marginal/-2%. Heuristic gates split-K to regions where it wins.
+        // Auto-tune: split-K helps under-occupied grids at low concurrency
+        // or with long context. The heuristic gates it to those regions.
         // FERRUM_SPLIT_K_ATTN=1 forces on, FERRUM_SPLIT_K_ATTN=0 forces off.
         //
         // total_q_tokens cap: the unified prefill path can pack

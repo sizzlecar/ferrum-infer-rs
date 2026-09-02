@@ -4,11 +4,7 @@ use ferrum_models::qwen35_config::{
 };
 use ferrum_types::{DataType, Device, RequestId};
 
-const ARTIFACT_ROOT: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../docs/goals/model-coverage-2026-06-12/artifacts/",
-    "w3_hf_config_probe_20260617T131209Z_f97c1d6f"
-);
+const ARTIFACT_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
 
 const QWEN38_FP8_CONFIG: &str = include_str!("fixtures/qwen38_fp8_config.contract.json");
 const QWEN38_FP8_BAD_RECIPE: &str = include_str!("fixtures/qwen38_fp8_config.bad-recipe.json");
@@ -19,7 +15,7 @@ fn read_artifact(name: &str) -> String {
 
 #[test]
 fn parses_official_qwen35_dense_min_config() {
-    let raw = read_artifact("dense_min_reference.config.json");
+    let raw = read_artifact("qwen35_dense_min_reference.config.json");
     let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
     assert!(!cfg.is_moe());
     assert_eq!(cfg.top_level_model_type.as_deref(), Some("qwen3_5"));
@@ -122,7 +118,7 @@ fn parses_official_qwen35_dense_min_config() {
 
 #[test]
 fn rejects_missing_or_unsupported_mamba_ssm_dtype() {
-    let raw = read_artifact("dense_min_reference.config.json");
+    let raw = read_artifact("qwen35_dense_min_reference.config.json");
     let mut missing: serde_json::Value = serde_json::from_str(&raw).unwrap();
     missing["text_config"]
         .as_object_mut()
@@ -147,7 +143,7 @@ fn rejects_missing_or_unsupported_mamba_ssm_dtype() {
 
 #[test]
 fn parses_official_qwen36_shared_expert_moe_config() {
-    let raw = read_artifact("moe_shared_expert_reference.config.json");
+    let raw = read_artifact("qwen35_moe_shared_expert_reference.config.json");
     let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
     assert!(cfg.is_moe());
     assert!(cfg.quantization.is_none());
@@ -471,7 +467,7 @@ fn rejects_moe_config_without_shared_expert() {
 
 #[test]
 fn rejects_zero_recurrent_state_batch_slots() {
-    let raw = read_artifact("dense_min_reference.config.json");
+    let raw = read_artifact("qwen35_dense_min_reference.config.json");
     let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
     let err = cfg
         .to_recurrent_state_spec(RequestId::new(), DataType::FP16, Device::CPU, 0)
@@ -481,7 +477,7 @@ fn rejects_zero_recurrent_state_batch_slots() {
 
 #[test]
 fn rejects_recurrent_state_dimension_overflow_before_spec_creation() {
-    let raw = read_artifact("dense_min_reference.config.json");
+    let raw = read_artifact("qwen35_dense_min_reference.config.json");
     let mut cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
     cfg.linear_attention.num_key_heads = usize::MAX;
 
@@ -494,7 +490,7 @@ fn rejects_recurrent_state_dimension_overflow_before_spec_creation() {
 
 #[test]
 fn rejects_out_of_range_layer_plan_lookup() {
-    let raw = read_artifact("dense_min_reference.config.json");
+    let raw = read_artifact("qwen35_dense_min_reference.config.json");
     let cfg = Qwen35TextConfig::from_hf_config_str(&raw).unwrap();
     let err = cfg
         .mlp_kind_for_layer(cfg.num_hidden_layers)

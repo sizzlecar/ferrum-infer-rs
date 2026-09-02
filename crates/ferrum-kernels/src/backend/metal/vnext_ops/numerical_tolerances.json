@@ -1,0 +1,613 @@
+{
+  "schema_version": 1,
+  "rows": [
+    {
+      "tolerance_id": "runtime-vnext.metal.causal-attention.v2.operation.fp16.none.fixed-page-split",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.006,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.causal-attention.v2.state.kv.fp16.none.fixed-page-split",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.dense-linear.v1.operation.fp16.gguf-q4-k.hidden-2560",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.dense-swiglu.v1.operation.fp16.gguf-q4-k-q6-k.full-pipeline",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.log-rate-grouped",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.operation.fp16.none.negative-rate-interleaved",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.log-rate-grouped",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.conv.fp16.none.negative-rate-interleaved",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.log-rate-grouped",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v4.state.delta.fp32.none.negative-rate-interleaved",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v5.operation.fp16.none.log-rate-grouped",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v5.operation.fp16.none.negative-rate-interleaved",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v5.state.conv.fp16.none.log-rate-grouped",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v5.state.conv.fp16.none.negative-rate-interleaved",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v5.state.delta.fp32.none.log-rate-grouped",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v5.state.delta.fp32.none.negative-rate-interleaved",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v6.operation.fp16.none.log-rate-grouped",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v6.operation.fp16.none.negative-rate-interleaved",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v6.state.conv.fp16.none.log-rate-grouped",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v6.state.conv.fp16.none.negative-rate-interleaved",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v6.state.delta.fp32.none.log-rate-grouped",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.gated-delta.v6.state.delta.fp32.none.negative-rate-interleaved",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.last-token-dense-linear.v1.operation.fp16.gguf-q6-k.final-row",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.last-token-dense-linear.v1_1.operation.fp16.gguf-q6-k.packed-15",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.9999,
+        "max_abs_max": 0.002,
+        "relative_l2_max": 0.001
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-attention-f32-master.v1.layer.fp32.gguf-q4-k-m.tokens-24",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-attention.v2.layer.fp16.gguf-q4-k-m.tokens-24",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-model-f32-master.v1.full-model.fp32.gguf-q4-k-m.tokens-24",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.25,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-model.v1.full-model.fp16.gguf-q4-k-m.tokens-24",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.25,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-vocab-logits-f32.v1.full-vocab-logits.fp32.gguf-q4-k-m.tokens-24",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.1,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.full-vocab-logits.v1.full-vocab-logits.fp16.gguf-q4-k-m.tokens-24",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.1,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention-f32-master.v1.layer.fp32.gguf-q4-k-m.tokens-24",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v4.layer.fp16.gguf-q4-k-m.tokens-24",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v5.layer.fp16.gguf-q4-k-m.tokens-24",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.linear-attention.v6.layer.fp16.gguf-q4-k-m.tokens-24",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.012,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.qwen35-4b.same-history-logits.v1.full-vocab-logits.fp32.gguf-q4-k-m.decisions-64",
+      "dtype": "fp32",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.1,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.residual-add.v1.operation.fp16.none.hidden-2560",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.001,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.rms-norm.v1.operation.fp16.none.hidden-2560",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.002,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    },
+    {
+      "tolerance_id": "runtime-vnext.metal.token-embedding.v1.operation.fp16.gguf-q6-k.padding",
+      "dtype": "fp16",
+      "oracle_precision": "fp32",
+      "bounds": {
+        "cosine_min": 0.999,
+        "max_abs_max": 0.02,
+        "relative_l2_max": 0.01
+      },
+      "invariants": {
+        "exact_dtype": true,
+        "exact_shape": true,
+        "max_inf": 0,
+        "max_nan": 0
+      }
+    }
+  ]
+}

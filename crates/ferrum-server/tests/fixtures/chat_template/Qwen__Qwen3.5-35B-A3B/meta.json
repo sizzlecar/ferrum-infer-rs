@@ -10,17 +10,17 @@
   "sidecars": {
     "generation_config.json": {
       "status": "copied",
-      "path": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/generation_config.json",
+      "path": "generation_config.json",
       "size_bytes": 244
     },
     "tokenizer_config.json": {
       "status": "copied",
-      "path": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/tokenizer_config.json",
+      "path": "tokenizer_config.json",
       "size_bytes": 16710
     },
     "tokenizer_special_tokens.json": {
       "status": "generated",
-      "path": "/Users/chejinxuan/rust_ws/ferrum-infer-rs/crates/ferrum-server/tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/tokenizer_special_tokens.json",
+      "path": "tokenizer_special_tokens.json",
       "size_bytes": 1037
     }
   }

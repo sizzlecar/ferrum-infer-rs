@@ -1,1 +1,0 @@
-ABORTED: operator stopped cold-cache build before completion; ignore earlier trap PASS line

@@ -1,3 +1,0 @@
-poll=1 cur_state=stopped actual_status=running
-poll=2 cur_state=stopped actual_status=running
-poll=3 cur_state=stopped actual_status=exited

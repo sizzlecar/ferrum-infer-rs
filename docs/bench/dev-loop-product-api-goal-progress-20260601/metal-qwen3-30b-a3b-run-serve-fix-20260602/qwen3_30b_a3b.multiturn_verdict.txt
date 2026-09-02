@@ -1,4 +1,0 @@
-content=
-
-蓝色月亮
-passed=true

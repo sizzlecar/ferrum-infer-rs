@@ -70,8 +70,8 @@ pub fn finish_probe_timer<B: Backend>(
 /// one call. When `FERRUM_TRACE_OUT` is unset, the trace push is a
 /// no-op (cheap atomic check inside [`global_trace`]).
 ///
-/// PLAYBOOK § 1.5 — Phase 4 `visualize_layerwise.py` reads chrome-trace
-/// JSON populated by these probe sites.
+/// The trace is standard chrome-trace JSON and can be inspected with common
+/// profiling tools.
 pub fn finish_probe_timer_traced<B: Backend>(
     timer: Option<B::Timer>,
     ctx: &mut B::Context,

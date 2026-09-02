@@ -1,1 +1,0 @@
-PATH=/root/.cargo/bin:$PATH cargo test -p ferrum-kernels --features cuda,marlin cuda_marlin_runtime_config -- --nocapture

@@ -1,4 +1,4 @@
-//! Minimal Rust-cudarc graph reproducer, mirrors `scripts/graph_repro_v4.cu`
+//! Minimal Rust-cudarc graph reproducer for the CUDA graph contract.
 //! but goes through cudarc's CudaContext / CudaStream / alloc APIs instead
 //! of raw driver FFI. Isolates cudarc as a variable.
 //!

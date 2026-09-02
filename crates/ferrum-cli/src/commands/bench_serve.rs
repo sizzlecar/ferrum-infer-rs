@@ -1,6 +1,5 @@
 //! Tokenizer-aware HTTP bench client — emits the canonical schema
-//! defined in `crates/ferrum-bench-core` and gated by
-//! `docs/bench/PLAYBOOK.md` § 7.
+//! defined in `crates/ferrum-bench-core`.
 //!
 //! Scenarios (PLAYBOOK § 2):
 //!   - **Closed-loop** — `--concurrency K`, K workers in tight send→wait
@@ -198,7 +197,7 @@ pub struct BenchServeCommand {
 
     // ─── Output ────────────────────────────────────────────────────
     /// Output format: `json` (BenchReport), `jsonl` (append one
-    /// `BenchReport` per line — used by `scripts/compare-commits.sh`),
+    /// `BenchReport` per line for external comparison tools,
     /// `md` (human-readable markdown).
     #[arg(long, default_value = "json")]
     pub output: String,
@@ -218,8 +217,7 @@ pub struct BenchServeCommand {
     #[arg(long)]
     pub commit_sha: Option<String>,
 
-    /// Tag string written into the report's `model` field's suffix —
-    /// useful for the `bench_vs_vllm.sh` script which tags ferrum/vllm.
+    /// Tag string written into the report's `model` field suffix.
     #[arg(long)]
     pub tag: Option<String>,
 }

@@ -14,8 +14,7 @@
 //!
 //! Replaces the `is_gguf_path` short-circuit in
 //! `ferrum-engine::registry::CandleExecutorFactory` with a real
-//! polymorphism point matching the 5-dim architecture (see
-//! `docs/architecture-refactor-status.md`).
+//! polymorphism point in the executor architecture.
 
 use ferrum_types::{FerrumError, Result};
 use std::path::{Path, PathBuf};

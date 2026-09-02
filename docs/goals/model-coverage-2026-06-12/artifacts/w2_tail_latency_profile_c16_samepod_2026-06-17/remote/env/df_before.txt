@@ -1,3 +1,0 @@
-Filesystem      Size  Used Avail Use% Mounted on
-overlay         300G   30G  271G  10% /
-overlay         300G   30G  271G  10% /

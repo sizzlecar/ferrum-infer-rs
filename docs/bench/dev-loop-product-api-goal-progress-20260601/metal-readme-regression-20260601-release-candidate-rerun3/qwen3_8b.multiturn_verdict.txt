@@ -1,2 +1,0 @@
-content=The assistant named Paris.
-passed=true

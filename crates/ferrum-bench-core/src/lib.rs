@@ -1,8 +1,7 @@
 //! ferrum-bench-core — canonical schema, metric aggregation, and
 //! variance reporting for ferrum's `bench` and `bench-serve` commands.
 //!
-//! Locked by `docs/bench/PLAYBOOK.md` § 7. Do not invent variants;
-//! producers and consumers (bench, bench-serve, compare-commits,
+//! Do not invent variants; producers and consumers (bench, bench-serve,
 //! visualizer, dashboards) all build against the types here.
 //!
 //! # Quick map
@@ -171,7 +170,7 @@ pub struct BenchmarkRequestRecord {
     pub server_request_id: Option<String>,
 }
 
-/// Locked enum of bench scenarios — see `docs/bench/PLAYBOOK.md` § 2.
+/// Locked enum of bench scenarios shared by all benchmark producers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scenario {

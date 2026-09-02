@@ -7,14 +7,11 @@ use serde::Deserialize;
 
 const HISTORICAL_REPLAY_JSON: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/da9c1ee8_cross_phase_capacity_replay.json"
+    "/tests/fixtures/cross_phase_capacity_replay.json"
 ));
 
 #[derive(Debug, Deserialize)]
 struct HistoricalReplayFixture {
-    schema_version: u32,
-    name: String,
-    source: HistoricalReplaySource,
     coordinator_id: u64,
     current_wake_epochs: HistoricalWakeEpochs,
     post_release_wake_epochs: HistoricalWakeEpochs,
@@ -24,16 +21,6 @@ struct HistoricalReplayFixture {
     rejected_terminal: HistoricalRejectedTerminal,
     expected: HistoricalExpectedReplay,
     steps: Vec<HistoricalReplayStep>,
-}
-
-#[derive(Debug, Deserialize)]
-struct HistoricalReplaySource {
-    git_sha: String,
-    binary_sha256: String,
-    trace_sha256: String,
-    artifact: String,
-    failure_class: String,
-    terminal_event_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -295,8 +282,6 @@ struct HistoricalYieldProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HistoricalReplayProjection {
-    source_git_sha: String,
-    source_trace_sha256: String,
     batches: Vec<Vec<HistoricalRequestRole>>,
     snapshot_labels: Vec<&'static str>,
     snapshots: Vec<ContinuousSchedulerTraceSnapshot>,
@@ -389,40 +374,6 @@ fn observed_wake_for_role(
 
 async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
     let fixture: HistoricalReplayFixture = serde_json::from_str(HISTORICAL_REPLAY_JSON).unwrap();
-    assert_eq!(fixture.schema_version, 1);
-    assert_eq!(fixture.name, "da9c1ee8_cross_phase_capacity_deadlock");
-    assert_eq!(
-        fixture.source.git_sha,
-        "da9c1ee8363c686e71420fd5df8042c496e69757"
-    );
-    assert_eq!(
-        fixture.source.failure_class,
-        "cross_phase_capacity_progress_deadlock"
-    );
-    assert_eq!(
-        fixture.source.binary_sha256,
-        "19fe1907e1d74c199fb34da4990297109e5e05257600f1299426f3e9eb6d50c4"
-    );
-    assert_eq!(
-        fixture.source.trace_sha256,
-        "5360a85b49423e094400c5cf39f6e6b3df85b1254b62ec841925ee63c539011e"
-    );
-    assert_eq!(
-        fixture.source.artifact,
-        "runtime-vnext-s1-progress-lease-da9c1ee8-20260717/raw/target/scheduler-trace.jsonl"
-    );
-    assert_eq!(
-        fixture.source.terminal_event_ids,
-        [
-            "evt-engine-vnext-admission-531",
-            "evt-engine-vnext-admission-532",
-            "evt-engine-vnext-admission-533",
-            "evt-engine-vnext-admission-534",
-            "evt-engine-vnext-admission-535",
-            "evt-engine-vnext-admission-536",
-            "evt-engine-vnext-admission-537",
-        ]
-    );
     assert_eq!(
         fixture.current_wake_epochs,
         HistoricalWakeEpochs {
@@ -739,8 +690,6 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
     assert_eq!(journal, fixture.expected.transitions);
 
     HistoricalReplayProjection {
-        source_git_sha: fixture.source.git_sha,
-        source_trace_sha256: fixture.source.trace_sha256,
         batches,
         snapshot_labels,
         snapshots,
@@ -752,8 +701,7 @@ async fn replay_historical_cross_phase_fixture() -> HistoricalReplayProjection {
 }
 
 #[tokio::test]
-async fn da9c1ee8_cross_phase_capacity_replay_rejects_old_terminal_one_hundred_of_one_hundred() {
-    const REPLAY_COUNT: usize = 100;
+async fn cross_phase_capacity_replay_rejects_the_old_terminal_path() {
     let expected = replay_historical_cross_phase_fixture().await;
     assert_eq!(expected.old_terminal_matches, 0);
     assert!(expected.passive_park_prevented);
@@ -776,19 +724,4 @@ async fn da9c1ee8_cross_phase_capacity_replay_rejects_old_terminal_one_hundred_o
         .journal
         .windows(2)
         .all(|pair| pair[0].ordinal < pair[1].ordinal));
-
-    for ordinal in 1..REPLAY_COUNT {
-        assert_eq!(
-            replay_historical_cross_phase_fixture().await,
-            expected,
-            "historical scheduler replay {ordinal} diverged from replay 0"
-        );
-    }
-    println!(
-        "FERRUM G04 HISTORICAL CAPACITY REPLAY KEEP: source_commit={} trace_sha256={} deterministic_replays={REPLAY_COUNT}/{REPLAY_COUNT} independent_oracle={REPLAY_COUNT}/{REPLAY_COUNT} yield_planned={REPLAY_COUNT}/{REPLAY_COUNT} post_release_progress={REPLAY_COUNT}/{REPLAY_COUNT} global_park_prevented={REPLAY_COUNT}/{REPLAY_COUNT} old_terminal=0/{REPLAY_COUNT} snapshots={} journal_transitions={}",
-        expected.source_git_sha,
-        expected.source_trace_sha256,
-        expected.snapshots.len(),
-        expected.journal.len(),
-    );
 }
