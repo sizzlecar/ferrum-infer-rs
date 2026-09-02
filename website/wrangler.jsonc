@@ -1,0 +1,17 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "ferrum-site",
+  "main": "./cloudflare-worker.js",
+  "account_id": "5316fe0cde6e3b56159b45a49b2f260f",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "ferrum.pandaailabs.com",
+      "custom_domain": true
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

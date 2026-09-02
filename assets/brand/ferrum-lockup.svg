@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="176" viewBox="0 0 760 176" role="img" aria-labelledby="title desc">
+  <title id="title">Ferrum</title>
+  <desc id="desc">Ferrum logo and the words Local LLM Runtime.</desc>
+  <g transform="translate(16 16) scale(2.25)">
+    <rect x="4" y="4" width="56" height="56" rx="13" fill="#0b0d0f"/>
+    <path d="M16 14H50L47 24H29V31H38L35 41H29V52H16Z" fill="#f0682f"/>
+    <path d="M38 31H50L47 41H35Z" fill="#81d8a7"/>
+  </g>
+  <text x="184" y="91" fill="#0b0d0f" font-family="Inter, Arial, Helvetica, sans-serif" font-size="58" font-weight="800" letter-spacing="10">FERRUM</text>
+  <text x="188" y="129" fill="#737b76" font-family="Inter, Arial, Helvetica, sans-serif" font-size="19" font-weight="500" letter-spacing="4.2">LOCAL LLM RUNTIME</text>
+</svg>
