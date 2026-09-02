@@ -1465,9 +1465,8 @@ impl MoeBucketPlan {
 /// router output, softmax scratch buffer, and bucket plan, all reused
 /// across layers so the inner MoE forward path is allocation-free.
 ///
-/// At c=32 / Qwen3-MoE / 48 layers, the previous fresh-`Vec`-per-layer
-/// pattern accounted for ~10 ms / token of pure CPU softmax+sort+alloc
-/// (25% of MoE wallclock — see `docs/bench/cuda-rtx4090-2026-05-08-m3-moe`).
+/// This avoids repeated CPU softmax, sort, and allocation setup across
+/// layers.
 pub struct MoeRouteScratch {
     pub output: RouterOutput,
     /// Softmax buffer reused across all rows of all layers — sized to
@@ -1618,11 +1617,8 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // Device-routing path: enabled whenever the caller passes
     // pre-allocated `DeviceRouteScratch` AND the vLLM MoE path is selected
     // by runtime config or by the loaded weight stack. No separate env var
-    // — the device path is strictly faster than
-    // the host path (+15.4% c=32 on Qwen3-30B-A3B-GPTQ-Int4, RTX 4090
-    // bench docs/bench/moe-phase3-vast-2026-05-12); the host path's
-    // per-layer `try_gpu_route_topk_into_host` (D2H + cuStreamSynchronize)
-    // was a per-layer GPU stall that compounded over 48 layers.
+    // — the device path avoids the host path's per-layer
+    // `try_gpu_route_topk_into_host` D2H copy and synchronization stall.
     //
     // Requires use_vllm_moe because the non-vLLM bucketed path needs
     // host phase1_dispatches / phase3_dispatches lists (one entry per
@@ -1826,13 +1822,6 @@ pub fn moe_forward_bucketed<B: QuantLlmBackend + BackendMoeFused>(
     // utilization. But each expert pads its actual token count up to
     // a multiple of block_size — sparse routing (many experts, few
     // tokens each) bleeds into massive padding waste.
-    //
-    // Test data (commit ccba35f static block=64 vs reverted block=16):
-    //   bench/v0.2-cuda dmon @ c=32:
-    //     block=16  →  SM=99%  DRAM=50%  (mem-stalled, tile too small)
-    //     block=64  →  varies wildly:
-    //                    same-prompt c=32  : 2078 tok/s (+100% vs block=16)
-    //                    apples c=32 diverse: 921 tok/s (-11% vs block=16)
     //
     // Decision rule: pick the largest block_size whose padding overhead
     // would still be ≤ ~30%. The host-routing path has `plan.expert_offsets`

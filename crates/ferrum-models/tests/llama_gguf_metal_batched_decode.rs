@@ -5,14 +5,8 @@ use std::path::PathBuf;
 use ferrum_models::gguf_engine_loader::load_gguf_decoder;
 use ferrum_types::Device;
 
-fn llama_gguf_path() -> PathBuf {
-    std::env::var_os("FERRUM_TEST_LLAMA_GGUF")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(
-                "/Users/chejinxuan/ferrum-bench/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-            )
-        })
+fn llama_gguf_path() -> Option<PathBuf> {
+    std::env::var_os("FERRUM_TEST_LLAMA_GGUF").map(PathBuf::from)
 }
 
 fn argmax(xs: &[f32]) -> usize {
@@ -71,7 +65,10 @@ fn assert_close_logits(label: &str, sequential: &[f32], batched: &[f32], vocab: 
 #[test]
 #[ignore = "loads local Llama-3.1-8B GGUF and compares Metal sequential vs batched decode"]
 fn llama31_8b_metal_batched_decode_matches_sequential_decode() {
-    let path = llama_gguf_path();
+    let Some(path) = llama_gguf_path() else {
+        eprintln!("FERRUM_TEST_LLAMA_GGUF is unset; skipping local-model test");
+        return;
+    };
     assert!(path.is_file(), "missing test model: {}", path.display());
 
     let mut model = load_gguf_decoder(&path, &Device::Metal).expect("load Llama GGUF on Metal");

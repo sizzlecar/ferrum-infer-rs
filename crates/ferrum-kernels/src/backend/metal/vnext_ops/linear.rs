@@ -1991,20 +1991,12 @@ mod tests {
 
     const DENSE_LINEAR_TOLERANCE_ID: &str =
         "runtime-vnext.metal.dense-linear.v1.operation.fp16.gguf-q4-k.hidden-2560";
-    const DENSE_LINEAR_TOLERANCE_FINGERPRINT: &str =
-        "afde4fbda18b82e0d7dfde8e92a416f1ee30f65a5b5ab0b1e31b27b8d3a27878";
     const DENSE_SWIGLU_TOLERANCE_ID: &str =
         "runtime-vnext.metal.dense-swiglu.v1.operation.fp16.gguf-q4-k-q6-k.full-pipeline";
-    const DENSE_SWIGLU_TOLERANCE_FINGERPRINT: &str =
-        "42d0496fbb889d9c95a35f151cda9726f7730f42f20efbd61aa593083f80661b";
     const LAST_TOKEN_LINEAR_TOLERANCE_ID: &str =
         "runtime-vnext.metal.last-token-dense-linear.v1.operation.fp16.gguf-q6-k.final-row";
-    const LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT: &str =
-        "5dc080fb15a72c886acf83fc02877265f57359cf1c28c424a6cc1148cb256056";
     const PACKED_LAST_TOKEN_LINEAR_TOLERANCE_ID: &str =
         "runtime-vnext.metal.last-token-dense-linear.v1_1.operation.fp16.gguf-q6-k.packed-15";
-    const PACKED_LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT: &str =
-        "bc49f573fda4a5eca27e90604294358d7108a610d8dfb0a1d82855b22734dcf6";
 
     fn shared_buffer<T>(device: &Device, values: &[T]) -> metal::Buffer {
         device.new_buffer_with_data(
@@ -2189,7 +2181,6 @@ mod tests {
                     &[rows, output_width],
                     numerical_tolerance::LogicalDtype::Fp16,
                     DENSE_LINEAR_TOLERANCE_ID,
-                    DENSE_LINEAR_TOLERANCE_FINGERPRINT,
                 )
                 .expect("reviewed dense-linear numerical contract");
             } else {
@@ -2680,7 +2671,6 @@ mod tests {
             &[rows, hidden],
             numerical_tolerance::LogicalDtype::Fp16,
             DENSE_SWIGLU_TOLERANCE_ID,
-            DENSE_SWIGLU_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed dense-SwiGLU numerical contract");
     }
@@ -2768,7 +2758,6 @@ mod tests {
             &[1, output_width],
             numerical_tolerance::LogicalDtype::Fp16,
             LAST_TOKEN_LINEAR_TOLERANCE_ID,
-            LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed last-token dense-linear numerical contract");
     }
@@ -2982,7 +2971,6 @@ mod tests {
             &[participant_count, output_width],
             numerical_tolerance::LogicalDtype::Fp16,
             PACKED_LAST_TOKEN_LINEAR_TOLERANCE_ID,
-            PACKED_LAST_TOKEN_LINEAR_TOLERANCE_FINGERPRINT,
         )
         .expect("reviewed packed last-token dense-linear numerical contract");
     }

@@ -33,9 +33,8 @@ pub fn is_gguf_path(path: &str) -> bool {
 /// 1. `<gguf-stem>.tokenizer.json` next to the GGUF (e.g.
 ///    `Qwen3-8B-Q4_K_M.tokenizer.json`).
 /// 2. `tokenizer.json` next to the GGUF.
-/// 3. `<stem-without-quant>.tokenizer.json` in a sibling
-///    `../tokenizers/` directory (matches the `~/ferrum-bench/{models,tokenizers}/`
-///    layout used by the Group A benchmark scripts).
+/// 3. `<stem-without-quant>.tokenizer.json` in a sibling `../tokenizers/`
+///    directory.
 ///
 /// Returns `None` if nothing is found — caller should surface a clear
 /// error. We keep this in `ferrum-models` (not `ferrum-cli`) because both

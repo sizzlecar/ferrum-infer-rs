@@ -1,3 +1,0 @@
-content=Paris
-finish_reason=stop
-passed=true

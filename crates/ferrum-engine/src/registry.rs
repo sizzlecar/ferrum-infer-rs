@@ -582,7 +582,7 @@ impl ComponentFactory<Arc<dyn Tokenizer + Send + Sync>> for HuggingFaceTokenizer
         if let Some(model_path) = tokenizer_path {
             let path = std::path::Path::new(&model_path);
             // GGUF path: model_path is a file. Auto-discover a sibling
-            // tokenizer.json (or the convention used by ~/ferrum-bench).
+            // tokenizer.json or a sibling tokenizers/ directory.
             let tokenizer_file = if ferrum_models::gguf_engine_loader::is_gguf_path(&model_path) {
                 ferrum_models::gguf_engine_loader::auto_discover_tokenizer_path(path).ok_or_else(
                     || {
@@ -954,8 +954,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for StubExecutorFact
 ///   - Dim 4 (device): CpuBackend / MetalBackend / CudaBackend — type
 ///     parameter `B`, picked by the `(device, kv_dtype)` cascade below.
 ///   - Dim 5 (kv dtype): KvFp16 / KvInt8 / KvFp8 — type parameter `K`,
-///     same cascade. Only `KvFp16` is wired today; `KvInt8` lands in
-///     PR C (see `docs/dim5-model-wireup-plan.md`).
+///     same cascade. Only `KvFp16` is wired today.
 pub struct LlmExecutorFactory;
 
 fn resolve_llama_layer_split_plan(
@@ -1703,8 +1702,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         }
                         (dev, dt) => {
                             return Err(FerrumError::unsupported(format!(
-                                "(device={dev:?}, kv_dtype={dt:?}) not implemented — \
-                             see docs/dim5-model-wireup-plan.md"
+                                "(device={dev:?}, kv_dtype={dt:?}) not implemented"
                             )));
                         }
                     };

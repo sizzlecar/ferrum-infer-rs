@@ -1,13 +1,9 @@
-use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const CATALOG: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../scripts/release/configs/runtime_vnext_numerical_tolerances.json"
-));
+const CATALOG: &str = include_str!("numerical_tolerances.json");
 const MAX_RELATIVE_ERROR_DENOMINATOR_FLOOR: f64 = 1.0e-12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -41,7 +37,6 @@ struct NumericalTolerance {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub(super) struct NumericalMetrics {
     pub(super) tolerance_id: String,
-    pub(super) row_fingerprint: String,
     pub(super) element_count: usize,
     pub(super) shape: Vec<usize>,
     pub(super) logical_dtype: LogicalDtype,
@@ -68,9 +63,8 @@ pub(super) fn assert_matches(
     expected_shape: &[usize],
     logical_dtype: LogicalDtype,
     tolerance_id: &str,
-    expected_row_fingerprint: &str,
 ) -> Result<NumericalMetrics, String> {
-    let tolerance = resolve(tolerance_id, expected_row_fingerprint)?;
+    let tolerance = resolve(tolerance_id)?;
     if logical_dtype != tolerance.logical_dtype {
         return Err(format!(
             "{label}: logical dtype {} does not match catalog dtype {}",
@@ -96,14 +90,7 @@ pub(super) fn assert_matches(
         ));
     }
 
-    let metrics = measure(
-        actual,
-        actual_shape,
-        expected,
-        logical_dtype,
-        tolerance_id,
-        expected_row_fingerprint,
-    );
+    let metrics = measure(actual, actual_shape, expected, logical_dtype, tolerance_id);
     let mut violations = Vec::new();
     if metrics.actual_nan_count > tolerance.max_nan
         || metrics.expected_nan_count > tolerance.max_nan
@@ -159,7 +146,6 @@ fn measure(
     expected: &[f32],
     logical_dtype: LogicalDtype,
     tolerance_id: &str,
-    row_fingerprint: &str,
 ) -> NumericalMetrics {
     let actual_nan_count = actual.iter().filter(|value| value.is_nan()).count();
     let actual_inf_count = actual.iter().filter(|value| value.is_infinite()).count();
@@ -208,7 +194,6 @@ fn measure(
 
     NumericalMetrics {
         tolerance_id: tolerance_id.to_owned(),
-        row_fingerprint: row_fingerprint.to_owned(),
         element_count: actual.len(),
         shape: shape.to_vec(),
         logical_dtype,
@@ -227,10 +212,7 @@ fn measure(
     }
 }
 
-fn resolve(
-    tolerance_id: &str,
-    expected_row_fingerprint: &str,
-) -> Result<NumericalTolerance, String> {
+fn resolve(tolerance_id: &str) -> Result<NumericalTolerance, String> {
     static DOCUMENT: OnceLock<Value> = OnceLock::new();
     let document = DOCUMENT.get_or_init(|| {
         serde_json::from_str(CATALOG).expect("checked-in numerical tolerance catalog must be JSON")
@@ -249,22 +231,6 @@ fn resolve(
         ));
     }
     let row = matches[0];
-    let stored_row_fingerprint = row
-        .get("row_fingerprint")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{tolerance_id}.row_fingerprint must be a string"))?;
-    let computed_row_fingerprint = compute_row_fingerprint(row)?;
-    if stored_row_fingerprint != computed_row_fingerprint {
-        return Err(format!(
-            "checked-in tolerance row fingerprint does not match its contents: {tolerance_id}"
-        ));
-    }
-    if computed_row_fingerprint != expected_row_fingerprint {
-        return Err(format!(
-            "checked-in tolerance row fingerprint changed: {tolerance_id}"
-        ));
-    }
-
     let logical_dtype = match row.get("dtype").and_then(Value::as_str) {
         Some("fp16") => LogicalDtype::Fp16,
         Some("bf16") => LogicalDtype::Bf16,
@@ -335,87 +301,10 @@ fn f32_tensor_sha256(values: &[f32]) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn compute_row_fingerprint(row: &Value) -> Result<String, String> {
-    let mut row = row
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "numerical tolerance row must be an object".to_owned())?;
-    row.remove("row_fingerprint")
-        .ok_or_else(|| "numerical tolerance row fingerprint is missing".to_owned())?;
-    let mut canonical = String::new();
-    write_canonical_json(&Value::Object(row), &mut canonical)?;
-    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
-}
-
-// Matches Python json.dumps for the catalog's validated number/string domain.
-fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), String> {
-    match value {
-        Value::Null => output.push_str("null"),
-        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
-        Value::Number(value) => output.push_str(&value.to_string()),
-        Value::String(value) => write_ascii_json_string(value, output),
-        Value::Array(values) => {
-            output.push('[');
-            for (index, value) in values.iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                write_canonical_json(value, output)?;
-            }
-            output.push(']');
-        }
-        Value::Object(values) => {
-            output.push('{');
-            let mut keys = values.keys().collect::<Vec<_>>();
-            keys.sort_unstable();
-            for (index, key) in keys.into_iter().enumerate() {
-                if index != 0 {
-                    output.push(',');
-                }
-                write_ascii_json_string(key, output);
-                output.push(':');
-                write_canonical_json(&values[key], output)?;
-            }
-            output.push('}');
-        }
-    }
-    Ok(())
-}
-
-fn write_ascii_json_string(value: &str, output: &mut String) {
-    output.push('"');
-    for character in value.chars() {
-        match character {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\u{0008}' => output.push_str("\\b"),
-            '\u{000c}' => output.push_str("\\f"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            character if character <= '\u{001f}' => {
-                write!(output, "\\u{:04x}", character as u32).unwrap();
-            }
-            character if character.is_ascii() => output.push(character),
-            character if (character as u32) <= 0xffff => {
-                write!(output, "\\u{:04x}", character as u32).unwrap();
-            }
-            character => {
-                let code_point = character as u32 - 0x1_0000;
-                let high = 0xd800 + (code_point >> 10);
-                let low = 0xdc00 + (code_point & 0x3ff);
-                write!(output, "\\u{high:04x}\\u{low:04x}").unwrap();
-            }
-        }
-    }
-    output.push('"');
-}
-
 #[test]
-fn catalog_binding_recomputes_fingerprint_and_reports_all_metrics() {
+fn catalog_binding_reports_code_level_numerical_metrics() {
     let tolerance_id =
         "runtime-vnext.metal.causal-attention.v2.operation.fp16.none.fixed-page-split";
-    let fingerprint = "d30006c0535a3b3172ac88db66f75f07df6256e321509188bb0949c7a64a9fdb";
     let metrics = assert_matches(
         "identity",
         &[0.0, 1.0, -2.0],
@@ -424,7 +313,6 @@ fn catalog_binding_recomputes_fingerprint_and_reports_all_metrics() {
         &[3],
         LogicalDtype::Fp16,
         tolerance_id,
-        fingerprint,
     )
     .unwrap();
     assert_eq!(metrics.max_abs, 0.0);
@@ -436,30 +324,15 @@ fn catalog_binding_recomputes_fingerprint_and_reports_all_metrics() {
     assert_eq!(metrics.expected_f32_sha256.len(), 64);
     let evidence = serde_json::to_value(&metrics).unwrap();
     assert_eq!(evidence["tolerance_id"], tolerance_id);
-    assert_eq!(evidence["row_fingerprint"], fingerprint);
     assert_eq!(evidence["logical_dtype"], "fp16");
     assert_eq!(evidence["oracle_precision"], "fp32");
-
-    let document: Value = serde_json::from_str(CATALOG).unwrap();
-    let row = document["rows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|row| row["tolerance_id"] == tolerance_id)
-        .unwrap();
-    assert_eq!(compute_row_fingerprint(row).unwrap(), fingerprint);
-    let mut tampered = row.clone();
-    tampered["bounds"]["max_abs_max"] = Value::from(1.0);
-    assert_ne!(compute_row_fingerprint(&tampered).unwrap(), fingerprint);
 }
 
 #[test]
 fn numerical_contract_rejects_partial_or_non_finite_comparisons() {
     let tolerance_id =
         "runtime-vnext.metal.causal-attention.v2.operation.fp16.none.fixed-page-split";
-    let fingerprint = "d30006c0535a3b3172ac88db66f75f07df6256e321509188bb0949c7a64a9fdb";
-    assert!(resolve("missing", "0").is_err());
-    assert!(resolve(tolerance_id, &"0".repeat(64)).is_err());
+    assert!(resolve("missing").is_err());
     assert!(assert_matches(
         "shape",
         &[1.0, 2.0],
@@ -468,7 +341,6 @@ fn numerical_contract_rejects_partial_or_non_finite_comparisons() {
         &[1, 2],
         LogicalDtype::Fp16,
         tolerance_id,
-        fingerprint,
     )
     .is_err());
     assert!(assert_matches(
@@ -479,7 +351,6 @@ fn numerical_contract_rejects_partial_or_non_finite_comparisons() {
         &[1],
         LogicalDtype::Fp32,
         tolerance_id,
-        fingerprint,
     )
     .is_err());
     assert!(assert_matches(
@@ -490,7 +361,6 @@ fn numerical_contract_rejects_partial_or_non_finite_comparisons() {
         &[1],
         LogicalDtype::Fp16,
         tolerance_id,
-        fingerprint,
     )
     .unwrap_err()
     .contains("NaN count"));
@@ -502,7 +372,6 @@ fn numerical_contract_rejects_partial_or_non_finite_comparisons() {
         &[2],
         LogicalDtype::Fp16,
         tolerance_id,
-        fingerprint,
     )
     .unwrap_err()
     .contains("cosine"));

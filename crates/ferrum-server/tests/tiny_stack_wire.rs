@@ -3,8 +3,7 @@
 //! download, no GPU — and asserts the `/v1/models` and chat-validation
 //! contracts in-process.
 //!
-//! `tiny_stack_openai_wire_contract` is pinned by
-//! `scripts/release/test_arch_goal_gate.py` (`REQUIRED_SCENARIO_TESTS`).
+//! `tiny_stack_openai_wire_contract` is part of the integration-test contract.
 //! Kills hb-06: `/v1/models` returning an empty list and an empty `messages`
 //! array being accepted instead of rejected with 400.
 

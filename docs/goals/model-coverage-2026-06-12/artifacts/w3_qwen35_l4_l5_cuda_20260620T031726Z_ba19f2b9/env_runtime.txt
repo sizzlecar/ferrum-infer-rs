@@ -1,3 +1,0 @@
-"HF_HOME="/workspace/hf-cache"
-HF_XET_HIGH_PERFORMANCE="1"
-"

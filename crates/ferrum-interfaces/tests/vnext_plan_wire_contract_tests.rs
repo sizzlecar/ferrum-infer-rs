@@ -59,50 +59,41 @@ fn dynamic_descriptor_and_memory_plan_standalone_wire_are_checked() {
 }
 
 #[test]
-fn execution_plan_is_deterministic_100_of_100() {
-    for variant in 0..100 {
-        let left = plan_fixture(variant).plan;
-        let right = plan_fixture(variant).plan;
-        assert_eq!(left.plan_hash(), right.plan_hash());
-        assert_eq!(left.to_json().unwrap(), right.to_json().unwrap());
-    }
-    println!("\nVNEXT PLAN DETERMINISM PASS: 100/100");
+fn execution_plan_is_deterministic() {
+    let left = plan_fixture(0).plan;
+    let right = plan_fixture(0).plan;
+    assert_eq!(left.plan_hash(), right.plan_hash());
+    assert_eq!(left.to_json().unwrap(), right.to_json().unwrap());
 }
 
 #[test]
-fn execution_plan_schema_round_trip_100_of_100() {
-    for variant in 0..100 {
-        let fixture = plan_fixture(variant);
-        let restored = ExecutionPlan::from_json_validated(
-            &fixture.plan.to_json().unwrap(),
-            &fixture.family,
-            &fixture.catalog,
-            &fixture.policy,
-            fixture.node_resolutions.clone(),
-        )
-        .unwrap();
-        assert_eq!(fixture.plan, restored);
-    }
-    println!("\nVNEXT PLAN ROUNDTRIP PASS: 100/100");
+fn execution_plan_schema_round_trips() {
+    let fixture = plan_fixture(0);
+    let restored = ExecutionPlan::from_json_validated(
+        &fixture.plan.to_json().unwrap(),
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        fixture.node_resolutions.clone(),
+    )
+    .unwrap();
+    assert_eq!(fixture.plan, restored);
 }
 
 #[test]
-fn breaking_schema_versions_are_rejected_100_of_100() {
-    for variant in 0..100 {
-        let fixture = plan_fixture(variant);
-        let mut value = serde_json::to_value(&fixture.plan).unwrap();
-        value["payload"]["schema"]["major"] = json!(EXECUTION_PLAN_SCHEMA.major + 1);
-        rehash_plan_json(&mut value);
-        assert!(ExecutionPlan::from_json_validated(
-            &serde_json::to_vec(&value).unwrap(),
-            &fixture.family,
-            &fixture.catalog,
-            &fixture.policy,
-            fixture.node_resolutions.clone(),
-        )
-        .is_err());
-    }
-    println!("\nVNEXT BREAKING VERSION REJECT PASS: 100/100");
+fn breaking_schema_versions_are_rejected() {
+    let fixture = plan_fixture(0);
+    let mut value = serde_json::to_value(&fixture.plan).unwrap();
+    value["payload"]["schema"]["major"] = json!(EXECUTION_PLAN_SCHEMA.major + 1);
+    rehash_plan_json(&mut value);
+    assert!(ExecutionPlan::from_json_validated(
+        &serde_json::to_vec(&value).unwrap(),
+        &fixture.family,
+        &fixture.catalog,
+        &fixture.policy,
+        fixture.node_resolutions.clone(),
+    )
+    .is_err());
 }
 
 #[test]

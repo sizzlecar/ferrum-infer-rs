@@ -293,7 +293,7 @@ impl<B: MoeLlmBackend, K: KvDtypeKind> Qwen3MoeModel<B, K> {
         let prof = stage_t0.is_some();
         // PLAYBOOK § 1.2 — migrated. Replaces `Instant::now()` + `B::sync`
         // with BackendTimer (CUDA event-accurate) and pushes a chrome-trace
-        // event so visualize_layerwise.py shows embed / final_norm / lm_head
+        // event so chrome-trace viewers show embed / final_norm / lm_head
         // as separate stages within the decode_step category.
         let decode_op_profile = self.runtime_env.decode_op_profile;
         let stage_start =

@@ -1,1 +1,0 @@
-UID          PID    PPID  C STIME TTY          TIME CMD

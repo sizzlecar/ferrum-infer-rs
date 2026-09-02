@@ -1,3 +1,0 @@
-content=蓝色月亮
-finish_reason=stop
-passed=true

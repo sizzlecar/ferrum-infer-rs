@@ -1,4 +1,0 @@
-instance_id=40826362
-latest_poll=stop_poll_32.sanitized.json
-cur_state=stopped
-actual_status=exited

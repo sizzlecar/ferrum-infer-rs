@@ -2,7 +2,7 @@
 //!
 //! Renders one or more `BenchReport`s into a human-readable markdown
 //! document — the artifact you commit alongside the JSON to
-//! `docs/bench/<platform>-<date>/`. The format is deliberately uniform
+//! a caller-selected output directory. The format is deliberately uniform
 //! across scenarios so PRs can diff bench reports the same way they
 //! diff source.
 //!

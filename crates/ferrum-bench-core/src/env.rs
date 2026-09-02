@@ -1,9 +1,8 @@
 //! Bench environment snapshot — hardware + software + config — and
-//! the SHA-256 `env_hash` used by `compare-commits.sh` and similar to
+//! the SHA-256 `env_hash` used by benchmark comparison tools and similar to
 //! filter "apples-to-apples" cells.
 //!
-//! See `docs/bench/PLAYBOOK.md` § 7 schema + § 0.6 vs-vLLM parity:
-//! every cell carries one `Env` block and its `env_hash`. Two cells
+//! Every cell carries one `Env` block and its `env_hash`. Two cells
 //! with the same hash are guaranteed comparable.
 
 use ferrum_types::RuntimeConfigSnapshot;

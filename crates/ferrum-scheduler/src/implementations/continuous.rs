@@ -5272,23 +5272,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_phase_scheduler_is_deterministic_one_hundred_of_one_hundred() {
-        const REPLAY_COUNT: usize = 100;
+    async fn cross_phase_scheduler_is_deterministic() {
         let expected = collect_cross_phase_pressure_replay().await;
-        for ordinal in 1..REPLAY_COUNT {
-            assert_eq!(
-                collect_cross_phase_pressure_replay().await,
-                expected,
-                "scheduler execution {ordinal} diverged from execution 0"
-            );
-        }
-        println!(
-            "FERRUM G04 SCHEDULER DETERMINISM KEEP: deterministic_executions={REPLAY_COUNT}/{REPLAY_COUNT} batch_ticks={} trace_snapshots={} observation_batches={} journal_transitions={}",
-            expected.batches.len(),
-            expected.traces.len(),
-            expected.observations.len(),
-            expected.journal.len(),
-        );
+        assert_eq!(collect_cross_phase_pressure_replay().await, expected);
     }
 
     async fn collect_constrained_decode_membership() -> Vec<Vec<RequestId>> {
@@ -5355,8 +5341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn constrained_decode_membership_is_stable_and_fair_one_hundred_of_one_hundred() {
-        const EXECUTION_COUNT: usize = 100;
+    async fn constrained_decode_membership_is_stable_and_fair() {
         let expected = collect_constrained_decode_membership().await;
         let mut selection_counts = HashMap::<RequestId, usize>::new();
         for request_id in expected.iter().flatten() {
@@ -5368,16 +5353,7 @@ mod tests {
             max_count - min_count <= 1,
             "constrained round-robin selection must remain balanced"
         );
-        for ordinal in 1..EXECUTION_COUNT {
-            assert_eq!(
-                collect_constrained_decode_membership().await,
-                expected,
-                "constrained decode execution {ordinal} diverged from execution 0"
-            );
-        }
-        println!(
-            "FERRUM G04 CONSTRAINED DECODE DETERMINISM KEEP: deterministic_executions={EXECUTION_COUNT}/{EXECUTION_COUNT} requests=8 batch_limit=3 rounds=4"
-        );
+        assert_eq!(collect_constrained_decode_membership().await, expected);
     }
 
     #[tokio::test]

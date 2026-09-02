@@ -2408,7 +2408,7 @@ pub enum DeviceCommandPhase {
     ResultBinding,
 }
 
-/// Stable machine identity for backend-native work attribution.
+/// Stable operation identity for backend-native work attribution.
 ///
 /// This identity is emitted into replay, determinism, and profile artifacts,
 /// so it must remain portable across filesystems and analysis tools. Human
