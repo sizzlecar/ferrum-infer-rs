@@ -1,5 +1,7 @@
 //! Request and response types for inference
 
+mod xml_parameter_schema;
+
 use crate::{
     ids::*, models::TokenUsage, FinishReason, Priority, ResponseCompletionEnvelope, SamplingParams,
     TokenId,
@@ -7,6 +9,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use xml_parameter_schema::XmlParameterSchemaProbe;
 
 pub const PROMPT_TOKENS_METADATA_KEY: &str = "ferrum_prompt_tokens";
 pub const DEFAULT_MAX_TOKENS_METADATA_KEY: &str = "ferrum_default_max_tokens";
@@ -570,8 +573,15 @@ fn parse_function_parameter_xml_tool_calls(
         {
             return None;
         }
-        let arguments =
-            parse_function_parameter_xml_arguments(&function[name_end + 1..arguments_end])?;
+        let parameter_schema = chat_request
+            .tools
+            .iter()
+            .find(|tool| tool.tool_type == "function" && tool.function.name == name)
+            .and_then(|tool| tool.function.parameters.as_ref());
+        let arguments = parse_function_parameter_xml_arguments(
+            &function[name_end + 1..arguments_end],
+            parameter_schema,
+        )?;
         let arguments = serde_json::to_string(&arguments).ok()?;
         calls.push(ApiToolCall {
             id: format!("call_{}", calls.len()),
@@ -588,11 +598,13 @@ fn parse_function_parameter_xml_tool_calls(
 
 fn parse_function_parameter_xml_arguments(
     text: &str,
+    parameter_schema: Option<&serde_json::Value>,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     const PARAMETER_START: &str = "<parameter=";
     const PARAMETER_END: &str = "</parameter>";
 
     let mut arguments = serde_json::Map::new();
+    let mut schema_probe = parameter_schema.map(XmlParameterSchemaProbe::new);
     let mut remaining = text;
     while let Some(parameter_start) = remaining.find(PARAMETER_START) {
         remaining = &remaining[parameter_start + PARAMETER_START.len()..];
@@ -608,13 +620,32 @@ fn parse_function_parameter_xml_arguments(
         if arguments.contains_key(name) {
             return None;
         }
-        arguments.insert(
-            name.to_string(),
-            serde_json::Value::String(remaining[..value_end].trim().to_string()),
+        let value = strip_xml_parameter_wrapper_newlines(&remaining[..value_end]);
+        let value = schema_probe.as_mut().map_or_else(
+            || serde_json::Value::String(value.to_string()),
+            |probe| probe.decode(name, value),
         );
+        arguments.insert(name.to_string(), value);
         remaining = &remaining[value_end + PARAMETER_END.len()..];
     }
     Some(arguments)
+}
+
+/// Qwen-style function XML renders one structural newline immediately inside
+/// each parameter tag. Remove only that framing while preserving whitespace
+/// that belongs to the argument itself, such as code indentation or a final
+/// newline used by exact-match edit tools.
+fn strip_xml_parameter_wrapper_newlines(value: &str) -> &str {
+    if let Some(value) = value.strip_prefix("\r\n") {
+        return value.strip_suffix("\r\n").unwrap_or(value);
+    }
+    if let Some(value) = value.strip_prefix('\n') {
+        if value.ends_with("\r\n") {
+            return value;
+        }
+        return value.strip_suffix('\n').unwrap_or(value);
+    }
+    value
 }
 
 fn parse_wrapped_tool_call_value(
