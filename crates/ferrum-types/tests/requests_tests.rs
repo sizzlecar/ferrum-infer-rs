@@ -232,6 +232,31 @@ fn api_response_after_stop(request: &InferenceRequest, text: &str) -> Option<Api
     api_response_from_generated_text(request, text, FinishReason::Stop)
 }
 
+fn parse_single_xml_parameter(
+    parameter_schema: serde_json::Value,
+    value: &str,
+) -> serde_json::Value {
+    let mut request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.tools[0].function.name = "types".to_string();
+    chat.tools[0].function.parameters = Some(parameter_schema);
+    let text = format!(
+        "<tool_call><function=types><parameter=value>{value}</parameter></function></tool_call>"
+    );
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, &text) else {
+        panic!("expected XML tool call");
+    };
+    let arguments: serde_json::Value =
+        serde_json::from_str(&response.message.tool_calls[0].function.arguments)
+            .expect("tool arguments must be JSON");
+    arguments["value"].clone()
+}
+
 #[test]
 fn typed_tool_envelope_is_exposed_only_for_an_enabled_xml_protocol() {
     let xml_request = chat_request_with_tool_protocol(
@@ -294,6 +319,479 @@ c
         response.message.tool_calls[0].function.arguments,
         r#"{"city":"Paris","unit":"c"}"#
     );
+}
+
+#[test]
+fn function_parameter_xml_preserves_opencode_edit_whitespace() {
+    let mut request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.tools[0].function.name = "edit".to_string();
+    chat.tools[0].function.parameters = Some(json!({
+        "type": "object",
+        "properties": {
+            "filePath": {"type": "string"},
+            "oldString": {"type": "string"},
+            "newString": {"type": "string"},
+            "replaceAll": {"type": "boolean"}
+        },
+        "required": ["filePath", "oldString", "newString"]
+    }));
+
+    let text = concat!(
+        "<tool_call>\n",
+        "<function=edit>\n",
+        "<parameter=filePath>\n",
+        "/workspace/src/main.rs\n",
+        "</parameter>\n",
+        "<parameter=oldString>\n",
+        "    if x:\n",
+        "        return 1\n",
+        "\n",
+        "</parameter>\n",
+        "<parameter=newString>\n",
+        "    if x:\n",
+        "        return 2\n",
+        "\n",
+        "</parameter>\n",
+        "<parameter=replaceAll>\n",
+        "true\n",
+        "</parameter>\n",
+        "</function>\n",
+        "</tool_call>",
+    );
+
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
+        panic!("expected XML tool call");
+    };
+    let arguments: serde_json::Value =
+        serde_json::from_str(&response.message.tool_calls[0].function.arguments)
+            .expect("tool arguments must be JSON");
+    assert_eq!(arguments["filePath"], json!("/workspace/src/main.rs"));
+    assert_eq!(
+        arguments["oldString"],
+        json!("    if x:\n        return 1\n")
+    );
+    assert_eq!(
+        arguments["newString"],
+        json!("    if x:\n        return 2\n")
+    );
+    assert_eq!(arguments["replaceAll"], json!(true));
+}
+
+#[test]
+fn function_parameter_xml_strips_only_matching_wrapper_newlines() {
+    let request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+
+    for (case, value, expected) in [
+        ("lf", "\nParis\n", "Paris"),
+        ("crlf", "\r\nParis\r\n", "Paris"),
+        ("lf payload newline", "\nParis\n\n", "Paris\n"),
+        ("crlf payload newline", "\r\nParis\r\n\r\n", "Paris\r\n"),
+        ("unwrapped", "  Paris \n", "  Paris \n"),
+        ("lf opening with crlf ending", "\nParis\r\n", "Paris\r\n"),
+        ("crlf opening with lf ending", "\r\nParis\n", "Paris\n"),
+    ] {
+        let text = format!(
+            "<tool_call><function=weather><parameter=city>{value}</parameter></function></tool_call>"
+        );
+        let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, &text) else {
+            panic!("expected XML tool call for {case}");
+        };
+        let arguments: serde_json::Value =
+            serde_json::from_str(&response.message.tool_calls[0].function.arguments)
+                .expect("tool arguments must be JSON");
+        assert_eq!(arguments["city"], json!(expected), "case: {case}");
+    }
+}
+
+#[test]
+fn function_parameter_xml_decodes_values_using_the_declared_schema() {
+    let mut request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.tools[0].function.name = "types".to_string();
+    chat.tools[0].function.parameters = Some(json!({
+        "type": "object",
+        "$defs": {
+            "Cfg": {
+                "type": "object",
+                "properties": {"flag": {"type": "boolean"}},
+                "required": ["flag"]
+            },
+            "a/b~c": {"type": "object"}
+        },
+        "definitions": {
+            "Legacy": {"type": "array", "items": {"type": "integer"}}
+        },
+        "properties": {
+            "obj": {"type": "object"},
+            "arr": {"type": "array", "items": {"type": "object"}},
+            "enabled": {"type": "boolean"},
+            "count": {"type": "integer"},
+            "ratio": {"type": "number"},
+            "nothing": {"type": "null"},
+            "cfg": {"$ref": "#/$defs/Cfg", "description": "ref siblings remain untouched"},
+            "escaped": {"$ref": "#/$defs/a~1b~0c"},
+            "legacy": {"$ref": "#/definitions/Legacy"},
+            "nullable_bool": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+            "string_or_null": {"oneOf": [{"type": "string"}, {"type": "null"}]},
+            "text": {"type": "string"}
+        }
+    }));
+    let schema_before = chat.tools[0].function.parameters.clone();
+    let text = concat!(
+        "<tool_call>\n",
+        "<function=types>\n",
+        "<parameter=obj>\n{\"k\":\"v\"}\n</parameter>\n",
+        "<parameter=arr>\n[{\"type\":\"web\"}]\n</parameter>\n",
+        "<parameter=enabled>\ntrue\n</parameter>\n",
+        "<parameter=count>\n42\n</parameter>\n",
+        "<parameter=ratio>\n2.5\n</parameter>\n",
+        "<parameter=nothing>\nnull\n</parameter>\n",
+        "<parameter=cfg>\n{\"flag\":false}\n</parameter>\n",
+        "<parameter=escaped>\n{\"ok\":true}\n</parameter>\n",
+        "<parameter=legacy>\n[1,2]\n</parameter>\n",
+        "<parameter=nullable_bool>\nnull\n</parameter>\n",
+        "<parameter=string_or_null>\nnull\n</parameter>\n",
+        "<parameter=text>\n42\n</parameter>\n",
+        "</function>\n",
+        "</tool_call>",
+    );
+
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
+        panic!("expected typed XML tool call");
+    };
+    let arguments: serde_json::Value =
+        serde_json::from_str(&response.message.tool_calls[0].function.arguments)
+            .expect("tool arguments must be JSON");
+    assert_eq!(arguments["obj"], json!({"k": "v"}));
+    assert_eq!(arguments["arr"], json!([{"type": "web"}]));
+    assert_eq!(arguments["enabled"], json!(true));
+    assert_eq!(arguments["count"], json!(42));
+    assert_eq!(arguments["ratio"], json!(2.5));
+    assert_eq!(arguments["nothing"], serde_json::Value::Null);
+    assert_eq!(arguments["cfg"], json!({"flag": false}));
+    assert_eq!(arguments["escaped"], json!({"ok": true}));
+    assert_eq!(arguments["legacy"], json!([1, 2]));
+    assert_eq!(arguments["nullable_bool"], serde_json::Value::Null);
+    assert_eq!(arguments["string_or_null"], json!("null"));
+    assert_eq!(arguments["text"], json!("42"));
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_ref() else {
+        panic!("expected chat request");
+    };
+    assert_eq!(chat.tools[0].function.parameters, schema_before);
+}
+
+#[test]
+fn function_parameter_xml_keeps_text_when_schema_cannot_prove_a_json_type() {
+    let mut request = chat_request_with_tool_protocol(
+        Some(ApiToolChoice::Mode("auto".to_string())),
+        ApiToolCallProtocol::FunctionParameterXml,
+    );
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.tools[0].function.name = "types".to_string();
+    chat.tools[0].function.parameters = Some(json!({
+        "$ref": "#/$defs/Arguments",
+        "$defs": {
+            "Arguments": {
+                "type": "object",
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                    "invalid_bool": {"type": "boolean"},
+                    "unknown": {},
+                    "external": {"$ref": "https://example.com/schema.json"},
+                    "cycle": {"$ref": "#/$defs/Cycle"}
+                }
+            },
+            "Cycle": {"$ref": "#/$defs/Cycle"}
+        }
+    }));
+    let text = concat!(
+        "<tool_call><function=types>",
+        "<parameter=enabled>true</parameter>",
+        "<parameter=invalid_bool>yes</parameter>",
+        "<parameter=unknown>true</parameter>",
+        "<parameter=external>{\"k\":1}</parameter>",
+        "<parameter=cycle>[1]</parameter>",
+        "<parameter=undeclared>false</parameter>",
+        "</function></tool_call>",
+    );
+
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
+        panic!("expected XML tool call");
+    };
+    let arguments: serde_json::Value =
+        serde_json::from_str(&response.message.tool_calls[0].function.arguments)
+            .expect("tool arguments must be JSON");
+    assert_eq!(arguments["enabled"], json!(true));
+    assert_eq!(arguments["invalid_bool"], json!("yes"));
+    assert_eq!(arguments["unknown"], json!("true"));
+    assert_eq!(arguments["external"], json!(r#"{"k":1}"#));
+    assert_eq!(arguments["cycle"], json!("[1]"));
+    assert_eq!(arguments["undeclared"], json!("false"));
+}
+
+#[test]
+fn function_parameter_xml_combines_root_schema_branches_without_order_dependence() {
+    for (case, schema, value, expected) in [
+        (
+            "allOf unconstrained first",
+            json!({
+                "type": "object",
+                "allOf": [
+                    {"properties": {"value": {}}},
+                    {"properties": {"value": {"type": "boolean"}}}
+                ]
+            }),
+            "true",
+            json!(true),
+        ),
+        (
+            "allOf unconstrained last",
+            json!({
+                "type": "object",
+                "allOf": [
+                    {"properties": {"value": {"type": "boolean"}}},
+                    {"properties": {"value": {}}}
+                ]
+            }),
+            "true",
+            json!(true),
+        ),
+        (
+            "anyOf native types",
+            json!({
+                "type": "object",
+                "anyOf": [
+                    {"properties": {"value": {"type": "boolean"}}},
+                    {"properties": {"value": {"type": "null"}}}
+                ]
+            }),
+            "null",
+            serde_json::Value::Null,
+        ),
+        (
+            "anyOf includes string",
+            json!({
+                "type": "object",
+                "anyOf": [
+                    {"properties": {"value": {"type": "string"}}},
+                    {"properties": {"value": {"type": "null"}}}
+                ]
+            }),
+            "null",
+            json!("null"),
+        ),
+        (
+            "oneOf native types",
+            json!({
+                "type": "object",
+                "oneOf": [
+                    {"properties": {"value": {"type": "array"}}},
+                    {"properties": {"value": {"type": "object"}}}
+                ]
+            }),
+            "[]",
+            json!([]),
+        ),
+        (
+            "oneOf includes string",
+            json!({
+                "type": "object",
+                "oneOf": [
+                    {"properties": {"value": {"type": "string"}}},
+                    {"properties": {"value": {"type": "object"}}}
+                ]
+            }),
+            "{}",
+            json!("{}"),
+        ),
+    ] {
+        assert_eq!(
+            parse_single_xml_parameter(schema, value),
+            expected,
+            "case: {case}"
+        );
+    }
+}
+
+#[test]
+fn function_parameter_xml_honors_ref_dialects_and_typed_additional_properties() {
+    for (case, schema, expected) in [
+        (
+            "draft 7 ignores ref sibling",
+            json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "$defs": {"Any": {}},
+                "type": "object",
+                "properties": {
+                    "value": {"$ref": "#/$defs/Any", "type": "boolean"}
+                }
+            }),
+            json!("true"),
+        ),
+        (
+            "default 2020-12 applies ref sibling",
+            json!({
+                "$defs": {"Any": {}},
+                "type": "object",
+                "properties": {
+                    "value": {"$ref": "#/$defs/Any", "type": "boolean"}
+                }
+            }),
+            json!(true),
+        ),
+        (
+            "typed additionalProperties",
+            json!({
+                "type": "object",
+                "additionalProperties": {"type": "boolean"}
+            }),
+            json!(true),
+        ),
+        (
+            "patternProperties remains conservative",
+            json!({
+                "type": "object",
+                "patternProperties": {"^value$": {}},
+                "additionalProperties": {"type": "boolean"}
+            }),
+            json!("true"),
+        ),
+        (
+            "unknown type remains conservative",
+            json!({
+                "type": "object",
+                "properties": {"value": {"type": "booolean"}}
+            }),
+            json!("true"),
+        ),
+        (
+            "unknown schema dialect remains conservative",
+            json!({
+                "$schema": "https://example.com/custom-schema",
+                "type": "object",
+                "properties": {"value": {"type": "boolean"}}
+            }),
+            json!("true"),
+        ),
+        (
+            "root id keeps the root dialect",
+            json!({
+                "$id": "https://example.com/tool-schema",
+                "type": "object",
+                "properties": {"value": {"type": "boolean"}}
+            }),
+            json!(true),
+        ),
+        (
+            "nested schema declaration is a dialect boundary",
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "$schema": "http://json-schema.org/draft-04/schema#",
+                        "const": true
+                    }
+                }
+            }),
+            json!("true"),
+        ),
+        (
+            "legacy nested id is a resource boundary",
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {"id": "nested-schema", "type": "boolean"}
+                }
+            }),
+            json!("true"),
+        ),
+        (
+            "nested dialect does not inherit root const semantics",
+            json!({
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "$id": "nested-schema",
+                        "$schema": "http://json-schema.org/draft-04/schema#",
+                        "const": true
+                    }
+                }
+            }),
+            json!("true"),
+        ),
+        (
+            "nested schema resource keeps refs local",
+            json!({
+                "type": "object",
+                "$defs": {
+                    "Scoped": {
+                        "$id": "nested-schema",
+                        "$defs": {"Flag": {"type": "boolean"}}
+                    }
+                },
+                "properties": {
+                    "value": {"$ref": "#/$defs/Scoped/$defs/Flag"}
+                }
+            }),
+            json!("true"),
+        ),
+        (
+            "percent encoded ref is not treated as a literal key",
+            json!({
+                "type": "object",
+                "$defs": {
+                    "Flag value": {"type": "string"},
+                    "Flag%20value": {"type": "boolean"}
+                },
+                "properties": {
+                    "value": {"$ref": "#/$defs/Flag%20value"}
+                }
+            }),
+            json!("true"),
+        ),
+    ] {
+        assert_eq!(
+            parse_single_xml_parameter(schema, "true"),
+            expected,
+            "case: {case}"
+        );
+    }
+}
+
+#[test]
+fn function_parameter_xml_bounds_repeated_ref_graph_traversal() {
+    let mut definitions = serde_json::Map::new();
+    definitions.insert("Level0".to_string(), json!({"type": "boolean"}));
+    for level in 1..=24 {
+        let previous = format!("#/$defs/Level{}", level - 1);
+        definitions.insert(
+            format!("Level{level}"),
+            json!({"anyOf": [{"$ref": previous}, {"$ref": previous}]}),
+        );
+    }
+    let schema = json!({
+        "type": "object",
+        "$defs": definitions,
+        "properties": {"value": {"$ref": "#/$defs/Level24"}}
+    });
+
+    assert_eq!(parse_single_xml_parameter(schema, "true"), json!(true));
 }
 
 #[test]

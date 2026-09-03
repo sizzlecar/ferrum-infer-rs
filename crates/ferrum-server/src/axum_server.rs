@@ -7797,6 +7797,145 @@ mod tests {
         );
     }
 
+    fn xml_object_argument_tool_request(stream: bool) -> Value {
+        json!({
+            "model": "stub-model",
+            "messages": [{"role": "user", "content": "Weather in Berlin with a forecast."}],
+            "stream": stream,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "$defs": {
+                            "WeatherOptions": {
+                                "type": "object",
+                                "properties": {
+                                    "unit": {"type": "string"},
+                                    "include_forecast": {"type": "boolean"}
+                                },
+                                "required": ["unit", "include_forecast"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "properties": {
+                            "city": {"type": "string"},
+                            "options": {"$ref": "#/$defs/WeatherOptions"}
+                        },
+                        "required": ["city", "options"],
+                        "additionalProperties": false
+                    }
+                }
+            }]
+        })
+    }
+
+    #[tokio::test]
+    async fn route_chat_decodes_xml_object_argument_through_local_schema_ref() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
+            "function-parameter-xml-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template(
+                concat!(
+                    "<tool_call>\n",
+                    "<function=get_weather>\n",
+                    "<parameter=city>\nBerlin\n</parameter>\n",
+                    "<parameter=options>\n",
+                    "{\"unit\":\"celsius\",\"include_forecast\":true}\n",
+                    "</parameter>\n",
+                    "</function>\n",
+                    "</tool_call>",
+                ),
+                template,
+            ),
+            "/v1/chat/completions",
+            xml_object_argument_tool_request(false),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        let arguments = body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+            .expect("tool arguments must contain one-decode structured JSON");
+        assert_eq!(arguments["city"], json!("Berlin"));
+        assert_eq!(
+            arguments["options"],
+            json!({"unit": "celsius", "include_forecast": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn route_chat_rejects_malformed_native_xml_object_argument() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
+            "function-parameter-xml-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template(
+                concat!(
+                    "<tool_call><function=get_weather>",
+                    "<parameter=city>Berlin</parameter>",
+                    "<parameter=options>{\"unit\":\"celsius\",</parameter>",
+                    "</function></tool_call>",
+                ),
+                template,
+            ),
+            "/v1/chat/completions",
+            xml_object_argument_tool_request(false),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("did not satisfy its schema")),
+            "body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_rejects_malformed_native_xml_before_tool_delta() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
+            "function-parameter-xml-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template(
+                concat!(
+                    "<tool_call><function=get_weather>",
+                    "<parameter=city>Berlin</parameter>",
+                    "<parameter=options>{\"unit\":\"celsius\",</parameter>",
+                    "</function></tool_call>",
+                ),
+                template,
+            ),
+            "/v1/chat/completions",
+            xml_object_argument_tool_request(true),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert_eq!(body.matches("data: [DONE]").count(), 1, "body: {body}");
+        assert!(
+            body.contains(r#""error":{"#) && body.contains("did not satisfy its schema"),
+            "stream must return a controlled schema error: {body}"
+        );
+        assert!(
+            !body.contains(r#""tool_calls":[{"#),
+            "invalid native arguments must not leak a tool delta: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn route_chat_parses_tool_call_from_reasoning_before_fake_tool_result_content() {
         let response = post_json(
@@ -8292,6 +8431,74 @@ mod tests {
         assert!(
             !body.contains(r#""content":"{\"function\""#),
             "raw Qwen3 tool JSON should not leak as assistant content: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_chat_preserves_opencode_edit_xml_whitespace() {
+        let template = ModelChatTemplate::new(
+            "{% if tools %}<tool_call><function=name><parameter=key>value</parameter></function></tool_call>{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}",
+            "function-parameter-xml-template",
+        );
+        let generated = concat!(
+            "<tool_call>\n",
+            "<function=edit>\n",
+            "<parameter=filePath>\n",
+            "/workspace/src/main.rs\n",
+            "</parameter>\n",
+            "<parameter=oldString>\n",
+            "    if x:\n",
+            "        return 1\n",
+            "\n",
+            "</parameter>\n",
+            "<parameter=newString>\n",
+            "    if x:\n",
+            "        return 2\n",
+            "\n",
+            "</parameter>\n",
+            "<parameter=replaceAll>\n",
+            "true\n",
+            "</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        );
+        let response = post_json(
+            router_with_stub_and_template(generated, template),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Replace the code."}],
+                "stream": true,
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "edit",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": {"type": "string"},
+                                "oldString": {"type": "string"},
+                                "newString": {"type": "string"},
+                                "replaceAll": {"type": "boolean"}
+                            },
+                            "required": ["filePath", "oldString", "newString"]
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(body.contains("data: [DONE]"), "missing DONE: {body}");
+        assert!(
+            body.contains(r#"\"oldString\":\"    if x:\\n        return 1\\n\""#),
+            "stream must preserve exact code whitespace in tool arguments: {body}"
+        );
+        assert!(
+            body.contains(r#"\"replaceAll\":true"#),
+            "stream must preserve the boolean tool argument type: {body}"
         );
     }
 
