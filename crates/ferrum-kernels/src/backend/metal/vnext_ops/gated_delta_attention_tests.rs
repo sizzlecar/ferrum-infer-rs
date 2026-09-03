@@ -85,15 +85,94 @@ fn simd_delta_specialization_is_shape_and_device_capability_driven() {
         value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
     };
     let mut params = test_params(1, semantics);
-    assert!(supports_simd_delta(&params, 32));
-    assert!(!supports_simd_delta(&params, 16));
+    assert!(supports_simd_delta(&params, 32, SIMD_DELTA_THREADS));
+    assert!(!supports_simd_delta(&params, 16, SIMD_DELTA_THREADS));
+    assert!(!supports_simd_delta(&params, 32, SIMD_DELTA_THREADS - 1));
 
     params.key_dim = 96;
-    assert!(supports_simd_delta(&params, 32));
+    assert!(supports_simd_delta(&params, 32, SIMD_DELTA_THREADS));
     params.key_dim = 80;
-    assert!(!supports_simd_delta(&params, 32));
+    assert!(!supports_simd_delta(&params, 32, SIMD_DELTA_THREADS));
     params.key_dim = 160;
-    assert!(!supports_simd_delta(&params, 32));
+    assert!(!supports_simd_delta(&params, 32, SIMD_DELTA_THREADS));
+}
+
+#[test]
+fn cost_model_prefers_register_recurrent_and_preserves_chunked_fallback() {
+    let shape = qwen35_attention_shape();
+    let simd_model =
+        MetalGatedDeltaExecutionCostModel::initial_c64(SIMD_DELTA_WIDTH, SIMD_DELTA_THREADS);
+    for tokens in [1, 64, 2_048, 7_412] {
+        assert_eq!(
+            simd_model.preference(shape, tokens),
+            GatedDeltaExecutionPreference::RecurrentScan,
+        );
+    }
+
+    let unsupported_model = MetalGatedDeltaExecutionCostModel::initial_c64(16, SIMD_DELTA_THREADS);
+    assert_eq!(
+        unsupported_model.preference(shape, 63),
+        GatedDeltaExecutionPreference::RecurrentScan,
+    );
+    assert_eq!(
+        unsupported_model.preference(shape, 64),
+        GatedDeltaExecutionPreference::ChunkedScan,
+    );
+
+    let thread_limited_model =
+        MetalGatedDeltaExecutionCostModel::initial_c64(SIMD_DELTA_WIDTH, SIMD_DELTA_THREADS - 1);
+    assert_eq!(
+        thread_limited_model.preference(shape, 63),
+        GatedDeltaExecutionPreference::RecurrentScan,
+    );
+    assert_eq!(
+        thread_limited_model.preference(shape, 64),
+        GatedDeltaExecutionPreference::ChunkedScan,
+    );
+}
+
+#[test]
+fn delta_dispatch_metadata_counts_optional_gram_kernel() {
+    let semantics = TestSemantics {
+        decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+        value_head_mapping: GatedDeltaValueHeadMapping::GroupedByKeyHead,
+    };
+    let params = test_params(64, semantics);
+    let capabilities =
+        GatedDeltaExecutionCapabilities::with_chunked_scan(GATED_DELTA_CHUNK_SIZE).unwrap();
+    let recurrent = capabilities
+        .select(64, GatedDeltaExecutionPreference::RecurrentScan)
+        .unwrap();
+    let chunked = capabilities
+        .select(64, GatedDeltaExecutionPreference::ChunkedScan)
+        .unwrap();
+    assert_eq!(delta_dispatch_count(recurrent, &params), 1);
+    assert_eq!(delta_dispatch_count(chunked, &params), 6);
+
+    let mut no_repeated_heads = params;
+    no_repeated_heads.value_heads = no_repeated_heads.key_heads;
+    assert_eq!(delta_dispatch_count(chunked, &no_repeated_heads), 5);
+}
+
+fn qwen35_attention_shape() -> AttentionShape {
+    AttentionShape {
+        hidden_size: 2_560,
+        key_heads: KEY_HEADS as u64,
+        value_heads: VALUE_HEADS as u64,
+        key_dim: KEY_DIM as u64,
+        value_dim: VALUE_DIM as u64,
+        qkv_features: QKV_FEATURES as u64,
+        value_features: VALUE_FEATURES as u64,
+        qkvz_features: QKVZ_FEATURES as u64,
+        ba_features: BA_FEATURES as u64,
+        qkvzba_features: (QKVZ_FEATURES + BA_FEATURES) as u64,
+        conv_kernel: CONV_KERNEL as u64,
+        conv_state_width: CONV_STATE_WIDTH as u64,
+        epsilon: 1.0e-6,
+        layer_index: 0,
+        decay_parameterization: GatedDeltaDecayParameterization::LogRate,
+        value_head_mapping: GatedDeltaValueHeadMapping::InterleavedByKeyHead,
+    }
 }
 
 fn assert_recurrent_conformance(semantics: TestSemantics) {
@@ -887,7 +966,17 @@ fn run_segment(
         MTLSize::new(THREADS_PER_GROUP, 1, 1),
     );
 
-    encoder.set_compute_pipeline_state(&pipelines.delta);
+    let use_simd_delta = supports_simd_delta(
+        &params,
+        pipelines.simd_delta.thread_execution_width(),
+        pipelines
+            .simd_delta
+            .max_total_threads_per_threadgroup()
+            .try_into()
+            .unwrap_or(0),
+    );
+    assert!(use_simd_delta, "Qwen3.5 test shape must use SIMD recurrent");
+    encoder.set_compute_pipeline_state(&pipelines.simd_delta);
     for (index, buffer) in [&*query, &*key, &*value, &*g, &*beta, delta_state, &*core]
         .into_iter()
         .enumerate()
@@ -897,11 +986,11 @@ fn run_segment(
     set_params(encoder, 7, &params);
     encoder.dispatch_thread_groups(
         MTLSize::new(
-            (VALUE_DIM as u64).div_ceil(VALUE_TILE),
+            (VALUE_DIM as u64).div_ceil(SIMD_DELTA_ROWS_PER_GROUP),
             VALUE_HEADS as u64,
             1,
         ),
-        MTLSize::new(THREADS_PER_GROUP, 1, 1),
+        MTLSize::new(SIMD_DELTA_THREADS, 1, 1),
     );
 
     encoder.set_compute_pipeline_state(&pipelines.gated_norm);

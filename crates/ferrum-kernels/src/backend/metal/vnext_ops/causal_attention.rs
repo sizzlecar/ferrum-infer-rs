@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::vnext_runtime::{
     MetalBufferRegion, MetalDeviceBuffer, MetalDeviceCommand, MetalDeviceRuntime,
-    MetalDeviceRuntimeError,
+    MetalDeviceRuntimeError, MetalSubmissionEncoder,
 };
 use super::linear::{
     append_shared_matrix_weight, dispatch_linear, linear_launch,
@@ -53,20 +53,42 @@ const F32_MASTER_ESTIMATOR_ID: &str =
     "resource-estimator.metal.causal_paged_attention.f32-master.native";
 const PREPARE_KERNEL: &str = "vnext_causal_prepare_f16";
 const ATTENTION_KERNEL: &str = "vnext_causal_attention_f16";
+const DIRECT_DECODE_ATTENTION_KERNEL: &str = "vnext_causal_attention_decode_direct_f16";
+const GROUPED_DECODE_PARTIAL_ATTENTION_KERNEL: &str =
+    "vnext_causal_attention_decode_grouped_partial_f16";
+const GROUPED_DECODE_REDUCE_ATTENTION_KERNEL: &str =
+    "vnext_causal_attention_decode_grouped_reduce_f16";
+const TILED_PREFILL_ATTENTION_KERNEL: &str = "vnext_causal_attention_prefill_tiled_f16";
+const GQA_TILED_PREFILL_ATTENTION_KERNEL: &str = "vnext_causal_attention_prefill_gqa_tiled_f16";
 const PREPARE_PAGE_TABLE_INDEX: u64 = 6;
 const ATTENTION_PAGE_TABLE_INDEX: u64 = 3;
 const SIMD_THREADS: u64 = 32;
+const THREADGROUP_MEMORY_ALIGNMENT: u64 = 16;
 const MAXIMUM_ATTENTION_SIMDGROUPS: u64 = 16;
 const MAXIMUM_HEAD_DIM: u64 = 256;
 const MAXIMUM_KV_PAGES: u64 = 16_384;
+const TILED_PREFILL_QUERY_TILE: u32 = 8;
+const TILED_PREFILL_KEY_TILE: u64 = 32;
+const GQA_TILED_PREFILL_KEY_TILE: u64 = 64;
+const TILED_PREFILL_SIMDGROUPS: u64 = 4;
+const GQA_TILED_PREFILL_QUERY_HEADS: u32 = 2;
+const GQA_TILED_PREFILL_SIMDGROUPS: u64 = 8;
+const GROUPED_DECODE_PARTITIONS: u64 = 8;
+const GROUPED_DECODE_MINIMUM_CONTEXT: u64 = GROUPED_DECODE_PARTITIONS * TILED_PREFILL_KEY_TILE;
 
 pub(super) struct MetalCausalAttentionPipelines {
     prepare: ComputePipelineState,
     attention: ComputePipelineState,
+    direct_decode_attention: ComputePipelineState,
+    grouped_decode_partial_attention: ComputePipelineState,
+    grouped_decode_reduce_attention: ComputePipelineState,
+    tiled_prefill_attention: ComputePipelineState,
+    gqa_tiled_prefill_attention: ComputePipelineState,
     prepare_function: Function,
     binding_encoded_length: u64,
     binding_alignment: u64,
     maximum_attention_simdgroups: u32,
+    maximum_threadgroup_memory_length: u64,
 }
 
 impl MetalCausalAttentionPipelines {
@@ -92,14 +114,37 @@ impl MetalCausalAttentionPipelines {
         };
         let prepare_function = function(PREPARE_KERNEL)?;
         let attention_function = function(ATTENTION_KERNEL)?;
+        let direct_decode_attention_function = function(DIRECT_DECODE_ATTENTION_KERNEL)?;
+        let grouped_decode_partial_attention_function =
+            function(GROUPED_DECODE_PARTIAL_ATTENTION_KERNEL)?;
+        let grouped_decode_reduce_attention_function =
+            function(GROUPED_DECODE_REDUCE_ATTENTION_KERNEL)?;
+        let tiled_prefill_attention_function = function(TILED_PREFILL_ATTENTION_KERNEL)?;
+        let gqa_tiled_prefill_attention_function = function(GQA_TILED_PREFILL_ATTENTION_KERNEL)?;
         let prepare_encoder = prepare_function.new_argument_encoder(PREPARE_PAGE_TABLE_INDEX);
         let attention_encoder = attention_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let direct_decode_attention_encoder =
+            direct_decode_attention_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let grouped_decode_partial_attention_encoder = grouped_decode_partial_attention_function
+            .new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let tiled_prefill_attention_encoder =
+            tiled_prefill_attention_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
+        let gqa_tiled_prefill_attention_encoder =
+            gqa_tiled_prefill_attention_function.new_argument_encoder(ATTENTION_PAGE_TABLE_INDEX);
         let binding_encoded_length = prepare_encoder.encoded_length();
         let binding_alignment = prepare_encoder.alignment();
         if binding_encoded_length == 0
             || binding_alignment == 0
             || attention_encoder.encoded_length() != binding_encoded_length
             || attention_encoder.alignment() != binding_alignment
+            || direct_decode_attention_encoder.encoded_length() != binding_encoded_length
+            || direct_decode_attention_encoder.alignment() != binding_alignment
+            || grouped_decode_partial_attention_encoder.encoded_length() != binding_encoded_length
+            || grouped_decode_partial_attention_encoder.alignment() != binding_alignment
+            || tiled_prefill_attention_encoder.encoded_length() != binding_encoded_length
+            || tiled_prefill_attention_encoder.alignment() != binding_alignment
+            || gqa_tiled_prefill_attention_encoder.encoded_length() != binding_encoded_length
+            || gqa_tiled_prefill_attention_encoder.alignment() != binding_alignment
         {
             return Err(MetalDeviceRuntimeError::contract(
                 "Metal causal-attention kernels disagree on the page-table argument layout",
@@ -116,25 +161,86 @@ impl MetalCausalAttentionPipelines {
         };
         let prepare = pipeline(&prepare_function)?;
         let attention = pipeline(&attention_function)?;
+        let direct_decode_attention = pipeline(&direct_decode_attention_function)?;
+        let grouped_decode_partial_attention =
+            pipeline(&grouped_decode_partial_attention_function)?;
+        let grouped_decode_reduce_attention = pipeline(&grouped_decode_reduce_attention_function)?;
+        let tiled_prefill_attention = pipeline(&tiled_prefill_attention_function)?;
+        let gqa_tiled_prefill_attention = pipeline(&gqa_tiled_prefill_attention_function)?;
         if prepare.thread_execution_width() != SIMD_THREADS
             || attention.thread_execution_width() != SIMD_THREADS
+            || direct_decode_attention.thread_execution_width() != SIMD_THREADS
+            || grouped_decode_partial_attention.thread_execution_width() != SIMD_THREADS
+            || grouped_decode_reduce_attention.thread_execution_width() != SIMD_THREADS
+            || tiled_prefill_attention.thread_execution_width() != SIMD_THREADS
+            || gqa_tiled_prefill_attention.thread_execution_width() != SIMD_THREADS
         {
             return Err(MetalDeviceRuntimeError::contract(format!(
-                "Metal causal attention requires {SIMD_THREADS}-lane SIMD execution, got prepare={} attention={}",
+                "Metal causal attention requires {SIMD_THREADS}-lane SIMD execution, got prepare={} attention={} direct_decode={} grouped_decode_partial={} grouped_decode_reduce={} tiled_prefill={} gqa_tiled_prefill={}",
                 prepare.thread_execution_width(),
-                attention.thread_execution_width()
+                attention.thread_execution_width(),
+                direct_decode_attention.thread_execution_width(),
+                grouped_decode_partial_attention.thread_execution_width(),
+                grouped_decode_reduce_attention.thread_execution_width(),
+                tiled_prefill_attention.thread_execution_width(),
+                gqa_tiled_prefill_attention.thread_execution_width()
             )));
         }
-        let maximum_attention_simdgroups =
-            (attention.max_total_threads_per_threadgroup() as u64 / SIMD_THREADS)
-                .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS) as u32;
+        let tiled_prefill_threads = SIMD_THREADS * TILED_PREFILL_SIMDGROUPS;
+        if (grouped_decode_partial_attention.max_total_threads_per_threadgroup() as u64)
+            < tiled_prefill_threads
+        {
+            return Err(MetalDeviceRuntimeError::contract(format!(
+                "Metal grouped causal decode requires {tiled_prefill_threads} threads per threadgroup, pipeline supports {}",
+                grouped_decode_partial_attention.max_total_threads_per_threadgroup()
+            )));
+        }
+        if (grouped_decode_reduce_attention.max_total_threads_per_threadgroup() as u64)
+            < SIMD_THREADS
+        {
+            return Err(MetalDeviceRuntimeError::contract(format!(
+                "Metal grouped causal-decode reduction requires {SIMD_THREADS} threads per threadgroup, pipeline supports {}",
+                grouped_decode_reduce_attention.max_total_threads_per_threadgroup()
+            )));
+        }
+        if (tiled_prefill_attention.max_total_threads_per_threadgroup() as u64)
+            < tiled_prefill_threads
+        {
+            return Err(MetalDeviceRuntimeError::contract(format!(
+                "Metal tiled causal prefill requires {tiled_prefill_threads} threads per threadgroup, pipeline supports {}",
+                tiled_prefill_attention.max_total_threads_per_threadgroup()
+            )));
+        }
+        let gqa_tiled_prefill_threads = SIMD_THREADS * GQA_TILED_PREFILL_SIMDGROUPS;
+        if (gqa_tiled_prefill_attention.max_total_threads_per_threadgroup() as u64)
+            < gqa_tiled_prefill_threads
+        {
+            return Err(MetalDeviceRuntimeError::contract(format!(
+                "Metal GQA tiled causal prefill requires {gqa_tiled_prefill_threads} threads per threadgroup, pipeline supports {}",
+                gqa_tiled_prefill_attention.max_total_threads_per_threadgroup()
+            )));
+        }
+        let maximum_attention_simdgroups = (attention
+            .max_total_threads_per_threadgroup()
+            .min(direct_decode_attention.max_total_threads_per_threadgroup())
+            as u64
+            / SIMD_THREADS)
+            .clamp(1, MAXIMUM_ATTENTION_SIMDGROUPS)
+            as u32;
+        let maximum_threadgroup_memory_length = device.max_threadgroup_memory_length() as u64;
         Ok(Self {
             prepare,
             attention,
+            direct_decode_attention,
+            grouped_decode_partial_attention,
+            grouped_decode_reduce_attention,
+            tiled_prefill_attention,
+            gqa_tiled_prefill_attention,
             prepare_function,
             binding_encoded_length,
             binding_alignment,
             maximum_attention_simdgroups,
+            maximum_threadgroup_memory_length,
         })
     }
 
@@ -298,7 +404,11 @@ impl OperationResourceEstimator for MetalCausalPagedAttentionProvider {
         let shape =
             CausalAttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
-            ProviderWorkspaceSizeFormula::tokens(
+            ProviderWorkspaceSizeFormula::affine(
+                0,
+                shape
+                    .split_decode_partial_bytes_per_sequence()
+                    .map_err(invalid_plan)?,
                 shape.scratch_bytes_per_token().map_err(invalid_plan)?,
             )?,
             VALUE_ALIGNMENT_BYTES,
@@ -524,6 +634,18 @@ impl CausalAttentionShape {
         })
     }
 
+    fn split_decode_partial_bytes_per_sequence(self) -> Result<u64, String> {
+        let elements_per_partial = self
+            .head_dim
+            .checked_add(2)
+            .ok_or_else(|| "Metal grouped-decode partial width overflows".to_owned())?;
+        let elements = GROUPED_DECODE_PARTITIONS
+            .checked_mul(self.query_heads)
+            .and_then(|value| value.checked_mul(elements_per_partial))
+            .ok_or_else(|| "Metal grouped-decode partial workspace overflows".to_owned())?;
+        aligned_bytes(elements, std::mem::size_of::<f32>() as u64)
+    }
+
     fn params(
         self,
         tokens: u64,
@@ -600,6 +722,8 @@ struct CausalAttentionParams {
 #[derive(Debug, Clone, Copy)]
 struct ScratchLayout {
     required_bytes: u64,
+    split_decode: u64,
+    split_decode_bytes_per_sequence: u64,
     normalized: u64,
     query_raw: u64,
     key_raw: u64,
@@ -610,11 +734,28 @@ struct ScratchLayout {
 }
 
 impl ScratchLayout {
-    fn new(shape: CausalAttentionShape, total_tokens: u64) -> Result<Self, String> {
-        if total_tokens == 0 {
+    fn new(
+        shape: CausalAttentionShape,
+        total_tokens: u64,
+        participant_count: usize,
+    ) -> Result<Self, String> {
+        if total_tokens == 0 || participant_count == 0 {
             return Err("Metal causal-attention scratch cannot size empty work".to_owned());
         }
-        let mut offset = 0;
+        let participant_count = u64::try_from(participant_count)
+            .map_err(|_| "Metal causal-attention participant count exceeds u64".to_owned())?;
+        let mut offset = 0_u64;
+        let split_decode = offset;
+        let split_decode_bytes_per_sequence = shape.split_decode_partial_bytes_per_sequence()?;
+        offset = offset
+            .checked_add(
+                split_decode_bytes_per_sequence
+                    .checked_mul(participant_count)
+                    .ok_or_else(|| {
+                        "Metal grouped-decode participant workspace overflows".to_owned()
+                    })?,
+            )
+            .ok_or_else(|| "Metal grouped-decode scratch offset overflows".to_owned())?;
         let normalized = reserve_tokens(&mut offset, shape.hidden_size, total_tokens)?;
         let query_raw = reserve_tokens(&mut offset, shape.query_projection_features, total_tokens)?;
         let key_raw = reserve_tokens(&mut offset, shape.kv_features, total_tokens)?;
@@ -625,6 +766,11 @@ impl ScratchLayout {
         let expected = shape
             .scratch_bytes_per_token()?
             .checked_mul(total_tokens)
+            .and_then(|bytes| {
+                split_decode_bytes_per_sequence
+                    .checked_mul(participant_count)
+                    .and_then(|split_bytes| bytes.checked_add(split_bytes))
+            })
             .ok_or_else(|| "Metal causal-attention scratch size overflows".to_owned())?;
         if offset != expected {
             return Err(
@@ -633,6 +779,8 @@ impl ScratchLayout {
         }
         Ok(Self {
             required_bytes: offset,
+            split_decode,
+            split_decode_bytes_per_sequence,
             normalized,
             query_raw,
             key_raw,
@@ -641,6 +789,26 @@ impl ScratchLayout {
             context,
             projected,
         })
+    }
+
+    fn split_decode_offset(self, participant_index: usize) -> Result<u64, String> {
+        let participant_index = u64::try_from(participant_index)
+            .map_err(|_| "Metal grouped-decode participant index exceeds u64".to_owned())?;
+        let offset = self
+            .split_decode
+            .checked_add(
+                self.split_decode_bytes_per_sequence
+                    .checked_mul(participant_index)
+                    .ok_or_else(|| {
+                        "Metal grouped-decode participant offset overflows".to_owned()
+                    })?,
+            )
+            .ok_or_else(|| "Metal grouped-decode participant offset overflows".to_owned())?;
+        offset
+            .checked_add(self.split_decode_bytes_per_sequence)
+            .filter(|end| *end <= self.normalized)
+            .map(|_| offset)
+            .ok_or_else(|| "Metal grouped-decode participant range is invalid".to_owned())
     }
 
     fn token_offset(self, base: u64, token_start: u64, width: u64) -> Result<u64, String> {
@@ -706,6 +874,7 @@ struct ParticipantLaunch {
     first_page_region: usize,
     page_count: usize,
     binding_offset: u64,
+    split_decode: u64,
     normalized: u64,
     query_raw: u64,
     key_raw: u64,
@@ -765,7 +934,7 @@ fn encode_attention(
     }
 
     let total_tokens = invocation.work_shape().immediate_tokens();
-    let layout = ScratchLayout::new(shape, total_tokens)?;
+    let layout = ScratchLayout::new(shape, total_tokens, invocation.participants().len())?;
     let binding_layout = BindingLayout::new(
         attention.binding_slot_bytes()?,
         invocation.participants().len(),
@@ -917,6 +1086,7 @@ fn encode_attention(
             first_page_region,
             page_count,
             binding_offset,
+            split_decode: layout.split_decode_offset(participant_index)?,
             normalized,
             query_raw,
             key_raw,
@@ -1102,7 +1272,14 @@ fn encode_attention(
     )?;
     let token_count = invocation.work_shape().immediate_tokens();
     let packed_enabled = packed.is_some();
-    let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled);
+    let grouped_decode_reductions = launches
+        .iter()
+        .filter(|launch| {
+            attention_dispatch_plan(&launch.params).kind == AttentionDispatchKind::GroupedDecode
+        })
+        .count() as u64;
+    let dispatch_count = physical_dispatch_count(launches.len(), packed_enabled)
+        .saturating_add(grouped_decode_reductions);
     let operation_label = if hidden_type == ElementType::F32 {
         "vnext_causal_paged_attention_f32_master"
     } else {
@@ -1117,7 +1294,7 @@ fn encode_attention(
                     &linear,
                     &primitives,
                     hidden_type,
-                    encoder.compute_encoder(),
+                    encoder,
                     regions,
                     shared,
                     packed,
@@ -1130,7 +1307,7 @@ fn encode_attention(
                         &linear,
                         &primitives,
                         hidden_type,
-                        encoder.compute_encoder(),
+                        encoder,
                         regions,
                         shared,
                         launch,
@@ -1318,7 +1495,7 @@ fn enqueue_attention(
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
     hidden_type: ElementType,
-    encoder: &ComputeCommandEncoderRef,
+    encoder: &mut MetalSubmissionEncoder,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
     launch: &ParticipantLaunch,
@@ -1327,7 +1504,7 @@ fn enqueue_attention(
     dispatch_input_rms_norm(
         primitives,
         hidden_type,
-        encoder,
+        compute_subwork(encoder, "causal_attention.input_norm"),
         &regions[launch.input],
         0,
         &regions[shared.input_norm],
@@ -1337,20 +1514,42 @@ fn enqueue_attention(
         launch.hidden_size,
         launch.params.epsilon,
     );
-    for projection in [
-        launch.query_projection,
-        launch.key_projection,
-        launch.value_projection,
+    for (projection, subwork_id) in [
+        (launch.query_projection, "causal_attention.query_projection"),
+        (launch.key_projection, "causal_attention.key_projection"),
+        (launch.value_projection, "causal_attention.value_projection"),
     ] {
-        dispatch_linear(linear, encoder, regions, projection);
+        dispatch_linear(
+            linear,
+            compute_subwork(encoder, subwork_id),
+            regions,
+            projection,
+        );
     }
-    dispatch_prepare(attention, encoder, regions, shared, launch);
-    dispatch_attention(attention, encoder, regions, shared, launch);
-    dispatch_linear(linear, encoder, regions, launch.output_projection);
+    dispatch_prepare(
+        attention,
+        compute_subwork(encoder, "causal_attention.prepare"),
+        regions,
+        shared,
+        launch,
+    );
+    dispatch_attention(
+        attention,
+        compute_subwork(encoder, "causal_attention.core"),
+        regions,
+        shared,
+        launch,
+    );
+    dispatch_linear(
+        linear,
+        compute_subwork(encoder, "causal_attention.output_projection"),
+        regions,
+        launch.output_projection,
+    );
     dispatch_hidden_residual(
         primitives,
         hidden_type,
-        encoder,
+        compute_subwork(encoder, "causal_attention.residual_add"),
         &regions[launch.input],
         0,
         scratch,
@@ -1367,7 +1566,7 @@ fn enqueue_packed_attention(
     linear: &MetalLinearPipelines,
     primitives: &MetalPrimitivePipelines,
     hidden_type: ElementType,
-    encoder: &ComputeCommandEncoderRef,
+    encoder: &mut MetalSubmissionEncoder,
     regions: &[MetalBufferRegion],
     shared: SharedRegions,
     packed: &PackedLaunch,
@@ -1377,7 +1576,7 @@ fn enqueue_packed_attention(
     dispatch_input_rms_norm(
         primitives,
         hidden_type,
-        encoder,
+        compute_subwork(encoder, "causal_attention.input_norm"),
         &regions[packed.input],
         0,
         &regions[shared.input_norm],
@@ -1387,22 +1586,44 @@ fn enqueue_packed_attention(
         packed.hidden_size,
         packed.epsilon,
     );
-    for projection in [
-        packed.query_projection,
-        packed.key_projection,
-        packed.value_projection,
+    for (projection, subwork_id) in [
+        (packed.query_projection, "causal_attention.query_projection"),
+        (packed.key_projection, "causal_attention.key_projection"),
+        (packed.value_projection, "causal_attention.value_projection"),
     ] {
-        dispatch_linear(linear, encoder, regions, projection);
+        dispatch_linear(
+            linear,
+            compute_subwork(encoder, subwork_id),
+            regions,
+            projection,
+        );
     }
     for participant in participants {
-        dispatch_prepare(attention, encoder, regions, shared, participant);
-        dispatch_attention(attention, encoder, regions, shared, participant);
+        dispatch_prepare(
+            attention,
+            compute_subwork(encoder, "causal_attention.prepare"),
+            regions,
+            shared,
+            participant,
+        );
+        dispatch_attention(
+            attention,
+            compute_subwork(encoder, "causal_attention.core"),
+            regions,
+            shared,
+            participant,
+        );
     }
-    dispatch_linear(linear, encoder, regions, packed.output_projection);
+    dispatch_linear(
+        linear,
+        compute_subwork(encoder, "causal_attention.output_projection"),
+        regions,
+        packed.output_projection,
+    );
     dispatch_hidden_residual(
         primitives,
         hidden_type,
-        encoder,
+        compute_subwork(encoder, "causal_attention.residual_add"),
         &regions[packed.input],
         0,
         scratch,
@@ -1411,6 +1632,14 @@ fn enqueue_packed_attention(
         0,
         packed.residual_elements,
     );
+}
+
+fn compute_subwork<'a>(
+    encoder: &'a mut MetalSubmissionEncoder,
+    subwork_id: &'static str,
+) -> &'a ComputeCommandEncoderRef {
+    encoder.begin_compute_subwork(subwork_id);
+    encoder.compute_encoder()
 }
 
 fn dispatch_prepare(
@@ -1439,6 +1668,8 @@ fn dispatch_prepare(
     );
     set_params(encoder, 7, &launch.params);
     use_pages(encoder, regions, launch);
+    encoder.set_threadgroup_memory_length(0, 0);
+    encoder.set_threadgroup_memory_length(1, 0);
     encoder.dispatch_thread_groups(
         MTLSize::new(
             u64::from(launch.params.tokens),
@@ -1457,10 +1688,22 @@ fn dispatch_attention(
     launch: &ParticipantLaunch,
 ) {
     let scratch = &regions[shared.scratch];
-    encoder.set_compute_pipeline_state(&pipelines.attention);
+    let plan = attention_dispatch_plan_with_memory_limit(
+        &launch.params,
+        pipelines.maximum_threadgroup_memory_length,
+    );
     set_region_offset(encoder, 0, scratch, launch.query);
     set_region_offset(encoder, 1, scratch, launch.query_raw);
-    set_region_offset(encoder, 2, scratch, launch.context);
+    set_region_offset(
+        encoder,
+        2,
+        scratch,
+        if plan.kind == AttentionDispatchKind::GroupedDecode {
+            launch.split_decode
+        } else {
+            launch.context
+        },
+    );
     set_region_offset(
         encoder,
         ATTENTION_PAGE_TABLE_INDEX,
@@ -1469,25 +1712,290 @@ fn dispatch_attention(
     );
     set_params(encoder, 4, &launch.params);
     use_pages(encoder, regions, launch);
-    encoder.set_threadgroup_memory_length(0, attention_threadgroup_memory_bytes(&launch.params));
+    encode_attention_dispatch(pipelines, encoder, plan);
+    if plan.kind == AttentionDispatchKind::GroupedDecode {
+        encoder.set_compute_pipeline_state(&pipelines.grouped_decode_reduce_attention);
+        set_region_offset(encoder, 0, scratch, launch.split_decode);
+        set_region_offset(encoder, 1, scratch, launch.query_raw);
+        set_region_offset(encoder, 2, scratch, launch.context);
+        set_params(encoder, 4, &launch.params);
+        encoder.set_threadgroup_memory_length(0, grouped_decode_reduce_threadgroup_memory_bytes());
+        encoder.set_threadgroup_memory_length(1, 0);
+        encoder.dispatch_thread_groups(
+            MTLSize::new(u64::from(launch.params.query_heads), 1, 1),
+            MTLSize::new(SIMD_THREADS, 1, 1),
+        );
+        encoder.set_threadgroup_memory_length(0, 0);
+        encoder.set_threadgroup_memory_length(1, 0);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttentionDispatchKind {
+    General,
+    DirectDecode,
+    GroupedDecode,
+    GqaTiledPrefill,
+    TiledPrefill,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AttentionDispatchPlan {
+    kind: AttentionDispatchKind,
+    threadgroups: [u64; 3],
+    threads_per_threadgroup: [u64; 3],
+    threadgroup_memory_bytes: [u64; 2],
+}
+
+fn attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchPlan {
+    attention_dispatch_plan_with_memory_limit(params, u64::MAX)
+}
+
+fn attention_dispatch_plan_with_memory_limit(
+    params: &CausalAttentionParams,
+    maximum_threadgroup_memory_length: u64,
+) -> AttentionDispatchPlan {
+    if uses_grouped_decode(params) {
+        grouped_decode_attention_dispatch_plan(params)
+    } else if uses_direct_decode(params) {
+        direct_decode_attention_dispatch_plan(params)
+    } else if uses_gqa_tiled_prefill(params)
+        && gqa_tiled_prefill_threadgroup_memory_bytes(params) <= maximum_threadgroup_memory_length
+    {
+        gqa_tiled_prefill_attention_dispatch_plan(params)
+    } else if uses_tiled_prefill(params) {
+        tiled_prefill_attention_dispatch_plan(params)
+    } else {
+        general_attention_dispatch_plan(params)
+    }
+}
+
+fn grouped_decode_attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchPlan {
+    AttentionDispatchPlan {
+        kind: AttentionDispatchKind::GroupedDecode,
+        threadgroups: [
+            GROUPED_DECODE_PARTITIONS,
+            u64::from(params.key_value_heads),
+            1,
+        ],
+        threads_per_threadgroup: [SIMD_THREADS, TILED_PREFILL_SIMDGROUPS, 1],
+        threadgroup_memory_bytes: [
+            tiled_prefill_half_threadgroup_bytes(params),
+            tiled_prefill_float_threadgroup_bytes(params),
+        ],
+    }
+}
+
+fn direct_decode_attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchPlan {
+    AttentionDispatchPlan {
+        kind: AttentionDispatchKind::DirectDecode,
+        threadgroups: [u64::from(params.tokens), u64::from(params.query_heads), 1],
+        threads_per_threadgroup: [SIMD_THREADS, u64::from(params.attention_simdgroups), 1],
+        threadgroup_memory_bytes: [attention_threadgroup_memory_bytes(params), 0],
+    }
+}
+
+fn general_attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchPlan {
+    AttentionDispatchPlan {
+        kind: AttentionDispatchKind::General,
+        threadgroups: [u64::from(params.tokens), u64::from(params.query_heads), 1],
+        threads_per_threadgroup: [SIMD_THREADS, u64::from(params.attention_simdgroups), 1],
+        threadgroup_memory_bytes: [attention_threadgroup_memory_bytes(params), 0],
+    }
+}
+
+fn tiled_prefill_attention_dispatch_plan(params: &CausalAttentionParams) -> AttentionDispatchPlan {
+    AttentionDispatchPlan {
+        kind: AttentionDispatchKind::TiledPrefill,
+        threadgroups: [
+            u64::from(params.tokens).div_ceil(u64::from(TILED_PREFILL_QUERY_TILE)),
+            u64::from(params.query_heads),
+            1,
+        ],
+        threads_per_threadgroup: [SIMD_THREADS, TILED_PREFILL_SIMDGROUPS, 1],
+        threadgroup_memory_bytes: [
+            tiled_prefill_half_threadgroup_bytes(params),
+            tiled_prefill_float_threadgroup_bytes(params),
+        ],
+    }
+}
+
+fn gqa_tiled_prefill_attention_dispatch_plan(
+    params: &CausalAttentionParams,
+) -> AttentionDispatchPlan {
+    AttentionDispatchPlan {
+        kind: AttentionDispatchKind::GqaTiledPrefill,
+        threadgroups: [
+            u64::from(params.tokens).div_ceil(u64::from(TILED_PREFILL_QUERY_TILE)),
+            u64::from(params.query_heads / GQA_TILED_PREFILL_QUERY_HEADS),
+            1,
+        ],
+        threads_per_threadgroup: [SIMD_THREADS, GQA_TILED_PREFILL_SIMDGROUPS, 1],
+        threadgroup_memory_bytes: [
+            gqa_tiled_prefill_half_threadgroup_bytes(params),
+            gqa_tiled_prefill_float_threadgroup_bytes(params),
+        ],
+    }
+}
+
+fn encode_attention_dispatch(
+    pipelines: &MetalCausalAttentionPipelines,
+    encoder: &ComputeCommandEncoderRef,
+    plan: AttentionDispatchPlan,
+) {
+    encoder.set_compute_pipeline_state(match plan.kind {
+        AttentionDispatchKind::General => &pipelines.attention,
+        AttentionDispatchKind::DirectDecode => &pipelines.direct_decode_attention,
+        AttentionDispatchKind::GroupedDecode => &pipelines.grouped_decode_partial_attention,
+        AttentionDispatchKind::GqaTiledPrefill => &pipelines.gqa_tiled_prefill_attention,
+        AttentionDispatchKind::TiledPrefill => &pipelines.tiled_prefill_attention,
+    });
+    encoder.set_threadgroup_memory_length(0, plan.threadgroup_memory_bytes[0]);
+    encoder.set_threadgroup_memory_length(1, plan.threadgroup_memory_bytes[1]);
     encoder.dispatch_thread_groups(
         MTLSize::new(
-            u64::from(launch.params.tokens),
-            u64::from(launch.params.query_heads),
-            1,
+            plan.threadgroups[0],
+            plan.threadgroups[1],
+            plan.threadgroups[2],
         ),
         MTLSize::new(
-            SIMD_THREADS,
-            u64::from(launch.params.attention_simdgroups),
-            1,
+            plan.threads_per_threadgroup[0],
+            plan.threads_per_threadgroup[1],
+            plan.threads_per_threadgroup[2],
         ),
     );
+    encoder.set_threadgroup_memory_length(0, 0);
+    encoder.set_threadgroup_memory_length(1, 0);
+}
+
+fn uses_grouped_decode(params: &CausalAttentionParams) -> bool {
+    let Some(query_heads_per_kv_head) = query_heads_per_kv_head(params) else {
+        return false;
+    };
+    params.tokens == 1
+        && matches!(params.head_dim, 128 | 256)
+        && matches!(query_heads_per_kv_head, 4 | TILED_PREFILL_QUERY_TILE)
+        && u64::from(params.position_start).saturating_add(u64::from(params.tokens))
+            >= GROUPED_DECODE_MINIMUM_CONTEXT
+        && page_supports_eight_token_matrix(params)
+}
+
+fn uses_direct_decode(params: &CausalAttentionParams) -> bool {
+    params.tokens == 1
+        && matches!(params.head_dim, 128 | 256)
+        && query_heads_per_kv_head(params).is_some()
+        && page_holds_whole_token_rows(params)
+}
+
+fn query_heads_per_kv_head(params: &CausalAttentionParams) -> Option<u32> {
+    (params.key_value_heads != 0
+        && params.query_heads != 0
+        && params.query_heads.is_multiple_of(params.key_value_heads))
+    .then(|| params.query_heads / params.key_value_heads)
+}
+
+fn uses_gqa_tiled_prefill(params: &CausalAttentionParams) -> bool {
+    let Some(query_heads_per_kv_head) = query_heads_per_kv_head(params) else {
+        return false;
+    };
+    params.tokens >= TILED_PREFILL_QUERY_TILE
+        && params.head_dim == 256
+        && query_heads_per_kv_head >= GQA_TILED_PREFILL_QUERY_HEADS
+        && query_heads_per_kv_head.is_multiple_of(GQA_TILED_PREFILL_QUERY_HEADS)
+        && page_supports_eight_token_matrix(params)
+}
+
+fn uses_tiled_prefill(params: &CausalAttentionParams) -> bool {
+    if !matches!(params.head_dim, 128 | 256)
+        || params.tokens < TILED_PREFILL_QUERY_TILE
+        || query_heads_per_kv_head(params).is_none()
+    {
+        return false;
+    }
+    page_supports_eight_token_matrix(params)
+}
+
+fn page_supports_eight_token_matrix(params: &CausalAttentionParams) -> bool {
+    let Some(token_stride) = key_value_token_stride(params) else {
+        return false;
+    };
+    let page_elements = u64::from(params.page_elements);
+    page_holds_whole_token_rows(params)
+        && (page_elements / token_stride).is_multiple_of(TILED_PREFILL_QUERY_TILE.into())
+}
+
+fn page_holds_whole_token_rows(params: &CausalAttentionParams) -> bool {
+    let Some(token_stride) = key_value_token_stride(params) else {
+        return false;
+    };
+    let page_elements = u64::from(params.page_elements);
+    page_elements >= token_stride && page_elements.is_multiple_of(token_stride)
+}
+
+fn key_value_token_stride(params: &CausalAttentionParams) -> Option<u64> {
+    2_u64
+        .checked_mul(u64::from(params.key_value_heads))
+        .and_then(|stride| stride.checked_mul(u64::from(params.head_dim)))
+        .filter(|stride| *stride != 0)
+}
+
+fn tiled_prefill_half_threadgroup_bytes(params: &CausalAttentionParams) -> u64 {
+    tiled_prefill_half_threadgroup_bytes_for_key_tile(params, TILED_PREFILL_KEY_TILE)
+}
+
+fn tiled_prefill_half_threadgroup_bytes_for_key_tile(
+    params: &CausalAttentionParams,
+    key_tile: u64,
+) -> u64 {
+    let head_dim = u64::from(params.head_dim);
+    ((u64::from(TILED_PREFILL_QUERY_TILE) * head_dim)
+        + (u64::from(TILED_PREFILL_QUERY_TILE) * key_tile))
+        * std::mem::size_of::<half::f16>() as u64
+}
+
+fn tiled_prefill_float_threadgroup_bytes(params: &CausalAttentionParams) -> u64 {
+    tiled_prefill_float_threadgroup_bytes_for_key_tile(params, TILED_PREFILL_KEY_TILE)
+}
+
+fn tiled_prefill_float_threadgroup_bytes_for_key_tile(
+    params: &CausalAttentionParams,
+    key_tile: u64,
+) -> u64 {
+    let head_dim = u64::from(params.head_dim);
+    ((u64::from(TILED_PREFILL_QUERY_TILE) * head_dim)
+        + (u64::from(TILED_PREFILL_QUERY_TILE) * key_tile))
+        * std::mem::size_of::<f32>() as u64
+}
+
+fn gqa_tiled_prefill_half_threadgroup_bytes(params: &CausalAttentionParams) -> u64 {
+    u64::from(GQA_TILED_PREFILL_QUERY_HEADS)
+        * tiled_prefill_half_threadgroup_bytes_for_key_tile(params, GQA_TILED_PREFILL_KEY_TILE)
+}
+
+fn gqa_tiled_prefill_float_threadgroup_bytes(params: &CausalAttentionParams) -> u64 {
+    u64::from(GQA_TILED_PREFILL_QUERY_HEADS)
+        * tiled_prefill_float_threadgroup_bytes_for_key_tile(params, GQA_TILED_PREFILL_KEY_TILE)
+}
+
+fn gqa_tiled_prefill_threadgroup_memory_bytes(params: &CausalAttentionParams) -> u64 {
+    gqa_tiled_prefill_half_threadgroup_bytes(params)
+        .saturating_add(gqa_tiled_prefill_float_threadgroup_bytes(params))
+}
+
+fn grouped_decode_reduce_threadgroup_memory_bytes() -> u64 {
+    aligned_threadgroup_memory_bytes(
+        (GROUPED_DECODE_PARTITIONS + 1) * std::mem::size_of::<f32>() as u64,
+    )
 }
 
 fn attention_threadgroup_memory_bytes(params: &CausalAttentionParams) -> u64 {
     let simdgroups = u64::from(params.attention_simdgroups);
     let values = simdgroups * u64::from(params.head_dim) + 3 * simdgroups;
-    values * std::mem::size_of::<f32>() as u64
+    aligned_threadgroup_memory_bytes(values * std::mem::size_of::<f32>() as u64)
+}
+
+fn aligned_threadgroup_memory_bytes(bytes: u64) -> u64 {
+    bytes.div_ceil(THREADGROUP_MEMORY_ALIGNMENT) * THREADGROUP_MEMORY_ALIGNMENT
 }
 
 fn use_pages(
@@ -1787,9 +2295,40 @@ mod shape_tests {
             2 * VNEXT_KV_PAGE_BYTES
         );
         assert_eq!(
-            ScratchLayout::new(shape, 3).unwrap().required_bytes,
-            3 * shape.scratch_bytes_per_token().unwrap()
+            ScratchLayout::new(shape, 3, 1).unwrap().required_bytes,
+            shape.split_decode_partial_bytes_per_sequence().unwrap()
+                + 3 * shape.scratch_bytes_per_token().unwrap()
         );
+    }
+
+    #[test]
+    fn split_decode_scratch_scales_per_sequence_without_overlapping_token_scratch() {
+        let shape = CausalAttentionShape::from_attributes(&qwen35_4b_attributes()).unwrap();
+        let split_stride = shape.split_decode_partial_bytes_per_sequence().unwrap();
+        let token_stride = shape.scratch_bytes_per_token().unwrap();
+        assert_eq!(split_stride, 132_096);
+
+        for participant_count in [1_usize, 3] {
+            for total_tokens in [1_u64, 2_048] {
+                let layout = ScratchLayout::new(shape, total_tokens, participant_count).unwrap();
+                assert_eq!(
+                    layout.required_bytes,
+                    participant_count as u64 * split_stride + total_tokens * token_stride,
+                );
+                assert_eq!(layout.normalized, participant_count as u64 * split_stride,);
+
+                let mut previous_end = layout.split_decode;
+                for participant_index in 0..participant_count {
+                    let start = layout.split_decode_offset(participant_index).unwrap();
+                    let end = start.checked_add(split_stride).unwrap();
+                    assert!(start >= previous_end);
+                    assert!(end <= layout.normalized);
+                    previous_end = end;
+                }
+                assert_eq!(previous_end, layout.normalized);
+                assert!(layout.split_decode_offset(participant_count).is_err());
+            }
+        }
     }
 
     #[test]

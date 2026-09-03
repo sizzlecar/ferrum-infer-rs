@@ -7785,6 +7785,89 @@ fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
 }
 
 #[test]
+fn opencode_sized_prompt_rejects_an_explicit_4096_context() {
+    const INPUT_TOKENS: usize = 7_470;
+    const OUTPUT_TOKENS: usize = 512;
+
+    let config = EngineConfig::default();
+    let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, [(MAX_MODEL_LEN_ENV, "4096")]);
+    let request = InferenceRequest::new("test", "test").with_sampling_params(SamplingParams {
+        max_tokens: OUTPUT_TOKENS,
+        ..SamplingParams::default()
+    });
+
+    let error =
+        validate_request_context_budget(&request, INPUT_TOKENS, &config, &runtime, Some(262_144))
+            .expect_err("an explicit 4096-token product ceiling cannot admit the prompt");
+
+    assert!(error.to_string().contains(
+        "This model context is limited to 4096 tokens, but this request needs 7470 input tokens + 512 output tokens"
+    ));
+}
+
+#[test]
+fn opencode_sized_prompt_fits_default_model_context_and_explicit_8192_context() {
+    const INPUT_TOKENS: usize = 7_470;
+    const OUTPUT_TOKENS: usize = 512;
+
+    let config = EngineConfig::default();
+    let request = InferenceRequest::new("test", "test").with_sampling_params(SamplingParams {
+        max_tokens: OUTPUT_TOKENS,
+        ..SamplingParams::default()
+    });
+    let default_runtime =
+        ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
+    validate_request_context_budget(
+        &request,
+        INPUT_TOKENS,
+        &config,
+        &default_runtime,
+        Some(262_144),
+    )
+    .expect("the model-derived default context must admit the prompt");
+
+    let bounded_runtime =
+        ContinuousEngineRuntimeConfig::from_env_vars(None, [(MAX_MODEL_LEN_ENV, "8192")]);
+    validate_request_context_budget(
+        &request,
+        INPUT_TOKENS,
+        &config,
+        &bounded_runtime,
+        Some(262_144),
+    )
+    .expect("an explicit 8192-token context must admit the prompt and output budget");
+}
+
+#[test]
+fn opencode_sized_prompt_clamps_only_an_automatic_output_budget() {
+    const INPUT_TOKENS: usize = 7_470;
+
+    let config = EngineConfig::default();
+    let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, [(MAX_MODEL_LEN_ENV, "8192")]);
+    let mut request = InferenceRequest::new("test", "test")
+        .with_sampling_params(SamplingParams {
+            max_tokens: 4_096,
+            ..SamplingParams::default()
+        })
+        .with_metadata(
+            DEFAULT_MAX_TOKENS_METADATA_KEY.to_string(),
+            serde_json::json!(true),
+        );
+
+    clamp_default_max_tokens_to_context(
+        &mut request,
+        INPUT_TOKENS,
+        &config,
+        &runtime,
+        Some(262_144),
+    );
+
+    assert_eq!(request.sampling_params.max_tokens, 722);
+    validate_request_context_budget(&request, INPUT_TOKENS, &config, &runtime, Some(262_144))
+        .unwrap();
+}
+
+#[test]
 fn automatic_output_budget_clamps_to_remaining_executor_capacity() {
     let config = EngineConfig::default();
     let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());

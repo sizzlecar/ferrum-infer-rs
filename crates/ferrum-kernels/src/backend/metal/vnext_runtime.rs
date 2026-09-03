@@ -22,11 +22,11 @@ use std::time::Instant;
 use ferrum_interfaces::vnext::{
     BufferDescriptor, BufferRequest, BufferUsage, CapabilityId, CopyRegion, DefinitelyNotSubmitted,
     DeviceBatchingForm, DeviceBufferRetention, DeviceClass, DeviceCommandBatch,
-    DeviceCommandExecutionTiming, DeviceCommandLogicalWork, DeviceCommandPhase,
-    DeviceComputePathRequirement, DeviceDescriptor, DeviceErrorReport, DeviceExecutionInterval,
-    DeviceExecutionIntervalKind, DeviceExecutionPath, DeviceExecutionTiming, DeviceId,
-    DeviceNativeOperationId, DeviceNativeWorkAttribution, DeviceRuntime,
-    DeviceSubmissionAttribution, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
+    DeviceCommandLogicalWork, DeviceCommandPhase, DeviceComputePathRequirement, DeviceDescriptor,
+    DeviceErrorReport, DeviceExecutionInterval, DeviceExecutionIntervalKind, DeviceExecutionPath,
+    DeviceExecutionSpanKind, DeviceExecutionTiming, DeviceId, DeviceNativeOperationId,
+    DeviceNativeWorkAttribution, DeviceRuntime, DeviceSubmissionAttribution,
+    DeviceSubmissionExecutionSpan, DeviceSubmissionExecutionTiming, DeviceSubmissionStage,
     DeviceSubmissionTimingSink, DeviceTerminal, DeviceTerminalReceipt, DeviceTimingMeasurement,
     DeviceTimingMode, DeviceTimingUnavailableReason, DisabledDeviceSubmissionTimingSink,
     DynamicStorageProfile, ElementType, FenceIndeterminate, FenceQuery, HostTransferLayout,
@@ -783,7 +783,11 @@ impl MetalCounterCaptureBuilder {
         self.unavailable = true;
     }
 
-    fn finish(mut self, command_buffer: &CommandBufferRef) -> MetalCounterCapture {
+    fn finish(
+        mut self,
+        command_buffer: &CommandBufferRef,
+        command_count: u32,
+    ) -> MetalCounterCapture {
         if !self.unavailable && !self.pages.is_empty() {
             let blit = command_buffer.new_blit_command_encoder();
             blit.set_label("ferrum.vnext.resolve_command_timestamps");
@@ -810,6 +814,7 @@ impl MetalCounterCaptureBuilder {
             device: self.device,
             pages: resolved_pages,
             mappings: self.mappings.into_boxed_slice(),
+            command_count,
             cpu_anchor_start: self.cpu_anchor_start,
             gpu_anchor_start: self.gpu_anchor_start,
             unavailable: self.unavailable,
@@ -827,9 +832,42 @@ struct MetalCounterCapture {
     device: metal::Device,
     pages: Vec<MetalCounterPage>,
     mappings: Box<[MetalCounterIntervalMapping]>,
+    command_count: u32,
     cpu_anchor_start: u64,
     gpu_anchor_start: u64,
     unavailable: bool,
+}
+
+fn metal_submission_execution_timing(
+    command_count: u32,
+    mut commands: BTreeMap<u32, Vec<DeviceExecutionInterval>>,
+) -> Option<DeviceSubmissionExecutionTiming> {
+    if commands
+        .last_key_value()
+        .is_some_and(|(command_index, _)| *command_index >= command_count)
+    {
+        return None;
+    }
+    let spans = (0..command_count)
+        .map(|command_index| {
+            let end_command_index = command_index.checked_add(1)?;
+            match commands.remove(&command_index) {
+                Some(intervals) => DeviceSubmissionExecutionSpan::measured(
+                    command_index,
+                    end_command_index,
+                    DeviceExecutionSpanKind::EagerCommand,
+                    intervals,
+                ),
+                None => DeviceSubmissionExecutionSpan::unavailable(
+                    command_index,
+                    end_command_index,
+                    DeviceExecutionSpanKind::EagerCommand,
+                    DeviceTimingUnavailableReason::BackendMeasurementFailed,
+                ),
+            }
+        })
+        .collect::<Option<Vec<_>>>()?;
+    DeviceSubmissionExecutionTiming::from_spans(command_count, spans)
 }
 
 impl MetalCounterCapture {
@@ -926,14 +964,7 @@ impl MetalCounterCapture {
                 .or_default()
                 .push(interval);
         }
-        let Some(commands) = commands
-            .into_iter()
-            .map(|(command_index, intervals)| {
-                DeviceCommandExecutionTiming::new(command_index, intervals)
-            })
-            .collect::<Option<Vec<_>>>()
-            .and_then(DeviceSubmissionExecutionTiming::new)
-        else {
+        let Some(commands) = metal_submission_execution_timing(self.command_count, commands) else {
             return DeviceTimingMeasurement::Unavailable(
                 DeviceTimingUnavailableReason::BackendMeasurementFailed,
             );
@@ -1136,11 +1167,11 @@ impl MetalSubmissionEncoder {
         encode(&encoder.0)
     }
 
-    fn finish(mut self) -> Option<MetalCounterCapture> {
+    fn finish(mut self, command_count: u32) -> Option<MetalCounterCapture> {
         self.end_compute();
         self.counter_capture
             .take()
-            .map(|capture| capture.finish(&self.command_buffer))
+            .map(|capture| capture.finish(&self.command_buffer, command_count))
     }
 }
 
@@ -1743,11 +1774,11 @@ impl MetalDeviceRuntime {
                 MetalDeviceRuntimeError::contract("Metal command batch is empty"),
             ));
         }
-        if u32::try_from(entries.len()).is_err() {
-            return Err(DefinitelyNotSubmitted::new(
-                MetalDeviceRuntimeError::contract("Metal command batch exceeds u32 indexing"),
-            ));
-        }
+        let command_count = u32::try_from(entries.len()).map_err(|_| {
+            DefinitelyNotSubmitted::new(MetalDeviceRuntimeError::contract(
+                "Metal command batch exceeds u32 indexing",
+            ))
+        })?;
         if entries
             .iter()
             .any(|(_, _, command)| command.runtime_instance != self.runtime_instance)
@@ -1838,7 +1869,7 @@ impl MetalDeviceRuntime {
                 }
             }
         }
-        let counter_capture = encoder.finish();
+        let counter_capture = encoder.finish(command_count);
         let command_timing = match (physical_span_attribution, counter_capture) {
             (false, _) => MetalFenceCommandTiming::NotRequested,
             (true, Some(capture)) => MetalFenceCommandTiming::Captured {
@@ -2441,6 +2472,88 @@ mod tests {
     }
 
     #[test]
+    fn metal_submission_timing_preserves_measured_commands_across_mapping_holes() {
+        let commands = BTreeMap::from([
+            (
+                1,
+                vec![
+                    DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 10, 20)
+                        .unwrap(),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Transfer, 30, 40)
+                        .unwrap(),
+                ],
+            ),
+        ]);
+
+        let timing = metal_submission_execution_timing(5, commands).expect("submission timing");
+        assert_eq!(timing.command_count(), 5);
+        assert_eq!(timing.spans().len(), 5);
+        for (command_index, span) in timing.spans().iter().enumerate() {
+            assert_eq!(span.start_command_index(), command_index as u32);
+            assert_eq!(span.end_command_index(), command_index as u32 + 1);
+            if matches!(command_index, 1 | 3) {
+                assert!(span.measurement().elapsed_ns().is_some());
+            } else {
+                assert_eq!(
+                    span.measurement().unavailable_reason(),
+                    Some(DeviceTimingUnavailableReason::BackendMeasurementFailed)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_submission_timing_preserves_interval_order_and_rejects_out_of_range_mapping() {
+        let intervals = vec![
+            DeviceExecutionInterval::new_labeled(
+                DeviceExecutionIntervalKind::Compute,
+                10,
+                20,
+                "first",
+            )
+            .unwrap(),
+            DeviceExecutionInterval::new_labeled(
+                DeviceExecutionIntervalKind::Transfer,
+                20,
+                30,
+                "second",
+            )
+            .unwrap(),
+        ];
+        let timing = metal_submission_execution_timing(2, BTreeMap::from([(0, intervals.clone())]))
+            .expect("submission timing");
+        assert_eq!(
+            timing.spans()[0].measurement().intervals(),
+            Some(intervals.as_slice())
+        );
+        assert!(metal_submission_execution_timing(
+            2,
+            BTreeMap::from([
+                (
+                    0,
+                    vec![
+                        DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 0, 1,)
+                            .unwrap()
+                    ],
+                ),
+                (
+                    2,
+                    vec![
+                        DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 2, 3,)
+                            .unwrap()
+                    ],
+                ),
+            ]),
+        )
+        .is_none());
+    }
+
+    #[test]
     fn ordered_transfer_batch_is_async_and_readback_is_exact() {
         let runtime = runtime();
         let source = runtime
@@ -2750,6 +2863,60 @@ mod tests {
         assert_eq!(intervals.len(), 1);
         assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
         assert!(timing.measurement().elapsed_ns().unwrap() > 0);
+    }
+
+    #[test]
+    fn kernel_profile_keeps_gpu_timings_around_host_only_command() {
+        let runtime = runtime();
+        let destination = runtime
+            .allocate_request(&buffer_request("resource/kernel-profile-host-hole"))
+            .expect("destination allocation");
+        let first = runtime
+            .encode_zero(&destination, 0, 8)
+            .expect("first zero command");
+        let host_only = MetalDeviceCommand::operation(
+            "test.host_binding",
+            vec![destination.region(0..8).expect("destination region")],
+            |_encoder, _regions| Ok(()),
+        )
+        .expect("host-only command");
+        let last = runtime
+            .encode_zero(&destination, 0, 8)
+            .expect("last zero command");
+        let mut stream = runtime.create_stream().expect("stream");
+
+        let fence = runtime
+            .submit_commands(
+                &mut stream,
+                compute_entries(vec![first, host_only, last]),
+                DeviceTimingMode::Kernel,
+                &DisabledDeviceSubmissionTimingSink,
+            )
+            .expect("kernel-profiled submission");
+        let terminal = runtime.wait_fence(&fence).expect("terminal fence");
+        assert!(terminal.terminal().is_succeeded());
+        let timing = match terminal.submission_timing() {
+            DeviceTimingMeasurement::Measured(timing) => timing,
+            DeviceTimingMeasurement::Unavailable(
+                DeviceTimingUnavailableReason::BackendUnsupported,
+            ) => return,
+            other => panic!("Metal kernel profile command timing failed: {other:?}"),
+        };
+
+        assert_eq!(timing.command_count(), 3);
+        let [first, host_only, last] = timing.spans() else {
+            panic!("expected three command timing rows")
+        };
+        for measured in [first, last] {
+            let intervals = measured.measurement().intervals().unwrap();
+            assert_eq!(intervals.len(), 1);
+            assert_eq!(intervals[0].kind(), DeviceExecutionIntervalKind::Transfer);
+            assert!(measured.measurement().elapsed_ns().unwrap() > 0);
+        }
+        assert_eq!(
+            host_only.measurement().unavailable_reason(),
+            Some(DeviceTimingUnavailableReason::BackendMeasurementFailed)
+        );
     }
 
     #[test]
