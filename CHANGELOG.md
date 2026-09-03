@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes.
 
+## [0.8.5] - 2026-09-03
+
+### Changed
+- Optimized the vNext Metal causal-attention prefill and gated-delta execution paths used by Qwen3.5 long-context requests.
+- Clarified model-derived context defaults and explicit context-limit behavior for OpenAI-compatible clients.
+
+### Fixed
+- Fixed Metal device-timing attribution when a submission contains commands without GPU counter samples.
+- Added long-context admission coverage so an intentionally configured 4,096-token limit fails clearly while supported larger contexts are admitted.
+
 ## [0.8.0] - 2026-08-14
 
 ### Added

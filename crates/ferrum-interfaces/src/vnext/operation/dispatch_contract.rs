@@ -156,16 +156,7 @@ impl BoundDeviceSubmissionAttribution {
         terminal_timing: DeviceTimingMeasurement<DeviceSubmissionExecutionTiming>,
     ) -> Result<Self, VNextError> {
         if let DeviceTimingMeasurement::Measured(timing) = &terminal_timing {
-            if usize::try_from(timing.command_count()).ok() != Some(self.device.commands().len())
-                || self
-                    .device
-                    .commands()
-                    .iter()
-                    .enumerate()
-                    .any(|(index, command)| {
-                        u32::try_from(index).ok() != Some(command.command_index())
-                    })
-            {
+            if !terminal_timing_matches_submission_attribution(timing, &self.device) {
                 return Err(invalid_operation(
                     "terminal device timing coverage differs from submission command attribution",
                 ));
@@ -192,6 +183,26 @@ impl BoundDeviceSubmissionAttribution {
     ) -> &DeviceTimingMeasurement<DeviceSubmissionExecutionTiming> {
         &self.terminal_timing
     }
+}
+
+fn terminal_timing_matches_submission_attribution(
+    timing: &DeviceSubmissionExecutionTiming,
+    attribution: &DeviceSubmissionAttribution,
+) -> bool {
+    let commands = attribution.commands();
+    let attributed = |command_index| {
+        commands
+            .binary_search_by_key(&command_index, |command| command.command_index())
+            .is_ok()
+    };
+    commands
+        .iter()
+        .all(|command| timing.span_for_command(command.command_index()).is_some())
+        && timing.spans().iter().all(|span| {
+            span.measurement().elapsed_ns().is_none()
+                || (span.start_command_index()..span.end_command_index())
+                    .all(|command_index| attributed(command_index))
+        })
 }
 
 #[must_use = "profiled submission evidence and completion must be consumed together"]
@@ -331,6 +342,125 @@ mod submission_wave_dispatch_timing_tests {
         drop(timer);
 
         assert!(!DisabledPanicSink::ENABLED);
+    }
+}
+
+#[cfg(test)]
+mod terminal_timing_attribution_tests {
+    use super::*;
+    use crate::vnext::{
+        DeviceBatchingForm, DeviceExecutionInterval, DeviceExecutionIntervalKind,
+        DeviceExecutionPath, DeviceExecutionSpanKind, DeviceNativeOperationId,
+        DeviceNativeWorkAttribution, DeviceSubmissionExecutionSpan, DeviceTimingUnavailableReason,
+    };
+
+    fn attributed_command(command_index: u32) -> DeviceNativeWorkAttribution {
+        DeviceNativeWorkAttribution::new(
+            command_index,
+            None,
+            DeviceCommandPhase::Compute,
+            DeviceNativeOperationId::new("test.compute").unwrap(),
+            DeviceExecutionPath::Eager,
+            DeviceBatchingForm::Scalar,
+            1,
+            1,
+            1,
+            0,
+            None,
+        )
+        .unwrap()
+    }
+
+    fn measured_span(command_index: u32) -> DeviceSubmissionExecutionSpan {
+        DeviceSubmissionExecutionSpan::measured(
+            command_index,
+            command_index + 1,
+            DeviceExecutionSpanKind::EagerCommand,
+            vec![DeviceExecutionInterval::new(
+                DeviceExecutionIntervalKind::Compute,
+                u64::from(command_index) * 10,
+                u64::from(command_index) * 10 + 5,
+            )
+            .unwrap()],
+        )
+        .unwrap()
+    }
+
+    fn unavailable_span(command_index: u32) -> DeviceSubmissionExecutionSpan {
+        DeviceSubmissionExecutionSpan::unavailable(
+            command_index,
+            command_index + 1,
+            DeviceExecutionSpanKind::EagerCommand,
+            DeviceTimingUnavailableReason::BackendMeasurementFailed,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn terminal_timing_accepts_unavailable_hole_between_attributed_commands() {
+        let attribution =
+            DeviceSubmissionAttribution::new(vec![attributed_command(0), attributed_command(2)])
+                .unwrap();
+        let timing = DeviceSubmissionExecutionTiming::from_spans(
+            3,
+            vec![measured_span(0), unavailable_span(1), measured_span(2)],
+        )
+        .unwrap();
+
+        assert!(terminal_timing_matches_submission_attribution(
+            &timing,
+            &attribution
+        ));
+    }
+
+    #[test]
+    fn terminal_timing_rejects_measured_unattributed_work_or_missing_attributed_command() {
+        let attribution =
+            DeviceSubmissionAttribution::new(vec![attributed_command(0), attributed_command(2)])
+                .unwrap();
+        let unattributed = DeviceSubmissionExecutionTiming::from_spans(
+            3,
+            vec![measured_span(0), measured_span(1), measured_span(2)],
+        )
+        .unwrap();
+        let truncated = DeviceSubmissionExecutionTiming::from_spans(
+            2,
+            vec![measured_span(0), unavailable_span(1)],
+        )
+        .unwrap();
+
+        assert!(!terminal_timing_matches_submission_attribution(
+            &unattributed,
+            &attribution
+        ));
+        assert!(!terminal_timing_matches_submission_attribution(
+            &truncated,
+            &attribution
+        ));
+    }
+
+    #[test]
+    fn terminal_timing_rejects_reusable_span_covering_unattributed_command() {
+        let attribution = DeviceSubmissionAttribution::new(vec![attributed_command(0)]).unwrap();
+        let timing = DeviceSubmissionExecutionTiming::from_spans(
+            2,
+            vec![DeviceSubmissionExecutionSpan::measured(
+                0,
+                2,
+                DeviceExecutionSpanKind::ReusableExecutable,
+                vec![
+                    DeviceExecutionInterval::new(DeviceExecutionIntervalKind::Compute, 0, 5)
+                        .unwrap(),
+                ],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+
+        assert!(!terminal_timing_matches_submission_attribution(
+            &timing,
+            &attribution
+        ));
     }
 }
 

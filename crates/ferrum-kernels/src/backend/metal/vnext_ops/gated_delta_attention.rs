@@ -74,6 +74,7 @@ const DELTA_STATE_ELEMENT_TYPE: ElementType = ElementType::F32;
 const VALUE_TILE: u64 = 16;
 const SIMD_DELTA_WIDTH: u64 = 32;
 const SIMD_DELTA_ROWS_PER_GROUP: u64 = 4;
+const SIMD_DELTA_THREADS: u64 = SIMD_DELTA_WIDTH * SIMD_DELTA_ROWS_PER_GROUP;
 const SIMD_DELTA_MAX_KEY_DIM: u32 = 128;
 const GATED_DELTA_CHUNK_SIZE: u32 = 64;
 const GATED_DELTA_CHUNK_KEY_DIM_LIMIT: u64 = 128;
@@ -82,17 +83,30 @@ const GATED_DELTA_CHUNK_INITIAL_CROSSOVER_TOKENS: u64 = 64;
 #[derive(Debug, Clone, Copy)]
 struct MetalGatedDeltaExecutionCostModel {
     chunked_scan_crossover_tokens: u64,
+    simd_delta_thread_execution_width: u64,
+    simd_delta_max_threads_per_threadgroup: u64,
 }
 
 impl MetalGatedDeltaExecutionCostModel {
-    const fn initial_c64() -> Self {
+    const fn initial_c64(
+        simd_delta_thread_execution_width: u64,
+        simd_delta_max_threads_per_threadgroup: u64,
+    ) -> Self {
         Self {
             chunked_scan_crossover_tokens: GATED_DELTA_CHUNK_INITIAL_CROSSOVER_TOKENS,
+            simd_delta_thread_execution_width,
+            simd_delta_max_threads_per_threadgroup,
         }
     }
 
-    const fn preference(self, tokens: u64) -> GatedDeltaExecutionPreference {
-        if tokens >= self.chunked_scan_crossover_tokens {
+    fn preference(self, shape: AttentionShape, tokens: u64) -> GatedDeltaExecutionPreference {
+        if supports_simd_recurrent_shape(
+            shape.key_dim,
+            self.simd_delta_thread_execution_width,
+            self.simd_delta_max_threads_per_threadgroup,
+        ) {
+            GatedDeltaExecutionPreference::RecurrentScan
+        } else if tokens >= self.chunked_scan_crossover_tokens {
             GatedDeltaExecutionPreference::ChunkedScan
         } else {
             GatedDeltaExecutionPreference::RecurrentScan
@@ -279,7 +293,14 @@ impl MetalGatedDeltaRecurrentAttentionProvider {
         let execution_capabilities =
             GatedDeltaExecutionCapabilities::with_chunked_scan(GATED_DELTA_CHUNK_SIZE)
                 .map_err(super::contract_error)?;
-        let execution_cost_model = MetalGatedDeltaExecutionCostModel::initial_c64();
+        let execution_cost_model = MetalGatedDeltaExecutionCostModel::initial_c64(
+            attention.simd_delta.thread_execution_width(),
+            attention
+                .simd_delta
+                .max_total_threads_per_threadgroup()
+                .try_into()
+                .unwrap_or(0),
+        );
         let descriptor = provider_descriptor(
             runtime,
             &contract,
@@ -436,7 +457,7 @@ fn reusable_attention_topology(
             GatedDeltaExecutionCapabilities::recurrent_only()
         };
         let execution_form = participant_capabilities
-            .select(tokens, execution_cost_model.preference(tokens))
+            .select(tokens, execution_cost_model.preference(shape, tokens))
             .map_err(|error| error.to_string())?;
         if matches!(execution_form, GatedDeltaExecutionForm::ChunkedScan(_)) {
             shape.validate_chunked_launch_extents(tokens)?;
@@ -966,7 +987,7 @@ fn encode_attention(
             GatedDeltaExecutionCapabilities::recurrent_only()
         };
         let execution_form = participant_capabilities
-            .select(tokens, execution_cost_model.preference(tokens))
+            .select(tokens, execution_cost_model.preference(shape, tokens))
             .map_err(|error| error.to_string())?;
         if matches!(execution_form, GatedDeltaExecutionForm::ChunkedScan(_)) {
             shape.validate_chunked_launch_extents(tokens)?;
@@ -1190,14 +1211,14 @@ fn encode_attention(
             .fold(6_u64 + shared_projection_dispatches, |total, launch| {
                 total
                     .saturating_add(3)
-                    .saturating_add(delta_dispatch_count(launch.execution_form))
+                    .saturating_add(delta_dispatch_count(launch.execution_form, &launch.params))
             })
     } else {
         launches.iter().fold(0_u64, |total, launch| {
             total
                 .saturating_add(9)
                 .saturating_add(launch.input_projections.len() as u64)
-                .saturating_add(delta_dispatch_count(launch.execution_form))
+                .saturating_add(delta_dispatch_count(launch.execution_form, &launch.params))
         })
     };
     let chunked_count = launches
@@ -1266,9 +1287,10 @@ fn encode_attention(
     .map_err(|error| error.to_string())
 }
 
-const fn delta_dispatch_count(form: GatedDeltaExecutionForm) -> u64 {
+const fn delta_dispatch_count(form: GatedDeltaExecutionForm, params: &GatedDeltaParams) -> u64 {
     match form {
         GatedDeltaExecutionForm::RecurrentScan => 1,
+        GatedDeltaExecutionForm::ChunkedScan(_) if uses_chunk_k_gram_k128(params) => 6,
         GatedDeltaExecutionForm::ChunkedScan(_) => 5,
     }
 }
@@ -1687,6 +1709,11 @@ fn dispatch_recurrent_delta(
     let use_simd_delta = supports_simd_delta(
         &launch.params,
         pipelines.simd_delta.thread_execution_width(),
+        pipelines
+            .simd_delta
+            .max_total_threads_per_threadgroup()
+            .try_into()
+            .unwrap_or(0),
     );
     encoder.set_compute_pipeline_state(if use_simd_delta {
         &pipelines.simd_delta
@@ -1715,7 +1742,7 @@ fn dispatch_recurrent_delta(
                 u64::from(launch.params.value_heads),
                 1,
             ),
-            MTLSize::new(SIMD_DELTA_WIDTH * SIMD_DELTA_ROWS_PER_GROUP, 1, 1),
+            MTLSize::new(SIMD_DELTA_THREADS, 1, 1),
         );
     } else {
         encoder.dispatch_thread_groups(
@@ -1729,11 +1756,28 @@ fn dispatch_recurrent_delta(
     }
 }
 
-fn supports_simd_delta(params: &GatedDeltaParams, thread_execution_width: u64) -> bool {
+fn supports_simd_delta(
+    params: &GatedDeltaParams,
+    thread_execution_width: u64,
+    max_threads_per_threadgroup: u64,
+) -> bool {
+    supports_simd_recurrent_shape(
+        u64::from(params.key_dim),
+        thread_execution_width,
+        max_threads_per_threadgroup,
+    )
+}
+
+fn supports_simd_recurrent_shape(
+    key_dim: u64,
+    thread_execution_width: u64,
+    max_threads_per_threadgroup: u64,
+) -> bool {
     thread_execution_width == SIMD_DELTA_WIDTH
-        && params.key_dim > 0
-        && params.key_dim <= SIMD_DELTA_MAX_KEY_DIM
-        && u64::from(params.key_dim).is_multiple_of(SIMD_DELTA_WIDTH)
+        && max_threads_per_threadgroup >= SIMD_DELTA_THREADS
+        && key_dim > 0
+        && key_dim <= u64::from(SIMD_DELTA_MAX_KEY_DIM)
+        && key_dim.is_multiple_of(SIMD_DELTA_WIDTH)
 }
 
 fn dispatch_chunked_delta_c64(

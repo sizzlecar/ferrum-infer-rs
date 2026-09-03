@@ -75,7 +75,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
 ```
 
-A working request returns HTTP 200 with a non-empty assistant response.
+A working request returns HTTP 200 with a non-empty assistant response. Ferrum
+uses the model's context limit unless `--max-model-len` is set explicitly; any
+explicit limit must fit the rendered input plus the requested output budget.
 
 The Quick Start uses `--disable-thinking` so the first response is short and
 direct. Omit the flag to preserve the model template's default reasoning
@@ -150,15 +152,15 @@ Prebuilt release tarballs:
 
 ```bash
 # Linux x86_64 CUDA sm89
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-linux-x86_64-cuda-sm89.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
 
 # macOS Apple Silicon Metal
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-macos-aarch64.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-macos-aarch64.tar.gz.sha256
 shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
 tar -xzf ferrum-macos-aarch64.tar.gz
 ./ferrum --version
@@ -168,7 +170,7 @@ Install the Metal build from crates.io:
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.4 --locked --features metal
+cargo install ferrum-cli --version 0.8.5 --locked --features metal
 ```
 
 The official prebuilt CUDA asset targets `sm89`. CUDA installation requires a
