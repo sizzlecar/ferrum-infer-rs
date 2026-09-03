@@ -77,6 +77,46 @@ curl http://localhost:8000/v1/chat/completions \
 
 A working request returns HTTP 200 with a non-empty assistant response.
 
+### OpenCode
+
+OpenCode's built-in system prompt and tool schemas can exceed 7,000 tokens
+before repository context is added. Use a context window larger than 4,096:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ferrum/ferrum",
+  "small_model": "ferrum/ferrum",
+  "provider": {
+    "ferrum": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ferrum",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "ferrum": {
+          "name": "Ferrum Qwen3.5 4B",
+          "limit": {
+            "context": 32768,
+            "output": 4096
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Use this with the `--served-model-name ferrum` command above. Do not add
+`--max-model-len 4096`: Ferrum validates input plus output against that total,
+so OpenCode can exceed it on its first request. On a memory-constrained host,
+add `--max-model-len N` to the server command and set `limit.context` to the
+same `N`. Keep it above the rendered prompt plus the output budget; 8,192
+is the smallest context limit covered by the admission regression for the
+observed 7,470-token prompt plus a 512-token output budget.
+
 The Quick Start uses `--disable-thinking` so the first response is short and
 direct. Omit the flag to preserve the model template's default reasoning
 behavior; an HTTP request can override the server default with
@@ -150,15 +190,15 @@ Prebuilt release tarballs:
 
 ```bash
 # Linux x86_64 CUDA sm89
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-linux-x86_64-cuda-sm89.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
 
 # macOS Apple Silicon Metal
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.4/ferrum-macos-aarch64.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-macos-aarch64.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.5/ferrum-macos-aarch64.tar.gz.sha256
 shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
 tar -xzf ferrum-macos-aarch64.tar.gz
 ./ferrum --version
@@ -168,7 +208,7 @@ Install the Metal build from crates.io:
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.4 --locked --features metal
+cargo install ferrum-cli --version 0.8.5 --locked --features metal
 ```
 
 The official prebuilt CUDA asset targets `sm89`. CUDA installation requires a
