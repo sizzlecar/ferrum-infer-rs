@@ -13,7 +13,7 @@ No unreleased changes.
 
 ### Changed
 - Optimized the vNext Metal causal-attention prefill and gated-delta execution paths used by Qwen3.5 long-context requests.
-- Added an explicit OpenCode setup with a context window large enough for its tool schemas and initial repository prompt.
+- Clarified model-derived context defaults and explicit context-limit behavior for OpenAI-compatible clients.
 
 ### Fixed
 - Fixed Metal device-timing attribution when a submission contains commands without GPU counter samples.

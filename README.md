@@ -75,47 +75,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
 ```
 
-A working request returns HTTP 200 with a non-empty assistant response.
-
-### OpenCode
-
-OpenCode's built-in system prompt and tool schemas can exceed 7,000 tokens
-before repository context is added. Use a context window larger than 4,096:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "ferrum/ferrum",
-  "small_model": "ferrum/ferrum",
-  "provider": {
-    "ferrum": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Ferrum",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "local"
-      },
-      "models": {
-        "ferrum": {
-          "name": "Ferrum Qwen3.5 4B",
-          "limit": {
-            "context": 32768,
-            "output": 4096
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-Use this with the `--served-model-name ferrum` command above. Do not add
-`--max-model-len 4096`: Ferrum validates input plus output against that total,
-so OpenCode can exceed it on its first request. On a memory-constrained host,
-add `--max-model-len N` to the server command and set `limit.context` to the
-same `N`. Keep it above the rendered prompt plus the output budget; 8,192
-is the smallest context limit covered by the admission regression for the
-observed 7,470-token prompt plus a 512-token output budget.
+A working request returns HTTP 200 with a non-empty assistant response. Ferrum
+uses the model's context limit unless `--max-model-len` is set explicitly; any
+explicit limit must fit the rendered input plus the requested output budget.
 
 The Quick Start uses `--disable-thinking` so the first response is short and
 direct. Omit the flag to preserve the model template's default reasoning

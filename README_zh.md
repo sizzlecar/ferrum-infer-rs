@@ -73,46 +73,9 @@ curl http://localhost:8000/v1/chat/completions \
   -d '{"model":"ferrum","messages":[{"role":"user","content":"Reply with a short hello from Ferrum."}],"max_tokens":32}'
 ```
 
-正常时请求会返回 HTTP 200 和非空的 assistant 回答。
-
-### OpenCode
-
-OpenCode 内置的 system prompt 和工具 schema 在加入仓库上下文之前就可能超过 7,000
-tokens，因此上下文窗口不要设为 4,096：
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "ferrum/ferrum",
-  "small_model": "ferrum/ferrum",
-  "provider": {
-    "ferrum": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Ferrum",
-      "options": {
-        "baseURL": "http://127.0.0.1:8000/v1",
-        "apiKey": "local"
-      },
-      "models": {
-        "ferrum": {
-          "name": "Ferrum Qwen3.5 4B",
-          "limit": {
-            "context": 32768,
-            "output": 4096
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-请与上面的 `--served-model-name ferrum` 命令一起使用。不要额外添加
-`--max-model-len 4096`：Ferrum 会用输入加输出校验这个总上限，OpenCode 的第一次
-请求就可能超过它。内存受限时，可在服务命令添加 `--max-model-len N`，并把
-`limit.context` 设为同一个 `N`。该值仍需大于渲染后的 prompt 与输出预算之和；
-针对本次观察到的 7,470-token prompt 加 512-token 输出预算，admission 回归测试
-覆盖的最小上下文上限是 8,192。
+正常时请求会返回 HTTP 200 和非空的 assistant 回答。除非显式设置
+`--max-model-len`，Ferrum 会使用模型自身的上下文上限；显式上限必须容纳渲染后的
+输入与请求的输出预算之和。
 
 快速开始默认使用 `--disable-thinking`，让首次回答简短直接。删除该参数即可恢复模型模板默认的
 推理行为；HTTP 请求也可以通过 `chat_template_kwargs.enable_thinking` 覆盖服务端默认值。
