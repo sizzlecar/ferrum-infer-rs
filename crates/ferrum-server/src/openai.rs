@@ -263,6 +263,9 @@ pub struct ChatMessage {
     /// vLLM-compatible parsed reasoning text. When Ferrum parses
     /// `<think>...</think>`, `content` contains only the final visible
     /// answer and this field contains the reasoning block text.
+    /// Historical input also accepts `reasoning_content`. A string in
+    /// `reasoning` takes precedence, including an empty string; missing or
+    /// null `reasoning` falls back to the alias. Output uses only `reasoning`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 
