@@ -5,9 +5,9 @@
 
 use crate::{
     chat_template::{
-        render_chat_prompt_with_model_template_options,
-        render_chat_prompt_with_tools_and_model_template, ChatTemplateOptions, ModelChatTemplate,
-        ModelReasoningProtocol, ReasoningEffort,
+        render_chat_prompt_with_model_template_options_and_compatibility,
+        render_chat_prompt_with_tools_and_model_template_compatibility, ChatTemplateOptions,
+        ModelChatTemplate, ModelReasoningProtocol, ReasoningEffort,
     },
     model_registry::{LoraAdapterModel, ServedModelKind, ServedModelRegistry},
     openai::*,
@@ -254,6 +254,13 @@ impl AxumServer {
         self
     }
 
+    /// Control the compatibility retry for model templates that reject
+    /// non-leading system messages. It is enabled by default.
+    pub fn with_interleaved_system_coalescing(mut self, enabled: bool) -> Self {
+        self.state = self.state.with_interleaved_system_coalescing(enabled);
+        self
+    }
+
     /// Install the public OpenAI model namespace used for request routing and
     /// `/v1/models`. The registry keeps public aliases separate from the
     /// engine's internal model id.
@@ -359,6 +366,7 @@ pub struct AppState {
     pub auto_config: Option<ResolvedFerrumConfig>,
     pub prompt_template: Option<Arc<ModelChatTemplate>>,
     pub default_enable_thinking: Option<bool>,
+    interleaved_system_coalescing: Option<bool>,
     pub served_model_registry: Arc<ServedModelRegistry>,
     pub request_dump_dir: Option<Arc<PathBuf>>,
     pub profile_jsonl: Option<Arc<PathBuf>>,
@@ -422,6 +430,11 @@ impl AppState {
 
     pub fn with_default_enable_thinking(mut self, enable_thinking: Option<bool>) -> Self {
         self.default_enable_thinking = enable_thinking;
+        self
+    }
+
+    pub fn with_interleaved_system_coalescing(mut self, enabled: bool) -> Self {
+        self.interleaved_system_coalescing = Some(enabled);
         self
     }
 
@@ -1176,6 +1189,15 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
 ) -> std::result::Result<Response, ServerError> {
+    chat_completions_handler_with_phases(State(state), headers, request, None).await
+}
+
+async fn chat_completions_handler_with_phases(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: std::result::Result<Json<ChatCompletionsRequest>, JsonRejection>,
+    mut message_phases: Option<Vec<Option<AssistantMessagePhase>>>,
+) -> std::result::Result<Response, ServerError> {
     let Json(mut request) = request.map_err(|error| {
         ServerError::invalid_request(
             format!(
@@ -1187,10 +1209,30 @@ async fn chat_completions_handler(
     })?;
     let benchmark_correlation = benchmark_request_correlation(&headers)?;
     let cache_policy = CachePolicy::current();
+    if message_phases
+        .as_ref()
+        .is_some_and(|phases| phases.len() != request.messages.len())
+    {
+        return Err(ServerError::InternalError(
+            "Responses message phase metadata did not match input history".to_string(),
+        ));
+    }
     let session_context =
         state
             .cache
             .prepare_session_request(&mut request, &headers, &cache_policy);
+    if let Some(phases) = &mut message_phases {
+        let prepended = request
+            .messages
+            .len()
+            .checked_sub(phases.len())
+            .ok_or_else(|| {
+                ServerError::InternalError(
+                    "session preparation shortened Responses input history".to_string(),
+                )
+            })?;
+        phases.splice(0..0, std::iter::repeat(None).take(prepended));
+    }
 
     let span = span!(Level::INFO, "chat_completions", model = %request.model);
     let _enter = span.enter();
@@ -1216,6 +1258,8 @@ async fn chat_completions_handler(
         &engine_model_id.0,
         state.prompt_template.as_deref(),
         state.default_enable_thinking,
+        state.interleaved_system_coalescing.unwrap_or(true),
+        message_phases.as_deref(),
     )
     .map_err(server_error_from_ferrum_error)?;
     apply_served_model_resolution(&mut inference_request, engine_model_id, lora_adapter);
@@ -3312,6 +3356,8 @@ fn convert_chat_request_with_template_model(
         template_model_id,
         model_template,
         None,
+        true,
+        None,
     )
 }
 
@@ -3320,6 +3366,8 @@ fn convert_chat_request_with_template_model_and_default(
     template_model_id: &str,
     model_template: Option<&ModelChatTemplate>,
     default_enable_thinking: Option<bool>,
+    interleaved_system_coalescing: bool,
+    message_phases: Option<&[Option<AssistantMessagePhase>]>,
 ) -> ferrum_types::Result<InferenceRequest> {
     let no_tools: &[ChatTool] = &[];
     let tools = if tool_choice_none_hides_tools(request.tool_choice.as_ref(), model_template) {
@@ -3362,20 +3410,23 @@ fn convert_chat_request_with_template_model_and_default(
     });
     let reasoning_enabled = model_template
         .is_some_and(|template| template.reasoning_enabled(chat_template_options.enable_thinking));
-    let render_messages = render_messages_with_response_format_instruction(
+    let (render_messages, render_message_phases) = render_messages_with_response_format_instruction(
         request,
         output_contract,
         reasoning_enabled,
+        message_phases,
     );
     let prompt = if tools.is_empty() && functions.is_empty() {
-        render_chat_prompt_with_model_template_options(
+        render_chat_prompt_with_model_template_options_and_compatibility(
             &render_messages,
             template_model_id,
             model_template,
             &chat_template_options,
+            interleaved_system_coalescing,
+            Some(&render_message_phases),
         )?
     } else {
-        render_chat_prompt_with_tools_and_model_template(
+        render_chat_prompt_with_tools_and_model_template_compatibility(
             &render_messages,
             template_model_id,
             model_template,
@@ -3384,6 +3435,8 @@ fn convert_chat_request_with_template_model_and_default(
             effective_tool_choice,
             functions,
             request.function_call.as_ref(),
+            interleaved_system_coalescing,
+            Some(&render_message_phases),
         )?
     };
     let tool_call_protocol = model_template
@@ -3574,11 +3627,16 @@ fn render_messages_with_response_format_instruction(
     request: &ChatCompletionsRequest,
     output_contract: EffectiveChatOutputContract,
     reasoning_enabled: bool,
-) -> Vec<ChatMessage> {
+    message_phases: Option<&[Option<AssistantMessagePhase>]>,
+) -> (Vec<ChatMessage>, Vec<Option<AssistantMessagePhase>>) {
+    let mut phases = message_phases
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| vec![None; request.messages.len()]);
+    debug_assert_eq!(phases.len(), request.messages.len());
     let Some(instruction) =
         response_format_prompt_instruction(request, output_contract, reasoning_enabled)
     else {
-        return request.messages.clone();
+        return (request.messages.clone(), phases);
     };
     let mut messages = request.messages.clone();
     let leading_systems = messages
@@ -3593,6 +3651,7 @@ fn render_messages_with_response_format_instruction(
             .map(|message| message.content)
             .filter(|content| !content.is_empty()),
     );
+    phases.drain(..leading_systems);
     messages.insert(
         0,
         ChatMessage {
@@ -3605,7 +3664,8 @@ fn render_messages_with_response_format_instruction(
             function_call: None,
         },
     );
-    messages
+    phases.insert(0, None);
+    (messages, phases)
 }
 
 fn response_format_prompt_instruction(
@@ -6479,6 +6539,15 @@ mod tests {
         })
     }
 
+    fn weather_tool_api_response_with_commentary() -> ferrum_types::ApiResponse {
+        let mut response = weather_tool_api_response();
+        let ferrum_types::ApiResponse::Chat(chat) = &mut response else {
+            unreachable!("weather response is chat")
+        };
+        chat.message.content = "I will check.".to_string();
+        response
+    }
+
     fn namespaced_tool_api_response() -> ferrum_types::ApiResponse {
         ferrum_types::ApiResponse::Chat(ferrum_types::ApiChatResponse {
             message: ferrum_types::ApiChatMessage {
@@ -6985,6 +7054,7 @@ mod tests {
         assert_eq!(body["status"], "completed");
         assert_eq!(body["store"], false);
         assert_eq!(body["output"][0]["type"], "message");
+        assert_eq!(body["output"][0]["phase"], "final_answer");
         assert_eq!(body["output"][0]["content"][0]["text"], "hello from ferrum");
         assert_eq!(body["usage"]["input_tokens"], 7);
         assert_eq!(body["usage"]["output_tokens"], 2);
@@ -7034,6 +7104,29 @@ mod tests {
             "missing second delta: {body}"
         );
         assert!(body.contains("\"input_tokens\":5"), "missing usage: {body}");
+        let events = responses_sse_json_events(&body);
+        let message_added = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.added" && event["item"]["type"] == "message"
+            })
+            .expect("message item added");
+        assert!(
+            message_added["item"].get("phase").is_none(),
+            "stream must not guess phase before later tool calls are known: {body}"
+        );
+        let message_done = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done" && event["item"]["type"] == "message"
+            })
+            .expect("message item done");
+        assert_eq!(message_done["item"]["phase"], "final_answer");
+        let terminal = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("completed response");
+        assert_eq!(terminal["response"]["output"][0]["phase"], "final_answer");
         let completed = body
             .find("event: response.completed")
             .expect("completed event");
@@ -7095,6 +7188,65 @@ mod tests {
             second_body["output"][0]["content"][0]["text"],
             "weather received"
         );
+    }
+
+    #[tokio::test]
+    async fn responses_route_marks_text_before_calls_as_commentary() {
+        let request = || {
+            json!({
+                "model": "stub-model",
+                "input": "Use the weather tool",
+                "stream": false,
+                "tools": [{
+                    "type": "function",
+                    "name": "weather",
+                    "parameters": {"type": "object"}
+                }]
+            })
+        };
+        let sync = post_json(
+            router_with_stub_api_response("", weather_tool_api_response_with_commentary()),
+            "/v1/responses",
+            request(),
+        )
+        .await;
+        assert_eq!(sync.status(), AxumStatusCode::OK);
+        let sync = response_json(sync).await;
+        assert_eq!(sync["output"][0]["type"], "message");
+        assert_eq!(sync["output"][0]["phase"], "commentary");
+        assert_eq!(sync["output"][1]["type"], "function_call");
+
+        let mut stream_request = request();
+        stream_request["stream"] = json!(true);
+        let stream = post_json(
+            router_with_stub_api_response("", weather_tool_api_response_with_commentary()),
+            "/v1/responses",
+            stream_request,
+        )
+        .await;
+        assert_eq!(stream.status(), AxumStatusCode::OK);
+        let body = response_text(stream).await;
+        let events = responses_sse_json_events(&body);
+        let message_added = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.added" && event["item"]["type"] == "message"
+            })
+            .expect("message item added");
+        assert!(message_added["item"].get("phase").is_none());
+        let message_done = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done" && event["item"]["type"] == "message"
+            })
+            .expect("message item done");
+        assert_eq!(message_done["item"]["phase"], "commentary");
+        let terminal = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("completed response");
+        assert_eq!(terminal["response"]["output"][0]["phase"], "commentary");
+        assert_eq!(terminal["response"]["output"][1]["type"], "function_call");
     }
 
     #[tokio::test]
@@ -7167,6 +7319,150 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), AxumStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn responses_route_adapts_interleaved_system_for_strict_template() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}{% endfor %}{% if messages|length != 2 %}{{ raise_exception('expected two messages') }}{% endif %}{% if messages[0].role != 'system' %}{{ raise_exception('system must be first') }}{% endif %}{% if messages[0].content != 'Initial instructions\\n\\nDeferred tool instructions' %}{{ raise_exception('system instructions were not preserved') }}{% endif %}[{{ messages[0].role }}]{{ messages[0].content }}[{{ messages[1].role }}]{{ messages[1].content }}",
+            "strict-leading-system-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template("ok", template),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": [
+                    {"role": "system", "content": "Initial instructions"},
+                    {"role": "user", "content": "Use the available tool"},
+                    {"role": "developer", "content": "Deferred tool instructions"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn responses_route_keeps_phase_aligned_through_system_injection() {
+        let template = ModelChatTemplate::new(
+            "{% if messages|length != 3 %}{{ raise_exception('expected three messages') }}{% endif %}{% if messages[0].role != 'system' %}{{ raise_exception('system must be first') }}{% endif %}{% if messages[1].role != 'assistant' or messages[1].phase != 'commentary' %}{{ raise_exception('assistant phase was not preserved') }}{% endif %}{% if messages[2].role != 'user' or messages[2].phase is defined %}{{ raise_exception('phase metadata shifted') }}{% endif %}[assistant]",
+            "phase-alignment-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template(r#"{"ok":true}"#, template),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "instructions": "Top-level instructions",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": "I will inspect."
+                    },
+                    {"type": "message", "role": "user", "content": "Continue"}
+                ],
+                "text": {"format": {"type": "json_object"}}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn responses_route_can_disable_interleaved_system_coalescing() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+            "strict-leading-system-template",
+        );
+        let router = AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(StubLlm::new("ok")))
+                .with_prompt_template(Some(template))
+                .with_interleaved_system_coalescing(false),
+        )
+        .build_router();
+        let response = post_json(
+            router,
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": [
+                    {"role": "system", "content": "Initial instructions"},
+                    {"role": "user", "content": "Use the available tool"},
+                    {"role": "developer", "content": "Deferred tool instructions"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(response).await;
+        assert!(
+            body.to_string()
+                .contains("System message must be at the beginning."),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_route_applies_and_can_disable_interleaved_system_coalescing() {
+        let template = || {
+            ModelChatTemplate::new(
+                "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+                "strict-leading-system-template",
+            )
+        };
+        let request = || {
+            json!({
+                "model": "stub-model",
+                "messages": [
+                    {"role": "system", "content": "Initial instructions"},
+                    {"role": "user", "content": "Use the available tool"},
+                    {"role": "system", "content": "Deferred tool instructions"}
+                ]
+            })
+        };
+
+        let enabled = post_json(
+            router_with_stub_and_template("ok", template()),
+            "/v1/chat/completions",
+            request(),
+        )
+        .await;
+        assert_eq!(enabled.status(), AxumStatusCode::OK);
+
+        let consecutive = post_json(
+            router_with_stub_and_template("ok", template()),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [
+                    {"role": "system", "content": "Initial instructions"},
+                    {"role": "system", "content": "Deferred tool instructions"},
+                    {"role": "user", "content": "Use the available tool"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(consecutive.status(), AxumStatusCode::OK);
+
+        let disabled_router = AxumServer::from_state(
+            AppState::default()
+                .with_llm(Arc::new(StubLlm::new("ok")))
+                .with_prompt_template(Some(template()))
+                .with_interleaved_system_coalescing(false),
+        )
+        .build_router();
+        let disabled = post_json(disabled_router, "/v1/chat/completions", request()).await;
+        assert_eq!(disabled.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        let body = response_json(disabled).await;
+        assert!(
+            body.to_string()
+                .contains("System message must be at the beginning."),
+            "{body}"
+        );
     }
 
     #[tokio::test]

@@ -61,6 +61,15 @@ support matrix and are hidden from the default CLI help.
 | legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape, including non-streaming responses and streaming deltas when engine output emits matching function-call JSON. |
 | specific legacy `function_call` | Supported | Named function-call selectors validate against declared legacy functions and constrain generated function-call JSON parsing to the selected function. Undeclared function names return HTTP 400 with `param=function_call`. |
 
+Both Chat Completions and Responses first render system and developer messages
+in their original positions. If a model-owned template explicitly rejects a
+non-leading system message, the server retries with system text coalesced in
+wire order into one leading message. This compatibility retry is enabled by
+default. Operators can disable it with
+`ferrum serve --disable-interleaved-system-coalescing` or set
+`server.interleaved_system_coalescing = false` in `ferrum.toml`; Ferrum then
+returns the model-owned template's original error.
+
 ## Stateless Responses API
 
 `POST /v1/responses` reuses the same model, tokenizer, sampling, structured-output,
@@ -68,6 +77,13 @@ and function-call path as Chat Completions. Input may be a string or an ordered
 array containing `message`, readable `reasoning`, `function_call`, and
 `function_call_output` items. The caller owns the loop and resends the complete
 ordered history on each turn; Ferrum correlates tool results by `call_id`.
+
+Assistant message `phase` values (`commentary` and `final_answer`) are validated,
+preserved in caller-owned history, and exposed to model chat templates. Generated
+text before a function call is labelled `commentary`; terminal text is labelled
+`final_answer`. A streaming `response.output_item.added` omits this optional
+field until later tool calls are known, while `response.output_item.done` and the
+terminal response contain the resolved phase.
 
 The endpoint accepts `instructions`, `max_output_tokens`, `temperature`, `top_p`,
 `stream`, function and namespace `tools`, `tool_choice`, `parallel_tool_calls`, supported

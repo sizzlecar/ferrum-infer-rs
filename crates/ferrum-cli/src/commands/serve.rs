@@ -309,7 +309,65 @@ pub struct ServeCommand {
     pub lora_model_id_template: String,
 }
 
+/// Product CLI wrapper for serve-only compatibility controls. Keeping these
+/// options outside [`ServeCommand`] avoids breaking existing library callers
+/// that construct that public command with a struct literal.
+#[derive(Args)]
+pub struct ServeCliCommand {
+    #[command(flatten)]
+    command: ServeCommand,
+
+    /// Enable the compatibility retry that coalesces non-leading system
+    /// messages when a model-owned chat template rejects their original order.
+    #[arg(long, conflicts_with = "disable_interleaved_system_coalescing")]
+    enable_interleaved_system_coalescing: bool,
+
+    /// Disable the compatibility retry for non-leading system messages and
+    /// return the model-owned template's original rendering error instead.
+    #[arg(long, conflicts_with = "enable_interleaved_system_coalescing")]
+    disable_interleaved_system_coalescing: bool,
+}
+
+fn resolve_interleaved_system_coalescing(
+    enable: bool,
+    disable: bool,
+    configured_default: bool,
+) -> bool {
+    if enable {
+        true
+    } else if disable {
+        false
+    } else {
+        configured_default
+    }
+}
+
 pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
+    execute_with_compatibility(cmd, config, false, false, true).await
+}
+
+pub async fn execute_cli(
+    cmd: ServeCliCommand,
+    config: CliConfig,
+    configured_interleaved_system_coalescing: bool,
+) -> Result<()> {
+    execute_with_compatibility(
+        cmd.command,
+        config,
+        cmd.enable_interleaved_system_coalescing,
+        cmd.disable_interleaved_system_coalescing,
+        configured_interleaved_system_coalescing,
+    )
+    .await
+}
+
+async fn execute_with_compatibility(
+    cmd: ServeCommand,
+    config: CliConfig,
+    enable_interleaved_system_coalescing: bool,
+    disable_interleaved_system_coalescing: bool,
+    configured_interleaved_system_coalescing: bool,
+) -> Result<()> {
     let ServeCommand {
         model,
         model_option,
@@ -384,6 +442,11 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
     } else {
         None
     };
+    let interleaved_system_coalescing = resolve_interleaved_system_coalescing(
+        enable_interleaved_system_coalescing,
+        disable_interleaved_system_coalescing,
+        configured_interleaved_system_coalescing,
+    );
 
     // Reject malformed adapter specs before selecting a device or resolving,
     // downloading, and preparing the base model.
@@ -1069,7 +1132,8 @@ pub async fn execute(cmd: ServeCommand, config: CliConfig) -> Result<()> {
         }
     }
     .with_auto_config(startup_auto_config)
-    .with_default_enable_thinking(default_enable_thinking);
+    .with_default_enable_thinking(default_enable_thinking)
+    .with_interleaved_system_coalescing(interleaved_system_coalescing);
     let model_loaded_sample = product_memory_enabled
         .then(|| memory_sampler.sample())
         .flatten();
@@ -2309,6 +2373,50 @@ mod tests {
             parsed.serve.vnext_diagnostic_fault,
             Some(crate::commands::VNextDiagnosticFaultArg::PrefillResourceAfterSubmitOnce)
         );
+    }
+
+    #[test]
+    fn serve_parses_interleaved_system_coalescing_switches() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            serve: ServeCliCommand,
+        }
+
+        let default = TestCli::parse_from(["ferrum", "--model", "qwen3.5"]);
+        assert!(!default.serve.enable_interleaved_system_coalescing);
+        assert!(!default.serve.disable_interleaved_system_coalescing);
+        assert!(resolve_interleaved_system_coalescing(false, false, true));
+        assert!(!resolve_interleaved_system_coalescing(false, false, false));
+
+        let disabled = TestCli::parse_from([
+            "ferrum",
+            "--model",
+            "qwen3.5",
+            "--disable-interleaved-system-coalescing",
+        ]);
+        assert!(disabled.serve.disable_interleaved_system_coalescing);
+        assert!(!resolve_interleaved_system_coalescing(false, true, true));
+
+        let enabled = TestCli::parse_from([
+            "ferrum",
+            "--model",
+            "qwen3.5",
+            "--enable-interleaved-system-coalescing",
+        ]);
+        assert!(enabled.serve.enable_interleaved_system_coalescing);
+        assert!(resolve_interleaved_system_coalescing(true, false, false));
+
+        let conflict = TestCli::try_parse_from([
+            "ferrum",
+            "--model",
+            "qwen3.5",
+            "--enable-interleaved-system-coalescing",
+            "--disable-interleaved-system-coalescing",
+        ]);
+        assert!(conflict.is_err());
     }
 
     #[test]

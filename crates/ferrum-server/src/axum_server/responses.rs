@@ -1,6 +1,7 @@
-use super::{chat_completions_handler, json_rejection_detail, AppState, ServerError};
+use super::{json_rejection_detail, AppState, ServerError};
 use crate::openai::{
-    ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage, ChatToolCall, Usage,
+    AssistantMessagePhase, ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage,
+    ChatToolCall, Usage,
 };
 use axum::{
     body::to_bytes,
@@ -26,7 +27,7 @@ use request::ResponsesRequest;
 use stream::adapt_chat_stream;
 
 #[cfg(test)]
-use request::parse_input;
+use request::{parse_input, parse_input_phases};
 #[cfg(test)]
 use stream::SseDecoder;
 #[cfg(test)]
@@ -36,6 +37,7 @@ const MAX_SYNC_ADAPTER_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 struct ConvertedRequest {
     chat: ChatCompletionsRequest,
+    message_phases: Vec<Option<AssistantMessagePhase>>,
     response: ResponseContext,
     stream: bool,
 }
@@ -117,8 +119,13 @@ pub(super) async fn responses_handler(
         )
     })?;
     let converted = request.convert()?;
-    let chat_response =
-        chat_completions_handler(State(state), headers, Ok(Json(converted.chat))).await?;
+    let chat_response = super::chat_completions_handler_with_phases(
+        State(state),
+        headers,
+        Ok(Json(converted.chat)),
+        Some(converted.message_phases),
+    )
+    .await?;
     if converted.stream {
         Ok(adapt_chat_stream(chat_response, converted.response))
     } else {
@@ -246,6 +253,11 @@ fn response_output_from_message(
         .map(Vec::len)
         .unwrap_or_default()
         + usize::from(message.function_call.is_some());
+    let message_phase = if call_count > 0 {
+        AssistantMessagePhase::Commentary
+    } else {
+        AssistantMessagePhase::FinalAnswer
+    };
     if !parallel_tool_calls && call_count > 1 {
         return Err(ServerError::InternalError(
             "model emitted multiple function calls while parallel_tool_calls=false".to_string(),
@@ -269,6 +281,7 @@ fn response_output_from_message(
             format!("msg_{}", Uuid::new_v4().simple()),
             message.content,
             "completed",
+            message_phase,
         ));
     }
     for call in message.tool_calls.unwrap_or_default() {
@@ -309,12 +322,18 @@ fn reasoning_output_item(
     Value::Object(item)
 }
 
-fn message_output_item(id: String, text: String, status: &str) -> Value {
+fn message_output_item(
+    id: String,
+    text: String,
+    status: &str,
+    phase: AssistantMessagePhase,
+) -> Value {
     json!({
         "id": id,
         "type": "message",
         "status": status,
         "role": "assistant",
+        "phase": phase,
         "content": [{
             "type": "output_text",
             "text": text,
@@ -551,6 +570,150 @@ mod tests {
     }
 
     #[test]
+    fn responses_input_preserves_assistant_phase_and_rejects_invalid_uses() {
+        let input = json!([{
+            "type": "message",
+            "role": "assistant",
+            "content": "Working on it.",
+            "phase": "commentary"
+        }]);
+        let messages = parse_input(&input).expect("assistant phase message");
+        let phases = parse_input_phases(&input).expect("assistant phase metadata");
+        assert_eq!(messages[0].content, "Working on it.");
+        assert_eq!(phases[0], Some(AssistantMessagePhase::Commentary));
+
+        for input in [
+            json!([{
+                "type": "message",
+                "role": "assistant",
+                "content": "Done",
+                "phase": "draft"
+            }]),
+            json!([{
+                "type": "message",
+                "role": "user",
+                "content": "Hello",
+                "phase": "commentary"
+            }]),
+        ] {
+            let error = parse_input(&input).expect_err("invalid phase");
+            match error {
+                ServerError::InvalidRequest { param, .. } => {
+                    assert_eq!(param.as_deref(), Some("input[0].phase"));
+                }
+                other => panic!("expected invalid phase, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn responses_input_preserves_noncanonical_assistant_item_order() {
+        let message_then_reasoning = parse_input(&json!([
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "First text",
+                "phase": "commentary"
+            },
+            {
+                "type": "reasoning",
+                "content": [{"type": "reasoning_text", "text": "Later reasoning"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "inspect",
+                "arguments": "{}"
+            }
+        ]))
+        .expect("message then reasoning");
+        assert_eq!(message_then_reasoning.len(), 2);
+        assert_eq!(message_then_reasoning[0].content, "First text");
+        assert_eq!(message_then_reasoning[0].reasoning, None);
+        assert!(message_then_reasoning[0].tool_calls.is_none());
+        assert_eq!(
+            message_then_reasoning[1].reasoning.as_deref(),
+            Some("Later reasoning")
+        );
+        assert_eq!(
+            message_then_reasoning[1].tool_calls.as_ref().unwrap()[0].id,
+            "call_1"
+        );
+
+        let call_then_reasoning = parse_input(&json!([
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "inspect",
+                "arguments": "{}"
+            },
+            {
+                "type": "reasoning",
+                "content": [{"type": "reasoning_text", "text": "Between calls"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_2",
+                "name": "inspect",
+                "arguments": "{}"
+            }
+        ]))
+        .expect("call then reasoning");
+        assert_eq!(call_then_reasoning.len(), 2);
+        assert_eq!(
+            call_then_reasoning[0].tool_calls.as_ref().unwrap()[0].id,
+            "call_1"
+        );
+        assert_eq!(call_then_reasoning[0].reasoning, None);
+        assert_eq!(
+            call_then_reasoning[1].reasoning.as_deref(),
+            Some("Between calls")
+        );
+        assert_eq!(
+            call_then_reasoning[1].tool_calls.as_ref().unwrap()[0].id,
+            "call_2"
+        );
+    }
+
+    #[test]
+    fn responses_input_does_not_append_calls_to_a_final_answer() {
+        let messages = parse_input(&json!([
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "Done",
+                "phase": "final_answer"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "inspect",
+                "arguments": "{}"
+            }
+        ]))
+        .expect("final answer then call");
+        assert_eq!(messages.len(), 2);
+        let phases = parse_input_phases(&json!([
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "Done",
+                "phase": "final_answer"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "inspect",
+                "arguments": "{}"
+            }
+        ]))
+        .expect("final answer phase metadata");
+        assert_eq!(phases[0], Some(AssistantMessagePhase::FinalAnswer));
+        assert!(messages[0].tool_calls.is_none());
+        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].id, "call_1");
+    }
+
+    #[test]
     fn responses_request_accepts_captured_codex_http_tool_round_trip() {
         let request: ResponsesRequest = serde_json::from_value(json!({
             "model": "local-model",
@@ -630,6 +793,10 @@ mod tests {
         assert_eq!(assistant.role, MessageRole::Assistant);
         assert_eq!(assistant.content, "I will inspect.");
         assert_eq!(assistant.reasoning.as_deref(), Some("raw reasoning"));
+        assert_eq!(
+            converted.message_phases[2],
+            Some(AssistantMessagePhase::Commentary)
+        );
         assert_eq!(assistant.tool_calls.as_ref().unwrap()[0].id, "call_1");
         assert_eq!(converted.chat.messages[3].role, MessageRole::Tool);
         assert_eq!(

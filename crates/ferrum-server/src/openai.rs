@@ -376,6 +376,15 @@ pub enum MessageRole {
     Tool,
 }
 
+/// Whether an assistant message is intermediate commentary or the terminal
+/// answer for a Responses API turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AssistantMessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
 /// Chat completions response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatCompletionsResponse {

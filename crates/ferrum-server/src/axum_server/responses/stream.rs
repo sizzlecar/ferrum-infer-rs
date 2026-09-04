@@ -2,6 +2,7 @@ use super::{
     function_call_arguments_done, function_call_item, message_output_item, reasoning_output_item,
     ResponseContext,
 };
+use crate::openai::AssistantMessagePhase;
 use crate::openai::{ChatCompletionsResponse, Usage};
 use axum::response::{sse::Event, IntoResponse, Response, Sse};
 use futures::StreamExt;
@@ -378,8 +379,17 @@ impl ResponsesStreamState {
             } else {
                 "completed"
             };
-            let item =
-                message_output_item(self.text_item_id.clone(), self.text.clone(), text_status);
+            let phase = if self.tool_calls.is_empty() {
+                AssistantMessagePhase::FinalAnswer
+            } else {
+                AssistantMessagePhase::Commentary
+            };
+            let item = message_output_item(
+                self.text_item_id.clone(),
+                self.text.clone(),
+                text_status,
+                phase,
+            );
             self.send(
                 tx,
                 "response.content_part.done",

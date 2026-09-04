@@ -5,8 +5,8 @@ use super::super::{
 use super::tools::{parse_tool_choice, parse_tools};
 use super::{ConvertedRequest, ResponseContext, ToolNameMap};
 use crate::openai::{
-    ChatCompletionsRequest, ChatFunctionCall, ChatMessage, ChatToolCall, MessageRole,
-    OpenAiJsonSchema, OpenAiResponseFormat, StreamOptions,
+    AssistantMessagePhase, ChatCompletionsRequest, ChatFunctionCall, ChatMessage, ChatToolCall,
+    MessageRole, OpenAiJsonSchema, OpenAiResponseFormat, StreamOptions,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -86,8 +86,11 @@ impl ResponsesRequest {
             .ok_or_else(|| ServerError::invalid_request("model is required", Some("model")))?
             .to_string();
         let (chat_tools, response_tools, tool_names) = parse_tools(self.tools.as_deref())?;
-        let mut messages = parse_input_with_tool_names(&self.input, &tool_names)?;
-        merge_leading_system_messages(&mut messages, self.instructions.as_deref());
+        let ParsedInput {
+            mut messages,
+            mut phases,
+        } = parse_input_with_tool_names(&self.input, &tool_names)?;
+        merge_leading_system_messages(&mut messages, &mut phases, self.instructions.as_deref());
         if messages.is_empty() {
             return Err(ServerError::invalid_request(
                 "input must contain at least one text message or function item",
@@ -169,6 +172,7 @@ impl ResponsesRequest {
 
         Ok(ConvertedRequest {
             chat,
+            message_phases: phases,
             response,
             stream,
         })
@@ -428,7 +432,12 @@ fn chat_message(role: MessageRole, content: String) -> ChatMessage {
     }
 }
 
-fn merge_leading_system_messages(messages: &mut Vec<ChatMessage>, instructions: Option<&str>) {
+fn merge_leading_system_messages(
+    messages: &mut Vec<ChatMessage>,
+    phases: &mut Vec<Option<AssistantMessagePhase>>,
+    instructions: Option<&str>,
+) {
+    debug_assert_eq!(messages.len(), phases.len());
     let leading_systems = messages
         .iter()
         .take_while(|message| message.role == MessageRole::System)
@@ -447,24 +456,42 @@ fn merge_leading_system_messages(messages: &mut Vec<ChatMessage>, instructions: 
             .map(|message| message.content)
             .filter(|content| !content.is_empty()),
     );
+    phases.drain(..leading_systems);
     if !parts.is_empty() {
         messages.insert(0, chat_message(MessageRole::System, parts.join("\n\n")));
+        phases.insert(0, None);
     }
+}
+
+struct ParsedInput {
+    messages: Vec<ChatMessage>,
+    phases: Vec<Option<AssistantMessagePhase>>,
 }
 
 #[cfg(test)]
 pub(super) fn parse_input(input: &Value) -> std::result::Result<Vec<ChatMessage>, ServerError> {
-    parse_input_with_tool_names(input, &ToolNameMap::default())
+    parse_input_with_tool_names(input, &ToolNameMap::default()).map(|parsed| parsed.messages)
+}
+
+#[cfg(test)]
+pub(super) fn parse_input_phases(
+    input: &Value,
+) -> std::result::Result<Vec<Option<AssistantMessagePhase>>, ServerError> {
+    parse_input_with_tool_names(input, &ToolNameMap::default()).map(|parsed| parsed.phases)
 }
 
 fn parse_input_with_tool_names(
     input: &Value,
     tool_names: &ToolNameMap,
-) -> std::result::Result<Vec<ChatMessage>, ServerError> {
+) -> std::result::Result<ParsedInput, ServerError> {
     match input {
-        Value::String(text) => Ok(vec![chat_message(MessageRole::User, text.clone())]),
+        Value::String(text) => Ok(ParsedInput {
+            messages: vec![chat_message(MessageRole::User, text.clone())],
+            phases: vec![None],
+        }),
         Value::Array(items) => {
             let mut messages = Vec::new();
+            let mut phases = Vec::new();
             let mut function_calls = HashSet::new();
             let mut function_outputs = HashSet::new();
             for (index, item) in items.iter().enumerate() {
@@ -472,12 +499,13 @@ fn parse_input_with_tool_names(
                     item,
                     index,
                     &mut messages,
+                    &mut phases,
                     &mut function_calls,
                     &mut function_outputs,
                     tool_names,
                 )?;
             }
-            Ok(messages)
+            Ok(ParsedInput { messages, phases })
         }
         _ => Err(ServerError::invalid_request(
             "input must be a string or an array of input items",
@@ -490,6 +518,7 @@ fn parse_input_item(
     item: &Value,
     index: usize,
     messages: &mut Vec<ChatMessage>,
+    phases: &mut Vec<Option<AssistantMessagePhase>>,
     function_calls: &mut HashSet<String>,
     function_outputs: &mut HashSet<String>,
     tool_names: &ToolNameMap,
@@ -520,34 +549,63 @@ fn parse_input_item(
             };
             let content_param = format!("input[{index}].content");
             let content = parse_message_content(object.get("content"), &content_param)?;
+            let phase_param = format!("input[{index}].phase");
+            let phase = match optional_string(object, "phase", &phase_param)?.as_deref() {
+                None => None,
+                Some(_) if role != MessageRole::Assistant => {
+                    return Err(ServerError::invalid_request(
+                        "phase is only valid for assistant messages",
+                        Some(&phase_param),
+                    ))
+                }
+                Some("commentary") => Some(AssistantMessagePhase::Commentary),
+                Some("final_answer") => Some(AssistantMessagePhase::FinalAnswer),
+                Some(_) => {
+                    return Err(ServerError::invalid_request(
+                        "assistant message phase must be commentary or final_answer",
+                        Some(&phase_param),
+                    ))
+                }
+            };
             let pending_reasoning = if role == MessageRole::Assistant {
-                messages.last_mut().filter(|message| {
+                messages.last().is_some_and(|message| {
                     message.role == MessageRole::Assistant
                         && message.content.is_empty()
                         && message.reasoning.is_some()
+                        && phases.last().is_some_and(Option::is_none)
                         && message.tool_calls.is_none()
                         && message.function_call.is_none()
                 })
             } else {
-                None
+                false
             };
-            if let Some(previous) = pending_reasoning {
+            if pending_reasoning {
+                let previous = messages.last_mut().expect("pending reasoning message");
                 previous.content = content;
+                *phases.last_mut().expect("pending reasoning phase") = phase;
             } else {
                 messages.push(chat_message(role, content));
+                phases.push(phase);
             }
         }
         "reasoning" => {
             if let Some(reasoning) = parse_reasoning_input_item(object, index)? {
-                if let Some(previous) = messages
-                    .last_mut()
-                    .filter(|message| message.role == MessageRole::Assistant)
-                {
+                let append_to_previous = messages.last().is_some_and(|message| {
+                    message.role == MessageRole::Assistant
+                        && message.content.is_empty()
+                        && message.tool_calls.is_none()
+                        && message.function_call.is_none()
+                        && phases.last().copied().flatten()
+                            != Some(AssistantMessagePhase::FinalAnswer)
+                });
+                if append_to_previous {
+                    let previous = messages.last_mut().expect("previous assistant message");
                     append_reasoning_text(&mut previous.reasoning, &reasoning);
                 } else {
                     let mut message = chat_message(MessageRole::Assistant, String::new());
                     message.reasoning = Some(reasoning);
                     messages.push(message);
+                    phases.push(None);
                 }
             }
         }
@@ -597,15 +655,18 @@ fn parse_input_item(
                     arguments: required_text(object, "arguments", &arguments_param)?,
                 },
             };
-            if let Some(last) = messages
-                .last_mut()
-                .filter(|message| message.role == MessageRole::Assistant)
-            {
+            let append_to_previous = messages.last().is_some_and(|message| {
+                message.role == MessageRole::Assistant
+                    && phases.last().copied().flatten() != Some(AssistantMessagePhase::FinalAnswer)
+            });
+            if append_to_previous {
+                let last = messages.last_mut().expect("previous assistant message");
                 last.tool_calls.get_or_insert_with(Vec::new).push(call);
             } else {
                 let mut message = chat_message(MessageRole::Assistant, String::new());
                 message.tool_calls = Some(vec![call]);
                 messages.push(message);
+                phases.push(None);
             }
         }
         "function_call_output" => {
@@ -630,6 +691,7 @@ fn parse_input_item(
             );
             message.tool_call_id = Some(call_id);
             messages.push(message);
+            phases.push(None);
         }
         unsupported_type => {
             return Err(ServerError::unsupported_feature(

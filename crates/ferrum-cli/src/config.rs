@@ -52,6 +52,30 @@ pub struct ServerCliConfig {
     pub hot_reload: bool,
 }
 
+const fn enabled_by_default() -> bool {
+    true
+}
+
+#[derive(Default, Deserialize)]
+struct CompatibilityConfigFile {
+    #[serde(default)]
+    server: CompatibilityServerConfig,
+}
+
+#[derive(Deserialize)]
+struct CompatibilityServerConfig {
+    #[serde(default = "enabled_by_default")]
+    interleaved_system_coalescing: bool,
+}
+
+impl Default for CompatibilityServerConfig {
+    fn default() -> Self {
+        Self {
+            interleaved_system_coalescing: true,
+        }
+    }
+}
+
 /// Model CLI configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelCliConfig {
@@ -680,6 +704,29 @@ impl CliConfig {
     }
 }
 
+/// Read serve-only compatibility controls without extending the public
+/// `CliConfig` structs used by library callers.
+pub async fn load_interleaved_system_coalescing<P: AsRef<Path>>(path: P) -> Result<bool> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(true);
+    }
+    let content = fs::read_to_string(path).await.map_err(|error| {
+        ferrum_types::FerrumError::io_str(format!("Failed to read config file: {error}"))
+    })?;
+    parse_interleaved_system_coalescing(&content)
+}
+
+fn parse_interleaved_system_coalescing(content: &str) -> Result<bool> {
+    toml::from_str::<CompatibilityConfigFile>(content)
+        .map(|config| config.server.interleaved_system_coalescing)
+        .map_err(|error| {
+            ferrum_types::FerrumError::configuration(format!(
+                "Failed to parse serve compatibility config: {error}"
+            ))
+        })
+}
+
 impl Default for ServerCliConfig {
     fn default() -> Self {
         Self {
@@ -1053,5 +1100,35 @@ mod tests {
         assert!(config.runtime.preset.is_none());
         assert!(config.runtime.kv_dtype.is_none());
         assert!(config.runtime.runtime_config_entries().is_empty());
+    }
+
+    #[test]
+    fn serve_compatibility_defaults_interleaved_system_coalescing_and_accepts_disable() {
+        let omitted = parse_interleaved_system_coalescing(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8000
+            config_path = "server.toml"
+            log_level = "info"
+            hot_reload = false
+            "#,
+        )
+        .unwrap();
+        assert!(omitted);
+
+        let disabled = parse_interleaved_system_coalescing(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8000
+            config_path = "server.toml"
+            log_level = "info"
+            hot_reload = false
+            interleaved_system_coalescing = false
+            "#,
+        )
+        .unwrap();
+        assert!(!disabled);
     }
 }
