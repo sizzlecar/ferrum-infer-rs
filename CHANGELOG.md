@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes.
 
+## [0.8.6] - 2026-09-04
+
+### Added
+- Added caller-owned OpenAI Responses history with reasoning replay and namespace-aware tool loops.
+
+### Fixed
+- Preserved typed and whitespace-sensitive Qwen XML tool arguments.
+- Retried model templates that reject interleaved system messages using ordered coalescing, with a typed opt-out.
+- Restored concurrent CUDA greedy-decode throughput by keeping repetition penalties and row-wise token selection on device, and corrected paged-attention shared-memory sizing above 16K tokens.
+
 ## [0.8.5] - 2026-09-03
 
 ### Changed
