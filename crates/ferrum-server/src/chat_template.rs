@@ -73,17 +73,21 @@ fn tool_call_protocol_for_template(template: &str) -> ApiToolCallProtocol {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 impl ReasoningEffort {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
         }
     }
 }
@@ -99,11 +103,13 @@ impl FromStr for ReasoningEffort {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "minimal" => Ok(Self::Minimal),
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
             _ => Err(format!(
-                "unsupported reasoning effort {value:?}; expected low, medium, or high"
+                "unsupported reasoning effort {value:?}; expected minimal, low, medium, high, or xhigh"
             )),
         }
     }

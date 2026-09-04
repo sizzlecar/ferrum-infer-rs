@@ -124,7 +124,8 @@ mean tok/s with the 95% confidence-interval half-width across three repeats.
 Ferrum supports:
 
 - chat completions and streaming usage
-- stateless Responses text, streaming, usage, and function tools
+- stateless Responses text, reasoning replay, streaming, usage, and
+  caller-owned function/namespace tool loops
 - function tools with `auto`, `none`, `required`, or a named function
 - `json_object` and strict `json_schema` structured output
 - multi-turn sessions, prefix cache, and session cache

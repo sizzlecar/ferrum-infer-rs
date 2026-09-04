@@ -3558,7 +3558,7 @@ fn chat_template_options_for_request(
     if let Some(value) = kwargs.get("reasoning_effort") {
         let Some(reasoning_effort) = value.as_str() else {
             return Err(Error::invalid_request(
-                "chat_template_kwargs.reasoning_effort must be one of: low, medium, high",
+                "chat_template_kwargs.reasoning_effort must be one of: minimal, low, medium, high, xhigh",
             ));
         };
         options.reasoning_effort = Some(reasoning_effort.parse::<ReasoningEffort>().map_err(
@@ -3580,17 +3580,31 @@ fn render_messages_with_response_format_instruction(
     else {
         return request.messages.clone();
     };
-    let mut messages = Vec::with_capacity(request.messages.len() + 1);
-    messages.push(ChatMessage {
-        role: MessageRole::System,
-        content: instruction,
-        reasoning: None,
-        name: None,
-        tool_calls: None,
-        tool_call_id: None,
-        function_call: None,
-    });
-    messages.extend(request.messages.clone());
+    let mut messages = request.messages.clone();
+    let leading_systems = messages
+        .iter()
+        .take_while(|message| message.role == MessageRole::System)
+        .count();
+    let mut system_parts = Vec::with_capacity(leading_systems + 1);
+    system_parts.push(instruction);
+    system_parts.extend(
+        messages
+            .drain(..leading_systems)
+            .map(|message| message.content)
+            .filter(|content| !content.is_empty()),
+    );
+    messages.insert(
+        0,
+        ChatMessage {
+            role: MessageRole::System,
+            content: system_parts.join("\n\n"),
+            reasoning: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            function_call: None,
+        },
+    );
     messages
 }
 
@@ -6383,6 +6397,14 @@ mod tests {
         AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(chunks))).build_router()
     }
 
+    fn router_with_stub_finish_reason(text: &str, finish_reason: FinishReason) -> Router {
+        AxumServer::from_llm(Arc::new(StubLlm {
+            finish_reason,
+            ..StubLlm::new(text)
+        }))
+        .build_router()
+    }
+
     fn router_with_stub_stream_chunks_and_request_dump_dir(
         chunks: &[&str],
         request_dump_dir: PathBuf,
@@ -6450,6 +6472,58 @@ mod tests {
                         arguments: "{\"city\":\"Paris\"}".to_string(),
                     },
                 }],
+                tool_call_id: None,
+                function_call: None,
+            },
+            finish_reason: Some("tool_calls".to_string()),
+        })
+    }
+
+    fn namespaced_tool_api_response() -> ferrum_types::ApiResponse {
+        ferrum_types::ApiResponse::Chat(ferrum_types::ApiChatResponse {
+            message: ferrum_types::ApiChatMessage {
+                role: ferrum_types::ApiMessageRole::Assistant,
+                content: String::new(),
+                name: None,
+                tool_calls: vec![ferrum_types::ApiToolCall {
+                    id: "call_ns_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: ferrum_types::ApiFunctionCall {
+                        name: "collaboration__wait_agent".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }],
+                tool_call_id: None,
+                function_call: None,
+            },
+            finish_reason: Some("tool_calls".to_string()),
+        })
+    }
+
+    fn two_tool_api_response() -> ferrum_types::ApiResponse {
+        ferrum_types::ApiResponse::Chat(ferrum_types::ApiChatResponse {
+            message: ferrum_types::ApiChatMessage {
+                role: ferrum_types::ApiMessageRole::Assistant,
+                content: String::new(),
+                name: None,
+                tool_calls: vec![
+                    ferrum_types::ApiToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: ferrum_types::ApiFunctionCall {
+                            name: "weather".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                    ferrum_types::ApiToolCall {
+                        id: "call_2".to_string(),
+                        tool_type: "function".to_string(),
+                        function: ferrum_types::ApiFunctionCall {
+                            name: "clock".to_string(),
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                ],
                 tool_call_id: None,
                 function_call: None,
             },
@@ -6839,6 +6913,14 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("utf8 body")
     }
 
+    fn responses_sse_json_events(body: &str) -> Vec<Value> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).expect("Responses SSE JSON event"))
+            .collect()
+    }
+
     async fn response_bytes(response: Response) -> Vec<u8> {
         to_bytes(response.into_body(), usize::MAX)
             .await
@@ -6907,6 +6989,8 @@ mod tests {
         assert_eq!(body["usage"]["input_tokens"], 7);
         assert_eq!(body["usage"]["output_tokens"], 2);
         assert_eq!(body["usage"]["total_tokens"], 9);
+        assert_eq!(body["presence_penalty"], 0.0);
+        assert_eq!(body["frequency_penalty"], 0.0);
     }
 
     #[tokio::test]
@@ -6950,9 +7034,13 @@ mod tests {
             "missing second delta: {body}"
         );
         assert!(body.contains("\"input_tokens\":5"), "missing usage: {body}");
+        let completed = body
+            .find("event: response.completed")
+            .expect("completed event");
+        let done = body.find("data: [DONE]").expect("terminal DONE marker");
         assert!(
-            !body.contains("[DONE]"),
-            "Responses streams do not use chat DONE: {body}"
+            completed < done,
+            "DONE must follow response.completed: {body}"
         );
     }
 
@@ -7010,6 +7098,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_route_accepts_real_caller_owned_second_turn_shape() {
+        let response = post_json(
+            router_with_stub("You first said hello."),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "instructions": "Answer from the supplied history.",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Hello"}]
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Hi there!"}]
+                    },
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": null,
+                        "summary": []
+                    },
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "What did I say first?"}]
+                    }
+                ],
+                "store": false,
+                "stream": false,
+                "include": ["reasoning.encrypted_content"],
+                "parallel_tool_calls": false,
+                "prompt_cache_key": "thread-1",
+                "reasoning": {"effort": "high", "summary": "auto"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(
+            body["output"][0]["content"][0]["text"],
+            "You first said hello."
+        );
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["prompt_cache_key"], "thread-1");
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[tokio::test]
+    async fn responses_route_merges_instructions_with_leading_developer_message() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+            "strict-leading-system-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template("ok", template),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "instructions": "Top-level instructions",
+                "input": [
+                    {"type": "message", "role": "developer", "content": "Developer instructions"},
+                    {"type": "message", "role": "user", "content": "Hello"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn responses_route_keeps_structured_output_to_one_leading_system_message() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+            "strict-leading-system-template",
+        );
+        let response = post_json(
+            router_with_stub_and_template(r#"{"ok":true}"#, template),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "instructions": "Top-level instructions",
+                "input": [
+                    {"type": "message", "role": "developer", "content": "Developer instructions"},
+                    {"type": "message", "role": "user", "content": "Return JSON"}
+                ],
+                "text": {"format": {"type": "json_object"}}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["output"][0]["content"][0]["text"], r#"{"ok":true}"#);
+    }
+
+    #[tokio::test]
+    async fn responses_route_output_can_be_replayed_with_readable_reasoning() {
+        let first = post_json(
+            router_with_stub("<think>Checked the supplied facts.</think>\nFirst answer"),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "First question",
+                "include": ["reasoning.encrypted_content"]
+            }),
+        )
+        .await;
+        assert_eq!(first.status(), AxumStatusCode::OK);
+        let first_body = response_json(first).await;
+        assert_eq!(first_body["output"][0]["type"], "reasoning");
+        assert_eq!(
+            first_body["output"][0]["content"][0]["text"],
+            "Checked the supplied facts."
+        );
+        assert_eq!(first_body["output"][0]["encrypted_content"], Value::Null);
+        assert_eq!(first_body["output"][1]["type"], "message");
+
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "First question"}]
+        })];
+        input.extend(first_body["output"].as_array().unwrap().iter().cloned());
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue"}]
+        }));
+        let second = post_json(
+            router_with_stub("Second answer"),
+            "/v1/responses",
+            json!({"model": "stub-model", "input": input}),
+        )
+        .await;
+        assert_eq!(second.status(), AxumStatusCode::OK);
+        let second_body = response_json(second).await;
+        assert_eq!(
+            second_body["output"][0]["content"][0]["text"],
+            "Second answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_route_streams_reasoning_before_text_with_stable_indices() {
+        let response = post_json(
+            router_with_stub_stream_chunks(&["<think>inspect", " history</think>\nfinal"]),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "answer",
+                "stream": true,
+                "include": ["reasoning.encrypted_content"]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        let events = responses_sse_json_events(&body);
+        for (sequence, event) in events.iter().enumerate() {
+            assert_eq!(
+                event["sequence_number"], sequence,
+                "Responses sequence numbers must be contiguous: {body}"
+            );
+        }
+        for event in [
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
+            "response.output_text.delta",
+            "response.completed",
+        ] {
+            assert!(
+                body.contains(&format!("event: {event}")),
+                "missing {event}: {body}"
+            );
+        }
+        let reasoning_done = body
+            .find("event: response.reasoning_text.done")
+            .expect("reasoning done");
+        let text_added = body[reasoning_done..]
+            .find("event: response.output_item.added")
+            .map(|offset| reasoning_done + offset)
+            .expect("text item added");
+        assert!(
+            reasoning_done < text_added,
+            "reasoning must finish before text: {body}"
+        );
+        assert!(
+            body.contains("\"output_index\":0,\"content_index\":0,\"delta\":\"inspect"),
+            "reasoning must use output index 0: {body}"
+        );
+        assert!(
+            body.contains("\"output_index\":1,\"content_index\":0,\"delta\":\"final"),
+            "text must use output index 1: {body}"
+        );
+        let reasoning_added = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.added"
+                    && event["item"]["type"] == "reasoning"
+            })
+            .expect("reasoning item added");
+        assert_eq!(reasoning_added["item"]["status"], "in_progress");
+        let reasoning_part_added = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.content_part.added"
+                    && event["part"]["type"] == "reasoning_text"
+            })
+            .expect("reasoning content part added");
+        assert_eq!(reasoning_part_added["output_index"], 0);
+        let reasoning_item_done = events
+            .iter()
+            .find(|event| {
+                event["type"] == "response.output_item.done" && event["item"]["type"] == "reasoning"
+            })
+            .expect("reasoning item done");
+        assert_eq!(reasoning_item_done["item"]["status"], "completed");
+        let terminal = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("terminal response");
+        assert_eq!(
+            terminal["response"]["output"][0],
+            reasoning_item_done["item"]
+        );
+        assert!(
+            body.contains("data: [DONE]"),
+            "missing terminal marker: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn responses_route_streams_function_call_events() {
         let response = post_json(
             router_with_stub_api_response("", weather_tool_api_response()),
@@ -7041,6 +7362,161 @@ mod tests {
             "missing call id: {body}"
         );
         assert_eq!(body.matches("event: response.completed").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn responses_route_round_trips_namespace_identity_without_leaking_chat_alias() {
+        let namespace_tool = json!({
+            "type": "namespace",
+            "name": "collaboration",
+            "description": "Agent coordination tools",
+            "tools": [{
+                "type": "function",
+                "name": "wait_agent",
+                "parameters": {"type": "object"}
+            }]
+        });
+        let sync = post_json(
+            router_with_stub_api_response("", namespaced_tool_api_response()),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "Wait for the agent",
+                "tools": [namespace_tool.clone()]
+            }),
+        )
+        .await;
+        assert_eq!(sync.status(), AxumStatusCode::OK);
+        let sync_body = response_json(sync).await;
+        assert_eq!(sync_body["output"][0]["type"], "function_call");
+        assert_eq!(sync_body["output"][0]["namespace"], "collaboration");
+        assert_eq!(sync_body["output"][0]["name"], "wait_agent");
+
+        let stream = post_json(
+            router_with_stub_api_response("", namespaced_tool_api_response()),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "Wait for the agent",
+                "tools": [namespace_tool],
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(stream.status(), AxumStatusCode::OK);
+        let stream_body = response_text(stream).await;
+        let events = responses_sse_json_events(&stream_body);
+        let function_events = events
+            .iter()
+            .filter(|event| {
+                event["item"]["type"] == "function_call"
+                    || event["type"] == "response.function_call_arguments.done"
+            })
+            .collect::<Vec<_>>();
+        assert!(!function_events.is_empty());
+        for event in function_events {
+            let value = event.get("item").unwrap_or(event);
+            assert_eq!(value["namespace"], "collaboration");
+            assert_eq!(value["name"], "wait_agent");
+        }
+        assert!(stream_body.contains("data: [DONE]"));
+        assert!(!stream_body.contains("collaboration__wait_agent"));
+    }
+
+    #[tokio::test]
+    async fn responses_route_enforces_parallel_tool_call_constraint() {
+        let tools = json!([
+            {"type": "function", "name": "weather", "parameters": {"type": "object"}},
+            {"type": "function", "name": "clock", "parameters": {"type": "object"}}
+        ]);
+        let sync = post_json(
+            router_with_stub_api_response("", two_tool_api_response()),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "Use both tools",
+                "tools": tools.clone(),
+                "parallel_tool_calls": false
+            }),
+        )
+        .await;
+        assert_eq!(sync.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+
+        let stream = post_json(
+            router_with_stub_api_response("", two_tool_api_response()),
+            "/v1/responses",
+            json!({
+                "model": "stub-model",
+                "input": "Use both tools",
+                "tools": tools,
+                "parallel_tool_calls": false,
+                "stream": true
+            }),
+        )
+        .await;
+        assert_eq!(stream.status(), AxumStatusCode::OK);
+        let body = response_text(stream).await;
+        assert!(
+            body.contains("event: response.failed"),
+            "missing failure: {body}"
+        );
+        assert!(
+            !body.contains("event: response.completed"),
+            "must not complete: {body}"
+        );
+        assert!(
+            body.contains("data: [DONE]"),
+            "missing terminal marker: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_route_streams_incomplete_terminal_event() {
+        let response = post_json(
+            router_with_stub_finish_reason("partial", FinishReason::Length),
+            "/v1/responses",
+            json!({"model": "stub-model", "input": "answer", "stream": true}),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_text(response).await;
+        assert!(
+            body.contains("event: response.incomplete"),
+            "missing incomplete terminal event: {body}"
+        );
+        assert!(
+            !body.contains("event: response.completed"),
+            "incomplete response must not emit completed: {body}"
+        );
+        assert!(
+            body.contains("data: [DONE]"),
+            "missing terminal marker: {body}"
+        );
+        let events = responses_sse_json_events(&body);
+        let output_done = events
+            .iter()
+            .find(|event| event["type"] == "response.output_item.done")
+            .expect("incomplete output item done event");
+        assert_eq!(output_done["item"]["status"], "incomplete");
+        let terminal = events
+            .iter()
+            .find(|event| event["type"] == "response.incomplete")
+            .expect("incomplete terminal event");
+        assert_eq!(terminal["response"]["output"][0]["status"], "incomplete");
+    }
+
+    #[tokio::test]
+    async fn responses_route_marks_sync_length_output_incomplete() {
+        let response = post_json(
+            router_with_stub_finish_reason("partial", FinishReason::Length),
+            "/v1/responses",
+            json!({"model": "stub-model", "input": "answer"}),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["status"], "incomplete");
+        assert_eq!(body["output"][0]["status"], "incomplete");
     }
 
     #[tokio::test]
@@ -9512,7 +9988,20 @@ mod tests {
         assert_eq!(response.status(), AxumStatusCode::OK);
         assert_eq!(engine.last_request().prompt, "Reasoning: low");
 
-        for invalid in [json!("xhigh"), json!(1)] {
+        let response = post_json(
+            router.clone(),
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {"reasoning_effort": "xhigh"}
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        assert_eq!(engine.last_request().prompt, "Reasoning: xhigh");
+
+        for invalid in [json!("extreme"), json!(1)] {
             let response = post_json(
                 router.clone(),
                 "/v1/chat/completions",
