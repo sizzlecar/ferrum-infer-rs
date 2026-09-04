@@ -10032,6 +10032,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_prefers_canonical_reasoning_in_qwen36_tool_history() {
+        for stream in [false, true] {
+            for reasoning in ["canonical-history-marker", ""] {
+                let request = capture_qwen36_tool_history_request(
+                    json!({
+                        "reasoning": reasoning,
+                        "reasoning_content": "alias-history-marker"
+                    }),
+                    stream,
+                )
+                .await;
+                let canonical =
+                    capture_qwen36_tool_history_request(json!({"reasoning": reasoning}), stream)
+                        .await;
+                assert_eq!(request.prompt, canonical.prompt);
+                assert!(!request.prompt.contains("alias-history-marker"));
+                let message = &request.metadata["openai_messages"][1];
+                assert_eq!(message["reasoning"], reasoning);
+                assert!(message.get("reasoning_content").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn route_does_not_force_reasoning_into_templates_that_ignore_it() {
         let template = ModelChatTemplate::new(
             "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}",
@@ -10565,6 +10589,7 @@ mod tests {
             body.contains(r#""reasoning":"\nreason"#),
             "stream should emit reasoning delta after full think prefix: {body}"
         );
+        assert!(!body.contains("\"reasoning_content\":"));
         assert!(
             body.contains(r#""content":"final""#),
             "stream should emit visible content after think close: {body}"

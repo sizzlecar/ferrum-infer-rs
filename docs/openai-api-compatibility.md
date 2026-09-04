@@ -41,6 +41,7 @@ support matrix and are hidden from the default CLI help.
 | `messages` | Supported | `system`, `user`, `assistant`, `tool`, and legacy `function` roles parse into structured request data and are rendered by the chat-template layer. Assistant `tool_calls` / legacy `function_call` history is included in the rendered prompt for caller-owned tool-result loops. |
 | string `content` | Supported | Rendered through the model-family chat template layer. |
 | text content parts | Supported | `content: [{"type":"text","text":"..."}]` is accepted and concatenated. |
+| assistant `reasoning` / `reasoning_content` | Supported extension | Historical reasoning accepts either field. A string in canonical `reasoning` wins, including an empty string; missing or null `reasoning` falls back to `reasoning_content`. The selected value must be a string or null. The model's chat template decides whether to retain it in the prompt. Chat response messages and SSE deltas emit only canonical `reasoning`. |
 | multimodal content parts | Rejected | Non-text parts return HTTP 400 instead of being silently dropped. |
 | `max_tokens` | Supported | Legacy completion budget. |
 | `max_completion_tokens` | Supported | Overrides `max_tokens` when both are supplied. |
