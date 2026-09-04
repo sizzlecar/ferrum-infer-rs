@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrum_interfaces::{
     kv_dtype::KvFp16,
-    model_executor::{LogitsReturnPolicy, TokenSelectionMask},
+    model_executor::{GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask},
 };
 use ferrum_kernels::backend::{
     Backend, BackendGraph, BackendMoeFused, BackendPagedKv, BackendQuantGguf, BackendQuantMarlin,
@@ -76,12 +76,13 @@ impl UnifiedGraphCaptureScope {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum DecodeLogitsReturn<'a> {
     Full,
     LegacyDefault,
     GreedyArgmax {
         token_mask: Option<&'a TokenSelectionMask>,
+        repetition_penalties: Vec<Option<&'a GreedyRepetitionPenalty>>,
     },
 }
 
@@ -89,6 +90,17 @@ enum DecodeLogitsReturn<'a> {
 enum ArgmaxMode<'a> {
     Raw,
     Masked(&'a TokenSelectionMask),
+    SparseRepetition {
+        token_mask: Option<&'a TokenSelectionMask>,
+        repetition_penalties: &'a [Option<&'a GreedyRepetitionPenalty>],
+    },
+}
+
+fn has_sparse_repetition_penalties(penalties: &[Option<&GreedyRepetitionPenalty>]) -> bool {
+    penalties
+        .iter()
+        .flatten()
+        .any(|penalty| !penalty.is_empty())
 }
 
 fn resolve_unified_logits_return<'a>(
@@ -105,15 +117,27 @@ fn resolve_unified_logits_return<'a>(
 
     let mut selected_mask: Option<&'a TokenSelectionMask> = None;
     let mut saw_unmasked = false;
-    for &(orig_idx, _) in final_indices {
+    // Keep the common no-penalty greedy path allocation-free. Once the first
+    // live penalty appears, backfill earlier rows so device metadata remains
+    // aligned with `final_indices`.
+    let mut repetition_penalties = Vec::new();
+    for (sampled_idx, &(orig_idx, _)) in final_indices.iter().enumerate() {
         match &policies[orig_idx] {
             LogitsReturnPolicy::FullLogits => return DecodeLogitsReturn::Full,
             LogitsReturnPolicy::GreedyArgmax {
                 token_mask,
                 repetition_penalty,
             } => {
-                if repetition_penalty.is_some() {
-                    return DecodeLogitsReturn::Full;
+                let repetition_penalty = repetition_penalty
+                    .as_ref()
+                    .filter(|penalty| !penalty.is_empty());
+                if repetition_penalties.is_empty() {
+                    if let Some(repetition_penalty) = repetition_penalty {
+                        repetition_penalties.resize(sampled_idx, None);
+                        repetition_penalties.push(Some(repetition_penalty));
+                    }
+                } else {
+                    repetition_penalties.push(repetition_penalty);
                 }
                 match token_mask.as_ref() {
                     Some(mask) => {
@@ -143,6 +167,7 @@ fn resolve_unified_logits_return<'a>(
 
     DecodeLogitsReturn::GreedyArgmax {
         token_mask: selected_mask,
+        repetition_penalties,
     }
 }
 
@@ -499,13 +524,95 @@ fn should_log_unified_logits_diag(call: u64) -> bool {
 mod tests {
     use super::{
         batched_decode_graph_key, format_logit_top, logit_row_diagnostics,
-        should_log_batched_graph_replay_count, should_log_unified_graph_count,
-        should_log_unified_logits_diag, should_log_unified_op_profile_call,
-        should_log_unified_op_profile_sample, should_use_batched_decode_graph,
-        unified_graph_capture_skip_reason, unified_graph_scope_label, LlamaBatchedRuntimeConfig,
+        resolve_unified_logits_return, should_log_batched_graph_replay_count,
+        should_log_unified_graph_count, should_log_unified_logits_diag,
+        should_log_unified_op_profile_call, should_log_unified_op_profile_sample,
+        should_use_batched_decode_graph, unified_graph_capture_skip_reason,
+        unified_graph_scope_label, DecodeLogitsReturn, LlamaBatchedRuntimeConfig,
         UnifiedGraphCaptureScope, BATCHED_DEVICE_SHADOW_GRAPH_KEY_BIT,
         UNIFIED_GRAPH_MAX_CACHED_KEYS,
     };
+    use ferrum_interfaces::model_executor::{
+        GreedyRepetitionPenalty, LogitsReturnPolicy, TokenSelectionMask,
+    };
+
+    #[test]
+    fn unified_logits_policy_keeps_sparse_repetition_on_greedy_path() {
+        let mask = TokenSelectionMask::new(vec![1, 1, 0, 1]);
+        let repetition = GreedyRepetitionPenalty::new(1.1, vec![3, 1, 3]);
+        let policies = vec![
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(mask.clone()),
+                repetition_penalty: None,
+            },
+            // A non-final item must not force full-logits readback.
+            LogitsReturnPolicy::FullLogits,
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(mask.clone()),
+                repetition_penalty: Some(repetition),
+            },
+        ];
+
+        let resolved = resolve_unified_logits_return(Some(&policies), 3, &[(0, 0), (2, 5)]);
+        let DecodeLogitsReturn::GreedyArgmax {
+            token_mask,
+            repetition_penalties,
+        } = resolved
+        else {
+            panic!("compatible greedy policies should stay on the GPU argmax path");
+        };
+        assert_eq!(
+            token_mask.map(|value| value.fingerprint),
+            Some(mask.fingerprint)
+        );
+        assert!(repetition_penalties[0].is_none());
+        let repetition = repetition_penalties[1].expect("second row repetition metadata");
+        assert_eq!(repetition.penalty(), 1.1);
+        assert_eq!(repetition.token_ids(), [3, 1]);
+    }
+
+    #[test]
+    fn unified_logits_policy_keeps_explicit_full_logits() {
+        let policies = vec![LogitsReturnPolicy::FullLogits];
+        assert!(matches!(
+            resolve_unified_logits_return(Some(&policies), 1, &[(0, 0)]),
+            DecodeLogitsReturn::Full
+        ));
+    }
+
+    #[test]
+    fn unified_logits_policy_keeps_no_op_repetition_allocation_free() {
+        let policies = vec![LogitsReturnPolicy::GreedyArgmax {
+            token_mask: None,
+            repetition_penalty: Some(GreedyRepetitionPenalty::new(1.0, vec![1, 2])),
+        }];
+        let DecodeLogitsReturn::GreedyArgmax {
+            repetition_penalties,
+            ..
+        } = resolve_unified_logits_return(Some(&policies), 1, &[(0, 0)])
+        else {
+            panic!("a no-op repetition penalty should keep the greedy path");
+        };
+        assert!(repetition_penalties.is_empty());
+    }
+
+    #[test]
+    fn unified_logits_policy_rejects_inconsistent_masks() {
+        let policies = vec![
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(TokenSelectionMask::new(vec![1, 0, 1])),
+                repetition_penalty: None,
+            },
+            LogitsReturnPolicy::GreedyArgmax {
+                token_mask: Some(TokenSelectionMask::new(vec![1, 1, 0])),
+                repetition_penalty: None,
+            },
+        ];
+        assert!(matches!(
+            resolve_unified_logits_return(Some(&policies), 2, &[(0, 0), (1, 1)]),
+            DecodeLogitsReturn::Full
+        ));
+    }
 
     #[test]
     fn llama_batched_runtime_config_parses_startup_knobs() {
@@ -1870,7 +1977,6 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             m_total,
             num_seqs,
             max_kv_len,
-            self.runtime_env.kv_capacity_for_model(self.cfg.max_seq_len),
             self.batched_cfg.split_k_attn,
         );
         let graph_key = if graph_scope == UnifiedGraphCaptureScope::LayersOnly {
@@ -2356,22 +2462,33 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         debug_assert!(final_pack_ready);
         debug_assert!(lm_head_ready);
 
-        // Sync + readback. Keep full logits only for rows whose policy
+        // Readback. Keep full logits only for rows whose policy
         // requires CPU-side sampling. Policy-compatible greedy rows use the
         // existing GPU argmax kernels and return a one-element token sentinel.
-        B::sync(&mut ctx);
+        B::sync_before_host_readback(&mut ctx);
         let mut out: Vec<Option<Vec<f32>>> = (0..items.len()).map(|_| None).collect();
         if num_sampled > 0 {
             let readback_t0 = unified_op_profile.then(std::time::Instant::now);
             let logits_return =
                 resolve_unified_logits_return(logits_policies, items.len(), &final_indices);
-            let argmax_mode = match logits_return {
+            let argmax_mode = match &logits_return {
                 DecodeLogitsReturn::Full => None,
                 DecodeLogitsReturn::LegacyDefault if self.batched_cfg.greedy_argmax => {
                     Some(ArgmaxMode::Raw)
                 }
                 DecodeLogitsReturn::LegacyDefault => None,
-                DecodeLogitsReturn::GreedyArgmax { token_mask } => {
+                DecodeLogitsReturn::GreedyArgmax {
+                    token_mask,
+                    repetition_penalties,
+                } if has_sparse_repetition_penalties(repetition_penalties) => {
+                    B::supports_argmax_rows_f16_sparse_repetition_penalty().then_some(
+                        ArgmaxMode::SparseRepetition {
+                            token_mask: *token_mask,
+                            repetition_penalties,
+                        },
+                    )
+                }
+                DecodeLogitsReturn::GreedyArgmax { token_mask, .. } => {
                     token_mask.map(ArgmaxMode::Masked).or(Some(ArgmaxMode::Raw))
                 }
             };
@@ -2404,6 +2521,71 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                             packed_logits,
                             device_mask,
                             mask_len,
+                            num_sampled,
+                            vocab,
+                        )
+                    }
+                    ArgmaxMode::SparseRepetition {
+                        token_mask,
+                        repetition_penalties,
+                    } => {
+                        self.scratch
+                            .ensure_unified_argmax_logits(&self.cfg, num_sampled);
+                        if let Some(mask) = token_mask {
+                            self.scratch.ensure_argmax_token_mask(&mut ctx, mask);
+                        }
+                        let total_token_ids = self
+                            .scratch
+                            .upload_argmax_repetition_penalties(&mut ctx, repetition_penalties);
+                        {
+                            let packed_logits = self
+                                .scratch
+                                .unified_packed_logits
+                                .as_ref()
+                                .expect("unified_packed_logits missing");
+                            let selection_logits = self
+                                .scratch
+                                .unified_argmax_logits
+                                .as_mut()
+                                .expect("unified_argmax_logits missing");
+                            B::copy_slice(
+                                &mut ctx,
+                                packed_logits,
+                                0,
+                                selection_logits,
+                                0,
+                                num_sampled * vocab,
+                            );
+                        }
+                        let valid_token_mask = token_mask.map(|_| {
+                            (
+                                self.scratch
+                                    .argmax_token_mask
+                                    .as_ref()
+                                    .expect("argmax token mask upload failed"),
+                                self.scratch.argmax_token_mask_len,
+                            )
+                        });
+                        B::argmax_rows_f16_sparse_repetition_penalty(
+                            &mut ctx,
+                            self.scratch
+                                .unified_argmax_logits
+                                .as_mut()
+                                .expect("unified_argmax_logits missing"),
+                            valid_token_mask,
+                            self.scratch
+                                .argmax_repetition_offsets
+                                .as_ref()
+                                .expect("argmax repetition offsets missing"),
+                            self.scratch
+                                .argmax_repetition_token_ids
+                                .as_ref()
+                                .expect("argmax repetition token ids missing"),
+                            self.scratch
+                                .argmax_repetition_penalties
+                                .as_ref()
+                                .expect("argmax repetition penalties missing"),
+                            total_token_ids,
                             num_sampled,
                             vocab,
                         )
@@ -3159,6 +3341,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
             batch,
             DecodeLogitsReturn::GreedyArgmax {
                 token_mask: selected_mask,
+                repetition_penalties: vec![None; batch.len()],
             },
         )
     }
@@ -3168,7 +3351,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
         batch: &[(String, u32, u32)],
         logits_return: DecodeLogitsReturn<'_>,
     ) -> Vec<Vec<f32>> {
-        let force_full_logits = matches!(logits_return, DecodeLogitsReturn::Full);
+        let force_full_logits = matches!(&logits_return, DecodeLogitsReturn::Full);
         let m = batch.len();
         if m == 0 {
             return Vec::new();
@@ -3721,7 +3904,7 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                 Some(ArgmaxMode::Raw)
             }
             DecodeLogitsReturn::LegacyDefault => None,
-            DecodeLogitsReturn::GreedyArgmax { token_mask } => {
+            DecodeLogitsReturn::GreedyArgmax { token_mask, .. } => {
                 token_mask.map(ArgmaxMode::Masked).or(Some(ArgmaxMode::Raw))
             }
         };
@@ -3747,6 +3930,9 @@ impl<B: MoeLlmBackend> LlamaFamilyModel<B, KvFp16> {
                         vocab,
                     )
                 }
+                ArgmaxMode::SparseRepetition { .. } => unreachable!(
+                    "legacy batched decode keeps repetition-penalty sampling on the host"
+                ),
             };
             if let Ok(tokens) = tokens {
                 if tokens.iter().all(|&token| token != u32::MAX) {

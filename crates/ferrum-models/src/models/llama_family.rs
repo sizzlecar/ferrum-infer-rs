@@ -1219,6 +1219,17 @@ pub struct LlamaFamilyScratch<B: QuantLlmBackend + BackendMoeFused> {
     pub argmax_token_mask: Option<B::Buffer>,
     pub argmax_token_mask_fingerprint: Option<u64>,
     pub argmax_token_mask_len: usize,
+    pub argmax_repetition_offsets: Option<B::Buffer>,
+    pub argmax_repetition_token_ids: Option<B::Buffer>,
+    pub argmax_repetition_penalties: Option<B::Buffer>,
+    pub argmax_repetition_offsets_capacity: usize,
+    pub argmax_repetition_token_ids_capacity: usize,
+    pub argmax_repetition_penalties_capacity: usize,
+    /// Dedicated selection scratch for sparse repetition-penalty argmax.
+    /// This is intentionally separate from `batch_logits`: legacy CUDA
+    /// graphs may retain the latter's pointer while other paths grow it.
+    pub unified_argmax_logits: Option<B::Buffer>,
+    pub unified_argmax_logits_capacity: usize,
     /// Token-major Q/K/V right after `split_qkv`. Stride: heads * hd per row.
     pub q_buf: B::Buffer,
     pub k_buf: B::Buffer,
@@ -1410,6 +1421,14 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
             argmax_token_mask: None,
             argmax_token_mask_fingerprint: None,
             argmax_token_mask_len: 0,
+            argmax_repetition_offsets: None,
+            argmax_repetition_token_ids: None,
+            argmax_repetition_penalties: None,
+            argmax_repetition_offsets_capacity: 0,
+            argmax_repetition_token_ids_capacity: 0,
+            argmax_repetition_penalties_capacity: 0,
+            unified_argmax_logits: None,
+            unified_argmax_logits_capacity: 0,
             // Paged batched dispatch scratch. None until `enable_paged_batch`
             // is called from `ensure_kv` once the model knows max_seqs +
             // max_blocks_per_seq. This avoids paying the alloc cost when
@@ -1496,6 +1515,111 @@ impl<B: QuantLlmBackend + BackendMoeFused> LlamaFamilyScratch<B> {
         self.argmax_token_mask
             .as_ref()
             .expect("argmax token mask upload failed")
+    }
+
+    pub(crate) fn upload_argmax_repetition_penalties(
+        &mut self,
+        ctx: &mut B::Context,
+        penalties: &[Option<&ferrum_interfaces::model_executor::GreedyRepetitionPenalty>],
+    ) -> usize {
+        let mut offsets = Vec::with_capacity(penalties.len() + 1);
+        let mut token_ids = Vec::new();
+        let mut row_penalties = Vec::with_capacity(penalties.len());
+        offsets.push(0u32);
+        for penalty in penalties {
+            if let Some(penalty) = penalty
+                .as_ref()
+                .copied()
+                .filter(|penalty| !penalty.is_empty())
+            {
+                row_penalties.push(penalty.penalty());
+                token_ids.extend_from_slice(penalty.token_ids());
+            } else {
+                row_penalties.push(1.0);
+            }
+            offsets.push(
+                u32::try_from(token_ids.len()).expect("argmax repetition token count exceeds u32"),
+            );
+        }
+
+        let offsets_len = offsets.len().max(1);
+        if self.argmax_repetition_offsets_capacity < offsets_len {
+            let capacity = offsets_len
+                .checked_next_power_of_two()
+                .unwrap_or(offsets_len);
+            self.argmax_repetition_offsets = Some(alloc_model_typed_buffer::<B>(
+                "llama.scratch.argmax_repetition_offsets",
+                ferrum_kernels::backend::Dtype::U32,
+                capacity,
+            ));
+            self.argmax_repetition_offsets_capacity = capacity;
+        }
+        let token_ids_len = token_ids.len().max(1);
+        if self.argmax_repetition_token_ids_capacity < token_ids_len {
+            let capacity = token_ids_len
+                .checked_next_power_of_two()
+                .unwrap_or(token_ids_len);
+            self.argmax_repetition_token_ids = Some(alloc_model_typed_buffer::<B>(
+                "llama.scratch.argmax_repetition_token_ids",
+                ferrum_kernels::backend::Dtype::U32,
+                capacity,
+            ));
+            self.argmax_repetition_token_ids_capacity = capacity;
+        }
+        let penalties_len = row_penalties.len().max(1);
+        if self.argmax_repetition_penalties_capacity < penalties_len {
+            let capacity = penalties_len
+                .checked_next_power_of_two()
+                .unwrap_or(penalties_len);
+            self.argmax_repetition_penalties = Some(alloc_model_typed_buffer::<B>(
+                "llama.scratch.argmax_repetition_penalties",
+                ferrum_kernels::backend::Dtype::F32,
+                capacity,
+            ));
+            self.argmax_repetition_penalties_capacity = capacity;
+        }
+
+        B::write_typed::<u32>(
+            ctx,
+            self.argmax_repetition_offsets
+                .as_mut()
+                .expect("argmax repetition offsets allocation failed"),
+            &offsets,
+        );
+        let token_ids_upload = if token_ids.is_empty() {
+            &[0u32][..]
+        } else {
+            token_ids.as_slice()
+        };
+        B::write_typed::<u32>(
+            ctx,
+            self.argmax_repetition_token_ids
+                .as_mut()
+                .expect("argmax repetition token ids allocation failed"),
+            token_ids_upload,
+        );
+        B::write_typed::<f32>(
+            ctx,
+            self.argmax_repetition_penalties
+                .as_mut()
+                .expect("argmax repetition penalties allocation failed"),
+            &row_penalties,
+        );
+
+        token_ids.len()
+    }
+
+    pub(crate) fn ensure_unified_argmax_logits(&mut self, cfg: &LlamaFamilyConfig, rows: usize) {
+        let rows = rows.max(1);
+        if rows <= self.unified_argmax_logits_capacity {
+            return;
+        }
+        let capacity = rows.checked_next_power_of_two().unwrap_or(rows);
+        self.unified_argmax_logits = Some(alloc_model_buffer::<B>(
+            "llama.scratch.unified_argmax_logits",
+            capacity * cfg.vocab_size,
+        ));
+        self.unified_argmax_logits_capacity = capacity;
     }
 
     /// Grow unified-path scratch buffers to accommodate `m_total` query

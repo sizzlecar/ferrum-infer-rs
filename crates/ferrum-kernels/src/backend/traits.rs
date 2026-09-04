@@ -1567,6 +1567,12 @@ pub trait Backend: Send + Sync + Sized + 'static {
         ))
     }
 
+    /// Whether this backend can apply a per-row sparse repetition penalty and
+    /// select the greedy token without reading full logits back to the host.
+    fn supports_argmax_rows_f16_sparse_repetition_penalty() -> bool {
+        false
+    }
+
     /// Greedy-decode fast path with sparse repetition penalty.
     ///
     /// `row_offsets` has length `m + 1` and indexes into `token_ids`; row `r`

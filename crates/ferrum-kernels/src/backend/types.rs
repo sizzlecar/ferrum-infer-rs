@@ -5,6 +5,24 @@ use half::{bf16, f16};
 use super::traits::{Backend, BackendKvDtype};
 use ferrum_interfaces::kv_dtype::{KvDtypeKind, KvFp16};
 
+/// Number of score slots to reserve for a paged-attention launch.
+///
+/// CUDA graphs freeze dynamic shared-memory size at capture time. Rounding a
+/// short live KV length up to a power-of-two bucket keeps a captured launch
+/// safe for later lengths in the same bucket without reserving the model's
+/// entire configured context window on every decode step. Above 16K, retain
+/// the exact length: rounding 16,385 scores to 32K would require 128 KiB of
+/// dynamic shared memory and make otherwise valid launches fail on GPUs with
+/// the common 96-100 KiB per-block opt-in limit.
+pub fn attention_score_capacity_bucket(kv_len: usize) -> usize {
+    let live_len = kv_len.max(1);
+    if live_len > 16_384 {
+        live_len
+    } else {
+        live_len.checked_next_power_of_two().unwrap_or(live_len)
+    }
+}
+
 /// Source dtype for a weight tensor read straight from safetensors mmap.
 ///
 /// Passed to `Backend::from_weight_bytes` so each backend can choose whether
@@ -227,4 +245,21 @@ pub struct MoeRouting<B: Backend + ?Sized> {
     pub sorted_token_ids: B::Buffer,
     pub expert_ids: B::Buffer,
     pub num_tokens_past_padded: B::Buffer,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attention_score_capacity_bucket;
+
+    #[test]
+    fn attention_score_capacity_tracks_live_kv_by_power_of_two() {
+        assert_eq!(attention_score_capacity_bucket(0), 1);
+        assert_eq!(attention_score_capacity_bucket(1), 1);
+        assert_eq!(attention_score_capacity_bucket(128), 128);
+        assert_eq!(attention_score_capacity_bucket(129), 256);
+        assert_eq!(attention_score_capacity_bucket(300), 512);
+        assert_eq!(attention_score_capacity_bucket(16_384), 16_384);
+        assert_eq!(attention_score_capacity_bucket(16_385), 16_385);
+        assert_eq!(attention_score_capacity_bucket(25_000), 25_000);
+    }
 }

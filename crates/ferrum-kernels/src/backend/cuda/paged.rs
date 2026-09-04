@@ -1028,13 +1028,11 @@ impl BackendPagedKv for CudaBackend {
         // Compute shared_bytes BEFORE the launch builder so we can opt into
         // the extended dynamic shared-memory limit if needed.
         //
-        // CUDA graph capture freezes `shared_mem_bytes` at capture time;
-        // graph keys at the engine level are (m_total, num_seqs) — they
-        // do NOT distinguish kv_len buckets. So a graph captured at
-        // kv_len=300 (shared=300*4) replays unchanged at kv_len=600 →
-        // kernel writes scores[300..600] OOB into shared. Allocate the
-        // worst-case kv slot length so any future replay is safe.
-        let shared_kv = cuda_paged_runtime_config().shared_kv_for(max_kv_len);
+        // CUDA graph capture freezes `shared_mem_bytes` at capture time. The
+        // unified graph key carries the same power-of-two KV bucket, so replay
+        // remains safe while short-context batches avoid reserving the whole
+        // configured context window per CTA.
+        let shared_kv = crate::backend::attention_score_capacity_bucket(max_kv_len);
         let shared_bytes = (shared_kv as u32) * 4;
         // If shared exceeds the default 48 KB per-block budget, opt into
         // the extended limit (sm_89/Hopper/Blackwell support up to
