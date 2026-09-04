@@ -8,7 +8,7 @@ use ferrum_bench_core::decode_isolation::{
     DecodeIsolationRequestEvidence, DecodeIsolationRunReport,
 };
 use ferrum_bench_core::{
-    BenchmarkPhase, ItlEligibility, OutputTokenCountSource, QualityIssueCounts,
+    BenchmarkPhase, ItlEvidenceSource, OutputTokenCountSource, QualityIssueCounts,
 };
 use ferrum_types::Result;
 use rand::{rngs::StdRng, SeedableRng};
@@ -141,7 +141,7 @@ pub(super) async fn run_once(
             ),
         )
         .await;
-        if !record_contract_valid(&record, incumbent_output_tokens, true) {
+        if !record_contract_valid(&record, incumbent_output_tokens) {
             warmup_valid = false;
         }
     }
@@ -252,11 +252,11 @@ pub(super) async fn run_once(
     }));
 
     let progress_deadline = tokio::time::Instant::now() + Duration::from_secs_f64(cmd.timeout);
-    let aggressor_first_token = match wait_for_output_events(
+    let aggressor_first_output_event = match wait_for_output_events(
         &mut aggressor_progress_rx,
         1,
         progress_deadline,
-        "aggressor first token",
+        "aggressor first output event",
     )
     .await
     {
@@ -267,8 +267,8 @@ pub(super) async fn run_once(
         }
     };
 
-    let Some(aggressor_first_token) = aggressor_first_token else {
-        invalid_reasons.push("aggressor produced no observable first token".to_string());
+    let Some(aggressor_first_output_event) = aggressor_first_output_event else {
+        invalid_reasons.push("aggressor produced no observable first output event".to_string());
         let (incumbents, incumbent_errors) = drain_tasks(&mut incumbent_handles, true).await;
         let (mut aggressors, aggressor_errors) = drain_tasks(&mut aggressor_handles, true).await;
         invalid_reasons.extend(incumbent_errors);
@@ -286,7 +286,7 @@ pub(super) async fn run_once(
         );
     };
 
-    // Snapshot at the observed aggressor first-token signal, then require a
+    // Snapshot at the observed aggressor first-output-event signal, then require a
     // strictly later event from every incumbent. This proves each stream was
     // still live; zero progress inside the interference window remains a valid
     // starvation measurement rather than an orchestration failure.
@@ -326,7 +326,7 @@ pub(super) async fn run_once(
         progressed_after,
         run_origin,
         injection_at,
-        aggressor_first_token,
+        aggressor_first_output_event,
         incumbents,
         aggressor,
         invalid_reasons,
@@ -388,11 +388,11 @@ fn finish_report(
     config: &DecodeIsolationConfig,
     warmup_valid: bool,
     incumbents_ready: u32,
-    aggressor_first_token_observed: bool,
+    aggressor_first_output_event_observed: bool,
     progressed_after: u32,
     run_origin: Instant,
     injection_at: Instant,
-    aggressor_first_token: Instant,
+    aggressor_first_output_event: Instant,
     incumbents: Vec<Option<ObservedRequest>>,
     aggressor: Option<ObservedRequest>,
     mut invalid_reasons: Vec<String>,
@@ -407,7 +407,6 @@ fn finish_report(
                         "incumbent",
                         request,
                         config.incumbent_output_tokens as usize,
-                        true,
                     )
                 })
                 .unwrap_or_else(|| missing_evidence("incumbent"))
@@ -420,7 +419,6 @@ fn finish_report(
                 "aggressor",
                 request,
                 config.aggressor_output_tokens as usize,
-                false,
             )
         })
         .unwrap_or_else(|| missing_evidence("aggressor"));
@@ -436,11 +434,11 @@ fn finish_report(
             request
                 .output_event_times
                 .iter()
-                .any(|event| *event > aggressor_first_token)
+                .any(|event| *event > aggressor_first_output_event)
         })
         .count() as u32;
     let orchestration_valid = incumbents_ready == config.incumbents
-        && aggressor_first_token_observed
+        && aggressor_first_output_event_observed
         && progressed_after == config.incumbents
         && timestamp_progressed_after == config.incumbents;
     if !all_incumbents_valid {
@@ -466,7 +464,7 @@ fn finish_report(
         && orchestration_valid
         && invalid_reasons.is_empty();
 
-    let (metrics, aggressor_ttft_ms) = if all_valid {
+    let (metrics, aggressor_time_to_first_output_event_ms) = if all_valid {
         let timelines: Vec<_> = incumbents
             .iter()
             .filter_map(Option::as_ref)
@@ -481,13 +479,13 @@ fn finish_report(
         match analyze_decode_isolation(
             &timelines,
             elapsed_ms(run_origin, injection_at),
-            elapsed_ms(run_origin, aggressor_first_token),
+            elapsed_ms(run_origin, aggressor_first_output_event),
         ) {
             Ok(metrics) => (
                 Some(metrics),
                 aggressor
                     .as_ref()
-                    .map(|request| elapsed_ms(request.started_at, aggressor_first_token)),
+                    .map(|request| elapsed_ms(request.started_at, aggressor_first_output_event)),
             ),
             Err(error) => {
                 invalid_reasons.push(format!("invalid event timeline: {error}"));
@@ -497,18 +495,19 @@ fn finish_report(
     } else {
         (None, None)
     };
-    let all_valid = all_valid && metrics.is_some() && aggressor_ttft_ms.is_some();
+    let all_valid =
+        all_valid && metrics.is_some() && aggressor_time_to_first_output_event_ms.is_some();
     DecodeIsolationRunReport {
         repeat,
         orchestration: DecodeIsolationOrchestrationEvidence {
             incumbents_expected: config.incumbents,
             incumbents_ready_before_injection: incumbents_ready,
             all_incumbents_ready_before_injection: incumbents_ready == config.incumbents,
-            aggressor_first_token_observed,
-            incumbents_progressed_after_aggressor_first_token: timestamp_progressed_after,
-            every_incumbent_progressed_after_aggressor_first_token: timestamp_progressed_after
-                == config.incumbents
-                && progressed_after == config.incumbents,
+            aggressor_first_output_event_observed,
+            incumbents_progressed_after_aggressor_first_output_event: timestamp_progressed_after,
+            every_incumbent_progressed_after_aggressor_first_output_event:
+                timestamp_progressed_after == config.incumbents
+                    && progressed_after == config.incumbents,
             all_tasks_drained: true,
         },
         validity: DecodeIsolationEvidenceValidity {
@@ -520,7 +519,7 @@ fn finish_report(
             invalid_reasons,
         },
         metrics,
-        aggressor_ttft_ms,
+        aggressor_time_to_first_output_event_ms,
         incumbents: incumbent_evidence,
         aggressor: aggressor_evidence,
     }
@@ -532,7 +531,7 @@ fn invalid_report(
     config: &DecodeIsolationConfig,
     warmup_valid: bool,
     incumbents_ready: u32,
-    aggressor_first_token_observed: bool,
+    aggressor_first_output_event_observed: bool,
     progressed_after: u32,
     incumbents: Vec<Option<ObservedRequest>>,
     aggressor: Option<ObservedRequest>,
@@ -544,7 +543,7 @@ fn invalid_report(
         config,
         warmup_valid,
         incumbents_ready,
-        aggressor_first_token_observed,
+        aggressor_first_output_event_observed,
         progressed_after,
         now,
         now,
@@ -558,34 +557,48 @@ fn invalid_report(
 fn record_contract_valid(
     record: &ferrum_bench_core::RequestRecord,
     expected_output_tokens: usize,
-    require_itl: bool,
 ) -> bool {
     record.success
         && record.output_token_count_source == OutputTokenCountSource::Usage
         && usize::try_from(record.output_tokens).ok() == Some(expected_output_tokens)
-        && (!require_itl || record.itl_evidence.is_eligible())
+        && output_event_timing_valid(record)
+}
+
+fn output_event_timing_valid(record: &ferrum_bench_core::RequestRecord) -> bool {
+    let evidence = &record.itl_evidence;
+    evidence.source == ItlEvidenceSource::SseDeltaEvents
+        && evidence.output_events > 0
+        && evidence.observed_intervals == evidence.output_events.saturating_sub(1)
+        && evidence.transport_coalesced_output_chunks == 0
 }
 
 fn request_evidence(
     role: &str,
     request: &ObservedRequest,
     expected_output_tokens: usize,
-    require_itl: bool,
 ) -> DecodeIsolationRequestEvidence {
+    let output_event_timing_valid = output_event_timing_valid(&request.record);
     DecodeIsolationRequestEvidence {
         role: role.to_string(),
         server_request_id: request.record.server_request_id.clone(),
         success: request.record.success,
-        contract_valid: record_contract_valid(&request.record, expected_output_tokens, require_itl),
+        contract_valid: record_contract_valid(&request.record, expected_output_tokens),
         input_tokens: request.record.input_tokens,
-        output_tokens: request.record.output_tokens,
+        usage_output_tokens: (request.record.output_token_count_source
+            == OutputTokenCountSource::Usage)
+            .then_some(request.record.output_tokens),
         output_token_count_source: request
             .record
             .output_token_count_source
             .as_str()
             .to_string(),
-        itl_eligibility: request.record.itl_evidence.eligibility,
-        output_events: request.record.itl_evidence.output_events,
+        observable_output_events: request.record.itl_evidence.output_events,
+        observable_output_intervals: request.record.itl_evidence.observed_intervals,
+        transport_coalesced_output_chunks: request
+            .record
+            .itl_evidence
+            .transport_coalesced_output_chunks,
+        output_event_timing_valid,
         quality_issues: request.record.quality_issues.clone(),
     }
 }
@@ -599,10 +612,12 @@ fn missing_evidence(role: &str) -> DecodeIsolationRequestEvidence {
         success: false,
         contract_valid: false,
         input_tokens: 0,
-        output_tokens: 0,
+        usage_output_tokens: None,
         output_token_count_source: "none".to_string(),
-        itl_eligibility: ItlEligibility::RequestFailed,
-        output_events: 0,
+        observable_output_events: 0,
+        observable_output_intervals: 0,
+        transport_coalesced_output_chunks: 0,
+        output_event_timing_valid: false,
         quality_issues,
     }
 }
@@ -623,7 +638,7 @@ mod tests {
         DecodeIsolationCapabilities, DecodeIsolationErrorPolicy, DecodeIsolationScenarioContract,
         DecodeIsolationWindowEnd,
     };
-    use ferrum_bench_core::BENCHMARK_REQUEST_INDEX_HEADER;
+    use ferrum_bench_core::{RequestItlEvidence, RequestRecord, BENCHMARK_REQUEST_INDEX_HEADER};
     use serde_json::Value;
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -634,6 +649,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum MockMode {
         Normal,
+        EventUsageMismatch,
         Starvation,
         EarlyFinish,
         InvalidUsage,
@@ -796,6 +812,9 @@ mod tests {
             baseline
         };
         for token in start..max_tokens {
+            if state.mode == MockMode::EventUsageMismatch && token + 1 == max_tokens {
+                continue;
+            }
             if !send_token(&tx, request_index, token).await {
                 return;
             }
@@ -873,8 +892,8 @@ mod tests {
                 baseline_output_events_per_incumbent: 2,
                 fixed_output_budget: true,
                 injection_requires_all_incumbents_ready: true,
-                interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputToken,
-                post_aggressor_progress_required_per_incumbent: true,
+                interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputEvent,
+                post_aggressor_observable_progress_required_per_incumbent: true,
                 minimum_aggressor_scheduled_chunks: 4,
                 kv_capacity_headroom_numerator: 9,
                 kv_capacity_headroom_denominator: 10,
@@ -921,6 +940,62 @@ mod tests {
         cmd
     }
 
+    fn request_record(
+        usage_tokens: u32,
+        output_events: u32,
+        coalesced_chunks: u32,
+    ) -> RequestRecord {
+        RequestRecord {
+            benchmark_correlation: None,
+            server_request_id: Some("chatcmpl-test".to_string()),
+            success: true,
+            ttft_ms: 1.0,
+            e2e_ms: 2.0,
+            input_tokens: 8,
+            output_tokens: usage_tokens,
+            output_token_count_source: OutputTokenCountSource::Usage,
+            itl_evidence: RequestItlEvidence::sse(
+                true,
+                output_events,
+                Some(usage_tokens),
+                output_events.saturating_sub(1),
+                coalesced_chunks,
+            ),
+            quality_issues: QualityIssueCounts::default(),
+            itl_ms: vec![1.0; output_events.saturating_sub(1) as usize],
+        }
+    }
+
+    #[test]
+    fn output_event_contract_does_not_assume_one_text_event_per_token() {
+        let fewer_text_events = request_record(128, 124, 0);
+        assert!(record_contract_valid(&fewer_text_events, 128));
+
+        let wrong_usage = request_record(127, 124, 0);
+        assert!(!record_contract_valid(&wrong_usage, 128));
+
+        let coalesced = request_record(128, 124, 1);
+        assert!(!record_contract_valid(&coalesced, 128));
+
+        let no_observable_output = request_record(1, 0, 0);
+        assert!(!record_contract_valid(&no_observable_output, 1));
+    }
+
+    #[test]
+    fn missing_usage_is_not_reported_as_usage_tokens() {
+        let mut record = request_record(4, 4, 0);
+        record.output_token_count_source = OutputTokenCountSource::StreamChunks;
+        record.itl_evidence.usage_output_tokens = None;
+        let request = ObservedRequest {
+            record,
+            started_at: Instant::now(),
+            output_event_times: vec![Instant::now(); 4],
+        };
+        let evidence = request_evidence("incumbent", &request, 4);
+        assert_eq!(evidence.usage_output_tokens, None);
+        assert!(!evidence.contract_valid);
+    }
+
     #[tokio::test]
     async fn progress_wait_distinguishes_ready_finished_and_timeout() {
         let (tx, mut rx) = watch::channel(DecodeStreamProgress::default());
@@ -963,7 +1038,7 @@ mod tests {
         assert!(
             report
                 .orchestration
-                .every_incumbent_progressed_after_aggressor_first_token
+                .every_incumbent_progressed_after_aggressor_first_output_event
         );
         let events = server.state.events.lock().unwrap();
         let baseline = events
@@ -978,6 +1053,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn event_usage_mismatch_preserves_output_event_gap_evidence() {
+        let server = start_mock(MockMode::EventUsageMismatch, 1, 2).await;
+        let report = run_once(
+            &command(1.0),
+            &context(&server),
+            &test_config(),
+            prepared(0),
+        )
+        .await;
+        assert!(report.validity.all_valid, "{:?}", report.validity);
+        assert!(report.metrics.is_some());
+        assert_eq!(report.incumbents[0].usage_output_tokens, Some(6));
+        assert_eq!(report.incumbents[0].observable_output_events, 5);
+        assert!(report.incumbents[0].output_event_timing_valid);
+    }
+
+    #[tokio::test]
+    async fn event_usage_mismatch_does_not_invalidate_warmup() {
+        let server = start_mock(MockMode::EventUsageMismatch, 1, 2).await;
+        let report = run_once(
+            &command(1.0),
+            &context(&server),
+            &test_config(),
+            prepared(1),
+        )
+        .await;
+        assert!(report.validity.warmup_valid, "{:?}", report.validity);
+        assert!(report.validity.all_valid, "{:?}", report.validity);
+    }
+
+    #[tokio::test]
     async fn zero_decode_progress_is_valid_starvation_evidence() {
         let server = start_mock(MockMode::Starvation, 1, 2).await;
         let report = run_once(
@@ -988,7 +1094,7 @@ mod tests {
         )
         .await;
         assert!(report.validity.all_valid, "{:?}", report.validity);
-        assert_eq!(report.metrics.unwrap().decode_progress_events, 0);
+        assert_eq!(report.metrics.unwrap().observable_output_progress_events, 0);
     }
 
     #[tokio::test]
@@ -1003,7 +1109,7 @@ mod tests {
         .await;
         assert!(!report.validity.all_valid);
         assert!(report.metrics.is_none());
-        assert!(report.aggressor_ttft_ms.is_none());
+        assert!(report.aggressor_time_to_first_output_event_ms.is_none());
         assert!(report.orchestration.all_tasks_drained);
     }
 
@@ -1034,11 +1140,11 @@ mod tests {
         .await;
         assert!(!report.validity.warmup_valid);
         assert!(report.metrics.is_none());
-        assert!(report.aggressor_ttft_ms.is_none());
+        assert!(report.aggressor_time_to_first_output_event_ms.is_none());
     }
 
     #[tokio::test]
-    async fn first_token_timeout_aborts_and_drains_all_streams() {
+    async fn first_output_event_timeout_aborts_and_drains_all_streams() {
         let server = start_mock(MockMode::HangAggressor, 1, 2).await;
         let report = run_once(
             &command(0.08),

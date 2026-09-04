@@ -184,7 +184,7 @@ pub enum Scenario {
     /// `ferrum bench` single-user batch=1. Headline: TTFT + TPOT.
     Cli,
     /// Live decoders observed before and during an injected long prefill.
-    /// Headline: interference-window ITL and decode progress.
+    /// Headline: interference-window output-event gaps and observable progress.
     DecodeIsolation,
 }
 

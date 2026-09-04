@@ -4,7 +4,7 @@
 //! clock. This module classifies inter-event gaps before and during a long
 //! prefill request without embedding a pass/fail performance threshold.
 
-use crate::{percentile, Env, EnvHash, ItlEligibility, QualityIssueCounts, ScalarStats, Scenario};
+use crate::{percentile, Env, EnvHash, QualityIssueCounts, ScalarStats, Scenario};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,14 +14,14 @@ pub struct DecodeEventTimeline {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct DecodeLatencySummary {
+pub struct OutputEventGapSummary {
     pub samples: u64,
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub max_ms: f64,
 }
 
-impl DecodeLatencySummary {
+impl OutputEventGapSummary {
     fn from_samples(samples: &[f64]) -> Self {
         Self {
             samples: samples.len().try_into().unwrap_or(u64::MAX),
@@ -34,18 +34,20 @@ impl DecodeLatencySummary {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodeIsolationWindowMetrics {
-    pub baseline_itl: DecodeLatencySummary,
-    pub interference_itl: DecodeLatencySummary,
-    pub maximum_decode_gap_ms: f64,
-    pub decode_progress_events: u64,
-    pub incumbents_with_progress: u32,
+    /// Gaps between user-visible SSE text events before aggressor injection.
+    pub baseline_output_event_gap: OutputEventGapSummary,
+    /// Gaps between user-visible SSE text events while the aggressor prefills.
+    pub interference_output_event_gap: OutputEventGapSummary,
+    pub maximum_output_event_gap_ms: f64,
+    pub observable_output_progress_events: u64,
+    pub incumbents_with_observable_output_progress: u32,
 }
 
 /// End marker for the only interval in which prefill interference is measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecodeIsolationWindowEnd {
-    AggressorFirstOutputToken,
+    AggressorFirstOutputEvent,
 }
 
 /// Behavior when the wire contract or orchestration invariants are invalid.
@@ -64,7 +66,7 @@ pub struct DecodeIsolationScenarioContract {
     pub fixed_output_budget: bool,
     pub injection_requires_all_incumbents_ready: bool,
     pub interference_window_end: DecodeIsolationWindowEnd,
-    pub post_aggressor_progress_required_per_incumbent: bool,
+    pub post_aggressor_observable_progress_required_per_incumbent: bool,
     /// Minimum number of scheduler token chunks covered by the long prefill.
     pub minimum_aggressor_scheduled_chunks: u32,
     pub kv_capacity_headroom_numerator: u32,
@@ -116,10 +118,13 @@ pub struct DecodeIsolationRequestEvidence {
     pub success: bool,
     pub contract_valid: bool,
     pub input_tokens: u32,
-    pub output_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_output_tokens: Option<u32>,
     pub output_token_count_source: String,
-    pub itl_eligibility: ItlEligibility,
-    pub output_events: u32,
+    pub observable_output_events: u32,
+    pub observable_output_intervals: u32,
+    pub transport_coalesced_output_chunks: u32,
+    pub output_event_timing_valid: bool,
     pub quality_issues: QualityIssueCounts,
 }
 
@@ -128,9 +133,9 @@ pub struct DecodeIsolationOrchestrationEvidence {
     pub incumbents_expected: u32,
     pub incumbents_ready_before_injection: u32,
     pub all_incumbents_ready_before_injection: bool,
-    pub aggressor_first_token_observed: bool,
-    pub incumbents_progressed_after_aggressor_first_token: u32,
-    pub every_incumbent_progressed_after_aggressor_first_token: bool,
+    pub aggressor_first_output_event_observed: bool,
+    pub incumbents_progressed_after_aggressor_first_output_event: u32,
+    pub every_incumbent_progressed_after_aggressor_first_output_event: bool,
     pub all_tasks_drained: bool,
 }
 
@@ -156,22 +161,22 @@ pub struct DecodeIsolationRunReport {
     pub metrics: Option<DecodeIsolationWindowMetrics>,
     /// Absent under the same validity rule as `metrics`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub aggressor_ttft_ms: Option<f64>,
+    pub aggressor_time_to_first_output_event_ms: Option<f64>,
     pub incumbents: Vec<DecodeIsolationRequestEvidence>,
     pub aggressor: DecodeIsolationRequestEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecodeIsolationAggregate {
-    pub baseline_itl_p50_ms: ScalarStats,
-    pub baseline_itl_p95_ms: ScalarStats,
-    pub interference_itl_p50_ms: ScalarStats,
-    pub interference_itl_p95_ms: ScalarStats,
-    pub maximum_decode_gap_ms: ScalarStats,
-    pub decode_progress_events: ScalarStats,
-    pub incumbents_with_progress: ScalarStats,
-    pub incumbent_progress_fraction: ScalarStats,
-    pub aggressor_ttft_ms: ScalarStats,
+    pub baseline_output_event_gap_p50_ms: ScalarStats,
+    pub baseline_output_event_gap_p95_ms: ScalarStats,
+    pub interference_output_event_gap_p50_ms: ScalarStats,
+    pub interference_output_event_gap_p95_ms: ScalarStats,
+    pub maximum_output_event_gap_ms: ScalarStats,
+    pub observable_output_progress_events: ScalarStats,
+    pub incumbents_with_observable_output_progress: ScalarStats,
+    pub incumbent_observable_output_progress_fraction: ScalarStats,
+    pub aggressor_time_to_first_output_event_ms: ScalarStats,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +210,7 @@ pub fn aggregate_decode_isolation_runs(
             }
             Some((
                 run.metrics.as_ref()?,
-                run.aggressor_ttft_ms?,
+                run.aggressor_time_to_first_output_event_ms?,
                 run.orchestration.incumbents_expected,
             ))
         })
@@ -217,21 +222,33 @@ pub fn aggregate_decode_isolation_runs(
         ScalarStats::from_samples(&valid.iter().map(value).collect::<Vec<_>>())
     };
     Some(DecodeIsolationAggregate {
-        baseline_itl_p50_ms: stats(|(metrics, _, _)| metrics.baseline_itl.p50_ms),
-        baseline_itl_p95_ms: stats(|(metrics, _, _)| metrics.baseline_itl.p95_ms),
-        interference_itl_p50_ms: stats(|(metrics, _, _)| metrics.interference_itl.p50_ms),
-        interference_itl_p95_ms: stats(|(metrics, _, _)| metrics.interference_itl.p95_ms),
-        maximum_decode_gap_ms: stats(|(metrics, _, _)| metrics.maximum_decode_gap_ms),
-        decode_progress_events: stats(|(metrics, _, _)| metrics.decode_progress_events as f64),
-        incumbents_with_progress: stats(|(metrics, _, _)| metrics.incumbents_with_progress as f64),
-        incumbent_progress_fraction: stats(|(metrics, _, expected)| {
+        baseline_output_event_gap_p50_ms: stats(|(metrics, _, _)| {
+            metrics.baseline_output_event_gap.p50_ms
+        }),
+        baseline_output_event_gap_p95_ms: stats(|(metrics, _, _)| {
+            metrics.baseline_output_event_gap.p95_ms
+        }),
+        interference_output_event_gap_p50_ms: stats(|(metrics, _, _)| {
+            metrics.interference_output_event_gap.p50_ms
+        }),
+        interference_output_event_gap_p95_ms: stats(|(metrics, _, _)| {
+            metrics.interference_output_event_gap.p95_ms
+        }),
+        maximum_output_event_gap_ms: stats(|(metrics, _, _)| metrics.maximum_output_event_gap_ms),
+        observable_output_progress_events: stats(|(metrics, _, _)| {
+            metrics.observable_output_progress_events as f64
+        }),
+        incumbents_with_observable_output_progress: stats(|(metrics, _, _)| {
+            metrics.incumbents_with_observable_output_progress as f64
+        }),
+        incumbent_observable_output_progress_fraction: stats(|(metrics, _, expected)| {
             if *expected == 0 {
                 0.0
             } else {
-                metrics.incumbents_with_progress as f64 / f64::from(*expected)
+                metrics.incumbents_with_observable_output_progress as f64 / f64::from(*expected)
             }
         }),
-        aggressor_ttft_ms: stats(|(_, ttft, _)| *ttft),
+        aggressor_time_to_first_output_event_ms: stats(|(_, first_event_ms, _)| *first_event_ms),
     })
 }
 
@@ -239,19 +256,19 @@ pub fn aggregate_decode_isolation_runs(
 ///
 /// Baseline samples end at or before `injection_ms`. Interference samples are
 /// complete inter-event gaps that overlap `[injection_ms,
-/// aggressor_first_token_ms]`; retaining boundary-crossing gaps is important,
+/// aggressor_first_output_event_ms]`; retaining boundary-crossing gaps is important,
 /// because a fully starved decoder may emit no event inside the window. Decode
 /// progress counts events observed strictly after injection through the
-/// aggressor's first token, inclusive.
+/// aggressor's first observable output event, inclusive.
 pub fn analyze_decode_isolation(
     timelines: &[DecodeEventTimeline],
     injection_ms: f64,
-    aggressor_first_token_ms: f64,
+    aggressor_first_output_event_ms: f64,
 ) -> Result<DecodeIsolationWindowMetrics, String> {
     if !injection_ms.is_finite()
-        || !aggressor_first_token_ms.is_finite()
+        || !aggressor_first_output_event_ms.is_finite()
         || injection_ms < 0.0
-        || aggressor_first_token_ms < injection_ms
+        || aggressor_first_output_event_ms < injection_ms
     {
         return Err("decode-isolation window must be finite and ordered".to_string());
     }
@@ -259,7 +276,7 @@ pub fn analyze_decode_isolation(
     let mut baseline = Vec::new();
     let mut interference = Vec::new();
     let mut progress = 0_u64;
-    let mut incumbents_with_progress = 0_u32;
+    let mut incumbents_with_observable_output_progress = 0_u32;
 
     for timeline in timelines {
         if timeline
@@ -272,13 +289,13 @@ pub fn analyze_decode_isolation(
         let request_progress = timeline
             .output_event_ms
             .iter()
-            .filter(|&&event| event > injection_ms && event <= aggressor_first_token_ms)
+            .filter(|&&event| event > injection_ms && event <= aggressor_first_output_event_ms)
             .count();
         progress = progress
             .checked_add(request_progress.try_into().unwrap_or(u64::MAX))
             .ok_or_else(|| "decode progress count overflow".to_string())?;
         if request_progress > 0 {
-            incumbents_with_progress = incumbents_with_progress
+            incumbents_with_observable_output_progress = incumbents_with_observable_output_progress
                 .checked_add(1)
                 .ok_or_else(|| "incumbent progress count overflow".to_string())?;
         }
@@ -288,20 +305,20 @@ pub fn analyze_decode_isolation(
             if pair[1] <= injection_ms {
                 baseline.push(gap);
             }
-            if pair[0] < aggressor_first_token_ms && pair[1] > injection_ms {
+            if pair[0] < aggressor_first_output_event_ms && pair[1] > injection_ms {
                 interference.push(gap);
             }
         }
     }
 
-    let baseline_itl = DecodeLatencySummary::from_samples(&baseline);
-    let interference_itl = DecodeLatencySummary::from_samples(&interference);
+    let baseline_output_event_gap = OutputEventGapSummary::from_samples(&baseline);
+    let interference_output_event_gap = OutputEventGapSummary::from_samples(&interference);
     Ok(DecodeIsolationWindowMetrics {
-        baseline_itl,
-        maximum_decode_gap_ms: interference_itl.max_ms,
-        interference_itl,
-        decode_progress_events: progress,
-        incumbents_with_progress,
+        baseline_output_event_gap,
+        maximum_output_event_gap_ms: interference_output_event_gap.max_ms,
+        interference_output_event_gap,
+        observable_output_progress_events: progress,
+        incumbents_with_observable_output_progress,
     })
 }
 
@@ -316,10 +333,12 @@ mod tests {
             success: true,
             contract_valid: true,
             input_tokens: 8,
-            output_tokens: 4,
+            usage_output_tokens: Some(4),
             output_token_count_source: "usage".to_string(),
-            itl_eligibility: ItlEligibility::Eligible,
-            output_events: 4,
+            observable_output_events: 4,
+            observable_output_intervals: 3,
+            transport_coalesced_output_chunks: 0,
+            output_event_timing_valid: true,
             quality_issues: QualityIssueCounts::default(),
         };
         DecodeIsolationRunReport {
@@ -328,9 +347,9 @@ mod tests {
                 incumbents_expected: 1,
                 incumbents_ready_before_injection: 1,
                 all_incumbents_ready_before_injection: true,
-                aggressor_first_token_observed: true,
-                incumbents_progressed_after_aggressor_first_token: 1,
-                every_incumbent_progressed_after_aggressor_first_token: true,
+                aggressor_first_output_event_observed: true,
+                incumbents_progressed_after_aggressor_first_output_event: 1,
+                every_incumbent_progressed_after_aggressor_first_output_event: true,
                 all_tasks_drained: true,
             },
             validity: DecodeIsolationEvidenceValidity {
@@ -342,19 +361,19 @@ mod tests {
                 invalid_reasons: vec![],
             },
             metrics: Some(DecodeIsolationWindowMetrics {
-                baseline_itl: DecodeLatencySummary::from_samples(&[2.0, 3.0]),
-                interference_itl: DecodeLatencySummary::from_samples(&[6.0]),
-                maximum_decode_gap_ms: 6.0,
-                decode_progress_events: 1,
-                incumbents_with_progress: 1,
+                baseline_output_event_gap: OutputEventGapSummary::from_samples(&[2.0, 3.0]),
+                interference_output_event_gap: OutputEventGapSummary::from_samples(&[6.0]),
+                maximum_output_event_gap_ms: 6.0,
+                observable_output_progress_events: 1,
+                incumbents_with_observable_output_progress: 1,
             }),
-            aggressor_ttft_ms: Some(5.0),
+            aggressor_time_to_first_output_event_ms: Some(5.0),
             incumbents: vec![evidence.clone()],
             aggressor: DecodeIsolationRequestEvidence {
                 role: "aggressor".to_string(),
-                output_tokens: 1,
-                output_events: 1,
-                itl_eligibility: ItlEligibility::TooShort,
+                usage_output_tokens: Some(1),
+                observable_output_events: 1,
+                observable_output_intervals: 0,
                 ..evidence
             },
         }
@@ -376,12 +395,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(metrics.baseline_itl.samples, 4);
-        assert_eq!(metrics.baseline_itl.p50_ms, 10.0);
-        assert_eq!(metrics.interference_itl.samples, 4);
-        assert_eq!(metrics.maximum_decode_gap_ms, 50.0);
-        assert_eq!(metrics.decode_progress_events, 3);
-        assert_eq!(metrics.incumbents_with_progress, 2);
+        assert_eq!(metrics.baseline_output_event_gap.samples, 4);
+        assert_eq!(metrics.baseline_output_event_gap.p50_ms, 10.0);
+        assert_eq!(metrics.interference_output_event_gap.samples, 4);
+        assert_eq!(metrics.maximum_output_event_gap_ms, 50.0);
+        assert_eq!(metrics.observable_output_progress_events, 3);
+        assert_eq!(metrics.incumbents_with_observable_output_progress, 2);
     }
 
     #[test]
@@ -395,10 +414,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(metrics.decode_progress_events, 0);
-        assert_eq!(metrics.incumbents_with_progress, 0);
-        assert_eq!(metrics.interference_itl.samples, 1);
-        assert_eq!(metrics.maximum_decode_gap_ms, 100.0);
+        assert_eq!(metrics.observable_output_progress_events, 0);
+        assert_eq!(metrics.incumbents_with_observable_output_progress, 0);
+        assert_eq!(metrics.interference_output_event_gap.samples, 1);
+        assert_eq!(metrics.maximum_output_event_gap_ms, 100.0);
     }
 
     #[test]
@@ -418,7 +437,7 @@ mod tests {
     fn report_contract_round_trips_json() {
         let run = valid_run();
         let report = DecodeIsolationReport {
-            schema_version: 1,
+            schema_version: 2,
             scenario: Scenario::DecodeIsolation,
             model: "model#tag".to_string(),
             backend: "cuda".to_string(),
@@ -450,8 +469,8 @@ mod tests {
                     baseline_output_events_per_incumbent: 2,
                     fixed_output_budget: true,
                     injection_requires_all_incumbents_ready: true,
-                    interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputToken,
-                    post_aggressor_progress_required_per_incumbent: true,
+                    interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputEvent,
+                    post_aggressor_observable_progress_required_per_incumbent: true,
                     minimum_aggressor_scheduled_chunks: 2,
                     kv_capacity_headroom_numerator: 9,
                     kv_capacity_headroom_denominator: 10,
@@ -468,7 +487,12 @@ mod tests {
             env_hash: Env::default().hash(),
         };
         let encoded = serde_json::to_string(&report).unwrap();
+        assert!(!encoded.contains("baseline_itl"));
+        assert!(!encoded.contains("interference_itl"));
+        assert!(!encoded.contains("aggressor_ttft"));
+        assert!(!encoded.contains("itl_eligibility"));
         let decoded: DecodeIsolationReport = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.schema_version, 2);
         assert_eq!(decoded.scenario, Scenario::DecodeIsolation);
         assert_eq!(decoded.model, "model#tag");
         assert!(decoded.aggregate.is_some());

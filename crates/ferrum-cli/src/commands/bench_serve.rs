@@ -9,7 +9,8 @@
 //!   - **Open-loop** — `--request-rate R`, Poisson(R) arrivals. The
 //!     ONLY scenario in which goodput is meaningful (§ 0.4).
 //!   - **Decode isolation** — live decoders establish a baseline, then one
-//!     long prefill is injected to measure decode progress and ITL disruption.
+//!     long prefill is injected to measure user-visible output progress and
+//!     output-event gap disruption.
 //!
 //! Each cell runs `--n-repeats` independent times; the per-run percentiles
 //! are aggregated with mean + sample stddev + Student-t 95% CI half-width.

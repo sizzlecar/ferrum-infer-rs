@@ -135,7 +135,7 @@ pub(super) async fn execute(cmd: &BenchServeCommand, ctx: &RunContext) -> Result
         None => cmd.model.clone(),
     };
     let report = DecodeIsolationReport {
-        schema_version: 1,
+        schema_version: 2,
         scenario: Scenario::DecodeIsolation,
         model,
         backend,
@@ -450,8 +450,8 @@ fn resolve_config(
                 .decode_isolation_baseline_events,
             fixed_output_budget: true,
             injection_requires_all_incumbents_ready: true,
-            interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputToken,
-            post_aggressor_progress_required_per_incumbent: true,
+            interference_window_end: DecodeIsolationWindowEnd::AggressorFirstOutputEvent,
+            post_aggressor_observable_progress_required_per_incumbent: true,
             minimum_aggressor_scheduled_chunks: MINIMUM_AGGRESSOR_SCHEDULED_CHUNKS,
             kv_capacity_headroom_numerator: KV_HEADROOM_NUMERATOR,
             kv_capacity_headroom_denominator: KV_HEADROOM_DENOMINATOR,
@@ -535,22 +535,25 @@ fn render_markdown(report: &DecodeIsolationReport) -> String {
         "# {} — decode isolation\n\nincumbents: {} · aggressor input: {} tokens\n\n",
         report.model, report.config.incumbents, report.config.aggressor_input_tokens
     );
-    output.push_str("| repeat | baseline p50/p95 ms | interference p50/p95 ms | max gap ms | decode progress | aggressor TTFT ms | valid |\n");
+    output.push_str("The output-event gap is measured between user-visible SSE text events; it is not token-level latency.\n\n");
+    output.push_str("| repeat | baseline event-gap p50/p95 ms | interference event-gap p50/p95 ms | max event gap ms | observable output progress | time to first output event ms | valid |\n");
     output.push_str("|---:|---:|---:|---:|---:|---:|:---:|\n");
     for run in &report.runs {
-        if let (true, Some(metrics), Some(ttft)) =
-            (run.validity.all_valid, &run.metrics, run.aggressor_ttft_ms)
-        {
+        if let (true, Some(metrics), Some(first_event_ms)) = (
+            run.validity.all_valid,
+            &run.metrics,
+            run.aggressor_time_to_first_output_event_ms,
+        ) {
             output.push_str(&format!(
                 "| {} | {:.2}/{:.2} | {:.2}/{:.2} | {:.2} | {} | {:.2} | yes |\n",
                 run.repeat + 1,
-                metrics.baseline_itl.p50_ms,
-                metrics.baseline_itl.p95_ms,
-                metrics.interference_itl.p50_ms,
-                metrics.interference_itl.p95_ms,
-                metrics.maximum_decode_gap_ms,
-                metrics.decode_progress_events,
-                ttft,
+                metrics.baseline_output_event_gap.p50_ms,
+                metrics.baseline_output_event_gap.p95_ms,
+                metrics.interference_output_event_gap.p50_ms,
+                metrics.interference_output_event_gap.p95_ms,
+                metrics.maximum_output_event_gap_ms,
+                metrics.observable_output_progress_events,
+                first_event_ms,
             ));
         } else {
             output.push_str(&format!(
@@ -585,6 +588,31 @@ mod tests {
         cmd.random_input_len = 128;
         cmd.random_output_len = 16;
         cmd
+    }
+
+    #[test]
+    fn markdown_names_output_event_evidence_without_token_latency_claims() {
+        let env = ferrum_bench_core::Env::default();
+        let report = DecodeIsolationReport {
+            schema_version: 2,
+            scenario: Scenario::DecodeIsolation,
+            model: "test-model".to_string(),
+            backend: "cpu".to_string(),
+            n_repeats: 0,
+            config: resolve_config(&command(), capabilities()).unwrap(),
+            aggregate: None,
+            runs: vec![],
+            all_evidence_valid: false,
+            semantic_correctness_evaluated: false,
+            env_hash: env.hash(),
+            env,
+        };
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("output-event gap"));
+        assert!(markdown.contains("observable output progress"));
+        assert!(markdown.contains("time to first output event"));
+        assert!(!markdown.contains("ITL"));
+        assert!(!markdown.contains("TTFT"));
     }
 
     #[test]
