@@ -6867,6 +6867,69 @@ mod tests {
         (router, engine)
     }
 
+    fn qwen36_chat_template() -> ModelChatTemplate {
+        ModelChatTemplate::new(
+            include_str!("../tests/fixtures/chat_template/Qwen__Qwen3.6-35B-A3B/template.jinja"),
+            "Qwen/Qwen3.6-35B-A3B",
+        )
+    }
+
+    async fn capture_qwen36_tool_history_request(
+        reasoning_fields: Value,
+        stream: bool,
+    ) -> InferenceRequest {
+        let mut assistant = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+            }]
+        });
+        assistant
+            .as_object_mut()
+            .expect("assistant message object")
+            .extend(
+                reasoning_fields
+                    .as_object()
+                    .expect("reasoning fields object")
+                    .clone(),
+            );
+        let (router, engine) = router_with_capturing_llm_and_template(qwen36_chat_template());
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [
+                    {"role": "user", "content": "Use the weather tool."},
+                    assistant,
+                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "description": "Get weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"city": {"type": "string"}},
+                            "required": ["city"]
+                        }
+                    }
+                }],
+                "stream": stream
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        if stream {
+            assert!(response_text(response).await.contains("[DONE]"));
+        }
+        engine.last_request()
+    }
+
     fn router_with_capturing_lora_llm() -> (Router, Arc<CapturingLlm>) {
         let engine = Arc::new(CapturingLlm::new());
         let router = AxumServer::from_llm(engine.clone())
@@ -9999,6 +10062,75 @@ mod tests {
             api.messages[1].tool_calls[0].function.arguments,
             "{\"city\":\"Paris\"}"
         );
+    }
+
+    #[tokio::test]
+    async fn route_replays_reasoning_content_in_qwen36_tool_history_sync() {
+        let compatibility = capture_qwen36_tool_history_request(
+            json!({"reasoning_content": "opencode-reasoning-marker"}),
+            false,
+        )
+        .await;
+        let canonical = capture_qwen36_tool_history_request(
+            json!({"reasoning": "opencode-reasoning-marker"}),
+            false,
+        )
+        .await;
+
+        assert_eq!(compatibility.prompt, canonical.prompt);
+        assert!(
+            compatibility.prompt.contains("opencode-reasoning-marker"),
+            "Qwen3.6 prompt dropped assistant reasoning history: {}",
+            compatibility.prompt
+        );
+        let message = &compatibility.metadata["openai_messages"][1];
+        assert_eq!(message["reasoning"], "opencode-reasoning-marker");
+        assert!(message.get("reasoning_content").is_none());
+    }
+
+    #[tokio::test]
+    async fn route_replays_reasoning_content_in_qwen36_tool_history_stream() {
+        let request = capture_qwen36_tool_history_request(
+            json!({"reasoning_content": "opencode-stream-reasoning-marker"}),
+            true,
+        )
+        .await;
+        assert!(
+            request.prompt.contains("opencode-stream-reasoning-marker"),
+            "Qwen3.6 streaming prompt dropped assistant reasoning history: {}",
+            request.prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn route_does_not_force_reasoning_into_templates_that_ignore_it() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+            "content-only-template",
+        );
+        let (router, engine) = router_with_capturing_llm_and_template(template);
+        let response = post_json(
+            router,
+            "/v1/chat/completions",
+            json!({
+                "model": "served-alias",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {
+                        "role": "assistant",
+                        "content": "visible answer",
+                        "reasoning_content": "hidden-reasoning-marker"
+                    },
+                    {"role": "user", "content": "continue"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+
+        let request = engine.last_request();
+        assert!(request.prompt.contains("visible answer"));
+        assert!(!request.prompt.contains("hidden-reasoning-marker"));
     }
 
     #[tokio::test]
