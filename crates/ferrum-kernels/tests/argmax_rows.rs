@@ -51,3 +51,75 @@ fn argmax_rows_f16_masked_returns_sentinel_without_finite_valid_token() {
         CudaBackend::argmax_rows_f16_masked(&mut ctx, &logits_dev, &mask_dev, 4, 1, 4).unwrap();
     assert_eq!(masked, vec![u32::MAX]);
 }
+
+#[test]
+fn argmax_rows_f16_sparse_repetition_penalty_selects_after_penalty() {
+    let mut ctx = CudaBackend::new_context();
+    let mut logits_dev = CudaBackend::from_slice_typed::<f16>(&[
+        f16::from_f32(10.0),
+        f16::from_f32(9.0),
+        f16::from_f32(1.0),
+        f16::from_f32(0.0),
+        f16::from_f32(1.0),
+        f16::from_f32(5.0),
+        f16::from_f32(4.0),
+        f16::from_f32(3.0),
+        f16::from_f32(-2.0),
+        f16::from_f32(-3.0),
+        f16::from_f32(-5.0),
+        f16::from_f32(-6.0),
+    ]);
+    let offsets_dev = CudaBackend::from_slice_typed::<u32>(&[0, 1, 2, 3]);
+    let token_ids_dev = CudaBackend::from_slice_typed::<u32>(&[0, 1, 0]);
+    let penalties_dev = CudaBackend::from_slice_typed::<f32>(&[2.0, 2.0, 2.0]);
+
+    let selected = CudaBackend::argmax_rows_f16_sparse_repetition_penalty(
+        &mut ctx,
+        &mut logits_dev,
+        None,
+        &offsets_dev,
+        &token_ids_dev,
+        &penalties_dev,
+        3,
+        3,
+        4,
+    )
+    .unwrap();
+
+    assert_eq!(selected, vec![1, 2, 1]);
+}
+
+#[test]
+fn argmax_rows_f16_sparse_repetition_penalty_respects_mask() {
+    let mut ctx = CudaBackend::new_context();
+    let mut logits_dev = CudaBackend::from_slice_typed::<f16>(&[
+        f16::from_f32(10.0),
+        f16::from_f32(9.0),
+        f16::from_f32(8.0),
+        f16::from_f32(0.0),
+        f16::from_f32(5.0),
+        f16::from_f32(9.0),
+        f16::from_f32(2.0),
+        f16::from_f32(4.0),
+    ]);
+    let mut mask_dev = CudaBackend::alloc_typed(Dtype::I8, 4);
+    CudaBackend::write_typed::<i8>(&mut ctx, &mut mask_dev, &[1, 0, 1, 1]);
+    let offsets_dev = CudaBackend::from_slice_typed::<u32>(&[0, 1, 2]);
+    let token_ids_dev = CudaBackend::from_slice_typed::<u32>(&[0, 0]);
+    let penalties_dev = CudaBackend::from_slice_typed::<f32>(&[2.0, 2.0]);
+
+    let selected = CudaBackend::argmax_rows_f16_sparse_repetition_penalty(
+        &mut ctx,
+        &mut logits_dev,
+        Some((&mask_dev, 4)),
+        &offsets_dev,
+        &token_ids_dev,
+        &penalties_dev,
+        2,
+        2,
+        4,
+    )
+    .unwrap();
+
+    assert_eq!(selected, vec![2, 3]);
+}

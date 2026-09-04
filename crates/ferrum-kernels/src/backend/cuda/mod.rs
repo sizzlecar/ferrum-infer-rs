@@ -1378,6 +1378,10 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn supports_argmax_rows_f16_sparse_repetition_penalty() -> bool {
+        true
+    }
+
     // ── Norms ────────────────────────────────────────────────────────────
 
     fn rms_norm(

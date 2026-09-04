@@ -100,17 +100,15 @@ pub fn compute_final_indices(
 /// Compact key for host-side varlen-attention launch decisions captured in a
 /// unified CUDA graph.
 ///
-/// The raw `max_kv_len` changes almost every decode step, but the non-split-K
-/// CUDA launcher sizes dynamic shared memory to `max(kv_capacity, max_kv_len)`.
-/// Within that configured capacity, replaying a graph captured at a shorter KV
-/// length is safe because the captured launch already reserved the same shared
-/// memory. Split-K still uses an exact chunk-shaped dynamic shared allocation,
-/// so keep it conservative there.
+/// The raw `max_kv_len` changes almost every decode step. The non-split-K CUDA
+/// launcher rounds it to a power-of-two shared-memory bucket; include that
+/// bucket here so replay is safe without allocating the full configured
+/// context window for every short-context CTA. Split-K still uses an exact
+/// chunk-shaped dynamic shared allocation, so keep it conservative there.
 pub fn unified_attention_launch_key(
     total_q_tokens: usize,
     num_seqs: usize,
     max_kv_len: usize,
-    kv_capacity: usize,
     split_k_attn: Option<bool>,
 ) -> u64 {
     let use_split_k = split_k_attn
@@ -126,7 +124,7 @@ pub fn unified_attention_launch_key(
         return 0x7370_6c69_7400_0000u64 ^ ((num_splits as u64) << 32) ^ (chunk.max(1) as u64);
     }
 
-    let shared_kv = kv_capacity.max(max_kv_len).max(1);
+    let shared_kv = ferrum_kernels::backend::attention_score_capacity_bucket(max_kv_len);
     0x7368_6d65_6d00_0000u64 ^ (shared_kv as u64)
 }
 
@@ -269,7 +267,7 @@ mod tests {
 
     #[test]
     fn graph_key_high_bit_set() {
-        let launch_key = unified_attention_launch_key(32, 4, 128, 512, None);
+        let launch_key = unified_attention_launch_key(32, 4, 128, None);
         let k = unified_graph_key(32, 4, launch_key, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
         assert!(k & (1u64 << 63) != 0, "high bit must be set");
         // Legacy key with same low bits should differ.
@@ -278,20 +276,20 @@ mod tests {
     }
 
     #[test]
-    fn attention_launch_key_coalesces_non_split_k_under_capacity() {
-        let short = unified_attention_launch_key(16, 16, 128, 512, None);
-        let longer_under_capacity = unified_attention_launch_key(16, 16, 256, 512, None);
-        let over_capacity = unified_attention_launch_key(16, 16, 640, 512, None);
+    fn attention_launch_key_coalesces_non_split_k_within_power_of_two_bucket() {
+        let short = unified_attention_launch_key(16, 16, 129, None);
+        let longer_in_bucket = unified_attention_launch_key(16, 16, 256, None);
+        let next_bucket = unified_attention_launch_key(16, 16, 257, None);
 
-        assert_eq!(short, longer_under_capacity);
-        assert_ne!(short, over_capacity);
+        assert_eq!(short, longer_in_bucket);
+        assert_ne!(short, next_bucket);
     }
 
     #[test]
     fn attention_launch_key_keeps_split_k_chunk_shape() {
-        let short = unified_attention_launch_key(2, 2, 128, 512, None);
-        let longer = unified_attention_launch_key(2, 2, 256, 512, None);
-        let forced_off = unified_attention_launch_key(2, 2, 128, 512, Some(false));
+        let short = unified_attention_launch_key(2, 2, 128, None);
+        let longer = unified_attention_launch_key(2, 2, 256, None);
+        let forced_off = unified_attention_launch_key(2, 2, 128, Some(false));
 
         assert_ne!(short, longer);
         assert_ne!(short, forced_off);
@@ -300,17 +298,17 @@ mod tests {
     #[test]
     fn graph_key_uses_attention_launch_shape_and_final_offsets() {
         let decode_final = vec![(0, 0), (1, 1)];
-        let same_launch_short = unified_attention_launch_key(16, 16, 128, 512, None);
-        let same_launch_long = unified_attention_launch_key(16, 16, 256, 512, None);
-        let over_capacity = unified_attention_launch_key(16, 16, 640, 512, None);
+        let same_launch_short = unified_attention_launch_key(16, 16, 129, None);
+        let same_launch_long = unified_attention_launch_key(16, 16, 256, None);
+        let next_bucket = unified_attention_launch_key(16, 16, 257, None);
         let same_grid_short_kv = unified_graph_key(16, 16, same_launch_short, &decode_final);
         let same_grid_long_kv = unified_graph_key(16, 16, same_launch_long, &decode_final);
-        let different_launch = unified_graph_key(16, 16, over_capacity, &decode_final);
+        let different_launch = unified_graph_key(16, 16, next_bucket, &decode_final);
         assert_eq!(same_grid_short_kv, same_grid_long_kv);
         assert_ne!(same_grid_short_kv, different_launch);
 
         let prefill_final = vec![(0, 4), (1, 5)];
-        let prefill_launch = unified_attention_launch_key(6, 2, 128, 512, None);
+        let prefill_launch = unified_attention_launch_key(6, 2, 128, None);
         let different_final_offsets = unified_graph_key(6, 2, prefill_launch, &prefill_final);
         let same_grid_other_offsets = unified_graph_key(6, 2, prefill_launch, &[(0, 2), (1, 5)]);
         assert_ne!(different_final_offsets, same_grid_other_offsets);
@@ -321,8 +319,8 @@ mod tests {
 
     #[test]
     fn graph_key_distinguishes_capture_scope() {
-        let launch_short = unified_attention_launch_key(6, 2, 128, 512, None);
-        let launch_long = unified_attention_launch_key(6, 2, 640, 512, None);
+        let launch_short = unified_attention_launch_key(6, 2, 128, None);
+        let launch_long = unified_attention_launch_key(6, 2, 640, None);
         let full_no_sample = unified_graph_key(6, 2, launch_short, &[]);
         let layers_only = unified_layers_only_graph_key(6, 2, launch_short);
         let lm_head_eager = unified_lm_head_eager_graph_key(6, 2, launch_short, &[(0, 4), (1, 5)]);
