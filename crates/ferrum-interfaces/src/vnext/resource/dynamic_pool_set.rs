@@ -1141,7 +1141,7 @@ where
         let lane_owner: Arc<dyn LaneStableArenaLane> =
             Arc::clone(lane) as Arc<dyn LaneStableArenaLane>;
 
-        loop {
+        {
             {
                 let mut arenas = self
                     .lane_stable_arenas
