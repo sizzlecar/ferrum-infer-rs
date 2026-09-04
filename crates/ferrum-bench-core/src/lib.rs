@@ -23,6 +23,7 @@
 //! - CI95 fields are suppressed when `n_repeats < 3` (degenerate).
 
 pub mod arrivals;
+pub mod decode_isolation;
 pub mod env;
 pub mod jsonl_journal;
 pub mod profile;
@@ -182,6 +183,9 @@ pub enum Scenario {
     SharedPrefix,
     /// `ferrum bench` single-user batch=1. Headline: TTFT + TPOT.
     Cli,
+    /// Live decoders observed before and during an injected long prefill.
+    /// Headline: interference-window ITL and decode progress.
+    DecodeIsolation,
 }
 
 /// SLO thresholds applied when computing goodput. All in milliseconds.
