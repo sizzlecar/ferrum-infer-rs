@@ -8,6 +8,9 @@
 //!     closed-loop cells back-to-back to find the knee.
 //!   - **Open-loop** — `--request-rate R`, Poisson(R) arrivals. The
 //!     ONLY scenario in which goodput is meaningful (§ 0.4).
+//!   - **Decode isolation** — live decoders establish a baseline, then one
+//!     long prefill is injected to measure user-visible output progress and
+//!     output-event gap disruption.
 //!
 //! Each cell runs `--n-repeats` independent times; the per-run percentiles
 //! are aggregated with mean + sample stddev + Student-t 95% CI half-width.
@@ -35,6 +38,10 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::config::CliConfig;
+
+mod decode_isolation;
+
+use decode_isolation::{BenchServeWorkload, DecodeIsolationArgs};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum BenchTargetBackend {
@@ -86,7 +93,9 @@ pub struct BenchServeCommand {
     pub tokenizer: PathBuf,
 
     /// Backend of the server under test. This is independent of the HTTP
-    /// client's own compile-time accelerator features.
+    /// client's own compile-time accelerator features and is required for
+    /// decode isolation so the report cannot infer the server backend from
+    /// the client binary.
     #[arg(long, value_enum)]
     pub target_backend: Option<BenchTargetBackend>,
 
@@ -94,9 +103,19 @@ pub struct BenchServeCommand {
     #[arg(long, value_enum, default_value = "pooled")]
     pub http_connection_mode: BenchHttpConnectionMode,
 
+    /// Benchmark workload. `standard` preserves the regular closed/open-loop
+    /// modes; `decode-isolation` injects one long prefill into live decoders.
+    #[arg(long, value_enum, default_value = "standard")]
+    pub scenario: BenchServeWorkload,
+
+    #[command(flatten)]
+    pub decode_isolation: DecodeIsolationArgs,
+
     // ─── Workload selection (pick one mode) ────────────────────────
-    /// Closed-loop concurrency (single cell). Default when no other
-    /// mode is given. Alias: `--max-concurrency` (legacy vLLM naming).
+    /// Closed-loop concurrency (single cell). Default when no other mode is
+    /// given. Decode isolation derives its live decoder count from /health;
+    /// use `--decode-isolation-incumbents` rather than setting this option.
+    /// Alias: `--max-concurrency` (legacy vLLM naming).
     #[arg(long, default_value_t = 32, alias = "max-concurrency")]
     pub concurrency: u32,
 
@@ -125,8 +144,9 @@ pub struct BenchServeCommand {
     #[arg(long, default_value_t = 128)]
     pub random_output_len: usize,
 
-    /// Send vLLM-compatible `ignore_eos=true` so fixed-output benchmark
-    /// requests run until `max_tokens` instead of stopping on model EOS.
+    /// Send vLLM-compatible `ignore_eos=true` so fixed-output standard
+    /// benchmark requests run until `max_tokens`. Decode isolation always
+    /// enables this because fixed output is part of its evidence contract.
     #[arg(long)]
     pub ignore_eos: bool,
 
@@ -138,22 +158,26 @@ pub struct BenchServeCommand {
     #[arg(long, value_name = "LEVEL")]
     pub reasoning_effort: Option<ReasoningEffort>,
 
-    /// Path to a ShareGPT-format JSONL file (`--dataset sharegpt`).
+    /// Path to a ShareGPT-format JSONL file (`--dataset sharegpt`, standard
+    /// workloads only).
     /// Each line should be a `{"conversations": [{"from": "...", "value":
     /// "..."}, ...]}` object (HF anon8231489123/ShareGPT_Vicuna format).
     #[arg(long)]
     pub sharegpt_path: Option<PathBuf>,
 
-    /// Shared prefix length in *tokens* (`--dataset shared-prefix` only).
+    /// Shared prefix length in *tokens* (`--dataset shared-prefix`, standard
+    /// workloads only).
     #[arg(long, default_value_t = 1024)]
     pub shared_prefix_len: usize,
 
-    /// Per-request unique suffix length in *tokens* (`--dataset shared-prefix`).
+    /// Per-request unique suffix length in *tokens* (`--dataset shared-prefix`,
+    /// standard workloads only).
     #[arg(long, default_value_t = 64)]
     pub shared_suffix_len: usize,
 
     // ─── Run shape ─────────────────────────────────────────────────
-    /// Total prompts sent per run (warmup is counted separately).
+    /// Total prompts sent per standard workload run (warmup is counted
+    /// separately). Decode isolation derives its request shape from /health.
     #[arg(long, default_value_t = 100)]
     pub num_prompts: u32,
 
@@ -196,9 +220,10 @@ pub struct BenchServeCommand {
     pub seed: Option<u64>,
 
     // ─── Output ────────────────────────────────────────────────────
-    /// Output format: `json` (BenchReport), `jsonl` (append one
-    /// `BenchReport` per line for external comparison tools,
-    /// `md` (human-readable markdown).
+    /// Output format: `json`/`jsonl` emit the scenario's typed report
+    /// (`BenchReport` for standard workloads, `DecodeIsolationReport` for
+    /// decode isolation); `jsonl` appends one report per line. `md` emits a
+    /// human-readable summary.
     #[arg(long, default_value = "json")]
     pub output: String,
 
@@ -317,6 +342,50 @@ async fn stream_one(
     timeout_s: f64,
     correlation: BenchmarkRequestCorrelation,
 ) -> RequestRecord {
+    stream_one_observed(
+        client,
+        base_url,
+        model,
+        prompt,
+        max_tokens,
+        ignore_eos,
+        enable_thinking,
+        reasoning_effort,
+        timeout_s,
+        correlation,
+        None,
+    )
+    .await
+    .record
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DecodeStreamProgress {
+    pub output_events: u32,
+    pub finished: bool,
+    pub first_output_at: Option<Instant>,
+    pub last_output_at: Option<Instant>,
+}
+
+pub(super) struct ObservedRequest {
+    pub record: RequestRecord,
+    pub started_at: Instant,
+    pub output_event_times: Vec<Instant>,
+}
+
+async fn stream_one_observed(
+    client: &reqwest::Client,
+    base_url: &str,
+    model: &str,
+    prompt: PromptCase,
+    max_tokens: usize,
+    ignore_eos: bool,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<ReasoningEffort>,
+    timeout_s: f64,
+    correlation: BenchmarkRequestCorrelation,
+    progress: Option<tokio::sync::watch::Sender<DecodeStreamProgress>>,
+) -> ObservedRequest {
     let PromptCase {
         text,
         input_tokens,
@@ -370,7 +439,12 @@ async fn stream_one(
             );
             let mut quality_issues = QualityIssueCounts::default();
             quality_issues.malformed_stream = 1;
-            return failed_record(input_tokens, start, quality_issues, correlation);
+            publish_stream_finished(&progress, 0);
+            return ObservedRequest {
+                record: failed_record(input_tokens, start, quality_issues, correlation),
+                started_at: start,
+                output_event_times: vec![],
+            };
         }
     };
     if !resp.status().is_success() {
@@ -387,7 +461,12 @@ async fn stream_one(
         if looks_like_panic(&txt) {
             quality_issues.panic = 1;
         }
-        return failed_record(input_tokens, start, quality_issues, correlation);
+        publish_stream_finished(&progress, 0);
+        return ObservedRequest {
+            record: failed_record(input_tokens, start, quality_issues, correlation),
+            started_at: start,
+            output_event_times: vec![],
+        };
     }
 
     let mut stream = resp.bytes_stream();
@@ -404,6 +483,14 @@ async fn stream_one(
         };
         let before_output_events = state.output_delta_events;
         sse.push(&chunk, &mut state);
+        if let Some(progress) = &progress {
+            progress.send_replace(DecodeStreamProgress {
+                output_events: state.output_delta_events,
+                finished: false,
+                first_output_at: state.output_event_times.first().copied(),
+                last_output_at: state.output_event_times.last().copied(),
+            });
+        }
         state.note_transport_chunk(
             state
                 .output_delta_events
@@ -411,7 +498,31 @@ async fn stream_one(
         );
     }
     sse.finish(&mut state);
-    state.finish()
+    let output_events = state.output_delta_events;
+    let observed = state.finish_observed();
+    if let Some(progress) = &progress {
+        progress.send_replace(DecodeStreamProgress {
+            output_events,
+            finished: true,
+            first_output_at: observed.output_event_times.first().copied(),
+            last_output_at: observed.output_event_times.last().copied(),
+        });
+    }
+    observed
+}
+
+fn publish_stream_finished(
+    progress: &Option<tokio::sync::watch::Sender<DecodeStreamProgress>>,
+    output_events: u32,
+) {
+    if let Some(progress) = progress {
+        progress.send_replace(DecodeStreamProgress {
+            output_events,
+            finished: true,
+            first_output_at: None,
+            last_output_at: None,
+        });
+    }
 }
 
 #[derive(Default)]
@@ -596,6 +707,7 @@ struct StreamState {
     prompt_sha256: String,
     benchmark_correlation: Option<BenchmarkRequestCorrelation>,
     server_request_id: Option<String>,
+    output_event_times: Vec<Instant>,
 }
 
 impl StreamState {
@@ -625,6 +737,7 @@ impl StreamState {
             prompt_sha256,
             benchmark_correlation,
             server_request_id: None,
+            output_event_times: Vec::new(),
         }
     }
 
@@ -672,6 +785,7 @@ impl StreamState {
                             self.itl_ms.push((now - prev).as_secs_f64() * 1000.0);
                         }
                         self.last_token_time = Some(now);
+                        self.output_event_times.push(now);
                         self.output_delta_events = self
                             .output_delta_events
                             .checked_add(1)
@@ -750,6 +864,17 @@ impl StreamState {
             itl_evidence,
             quality_issues: self.quality_issues,
             itl_ms: self.itl_ms,
+        }
+    }
+
+    fn finish_observed(mut self) -> ObservedRequest {
+        let started_at = self.start;
+        let output_event_times = std::mem::take(&mut self.output_event_times);
+        let record = self.finish();
+        ObservedRequest {
+            record,
+            started_at,
+            output_event_times,
         }
     }
 }
@@ -1702,14 +1827,18 @@ fn benchmark_cell_id(index: usize, cell: Cell) -> String {
 
 pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
     validate_command(&cmd)?;
-    eprintln!(
-        "{}",
+    let banner = if cmd.scenario == BenchServeWorkload::DecodeIsolation {
+        format!(
+            "ferrum bench-serve — scenario=decode-isolation dataset=random warmup={} n_repeats={} fixed_output=true",
+            cmd.warmup_requests, cmd.n_repeats
+        )
+    } else {
         format!(
             "ferrum bench-serve — dataset={} num_prompts={} warmup={} n_repeats={}",
             cmd.dataset, cmd.num_prompts, cmd.warmup_requests, cmd.n_repeats
         )
-        .dimmed()
-    );
+    };
+    eprintln!("{}", banner.dimmed());
     if cmd.n_repeats < 3 {
         eprintln!(
             "{}",
@@ -1752,6 +1881,10 @@ pub async fn execute(cmd: BenchServeCommand, _cfg: CliConfig) -> Result<()> {
         benchmark_run_id: Arc::new(format!("bench-{}", Uuid::new_v4())),
     };
 
+    if cmd.scenario == BenchServeWorkload::DecodeIsolation {
+        return decode_isolation::execute(&cmd, &ctx).await;
+    }
+
     let mut reports: Vec<BenchReport> = Vec::with_capacity(cells.len());
     for (cell_index, cell) in cells.into_iter().enumerate() {
         eprintln!("{}", format!("→ {}", cell_label(cell)).bold());
@@ -1790,6 +1923,43 @@ fn emit_reports(cmd: &BenchServeCommand, reports: &[BenchReport]) -> Result<()> 
 }
 
 fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
+    if cmd.scenario == BenchServeWorkload::DecodeIsolation {
+        if cmd.dataset != "random" {
+            return Err(ferrum_types::FerrumError::model(
+                "--scenario decode-isolation requires --dataset random",
+            ));
+        }
+        if cmd.sharegpt_path.is_some()
+            || cmd.shared_prefix_len != 1024
+            || cmd.shared_suffix_len != 64
+        {
+            return Err(ferrum_types::FerrumError::model(
+                "--scenario decode-isolation cannot use ShareGPT or shared-prefix options",
+            ));
+        }
+        if cmd.num_prompts != 100 || cmd.concurrency != 32 {
+            return Err(ferrum_types::FerrumError::model(
+                "--scenario decode-isolation derives request count and concurrency; do not set --num-prompts or --concurrency",
+            ));
+        }
+        if cmd.goodput.is_some() {
+            return Err(ferrum_types::FerrumError::model(
+                "--scenario decode-isolation does not produce goodput",
+            ));
+        }
+        if cmd.target_backend.is_none() {
+            return Err(ferrum_types::FerrumError::model(
+                "--scenario decode-isolation requires --target-backend",
+            ));
+        }
+    }
+    if cmd.scenario == BenchServeWorkload::DecodeIsolation
+        && (cmd.request_rate.is_some() || !cmd.concurrency_sweep.is_empty())
+    {
+        return Err(ferrum_types::FerrumError::model(
+            "--scenario decode-isolation cannot be combined with --request-rate or --concurrency-sweep",
+        ));
+    }
     if let Some(rate) = cmd.request_rate {
         if rate <= 0.0 || !rate.is_finite() {
             return Err(ferrum_types::FerrumError::model(
@@ -1848,6 +2018,17 @@ fn validate_command(cmd: &BenchServeCommand) -> Result<()> {
                 "--max-error-rate must be in [0.0, 1.0]",
             ));
         }
+    }
+    if !matches!(cmd.output.as_str(), "json" | "jsonl" | "md") {
+        return Err(ferrum_types::FerrumError::model(format!(
+            "unknown --output '{}': allowed values are json, jsonl, md",
+            cmd.output
+        )));
+    }
+    if cmd.output == "jsonl" && cmd.out.is_none() {
+        return Err(ferrum_types::FerrumError::model(
+            "--output jsonl requires --out PATH (append-mode log)",
+        ));
     }
     for cell in &cmd.concurrency_sweep {
         if *cell == 0 {
@@ -1964,6 +2145,7 @@ fn emit_summary_line(r: &BenchReport) {
         Scenario::OpenLoop => format!("rate={}", r.request_rate.unwrap_or(0.0)),
         Scenario::SharedPrefix => "shared_prefix".to_string(),
         Scenario::Cli => "cli".to_string(),
+        Scenario::DecodeIsolation => "decode_isolation".to_string(),
     };
     let ci = if r.n_repeats >= 3 {
         format!(" (n_repeats={}, ± = ci95_hw)", r.n_repeats)
@@ -2218,6 +2400,25 @@ mod tests {
             TestCli::parse_from(base.into_iter().chain(["--http-connection-mode", "fresh"]))
                 .command;
         assert_eq!(fresh.http_connection_mode, BenchHttpConnectionMode::Fresh);
+
+        let isolation = TestCli::parse_from(base.into_iter().chain([
+            "--scenario",
+            "decode-isolation",
+            "--decode-isolation-incumbents",
+            "6",
+            "--decode-isolation-prefill-tokens",
+            "4096",
+        ]))
+        .command;
+        assert_eq!(isolation.scenario, BenchServeWorkload::DecodeIsolation);
+        assert_eq!(
+            isolation.decode_isolation.decode_isolation_incumbents,
+            Some(6)
+        );
+        assert_eq!(
+            isolation.decode_isolation.decode_isolation_prefill_tokens,
+            Some(4096)
+        );
     }
 
     #[test]
@@ -2540,13 +2741,15 @@ mod tests {
             .map(|entry| entry.effective_value)
     }
 
-    fn test_command() -> BenchServeCommand {
+    pub(super) fn test_command() -> BenchServeCommand {
         BenchServeCommand {
             base_url: "http://127.0.0.1:9".to_string(),
             model: "test-model".to_string(),
             tokenizer: std::path::PathBuf::from("."),
             target_backend: None,
             http_connection_mode: BenchHttpConnectionMode::Pooled,
+            scenario: BenchServeWorkload::Standard,
+            decode_isolation: DecodeIsolationArgs::default(),
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -2660,6 +2863,34 @@ mod tests {
     }
 
     #[test]
+    fn decode_isolation_rejects_non_random_dataset() {
+        let mut cmd = test_command();
+        cmd.scenario = BenchServeWorkload::DecodeIsolation;
+        cmd.target_backend = Some(BenchTargetBackend::Cuda);
+        cmd.dataset = "sharegpt".to_string();
+
+        let error = validate_command(&cmd).expect_err("dataset must match actual workload");
+        assert!(error
+            .to_string()
+            .contains("decode-isolation requires --dataset random"));
+    }
+
+    #[test]
+    fn decode_isolation_rejects_ignored_standard_workload_options() {
+        let mut cmd = test_command();
+        cmd.scenario = BenchServeWorkload::DecodeIsolation;
+        cmd.target_backend = Some(BenchTargetBackend::Cuda);
+        cmd.num_prompts = 12;
+        let error = validate_command(&cmd).expect_err("num-prompts is not part of this shape");
+        assert!(error.to_string().contains("derives request count"));
+
+        cmd.num_prompts = 100;
+        cmd.sharegpt_path = Some(PathBuf::from("unused.jsonl"));
+        let error = validate_command(&cmd).expect_err("unused dataset option must be rejected");
+        assert!(error.to_string().contains("cannot use ShareGPT"));
+    }
+
+    #[test]
     fn measured_error_rate_excludes_successful_warmups() {
         let report = policy_report(99, 1, 10, 0);
         let mut cmd = test_command();
@@ -2743,6 +2974,8 @@ mod tests {
             tokenizer: std::path::PathBuf::from("."),
             target_backend: None,
             http_connection_mode: BenchHttpConnectionMode::Pooled,
+            scenario: BenchServeWorkload::Standard,
+            decode_isolation: DecodeIsolationArgs::default(),
             concurrency: 2,
             concurrency_sweep: vec![],
             request_rate: None,
@@ -2833,6 +3066,8 @@ mod tests {
             tokenizer: std::path::PathBuf::from("."),
             target_backend: None,
             http_connection_mode: BenchHttpConnectionMode::Pooled,
+            scenario: BenchServeWorkload::Standard,
+            decode_isolation: DecodeIsolationArgs::default(),
             concurrency: 1,
             concurrency_sweep: vec![],
             request_rate: None,

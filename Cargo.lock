@@ -1360,6 +1360,7 @@ dependencies = [
  "anyhow",
  "async-openai",
  "async-trait",
+ "axum",
  "candle-core",
  "chrono",
  "clap",

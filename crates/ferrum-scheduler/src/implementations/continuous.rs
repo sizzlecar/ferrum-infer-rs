@@ -747,6 +747,11 @@ pub struct ContinuousBatchScheduler {
     /// Current iteration number
     current_iteration: AtomicU64,
 
+    /// Fill-first applies only while building the first decode cohort after
+    /// the scheduler was completely idle. Once decode starts, later arrivals
+    /// must share the steady-state token budget instead of pausing incumbents.
+    fill_first_initial_cohort_armed: AtomicBool,
+
     /// Statistics
     completed_counter: AtomicU64,
     failed_counter: AtomicU64,
@@ -896,6 +901,7 @@ impl ContinuousBatchScheduler {
             dynamic_admission_events: Mutex::new(Vec::new()),
             request_index: RwLock::new(HashMap::new()),
             current_iteration: AtomicU64::new(0),
+            fill_first_initial_cohort_armed: AtomicBool::new(true),
             completed_counter: AtomicU64::new(0),
             failed_counter: AtomicU64::new(0),
             cancelled_counter: AtomicU64::new(0),
@@ -1656,6 +1662,9 @@ impl ContinuousBatchScheduler {
     /// admitted prefills consume the budget first; a waiting request that does
     /// not fit seals the fair prefix instead of reserving unused authority.
     pub fn fill_first_dynamic_admission_limit(&self, hint: &BatchHint, target: usize) -> usize {
+        if !self.fill_first_initial_cohort_armed.load(Ordering::Acquire) {
+            return 0;
+        }
         let mut remaining_tokens = hint.max_tokens;
         let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
         let prefill_queue = self.prefill_queue.read();
@@ -3497,7 +3506,10 @@ impl ContinuousBatchScheduler {
         let decoding_count = self.decoding_count();
         let active_count = self.active_count();
         let capacity_backpressure_active = self.capacity_backpressure_admit_limit().is_some();
-        let skip_decode_for_prefill_first = prefill_first_target > 0
+        let fill_first_initial_cohort_armed =
+            self.fill_first_initial_cohort_armed.load(Ordering::Acquire);
+        let skip_decode_for_prefill_first = fill_first_initial_cohort_armed
+            && prefill_first_target > 0
             && decoding_count < prefill_first_target
             && active_count < prefill_first_target
             && !(capacity_backpressure_active && decoding_count > 0)
@@ -3516,7 +3528,7 @@ impl ContinuousBatchScheduler {
                 &mut waiting_admission,
             )?;
         }
-        let scheduled_decode_count = batch_requests.len();
+        let mut scheduled_decode_count = batch_requests.len();
         let active_decode_prefill_chunk =
             self.active_decode_prefill_chunk_for_iteration(&hint, scheduled_decode_count);
         let prefill_step_chunk = self.runtime_config.prefill_step_chunk;
@@ -3684,6 +3696,7 @@ impl ContinuousBatchScheduler {
         // its epoch can advance. If admission produced no runnable prefill,
         // restore decode work so the release condition can become true.
         if skip_decode_for_prefill_first && batch_requests.is_empty() {
+            let batch_len_before_decode_fallback = batch_requests.len();
             self.add_decode_requests_to_batch(
                 iteration,
                 &hint,
@@ -3692,6 +3705,15 @@ impl ContinuousBatchScheduler {
                 &mut scheduled_request_ids,
                 &mut waiting_admission,
             )?;
+            scheduled_decode_count += batch_requests.len() - batch_len_before_decode_fallback;
+        }
+
+        // Whichever path scheduled the first decode (the normal decode-first
+        // path or the WaitForRelease deadlock fallback) ends cold-cohort
+        // fill-first for this busy period.
+        if fill_first_initial_cohort_armed && scheduled_decode_count > 0 {
+            self.fill_first_initial_cohort_armed
+                .store(false, Ordering::Release);
         }
 
         // FERRUM_SCHED_NONE_PROF=1: log when next_batch is about to return SOME.
@@ -4007,10 +4029,16 @@ impl Scheduler for ContinuousBatchScheduler {
             .expect("newly enqueued admission ticket remains present")
             .waiting_admission_ticket = Some(ticket);
 
-        // Update index
-        self.request_index
-            .write()
-            .insert(request_id.clone(), RequestPhase::Waiting);
+        // Update the lifecycle index and arm fill-first only when this request
+        // starts a new cohort after every prior request has left. Doing both
+        // under the index write lock makes the idle transition exact with
+        // respect to concurrent completion and submission.
+        let mut request_index = self.request_index.write();
+        if request_index.is_empty() {
+            self.fill_first_initial_cohort_armed
+                .store(true, Ordering::Release);
+        }
+        request_index.insert(request_id.clone(), RequestPhase::Waiting);
 
         info!(
             "Request {} queued at position {}",
@@ -6041,8 +6069,8 @@ mod tests {
         use std::num::NonZeroU64;
 
         let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
-            max_running_requests: 2,
-            prefill_first_until_active: Some(2),
+            max_running_requests: 4,
+            prefill_first_until_active: Some(4),
             ..SchedulerConfig::default()
         });
         let blocked = create_test_request(Priority::Normal);
@@ -6061,7 +6089,7 @@ mod tests {
         let condition = CapacityWaitCondition::from_observation(23, availability.to_vec()).unwrap();
         let first = scheduler
             .next_batch_with_dynamic_admission(
-                BatchHint::simple(2),
+                BatchHint::simple(4),
                 AdmissionWakeSnapshot::new(wake, &availability),
                 &mut |request| {
                     if request.id == blocked_id {
@@ -6087,7 +6115,7 @@ mod tests {
         let mut observations = Vec::new();
         let unchanged = scheduler
             .next_batch_with_dynamic_admission_observed(
-                BatchHint::simple(2),
+                BatchHint::simple(4),
                 AdmissionWakeSnapshot::new(wake, &availability),
                 &mut |request| {
                     probes += 1;
@@ -6112,6 +6140,37 @@ mod tests {
                 ..
             }] if request_id == &blocked_id && *current == wake
         ));
+
+        let released_wake = AdmissionWakeEpochs::new(NonZeroU64::new(23).unwrap(), 8, 11, 0);
+        let released_availability =
+            [
+                CapacityAvailabilityEpoch::new(CapacityAvailabilitySource::ActiveSequenceSlots, 20)
+                    .unwrap(),
+            ];
+        let mut released_probes = 0;
+        let after_release = scheduler
+            .next_batch_with_dynamic_admission(
+                BatchHint::simple(4),
+                AdmissionWakeSnapshot::new(released_wake, &released_availability),
+                &mut |request| {
+                    released_probes += 1;
+                    assert_eq!(request.id, blocked_id);
+                    AdmissionProbeOutcome::Admitted(ExecutorPrefillAdmissionReceipt {
+                        request_id: request.id.clone(),
+                    })
+                },
+            )
+            .unwrap()
+            .expect("released prefill and survivor decode should both remain runnable");
+
+        assert_eq!(released_probes, 1);
+        assert!(after_release.requests.iter().any(|request| {
+            request.request.id == runnable_id && request.tokens_to_process == Some(1)
+        }));
+        assert!(after_release
+            .requests
+            .iter()
+            .any(|request| request.request.id == blocked_id));
     }
 
     #[tokio::test]
@@ -7957,6 +8016,130 @@ mod tests {
         assert_eq!(
             scheduled_decodes, 2,
             "fill-first must not starve decode once the active target is reached"
+        );
+    }
+
+    #[test]
+    fn late_prefill_does_not_rearm_fill_first_during_steady_decode() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 512,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        for _ in 0..2 {
+            enqueue_waiting(
+                &scheduler,
+                create_test_request_with_prompt_tokens(Priority::Normal, 128),
+            );
+        }
+
+        let initial_prefill = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        let incumbent_ids: Vec<RequestId> = initial_prefill
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        assert_eq!(incumbent_ids.len(), 2);
+        for request_id in &incumbent_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        let first_decode = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(
+            first_decode
+                .requests
+                .iter()
+                .filter(|request| request.tokens_to_process == Some(1))
+                .count(),
+            2
+        );
+
+        enqueue_waiting(
+            &scheduler,
+            create_test_request_with_prompt_tokens(Priority::Normal, 512),
+        );
+        assert_eq!(
+            scheduler.fill_first_dynamic_admission_limit(&hint, 4),
+            0,
+            "PlanRuntime admission must observe the same disarmed steady-state policy"
+        );
+        let with_late_prefill = scheduler.create_iteration_batch(hint).unwrap();
+        let scheduled_incumbent_decodes = with_late_prefill
+            .requests
+            .iter()
+            .filter(|request| {
+                incumbent_ids.contains(&request.request.id) && request.tokens_to_process == Some(1)
+            })
+            .count();
+
+        assert_eq!(
+            scheduled_incumbent_decodes, 2,
+            "a late prefill must not restart fill-first and starve active decodes"
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_first_rearms_after_last_active_request_is_cancelled() {
+        let scheduler = ContinuousBatchScheduler::new(SchedulerConfig {
+            prompt_token_estimate: true,
+            prefill_first_until_active: Some(4),
+            ..SchedulerConfig::default()
+        });
+        let hint = BatchHint {
+            max_batch_size: 4,
+            max_tokens: 256,
+            target_latency_ms: None,
+            available_memory: None,
+            resource_constraints: Default::default(),
+        };
+
+        let cold_request = create_test_request_with_prompt_tokens(Priority::Normal, 128);
+        let cold_id = cold_request.id.clone();
+        scheduler.submit(cold_request).await.unwrap();
+        let cold_prefill = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(cold_prefill.requests.len(), 1);
+        scheduler.mark_prefill_complete(&cold_id, 128);
+        let cold_decode = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(cold_decode.requests[0].tokens_to_process, Some(1));
+        assert!(scheduler.cancel(cold_id).await.unwrap());
+        assert_eq!(scheduler.active_count(), 0);
+        assert_eq!(scheduler.waiting_count(), 0);
+
+        let mut next_ids = Vec::new();
+        for _ in 0..3 {
+            let request = create_test_request_with_prompt_tokens(Priority::Normal, 128);
+            next_ids.push(request.id.clone());
+            scheduler.submit(request).await.unwrap();
+        }
+        let next_prefill = scheduler.create_iteration_batch(hint.clone()).unwrap();
+        assert_eq!(next_prefill.requests.len(), 2);
+        let first_next_ids: Vec<RequestId> = next_prefill
+            .requests
+            .iter()
+            .map(|request| request.request.id.clone())
+            .collect();
+        for request_id in &first_next_ids {
+            scheduler.mark_prefill_complete(request_id, 128);
+        }
+
+        let fill_batch = scheduler.create_iteration_batch(hint).unwrap();
+        assert_eq!(fill_batch.requests.len(), 1);
+        assert!(next_ids.contains(&fill_batch.requests[0].request.id));
+        assert_eq!(fill_batch.requests[0].tokens_to_process, Some(128));
+        assert!(
+            fill_batch
+                .requests
+                .iter()
+                .all(|request| !first_next_ids.contains(&request.request.id)),
+            "a new cohort after full idle should receive fill-first behavior again"
         );
     }
 

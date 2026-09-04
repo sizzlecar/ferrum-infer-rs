@@ -42,6 +42,7 @@ fn write_header(s: &mut String, r: &BenchReport) {
         Scenario::OpenLoop => format!("open_loop · rate={} req/s", r.request_rate.unwrap_or(0.0)),
         Scenario::SharedPrefix => "shared_prefix".to_string(),
         Scenario::Cli => "cli".to_string(),
+        Scenario::DecodeIsolation => "decode_isolation".to_string(),
     };
     writeln!(s, "# {} — {}", r.model, scenario_str).ok();
     writeln!(s).ok();
@@ -239,6 +240,7 @@ fn write_sweep_table(s: &mut String, reports: &[BenchReport]) {
             Scenario::OpenLoop => format!("rate={}", r.request_rate.unwrap_or(0.0)),
             Scenario::SharedPrefix => "shared_prefix".to_string(),
             Scenario::Cli => "cli".to_string(),
+            Scenario::DecodeIsolation => "decode_isolation".to_string(),
         };
         let cell_has_ci = r.n_repeats >= 3;
         writeln!(
