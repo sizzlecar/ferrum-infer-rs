@@ -65,6 +65,7 @@ struct HealthResponse {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct HealthAdmission {
     effective_max_concurrent: Option<u32>,
+    preflight_effective_max_concurrent: Option<u32>,
     maximum_active_sequences: Option<u32>,
     maximum_scheduled_tokens: Option<u64>,
 }
@@ -226,6 +227,7 @@ fn resolve_capabilities(health: HealthResponse) -> Result<DecodeIsolationCapabil
     let effective_max_concurrent = [
         health.admission.maximum_active_sequences,
         health.admission.effective_max_concurrent,
+        health.admission.preflight_effective_max_concurrent,
         auto.maximum_active_sequences,
         auto.effective_max_concurrent,
     ]
@@ -590,6 +592,7 @@ mod tests {
         let health: HealthResponse = serde_json::from_value(serde_json::json!({
             "admission": {
                 "effective_max_concurrent": 12,
+                "preflight_effective_max_concurrent": 8,
                 "maximum_active_sequences": 10,
                 "maximum_scheduled_tokens": 1024
             },
@@ -605,7 +608,7 @@ mod tests {
         }))
         .unwrap();
         let caps = resolve_capabilities(health).unwrap();
-        assert_eq!(caps.effective_max_concurrent, 10);
+        assert_eq!(caps.effective_max_concurrent, 8);
         assert_eq!(caps.maximum_scheduled_tokens, 1024);
         assert_eq!(caps.max_model_length, 8192);
         assert_eq!(caps.kv_capacity_tokens, 32768);
