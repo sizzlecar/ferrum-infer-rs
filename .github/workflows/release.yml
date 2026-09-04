@@ -10,12 +10,12 @@ on:
       release_candidate_tag:
         description: Annotated RC tag whose peeled commit is release_candidate_sha
         required: true
-        default: v0.8.5-rc.1
+        default: v0.8.6-rc.1
         type: string
       staging_label:
         description: Immutable artifact label; this does not create a tag or release
         required: true
-        default: v0.8.5-rc
+        default: v0.8.6-rc
         type: string
       publish_release:
         description: Safety lock; production staging requires false
@@ -46,8 +46,8 @@ jobs:
             echo "release_candidate_sha must be a full lowercase commit SHA" >&2
             exit 1
           fi
-          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.5-rc\.[1-9][0-9]*$ ]]; then
-            echo "release_candidate_tag must match v0.8.5-rc.N" >&2
+          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.6-rc\.[1-9][0-9]*$ ]]; then
+            echo "release_candidate_tag must match v0.8.6-rc.N" >&2
             exit 1
           fi
           if ! [[ "${{ inputs.staging_label }}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -94,15 +94,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: stage-v0.8.5-linux-x86_64-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: stage-v0.8.5-linux-x86_64-
+          key: stage-v0.8.6-linux-x86_64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.6-linux-x86_64-
 
       - name: Verify workspace release version
         id: metadata
         shell: bash
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ferrum-cli"))')"
-          test "$version" = "0.8.5"
+          test "$version" = "0.8.6"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build release CPU binary exactly once
@@ -232,8 +232,8 @@ jobs:
             echo "release_candidate_sha must be a full lowercase commit SHA" >&2
             exit 1
           fi
-          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.5-rc\.[1-9][0-9]*$ ]]; then
-            echo "release_candidate_tag must match v0.8.5-rc.N" >&2
+          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.6-rc\.[1-9][0-9]*$ ]]; then
+            echo "release_candidate_tag must match v0.8.6-rc.N" >&2
             exit 1
           fi
           if ! [[ "${{ inputs.staging_label }}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -267,15 +267,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: stage-v0.8.5-macos-aarch64-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: stage-v0.8.5-macos-aarch64-
+          key: stage-v0.8.6-macos-aarch64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: stage-v0.8.6-macos-aarch64-
 
       - name: Verify workspace release version
         id: metadata
         shell: bash
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ferrum-cli"))')"
-          test "$version" = "0.8.5"
+          test "$version" = "0.8.6"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build release Metal binary exactly once
