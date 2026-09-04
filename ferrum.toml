@@ -41,6 +41,7 @@ port = 8000
 config_path = "server.toml"
 log_level = "info"
 hot_reload = false
+interleaved_system_coalescing = true
 
 [dev]
 debug = false

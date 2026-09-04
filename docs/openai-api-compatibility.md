@@ -13,7 +13,7 @@ support matrix and are hidden from the default CLI help.
 | Endpoint | Status | Notes |
 |---|---|---|
 | `POST /v1/chat/completions` | Supported | Non-streaming and streaming chat responses. |
-| `POST /v1/responses` | Supported, stateless | Text/message input, non-streaming and streaming text, usage, and caller-owned function-tool loops. |
+| `POST /v1/responses` | Supported, stateless | Ordered text/reasoning/tool history, non-streaming and streaming output, usage, and caller-owned function/namespace-tool loops. |
 | `POST /v1/completions` | Supported | Non-streaming and streaming text completions with a single string `prompt`; prompt arrays/objects are rejected with `param=prompt`. |
 | `GET /v1/models` | Supported | Lists models known to the server. |
 | `POST /v1/embeddings` | Experimental / outside v0.8 release scope | Text and image embedding support depends on a specialized loaded model. |
@@ -61,18 +61,57 @@ support matrix and are hidden from the default CLI help.
 | legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape, including non-streaming responses and streaming deltas when engine output emits matching function-call JSON. |
 | specific legacy `function_call` | Supported | Named function-call selectors validate against declared legacy functions and constrain generated function-call JSON parsing to the selected function. Undeclared function names return HTTP 400 with `param=function_call`. |
 
+Both Chat Completions and Responses first render system and developer messages
+in their original positions. If a model-owned template explicitly rejects a
+non-leading system message, the server retries with system text coalesced in
+wire order into one leading message. This compatibility retry is enabled by
+default. Operators can disable it with
+`ferrum serve --disable-interleaved-system-coalescing` or set
+`server.interleaved_system_coalescing = false` in `ferrum.toml`; Ferrum then
+returns the model-owned template's original error.
+
 ## Stateless Responses API
 
-`POST /v1/responses` reuses the same model, tokenizer, sampling, and function-call
-path as Chat Completions. It accepts string or message input, `instructions`,
-`max_output_tokens`, `temperature`, `top_p`, `stream`, function `tools`, and
-`tool_choice`. Streaming uses typed Responses SSE events and ends with exactly
-one `response.completed` event rather than a chat `[DONE]` sentinel.
+`POST /v1/responses` reuses the same model, tokenizer, sampling, structured-output,
+and function-call path as Chat Completions. Input may be a string or an ordered
+array containing `message`, readable `reasoning`, `function_call`, and
+`function_call_output` items. The caller owns the loop and resends the complete
+ordered history on each turn; Ferrum correlates tool results by `call_id`.
+
+Assistant message `phase` values (`commentary` and `final_answer`) are validated,
+preserved in caller-owned history, and exposed to model chat templates. Generated
+text before a function call is labelled `commentary`; terminal text is labelled
+`final_answer`. A streaming `response.output_item.added` omits this optional
+field until later tool calls are known, while `response.output_item.done` and the
+terminal response contain the resolved phase.
+
+The endpoint accepts `instructions`, `max_output_tokens`, `temperature`, `top_p`,
+`stream`, function and namespace `tools`, `tool_choice`, `parallel_tool_calls`, supported
+`reasoning.effort` values, `text.format`, `prompt_cache_key`, and opaque client
+metadata. `include=["reasoning.encrypted_content"]` is accepted, but local model
+reasoning has no provider-owned encrypted state, so generated items return
+`encrypted_content: null`. An encrypted-only reasoning item cannot be replayed
+and is rejected instead of silently losing context.
+
+Supported namespace tools contain nested function tools; `allowed_callers` and
+`defer_loading` are rejected. `text.format` supports `text`, `json_object`, and
+`json_schema`; `text.verbosity` and non-empty JSON Schema descriptions are
+rejected because local model templates cannot preserve those semantics.
+
+Namespace tools are flattened only inside Ferrum's Chat-template bridge. A
+request-local, collision-safe mapping restores the original `namespace` and
+child `name` in every Responses output item and during caller-owned replay;
+internal aliases are never part of the public Responses contract.
+
+Streaming uses typed Responses lifecycle events with contiguous sequence numbers.
+It emits the applicable semantic terminal event (`response.completed`,
+`response.incomplete`, or `response.failed`) and then the transport sentinel
+`[DONE]`.
 
 Ferrum does not store Response objects. Requests for `store=true`,
 `previous_response_id`, conversations, background execution, built-in tools, or
-remote MCP return HTTP 400 with the failing field in `param`. Function execution
-and resubmission of `function_call_output` remain caller-owned.
+remote MCP return HTTP 400 with the failing field in `param`. Tool execution
+remains caller-owned.
 
 ## Structured Output
 
@@ -120,15 +159,9 @@ the failing field is known.
 
 ## Test Evidence
 
-The always-on compatibility path is covered by non-ignored Rust tests:
+The always-on compatibility path is covered by Rust unit and route tests:
 
 ```bash
 cargo test -q -p ferrum-server
 cargo test -q -p ferrum-types requests_tests
 ```
-
-The tracked status matrix with individual test names is maintained in
-[`docs/status/openai-api-compat-2026-05-30.md`](status/openai-api-compat-2026-05-30.md).
-Ignored SDK smoke tests exist for `async-openai` and the Python OpenAI SDK;
-those require a real served model and are intended for manual GPU/Metal
-validation.

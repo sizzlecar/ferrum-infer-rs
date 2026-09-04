@@ -1,5 +1,6 @@
 use crate::openai::{
-    ChatFunction, ChatMessage, ChatTool, FunctionCallChoice, MessageRole, ToolChoice,
+    AssistantMessagePhase, ChatFunction, ChatMessage, ChatTool, FunctionCallChoice, MessageRole,
+    ToolChoice,
 };
 use ferrum_types::{
     has_unclosed_thinking_block, ApiToolCallProtocol, FerrumError, ModelOutputProtocol,
@@ -73,17 +74,21 @@ fn tool_call_protocol_for_template(template: &str) -> ApiToolCallProtocol {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
 }
 
 impl ReasoningEffort {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
+            Self::XHigh => "xhigh",
         }
     }
 }
@@ -99,11 +104,13 @@ impl FromStr for ReasoningEffort {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
+            "minimal" => Ok(Self::Minimal),
             "low" => Ok(Self::Low),
             "medium" => Ok(Self::Medium),
             "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::XHigh),
             _ => Err(format!(
-                "unsupported reasoning effort {value:?}; expected low, medium, or high"
+                "unsupported reasoning effort {value:?}; expected minimal, low, medium, high, or xhigh"
             )),
         }
     }
@@ -282,11 +289,31 @@ pub fn render_prompt_messages_with_options(
     model_template: Option<&ModelChatTemplate>,
     options: &ChatTemplateOptions,
 ) -> ferrum_types::Result<String> {
+    render_prompt_messages_with_options_and_compatibility(
+        messages,
+        model_id,
+        model_template,
+        options,
+        true,
+        &[],
+    )
+}
+
+fn render_prompt_messages_with_options_and_compatibility(
+    messages: &[PromptMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+    coalesce_interleaved_system_messages: bool,
+    message_phases: &[Option<AssistantMessagePhase>],
+) -> ferrum_types::Result<String> {
     if let Some(model_template) = model_template {
         return match render_model_template(
             messages,
+            message_phases,
             model_template,
             options,
+            coalesce_interleaved_system_messages,
             None,
             None,
             None,
@@ -317,7 +344,7 @@ fn chat_template_render_error(
 
 #[derive(Serialize)]
 struct ModelTemplateContext<'a> {
-    messages: &'a [PromptMessage],
+    messages: Vec<Value>,
     add_generation_prompt: bool,
     bos_token: &'a str,
     eos_token: &'a str,
@@ -339,8 +366,142 @@ struct ModelTemplateContext<'a> {
     function_call: Option<&'a FunctionCallChoice>,
 }
 
+fn model_template_message_values(
+    messages: &[PromptMessage],
+    phases: &[Option<AssistantMessagePhase>],
+) -> std::result::Result<Vec<Value>, minijinja::Error> {
+    if !phases.is_empty() && phases.len() != messages.len() {
+        return Err(minijinja::Error::new(
+            minijinja::ErrorKind::InvalidOperation,
+            "assistant phase metadata did not match prompt messages",
+        ));
+    }
+    messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let mut value = serde_json::to_value(message).map_err(|error| {
+                minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("failed to serialize prompt message: {error}"),
+                )
+            })?;
+            if let Some(phase) = phases.get(index).copied().flatten() {
+                value
+                    .as_object_mut()
+                    .expect("PromptMessage serializes as an object")
+                    .insert("phase".to_string(), serde_json::json!(phase));
+            }
+            Ok(value)
+        })
+        .collect()
+}
+
 fn render_model_template(
     messages: &[PromptMessage],
+    message_phases: &[Option<AssistantMessagePhase>],
+    model_template: &ModelChatTemplate,
+    options: &ChatTemplateOptions,
+    coalesce_interleaved_system_messages: bool,
+    tools: Option<&[ChatTool]>,
+    tool_choice: Option<&ToolChoice>,
+    functions: Option<&[ChatFunction]>,
+    function_call: Option<&FunctionCallChoice>,
+) -> std::result::Result<String, minijinja::Error> {
+    let original = render_model_template_once(
+        messages,
+        message_phases,
+        model_template,
+        options,
+        tools,
+        tool_choice,
+        functions,
+        function_call,
+    );
+    if original.is_ok()
+        || !coalesce_interleaved_system_messages
+        || !has_nonleading_system_message(messages)
+        || !original
+            .as_ref()
+            .err()
+            .is_some_and(is_system_message_position_error)
+    {
+        return original;
+    }
+
+    // Preserve system messages in place for templates that support them. If a
+    // model-owned template rejects that valid API history shape, retry with a
+    // single leading system message while preserving system and conversation
+    // order within their respective streams.
+    let (adapted_messages, adapted_phases) = coalesce_system_messages(messages, message_phases);
+    match render_model_template_once(
+        &adapted_messages,
+        &adapted_phases,
+        model_template,
+        options,
+        tools,
+        tool_choice,
+        functions,
+        function_call,
+    ) {
+        Ok(prompt) => Ok(prompt),
+        Err(_) => original,
+    }
+}
+
+fn is_system_message_position_error(error: &minijinja::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    let identifies_system_message =
+        message.contains("system message") || message.contains("system role");
+    let identifies_position = message.contains("beginning")
+        || message.contains("must be first")
+        || message.contains("must be the first")
+        || message.contains("only be first")
+        || message.contains("only be the first")
+        || message.contains("must appear first")
+        || message.contains("can only appear first")
+        || message.contains("not allowed after")
+        || message.contains("cannot appear after");
+    identifies_system_message && identifies_position
+}
+
+fn has_nonleading_system_message(messages: &[PromptMessage]) -> bool {
+    messages
+        .iter()
+        .enumerate()
+        .any(|(index, message)| index > 0 && message.role == "system")
+}
+
+fn coalesce_system_messages(
+    messages: &[PromptMessage],
+    phases: &[Option<AssistantMessagePhase>],
+) -> (Vec<PromptMessage>, Vec<Option<AssistantMessagePhase>>) {
+    let mut first_system = None;
+    let mut system_parts = Vec::new();
+    let mut conversation = Vec::with_capacity(messages.len());
+    let mut conversation_phases = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        if message.role == "system" {
+            first_system.get_or_insert_with(|| message.clone());
+            if !message.content.is_empty() {
+                system_parts.push(message.content.clone());
+            }
+        } else {
+            conversation.push(message.clone());
+            conversation_phases.push(phases.get(index).copied().flatten());
+        }
+    }
+    if let Some(mut system) = first_system {
+        system.content = system_parts.join("\n\n");
+        conversation.insert(0, system);
+        conversation_phases.insert(0, None);
+    }
+    (conversation, conversation_phases)
+}
+
+fn render_model_template_once(
+    messages: &[PromptMessage],
+    message_phases: &[Option<AssistantMessagePhase>],
     model_template: &ModelChatTemplate,
     options: &ChatTemplateOptions,
     tools: Option<&[ChatTool]>,
@@ -394,6 +555,18 @@ fn render_model_template(
             .trim_start_matches('\n')
             .to_string()
     });
+    // transformers exposes this helper to HuggingFace templates. Templates
+    // use it to reject invalid message shapes with a useful model-authored
+    // error instead of failing with an unrelated "unknown function" error.
+    env.add_function(
+        "raise_exception",
+        |message: String| -> std::result::Result<String, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                message,
+            ))
+        },
+    );
     // transformers exposes `strftime_now(format)` = `datetime.now().strftime`
     // to templates (Mistral-Small-3.2 / Llama-3.x date their system prompts
     // with it). chrono's strftime covers the specifiers real templates use
@@ -416,11 +589,12 @@ fn render_model_template(
             Ok(out)
         },
     );
+    let template_messages = model_template_message_values(messages, message_phases)?;
     let template = normalize_hf_chat_template(&model_template.template);
     env.add_template("chat", &template)?;
     let tmpl = env.get_template("chat")?;
     tmpl.render(ModelTemplateContext {
-        messages,
+        messages: template_messages,
         add_generation_prompt: true,
         bos_token: model_template.bos_token.as_deref().unwrap_or(""),
         eos_token: model_template.eos_token.as_deref().unwrap_or(""),
@@ -450,12 +624,14 @@ fn detect_model_reasoning_protocol(
     let render = |enable_thinking| {
         render_model_template(
             &messages,
+            &[],
             model_template,
             &ChatTemplateOptions {
                 enable_thinking,
                 reasoning_effort: None,
                 now_override: now,
             },
+            true,
             None,
             None,
             None,
@@ -621,11 +797,36 @@ pub fn render_chat_prompt_with_model_template_options(
     model_template: Option<&ModelChatTemplate>,
     options: &ChatTemplateOptions,
 ) -> ferrum_types::Result<String> {
+    render_chat_prompt_with_model_template_options_and_compatibility(
+        messages,
+        model_id,
+        model_template,
+        options,
+        true,
+        None,
+    )
+}
+
+pub(crate) fn render_chat_prompt_with_model_template_options_and_compatibility(
+    messages: &[ChatMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+    coalesce_interleaved_system_messages: bool,
+    message_phases: Option<&[Option<AssistantMessagePhase>]>,
+) -> ferrum_types::Result<String> {
     let prompt_messages = messages
         .iter()
         .map(PromptMessage::from_chat_message)
         .collect::<Vec<_>>();
-    render_prompt_messages_with_options(&prompt_messages, model_id, model_template, options)
+    render_prompt_messages_with_options_and_compatibility(
+        &prompt_messages,
+        model_id,
+        model_template,
+        options,
+        coalesce_interleaved_system_messages,
+        message_phases.unwrap_or(&[]),
+    )
 }
 
 fn render_fallback_prompt(
@@ -715,6 +916,32 @@ pub fn render_chat_prompt_with_tools_and_model_template(
     functions: &[ChatFunction],
     function_call: Option<&FunctionCallChoice>,
 ) -> ferrum_types::Result<String> {
+    render_chat_prompt_with_tools_and_model_template_compatibility(
+        messages,
+        model_id,
+        model_template,
+        options,
+        tools,
+        tool_choice,
+        functions,
+        function_call,
+        true,
+        None,
+    )
+}
+
+pub(crate) fn render_chat_prompt_with_tools_and_model_template_compatibility(
+    messages: &[ChatMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+    tools: &[ChatTool],
+    tool_choice: Option<&ToolChoice>,
+    functions: &[ChatFunction],
+    function_call: Option<&FunctionCallChoice>,
+    coalesce_interleaved_system_messages: bool,
+    message_phases: Option<&[Option<AssistantMessagePhase>]>,
+) -> ferrum_types::Result<String> {
     if let Some(model_template) = model_template {
         if model_template_supports_tools(model_template) {
             let prompt_messages = messages
@@ -723,8 +950,10 @@ pub fn render_chat_prompt_with_tools_and_model_template(
                 .collect::<Vec<_>>();
             return match render_model_template(
                 &prompt_messages,
+                message_phases.unwrap_or(&[]),
                 model_template,
                 options,
+                coalesce_interleaved_system_messages,
                 (!tools.is_empty()).then_some(tools),
                 tool_choice,
                 (!functions.is_empty()).then_some(functions),
@@ -745,14 +974,25 @@ pub fn render_chat_prompt_with_tools_and_model_template(
         // so tool definitions still reach the model in its native prompt
         // format instead of being silently dropped.
         let mut prompt_messages = Vec::with_capacity(messages.len() + 1);
-        if let Some(spec) = render_tool_spec(tools, tool_choice, functions, function_call) {
+        let tool_spec = render_tool_spec(tools, tool_choice, functions, function_call);
+        if let Some(spec) = tool_spec.as_ref() {
             prompt_messages.push(PromptMessage::new("system", spec));
         }
         prompt_messages.extend(messages.iter().map(PromptMessage::from_chat_message));
+        let prompt_phases = message_phases.map(|phases| {
+            let mut prompt_phases = Vec::with_capacity(prompt_messages.len());
+            if tool_spec.is_some() {
+                prompt_phases.push(None);
+            }
+            prompt_phases.extend_from_slice(phases);
+            prompt_phases
+        });
         return match render_model_template(
             &prompt_messages,
+            prompt_phases.as_deref().unwrap_or(&[]),
             model_template,
             options,
+            coalesce_interleaved_system_messages,
             None,
             None,
             None,
@@ -1234,6 +1474,29 @@ mod tests {
     }
 
     #[test]
+    fn assistant_phase_is_visible_to_model_template() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}{% if message.phase is defined %}:{{ message.phase }}{% endif %}]{{ message.content }}{% endfor %}",
+            "phase-template",
+        );
+        let messages = [
+            msg(MessageRole::Assistant, "Still working"),
+            msg(MessageRole::User, "Continue"),
+        ];
+        let phases = [Some(AssistantMessagePhase::Commentary), None];
+        let out = render_chat_prompt_with_model_template_options_and_compatibility(
+            &messages,
+            "local-model",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            true,
+            Some(&phases),
+        )
+        .unwrap();
+        assert_eq!(out, "[assistant:commentary]Still working[user]Continue");
+    }
+
+    #[test]
     fn hf_python_split_expressions_are_normalized_for_minijinja() {
         let template = ModelChatTemplate::new(
             "{% for message in messages %}{% set content = message.content.split('</think>')[-1].lstrip('\\n') %}{% set reasoning_content = message.content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}<r>{{ reasoning_content.strip('\\n') }}</r>{{ content.lstrip('\\n') }}{% endfor %}",
@@ -1425,6 +1688,113 @@ mod tests {
         let message = format!("{err}");
         assert!(message.contains("broken-template"), "{message}");
         assert!(message.contains("failed to render"), "{message}");
+    }
+
+    #[test]
+    fn hf_raise_exception_reports_the_template_error() {
+        let template = ModelChatTemplate::new(
+            "{{ raise_exception('System message must be at the beginning.') }}",
+            "strict-template",
+        );
+        let err = render_prompt_messages(
+            &[PromptMessage::new("user", "hi")],
+            "qwen3",
+            Some(&template),
+        )
+        .unwrap_err();
+        let message = format!("{err}");
+        assert!(
+            message.contains("System message must be at the beginning."),
+            "{message}"
+        );
+        assert!(!message.contains("unknown function"), "{message}");
+    }
+
+    #[test]
+    fn permissive_template_preserves_interleaved_system_position() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+            "system-in-place-template",
+        );
+        let out = render_prompt_messages(
+            &[
+                PromptMessage::new("system", "Initial"),
+                PromptMessage::new("user", "Question"),
+                PromptMessage::new("system", "Deferred"),
+            ],
+            "model-with-system-in-place",
+            Some(&template),
+        )
+        .unwrap();
+        assert_eq!(out, "[system]Initial[user]Question[system]Deferred");
+    }
+
+    #[test]
+    fn interleaved_system_coalescing_can_be_disabled() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+            "strict-leading-system-template",
+        );
+        let error = render_prompt_messages_with_options_and_compatibility(
+            &[
+                PromptMessage::new("system", "Initial"),
+                PromptMessage::new("user", "Question"),
+                PromptMessage::new("system", "Deferred"),
+            ],
+            "strict-model",
+            Some(&template),
+            &ChatTemplateOptions::default(),
+            false,
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("System message must be at the beginning."),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn strict_template_coalesces_consecutive_leading_system_messages() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be the first message.') }}{% endif %}[{{ message.role }}]{{ message.content }}{% endfor %}",
+            "strict-single-system-template",
+        );
+        let out = render_prompt_messages(
+            &[
+                PromptMessage::new("system", "Initial"),
+                PromptMessage::new("system", "Additional"),
+                PromptMessage::new("user", "Question"),
+            ],
+            "strict-model",
+            Some(&template),
+        )
+        .unwrap();
+        assert_eq!(out, "[system]Initial\n\nAdditional[user]Question");
+    }
+
+    #[test]
+    fn interleaved_system_retry_does_not_hide_an_unrelated_template_error() {
+        let template = ModelChatTemplate::new(
+            "{% if messages|length == 3 %}{{ raise_exception('tool schema rejected') }}{% endif %}ok",
+            "unrelated-error-template",
+        );
+        let error = render_prompt_messages(
+            &[
+                PromptMessage::new("system", "Initial"),
+                PromptMessage::new("user", "Question"),
+                PromptMessage::new("system", "Deferred"),
+            ],
+            "strict-model",
+            Some(&template),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("tool schema rejected"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -65,7 +65,7 @@ enum Commands {
     Tts(tts::TtsCommand),
 
     /// Start the inference HTTP server
-    Serve(serve::ServeCommand),
+    Serve(serve::ServeCliCommand),
 
     /// Stop the running server
     Stop(stop::StopCommand),
@@ -93,13 +93,13 @@ async fn main() {
     }
 
     // Load the optional local configuration without creating files.
-    let config = match CliConfig::load("ferrum.toml").await {
-        Ok(config) => config,
+    let (config, config_loaded) = match CliConfig::load("ferrum.toml").await {
+        Ok(config) => (config, true),
         Err(e) => {
             if cli.verbose {
                 eprintln!("{} Config: {}", "⚠️".yellow(), e);
             }
-            CliConfig::default()
+            (CliConfig::default(), false)
         }
     };
 
@@ -113,7 +113,17 @@ async fn main() {
         Commands::Embed(cmd) => embed::execute(cmd, config).await,
         Commands::Transcribe(cmd) => transcribe::execute(cmd, config).await,
         Commands::Tts(cmd) => tts::execute(cmd, config).await,
-        Commands::Serve(cmd) => serve::execute(cmd, config).await,
+        Commands::Serve(cmd) => {
+            let compatibility = if config_loaded {
+                ferrum_cli::config::load_interleaved_system_coalescing("ferrum.toml").await
+            } else {
+                Ok(true)
+            };
+            match compatibility {
+                Ok(configured) => serve::execute_cli(cmd, config, configured).await,
+                Err(error) => Err(error),
+            }
+        }
         Commands::Stop(cmd) => stop::execute(cmd).await,
         Commands::Pull(cmd) => pull::execute(cmd, config).await,
         Commands::List(cmd) => list::execute(cmd, config).await,

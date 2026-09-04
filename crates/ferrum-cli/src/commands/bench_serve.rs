@@ -2206,10 +2206,9 @@ mod tests {
         let low =
             TestCli::parse_from(base.into_iter().chain(["--reasoning-effort", "low"])).command;
         assert_eq!(low.reasoning_effort, Some(ReasoningEffort::Low));
-        assert!(
-            TestCli::try_parse_from(base.into_iter().chain(["--reasoning-effort", "xhigh"]),)
-                .is_err()
-        );
+        let xhigh =
+            TestCli::parse_from(base.into_iter().chain(["--reasoning-effort", "xhigh"])).command;
+        assert_eq!(xhigh.reasoning_effort, Some(ReasoningEffort::XHigh));
 
         let metal =
             TestCli::parse_from(base.into_iter().chain(["--target-backend", "metal"])).command;

@@ -102,6 +102,7 @@ fn chat_template_goldens_match_transformers() {
                 chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
                     .unwrap_or_else(|e| panic!("{}: bad meta.json now {s:?}: {e}", meta.model_id))
             }),
+            ..Default::default()
         };
 
         let cases: BTreeMap<String, Case> =
@@ -122,6 +123,7 @@ fn chat_template_goldens_match_transformers() {
                     .or(options.enable_thinking),
                 reasoning_effort: options.reasoning_effort,
                 now_override: options.now_override,
+                ..Default::default()
             };
 
             let rendered = match &case.tools {
