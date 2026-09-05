@@ -3502,23 +3502,28 @@ fn convert_chat_request_with_template_model_and_default(
         );
     }
     let prompt_opened_thinking = has_unclosed_thinking_block(&prompt);
-    let structured_output_after_reasoning =
-        !matches!(response_format, ferrum_types::ResponseFormat::Text)
-            && (prompt_opened_thinking || model_generated_thinking);
-    let structured_output_start = if structured_output_after_reasoning {
-        StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
-    } else {
-        StructuredOutputStart::Immediate
-    };
-    let response_completion_boundary =
-        if prompt_opened_thinking || structured_output_after_reasoning {
-            ResponseCompletionBoundary::AfterDelimiterAndPayload {
-                delimiter: THINK_END_TAG.to_string(),
-                alternate_envelope: api_chat.generated_response_envelope(),
-            }
+    let structured_output = !matches!(response_format, ferrum_types::ResponseFormat::Text);
+    let structured_output_after_reasoning = structured_output
+        && model_output_protocol == ModelOutputProtocol::Text
+        && (prompt_opened_thinking || model_generated_thinking);
+    let structured_output_start =
+        if structured_output && model_output_protocol == ModelOutputProtocol::HarmonyGptOss {
+            StructuredOutputStart::HarmonyFinal
+        } else if structured_output_after_reasoning {
+            StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
         } else {
-            ResponseCompletionBoundary::Immediate
+            StructuredOutputStart::Immediate
         };
+    let response_completion_boundary = if model_output_protocol == ModelOutputProtocol::Text
+        && (prompt_opened_thinking || structured_output_after_reasoning)
+    {
+        ResponseCompletionBoundary::AfterDelimiterAndPayload {
+            delimiter: THINK_END_TAG.to_string(),
+            alternate_envelope: api_chat.generated_response_envelope(),
+        }
+    } else {
+        ResponseCompletionBoundary::Immediate
+    };
 
     Ok(InferenceRequest {
         id: RequestId(Uuid::new_v4()),
@@ -13114,6 +13119,197 @@ mod tests {
             internal.sampling_params.structured_output_start,
             StructuredOutputStart::Immediate
         );
+    }
+
+    fn harmony_json_template() -> ModelChatTemplate {
+        let mut template = ModelChatTemplate::new(
+            "{% for message in messages %}<|start|>{{ message.role }}<|message|>{{ message.content }}<|end|>{% endfor %}{% if add_generation_prompt %}<|start|>assistant{% endif %}",
+            "harmony-structured-template",
+        );
+        template.output_protocol = ModelOutputProtocol::HarmonyGptOss;
+        template
+    }
+
+    #[test]
+    fn harmony_structured_format_activates_at_final_payload() {
+        let template = harmony_json_template();
+        for (response_format, constrained) in [
+            (json!({"type": "json_object"}), true),
+            (
+                json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "answer",
+                        "strict": true,
+                        "schema": {
+                            "type": "object",
+                            "properties": {"answer": {"type": "integer"}},
+                            "required": ["answer"],
+                            "additionalProperties": false
+                        }
+                    }
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "best_effort",
+                        "strict": false,
+                        "schema": {"type": "object"}
+                    }
+                }),
+                false,
+            ),
+            (json!({"type": "text"}), false),
+        ] {
+            let request = chat_request(json!({"response_format": response_format}));
+            let internal =
+                convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                    .unwrap();
+            assert_eq!(
+                internal.sampling_params.structured_output_start,
+                if constrained {
+                    StructuredOutputStart::HarmonyFinal
+                } else {
+                    StructuredOutputStart::Immediate
+                }
+            );
+            assert_eq!(
+                internal.sampling_params.response_completion_boundary,
+                ResponseCompletionBoundary::Immediate,
+                "Harmony framing must not be gated on a Text reasoning delimiter"
+            );
+            internal.sampling_params.validate().unwrap();
+        }
+    }
+
+    fn harmony_json_request(stream: bool) -> Value {
+        json!({
+            "model": "stub-model",
+            "messages": [{"role": "user", "content": "Return an answer object."}],
+            "stream": stream,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"answer": {"type": "integer"}},
+                        "required": ["answer"],
+                        "additionalProperties": false
+                    }
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn harmony_strict_json_routes_validate_final_payload_in_sync_and_sse() {
+        for (chunks, finish_reason, reasoning) in [
+            (
+                vec![
+                    "<|channel|>fi",
+                    "nal<|message|>{\"answer\":",
+                    "42}<|return|>",
+                ],
+                FinishReason::Stop,
+                "",
+            ),
+            (
+                vec![
+                    "<|channel|>analysis<|message|>Compute.",
+                    "<|end|><|start|>assistant<|channel|>fi",
+                    "nal<|message|>{\"answer\":42}<|return|>",
+                ],
+                FinishReason::Stop,
+                "Compute.",
+            ),
+            (
+                vec!["<|channel|>final<|message|>{\"answer\":", "42}"],
+                FinishReason::Length,
+                "",
+            ),
+        ] {
+            for stream in [false, true] {
+                let engine = StubLlm {
+                    finish_reason,
+                    ..StubLlm::with_stream_chunks(&chunks)
+                };
+                let router = AxumServer::from_llm(Arc::new(engine))
+                    .with_prompt_template(Some(harmony_json_template()))
+                    .build_router();
+                let response =
+                    post_json(router, "/v1/chat/completions", harmony_json_request(stream)).await;
+                assert_eq!(response.status(), AxumStatusCode::OK);
+                if stream {
+                    let body = response_text(response).await;
+                    assert!(body.contains("data: [DONE]"));
+                    let events = responses_sse_json_events(&body);
+                    assert!(events.iter().all(|event| event.get("error").is_none()));
+                    let content: String = events
+                        .iter()
+                        .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                        .collect();
+                    let actual_reasoning: String = events
+                        .iter()
+                        .filter_map(|event| event["choices"][0]["delta"]["reasoning"].as_str())
+                        .collect();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&content).unwrap(),
+                        json!({"answer": 42})
+                    );
+                    assert_eq!(actual_reasoning, reasoning);
+                } else {
+                    let body = response_json(response).await;
+                    let message = &body["choices"][0]["message"];
+                    assert_eq!(message["content"], "{\"answer\":42}");
+                    assert_eq!(message["reasoning"].as_str().unwrap_or(""), reasoning);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn harmony_strict_json_routes_reject_bad_framing_and_payload_without_sse_leaks() {
+        for output in [
+            "{\"answer\":42}",
+            "<|channel|>final<|message|>{\"answer\":42}",
+            "<|channel|>final<|message|>{\"answer\":42}<|call|>",
+            "<|channel|>analysis<|message|>Compute.<|end|>\
+             <|start|>assistant<|channel|>final<|message|>{\"answer\":\"wrong\"}<|return|>",
+        ] {
+            for stream in [false, true] {
+                let response = post_json(
+                    router_with_stub_and_template(output, harmony_json_template()),
+                    "/v1/chat/completions",
+                    harmony_json_request(stream),
+                )
+                .await;
+                if stream {
+                    assert_eq!(response.status(), AxumStatusCode::OK);
+                    let body = response_text(response).await;
+                    assert!(body.contains("data: [DONE]"));
+                    let events = responses_sse_json_events(&body);
+                    assert!(events.iter().any(|event| event.get("error").is_some()));
+                    for event in events {
+                        for field in ["content", "reasoning"] {
+                            assert!(event["choices"][0]["delta"][field]
+                                .as_str()
+                                .unwrap_or("")
+                                .is_empty());
+                        }
+                    }
+                } else {
+                    assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+                    let body = response_json(response).await;
+                    assert_eq!(body["error"]["type"], "internal_server_error");
+                    assert!(body.get("choices").is_none());
+                }
+            }
+        }
     }
 
     #[test]

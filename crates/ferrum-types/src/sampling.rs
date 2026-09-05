@@ -124,6 +124,9 @@ pub enum StructuredOutputStart {
     /// Allow reasoning tokens until this exact tokenizer sequence is emitted,
     /// then constrain every subsequent token.
     AfterDelimiter(String),
+    /// Preserve the Harmony assistant framing and optional analysis message,
+    /// then constrain the final payload and its normal `<|return|>` boundary.
+    HarmonyFinal,
 }
 
 /// A lexical response envelope that can complete an otherwise pending response.
@@ -273,6 +276,13 @@ impl SamplingParams {
                     "typical_p must be in range (0, 1]".to_string(),
                 ));
             }
+        }
+        if self.structured_output_start == StructuredOutputStart::HarmonyFinal
+            && self.model_output_protocol != ModelOutputProtocol::HarmonyGptOss
+        {
+            return Err(FerrumError::invalid_request(
+                "Harmony final structured output requires the Harmony model output protocol",
+            ));
         }
         if let ResponseCompletionBoundary::AfterDelimiterAndPayload {
             delimiter,

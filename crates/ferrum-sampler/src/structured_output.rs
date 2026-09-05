@@ -20,6 +20,8 @@ use llguidance::{
 use parking_lot::Mutex;
 use serde_json::json;
 
+mod harmony;
+
 const MAX_CACHED_GRAMMARS: usize = 64;
 // Structured output is the requested product result; hidden reasoning may use
 // at most the other half of a normal-sized completion budget.
@@ -248,6 +250,17 @@ impl StructuredOutputFactory {
         };
         let (activation, budget) = match start {
             StructuredOutputStart::Immediate => (Activation::Active, None),
+            StructuredOutputStart::HarmonyFinal => {
+                let boundary = harmony::HarmonyBoundary::compile(
+                    self.tokenizer.as_ref(),
+                    self.vocab_size,
+                    max_output_tokens,
+                    stop_token_ids,
+                    stop_text_sequences,
+                )?;
+                let budget = boundary.budget();
+                (Activation::Harmony(boundary), Some(budget))
+            }
             StructuredOutputStart::AfterDelimiter(delimiter) => {
                 if delimiter.is_empty() {
                     return Err(FerrumError::invalid_request(
@@ -427,7 +440,7 @@ impl std::fmt::Debug for StructuredOutputProcessor {
         f.debug_struct("StructuredOutputProcessor")
             .field("vocab_size", &self.vocab_size)
             .field("consumed", &state.consumed)
-            .field("active", &matches!(state.activation, Activation::Active))
+            .field("active", &state.grammar_start.is_some())
             .field("budget", &self.budget)
             .finish()
     }
@@ -450,6 +463,7 @@ struct ProcessorState {
 #[derive(Clone)]
 enum Activation {
     Active,
+    Harmony(harmony::HarmonyBoundary),
     Boundary {
         delimiter_tokens: Vec<u32>,
         forcing: bool,
@@ -494,6 +508,20 @@ impl StructuredOutputProcessor {
         let mut state = self.state.lock();
         advance_state(&mut state, generated, terminal_token_ids)?;
         activate_forcing_if_due(&mut state, generated, self.budget);
+        if let Activation::Harmony(boundary) = &state.activation {
+            if !boundary.in_payload() {
+                self.mask_undefined_token_ids(logits);
+                let required_delimiter_token_id =
+                    boundary.mask_before_payload(logits, hidden_control_token_ids)?;
+                return Ok(StructuredOutputMaskOutcome {
+                    phase: boundary.progress().0,
+                    accepting: false,
+                    liveness_intervention: false,
+                    grammar_start_token_index: None,
+                    required_delimiter_token_id,
+                });
+            }
+        }
         if let Activation::Boundary {
             delimiter_tokens,
             forcing,
@@ -550,15 +578,20 @@ impl StructuredOutputProcessor {
         let mut finite_allowed = 0usize;
         for (idx, logit) in logits.iter_mut().enumerate() {
             let token = idx as u32;
+            let allowed_terminal = match &state.activation {
+                Activation::Harmony(boundary) => boundary.is_terminal(token),
+                _ => terminal_token_ids.is_some_and(|terminals| terminals.contains(&token)),
+            };
             let hidden_non_terminal_control = hidden_control_token_ids
                 .is_some_and(|controls| controls.contains(&token))
-                && !terminal_token_ids.is_some_and(|terminals| terminals.contains(&token));
+                && !allowed_terminal;
+            let protocol_control = matches!(&state.activation,
+                Activation::Harmony(boundary) if boundary.is_control(token) && !allowed_terminal);
             let allowed = idx < self.vocab_size
                 && self.defined_token_ids.get(idx).copied().unwrap_or(false)
                 && !hidden_non_terminal_control
-                && (mask.is_allowed(token)
-                    || (accepting
-                        && terminal_token_ids.is_some_and(|terminals| terminals.contains(&token))));
+                && !protocol_control
+                && (mask.is_allowed(token) || (accepting && allowed_terminal));
             if !allowed {
                 *logit = f32::NEG_INFINITY;
             } else if logit.is_finite() {
@@ -676,6 +709,20 @@ impl StructuredOutputProcessor {
                         ))
                     })?,
                 ),
+                Activation::Harmony(boundary) => {
+                    let (phase, length, prefix) = boundary.progress();
+                    (
+                        phase,
+                        Some(length),
+                        prefix,
+                        boundary.in_payload()
+                            && state.matcher.is_accepting().map_err(|error| {
+                                FerrumError::model(format!(
+                                    "structured-output acceptance check failed: {error}"
+                                ))
+                            })?,
+                    )
+                }
             };
         let grammar_tokens = state
             .grammar_start
@@ -755,6 +802,11 @@ fn activate_forcing_if_due(
     generated: &[TokenId],
     budget: Option<StructuredOutputBudgetPlan>,
 ) {
+    if let Activation::Harmony(boundary) = &mut state.activation {
+        boundary.activate_forcing_if_due(generated.len());
+        state.boundary_forced = boundary.is_forced();
+        return;
+    }
     let Some(budget) = budget else {
         return;
     };
@@ -767,7 +819,7 @@ fn activate_forcing_if_due(
             Activation::Boundary {
                 delimiter_tokens, ..
             } => delimiter_prefix_token_count(generated, delimiter_tokens),
-            Activation::Active => 0,
+            Activation::Active | Activation::Harmony(_) => 0,
         };
         if let Activation::Boundary { forcing, .. } = &mut state.activation {
             *forcing = true;
@@ -816,6 +868,21 @@ fn advance_state(
         ));
     }
 
+    if let Activation::Harmony(boundary) = &mut state.activation {
+        while state.consumed < generated.len() && !boundary.in_payload() {
+            let index = state.consumed;
+            if let Some(start) = boundary.observe(generated[index].get(), index)? {
+                state.grammar_start = Some(start);
+                state.boundary_start = Some(boundary.boundary_start());
+            }
+            state.consumed = index + 1;
+        }
+        state.boundary_forced = boundary.is_forced();
+        if !boundary.in_payload() {
+            return Ok(());
+        }
+    }
+
     if let Activation::Boundary {
         delimiter_tokens, ..
     } = &state.activation
@@ -844,7 +911,16 @@ fn advance_state(
     }
 
     for token in &generated[state.consumed..] {
-        if terminal_token_ids.is_some_and(|terminals| terminals.contains(&token.get()))
+        if let Activation::Harmony(boundary) = &mut state.activation {
+            let accepting = state.matcher.is_accepting().map_err(|error| {
+                FerrumError::model(format!(
+                    "structured-output acceptance check failed: {error}"
+                ))
+            })?;
+            if boundary.observe_payload_control(token.get(), accepting)? {
+                continue;
+            }
+        } else if terminal_token_ids.is_some_and(|terminals| terminals.contains(&token.get()))
             && state.matcher.is_accepting().map_err(|error| {
                 FerrumError::model(format!(
                     "structured-output acceptance check failed: {error}"
@@ -953,13 +1029,13 @@ mod tests {
     const EOS: u32 = 256;
     const TEST_MAX_OUTPUT_TOKENS: usize = 128;
 
-    struct ByteTokenizer {
+    pub(super) struct ByteTokenizer {
         special: SpecialTokens,
         token_text: Vec<String>,
     }
 
     impl ByteTokenizer {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let mut token_text = (0u16..=255)
                 .map(|byte| char::from_u32(byte as u32).unwrap().to_string())
                 .collect::<Vec<_>>();
