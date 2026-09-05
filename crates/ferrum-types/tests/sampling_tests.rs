@@ -67,6 +67,40 @@ fn model_output_protocol_is_backward_compatible_and_round_trips() {
 }
 
 #[test]
+fn harmony_structured_boundary_requires_its_protocol_and_round_trips() {
+    let mut params = SamplingParams {
+        response_format: ResponseFormat::JsonObject,
+        structured_output_start: StructuredOutputStart::HarmonyFinal,
+        ..SamplingParams::default()
+    };
+    assert!(params.validate().is_err());
+    params.model_output_protocol = ModelOutputProtocol::HarmonyGptOss;
+    params.validate().unwrap();
+    let encoded = serde_json::to_value(&params).unwrap();
+    assert_eq!(
+        encoded["structured_output_start"],
+        serde_json::json!({"mode": "harmony_final"})
+    );
+    let decoded: SamplingParams = serde_json::from_value(encoded).unwrap();
+    assert_eq!(
+        decoded.structured_output_start,
+        StructuredOutputStart::HarmonyFinal
+    );
+    decoded.validate().unwrap();
+
+    let mut legacy = serde_json::to_value(SamplingParams::default()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("structured_output_start");
+    let decoded: SamplingParams = serde_json::from_value(legacy).unwrap();
+    assert_eq!(
+        decoded.structured_output_start,
+        StructuredOutputStart::Immediate
+    );
+}
+
+#[test]
 fn sampling_params_validate_checks() {
     let mut p = SamplingParams::default();
     p.temperature = -0.1;

@@ -12561,6 +12561,148 @@ fn harmony_protocol_allows_only_its_typed_generation_controls() {
 }
 
 #[test]
+fn harmony_structured_sampling_preserves_framing_budget_history_and_terminal() {
+    const CHANNEL: u32 = 9;
+    const MESSAGE: u32 = 10;
+    const START: u32 = 11;
+    const END: u32 = 12;
+    const RETURN: u32 = 13;
+    const CALL: u32 = 14;
+    const UNRELATED_CONTROL: u32 = 16;
+    const MODEL_VOCAB: usize = 17;
+    let mut tokenizer = PolicyTokenizer::new(
+        9,
+        &[
+            ("{", 0),
+            (" ", 1),
+            ("x", 2),
+            ("<eos>", 3),
+            ("}", 4),
+            ("\"", 5),
+            ("analysis", 6),
+            ("final", 7),
+            ("assistant", 8),
+            ("<|channel|>", CHANNEL),
+            ("<|message|>", MESSAGE),
+            ("<|start|>", START),
+            ("<|end|>", END),
+            ("<|return|>", RETURN),
+            ("<|call|>", CALL),
+            ("<|constrain|>", 15),
+            ("<|fim_prefix|>", UNRELATED_CONTROL),
+        ],
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    tokenizer.special.extra_eos_tokens = vec![TokenId::new(RETURN), TokenId::new(CALL)];
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    let mut request = policy_request();
+    request.sampling_params.max_tokens = 64;
+    request.sampling_params.repetition_penalty = 2.0;
+    request.sampling_params.presence_penalty = 1.5;
+    request.sampling_params.model_output_protocol =
+        ferrum_types::ModelOutputProtocol::HarmonyGptOss;
+    request.sampling_params.structured_output_start =
+        ferrum_types::StructuredOutputStart::HarmonyFinal;
+    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+        r#"{"type":"object","maxProperties":0}"#.to_string(),
+    );
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(8)],
+        Some(Arc::clone(&tokenizer)),
+        Some(MODEL_VOCAB),
+    );
+    assert!(matches!(
+        state.model_decode_logits_policy(),
+        LogitsReturnPolicy::FullLogits
+    ));
+
+    let sample = |state: &mut SequenceState, expected: u32, forcing: bool| {
+        let mut logits = vec![f32::NEG_INFINITY; MODEL_VOCAB];
+        logits[UNRELATED_CONTROL as usize] = 400.0;
+        logits[3] = 300.0;
+        logits[CALL as usize] = 250.0;
+        // A forced boundary must become finite even when the model insists
+        // on more reasoning. Ordinary steps retain the requested logit.
+        logits[if forcing { 0 } else { expected as usize }] = 1.0;
+        let token = state
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(expected));
+        assert_eq!(logits[UNRELATED_CONTROL as usize], f32::NEG_INFINITY);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        assert_eq!(logits[CALL as usize], f32::NEG_INFINITY);
+        logits
+    };
+    for token in [CHANNEL, 6, MESSAGE] {
+        sample(&mut state, token, false);
+    }
+    let reasoning_limit = state
+        .structured_output_processor
+        .as_ref()
+        .unwrap()
+        .progress_with_terminals(&state.generated_tokens, &state.stop_token_ids)
+        .unwrap()
+        .budget
+        .unwrap()
+        .reasoning_token_limit;
+    while state.generated_tokens.len() < reasoning_limit {
+        sample(&mut state, 0, false);
+        assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
+        assert!(state.sampling_history.token_frequencies().is_empty());
+    }
+    for token in [END, START, 8, CHANNEL, 7, MESSAGE] {
+        sample(&mut state, token, true);
+        assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
+    }
+    assert!(state
+        .structured_output_terminal_error(FinishReason::Length)
+        .is_some());
+    let grammar_start = state.generated_tokens.len();
+    let logits = sample(&mut state, 0, false);
+    assert_eq!(logits[0], 1.0, "analysis must not penalize the JSON opener");
+    assert_eq!(
+        state.sampling_history.scope(),
+        SequenceSamplingHistoryScope::VisibleStructuredOutput {
+            start_token_index: grammar_start
+        }
+    );
+
+    state.reset_guided_processors().unwrap();
+    sample(&mut state, 4, false);
+    assert_eq!(
+        state
+            .sampling_history
+            .previous_tokens(&state.generated_tokens)
+            .unwrap(),
+        &[TokenId::new(0), TokenId::new(4)]
+    );
+    assert!(state
+        .structured_output_terminal_error(FinishReason::Length)
+        .is_none());
+    assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
+
+    sample(&mut state, RETURN, false);
+    let stop = state.stop_reason(Some(tokenizer.as_ref()));
+    assert_eq!(stop, Some(FinishReason::Stop));
+    assert!(state.should_stream_generated_token(
+        Some(tokenizer.as_ref()),
+        TokenId::new(RETURN),
+        stop,
+    ));
+    assert!(state
+        .structured_output_terminal_error(FinishReason::Stop)
+        .is_none());
+    assert!(state.generated_tokens.len() <= state.sampling_params.max_tokens);
+    let output = tokenizer.decode(&state.generated_tokens, true).unwrap();
+    let parsed = ferrum_types::parse_harmony_response(&output).unwrap();
+    assert_eq!(parsed.content, "{}");
+    assert!(!parsed.reasoning_content.unwrap().is_empty());
+}
+
+#[test]
 fn harmony_call_and_return_terminals_are_sent_to_the_incremental_stream() {
     let mut tokenizer = PolicyTokenizer::new(
         9,
