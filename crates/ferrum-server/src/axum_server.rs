@@ -5602,6 +5602,7 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;
     use super::*;
