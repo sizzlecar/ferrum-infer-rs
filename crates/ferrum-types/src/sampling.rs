@@ -395,7 +395,7 @@ pub enum Priority {
 pub enum FinishReason {
     /// Hit maximum token limit
     Length,
-    /// Hit stop sequence
+    /// Hit a caller-configured stop string or token; model EOS uses `EOS`.
     Stop,
     /// Hit end-of-sequence token
     EOS,

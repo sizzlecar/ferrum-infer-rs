@@ -69,6 +69,14 @@ to `basic`; explicitly select the checks relevant to the release:
 - `structured`: server JSON/schema behavior and valid structured responses.
 - `tools`: server tool calls and a tool-result continuation.
 
+A stop probe selects a unique suffix from the visible baseline that does not
+occur in its reasoning. If a model echoes the default copy prompt in analysis,
+use an explicit prose prompt, for example
+`--stop-prompt "Explain how rain forms to a child in exactly three short sentences."`.
+The same prompt is replayed through both entrypoints and recorded in the report;
+retained-prefix, stop-exclusion and termination checks still apply. Failure
+to find an isolated suffix is a coverage failure, not a passing stop test.
+
 For reasoning-history compatibility, add `--reasoning-alias-replay` to a run
 including `--checks tools`. Preserve the model's reasoning defaults for that run
 by omitting `--disable-thinking`. It must replay actual, non-empty reasoning;

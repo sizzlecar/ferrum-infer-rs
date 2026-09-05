@@ -9,8 +9,6 @@ use std::time::Duration;
 const FIRST_TURN: &str =
     "Remember the code cobalt-731. What is 17 + 25? Reply with only the number.";
 const SECOND_TURN: &str = "What code did I ask you to remember? Reply with only that code.";
-const STOP_PROMPT: &str =
-    "Write exactly this text, without quotes or explanation: alpha beta gamma delta epsilon.";
 
 enum Input<'a> {
     Repl(&'a str),
@@ -166,7 +164,13 @@ pub(super) async fn run_basic(args: &Args) -> Result<Value> {
 }
 
 pub(super) async fn run_stop(args: &Args) -> Result<Value> {
-    let baseline = run_chat(args, "run-stop-baseline", Input::Prompt(STOP_PROMPT), None).await?;
+    let baseline = run_chat(
+        args,
+        "run-stop-baseline",
+        Input::Prompt(&args.stop_prompt),
+        None,
+    )
+    .await?;
     ensure!(
         baseline.assistants.len() == 1,
         "baseline must return one answer"
@@ -181,7 +185,7 @@ pub(super) async fn run_stop(args: &Args) -> Result<Value> {
     let stopped = run_chat(
         args,
         "run-stop-replay",
-        Input::Prompt(STOP_PROMPT),
+        Input::Prompt(&args.stop_prompt),
         Some(&stop),
     )
     .await?;
@@ -283,7 +287,7 @@ pub(super) async fn serve_basic(server: &Server<'_>) -> Result<Value> {
 pub(super) async fn serve_stop(server: &Server<'_>) -> Result<Value> {
     let mut body = request(
         server,
-        vec![json!({"role": "user", "content": STOP_PROMPT})],
+        vec![json!({"role": "user", "content": server.args.stop_prompt})],
     );
     let baseline = chat(server, "serve-stop-baseline", body.clone(), false).await?;
     ensure!(

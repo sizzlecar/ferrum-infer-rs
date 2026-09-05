@@ -305,7 +305,16 @@ fn clamp_default_max_tokens_to_context(
     }
 }
 
-/// Resolve per-request stop conditions into (single-token-ids, multi-token-texts).
+struct StopConditions {
+    /// Automatic model termination, excluding explicit user-stop collisions.
+    model_eos_token_ids: Vec<u32>,
+    /// All terminal IDs, including model EOS and explicit user stops.
+    stop_token_ids: HashSet<u32>,
+    user_stop_token_ids: HashSet<u32>,
+    stop_text_seqs: Vec<String>,
+}
+
+/// Resolve per-request automatic and user stop conditions.
 ///
 /// Combines:
 /// 1. Model EOS reported by the tokenizer (`special_tokens().eos_token`).
@@ -322,7 +331,7 @@ fn resolve_stop_conditions(
     params: &SamplingParams,
     tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     ignore_eos: bool,
-) -> (Vec<u32>, HashSet<u32>, Vec<String>) {
+) -> StopConditions {
     let mut model_eos_token_ids = Vec::new();
     let mut text_seqs: Vec<String> = Vec::new();
 
@@ -344,6 +353,7 @@ fn resolve_stop_conditions(
     model_eos_token_ids.sort_unstable();
     model_eos_token_ids.dedup();
     let mut ids: HashSet<u32> = model_eos_token_ids.iter().copied().collect();
+    let mut user_stop_token_ids = HashSet::new();
 
     if let Some(tok) = tokenizer {
         for stop_seq in &params.stop_sequences {
@@ -354,6 +364,7 @@ fn resolve_stop_conditions(
             match tok.encode(stop_seq, false) {
                 Ok(toks) if toks.len() == 1 => {
                     ids.insert(toks[0].get());
+                    user_stop_token_ids.insert(toks[0].get());
                 }
                 _ => {}
             }
@@ -363,7 +374,16 @@ fn resolve_stop_conditions(
             text_seqs.push(stop_seq.clone());
         }
     }
-    (model_eos_token_ids, ids, text_seqs)
+    // Explicit stops may interrupt an unfinished response even when their ID
+    // is also model EOS. Keep the union intact for hard grammar validation and
+    // output stripping; only automatic completion gates exclude collisions.
+    model_eos_token_ids.retain(|id| !user_stop_token_ids.contains(id));
+    StopConditions {
+        model_eos_token_ids,
+        stop_token_ids: ids,
+        user_stop_token_ids,
+        stop_text_seqs: text_seqs,
+    }
 }
 
 #[derive(Debug)]

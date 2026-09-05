@@ -132,7 +132,7 @@ async fn tiny_stack_multi_turn_five_rounds() {
 
 /// EOS termination. The greedy stream is fixed by the model; we observe it,
 /// then point the tokenizer's EOS at the 3rd emitted token and assert the
-/// engine stops exactly there with `FinishReason::Stop`. Kills hb-01 (the
+/// engine stops exactly there with `FinishReason::EOS`. Kills hb-01 (the
 /// EOS-detection guard removal): without it, the run ignores EOS and falls
 /// through to `Length`.
 #[tokio::test]
@@ -168,8 +168,8 @@ async fn tiny_stack_eos_terminates() {
 
     assert_eq!(
         resp.finish_reason,
-        FinishReason::Stop,
-        "must stop on EOS, not Length"
+        FinishReason::EOS,
+        "must report model EOS"
     );
     let out_ids: Vec<u32> = resp.tokens.iter().map(|t| t.get()).collect();
     assert_eq!(
@@ -422,10 +422,7 @@ async fn tiny_stack_guided_tool_constraint() {
         .await
         .expect("guided request must complete without panic");
     assert!(
-        matches!(
-            resp.finish_reason,
-            FinishReason::Length | FinishReason::Stop
-        ),
+        matches!(resp.finish_reason, FinishReason::Length | FinishReason::EOS),
         "guided run terminates cleanly: {:?}",
         resp.finish_reason
     );

@@ -1427,6 +1427,7 @@ struct PolicyTokenizer {
     ids: HashMap<String, TokenId>,
     texts: Vec<Option<String>>,
     encoded_sequences: HashMap<String, Vec<TokenId>>,
+    hidden_decode_token_ids: HashSet<u32>,
 }
 
 impl PolicyTokenizer {
@@ -1453,6 +1454,7 @@ impl PolicyTokenizer {
             ids,
             texts,
             encoded_sequences: HashMap::new(),
+            hidden_decode_token_ids: HashSet::new(),
         }
     }
 }
@@ -1479,6 +1481,9 @@ impl Tokenizer for PolicyTokenizer {
         let mut output = String::new();
         let mut pending_bad_byte = false;
         for token in tokens {
+            if skip_special && self.hidden_decode_token_ids.contains(&token.get()) {
+                continue;
+            }
             let Some(text) = self.token_text(*token) else {
                 continue;
             };
@@ -10532,6 +10537,93 @@ async fn process_batch_unified_decode_resource_exhausted_keeps_recurrent_state_w
 }
 
 #[test]
+fn sequence_stop_reason_distinguishes_user_stop_from_natural_eos() {
+    let mut tokenizer = PolicyTokenizer::new(
+        8,
+        &[
+            ("prompt", 0),
+            ("<eos>", 3),
+            ("STOP", 6),
+            ("answerSTOPtail", 7),
+        ],
+    );
+    tokenizer.special.extra_eos_tokens = vec![TokenId::new(7)];
+    tokenizer.hidden_decode_token_ids.insert(3);
+    let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
+    assert_eq!(tokenizer.decode(&[TokenId::new(3)], true).unwrap(), "");
+    for (label, ignore_eos, stops, token, max_tokens, expected) in [
+        (
+            "natural EOS precedes length",
+            false,
+            vec![],
+            3,
+            1,
+            Some(FinishReason::EOS),
+        ),
+        ("ignored natural EOS", true, vec![], 3, 2, None),
+        (
+            "ignored EOS reaches length",
+            true,
+            vec![],
+            3,
+            1,
+            Some(FinishReason::Length),
+        ),
+        (
+            "user stop precedes length",
+            false,
+            vec!["STOP"],
+            6,
+            1,
+            Some(FinishReason::Stop),
+        ),
+        (
+            "hidden EOS is explicitly a user stop",
+            false,
+            vec!["<eos>"],
+            3,
+            1,
+            Some(FinishReason::Stop),
+        ),
+        (
+            "ignore EOS preserves colliding user stop",
+            true,
+            vec!["<eos>"],
+            3,
+            1,
+            Some(FinishReason::Stop),
+        ),
+        (
+            "text stop inside EOS precedes EOS and length",
+            false,
+            vec!["STOP"],
+            7,
+            1,
+            Some(FinishReason::Stop),
+        ),
+    ] {
+        let mut request = policy_request();
+        request.sampling_params.stop_sequences = stops.into_iter().map(str::to_string).collect();
+        request.sampling_params.max_tokens = max_tokens;
+        request.metadata.insert(
+            "ferrum_ignore_eos".to_string(),
+            serde_json::json!(ignore_eos),
+        );
+        let mut state = SequenceState::new_with_tokenizer(
+            request,
+            vec![TokenId::new(0)],
+            Some(Arc::clone(&tokenizer)),
+        );
+        state.generated_tokens.push(TokenId::new(token));
+        assert_eq!(
+            state.stop_reason(Some(tokenizer.as_ref())),
+            expected,
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn sequence_state_detects_text_stop_before_length() {
     let tokenizer = PolicyTokenizer::new(8, &[("OK", 5), ("<END>", 6), ("TAIL", 7)]);
     let mut request = policy_request();
@@ -11203,6 +11295,70 @@ fn response_completion_boundary_preserves_explicit_user_stop() {
 }
 
 #[test]
+fn response_completion_boundary_preserves_user_stop_colliding_with_model_eos() {
+    let tokenizer = response_completion_tokenizer();
+    for ignore_eos in [false, true] {
+        for model_argmax in [false, true] {
+            let mut request = response_completion_request();
+            request.sampling_params.stop_sequences = vec!["<eos>".to_string()];
+            request.metadata.insert(
+                "ferrum_ignore_eos".to_string(),
+                serde_json::json!(ignore_eos),
+            );
+            if !model_argmax {
+                request.sampling_params.presence_penalty = 1.0;
+            }
+            let mut state = SequenceState::new_with_tokenizer(
+                request,
+                vec![TokenId::new(0)],
+                Some(Arc::clone(&tokenizer)),
+            );
+            if model_argmax {
+                let LogitsReturnPolicy::GreedyArgmax {
+                    token_mask: Some(mask),
+                    ..
+                } = state.model_decode_logits_policy()
+                else {
+                    panic!("ordinary greedy sampling must retain its model argmax path");
+                };
+                assert_eq!(
+                    mask.valid_token_mask[3], 1,
+                    "an explicit stop must remain selectable before the completion boundary"
+                );
+                state
+                    .validate_and_commit_model_greedy_argmax_token(
+                        Some(tokenizer.as_ref()),
+                        TokenId::new(3),
+                    )
+                    .unwrap();
+            } else {
+                assert!(matches!(
+                    state.model_decode_logits_policy(),
+                    LogitsReturnPolicy::FullLogits
+                ));
+                let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
+                logits[0] = 1.0;
+                logits[3] = 100.0;
+                let token = state
+                    .sample_and_commit_with_processors_and_tokenizer(
+                        &mut logits,
+                        Some(tokenizer.as_ref()),
+                    )
+                    .unwrap();
+                assert_eq!(token, TokenId::new(3));
+            }
+            let stop = state.stop_reason(Some(tokenizer.as_ref()));
+            assert_eq!(stop, Some(FinishReason::Stop));
+            assert!(!state.should_stream_generated_token(
+                Some(tokenizer.as_ref()),
+                TokenId::new(3),
+                stop
+            ));
+        }
+    }
+}
+
+#[test]
 fn response_completion_boundary_preserves_ignore_eos() {
     let tokenizer = response_completion_tokenizer();
     let mut request = response_completion_request();
@@ -11553,38 +11709,45 @@ fn schema_guided_sampling_masks_extended_stop_tokens_before_accept() {
     tokenizer.special.unk_token = None;
     tokenizer.special.pad_token = None;
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(tokenizer);
-    let mut request = policy_request();
-    request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
-        r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
-            .to_string(),
-    );
-    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
-        request,
-        vec![TokenId::new(0)],
-        Some(tokenizer),
-        Some(9),
-    );
+    for user_stop in [None, Some("</s>"), Some("<|eot_id|>")] {
+        let mut request = policy_request();
+        request.sampling_params.stop_sequences =
+            user_stop.into_iter().map(str::to_string).collect();
+        request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+            r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#
+                .to_string(),
+        );
+        let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request,
+            vec![TokenId::new(0)],
+            Some(Arc::clone(&tokenizer)),
+            Some(9),
+        );
 
-    assert!(state.structured_output_processor.is_some());
-    assert!(
-        state.stop_token_ids.contains(&8),
-        "common eot token should be a resolved stop token"
-    );
+        assert!(state.structured_output_processor.is_some());
+        assert!(
+            state.stop_token_ids.contains(&8),
+            "common eot token should be a resolved stop token"
+        );
 
-    let mut logits = vec![f32::NEG_INFINITY; 9];
-    logits[0] = 1.0;
-    logits[1] = 0.5;
-    logits[8] = 100.0;
+        let mut logits = vec![f32::NEG_INFINITY; 9];
+        logits[0] = 1.0;
+        logits[1] = 0.5;
+        logits[3] = 200.0;
+        logits[8] = 100.0;
 
-    let token = state
-        .sample_and_commit_with_processors(&mut logits)
-        .unwrap();
+        let token = state
+            .sample_and_commit_with_processors(&mut logits)
+            .unwrap();
 
-    assert_eq!(token.get(), 0);
-    assert!(
-        logits[8].is_infinite() && logits[8].is_sign_negative(),
-        "schema-guided generation must not sample eot before the schema accepts"
-    );
+        assert_eq!(token.get(), 0);
+        for eos in [3, 8] {
+            assert!(
+                logits[eos].is_infinite() && logits[eos].is_sign_negative(),
+                "hard JSON must mask EOS {eos} before acceptance even with user stop {user_stop:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -12621,7 +12784,7 @@ fn gemma_thought_sampling_allows_native_controls_below_base_vocab() {
         assert_eq!(logits[9], f32::NEG_INFINITY);
         let stop = state.stop_reason(Some(tokenizer.as_ref()));
         if expected == 3 {
-            assert_eq!(stop, Some(FinishReason::Stop));
+            assert_eq!(stop, Some(FinishReason::EOS));
             assert!(!state.should_stream_generated_token(Some(tokenizer.as_ref()), token, stop));
         } else {
             assert_eq!(stop, None);
@@ -12730,14 +12893,14 @@ fn gemma_thought_structured_sampling_preserves_header_controls_and_turn_eos() {
             .is_none());
         sample(&mut state, 3, false, true);
         let stop = state.stop_reason(Some(tokenizer.as_ref()));
-        assert_eq!(stop, Some(FinishReason::Stop));
+        assert_eq!(stop, Some(FinishReason::EOS));
         assert!(!state.should_stream_generated_token(
             Some(tokenizer.as_ref()),
             TokenId::new(3),
             stop
         ));
         assert!(state
-            .structured_output_terminal_error(FinishReason::Stop)
+            .structured_output_terminal_error(FinishReason::EOS)
             .is_none());
     }
 }
@@ -12868,14 +13031,14 @@ fn harmony_structured_sampling_preserves_framing_budget_history_and_terminal() {
 
     sample(&mut state, RETURN, false);
     let stop = state.stop_reason(Some(tokenizer.as_ref()));
-    assert_eq!(stop, Some(FinishReason::Stop));
+    assert_eq!(stop, Some(FinishReason::EOS));
     assert!(state.should_stream_generated_token(
         Some(tokenizer.as_ref()),
         TokenId::new(RETURN),
         stop,
     ));
     assert!(state
-        .structured_output_terminal_error(FinishReason::Stop)
+        .structured_output_terminal_error(FinishReason::EOS)
         .is_none());
     assert!(state.generated_tokens.len() <= state.sampling_params.max_tokens);
     let output = tokenizer.decode(&state.generated_tokens, true).unwrap();
@@ -12917,7 +13080,7 @@ fn harmony_call_and_return_terminals_are_sent_to_the_incremental_stream() {
         state.generated_tokens.push(token);
         let stop_reason = state.stop_reason(Some(tokenizer.as_ref()));
 
-        assert_eq!(stop_reason, Some(FinishReason::Stop));
+        assert_eq!(stop_reason, Some(FinishReason::EOS));
         assert!(state.should_stream_generated_token(Some(tokenizer.as_ref()), token, stop_reason,));
         assert_eq!(
             tokenizer.decode(&state.generated_tokens, true).unwrap(),
@@ -12951,7 +13114,7 @@ fn ordinary_eos_and_untyped_harmony_terminal_are_not_sent_to_the_stream() {
         text_state.generated_tokens.clear();
         text_state.generated_tokens.push(token);
         let stop_reason = text_state.stop_reason(Some(tokenizer.as_ref()));
-        assert_eq!(stop_reason, Some(FinishReason::Stop));
+        assert_eq!(stop_reason, Some(FinishReason::EOS));
         assert!(
             !text_state
                 .should_stream_generated_token(Some(tokenizer.as_ref()), token, stop_reason,),
@@ -12970,7 +13133,7 @@ fn ordinary_eos_and_untyped_harmony_terminal_are_not_sent_to_the_stream() {
     );
     harmony_state.generated_tokens.push(TokenId::new(3));
     let stop_reason = harmony_state.stop_reason(Some(tokenizer.as_ref()));
-    assert_eq!(stop_reason, Some(FinishReason::Stop));
+    assert_eq!(stop_reason, Some(FinishReason::EOS));
     assert!(
         !harmony_state.should_stream_generated_token(
             Some(tokenizer.as_ref()),
