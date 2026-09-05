@@ -246,6 +246,7 @@ pub struct OpenAiJsonSchema {
 
 /// Chat message
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "ChatMessageWire")]
 pub struct ChatMessage {
     /// Message role
     pub role: MessageRole,
@@ -262,6 +263,9 @@ pub struct ChatMessage {
     /// vLLM-compatible parsed reasoning text. When Ferrum parses
     /// `<think>...</think>`, `content` contains only the final visible
     /// answer and this field contains the reasoning block text.
+    /// Historical input also accepts `reasoning_content`. A string in
+    /// `reasoning` takes precedence, including an empty string; missing or
+    /// null `reasoning` falls back to the alias. Output uses only `reasoning`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
 
@@ -280,6 +284,54 @@ pub struct ChatMessage {
     /// Legacy assistant function call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_call: Option<ChatFunctionCall>,
+}
+
+/// Deserialization wire shape. Both reasoning field names are parsed separately
+/// so receiving both is not a duplicate-field error; conversion below leaves
+/// one canonical value for the rest of Ferrum.
+#[derive(Deserialize)]
+struct ChatMessageWire {
+    role: MessageRole,
+    #[serde(default, deserialize_with = "deserialize_message_content")]
+    content: String,
+    #[serde(default)]
+    reasoning: serde_json::Value,
+    #[serde(default)]
+    reasoning_content: serde_json::Value,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    function_call: Option<ChatFunctionCall>,
+}
+
+impl TryFrom<ChatMessageWire> for ChatMessage {
+    type Error = String;
+
+    fn try_from(message: ChatMessageWire) -> Result<Self, Self::Error> {
+        let reasoning = match message.reasoning {
+            serde_json::Value::String(reasoning) => Some(reasoning),
+            serde_json::Value::Null => match message.reasoning_content {
+                serde_json::Value::String(reasoning) => Some(reasoning),
+                serde_json::Value::Null => None,
+                _ => return Err("reasoning_content must be a string or null".to_string()),
+            },
+            _ => return Err("reasoning must be a string or null".to_string()),
+        };
+
+        Ok(Self {
+            role: message.role,
+            content: message.content,
+            reasoning,
+            name: message.name,
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+            function_call: message.function_call,
+        })
+    }
 }
 
 /// Assistant tool call in OpenAI responses and historical conversation input.
@@ -748,4 +800,102 @@ fn default_audio_format() -> String {
 }
 fn default_language() -> String {
     "auto".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chat_request_with_assistant_fields(fields: &str) -> String {
+        format!(r#"{{"model":"test","messages":[{{"role":"assistant","content":null{fields}}}]}}"#)
+    }
+
+    #[test]
+    fn chat_request_normalizes_reasoning_content_at_the_wire_boundary() {
+        let cases = [
+            ("missing", "", None),
+            ("compatibility null", r#", "reasoning_content": null"#, None),
+            (
+                "compatibility empty",
+                r#", "reasoning_content": """#,
+                Some(""),
+            ),
+            (
+                "compatibility text",
+                r#", "reasoning_content": "compatibility""#,
+                Some("compatibility"),
+            ),
+            (
+                "canonical text",
+                r#", "reasoning": "canonical""#,
+                Some("canonical"),
+            ),
+            (
+                "compatibility then canonical",
+                r#", "reasoning_content": "compatibility", "reasoning": "canonical""#,
+                Some("canonical"),
+            ),
+            (
+                "canonical then compatibility",
+                r#", "reasoning": "canonical", "reasoning_content": "compatibility""#,
+                Some("canonical"),
+            ),
+            (
+                "canonical empty wins",
+                r#", "reasoning": "", "reasoning_content": "compatibility""#,
+                Some(""),
+            ),
+            (
+                "canonical null falls back",
+                r#", "reasoning": null, "reasoning_content": "compatibility""#,
+                Some("compatibility"),
+            ),
+            (
+                "canonical text ignores invalid compatibility",
+                r#", "reasoning_content": 7, "reasoning": "canonical""#,
+                Some("canonical"),
+            ),
+            (
+                "canonical empty ignores invalid compatibility",
+                r#", "reasoning": "", "reasoning_content": {"unexpected": true}"#,
+                Some(""),
+            ),
+        ];
+
+        for (name, fields, expected) in cases {
+            let request: ChatCompletionsRequest =
+                serde_json::from_str(&chat_request_with_assistant_fields(fields))
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(request.messages[0].reasoning.as_deref(), expected, "{name}");
+
+            let normalized = serde_json::to_value(request).expect("normalized request JSON");
+            let message = &normalized["messages"][0];
+            assert!(message.get("reasoning_content").is_none(), "{name}");
+            match expected {
+                Some(expected) => assert_eq!(message["reasoning"], expected, "{name}"),
+                None => assert!(message.get("reasoning").is_none(), "{name}"),
+            }
+        }
+    }
+
+    #[test]
+    fn chat_request_rejects_non_string_reasoning_fields() {
+        for (name, fields) in [
+            ("compatibility", r#", "reasoning_content": 7"#),
+            (
+                "canonical is not masked by compatibility",
+                r#", "reasoning": 7, "reasoning_content": "compatibility""#,
+            ),
+            (
+                "canonical null validates compatibility",
+                r#", "reasoning": null, "reasoning_content": 7"#,
+            ),
+        ] {
+            let error = serde_json::from_str::<ChatCompletionsRequest>(
+                &chat_request_with_assistant_fields(fields),
+            )
+            .expect_err(name);
+            assert!(error.to_string().contains("string"), "{name}: {error}");
+        }
+    }
 }
