@@ -23,9 +23,25 @@ struct Cursor {
     committed: usize,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct LogitStep {
+    candidates: Vec<(TokenId, f32)>,
+}
+
+impl LogitStep {
+    pub fn only(token: TokenId) -> Self {
+        Self::candidates(vec![(token, 1.0)])
+    }
+
+    pub fn candidates(candidates: Vec<(TokenId, f32)>) -> Self {
+        Self { candidates }
+    }
+}
+
 pub(super) struct ScriptedExecutor {
     metadata: MockModelExecutor,
-    script: Vec<TokenId>,
+    script: Vec<LogitStep>,
+    decoded_inputs: Mutex<Vec<TokenId>>,
     admitted: Mutex<HashSet<RequestId>>,
     active: Mutex<HashMap<String, Cursor>>,
     pub prompt_tokens: AtomicUsize,
@@ -36,10 +52,18 @@ pub(super) struct ScriptedExecutor {
 
 impl ScriptedExecutor {
     pub fn new(vocab_size: usize, script: Vec<TokenId>) -> Self {
-        assert!(!script.is_empty());
+        Self::from_steps(
+            vocab_size,
+            script.into_iter().map(LogitStep::only).collect(),
+        )
+    }
+
+    pub fn from_steps(vocab_size: usize, steps: Vec<LogitStep>) -> Self {
+        assert!(!steps.is_empty());
         Self {
             metadata: MockModelExecutor::instant(vocab_size),
-            script,
+            script: steps,
+            decoded_inputs: Mutex::new(Vec::new()),
             admitted: Mutex::new(HashSet::new()),
             active: Mutex::new(HashMap::new()),
             prompt_tokens: AtomicUsize::new(0),
@@ -50,13 +74,19 @@ impl ScriptedExecutor {
     }
 
     fn logits(&self, index: usize) -> Result<Vec<f32>> {
-        let token = self.script.get(index).ok_or_else(|| {
+        let step = self.script.get(index).ok_or_else(|| {
             FerrumError::backend("script exhausted: engine did not stop on the final token")
         })?;
         let mut logits = vec![f32::NEG_INFINITY; self.info().vocab_size];
-        logits[token.get() as usize] = 1.0;
+        for &(token, logit) in &step.candidates {
+            logits[token.get() as usize] = logit;
+        }
         self.generated_tokens.fetch_add(1, Ordering::Relaxed);
         Ok(logits)
+    }
+
+    pub fn decoded_inputs(&self) -> Vec<TokenId> {
+        self.decoded_inputs.lock().unwrap().clone()
     }
 
     pub fn assert_released(&self) {
@@ -204,7 +234,7 @@ impl ModelExecutor for ScriptedExecutor {
                     .get_mut(&input.kv_cache.cache_id())
                     .expect("active cache");
                 assert_eq!(cursor.request_id, input.request_id);
-                assert_eq!(input.input_token, self.script[cursor.next - 1]);
+                self.decoded_inputs.lock().unwrap().push(input.input_token);
                 let logits = self.logits(cursor.next)?;
                 cursor.next += 1;
                 cursor.committed += 1;
