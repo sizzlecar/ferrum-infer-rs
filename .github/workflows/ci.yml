@@ -1,11 +1,9 @@
 name: CI
 
 on:
-  # Only run on direct pushes to main (release commits, hotfixes).
-  # PR branches already get covered by the pull_request trigger — running
-  # both here doubles CI minutes for every PR commit.
-  push:
-    branches: [main]
+  # main requires PRs and the CI required check on an up-to-date branch.
+  # Validate the proposed merge once; do not repeat the same build on push.
+  # workflow_dispatch remains available for explicit backend/cache validation.
   pull_request:
   workflow_dispatch:
     inputs:
@@ -13,6 +11,10 @@ on:
         description: 'Also compile CUDA kernels to PTX (~40min)'
         type: boolean
         default: false
+
+defaults:
+  run:
+    shell: bash
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,10 +29,82 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  prepare:
+    name: Plan and validate docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      scope: ${{ steps.scope.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+        with:
+          components: rustfmt
+
+      - name: Check CI policy
+        run: |
+          rustfmt --edition 2021 --check .github/ci/policy.rs
+          rustc --edition=2021 --deny warnings --test .github/ci/policy.rs -o "$RUNNER_TEMP/policy-tests"
+          "$RUNNER_TEMP/policy-tests"
+          rustc --edition=2021 --deny warnings .github/ci/policy.rs -o "$RUNNER_TEMP/policy"
+
+      - name: Classify changes and check diff
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo 'scope=code' >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = pull_request ]; then
+            test -n "$BASE_SHA"
+            if ! git cat-file -e "$BASE_SHA^{commit}"; then
+              git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            fi
+            git diff --check "$BASE_SHA" HEAD --
+            # Keep both paths of renames and preserve NUL separators in a file.
+            # A code file renamed into docs must still run code checks.
+            git diff --no-renames --name-only -z "$BASE_SHA" HEAD -- > "$RUNNER_TEMP/changed-paths.z"
+            scope=$("$RUNNER_TEMP/policy" classify < "$RUNNER_TEMP/changed-paths.z")
+            echo "scope=$scope" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported event: $EVENT_NAME" >&2
+            exit 1
+          fi
+
+      - name: Check local documentation links and anchors
+        run: |
+          mkdir -p "$RUNNER_TEMP/lychee"
+          curl --fail --location --retry 2 --connect-timeout 10 --max-time 90 \
+            --output "$RUNNER_TEMP/lychee.tar.gz" \
+            https://github.com/lycheeverse/lychee/releases/download/lychee-v0.24.2/lychee-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            '1f4e0ef7f6554a6ed33dd7ac144fb2e1bbed98598e7af973042fc5cd43951c9a' \
+            "$RUNNER_TEMP/lychee.tar.gz" | sha256sum --check --strict -
+          tar -xzf "$RUNNER_TEMP/lychee.tar.gz" -C "$RUNNER_TEMP/lychee" \
+            lychee-x86_64-unknown-linux-gnu/lychee
+          "$RUNNER_TEMP/lychee/lychee-x86_64-unknown-linux-gnu/lychee" \
+            --offline --include-fragments --no-progress --format json \
+            --output "$RUNNER_TEMP/docs-links.json" \
+            README.md README_zh.md CHANGELOG.md 'docs/**/*.md'
+
+      - name: Save documentation link report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-links
+          path: ${{ runner.temp }}/docs-links.json
+          retention-days: 7
+
   # ── CPU (Linux) ──────────────────────────────────────────────────────
   # Core quality gate: format, lint, unit tests, integration tests
   cpu:
     name: CPU (Linux)
+    needs: prepare
+    if: needs.prepare.outputs.scope == 'code'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,7 +132,7 @@ jobs:
         with:
           components: rustfmt, clippy, rust-src
 
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -71,20 +145,22 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Compile (workspace, all targets)
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -A warnings
-        continue-on-error: true
+        run: cargo clippy --locked --workspace --all-targets -- -A warnings
 
-      # ── Unit Tests ────────────────────────────────────
-      - name: Unit tests (all crates)
-        run: cargo test --workspace
+      - name: Workspace tests (all targets)
+        run: cargo test --locked --workspace --all-targets
+
+      # --all-targets does not include doctests.
+      - name: Documentation tests
+        run: cargo test --locked --workspace --doc
 
       # ── CLI E2E ───────────────────────────────────────
       - name: "Test: CLI build + smoke test"
         run: |
-          cargo build -p ferrum-cli --bin ferrum
+          cargo build --locked -p ferrum-cli --bin ferrum
           # Verify help works
           ./target/debug/ferrum --help
           ./target/debug/ferrum tts --help
@@ -95,13 +171,15 @@ jobs:
   # Verifies Metal shader compilation + Metal-gated code paths
   metal:
     name: Metal (macOS)
+    needs: prepare
+    if: needs.prepare.outputs.scope == 'code'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@1.91.0
 
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -111,23 +189,30 @@ jobs:
           restore-keys: ${{ runner.os }}-metal-
 
       - name: Compile with Metal (all targets)
-        run: cargo check --workspace --all-targets --features metal
+        run: cargo check --locked --workspace --all-targets --features metal
 
-      - name: Build CLI (Metal, release)
-        run: cargo build --release -p ferrum-cli --features metal
+      # Reuse the dev profile built by tests. Release assets are built by the
+      # release workflows and undergo their own installation/runtime checks.
+      - name: Build CLI (Metal, dev)
+        run: cargo build --locked -p ferrum-cli --bin ferrum --features metal
 
-      - name: Unit tests (with Metal feature)
-        run: cargo test --workspace --features metal
+      - name: Workspace tests (all targets, Metal feature)
+        run: cargo test --locked --workspace --all-targets --features metal
+
+      - name: Documentation tests (Metal feature)
+        run: cargo test --locked --workspace --doc --features metal
 
       - name: "Test: CLI help (Metal build)"
         run: |
-          ./target/release/ferrum --help
-          ./target/release/ferrum tts --help
+          ./target/debug/ferrum --help
+          ./target/debug/ferrum tts --help
 
   # ── CUDA (Linux + CUDA toolkit) ─────────────────────────────────────
   # Type-checks CUDA code paths. PTX build optional (slow).
   cuda:
     name: CUDA (Linux)
+    needs: prepare
+    if: needs.prepare.outputs.scope == 'code'
     runs-on: ubuntu-latest
     container:
       image: nvidia/cuda:12.4.0-devel-ubuntu22.04
@@ -171,7 +256,7 @@ jobs:
         run: |
           export PATH="/root/.cargo/bin:/usr/local/cuda/bin:$PATH"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
-          cargo check -p ferrum-cli --bin ferrum \
+          cargo check --locked -p ferrum-cli --bin ferrum \
             --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
 
       - name: Build CUDA kernels (PTX)
@@ -181,4 +266,25 @@ jobs:
         run: |
           export PATH="/root/.cargo/bin:/usr/local/cuda/bin:$PATH"
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
-          cargo build -p ferrum-kernels --features cuda
+          cargo build --locked -p ferrum-kernels --features cuda
+
+  required:
+    name: CI required
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [prepare, cpu, metal, cuda]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Require successful checks for the selected scope
+        env:
+          PREPARE_RESULT: ${{ needs.prepare.result }}
+          CHANGE_SCOPE: ${{ needs.prepare.outputs.scope }}
+          CPU_RESULT: ${{ needs.cpu.result }}
+          METAL_RESULT: ${{ needs.metal.result }}
+          CUDA_RESULT: ${{ needs.cuda.result }}
+        run: |
+          rustc --edition=2021 --deny warnings .github/ci/policy.rs -o "$RUNNER_TEMP/policy"
+          "$RUNNER_TEMP/policy" aggregate "$PREPARE_RESULT" "$CHANGE_SCOPE" \
+            "$CPU_RESULT" "$METAL_RESULT" "$CUDA_RESULT"
