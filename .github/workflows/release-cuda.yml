@@ -10,12 +10,12 @@ on:
       release_candidate_tag:
         description: Annotated RC tag whose peeled commit is release_candidate_sha
         required: true
-        default: v0.8.6-rc.1
+        default: v0.8.7-rc.1
         type: string
       staging_label:
         description: Immutable artifact label; this does not create a tag or release
         required: true
-        default: v0.8.6-rc
+        default: v0.8.7-rc
         type: string
       publish_release:
         description: Safety lock; production staging requires false
@@ -58,8 +58,8 @@ jobs:
             echo "release_candidate_sha must be a full lowercase commit SHA" >&2
             exit 1
           fi
-          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.6-rc\.[1-9][0-9]*$ ]]; then
-            echo "release_candidate_tag must match v0.8.6-rc.N" >&2
+          if ! [[ "${{ inputs.release_candidate_tag }}" =~ ^v0\.8\.7-rc\.[1-9][0-9]*$ ]]; then
+            echo "release_candidate_tag must match v0.8.7-rc.N" >&2
             exit 1
           fi
           if ! [[ "${{ inputs.staging_label }}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -110,7 +110,7 @@ jobs:
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           version="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "ferrum-cli"))')"
-          test "$version" = "0.8.6"
+          test "$version" = "0.8.7"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v4
@@ -118,8 +118,10 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: stage-v0.8.6-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: stage-v0.8.6-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-
+          key: stage-v0.8.7-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            stage-v0.8.7-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-
+            stage-v0.8.6-linux-x86_64-cuda-sm89-cuda12.4-native-d4cdfe88-cargo-
 
       - name: Build release CUDA sm89 binary exactly once
         run: |
@@ -152,7 +154,7 @@ jobs:
           cp LICENSE dist/LICENSE
           cp README.md dist/README.md
           cat > dist/CUDA-BUILD.txt <<'EOF'
-          Ferrum v0.8.6 CUDA release binary
+          Ferrum v0.8.7 CUDA release binary
           CUDA toolkit image: nvidia/cuda:12.4.0-devel-ubuntu22.04
           CUDA_COMPUTE_CAP: 89
           Cargo features: cuda,vllm-moe-marlin,vllm-paged-attn-v2

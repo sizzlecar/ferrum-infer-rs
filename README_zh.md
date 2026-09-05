@@ -146,15 +146,15 @@ brew install ferrum-cuda
 
 ```bash
 # Linux x86_64 CUDA sm89
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.6/ferrum-linux-x86_64-cuda-sm89.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.6/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-linux-x86_64-cuda-sm89.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
 
 # macOS Apple Silicon Metal
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.6/ferrum-macos-aarch64.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.6/ferrum-macos-aarch64.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-macos-aarch64.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-macos-aarch64.tar.gz.sha256
 shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
 tar -xzf ferrum-macos-aarch64.tar.gz
 ./ferrum --version
@@ -164,7 +164,7 @@ tar -xzf ferrum-macos-aarch64.tar.gz
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.6 --locked --features metal
+cargo install ferrum-cli --version 0.8.7 --locked --features metal
 ```
 
 官方预编译 CUDA 资产的目标为 `sm89`。CUDA 安装需要兼容的 NVIDIA driver、
