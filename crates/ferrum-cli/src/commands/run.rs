@@ -35,6 +35,41 @@ use crate::source_resolver::tokenizer_sibling_repo;
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
 
+/// Keep the raw history evidence separate from the model template's messages.
+#[derive(Clone, Debug)]
+struct RunHistoryMessage {
+    prompt: PromptMessage,
+    raw_content: String,
+}
+
+impl RunHistoryMessage {
+    fn new(role: &str, content: &str) -> Self {
+        Self {
+            prompt: PromptMessage::new(role, content),
+            raw_content: content.to_string(),
+        }
+    }
+
+    fn assistant(
+        raw_content: &str,
+        protocol: ModelOutputProtocol,
+        parsed: &ParsedReasoningResponse,
+    ) -> Self {
+        let mut message = Self::new("assistant", raw_content);
+        match protocol {
+            // Text templates own their policy for inline <think> history.
+            ModelOutputProtocol::Text => {}
+            // Reuse the validated result, including valid length truncation.
+            // A Harmony envelope is not an assistant message's content.
+            ModelOutputProtocol::HarmonyGptOss => {
+                message.prompt.content = parsed.content.clone();
+                message.prompt.reasoning_content = parsed.reasoning.clone();
+            }
+        }
+        message
+    }
+}
+
 /// Output format for `ferrum run`. JSONL mode emits one record per event
 /// (assistant generation result, user input, exit) on stdout — used by
 /// integration tests and scripting. Text mode is the default interactive UX.
@@ -78,7 +113,7 @@ fn emit_jsonl_user(
     request_id: &str,
     turn: usize,
     content: &str,
-    history: &[(String, String)],
+    history: &[RunHistoryMessage],
 ) {
     let record = serde_json::json!({
         "schema_version": RUN_JSONL_SCHEMA_VERSION,
@@ -143,7 +178,7 @@ fn emit_jsonl_assistant(
     turn: usize,
     content: &str,
     reasoning: Option<&str>,
-    history: &[(String, String)],
+    history: &[RunHistoryMessage],
     finish_reason: Option<FinishReason>,
     usage: Option<&TokenUsage>,
     n_tokens: usize,
@@ -175,7 +210,7 @@ fn jsonl_assistant_record(
     turn: usize,
     content: &str,
     reasoning: Option<&str>,
-    history: &[(String, String)],
+    history: &[RunHistoryMessage],
     finish_reason: Option<FinishReason>,
     usage: Option<&TokenUsage>,
     n_tokens: usize,
@@ -222,11 +257,15 @@ fn sha256_text(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
-fn history_evidence(history: &[(String, String)]) -> serde_json::Value {
-    let encoded = serde_json::to_vec(history).expect("run history serialization cannot fail");
+fn history_evidence(history: &[RunHistoryMessage]) -> serde_json::Value {
+    let raw_history: Vec<_> = history
+        .iter()
+        .map(|message| (&message.prompt.role, &message.raw_content))
+        .collect();
+    let encoded = serde_json::to_vec(&raw_history).expect("run history serialization cannot fail");
     serde_json::json!({
         "message_count": history.len(),
-        "turn_count": history.iter().filter(|(role, _)| role == "user").count(),
+        "turn_count": count_user_turns(history),
         "sha256": format!("{:x}", Sha256::digest(encoded)),
     })
 }
@@ -1427,7 +1466,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         return Ok(());
     }
 
-    let mut history: Vec<(String, String)> = Vec::new(); // (role, content)
+    let mut history: Vec<RunHistoryMessage> = Vec::new();
     let mut history_epoch = 0usize;
     let mut turn = 0usize;
     let mut exit_reason: &str = "eof";
@@ -1685,7 +1724,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 )?;
                 let clean_response = display_response_text(&parsed.content);
                 let reasoning = (format == OutputFormat::Jsonl)
-                    .then_some(parsed.reasoning)
+                    .then_some(parsed.reasoning.as_deref())
                     .flatten()
                     .map(|value| value.trim().to_string())
                     .filter(|value| !value.is_empty());
@@ -1766,9 +1805,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                 }
 
                 // Add to history
-                history.push(("user".to_string(), input.to_string()));
+                history.push(RunHistoryMessage::new("user", input));
                 if !raw_response.is_empty() {
-                    history.push(("assistant".to_string(), raw_response));
+                    history.push(RunHistoryMessage::assistant(
+                        &raw_response,
+                        model_output_protocol,
+                        &parsed,
+                    ));
                 }
 
                 // Limit history
@@ -2157,7 +2200,7 @@ fn build_chat_template_options(
 }
 
 fn build_run_prompt_plan(
-    history: &[(String, String)],
+    history: &[RunHistoryMessage],
     user_input: &str,
     system: Option<&str>,
     model_id: &str,
@@ -2276,10 +2319,10 @@ fn build_run_prompt_plan(
     }
 }
 
-fn next_context_shift_history_start(history: &[(String, String)], start: usize) -> usize {
+fn next_context_shift_history_start(history: &[RunHistoryMessage], start: usize) -> usize {
     if start + 1 < history.len()
-        && history[start].0 == "user"
-        && history[start + 1].0 == "assistant"
+        && history[start].prompt.role == "user"
+        && history[start + 1].prompt.role == "assistant"
     {
         start + 2
     } else {
@@ -2287,8 +2330,11 @@ fn next_context_shift_history_start(history: &[(String, String)], start: usize) 
     }
 }
 
-fn count_user_turns(history: &[(String, String)]) -> usize {
-    history.iter().filter(|(role, _)| role == "user").count()
+fn count_user_turns(history: &[RunHistoryMessage]) -> usize {
+    history
+        .iter()
+        .filter(|message| message.prompt.role == "user")
+        .count()
 }
 
 fn maybe_warn_context_shift(plan: &RunPromptPlan, format: OutputFormat) {
@@ -2403,7 +2449,7 @@ pub fn select_device(backend: &str) -> Result<ferrum_types::Device> {
 }
 
 fn build_chat_prompt(
-    history: &[(String, String)],
+    history: &[RunHistoryMessage],
     user_input: &str,
     system: Option<&str>,
     model_id: &str,
@@ -2414,9 +2460,7 @@ fn build_chat_prompt(
     if let Some(sys) = system {
         messages.push(PromptMessage::new("system", sys));
     }
-    for (role, content) in history {
-        messages.push(PromptMessage::new(role, content));
-    }
+    messages.extend(history.iter().map(|message| message.prompt.clone()));
     messages.push(PromptMessage::new("user", user_input));
     ferrum_server::chat_template::render_prompt_messages_with_options(
         &messages,
@@ -3454,11 +3498,8 @@ mod tests {
     #[test]
     fn jsonl_v2_assistant_binds_reasoning_usage_and_history() {
         let history = vec![
-            ("user".to_string(), "first".to_string()),
-            (
-                "assistant".to_string(),
-                "<think>why</think>answer".to_string(),
-            ),
+            RunHistoryMessage::new("user", "first"),
+            RunHistoryMessage::new("assistant", "<think>why</think>answer"),
         ];
         let usage = TokenUsage::new(7, 3);
         let record = jsonl_assistant_record(
@@ -3495,10 +3536,10 @@ mod tests {
 
     #[test]
     fn history_evidence_changes_when_reasoning_history_changes() {
-        let first = vec![("assistant".to_string(), "answer".to_string())];
-        let second = vec![(
-            "assistant".to_string(),
-            "<think>why</think>answer".to_string(),
+        let first = vec![RunHistoryMessage::new("assistant", "answer")];
+        let second = vec![RunHistoryMessage::new(
+            "assistant",
+            "<think>why</think>answer",
         )];
         assert_ne!(
             history_evidence(&first)["sha256"],
@@ -3782,8 +3823,8 @@ mod tests {
         let budget = whitespace_budget(64);
         let long = std::iter::repeat_n("old", 80).collect::<Vec<_>>().join(" ");
         let history = vec![
-            ("user".to_string(), long.clone()),
-            ("assistant".to_string(), long),
+            RunHistoryMessage::new("user", &long),
+            RunHistoryMessage::new("assistant", &long),
         ];
         let options = default_template_options();
         let plan = build_run_prompt_plan(
@@ -3809,11 +3850,8 @@ mod tests {
         cmd.max_tokens = 1024;
         let budget = whitespace_budget(64);
         let history = vec![
-            (
-                "user".to_string(),
-                "Remember the identifier G00-c03-001-OK.".to_string(),
-            ),
-            ("assistant".to_string(), "ACKNOWLEDGED".to_string()),
+            RunHistoryMessage::new("user", "Remember the identifier G00-c03-001-OK."),
+            RunHistoryMessage::new("assistant", "ACKNOWLEDGED"),
         ];
         let options = default_template_options();
         let plan = build_run_prompt_plan(
@@ -3891,6 +3929,126 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.content, "Partial answer");
+    }
+
+    #[test]
+    fn harmony_run_history_renders_the_next_turn_after_complete_or_truncated_output() {
+        // The model's inference template rejects channel envelopes in content
+        // and intentionally omits analysis from previous assistant turns.
+        let mut template = ModelChatTemplate::new(
+            r#"{%- for message in messages -%}
+{%- if message.role == 'assistant' -%}
+{%- if '<|channel|>analysis<|message|>' in message.content or '<|channel|>final<|message|>' in message.content -%}
+{{- raise_exception('channel envelopes must not be passed as content') -}}
+{%- endif -%}
+{{- '<|start|>assistant<|channel|>final<|message|>' + message.content + '<|end|>' -}}
+{%- else -%}
+{{- '<|start|>' + message.role + '<|message|>' + message.content + '<|end|>' -}}
+{%- endif -%}
+{%- endfor -%}
+{{- '<|start|>assistant' -}}"#,
+            "harmony-history-contract",
+        );
+        template.output_protocol = ModelOutputProtocol::HarmonyGptOss;
+        for (raw, finish_reason, content, reasoning) in [
+            (
+                "<|channel|>final<|message|>42<|return|>",
+                FinishReason::Stop,
+                "42",
+                None,
+            ),
+            (
+                "<|channel|>analysis<|message|>Add the numbers.<|end|>\
+                 <|start|>assistant<|channel|>final<|message|>42<|return|>",
+                FinishReason::EOS,
+                "42",
+                Some("Add the numbers."),
+            ),
+            (
+                "<|channel|>final<|message|>Partial answer",
+                FinishReason::Length,
+                "Partial answer",
+                None,
+            ),
+            (
+                "<|channel|>analysis<|message|>Still reasoning",
+                FinishReason::Length,
+                "",
+                Some("Still reasoning"),
+            ),
+        ] {
+            let parsed =
+                parse_run_model_output(template.output_protocol, raw, false, Some(finish_reason))
+                    .unwrap();
+            let history = vec![
+                RunHistoryMessage::new("user", "17+25?"),
+                RunHistoryMessage::assistant(raw, template.output_protocol, &parsed),
+            ];
+            let plan = build_run_prompt_plan(
+                &history,
+                "Continue.",
+                None,
+                "model-with-declared-protocol",
+                Some(&template),
+                &ChatTemplateOptions::default(),
+                &test_run_cmd(),
+                &whitespace_budget(8192),
+            )
+            .expect("validated assistant output must render as history on the next turn");
+            assert_eq!(
+                plan.prompt,
+                format!(
+                    "<|start|>user<|message|>17+25?<|end|>\
+                     <|start|>assistant<|channel|>final<|message|>{content}<|end|>\
+                     <|start|>user<|message|>Continue.<|end|><|start|>assistant"
+                )
+            );
+            assert_eq!(history[1].prompt.reasoning_content.as_deref(), reasoning);
+            assert_eq!(history[1].raw_content, raw);
+            let original_history = [("user", "17+25?"), ("assistant", raw)];
+            assert_eq!(
+                history_evidence(&history)["sha256"],
+                sha256_text(&serde_json::to_string(&original_history).unwrap()),
+                "JSONL history evidence must continue to bind the raw generated output"
+            );
+        }
+    }
+
+    #[test]
+    fn text_run_history_leaves_reasoning_policy_to_the_template() {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+            "verbatim-history-template",
+        );
+        for raw in [
+            "<think>Reason.</think>Answer.",
+            "Reason.</think>Answer.",
+            "Plain answer.",
+        ] {
+            let parsed = parse_run_model_output(
+                ModelOutputProtocol::Text,
+                raw,
+                true,
+                Some(FinishReason::Stop),
+            )
+            .unwrap();
+            let history = [RunHistoryMessage::assistant(
+                raw,
+                ModelOutputProtocol::Text,
+                &parsed,
+            )];
+            let prompt = build_chat_prompt(
+                &history,
+                "Continue.",
+                None,
+                "text-protocol-model",
+                Some(&template),
+                &ChatTemplateOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(prompt, format!("{raw}Continue."));
+            assert!(history[0].prompt.reasoning_content.is_none());
+        }
     }
 
     #[test]
