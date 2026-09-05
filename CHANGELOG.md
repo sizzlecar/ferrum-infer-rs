@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes.
 
+## [0.8.7] - 2026-09-05
+
+### Fixed
+- Kept active requests producing output while a later request processes a long prompt.
+- Removed a redundant single-pass loop in runtime resource allocation.
+- Preserved stop-sequence boundaries across streamed tokens, retained legal text before a stop, and flushed buffered text consistently through `run` and `serve`.
+- Accepted `reasoning_content` in assistant history without losing it during multi-turn tool requests, while preserving model-template behavior and the existing `reasoning` response field.
+
 ## [0.8.6] - 2026-09-04
 
 ### Added
