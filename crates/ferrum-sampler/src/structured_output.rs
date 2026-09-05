@@ -21,6 +21,8 @@ use parking_lot::Mutex;
 use serde_json::json;
 
 mod harmony;
+#[cfg(test)]
+mod reasoning_envelope_tests;
 
 const MAX_CACHED_GRAMMARS: usize = 64;
 // Structured output is the requested product result; hidden reasoning may use
@@ -262,48 +264,71 @@ impl StructuredOutputFactory {
                 (Activation::Harmony(boundary), Some(budget))
             }
             StructuredOutputStart::AfterDelimiter(delimiter) => {
-                if delimiter.is_empty() {
-                    return Err(FerrumError::invalid_request(
-                        "structured-output delimiter must not be empty",
-                    ));
-                }
-                let delimiter_tokens = if let Some(token) = self.tokenizer.token_id(delimiter) {
-                    vec![token.get()]
-                } else {
-                    self.tokenizer
-                        .encode(delimiter, false)?
-                        .into_iter()
-                        .map(|token| token.get())
-                        .collect::<Vec<_>>()
-                };
-                if delimiter_tokens.is_empty() {
-                    return Err(FerrumError::invalid_request(format!(
-                        "structured-output delimiter {delimiter:?} did not tokenize"
-                    )));
-                }
-                if let Some(token) = delimiter_tokens
-                    .iter()
-                    .find(|token| stop_token_ids.contains(token))
-                {
-                    return Err(FerrumError::invalid_request(format!(
-                        "structured-output delimiter token {token} conflicts with a stop token"
-                    )));
-                }
-                if let Some(stop) = stop_text_sequences
-                    .iter()
-                    .find(|stop| !stop.is_empty() && delimiter.contains(stop.as_str()))
-                {
-                    return Err(FerrumError::invalid_request(format!(
-                        "structured-output delimiter {delimiter:?} conflicts with stop sequence {stop:?}"
-                    )));
-                }
+                let delimiter_tokens =
+                    self.boundary_token_ids(delimiter, stop_token_ids, stop_text_sequences)?;
                 let budget = StructuredOutputBudgetPlan::automatic(
                     max_output_tokens,
                     delimiter_tokens.len(),
                 )?;
                 (
                     Activation::Boundary {
+                        opening_tokens: Vec::new(),
                         delimiter_tokens,
+                        allow_reasoning: true,
+                        forcing: false,
+                    },
+                    Some(budget),
+                )
+            }
+            StructuredOutputStart::AfterReasoningEnvelope {
+                opening,
+                closing,
+                allow_reasoning,
+            } => {
+                let opening_tokens =
+                    self.boundary_token_ids(opening, stop_token_ids, stop_text_sequences)?;
+                let delimiter_tokens =
+                    self.boundary_token_ids(closing, stop_token_ids, stop_text_sequences)?;
+                if let Some(token) = opening_tokens
+                    .iter()
+                    .chain(&delimiter_tokens)
+                    .find(|token| {
+                        !self
+                            .defined_token_ids
+                            .get(**token as usize)
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                {
+                    return Err(FerrumError::invalid_request(format!(
+                        "structured-output reasoning envelope contains undefined token {token}"
+                    )));
+                }
+                // Empty reasoning is legal in either mode, so a stop can also
+                // cross directly from the opening header into the closing tag.
+                let empty_envelope = format!("{opening}{closing}");
+                if let Some(stop) = stop_text_sequences
+                    .iter()
+                    .find(|stop| !stop.is_empty() && empty_envelope.contains(stop.as_str()))
+                {
+                    return Err(FerrumError::invalid_request(format!(
+                        "structured-output reasoning envelope conflicts with stop sequence {stop:?}"
+                    )));
+                }
+                let mut budget = StructuredOutputBudgetPlan::automatic(
+                    max_output_tokens,
+                    opening_tokens.len() + delimiter_tokens.len(),
+                )?;
+                if !allow_reasoning {
+                    budget.reasoning_token_limit = 0;
+                    budget.structured_reserve_tokens =
+                        max_output_tokens - budget.boundary_token_count;
+                }
+                (
+                    Activation::Boundary {
+                        opening_tokens,
+                        delimiter_tokens,
+                        allow_reasoning: *allow_reasoning,
                         forcing: false,
                     },
                     Some(budget),
@@ -333,6 +358,47 @@ impl StructuredOutputFactory {
             budget,
             liveness,
         }))
+    }
+
+    fn boundary_token_ids(
+        &self,
+        delimiter: &str,
+        stop_token_ids: &HashSet<u32>,
+        stop_text_sequences: &[String],
+    ) -> Result<Vec<u32>> {
+        if delimiter.is_empty() {
+            return Err(FerrumError::invalid_request(
+                "structured-output delimiter must not be empty",
+            ));
+        }
+        let tokens = if let Some(token) = self.tokenizer.token_id(delimiter) {
+            vec![token.get()]
+        } else {
+            self.tokenizer
+                .encode(delimiter, false)?
+                .into_iter()
+                .map(|token| token.get())
+                .collect::<Vec<_>>()
+        };
+        if tokens.is_empty() {
+            return Err(FerrumError::invalid_request(format!(
+                "structured-output delimiter {delimiter:?} did not tokenize"
+            )));
+        }
+        if let Some(token) = tokens.iter().find(|token| stop_token_ids.contains(token)) {
+            return Err(FerrumError::invalid_request(format!(
+                "structured-output delimiter token {token} conflicts with a stop token"
+            )));
+        }
+        if let Some(stop) = stop_text_sequences
+            .iter()
+            .find(|stop| !stop.is_empty() && delimiter.contains(stop.as_str()))
+        {
+            return Err(FerrumError::invalid_request(format!(
+                "structured-output delimiter {delimiter:?} conflicts with stop sequence {stop:?}"
+            )));
+        }
+        Ok(tokens)
     }
 }
 
@@ -465,7 +531,9 @@ enum Activation {
     Active,
     Harmony(harmony::HarmonyBoundary),
     Boundary {
+        opening_tokens: Vec<u32>,
         delimiter_tokens: Vec<u32>,
+        allow_reasoning: bool,
         forcing: bool,
     },
 }
@@ -506,7 +574,7 @@ impl StructuredOutputProcessor {
         hidden_control_token_ids: Option<&HashSet<u32>>,
     ) -> Result<StructuredOutputMaskOutcome> {
         let mut state = self.state.lock();
-        advance_state(&mut state, generated, terminal_token_ids)?;
+        advance_state(&mut state, generated, terminal_token_ids, self.budget)?;
         activate_forcing_if_due(&mut state, generated, self.budget);
         if let Activation::Harmony(boundary) = &state.activation {
             if !boundary.in_payload() {
@@ -523,20 +591,24 @@ impl StructuredOutputProcessor {
             }
         }
         if let Activation::Boundary {
+            opening_tokens,
             delimiter_tokens,
             forcing,
+            ..
         } = &state.activation
         {
             self.mask_undefined_token_ids(logits);
+            let opening_token = opening_tokens.get(generated.len()).copied();
+            let after_opening = generated.get(opening_tokens.len()..).unwrap_or_default();
             let delimiter_prefix_token_count =
-                delimiter_prefix_token_count(generated, delimiter_tokens);
-            let required_delimiter_token = delimiter_tokens
-                .get(delimiter_prefix_token_count)
-                .copied()
+                delimiter_prefix_token_count(after_opening, delimiter_tokens);
+            let required_delimiter_token = opening_token
+                .or_else(|| delimiter_tokens.get(delimiter_prefix_token_count).copied())
                 .ok_or_else(|| {
                     FerrumError::internal("structured-output delimiter state has no next token")
                 })?;
-            if *forcing {
+            let force_boundary = opening_token.is_some() || *forcing;
+            if force_boundary {
                 force_exact_token(logits, required_delimiter_token)?;
             } else if let Some(hidden_control_token_ids) = hidden_control_token_ids {
                 for token_id in hidden_control_token_ids {
@@ -549,7 +621,7 @@ impl StructuredOutputProcessor {
                 }
             }
             return Ok(StructuredOutputMaskOutcome {
-                phase: if *forcing {
+                phase: if force_boundary {
                     StructuredOutputPhase::ForcingDelimiter
                 } else {
                     StructuredOutputPhase::WaitingForDelimiter
@@ -682,21 +754,27 @@ impl StructuredOutputProcessor {
         terminal_token_ids: Option<&HashSet<u32>>,
     ) -> Result<StructuredOutputProgress> {
         let mut state = self.state.lock();
-        advance_state(&mut state, generated, terminal_token_ids)?;
+        advance_state(&mut state, generated, terminal_token_ids, self.budget)?;
         activate_forcing_if_due(&mut state, generated, self.budget);
         let (phase, delimiter_token_count, delimiter_prefix_token_count, accepting) =
             match &state.activation {
                 Activation::Boundary {
+                    opening_tokens,
                     delimiter_tokens,
                     forcing,
+                    ..
                 } => (
-                    if *forcing {
+                    if generated.len() < opening_tokens.len() || *forcing {
                         StructuredOutputPhase::ForcingDelimiter
                     } else {
                         StructuredOutputPhase::WaitingForDelimiter
                     },
-                    Some(delimiter_tokens.len()),
-                    delimiter_prefix_token_count(generated, delimiter_tokens),
+                    Some(opening_tokens.len() + delimiter_tokens.len()),
+                    generated.len().min(opening_tokens.len())
+                        + delimiter_prefix_token_count(
+                            generated.get(opening_tokens.len()..).unwrap_or_default(),
+                            delimiter_tokens,
+                        ),
                     false,
                 ),
                 Activation::Active => (
@@ -755,6 +833,10 @@ impl StructuredOutputProcessor {
                 .take_while(|token| token.get() == token_id)
                 .count()
         });
+        let opening_token_count = match &state.initial_activation {
+            Activation::Boundary { opening_tokens, .. } => opening_tokens.len(),
+            _ => 0,
+        };
         Ok(StructuredOutputProgress {
             phase,
             generated_token_count: generated.len(),
@@ -762,9 +844,12 @@ impl StructuredOutputProcessor {
             delimiter_token_count: delimiter_token_count
                 .or(self.budget.map(|budget| budget.boundary_token_count)),
             delimiter_prefix_token_count,
-            reasoning_token_count: self
-                .budget
-                .map(|_| state.boundary_start.unwrap_or(generated.len())),
+            reasoning_token_count: self.budget.map(|_| {
+                state
+                    .boundary_start
+                    .unwrap_or(generated.len())
+                    .saturating_sub(opening_token_count)
+            }),
             boundary_forced: state.boundary_forced,
             budget: self.budget,
             grammar_token_count: grammar_tokens.len(),
@@ -810,15 +895,27 @@ fn activate_forcing_if_due(
     let Some(budget) = budget else {
         return;
     };
-    let should_force = matches!(
-        state.activation,
-        Activation::Boundary { forcing: false, .. }
-    ) && generated.len() >= budget.reasoning_token_limit;
+    let should_force = match &state.activation {
+        Activation::Boundary {
+            opening_tokens,
+            allow_reasoning,
+            forcing,
+            ..
+        } => {
+            !forcing
+                && generated.len() >= opening_tokens.len()
+                && (!allow_reasoning
+                    || generated.len() - opening_tokens.len() >= budget.reasoning_token_limit)
+        }
+        _ => false,
+    };
     if should_force {
         let delimiter_prefix_token_count = match &state.activation {
             Activation::Boundary {
-                delimiter_tokens, ..
-            } => delimiter_prefix_token_count(generated, delimiter_tokens),
+                opening_tokens,
+                delimiter_tokens,
+                ..
+            } => delimiter_prefix_token_count(&generated[opening_tokens.len()..], delimiter_tokens),
             Activation::Active | Activation::Harmony(_) => 0,
         };
         if let Activation::Boundary { forcing, .. } = &mut state.activation {
@@ -861,6 +958,7 @@ fn advance_state(
     state: &mut ProcessorState,
     generated: &[TokenId],
     terminal_token_ids: Option<&HashSet<u32>>,
+    budget: Option<StructuredOutputBudgetPlan>,
 ) -> Result<()> {
     if state.consumed > generated.len() {
         return Err(FerrumError::internal(
@@ -884,10 +982,39 @@ fn advance_state(
     }
 
     if let Activation::Boundary {
-        delimiter_tokens, ..
+        opening_tokens,
+        delimiter_tokens,
+        allow_reasoning,
+        ..
     } = &state.activation
     {
-        let search_from = state.consumed.saturating_sub(delimiter_tokens.len());
+        if opening_tokens
+            .iter()
+            .zip(generated)
+            .any(|(expected, token)| *expected != token.get())
+        {
+            return Err(FerrumError::model(
+                "structured-output reasoning envelope has an invalid opening header",
+            ));
+        }
+        if generated.len() < opening_tokens.len() {
+            state.consumed = generated.len();
+            return Ok(());
+        }
+        if !allow_reasoning
+            && delimiter_tokens
+                .iter()
+                .zip(&generated[opening_tokens.len()..])
+                .any(|(expected, token)| *expected != token.get())
+        {
+            return Err(FerrumError::model(
+                "structured-output reasoning is disabled; the envelope must close immediately",
+            ));
+        }
+        let search_from = state
+            .consumed
+            .saturating_sub(delimiter_tokens.len())
+            .max(opening_tokens.len());
         if let Some(offset) = generated[search_from..]
             .windows(delimiter_tokens.len())
             .position(|window| {
@@ -898,6 +1025,13 @@ fn advance_state(
             })
         {
             let grammar_start = search_from + offset + delimiter_tokens.len();
+            if !opening_tokens.is_empty() {
+                let reasoning_count = grammar_start - delimiter_tokens.len() - opening_tokens.len();
+                state.boundary_forced |= !allow_reasoning
+                    || budget.is_some_and(|plan| {
+                        reasoning_count + delimiter_tokens.len() - 1 >= plan.reasoning_token_limit
+                    });
+            }
             state.boundary_start = Some(grammar_start - delimiter_tokens.len());
             state.grammar_start = Some(grammar_start);
             state.activation = Activation::Active;

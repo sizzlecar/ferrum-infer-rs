@@ -43,12 +43,17 @@ fn probe_semantic_markers(tokenizer: &HfTokenizer) -> Vec<(u32, &'static str)> {
         .filter_map(|(text, canonical)| tokenizer.token_to_id(text).map(|id| (id, *canonical)))
         .collect();
 
-    markers.extend(
-        ModelOutputProtocol::HarmonyGptOss
-            .preserved_special_token_texts()
-            .iter()
-            .filter_map(|text| tokenizer.token_to_id(text).map(|id| (id, *text))),
-    );
+    for protocol in [
+        ModelOutputProtocol::HarmonyGptOss,
+        ModelOutputProtocol::GemmaThought,
+    ] {
+        markers.extend(
+            protocol
+                .preserved_special_token_texts()
+                .iter()
+                .filter_map(|text| tokenizer.token_to_id(text).map(|id| (id, *text))),
+        );
+    }
     markers
 }
 
@@ -1331,6 +1336,96 @@ mod tests {
             format!("hello{}world", harmony_markers.concat()),
             "the typed Harmony markers must survive while unrelated special tokens stay skipped"
         );
+    }
+
+    async fn gemma_thought_tokenizer() -> (HuggingFaceTokenizer, Vec<TokenId>) {
+        use tokenizers::decoders::fuse::Fuse;
+        use tokenizers::models::bpe::{Vocab, BPE};
+        use tokenizers::AddedToken;
+
+        // The observed Gemma sequence is 100, 45518, 107, 101, 236810,
+        // 236832, 236819, 106. Keep its exact pieces and special flags with
+        // compact IDs instead of copying the model's full vocabulary.
+        let pieces = [
+            "<|channel>",
+            "thought",
+            "\n",
+            "<channel|>",
+            "5",
+            "7",
+            "9",
+            "<turn|>",
+        ];
+        let vocab: Vocab = pieces
+            .iter()
+            .enumerate()
+            .map(|(id, piece)| ((*piece).to_string(), id as u32))
+            .collect();
+        let bpe = BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .build()
+            .unwrap();
+        let mut tokenizer = HfTokenizer::new(bpe);
+        tokenizer.with_decoder(Some(Fuse::new()));
+        tokenizer.add_special_tokens(&[
+            AddedToken::from("<|channel>", true),
+            AddedToken::from("<channel|>", true),
+            AddedToken::from("<turn|>", true),
+        ]);
+        let tokens = pieces
+            .iter()
+            .map(|piece| TokenId::new(tokenizer.token_to_id(piece).unwrap()))
+            .collect();
+        (HuggingFaceTokenizer::new(tokenizer).await.unwrap(), tokens)
+    }
+
+    #[tokio::test]
+    async fn skip_special_decode_preserves_gemma_thought_envelope_and_skips_turn() {
+        let (tokenizer, tokens) = gemma_thought_tokenizer().await;
+
+        assert_eq!(
+            tokenizer.decode(&tokens, false).unwrap(),
+            "<|channel>thought\n<channel|>579<turn|>"
+        );
+        assert_eq!(
+            tokenizer.decode(&tokens, true).unwrap(),
+            "<|channel>thought\n<channel|>579"
+        );
+        assert_eq!(tokenizer.decode(&tokens[7..], true).unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn incremental_decode_preserves_gemma_thought_envelope_and_skips_turn() {
+        let (tokenizer, tokens) = gemma_thought_tokenizer().await;
+        let mut state = tokenizer.create_state();
+        let mut stateless_text = String::new();
+        let mut stateful_text = String::new();
+
+        for (index, &token) in tokens.iter().enumerate() {
+            let delta = tokenizer
+                .decode_incremental(&tokens[..index], token)
+                .unwrap();
+            let stateful_delta = tokenizer
+                .decode_incremental_with_state(&mut state, token)
+                .unwrap();
+            assert_eq!(delta, stateful_delta);
+            stateless_text.push_str(&delta);
+            stateful_text.push_str(&stateful_delta);
+            assert_eq!(
+                stateless_text,
+                tokenizer.decode(&tokens[..=index], true).unwrap()
+            );
+            if index == tokens.len() - 1 {
+                assert!(
+                    delta.is_empty(),
+                    "ordinary turn EOS must not reach the stream"
+                );
+            }
+        }
+
+        assert_eq!(stateless_text, "<|channel>thought\n<channel|>579");
+        assert_eq!(stateful_text, stateless_text);
+        assert_eq!(tokenizer.get_decoded_text(&state), stateless_text);
     }
 
     #[tokio::test]

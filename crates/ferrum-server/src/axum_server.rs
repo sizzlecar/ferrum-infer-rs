@@ -28,15 +28,16 @@ use ferrum_bench_core::{
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    has_unclosed_thinking_block, parse_harmony_response, parse_length_truncated_harmony_response,
-    parse_reasoning_response, parse_reasoning_response_started_in_think, EngineMetrics,
-    EngineStatus, FerrumConfigBuilder, FerrumError as Error, FerrumProfileEvent, FinishReason,
-    InferenceExecutionEvidence, InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol,
-    ParsedReasoningResponse, Priority, ProcessMemoryObservation, ProcessMemorySample,
-    ProcessMemorySampler, ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus,
-    ReplayReference, RequestId, ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent,
-    ResponseCompletionBoundary, RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart,
-    TokenId, TokenUsage, DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
+    has_unclosed_model_reasoning_block, model_reasoning_markers, parse_harmony_response,
+    parse_length_truncated_harmony_response, parse_model_reasoning_response,
+    should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus, FerrumConfigBuilder,
+    FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
+    InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, ParsedReasoningResponse,
+    Priority, ProcessMemoryObservation, ProcessMemorySample, ProcessMemorySampler,
+    ProfileEntrypoint, ProfileError, ProfileEventKind, ProfileStatus, ReplayReference, RequestId,
+    ResolvedFerrumConfig, ResourceAction, ResourceTraceEvent, ResponseCompletionBoundary,
+    RuntimeConfigSnapshot, SamplingParams, StructuredOutputStart, TokenId, TokenUsage,
+    DEFAULT_CHAT_REPETITION_PENALTY, DEFAULT_MAX_TOKENS_METADATA_KEY,
     OBSERVABILITY_PROFILE_SCHEMA_VERSION, THINK_END_TAG, THINK_START_TAG,
 };
 use sha2::{Digest, Sha256};
@@ -2384,14 +2385,13 @@ fn parse_chat_model_output(
     finish_reason: FinishReason,
 ) -> std::result::Result<ParsedChatModelOutput, ServerError> {
     match protocol {
-        ModelOutputProtocol::Text => Ok(ParsedChatModelOutput {
-            visible: if started_in_think {
-                parse_reasoning_response_started_in_think(text)
-            } else {
-                parse_reasoning_response(text)
-            },
-            harmony_response: None,
-        }),
+        ModelOutputProtocol::Text | ModelOutputProtocol::GemmaThought => {
+            Ok(ParsedChatModelOutput {
+                visible: parse_model_reasoning_response(protocol, text, started_in_think)
+                    .map_err(|error| ServerError::InternalError(error.to_string()))?,
+                harmony_response: None,
+            })
+        }
         ModelOutputProtocol::HarmonyGptOss => {
             let parsed = if finish_reason == FinishReason::Length {
                 parse_length_truncated_harmony_response(text)
@@ -2480,7 +2480,8 @@ async fn handle_chat_completions_stream(
         || model_output_protocol == ModelOutputProtocol::HarmonyGptOss;
     // R1-distill-style templates open the think block inside the prompt;
     // the parser must know generation starts mid-think.
-    let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
+    let started_in_think =
+        has_unclosed_model_reasoning_block(model_output_protocol, &inference_request.prompt);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -2572,55 +2573,67 @@ async fn handle_chat_completions_stream(
                     if !chunk.text.is_empty() {
                         current_text.push_str(&chunk.text);
 
-                        if !buffer_stream_output {
-                            if should_defer_reasoning_stream_delta(&current_text) {
-                                continue;
-                            }
-                            let parsed = if started_in_think {
-                                parse_reasoning_response_started_in_think(&current_text)
-                            } else {
-                                parse_reasoning_response(&current_text)
+                        if !buffer_stream_output
+                            && !should_defer_model_reasoning_stream_delta(
+                                model_output_protocol,
+                                &current_text,
+                            )
+                        {
+                            let parsed = match parse_model_reasoning_response(
+                                model_output_protocol,
+                                &current_text,
+                                started_in_think,
+                            ) {
+                                Ok(parsed) => parsed,
+                                Err(error) => {
+                                    let _ = tx.send(Ok(openai_error_sse_event(
+                                        error.to_string(),
+                                        "internal_server_error",
+                                        Some("model_output"),
+                                    )));
+                                    let _ = tx.send(Ok(Event::default().data("[DONE]")));
+                                    break;
+                                }
                             };
                             let full_reasoning = parsed.reasoning.as_deref().unwrap_or("");
                             let reasoning_delta =
                                 stream_text_delta(full_reasoning, &mut sent_reasoning_len);
                             let content_delta =
                                 stream_text_delta(&parsed.content, &mut sent_content_len);
-                            if reasoning_delta.is_empty() && content_delta.is_empty() {
-                                continue;
-                            }
-                            // Create streaming response chunk
-                            let response_chunk = ChatCompletionsResponse {
-                                id: request_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created: chrono::Utc::now().timestamp() as u64,
-                                model: openai_request.model.clone(),
-                                choices: vec![ChatChoice {
-                                    index: 0,
-                                    message: None,
-                                    delta: Some(ChatMessage {
-                                        role: MessageRole::Assistant,
-                                        content: content_delta,
-                                        reasoning: (!reasoning_delta.is_empty())
-                                            .then_some(reasoning_delta),
-                                        name: None,
-                                        tool_calls: None,
-                                        tool_call_id: None,
-                                        function_call: None,
-                                    }),
-                                    finish_reason: None,
-                                }],
-                                usage: None,
-                            };
+                            if !reasoning_delta.is_empty() || !content_delta.is_empty() {
+                                // Create streaming response chunk
+                                let response_chunk = ChatCompletionsResponse {
+                                    id: request_id.clone(),
+                                    object: "chat.completion.chunk".to_string(),
+                                    created: chrono::Utc::now().timestamp() as u64,
+                                    model: openai_request.model.clone(),
+                                    choices: vec![ChatChoice {
+                                        index: 0,
+                                        message: None,
+                                        delta: Some(ChatMessage {
+                                            role: MessageRole::Assistant,
+                                            content: content_delta,
+                                            reasoning: (!reasoning_delta.is_empty())
+                                                .then_some(reasoning_delta),
+                                            name: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                            function_call: None,
+                                        }),
+                                        finish_reason: None,
+                                    }],
+                                    usage: None,
+                                };
 
-                            let sse_event = Event::default()
-                                .json_data(&response_chunk)
-                                .unwrap_or_else(|_| Event::default().data("error"));
-                            if tx.send(Ok(sse_event)).is_err() {
-                                break;
+                                let sse_event = Event::default()
+                                    .json_data(&response_chunk)
+                                    .unwrap_or_else(|_| Event::default().data("error"));
+                                if tx.send(Ok(sse_event)).is_err() {
+                                    break;
+                                }
+                                first_sse_enqueue_us
+                                    .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                             }
-                            first_sse_enqueue_us
-                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         }
                     }
 
@@ -2760,37 +2773,49 @@ async fn handle_chat_completions_stream(
                             let _ = tx.send(Ok(error_event));
                             let _ = tx.send(Ok(Event::default().data("[DONE]")));
                             break;
-                        } else if buffer_stream_output && !current_text.is_empty() {
-                            let response_chunk = ChatCompletionsResponse {
-                                id: request_id.clone(),
-                                object: "chat.completion.chunk".to_string(),
-                                created: chrono::Utc::now().timestamp() as u64,
-                                model: openai_request.model.clone(),
-                                choices: vec![ChatChoice {
-                                    index: 0,
-                                    message: None,
-                                    delta: Some(ChatMessage {
-                                        role: MessageRole::Assistant,
-                                        content: parsed_final.content.clone(),
-                                        reasoning: parsed_final.reasoning.clone(),
-                                        name: None,
-                                        tool_calls: None,
-                                        tool_call_id: None,
-                                        function_call: None,
-                                    }),
-                                    finish_reason: None,
-                                }],
-                                usage: None,
-                            };
+                        } else if !current_text.is_empty() {
+                            // Flush safe text held with an incomplete trailing
+                            // marker, including when text and finish share a chunk.
+                            // Buffered streams have sent lengths of zero.
+                            let content_delta =
+                                stream_text_delta(&parsed_final.content, &mut sent_content_len);
+                            let reasoning_delta = stream_text_delta(
+                                parsed_final.reasoning.as_deref().unwrap_or(""),
+                                &mut sent_reasoning_len,
+                            );
+                            if !content_delta.is_empty() || !reasoning_delta.is_empty() {
+                                let response_chunk = ChatCompletionsResponse {
+                                    id: request_id.clone(),
+                                    object: "chat.completion.chunk".to_string(),
+                                    created: chrono::Utc::now().timestamp() as u64,
+                                    model: openai_request.model.clone(),
+                                    choices: vec![ChatChoice {
+                                        index: 0,
+                                        message: None,
+                                        delta: Some(ChatMessage {
+                                            role: MessageRole::Assistant,
+                                            content: content_delta,
+                                            reasoning: (!reasoning_delta.is_empty())
+                                                .then_some(reasoning_delta),
+                                            name: None,
+                                            tool_calls: None,
+                                            tool_call_id: None,
+                                            function_call: None,
+                                        }),
+                                        finish_reason: None,
+                                    }],
+                                    usage: None,
+                                };
 
-                            let sse_event = Event::default()
-                                .json_data(&response_chunk)
-                                .unwrap_or_else(|_| Event::default().data("error"));
-                            if tx.send(Ok(sse_event)).is_err() {
-                                break;
+                                let sse_event = Event::default()
+                                    .json_data(&response_chunk)
+                                    .unwrap_or_else(|_| Event::default().data("error"));
+                                if tx.send(Ok(sse_event)).is_err() {
+                                    break;
+                                }
+                                first_sse_enqueue_us
+                                    .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                             }
-                            first_sse_enqueue_us
-                                .get_or_insert_with(|| elapsed_us_since(profile_started_at));
                         }
                         // Send final chunk. OpenAI-style streaming
                         // clients (e.g. `vllm bench serve`) blindly
@@ -2996,7 +3021,8 @@ async fn handle_chat_completions_sync(
         });
     let model_output_protocol = inference_request.sampling_params.model_output_protocol;
     // R1-distill-style templates open the think block inside the prompt.
-    let started_in_think = has_unclosed_thinking_block(&inference_request.prompt);
+    let started_in_think =
+        has_unclosed_model_reasoning_block(model_output_protocol, &inference_request.prompt);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -3478,8 +3504,12 @@ fn convert_chat_request_with_template_model_and_default(
             serde_json::json!(true),
         );
     }
-    if !has_unclosed_thinking_block(&prompt) {
-        let mut forbidden = vec![THINK_END_TAG.to_string()];
+    let prompt_opened_thinking = has_unclosed_model_reasoning_block(model_output_protocol, &prompt);
+    let reasoning_markers = model_reasoning_markers(model_output_protocol);
+    if !prompt_opened_thinking {
+        let mut forbidden = reasoning_markers
+            .map(|(_, close)| vec![close.to_string()])
+            .unwrap_or_default();
         if hard_tool_call_contract {
             for token_text in INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS {
                 push_unique_forbidden_token_text(&mut forbidden, token_text);
@@ -3493,7 +3523,9 @@ fn convert_chat_request_with_template_model_and_default(
                 push_unique_forbidden_token_text(&mut forbidden, eos);
             }
         }
-        if chat_template_options.enable_thinking == Some(false) {
+        if model_output_protocol == ModelOutputProtocol::Text
+            && chat_template_options.enable_thinking == Some(false)
+        {
             push_unique_forbidden_token_text(&mut forbidden, THINK_START_TAG);
         }
         metadata.insert(
@@ -3501,7 +3533,6 @@ fn convert_chat_request_with_template_model_and_default(
             serde_json::json!(forbidden),
         );
     }
-    let prompt_opened_thinking = has_unclosed_thinking_block(&prompt);
     let structured_output = !matches!(response_format, ferrum_types::ResponseFormat::Text);
     let structured_output_after_reasoning = structured_output
         && model_output_protocol == ModelOutputProtocol::Text
@@ -3509,16 +3540,34 @@ fn convert_chat_request_with_template_model_and_default(
     let structured_output_start =
         if structured_output && model_output_protocol == ModelOutputProtocol::HarmonyGptOss {
             StructuredOutputStart::HarmonyFinal
+        } else if structured_output && model_output_protocol == ModelOutputProtocol::GemmaThought {
+            let (opening, closing) = reasoning_markers.expect("Gemma thought markers");
+            if prompt_opened_thinking {
+                StructuredOutputStart::AfterDelimiter(closing.to_string())
+            } else if prompt.trim_end().ends_with(closing) {
+                StructuredOutputStart::Immediate
+            } else {
+                StructuredOutputStart::AfterReasoningEnvelope {
+                    opening: opening.to_string(),
+                    closing: closing.to_string(),
+                    allow_reasoning: reasoning_enabled,
+                }
+            }
         } else if structured_output_after_reasoning {
             StructuredOutputStart::AfterDelimiter(THINK_END_TAG.to_string())
         } else {
             StructuredOutputStart::Immediate
         };
-    let response_completion_boundary = if model_output_protocol == ModelOutputProtocol::Text
-        && (prompt_opened_thinking || structured_output_after_reasoning)
+    let delayed_grammar = matches!(
+        structured_output_start,
+        StructuredOutputStart::AfterDelimiter(_)
+            | StructuredOutputStart::AfterReasoningEnvelope { .. }
+    );
+    let response_completion_boundary = if let Some((_, closing)) =
+        reasoning_markers.filter(|_| prompt_opened_thinking || delayed_grammar)
     {
         ResponseCompletionBoundary::AfterDelimiterAndPayload {
-            delimiter: THINK_END_TAG.to_string(),
+            delimiter: closing.to_string(),
             alternate_envelope: api_chat.generated_response_envelope(),
         }
     } else {
@@ -3813,14 +3862,6 @@ fn single_function_tool(tools: &[ChatTool]) -> Option<&ChatTool> {
     let mut function_tools = tools.iter().filter(|tool| tool.tool_type == "function");
     let tool = function_tools.next()?;
     function_tools.next().is_none().then_some(tool)
-}
-
-fn should_defer_reasoning_stream_delta(text: &str) -> bool {
-    let candidate = text.trim_start_matches(['\r', '\n']);
-    if candidate.is_empty() {
-        return true;
-    }
-    THINK_START_TAG.starts_with(candidate) || THINK_END_TAG.starts_with(candidate)
 }
 
 fn stream_text_delta(text: &str, sent_len: &mut usize) -> String {
@@ -5565,6 +5606,7 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod gemma_thought;
     use super::*;
     use async_trait::async_trait;
     use axum::{
@@ -5576,7 +5618,8 @@ mod tests {
         EmbedEngine, InferenceEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine,
     };
     use ferrum_types::{
-        EngineConfig, EngineMetrics, EngineStatus, EngineTokenTimingEvidence, FinishReason,
+        has_unclosed_thinking_block, parse_reasoning_response_started_in_think, EngineConfig,
+        EngineMetrics, EngineStatus, EngineTokenTimingEvidence, FinishReason,
         HealthStatus as EngineHealthStatus, InferenceRequest, InferenceResponse, MemoryUsage,
         ModelId, StreamChunk, TokenId, TokenUsage,
     };
@@ -12368,8 +12411,8 @@ mod tests {
         );
         assert_eq!(
             internal.metadata[INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY],
-            json!([THINK_END_TAG]),
-            "the generic structured-call mask must remain disabled for Harmony"
+            json!([]),
+            "Harmony declares no think delimiter and must not receive the generic structured-call mask"
         );
         let Some(ferrum_types::ApiRequest::Chat(api)) = internal.api_request else {
             panic!("expected chat API request");

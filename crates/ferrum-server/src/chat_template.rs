@@ -3,8 +3,8 @@ use crate::openai::{
     ToolChoice,
 };
 use ferrum_types::{
-    has_unclosed_thinking_block, ApiToolCallProtocol, FerrumError, ModelOutputProtocol,
-    THINK_END_TAG, THINK_START_TAG,
+    has_unclosed_model_reasoning_block, model_reasoning_markers, ApiToolCallProtocol, FerrumError,
+    ModelOutputProtocol,
 };
 use minijinja::Environment;
 use serde::ser::SerializeStruct;
@@ -57,6 +57,15 @@ impl ModelChatTemplate {
     pub fn reasoning_enabled(&self, requested: Option<bool>) -> bool {
         self.reasoning_protocol != ModelReasoningProtocol::None
             && requested.unwrap_or(self.reasoning_default_enabled)
+    }
+
+    /// Bind the resolved model capability after loading its unchanged template
+    /// bytes, then probe reasoning with that protocol's actual delimiters.
+    pub fn set_output_protocol(&mut self, protocol: ModelOutputProtocol) {
+        self.output_protocol = protocol;
+        let (reasoning_protocol, reasoning_default_enabled) = detect_model_reasoning_protocol(self);
+        self.reasoning_protocol = reasoning_protocol;
+        self.reasoning_default_enabled = reasoning_default_enabled;
     }
 }
 
@@ -610,6 +619,9 @@ fn render_model_template_once(
 fn detect_model_reasoning_protocol(
     model_template: &ModelChatTemplate,
 ) -> (ModelReasoningProtocol, bool) {
+    let Some((opening, closing)) = model_reasoning_markers(model_template.output_protocol) else {
+        return (ModelReasoningProtocol::None, false);
+    };
     let messages = [PromptMessage {
         role: "user".to_string(),
         content: "reasoning protocol probe".to_string(),
@@ -643,8 +655,10 @@ fn detect_model_reasoning_protocol(
         return (ModelReasoningProtocol::None, false);
     };
     let default = render(None);
-    if has_unclosed_thinking_block(&enabled) {
-        let default_enabled = default.as_deref().is_some_and(has_unclosed_thinking_block);
+    let prompt_opened =
+        |prompt: &str| has_unclosed_model_reasoning_block(model_template.output_protocol, prompt);
+    if prompt_opened(&enabled) {
+        let default_enabled = default.as_deref().is_some_and(prompt_opened);
         return (ModelReasoningProtocol::PromptOpened, default_enabled);
     }
     let Some(disabled) = render(Some(false)) else {
@@ -652,9 +666,9 @@ fn detect_model_reasoning_protocol(
     };
     let completed_blocks = |prompt: &str| {
         prompt
-            .matches(THINK_START_TAG)
+            .matches(opening)
             .count()
-            .min(prompt.matches(THINK_END_TAG).count())
+            .min(prompt.matches(closing).count())
     };
     if completed_blocks(&disabled) > completed_blocks(&enabled) {
         return (
@@ -1433,6 +1447,77 @@ mod tests {
         assert!(template.reasoning_enabled(None));
         assert!(template.reasoning_enabled(Some(true)));
         assert!(!template.reasoning_enabled(Some(false)));
+    }
+
+    #[test]
+    fn declared_gemma_protocol_recomputes_template_reasoning_capability() {
+        // Preserve the canonical template's generation-tail decisions without
+        // copying its tool-schema formatting or other unrelated metadata.
+        let source = concat!(
+            "{% set enable_thinking = enable_thinking | default(false) %}",
+            "{% if enable_thinking %}<|turn>system\n<|think|>\n<turn|>\n{% endif %}",
+            "{% if add_generation_prompt %}",
+            "{% if messages[-1].role == 'tool' %}",
+            "<|turn>model\n<|tool_response>{{ messages[-1].content }}<tool_response|>",
+            "{% if enable_thinking %}<|channel>thought\n{% endif %}",
+            "{% else %}<|turn>model\n",
+            "{% if not enable_thinking %}<|channel>thought\n<channel|>{% endif %}",
+            "{% endif %}{% endif %}",
+        );
+        let mut template = ModelChatTemplate::new(source, "declared-thought-template");
+        assert_eq!(template.reasoning_protocol, ModelReasoningProtocol::None);
+        template.set_output_protocol(ModelOutputProtocol::GemmaThought);
+        assert_eq!(template.template, source);
+        assert_eq!(
+            template.reasoning_protocol,
+            ModelReasoningProtocol::ModelGenerated
+        );
+        assert!(!template.reasoning_default_enabled);
+        assert!(!template.reasoning_enabled(None));
+        assert!(!template.reasoning_enabled(Some(false)));
+        assert!(template.reasoning_enabled(Some(true)));
+
+        for (role, enabled, expected_tail, opened) in [
+            (
+                MessageRole::User,
+                false,
+                "<|turn>model\n<|channel>thought\n<channel|>",
+                false,
+            ),
+            (MessageRole::User, true, "<|turn>model\n", false),
+            (
+                MessageRole::Tool,
+                false,
+                "<|tool_response>579<tool_response|>",
+                false,
+            ),
+            (
+                MessageRole::Tool,
+                true,
+                "<|tool_response>579<tool_response|><|channel>thought\n",
+                true,
+            ),
+        ] {
+            let prompt = render_chat_prompt_with_model_template_options(
+                &[msg(role, "579")],
+                "loaded-model-alias",
+                Some(&template),
+                &ChatTemplateOptions {
+                    enable_thinking: Some(enabled),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(prompt.ends_with(expected_tail), "{prompt:?}");
+            assert_eq!(
+                has_unclosed_model_reasoning_block(template.output_protocol, &prompt),
+                opened
+            );
+        }
+
+        template.set_output_protocol(ModelOutputProtocol::Text);
+        assert_eq!(template.reasoning_protocol, ModelReasoningProtocol::None);
+        assert!(!template.reasoning_enabled(Some(true)));
     }
 
     #[test]
