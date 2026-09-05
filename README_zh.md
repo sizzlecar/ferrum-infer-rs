@@ -17,8 +17,17 @@
 
 安装 Ferrum：
 
+使用 Homebrew 6 时，授予信任前请先查看[公式定义](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)：
+加载这些定义会以当前用户权限执行 Ruby 代码。Homebrew 会读取两条公式来检查互斥安装，
+因此需要分别信任两条，再只安装适合当前平台的一条。旧版 Homebrew 可跳过两条
+`brew trust` 命令。详见 [Homebrew 信任说明](https://docs.brew.sh/Tap-Trust)。
+
 ```bash
 brew tap sizzlecar/ferrum
+
+# Homebrew 6：分别信任已查看的公式定义
+brew trust --formula sizzlecar/ferrum/ferrum
+brew trust --formula sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon
 brew install ferrum
@@ -130,10 +139,14 @@ Ferrum 支持：
 
 ## 安装
 
-Homebrew：
+Homebrew（公式信任说明见[快速开始](#快速开始)）：
 
 ```bash
 brew tap sizzlecar/ferrum
+
+# Homebrew 6：分别信任已查看的公式定义
+brew trust --formula sizzlecar/ferrum/ferrum
+brew trust --formula sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon Metal
 brew install ferrum
