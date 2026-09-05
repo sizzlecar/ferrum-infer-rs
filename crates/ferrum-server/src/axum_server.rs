@@ -2672,11 +2672,15 @@ async fn handle_chat_completions_stream(
                         let structured_chat_response =
                             finish_reason_allows_structured_api_response(terminal_finish_reason)
                                 .then(|| match chunk.api_response.as_ref() {
+                                    // The native envelope owns the recipient and whether this is
+                                    // a call at all, including a final answer containing JSON.
+                                    _ if model_output_protocol
+                                        == ModelOutputProtocol::HarmonyGptOss =>
+                                    {
+                                        parsed_model_output.harmony_response.clone()
+                                    }
                                     Some(ferrum_types::ApiResponse::Chat(response)) => {
                                         Some(response.clone())
-                                    }
-                                    _ if parsed_model_output.harmony_response.is_some() => {
-                                        parsed_model_output.harmony_response.clone()
                                     }
                                     _ if buffer_structured_api_stream => {
                                         chat_api_response_from_parsed_generated_text(
@@ -3070,11 +3074,13 @@ async fn handle_chat_completions_sync(
             let structured_chat_response =
                 finish_reason_allows_structured_api_response(finish_reason)
                     .then(|| match api_response.as_ref() {
+                        // The native envelope owns the recipient and whether this is
+                        // a call at all, including a final answer containing JSON.
+                        _ if model_output_protocol == ModelOutputProtocol::HarmonyGptOss => {
+                            parsed_model_output.harmony_response.clone()
+                        }
                         Some(ferrum_types::ApiResponse::Chat(chat_response)) => {
                             Some(chat_response.clone())
-                        }
-                        _ if parsed_model_output.harmony_response.is_some() => {
-                            parsed_model_output.harmony_response.clone()
                         }
                         _ => match request_chat_api.as_ref() {
                             Some(chat_request) => chat_api_response_from_parsed_generated_text(
