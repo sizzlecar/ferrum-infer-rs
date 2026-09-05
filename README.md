@@ -17,8 +17,18 @@
 
 Install Ferrum:
 
+On Homebrew 6, review the [formula definitions](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)
+before granting trust: loading them executes Ruby code with your user privileges.
+Homebrew reads both formulas to check their mutual conflict, so trust both below
+and install the one for your platform. Older Homebrew versions can skip the two
+`brew trust` commands. See [Homebrew's trust documentation](https://docs.brew.sh/Tap-Trust).
+
 ```bash
 brew tap sizzlecar/ferrum
+
+# Homebrew 6: trust the reviewed formula definitions
+brew trust --formula sizzlecar/ferrum/ferrum
+brew trust --formula sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon
 brew install ferrum
@@ -137,10 +147,14 @@ and session caching.
 
 ## Installation
 
-Homebrew:
+Homebrew (see the formula trust explanation in [Quick Start](#quick-start)):
 
 ```bash
 brew tap sizzlecar/ferrum
+
+# Homebrew 6: trust the reviewed formula definitions
+brew trust --formula sizzlecar/ferrum/ferrum
+brew trust --formula sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon Metal
 brew install ferrum
