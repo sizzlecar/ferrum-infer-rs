@@ -3521,6 +3521,55 @@ mod tests {
         assert_eq!(record["token_id"], 9271);
     }
 
+    #[tokio::test]
+    async fn run_collectors_preserve_tokenless_tail_before_terminal() {
+        let request_id = RequestId::new();
+        let expected_request_id = request_id.to_string();
+        for text_output in [false, true] {
+            let chunks = [
+                ("hello ", Some(TokenId::new(11)), None, None),
+                ("尾", None, None, None),
+                (
+                    "",
+                    None,
+                    Some(FinishReason::Length),
+                    Some(TokenUsage::new(7, 2)),
+                ),
+            ]
+            .into_iter()
+            .map(|(text, token, finish_reason, usage)| {
+                Ok(StreamChunk {
+                    request_id: request_id.clone(),
+                    text: text.to_string(),
+                    token,
+                    finish_reason,
+                    usage,
+                    created_at: chrono::Utc::now(),
+                    metadata: HashMap::new(),
+                    api_response: None,
+                    execution_evidence: None,
+                })
+            })
+            .collect::<Vec<_>>();
+            let stream: RunResponseStream = Box::pin(futures::stream::iter(chunks));
+            let result = if text_output {
+                collect_run_text_stream(stream, false, true, 0, &request_id, false, true).await
+            } else {
+                collect_run_stream(stream, false, true, 0, "session", 0, &expected_request_id).await
+            }
+            .expect("collect stream with a separately flushed tail");
+
+            assert_eq!(result.raw_text, "hello 尾");
+            assert_eq!(result.finish_reason, Some(FinishReason::Length));
+            assert_eq!(result.token_ids, vec![11]);
+            assert_eq!(result.token_count, 2, "final usage is authoritative");
+            assert_eq!(result.chunk_count, 2);
+            let usage = result.usage.expect("terminal usage");
+            assert_eq!(usage.prompt_tokens, 7);
+            assert_eq!(usage.completion_tokens, 2);
+        }
+    }
+
     #[test]
     fn cli_display_preserves_thinking_markers() {
         assert_eq!(

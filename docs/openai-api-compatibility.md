@@ -46,7 +46,7 @@ support matrix and are hidden from the default CLI help.
 | `max_completion_tokens` | Supported | Overrides `max_tokens` when both are supplied. |
 | `temperature`, `top_p` | Supported | Mapped into Ferrum sampling parameters. |
 | `top_k`, `min_p`, `repetition_penalty` | Supported extension | vLLM-compatible sampling fields. `top_k=-1/0` and `min_p=0` disable their filters. |
-| `stop` | Supported | Accepts a string or string array and strips a trailing stop sentinel from returned text. |
+| `stop` | Supported | Accepts a string or string array. Both streaming and non-streaming text end before the first matched stop, including matches across tokens or inside a token. Streaming holds possible stop prefixes and releases unmatched text when generation ends. Empty stop strings are ignored. |
 | `stream` | Supported | Emits OpenAI-shaped SSE chunks followed by `[DONE]`. |
 | `stream_options.include_usage` | Supported with `stream=true` | Emits a final usage chunk with `choices: []`; `stream_options` without streaming is rejected. |
 | `chat_template_kwargs.enable_thinking` | Supported when the model template reads it | Boolean vLLM-compatible chat-template variable. Ferrum forwards it to the model-provided template. `ferrum serve --enable-thinking` or `--disable-thinking` sets the default for omitted requests; the request value wins. Templates that do not use `enable_thinking` are unaffected; non-boolean values return HTTP 400. |
@@ -128,6 +128,8 @@ partial JSON is not emitted to the client. If a grammar cannot be compiled, the
 request fails before admission. If generation reaches a token or context limit
 without a complete valid value, non-streaming requests fail and streaming
 requests emit an OpenAI-shaped SSE error followed by one `[DONE]`.
+A user stop that cuts inside the constrained JSON value is also a generation
+error; a stop after the complete value can terminate normally.
 
 Schema support follows the embedded grammar compiler rather than Ferrum's old
 schema-to-regex subset. Constructs such as `oneOf` are passed to that compiler;

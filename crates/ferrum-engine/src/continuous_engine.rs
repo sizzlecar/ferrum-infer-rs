@@ -347,9 +347,10 @@ fn resolve_stop_conditions(
 
     if let Some(tok) = tokenizer {
         for stop_seq in &params.stop_sequences {
-            if !stop_seq.is_empty() {
-                text_seqs.push(stop_seq.clone());
+            if stop_seq.is_empty() {
+                continue;
             }
+            text_seqs.push(stop_seq.clone());
             match tok.encode(stop_seq, false) {
                 Ok(toks) if toks.len() == 1 => {
                     ids.insert(toks[0].get());

@@ -10,6 +10,111 @@ impl SequencePhysicalResources {
 }
 
 impl SequenceState {
+    /// Return the first matched stop, or hold the longest suffix that could
+    /// still become a stop. Character boundaries keep Unicode stops safe.
+    fn visible_text_end(&self, text: &str, terminal: bool) -> usize {
+        if let Some(end) = self
+            .stop_text_seqs
+            .iter()
+            .filter(|stop| !stop.is_empty())
+            .filter_map(|stop| text.find(stop.as_str()))
+            .min()
+        {
+            return end;
+        }
+        if terminal {
+            return text.len();
+        }
+        let held = self
+            .stop_text_seqs
+            .iter()
+            .flat_map(|stop| {
+                stop.char_indices()
+                    .skip(1)
+                    .map(move |(len, _)| &stop[..len])
+            })
+            .filter(|prefix| text.ends_with(prefix))
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        text.len() - held
+    }
+
+    fn decoded_output_text(
+        &self,
+        tokenizer: &(dyn Tokenizer + Send + Sync),
+        terminal: Option<FinishReason>,
+    ) -> Result<String> {
+        let mut text = tokenizer.decode(&self.generated_tokens, true)?;
+        let end = self.visible_text_end(&text, terminal.is_some());
+        if end < text.len() {
+            text.truncate(end);
+        } else if let (Some(reason), Some(&last)) = (terminal, self.generated_tokens.last()) {
+            // A tokenizer may retain a model terminal even with skip_special.
+            // Keep Harmony's typed terminators, but hide ordinary EOS/stop IDs.
+            if self.stop_token_ids.contains(&last.get())
+                && !self.should_stream_generated_token(Some(tokenizer), last, Some(reason))
+            {
+                text = tokenizer.decode(
+                    &self.generated_tokens[..self.generated_tokens.len() - 1],
+                    true,
+                )?;
+            }
+        }
+        Ok(text)
+    }
+
+    fn validate_structured_stop_boundary(
+        &self,
+        tokenizer: &(dyn Tokenizer + Send + Sync),
+    ) -> Result<()> {
+        let Some(processor) = self.structured_output_processor.as_ref() else {
+            return Ok(());
+        };
+        if self.stop_text_seqs.is_empty() {
+            return Ok(());
+        }
+        let full = tokenizer.decode(&self.generated_tokens, true)?;
+        let stop_end = self.visible_text_end(&full, true);
+        if stop_end == full.len() {
+            return Ok(());
+        }
+        // The grammar already validated the generated value. A text stop must
+        // not cut *inside* that value, even if the shorter prefix also parses
+        // (for example, cutting the final digit from a schema-constrained 123).
+        // Use its typed activation boundary, so stops in reasoning are caught
+        // without guessing a model-specific reasoning delimiter.
+        let progress =
+            processor.progress_with_terminals(&self.generated_tokens, &self.stop_token_ids)?;
+        let start = self.generated_tokens.len() - progress.grammar_token_count;
+        let prefix_len = tokenizer
+            .decode(&self.generated_tokens[..start], true)?
+            .len();
+        // The grammar accepts engine-owned terminal IDs as framing after the
+        // value. Some tokenizers still render them with skip_special enabled.
+        let end = self.generated_tokens.len()
+            - usize::from(
+                self.generated_tokens
+                    .last()
+                    .is_some_and(|token| self.stop_token_ids.contains(&token.get())),
+            );
+        let grammar_text = tokenizer.decode(&self.generated_tokens[start..end], true)?;
+        let mut values =
+            serde_json::Deserializer::from_str(&grammar_text).into_iter::<serde_json::Value>();
+        values
+            .next()
+            .ok_or_else(|| FerrumError::model("structured output has no JSON value"))?
+            .map_err(|_| {
+                FerrumError::model("structured output did not contain a complete JSON value")
+            })?;
+        if stop_end < prefix_len + values.byte_offset() {
+            return Err(FerrumError::model(
+                "stop sequence truncated the structured output before its complete JSON value",
+            ));
+        }
+        Ok(())
+    }
+
     pub(in crate::continuous_engine) fn client_receiver_closed(&self) -> bool {
         self.response_sender
             .as_ref()
@@ -147,6 +252,15 @@ impl EngineInner {
     }
 
     pub(super) async fn send_stream_update(&self, request_id: &RequestId, token: TokenId) {
+        self.send_stream_text(request_id, Some(token), None).await;
+    }
+
+    async fn send_stream_text(
+        &self,
+        request_id: &RequestId,
+        token: Option<TokenId>,
+        terminal: Option<FinishReason>,
+    ) {
         // Decode the full generated-token history (skip_special=true matches
         // the final-response decode in `complete_request`) and emit only
         // the delta that hasn't been streamed yet. Per-token decode is
@@ -160,27 +274,45 @@ impl EngineInner {
         // decode current full history, (c) if the decoded text ends in
         // `\u{FFFD}` defer the emit (a later token will complete the
         // multi-byte sequence), (d) otherwise carve off the substring
-        // past `streamed_text_len` and bump the watermark. Buffering is
-        // bounded — the longest multi-byte sequence is 4 bytes, so at
-        // most one or two tokens get deferred before flushing.
+        // past `streamed_text_len` and bump the watermark. Possible stop
+        // prefixes are held until they match, diverge, or generation ends.
         let (sender, delta, ttft_s, itl_s, first_emit_prof) = {
             let mut sequences = self.sequences.write();
             let Some(seq) = sequences.get_mut(request_id) else {
                 return;
             };
             let sender = seq.stream_sender.clone();
-            let full = self
-                .tokenizer
-                .decode(&seq.generated_tokens, true)
-                .unwrap_or_else(|_| format!("token_{}", token.get()));
-            if full.ends_with('\u{FFFD}') {
+            let Ok(mut full) = self.tokenizer.decode(&seq.generated_tokens, true) else {
+                return;
+            };
+            let incomplete_utf8 = full.ends_with('\u{FFFD}');
+            if incomplete_utf8 && terminal.is_none() {
                 // Partial multi-byte UTF-8 at the tail; wait for the next
                 // token. Do NOT advance streamed_text_len so the bytes get
                 // re-considered once the sequence completes.
                 return;
             }
-            let delta = full[seq.streamed_text_len..].to_string();
-            seq.streamed_text_len = full.len();
+            if !incomplete_utf8 {
+                seq.decoded_text_len = full.len();
+            }
+            let visible = if terminal.is_some() {
+                let Ok(text) = seq.decoded_output_text(self.tokenizer.as_ref(), terminal) else {
+                    return;
+                };
+                text
+            } else {
+                let end = seq.visible_text_end(&full, false);
+                full.truncate(end);
+                full
+            };
+            if visible.ends_with('\u{FFFD}') {
+                return;
+            }
+            let Some(delta) = visible.get(seq.streamed_text_len..) else {
+                return;
+            };
+            let delta = delta.to_string();
+            seq.streamed_text_len = visible.len();
 
             // Latency-metric tracking (PLAYBOOK § 7 definitions).
             // We capture timestamps in the critical section so the
@@ -253,7 +385,7 @@ impl EngineInner {
             let chunk = StreamChunk {
                 request_id: request_id.clone(),
                 text: delta,
-                token: Some(token),
+                token,
                 finish_reason: None,
                 usage: None,
                 created_at: chrono::Utc::now(),
@@ -468,6 +600,22 @@ impl EngineInner {
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
     ) -> Result<()> {
+        if explicit_terminal_error.is_none() {
+            explicit_terminal_error = self.sequences.read().get(request_id).and_then(|seq| {
+                seq.structured_output_terminal_error(finish_reason)
+                    .or_else(|| {
+                        seq.validate_structured_stop_boundary(self.tokenizer.as_ref())
+                            .err()
+                    })
+            });
+        }
+        if explicit_terminal_error.is_none() && finish_reason != FinishReason::Error {
+            // Flush held, unmatched prefixes and legal text before an in-token
+            // stop as a separate text chunk. Consumers may defer a text delta;
+            // they must still receive the independent terminal/usage event.
+            self.send_stream_text(request_id, None, Some(finish_reason))
+                .await;
+        }
         let (
             response,
             stream_sender,
@@ -478,18 +626,15 @@ impl EngineInner {
         ) = {
             let mut sequences = self.sequences.write();
             if let Some(mut seq) = sequences.remove(request_id) {
-                let terminal_error = explicit_terminal_error
-                    .take()
-                    .or_else(|| seq.structured_output_terminal_error(finish_reason));
+                let terminal_error = explicit_terminal_error.take();
                 let finish_reason = if terminal_error.is_some() {
                     FinishReason::Error
                 } else {
                     finish_reason
                 };
                 let terminal_token_trace = self.capture_sequence_terminal_token_trace(&seq);
-                let text = self
-                    .tokenizer
-                    .decode(&seq.generated_tokens, true)
+                let text = seq
+                    .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
                     .unwrap_or_default();
                 let api_response = ferrum_types::api_response_from_generated_text(
                     &seq.original_request,

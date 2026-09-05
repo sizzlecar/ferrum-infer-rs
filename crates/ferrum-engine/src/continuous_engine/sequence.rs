@@ -307,8 +307,8 @@ pub struct SequenceState {
     /// they are explicitly whitelisted in `allowed_extended_token_ids`.
     pub tokenizer_base_vocab_size: Option<usize>,
     pub allowed_extended_token_ids: HashSet<u32>,
-    /// Multi-token text stop sequences (`stop_sequences` entries that don't
-    /// resolve to a single token). Checked via accumulated decoded text.
+    /// User stop strings, including single-token encodings. Checked against
+    /// accumulated decoded text to preserve stop boundaries inside tokens.
     pub stop_text_seqs: Vec<String>,
     /// Base token-validity mask for model-side greedy argmax.
     pub argmax_token_mask: Option<TokenSelectionMask>,
@@ -329,6 +329,9 @@ pub struct SequenceState {
     /// emoji) that span several BPE tokens don't get rendered as
     /// `\u{FFFD}` replacement chars when decoded one token at a time.
     pub streamed_text_len: usize,
+    /// Stable decoded bytes examined by the output-quality filter. This can
+    /// exceed `streamed_text_len` while a possible stop-string prefix is held.
+    pub decoded_text_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -845,6 +848,7 @@ impl SequenceState {
             pending_decoded_utf8_fragment: false,
             pending_decoded_utf8_bytes: Vec::new(),
             streamed_text_len: 0,
+            decoded_text_len: 0,
         })
     }
 
@@ -1451,7 +1455,7 @@ impl SequenceState {
         }
         if self.sample_candidate_decodes_to_forbidden_output(
             tokenizer,
-            self.streamed_text_len,
+            self.decoded_text_len,
             token,
             None,
         ) {
@@ -1496,9 +1500,9 @@ impl SequenceState {
                     tokenizer
                         .decode(&self.generated_tokens, true)
                         .map(|text| {
-                            self.streamed_text_len <= text.len()
-                                && text.is_char_boundary(self.streamed_text_len)
-                                && text[self.streamed_text_len..].contains('\u{FFFD}')
+                            self.decoded_text_len <= text.len()
+                                && text.is_char_boundary(self.decoded_text_len)
+                                && text[self.decoded_text_len..].contains('\u{FFFD}')
                                 && text.ends_with('\u{FFFD}')
                         })
                         .unwrap_or(true)
@@ -1599,9 +1603,9 @@ impl SequenceState {
     ///
     /// Checks: (1) last generated token is in the resolved `stop_token_ids`
     /// set (model EOS + any single-token `stop_sequences`), (2) decoded text
-    /// contains a multi-token user stop sequence, (3) max-tokens budget is
+    /// contains a user stop sequence, (3) max-tokens budget is
     /// exhausted. Text-stop decoding only runs for requests that supplied a
-    /// multi-token stop string, so the common EOS path stays cheap.
+    /// stop string, so the common EOS path stays cheap.
     pub fn stop_reason(
         &self,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
@@ -1748,7 +1752,7 @@ impl SequenceState {
 
         let step = self.generated_tokens.len();
         let vocab_size = logits.len();
-        let previous_streamed_text_len = self.streamed_text_len;
+        let previous_streamed_text_len = self.decoded_text_len;
         let token = {
             let previous_tokens = self
                 .sampling_history
