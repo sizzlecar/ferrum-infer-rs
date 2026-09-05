@@ -101,10 +101,16 @@ pub fn has_unclosed_thinking_block(prompt: &str) -> bool {
 /// Parse generated text when the rendered prompt already opened `<think>`.
 /// Some reasoning templates emit only the closing tag in generated text.
 pub fn parse_reasoning_response_started_in_think(text: &str) -> ParsedReasoningResponse {
-    if text.contains(THINK_START_TAG) {
+    let end = text.find(THINK_END_TAG);
+    // A generated opener before the closer can repeat the template's opener.
+    // Once the prompt-opened block closes, further tags belong to the content.
+    if text
+        .find(THINK_START_TAG)
+        .is_some_and(|start| end.is_none_or(|end| start < end))
+    {
         return parse_reasoning_response(text);
     }
-    let Some(end) = text.find(THINK_END_TAG) else {
+    let Some(end) = end else {
         return ParsedReasoningResponse {
             content: String::new(),
             reasoning: (!text.is_empty()).then(|| text.to_string()),
@@ -185,6 +191,62 @@ mod tests {
         let parsed = parse_reasoning_response_started_in_think("reason</think>\nanswer");
         assert_eq!(parsed.reasoning.as_deref(), Some("reason"));
         assert_eq!(parsed.content, "answer");
+    }
+
+    #[test]
+    fn prompt_opened_thinking_preserves_literal_tags_in_final_content() {
+        for content in [
+            r#"{"text":"<think>literal</think>"}"#,
+            r#"{"text":"an unpaired <think> marker"}"#,
+            "The tags `<think>` and `</think>` are ordinary text here.",
+        ] {
+            let raw = format!("reason</think>\r\n{content}");
+            let parsed = parse_model_reasoning_response(ModelOutputProtocol::Text, &raw, true)
+                .expect("declared text reasoning protocol");
+            assert_eq!(parsed.reasoning.as_deref(), Some("reason"), "{content}");
+            assert_eq!(parsed.content, content);
+        }
+    }
+
+    #[test]
+    fn empty_prompt_opened_thinking_preserves_final_literal_tags() {
+        let parsed = parse_reasoning_response_started_in_think(
+            "</think>\n{\"text\":\"<think>literal</think>\"}",
+        );
+        assert_eq!(parsed.reasoning, None);
+        assert_eq!(parsed.content, r#"{"text":"<think>literal</think>"}"#);
+    }
+
+    #[test]
+    fn prompt_opened_thinking_keeps_closed_boundary_across_stream_prefixes() {
+        let content = r#"{"text":"答案 🦀 <think>literal</think>"}"#;
+        for end in content
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(content.len()))
+        {
+            let prefix = &content[..end];
+            let raw = format!("推理</think>\n{prefix}");
+            let parsed = parse_model_reasoning_response(ModelOutputProtocol::Text, &raw, true)
+                .expect("declared text reasoning protocol");
+            assert_eq!(parsed.reasoning.as_deref(), Some("推理"), "{prefix}");
+            assert_eq!(parsed.content, prefix);
+        }
+    }
+
+    #[test]
+    fn prompt_opened_thinking_accepts_repeated_opening_and_unfinished_reasoning() {
+        let parsed = parse_reasoning_response_started_in_think(
+            "<think>reason</think>\nThe literal <think> tag remains content.",
+        );
+        assert_eq!(parsed.reasoning.as_deref(), Some("reason"));
+        assert_eq!(parsed.content, "The literal <think> tag remains content.");
+
+        for raw in ["reason", "<think>reason"] {
+            let parsed = parse_reasoning_response_started_in_think(raw);
+            assert_eq!(parsed.reasoning.as_deref(), Some("reason"));
+            assert!(parsed.content.is_empty());
+        }
     }
 
     #[test]

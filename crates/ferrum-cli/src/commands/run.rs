@@ -3724,6 +3724,42 @@ mod tests {
     }
 
     #[test]
+    fn text_run_jsonl_preserves_literal_think_tags_after_open_reasoning() {
+        let raw = "reason</think>\n{\"text\":\"<think>literal</think>\"}";
+        let parsed = parse_run_model_output(
+            ModelOutputProtocol::Text,
+            raw,
+            true,
+            Some(FinishReason::EOS),
+        )
+        .unwrap();
+        let record = jsonl_assistant_record(
+            "session-1",
+            0,
+            "request-1",
+            0,
+            &parsed.content,
+            parsed.reasoning.as_deref(),
+            &[],
+            Some(FinishReason::EOS),
+            None,
+            1,
+            1,
+            raw,
+            0.0,
+        );
+
+        assert_eq!(record["content"], r#"{"text":"<think>literal</think>"}"#);
+        assert_eq!(record["reasoning"], "reason");
+        assert_eq!(record["raw_text_sha256"], sha256_text(raw));
+
+        // Text history remains raw; these parsed fields belong to JSONL output.
+        let history = RunHistoryMessage::assistant(raw, ModelOutputProtocol::Text, &parsed);
+        assert_eq!(history.prompt.content, raw);
+        assert!(history.prompt.reasoning_content.is_none());
+    }
+
+    #[test]
     fn history_evidence_changes_when_reasoning_history_changes() {
         let first = vec![RunHistoryMessage::new("assistant", "answer")];
         let second = vec![RunHistoryMessage::new(
