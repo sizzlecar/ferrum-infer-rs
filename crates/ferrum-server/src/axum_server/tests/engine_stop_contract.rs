@@ -20,6 +20,7 @@ use tokenizers::{
 };
 
 mod executor;
+mod structured;
 use executor::ScriptedExecutor;
 
 const STOP: &str = "STOP";
@@ -32,6 +33,8 @@ struct Observation {
     body: String,
     prompt_tokens: usize,
     generated_tokens: usize,
+    decoded_inputs: Vec<String>,
+    executor: Arc<ScriptedExecutor>,
 }
 
 fn template(protocol: ModelOutputProtocol) -> ModelChatTemplate {
@@ -107,11 +110,40 @@ async fn request(
     pieces.extend_from_slice(body_pieces);
     pieces.push(terminal);
     let tokenizer = Arc::new(tokenizer(&pieces).await);
-    let script = pieces
+    let script: Vec<_> = pieces
         .iter()
         .map(|piece| tokenizer.token_id(piece).unwrap())
         .collect();
-    let executor = Arc::new(ScriptedExecutor::new(tokenizer.vocab_size(), script));
+    let executor = Arc::new(ScriptedExecutor::new(
+        tokenizer.vocab_size(),
+        script.clone(),
+    ));
+    let response = request_with_executor(
+        protocol,
+        tokenizer,
+        executor,
+        pieces.len() + 4,
+        stop,
+        stream,
+        None,
+    )
+    .await;
+    response.executor.assert_completed();
+    let actual = response.executor.decoded_inputs();
+    assert!(actual.len() <= script.len());
+    assert_eq!(actual, script[..actual.len()]);
+    response
+}
+
+async fn request_with_executor(
+    protocol: ModelOutputProtocol,
+    tokenizer: Arc<HuggingFaceTokenizer>,
+    executor: Arc<ScriptedExecutor>,
+    max_tokens: usize,
+    stop: Option<&str>,
+    stream: bool,
+    response_format: Option<Value>,
+) -> Observation {
     let mut config = EngineConfig::default();
     config.model.model_id = ModelId::new("protocol-contract");
     config.scheduler.max_running_requests = 1;
@@ -120,7 +152,7 @@ async fn request(
         ContinuousBatchEngine::new_plan_runtime(
             config.clone(),
             Arc::new(ContinuousBatchScheduler::new(config.scheduler)),
-            tokenizer,
+            tokenizer.clone(),
             Arc::new(GreedySampler),
             executor.clone(),
             Arc::new(MockTensorFactory),
@@ -134,9 +166,12 @@ async fn request(
         "model": "protocol-contract",
         "messages": [{"role": "user", "content": "Continue."}],
         "temperature": 0,
-        "max_tokens": pieces.len() + 4,
+        "max_tokens": max_tokens,
         "stream": stream,
     });
+    if let Some(format) = response_format {
+        wire["response_format"] = format;
+    }
     if let Some(stop) = stop {
         wire["stop"] = json!([stop]);
     }
@@ -157,13 +192,20 @@ async fn request(
         Ok(response) => response.expect("production engine HTTP response must terminate"),
         Err(panic) => resume_unwind(panic),
     };
-    // An HTTP parser error still follows a normally completed engine sequence.
-    executor.assert_completed();
+    // Return failures as HTTP observations too, so negative controls fail on
+    // the protocol result rather than a preselected-token assertion.
+    let decoded_inputs = executor
+        .decoded_inputs()
+        .iter()
+        .map(|token| tokenizer.decode(&[*token], false).unwrap())
+        .collect();
     Observation {
         status,
         body,
         prompt_tokens: executor.prompt_tokens.load(Ordering::Relaxed),
         generated_tokens: executor.generated_tokens.load(Ordering::Relaxed),
+        decoded_inputs,
+        executor,
     }
 }
 
@@ -222,6 +264,7 @@ fn sse_oracle_rejects_incomplete_or_post_done_data() {
 
 fn assert_success(response: &Observation, stream: bool, expected: &str, expected_generated: usize) {
     assert_eq!(response.status, AxumStatusCode::OK, "{}", response.body);
+    response.executor.assert_completed();
     // The HTTP sync adapter also strips stop text. Consumption/usage, not
     // merely final text, proves that the stop reached and halted the engine.
     assert_eq!(
