@@ -42,6 +42,7 @@ pub(super) struct ScriptedExecutor {
     metadata: MockModelExecutor,
     script: Vec<LogitStep>,
     decoded_inputs: Mutex<Vec<TokenId>>,
+    prefill_tokens: Mutex<Vec<TokenId>>,
     admitted: Mutex<HashSet<RequestId>>,
     active: Mutex<HashMap<String, Cursor>>,
     pub prompt_tokens: AtomicUsize,
@@ -64,6 +65,7 @@ impl ScriptedExecutor {
             metadata: MockModelExecutor::instant(vocab_size),
             script: steps,
             decoded_inputs: Mutex::new(Vec::new()),
+            prefill_tokens: Mutex::new(Vec::new()),
             admitted: Mutex::new(HashSet::new()),
             active: Mutex::new(HashMap::new()),
             prompt_tokens: AtomicUsize::new(0),
@@ -87,6 +89,10 @@ impl ScriptedExecutor {
 
     pub fn decoded_inputs(&self) -> Vec<TokenId> {
         self.decoded_inputs.lock().unwrap().clone()
+    }
+
+    pub fn prefill_tokens(&self) -> Vec<TokenId> {
+        self.prefill_tokens.lock().unwrap().clone()
     }
 
     pub fn assert_released(&self) {
@@ -188,6 +194,7 @@ impl ModelExecutor for ScriptedExecutor {
             input.chunk.end(),
         ));
         let output = if input.chunk.is_final() {
+            *self.prefill_tokens.lock().unwrap() = input.input_tokens.to_vec();
             self.prompt_tokens
                 .store(input.input_tokens.len(), Ordering::Relaxed);
             assert!(self.admitted.lock().unwrap().remove(&input.request_id));

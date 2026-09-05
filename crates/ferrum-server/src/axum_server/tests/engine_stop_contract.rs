@@ -21,16 +21,19 @@ use tokenizers::{
 
 mod executor;
 mod structured;
+mod tools;
 use executor::ScriptedExecutor;
 
 const STOP: &str = "STOP";
 const ORDINARY_EOS: &str = "<|endoftext|>";
 const RETURN: &str = "<|return|>";
+const CALL: &str = "<|call|>";
 const FINAL_HEADER: [&str; 3] = ["<|channel|>", "final", "<|message|>"];
 
 struct Observation {
     status: AxumStatusCode,
     body: String,
+    prompt: String,
     prompt_tokens: usize,
     generated_tokens: usize,
     decoded_inputs: Vec<String>,
@@ -86,6 +89,7 @@ async fn tokenizer(pieces: &[&str]) -> HuggingFaceTokenizer {
     let generation = json!({"eos_token_id": [
         inner.token_to_id(ORDINARY_EOS).unwrap(),
         inner.token_to_id(RETURN).unwrap(),
+        inner.token_to_id(CALL).unwrap(),
     ]});
     HuggingFaceTokenizer::from_source_bytes(
         inner.to_string(false).unwrap().as_bytes(),
@@ -144,6 +148,31 @@ async fn request_with_executor(
     stream: bool,
     response_format: Option<Value>,
 ) -> Observation {
+    let mut wire = json!({
+        "model": "protocol-contract",
+        "messages": [{"role": "user", "content": "Continue."}],
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": stream,
+    });
+    if let Some(format) = response_format {
+        wire["response_format"] = format;
+    }
+    if let Some(stop) = stop {
+        wire["stop"] = json!([stop]);
+    }
+    if stream {
+        wire["stream_options"] = json!({"include_usage": true});
+    }
+    request_with_wire(protocol, tokenizer, executor, wire).await
+}
+
+async fn request_with_wire(
+    protocol: ModelOutputProtocol,
+    tokenizer: Arc<HuggingFaceTokenizer>,
+    executor: Arc<ScriptedExecutor>,
+    wire: Value,
+) -> Observation {
     let mut config = EngineConfig::default();
     config.model.model_id = ModelId::new("protocol-contract");
     config.scheduler.max_running_requests = 1;
@@ -162,22 +191,6 @@ async fn request_with_executor(
     let router = AxumServer::from_llm(engine.clone())
         .with_prompt_template(Some(template(protocol)))
         .build_router();
-    let mut wire = json!({
-        "model": "protocol-contract",
-        "messages": [{"role": "user", "content": "Continue."}],
-        "temperature": 0,
-        "max_tokens": max_tokens,
-        "stream": stream,
-    });
-    if let Some(format) = response_format {
-        wire["response_format"] = format;
-    }
-    if let Some(stop) = stop {
-        wire["stop"] = json!([stop]);
-    }
-    if stream {
-        wire["stream_options"] = json!({"include_usage": true});
-    }
     // Preserve timeout/panic outcomes until the production engine is shut down.
     let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(5), async {
         let response = post_json(router, "/v1/chat/completions", wire).await;
@@ -202,6 +215,7 @@ async fn request_with_executor(
     Observation {
         status,
         body,
+        prompt: tokenizer.decode(&executor.prefill_tokens(), false).unwrap(),
         prompt_tokens: executor.prompt_tokens.load(Ordering::Relaxed),
         generated_tokens: executor.generated_tokens.load(Ordering::Relaxed),
         decoded_inputs,
