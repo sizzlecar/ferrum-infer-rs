@@ -25,6 +25,8 @@ pub enum ModelOutputProtocol {
     Text,
     /// OpenAI Harmony output used by GPT-OSS checkpoints.
     HarmonyGptOss,
+    /// Gemma's native thought channel, including its ordinary-text header.
+    GemmaThought,
 }
 
 impl ModelOutputProtocol {
@@ -34,6 +36,7 @@ impl ModelOutputProtocol {
     pub const fn generated_control_token_texts(self) -> &'static [&'static str] {
         match self {
             Self::Text => &[],
+            Self::GemmaThought => &["<|channel>", "<channel|>"],
             Self::HarmonyGptOss => &[
                 "<|channel|>",
                 "<|message|>",
@@ -49,6 +52,7 @@ impl ModelOutputProtocol {
     pub const fn preserved_special_token_texts(self) -> &'static [&'static str] {
         match self {
             Self::Text => &[],
+            Self::GemmaThought => &["<|channel>", "<channel|>"],
             Self::HarmonyGptOss => &[
                 "<|channel|>",
                 "<|message|>",
@@ -124,6 +128,14 @@ pub enum StructuredOutputStart {
     /// Allow reasoning tokens until this exact tokenizer sequence is emitted,
     /// then constrain every subsequent token.
     AfterDelimiter(String),
+    /// Emit an exact native reasoning header and closing delimiter before
+    /// constraining the payload. Disabling reasoning still emits the complete
+    /// empty envelope required by the model's template.
+    AfterReasoningEnvelope {
+        opening: String,
+        closing: String,
+        allow_reasoning: bool,
+    },
     /// Preserve the Harmony assistant framing and optional analysis message,
     /// then constrain the final payload and its normal `<|return|>` boundary.
     HarmonyFinal,
@@ -283,6 +295,16 @@ impl SamplingParams {
             return Err(FerrumError::invalid_request(
                 "Harmony final structured output requires the Harmony model output protocol",
             ));
+        }
+        if let StructuredOutputStart::AfterReasoningEnvelope {
+            opening, closing, ..
+        } = &self.structured_output_start
+        {
+            if opening.is_empty() || closing.is_empty() {
+                return Err(FerrumError::invalid_request(
+                    "structured-output reasoning envelope boundaries must not be empty",
+                ));
+            }
         }
         if let ResponseCompletionBoundary::AfterDelimiterAndPayload {
             delimiter,

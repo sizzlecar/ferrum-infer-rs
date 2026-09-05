@@ -1426,6 +1426,7 @@ struct PolicyTokenizer {
     special: ferrum_types::SpecialTokens,
     ids: HashMap<String, TokenId>,
     texts: Vec<Option<String>>,
+    encoded_sequences: HashMap<String, Vec<TokenId>>,
 }
 
 impl PolicyTokenizer {
@@ -1451,12 +1452,16 @@ impl PolicyTokenizer {
             },
             ids,
             texts,
+            encoded_sequences: HashMap::new(),
         }
     }
 }
 
 impl Tokenizer for PolicyTokenizer {
     fn encode(&self, text: &str, _add_special: bool) -> Result<Vec<TokenId>> {
+        if let Some(tokens) = self.encoded_sequences.get(text) {
+            return Ok(tokens.clone());
+        }
         if let Some(id) = self.ids.get(text) {
             return Ok(vec![*id]);
         }
@@ -12558,6 +12563,183 @@ fn harmony_protocol_allows_only_its_typed_generation_controls() {
         .unwrap();
     assert_eq!(token.get(), 7);
     assert_eq!(logits[9], f32::NEG_INFINITY);
+}
+
+fn gemma_thought_policy_tokenizer() -> Arc<dyn Tokenizer + Send + Sync> {
+    let mut tokenizer = PolicyTokenizer::new(
+        9,
+        &[
+            ("{", 0),
+            ("}", 1),
+            ("<|channel>", 2),
+            ("<turn|>", 3),
+            ("<channel|>", 4),
+            ("thought", 5),
+            ("\n", 6),
+            ("x", 7),
+            ("\"", 8),
+            // The unrelated control exercises extended-vocabulary rejection;
+            // the native channel controls remain below the base vocabulary.
+            ("<|fim_prefix|>", 9),
+        ],
+    );
+    tokenizer.special.bos_token = None;
+    tokenizer.special.unk_token = None;
+    tokenizer.special.pad_token = None;
+    tokenizer.encoded_sequences.insert(
+        "<|channel>thought\n".to_string(),
+        [2, 5, 6].into_iter().map(TokenId::new).collect(),
+    );
+    Arc::new(tokenizer)
+}
+
+#[test]
+fn gemma_thought_sampling_allows_native_controls_below_base_vocab() {
+    let tokenizer = gemma_thought_policy_tokenizer();
+    let mut request = policy_request();
+    request.sampling_params.model_output_protocol = ferrum_types::ModelOutputProtocol::GemmaThought;
+    let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+        request,
+        vec![TokenId::new(7)],
+        Some(Arc::clone(&tokenizer)),
+        Some(10),
+    );
+    for native_control in [2, 4] {
+        assert!((native_control as usize) < tokenizer.vocab_size());
+        assert!(state.allowed_extended_token_ids.contains(&native_control));
+    }
+    assert!(!state.allowed_extended_token_ids.contains(&9));
+
+    for expected in [2, 5, 6, 4, 7, 3] {
+        let mut logits = vec![f32::NEG_INFINITY; 10];
+        logits[expected] = 1.0;
+        logits[9] = 100.0;
+        let token = state
+            .sample_and_commit_with_processors_and_tokenizer(&mut logits, Some(tokenizer.as_ref()))
+            .unwrap();
+        assert_eq!(token, TokenId::new(expected as u32));
+        assert_eq!(logits[9], f32::NEG_INFINITY);
+        let stop = state.stop_reason(Some(tokenizer.as_ref()));
+        if expected == 3 {
+            assert_eq!(stop, Some(FinishReason::Stop));
+            assert!(!state.should_stream_generated_token(Some(tokenizer.as_ref()), token, stop));
+        } else {
+            assert_eq!(stop, None);
+            assert!(state.should_stream_generated_token(Some(tokenizer.as_ref()), token, stop));
+        }
+    }
+}
+
+#[test]
+fn gemma_thought_structured_sampling_preserves_header_controls_and_turn_eos() {
+    // Both markers are below base_vocab_size, as in Gemma's real tokenizer.
+    // Exercise the SequenceState processor chain shared by run and serve:
+    // protocol controls must be selectable before JSON and masked within it.
+    let tokenizer = gemma_thought_policy_tokenizer();
+    for allow_reasoning in [true, false] {
+        let mut request = policy_request();
+        request.sampling_params.max_tokens = 64;
+        request.sampling_params.repetition_penalty = 2.0;
+        request.sampling_params.presence_penalty = 1.5;
+        request.sampling_params.model_output_protocol =
+            ferrum_types::ModelOutputProtocol::GemmaThought;
+        request.sampling_params.structured_output_start =
+            ferrum_types::StructuredOutputStart::AfterReasoningEnvelope {
+                opening: "<|channel>thought\n".to_string(),
+                closing: "<channel|>".to_string(),
+                allow_reasoning,
+            };
+        request.sampling_params.response_format = ferrum_types::ResponseFormat::JsonSchema(
+            r#"{"type":"object","maxProperties":0}"#.to_string(),
+        );
+        let mut state = SequenceState::new_with_tokenizer_and_model_vocab_size(
+            request,
+            vec![TokenId::new(7)],
+            Some(Arc::clone(&tokenizer)),
+            Some(10),
+        );
+        assert!(matches!(
+            state.model_decode_logits_policy(),
+            LogitsReturnPolicy::FullLogits
+        ));
+
+        let sample = |state: &mut SequenceState, expected: usize, forced: bool, grammar: bool| {
+            let mut logits = vec![f32::NEG_INFINITY; 10];
+            logits[if forced { 7 } else { expected }] = 1.0;
+            logits[9] = 400.0;
+            logits[3] = 300.0;
+            if grammar {
+                logits[2] = 200.0;
+                logits[4] = 200.0;
+            }
+            let token = state
+                .sample_and_commit_with_processors_and_tokenizer(
+                    &mut logits,
+                    Some(tokenizer.as_ref()),
+                )
+                .unwrap();
+            assert_eq!(token, TokenId::new(expected as u32));
+            assert_eq!(logits[9], f32::NEG_INFINITY);
+            if expected != 3 {
+                assert_eq!(logits[3], f32::NEG_INFINITY);
+            }
+            if grammar {
+                assert_eq!(logits[2], f32::NEG_INFINITY);
+                assert_eq!(logits[4], f32::NEG_INFINITY);
+            }
+            logits
+        };
+
+        // The ordinary thought/newline tokens are part of the required header,
+        // even when the model assigns them negative-infinity logits.
+        for token in [2, 5, 6] {
+            sample(&mut state, token, true, false);
+            assert_eq!(state.stop_reason(Some(tokenizer.as_ref())), None);
+        }
+        if allow_reasoning {
+            sample(&mut state, 0, false, false);
+        }
+        sample(&mut state, 4, !allow_reasoning, false);
+        assert!(state.sampling_history.token_frequencies().is_empty());
+        assert!(state
+            .structured_output_terminal_error(FinishReason::Length)
+            .is_some());
+
+        let grammar_start = state.generated_tokens.len();
+        let logits = sample(&mut state, 0, false, true);
+        assert_eq!(
+            logits[0], 1.0,
+            "reasoning must not penalize the visible JSON opener"
+        );
+        assert_eq!(
+            state.sampling_history.scope(),
+            SequenceSamplingHistoryScope::VisibleStructuredOutput {
+                start_token_index: grammar_start
+            }
+        );
+        state.reset_guided_processors().unwrap();
+        sample(&mut state, 1, false, true);
+        assert_eq!(
+            tokenizer
+                .decode(&state.generated_tokens[grammar_start..], true)
+                .unwrap(),
+            "{}"
+        );
+        assert!(state
+            .structured_output_terminal_error(FinishReason::Length)
+            .is_none());
+        sample(&mut state, 3, false, true);
+        let stop = state.stop_reason(Some(tokenizer.as_ref()));
+        assert_eq!(stop, Some(FinishReason::Stop));
+        assert!(!state.should_stream_generated_token(
+            Some(tokenizer.as_ref()),
+            TokenId::new(3),
+            stop
+        ));
+        assert!(state
+            .structured_output_terminal_error(FinishReason::Stop)
+            .is_none());
+    }
 }
 
 #[test]

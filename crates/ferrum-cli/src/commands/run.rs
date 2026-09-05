@@ -8,13 +8,13 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    has_unclosed_thinking_block, parse_harmony_response, parse_length_truncated_harmony_response,
-    parse_reasoning_response_for_prompt, FerrumConfigBuilder, FerrumError, FinishReason,
+    has_unclosed_model_reasoning_block, model_reasoning_markers, parse_harmony_response,
+    parse_length_truncated_harmony_response, parse_model_reasoning_response,
+    should_defer_model_reasoning_stream_delta, FerrumConfigBuilder, FerrumError, FinishReason,
     InferenceRequest, InferenceResponse, ModelCapabilities, ModelOutputProtocol,
     ParsedReasoningResponse, Priority, RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary,
     Result, RuntimeConfigEntry, RuntimeConfigSnapshot, RuntimeConfigSource, SamplingParams,
-    StreamChunk, TokenUsage, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_END_TAG,
-    THINK_START_TAG,
+    StreamChunk, TokenUsage, WorkloadProfile, DEFAULT_CHAT_REPETITION_PENALTY, THINK_START_TAG,
 };
 use futures::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -31,6 +31,8 @@ use uuid::Uuid;
 
 #[cfg(test)]
 use crate::source_resolver::tokenizer_sibling_repo;
+#[cfg(test)]
+use ferrum_types::{has_unclosed_thinking_block, THINK_END_TAG};
 
 const RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
 const RUN_JSONL_SCHEMA_VERSION: u32 = 2;
@@ -60,8 +62,8 @@ impl RunHistoryMessage {
             // Text templates own their policy for inline <think> history.
             ModelOutputProtocol::Text => {}
             // Reuse the validated result, including valid length truncation.
-            // A Harmony envelope is not an assistant message's content.
-            ModelOutputProtocol::HarmonyGptOss => {
+            // Native channel envelopes are not an assistant message's content.
+            ModelOutputProtocol::HarmonyGptOss | ModelOutputProtocol::GemmaThought => {
                 message.prompt.content = parsed.content.clone();
                 message.prompt.reasoning_content = parsed.reasoning.clone();
             }
@@ -273,11 +275,16 @@ fn history_evidence(history: &[RunHistoryMessage]) -> serde_json::Value {
 fn run_request_metadata(
     prompt: &str,
     chat_template_options: &ChatTemplateOptions,
+    protocol: ModelOutputProtocol,
 ) -> HashMap<String, serde_json::Value> {
     let mut metadata = HashMap::new();
-    if !has_unclosed_thinking_block(prompt) {
-        let mut forbidden = vec![serde_json::Value::String(THINK_END_TAG.to_string())];
-        if chat_template_options.enable_thinking == Some(false) {
+    if !has_unclosed_model_reasoning_block(protocol, prompt) {
+        let mut forbidden = model_reasoning_markers(protocol)
+            .map(|(_, closing)| vec![serde_json::Value::String(closing.to_string())])
+            .unwrap_or_default();
+        if protocol == ModelOutputProtocol::Text
+            && chat_template_options.enable_thinking == Some(false)
+        {
             forbidden.push(serde_json::Value::String(THINK_START_TAG.to_string()));
         }
         metadata.insert(
@@ -401,10 +408,9 @@ fn parse_run_model_output(
     finish_reason: Option<FinishReason>,
 ) -> Result<ParsedReasoningResponse> {
     match protocol {
-        ModelOutputProtocol::Text => Ok(parse_reasoning_response_for_prompt(
-            text,
-            prompt_opened_thinking,
-        )),
+        ModelOutputProtocol::Text | ModelOutputProtocol::GemmaThought => {
+            parse_model_reasoning_response(protocol, text, prompt_opened_thinking)
+        }
         ModelOutputProtocol::HarmonyGptOss => {
             let parsed = if finish_reason == Some(FinishReason::Length) {
                 parse_length_truncated_harmony_response(text)?
@@ -456,6 +462,62 @@ impl CollectedRunGeneration {
 
 type RunResponseStream = Pin<Box<dyn futures::Stream<Item = Result<StreamChunk>> + Send + 'static>>;
 
+struct RunStreamOutput {
+    protocol: ModelOutputProtocol,
+    prompt_opened_thinking: bool,
+    emitted_content: String,
+}
+
+impl RunStreamOutput {
+    fn new(protocol: ModelOutputProtocol, prompt_opened_thinking: bool) -> Self {
+        Self {
+            protocol,
+            prompt_opened_thinking,
+            emitted_content: String::new(),
+        }
+    }
+
+    fn delta(&mut self, raw_text: &str, raw_delta: &str) -> Result<Option<String>> {
+        match self.protocol {
+            ModelOutputProtocol::Text => Ok(Some(raw_delta.to_string())),
+            ModelOutputProtocol::HarmonyGptOss => Ok(None),
+            ModelOutputProtocol::GemmaThought => {
+                if should_defer_model_reasoning_stream_delta(self.protocol, raw_text) {
+                    return Ok(None);
+                }
+                self.parsed_content_delta(raw_text)
+            }
+        }
+    }
+
+    fn finish(&mut self, raw_text: &str) -> Result<Option<String>> {
+        match self.protocol {
+            // Ordinary text has already streamed; Harmony is validated and
+            // displayed as a complete message by the caller.
+            ModelOutputProtocol::Text | ModelOutputProtocol::HarmonyGptOss => Ok(None),
+            // A last chunk may contain visible text followed by an incomplete
+            // channel marker. Flush its safe visible prefix without the marker.
+            ModelOutputProtocol::GemmaThought => self.parsed_content_delta(raw_text),
+        }
+    }
+
+    fn parsed_content_delta(&mut self, raw_text: &str) -> Result<Option<String>> {
+        let parsed =
+            parse_model_reasoning_response(self.protocol, raw_text, self.prompt_opened_thinking)?;
+        let delta = parsed
+            .content
+            .strip_prefix(&self.emitted_content)
+            .ok_or_else(|| {
+                FerrumError::invalid_format(
+                    "model reasoning parsing changed previously emitted content",
+                )
+            })?
+            .to_string();
+        self.emitted_content = parsed.content;
+        Ok((!delta.is_empty()).then_some(delta))
+    }
+}
+
 async fn collect_run_stream(
     mut stream: RunResponseStream,
     trace_tokens: bool,
@@ -485,6 +547,9 @@ async fn collect_run_stream(
         let token_id = chunk.token.map(|token| token.get());
         if !chunk.text.is_empty() {
             raw_text.push_str(&chunk.text);
+            // JSONL raw_text_delta is an evidence field: concatenation must
+            // match raw_text_sha256, including native channel framing. The
+            // final assistant record exposes parsed content and reasoning.
             if !buffer_output {
                 emit_jsonl_assistant_delta(
                     session_id,
@@ -538,7 +603,7 @@ async fn collect_run_stream(
 async fn collect_run_text_stream(
     mut stream: RunResponseStream,
     trace_tokens: bool,
-    buffer_output: bool,
+    mut output: RunStreamOutput,
     turn: usize,
     expected_request_id: &RequestId,
     stdin_is_tty: bool,
@@ -585,8 +650,11 @@ async fn collect_run_text_stream(
         }
         if !chunk.text.is_empty() {
             raw_text.push_str(&chunk.text);
-            if !buffer_output {
-                print!("{}", chunk.text);
+            let delta = output.delta(&raw_text, &chunk.text).inspect_err(|_| {
+                clear_first_token_indicator(&mut first_token_indicator);
+            })?;
+            if let Some(delta) = delta {
+                print!("{delta}");
                 io::stdout().flush().ok();
             }
             chunk_count += 1;
@@ -614,6 +682,10 @@ async fn collect_run_text_stream(
         }
     }
     clear_first_token_indicator(&mut first_token_indicator);
+    if let Some(delta) = output.finish(&raw_text)? {
+        print!("{delta}");
+        io::stdout().flush().ok();
+    }
     Ok(CollectedRunGeneration {
         request_id: request_id
             .unwrap_or_else(|| expected_request_id.clone())
@@ -1231,9 +1303,11 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             }
         }
         maybe_warn_context_shift(&plan, format);
-        let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
         let model_output_protocol = plan.sampling_params.model_output_protocol;
-        let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
+        let prompt_opened_thinking =
+            has_unclosed_model_reasoning_block(model_output_protocol, &plan.prompt);
+        let metadata =
+            run_request_metadata(&plan.prompt, &chat_template_options, model_output_protocol);
         let prompt_chars = plan.prompt.chars().count();
         let request_id = RequestId(Uuid::new_v4());
         let request_id_text = request_id.to_string();
@@ -1375,7 +1449,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         if format == OutputFormat::Text && !bench {
             print!(
                 "{}",
-                if model_output_protocol == ModelOutputProtocol::HarmonyGptOss {
+                if model_output_protocol != ModelOutputProtocol::Text {
                     &content
                 } else {
                     &raw_response
@@ -1556,14 +1630,19 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     &run_budget,
                 )?;
                 maybe_warn_context_shift(&plan, format);
-                let prompt_opened_thinking = has_unclosed_thinking_block(&plan.prompt);
                 let model_output_protocol = plan.sampling_params.model_output_protocol;
+                let prompt_opened_thinking =
+                    has_unclosed_model_reasoning_block(model_output_protocol, &plan.prompt);
                 let observability_sampling_params =
                     product_memory_enabled.then(|| plan.sampling_params.clone());
                 let prompt_token_ids = plan.prompt_token_ids;
                 let prompt_token_count = plan.prompt_tokens;
                 let prompt_chars = plan.prompt.chars().count();
-                let metadata = run_request_metadata(&plan.prompt, &chat_template_options);
+                let metadata = run_request_metadata(
+                    &plan.prompt,
+                    &chat_template_options,
+                    model_output_protocol,
+                );
                 let request_id = RequestId(Uuid::new_v4());
                 let expected_request_id = request_id.clone();
                 let request_id_text = request_id.to_string();
@@ -1630,7 +1709,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                             collect_run_text_stream(
                                 stream,
                                 trace_tokens,
-                                model_output_protocol == ModelOutputProtocol::HarmonyGptOss,
+                                RunStreamOutput::new(model_output_protocol, prompt_opened_thinking),
                                 turn,
                                 &expected_request_id,
                                 stdin_is_tty,
@@ -2176,10 +2255,12 @@ fn validate_teacher_forced_checkpoint_run(
 }
 
 fn sampling_params_for_prompt(mut sampling_params: SamplingParams, prompt: &str) -> SamplingParams {
-    if has_unclosed_thinking_block(prompt) {
+    if has_unclosed_model_reasoning_block(sampling_params.model_output_protocol, prompt) {
+        let (_, closing) = model_reasoning_markers(sampling_params.model_output_protocol)
+            .expect("an open reasoning block has declared markers");
         sampling_params.response_completion_boundary =
             ResponseCompletionBoundary::AfterDelimiterAndPayload {
-                delimiter: THINK_END_TAG.to_string(),
+                delimiter: closing.to_string(),
                 alternate_envelope: None,
             };
     }
@@ -3425,8 +3506,11 @@ mod tests {
 
     #[test]
     fn run_metadata_forbids_initial_thinking_close_without_open_block() {
-        let metadata =
-            run_request_metadata("<|im_start|>assistant\n", &ChatTemplateOptions::default());
+        let metadata = run_request_metadata(
+            "<|im_start|>assistant\n",
+            &ChatTemplateOptions::default(),
+            ModelOutputProtocol::Text,
+        );
         let forbidden = metadata
             .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
             .and_then(|value| value.as_array())
@@ -3472,6 +3556,7 @@ mod tests {
                 enable_thinking: Some(false),
                 ..Default::default()
             },
+            ModelOutputProtocol::Text,
         );
         let forbidden = metadata
             .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
@@ -3491,8 +3576,116 @@ mod tests {
         let metadata = run_request_metadata(
             "<|im_start|>assistant\n<think>\n",
             &ChatTemplateOptions::default(),
+            ModelOutputProtocol::Text,
         );
         assert!(!metadata.contains_key(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
+    }
+
+    #[test]
+    fn gemma_run_metadata_and_completion_follow_the_rendered_thought_state() {
+        let protocol = ModelOutputProtocol::GemmaThought;
+        let options = ChatTemplateOptions {
+            enable_thinking: Some(false),
+            ..Default::default()
+        };
+        for (prompt, opened) in [
+            ("<|turn>model\n", false),
+            ("<|turn>model\n<|channel>thought\n<channel|>", false),
+            ("<|turn>model\n<|tool_response>579<tool_response|>", false),
+            (
+                "<|turn>model\n<|tool_response>579<tool_response|><|channel>thought\n",
+                true,
+            ),
+        ] {
+            let metadata = run_request_metadata(prompt, &options, protocol);
+            if opened {
+                assert!(!metadata.contains_key(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
+            } else {
+                assert_eq!(
+                    metadata[RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY],
+                    serde_json::json!(["<channel|>"]),
+                    "disabling reasoning must still allow an empty native thought header"
+                );
+            }
+            let mut params = SamplingParams::greedy();
+            params.model_output_protocol = protocol;
+            let params = sampling_params_for_prompt(params, prompt);
+            assert_eq!(
+                params.response_completion_boundary,
+                if opened {
+                    ResponseCompletionBoundary::AfterDelimiterAndPayload {
+                        delimiter: "<channel|>".to_string(),
+                        alternate_envelope: None,
+                    }
+                } else {
+                    ResponseCompletionBoundary::Immediate
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_run_stream_splits_never_expose_thought_frames_or_reasoning() {
+        for (raw, opened, expected) in [
+            ("<|channel>thought\n<channel|>579", false, "579"),
+            ("Compute.<channel|>579", true, "579"),
+            (
+                "Before.<|channel>thought\nOne.<channel|>Between.\
+                 <|channel>thought\nTwo 🧠.<channel|>After.",
+                false,
+                "Before.Between.After.",
+            ),
+            ("thought\n579", false, "thought\n579"),
+            ("Answer.<|channel>th", false, "Answer."),
+        ] {
+            for split in raw
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(raw.len()))
+            {
+                let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, opened);
+                let mut cumulative = String::new();
+                let mut visible = String::new();
+                for chunk in [&raw[..split], &raw[split..]] {
+                    cumulative.push_str(chunk);
+                    if let Some(delta) = output.delta(&cumulative, chunk).unwrap() {
+                        visible.push_str(&delta);
+                    }
+                    assert!(expected.starts_with(&visible));
+                }
+                if let Some(delta) = output.finish(&cumulative).unwrap() {
+                    visible.push_str(&delta);
+                }
+                assert_eq!(visible, expected, "split at {split}");
+                assert!(output.finish(&cumulative).unwrap().is_none());
+                let parsed = parse_run_model_output(
+                    ModelOutputProtocol::GemmaThought,
+                    &cumulative,
+                    opened,
+                    Some(FinishReason::Length),
+                )
+                .unwrap();
+                assert_eq!(parsed.content, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn gemma_run_stream_delivers_plain_content_early_and_rejects_unknown_channels() {
+        let mut output = RunStreamOutput::new(ModelOutputProtocol::GemmaThought, false);
+        assert_eq!(
+            output.delta("Hello.", "Hello.").unwrap().as_deref(),
+            Some("Hello.")
+        );
+        assert!(output
+            .delta("Hello.<|channel>", "<|channel>")
+            .unwrap()
+            .is_none());
+        let error = output
+            .delta("Hello.<|channel>unknown\nsecret", "unknown\nsecret")
+            .unwrap_err();
+        assert!(!error.to_string().contains("secret"));
+        assert!(!error.to_string().contains("<|"));
     }
 
     #[test]
@@ -3594,7 +3787,16 @@ mod tests {
             .collect::<Vec<_>>();
             let stream: RunResponseStream = Box::pin(futures::stream::iter(chunks));
             let result = if text_output {
-                collect_run_text_stream(stream, false, true, 0, &request_id, false, true).await
+                collect_run_text_stream(
+                    stream,
+                    false,
+                    RunStreamOutput::new(ModelOutputProtocol::HarmonyGptOss, false),
+                    0,
+                    &request_id,
+                    false,
+                    true,
+                )
+                .await
             } else {
                 collect_run_stream(stream, false, true, 0, "session", 0, &expected_request_id).await
             }
@@ -4010,6 +4212,89 @@ mod tests {
                 history_evidence(&history)["sha256"],
                 sha256_text(&serde_json::to_string(&original_history).unwrap()),
                 "JSONL history evidence must continue to bind the raw generated output"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_run_history_uses_typed_content_and_keeps_raw_evidence() {
+        // Gemma's template omits prior-turn reasoning after a new user turn,
+        // while accepting a separate reasoning field for same-turn continuation.
+        let mut template = ModelChatTemplate::new(
+            concat!(
+                "{%- set ns = namespace(last_user=-1) -%}",
+                "{%- for message in messages -%}",
+                "{%- if message.role == 'user' -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}",
+                "{%- endfor -%}",
+                "{%- for message in messages -%}",
+                "{{- '<|turn>' + ('model' if message.role == 'assistant' else message.role) + '\n' -}}",
+                "{%- if message.reasoning_content and loop.index0 > ns.last_user -%}",
+                "{{- '<|channel>thought\n' + message.reasoning_content + '<channel|>' -}}",
+                "{%- endif -%}",
+                "{{- message.content + '<turn|>\n' -}}",
+                "{%- endfor -%}",
+                "{{- '<|turn>model\n<|channel>thought\n<channel|>' -}}",
+            ),
+            "gemma-thought-history-contract",
+        );
+        template.set_output_protocol(ModelOutputProtocol::GemmaThought);
+        for (raw, opened, content, reasoning) in [
+            ("<|channel>thought\n<channel|>579", false, "579", None),
+            (
+                "<|channel>thought\nUse the sum.<channel|>579",
+                false,
+                "579",
+                Some("Use the sum."),
+            ),
+            (
+                "Use the sum.<channel|>579",
+                true,
+                "579",
+                Some("Use the sum."),
+            ),
+            (
+                "<|channel>thought\nStill computing.",
+                false,
+                "",
+                Some("Still computing."),
+            ),
+        ] {
+            let parsed = parse_run_model_output(
+                template.output_protocol,
+                raw,
+                opened,
+                Some(FinishReason::Length),
+            )
+            .unwrap();
+            let history = vec![
+                RunHistoryMessage::new("user", "123+456?"),
+                RunHistoryMessage::assistant(raw, template.output_protocol, &parsed),
+            ];
+            assert_eq!(history[1].prompt.content, content);
+            assert_eq!(history[1].prompt.reasoning_content.as_deref(), reasoning);
+            assert_eq!(history[1].raw_content, raw);
+            let plan = build_run_prompt_plan(
+                &history,
+                "Continue.",
+                None,
+                "loaded-model-alias",
+                Some(&template),
+                &ChatTemplateOptions::default(),
+                &test_run_cmd(),
+                &whitespace_budget(8192),
+            )
+            .unwrap();
+            assert_eq!(
+                plan.prompt,
+                format!(
+                    "<|turn>user\n123+456?<turn|>\n<|turn>model\n{content}<turn|>\n\
+                     <|turn>user\nContinue.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+                )
+            );
+            let raw_history = [("user", "123+456?"), ("assistant", raw)];
+            assert_eq!(
+                history_evidence(&history)["sha256"],
+                sha256_text(&serde_json::to_string(&raw_history).unwrap())
             );
         }
     }

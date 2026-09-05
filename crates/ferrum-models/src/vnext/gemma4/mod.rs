@@ -14,7 +14,7 @@ use ferrum_interfaces::vnext::{
     WeightComponentSource, WeightSchema,
 };
 use ferrum_quantization::{CompressedTensorsMarlinSafetensorsSource, SafetensorsArchive};
-use ferrum_types::DataType;
+use ferrum_types::{DataType, ModelOutputProtocol};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -233,7 +233,7 @@ fn production_descriptor(
             )
             .ok_or_else(|| ferrum_types::FerrumError::model("parameter count overflows u64"))
     })?;
-    CausalLanguageModelDescriptor::new(
+    Ok(CausalLanguageModelDescriptor::new(
         "gemma4_unified_text",
         parameter_count,
         usize::try_from(config.semantic.hidden_size)
@@ -252,7 +252,8 @@ fn production_descriptor(
             ferrum_types::FerrumError::model("maximum_sequence_tokens exceeds usize")
         })?,
         DataType::FP16,
-    )
+    )?
+    .with_output_protocol(ModelOutputProtocol::GemmaThought))
 }
 
 pub(super) fn family_registration() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>> {

@@ -845,7 +845,7 @@ pub fn load_prepared_product_chat_template(
             "typed product chat template bytes differ from the prepared family",
         ));
     }
-    selected.output_protocol = prepared.descriptor().output_protocol();
+    selected.set_output_protocol(prepared.descriptor().output_protocol());
     Ok(selected)
 }
 

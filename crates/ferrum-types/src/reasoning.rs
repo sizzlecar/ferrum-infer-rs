@@ -1,12 +1,93 @@
-//! Shared parsing for model outputs that carry `<think>` reasoning blocks.
+//! Shared parsing for declared model reasoning protocols.
+
+use crate::{FerrumError, ModelOutputProtocol, Result};
+
+mod gemma;
 
 pub const THINK_START_TAG: &str = "<think>";
 pub const THINK_END_TAG: &str = "</think>";
+pub const GEMMA_THOUGHT_START_TAG: &str = "<|channel>thought\n";
+pub const GEMMA_THOUGHT_END_TAG: &str = "<channel|>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedReasoningResponse {
     pub content: String,
     pub reasoning: Option<String>,
+}
+
+/// The full generated opening header and closing marker of a reasoning block.
+/// Harmony owns a separate message protocol rather than a delimited block.
+pub const fn model_reasoning_markers(
+    protocol: ModelOutputProtocol,
+) -> Option<(&'static str, &'static str)> {
+    match protocol {
+        ModelOutputProtocol::Text => Some((THINK_START_TAG, THINK_END_TAG)),
+        ModelOutputProtocol::GemmaThought => Some((GEMMA_THOUGHT_START_TAG, GEMMA_THOUGHT_END_TAG)),
+        ModelOutputProtocol::HarmonyGptOss => None,
+    }
+}
+
+pub fn has_unclosed_model_reasoning_block(protocol: ModelOutputProtocol, prompt: &str) -> bool {
+    match protocol {
+        ModelOutputProtocol::Text => has_unclosed_thinking_block(prompt),
+        ModelOutputProtocol::HarmonyGptOss => false,
+        ModelOutputProtocol::GemmaThought => {
+            // The generated turn, including a tool-response continuation, owns
+            // the prefill state. A marker mentioned in an earlier user turn
+            // must not make an ordinary model turn start inside reasoning.
+            let turn = prompt
+                .rsplit_once("<|turn>")
+                .map_or(prompt, |(_, turn)| turn);
+            match (
+                turn.rfind(GEMMA_THOUGHT_START_TAG),
+                turn.rfind(GEMMA_THOUGHT_END_TAG),
+            ) {
+                (Some(start), Some(end)) => start > end,
+                (Some(_), None) => true,
+                _ => false,
+            }
+        }
+    }
+}
+
+/// Parse a cumulative generated prefix without exposing partial protocol
+/// markers. Gemma accepts only the declared thought channel; ordinary words
+/// such as "thought" remain ordinary content outside that channel.
+pub fn parse_model_reasoning_response(
+    protocol: ModelOutputProtocol,
+    text: &str,
+    prompt_opened_thinking: bool,
+) -> Result<ParsedReasoningResponse> {
+    match protocol {
+        ModelOutputProtocol::Text => Ok(parse_reasoning_response_for_prompt(
+            text,
+            prompt_opened_thinking,
+        )),
+        ModelOutputProtocol::GemmaThought => gemma::parse(text, prompt_opened_thinking),
+        ModelOutputProtocol::HarmonyGptOss => Err(FerrumError::invalid_request(
+            "Harmony output requires its message-protocol parser",
+        )),
+    }
+}
+
+/// Hold only prefixes that can still become framing, not complete responses.
+/// Callers retain the cumulative input and parse it again when more arrives.
+pub fn should_defer_model_reasoning_stream_delta(
+    protocol: ModelOutputProtocol,
+    text: &str,
+) -> bool {
+    match protocol {
+        ModelOutputProtocol::Text => {
+            let candidate = text.trim_start_matches(['\r', '\n']);
+            candidate.is_empty()
+                || THINK_START_TAG.starts_with(candidate)
+                || THINK_END_TAG.starts_with(candidate)
+        }
+        ModelOutputProtocol::GemmaThought => {
+            text.is_empty() || gemma::has_partial_marker_suffix(text)
+        }
+        ModelOutputProtocol::HarmonyGptOss => false,
+    }
 }
 
 pub fn has_unclosed_thinking_block(prompt: &str) -> bool {

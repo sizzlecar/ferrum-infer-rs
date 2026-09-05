@@ -67,6 +67,61 @@ fn model_output_protocol_is_backward_compatible_and_round_trips() {
 }
 
 #[test]
+fn gemma_thought_protocol_preserves_only_native_channel_markers() {
+    let protocol = ModelOutputProtocol::GemmaThought;
+    assert_eq!(
+        protocol.generated_control_token_texts(),
+        &["<|channel>", "<channel|>"]
+    );
+    assert_eq!(
+        protocol.preserved_special_token_texts(),
+        &["<|channel>", "<channel|>"]
+    );
+    let encoded = serde_json::to_value(protocol).unwrap();
+    assert_eq!(encoded, "gemma_thought");
+    assert_eq!(
+        serde_json::from_value::<ModelOutputProtocol>(encoded).unwrap(),
+        protocol
+    );
+}
+
+#[test]
+fn reasoning_envelope_round_trips_and_requires_complete_boundaries() {
+    for allow_reasoning in [false, true] {
+        let mut params = SamplingParams {
+            response_format: ResponseFormat::JsonObject,
+            model_output_protocol: ModelOutputProtocol::GemmaThought,
+            structured_output_start: StructuredOutputStart::AfterReasoningEnvelope {
+                opening: "<|channel>thought\n".to_string(),
+                closing: "<channel|>".to_string(),
+                allow_reasoning,
+            },
+            ..SamplingParams::default()
+        };
+        params.validate().unwrap();
+        let encoded = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            encoded["structured_output_start"]["mode"],
+            "after_reasoning_envelope"
+        );
+        let decoded: SamplingParams = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            decoded.structured_output_start,
+            params.structured_output_start
+        );
+        decoded.validate().unwrap();
+        for (opening, closing) in [("", "<channel|>"), ("<|channel>thought\n", "")] {
+            params.structured_output_start = StructuredOutputStart::AfterReasoningEnvelope {
+                opening: opening.to_string(),
+                closing: closing.to_string(),
+                allow_reasoning,
+            };
+            assert!(params.validate().is_err());
+        }
+    }
+}
+
+#[test]
 fn harmony_structured_boundary_requires_its_protocol_and_round_trips() {
     let mut params = SamplingParams {
         response_format: ResponseFormat::JsonObject,
