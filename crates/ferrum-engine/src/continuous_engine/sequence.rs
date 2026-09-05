@@ -291,9 +291,11 @@ pub struct SequenceState {
     /// `<|im_end|>`, `<|endoftext|>`, `<|eot_id|>`), and one-token encodings of
     /// `sampling_params.stop_sequences`.
     pub stop_token_ids: HashSet<u32>,
-    /// Model-owned EOS ids, kept separate from user stop conditions so a
-    /// response-completion boundary can delay only model termination.
+    /// Effective automatic EOS IDs; ignore_eos and explicit user-stop
+    /// collisions are excluded so completion gates delay only model termination.
     pub model_eos_token_ids: Vec<u32>,
+    /// Explicit single-token user stops, including IDs also declared model EOS.
+    pub user_stop_token_ids: HashSet<u32>,
     /// Request-local compiled completion boundary. The common satisfied path
     /// is one enum comparison per token.
     pub(super) response_completion_state: ResponseCompletionState,
@@ -710,8 +712,12 @@ impl SequenceState {
             .get("ferrum_ignore_eos")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
-        let (model_eos_token_ids, stop_token_ids, stop_text_seqs) =
-            resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
+        let StopConditions {
+            model_eos_token_ids,
+            stop_token_ids,
+            user_stop_token_ids,
+            stop_text_seqs,
+        } = resolve_stop_conditions(&request.sampling_params, tokenizer.as_deref(), ignore_eos);
         let response_completion_state = ResponseCompletionState::compile(
             &request.sampling_params.response_completion_boundary,
             tokenizer.as_deref(),
@@ -837,6 +843,7 @@ impl SequenceState {
             sampling_history: SequenceSamplingHistory::default(),
             stop_token_ids,
             model_eos_token_ids,
+            user_stop_token_ids,
             response_completion_state,
             forbidden_token_ids,
             initial_forbidden_token_ids,
@@ -1601,17 +1608,16 @@ impl SequenceState {
 
     /// Return the reason this sequence should stop, if any.
     ///
-    /// Checks: (1) last generated token is in the resolved `stop_token_ids`
-    /// set (model EOS + any single-token `stop_sequences`), (2) decoded text
-    /// contains a user stop sequence, (3) max-tokens budget is
-    /// exhausted. Text-stop decoding only runs for requests that supplied a
-    /// stop string, so the common EOS path stays cheap.
+    /// Explicit user IDs or decoded text stops take precedence over automatic
+    /// model EOS, followed by the token budget. Text-stop decoding only runs
+    /// for requests that supplied a stop string, so the common EOS path stays
+    /// cheap. Keep the actual reason distinct until protocol serialization.
     pub fn stop_reason(
         &self,
         tokenizer: Option<&(dyn Tokenizer + Send + Sync)>,
     ) -> Option<FinishReason> {
         if let Some(&last_token) = self.generated_tokens.last() {
-            if self.stop_token_ids.contains(&last_token.get()) {
+            if self.user_stop_token_ids.contains(&last_token.get()) {
                 return Some(FinishReason::Stop);
             }
         }
@@ -1626,6 +1632,11 @@ impl SequenceState {
                         return Some(FinishReason::Stop);
                     }
                 }
+            }
+        }
+        if let Some(last_token) = self.generated_tokens.last() {
+            if self.model_eos_token_ids.contains(&last_token.get()) {
+                return Some(FinishReason::EOS);
             }
         }
         if self.generated_tokens.len() >= self.sampling_params.max_tokens {

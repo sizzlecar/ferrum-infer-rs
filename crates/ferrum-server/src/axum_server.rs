@@ -28,8 +28,8 @@ use ferrum_bench_core::{
 };
 use ferrum_interfaces::engine::{EmbedEngine, LlmInferenceEngine, TranscribeEngine, TtsEngine};
 use ferrum_types::{
-    has_unclosed_model_reasoning_block, model_reasoning_markers, parse_harmony_response,
-    parse_length_truncated_harmony_response, parse_model_reasoning_response,
+    has_unclosed_model_reasoning_block, model_reasoning_markers,
+    parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
     should_defer_model_reasoning_stream_delta, EngineMetrics, EngineStatus, FerrumConfigBuilder,
     FerrumError as Error, FerrumProfileEvent, FinishReason, InferenceExecutionEvidence,
     InferenceRequest, InferenceResponse, ModelId, ModelOutputProtocol, ParsedReasoningResponse,
@@ -2393,16 +2393,12 @@ fn parse_chat_model_output(
             })
         }
         ModelOutputProtocol::HarmonyGptOss => {
-            let parsed = if finish_reason == FinishReason::Length {
-                parse_length_truncated_harmony_response(text)
-            } else {
-                parse_harmony_response(text)
-            }
-            .map_err(|error| {
-                ServerError::InternalError(format!(
-                    "model output did not satisfy the GPT-OSS Harmony protocol: {error}"
-                ))
-            })?;
+            let parsed = parse_harmony_response_for_finish_reason(text, Some(finish_reason))
+                .map_err(|error| {
+                    ServerError::InternalError(format!(
+                        "model output did not satisfy the GPT-OSS Harmony protocol: {error}"
+                    ))
+                })?;
             let harmony_response =
                 parsed
                     .tool_call
@@ -5607,6 +5603,7 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
 #[cfg(test)]
 mod tests {
     mod gemma_thought;
+    mod harmony_stops;
     use super::*;
     use async_trait::async_trait;
     use axum::{
@@ -5681,25 +5678,33 @@ mod tests {
     }
 
     #[test]
-    fn gpt_oss_harmony_accepts_missing_text_terminal_only_for_length() {
+    fn gpt_oss_harmony_accepts_missing_text_terminal_only_for_explicit_truncation() {
         let output = "<|channel|>analysis<|message|>Still reasoning";
-        let parsed = parse_chat_model_output(
-            ModelOutputProtocol::HarmonyGptOss,
-            output,
-            false,
-            FinishReason::Length,
-        )
-        .unwrap();
-        assert_eq!(parsed.visible.reasoning.as_deref(), Some("Still reasoning"));
-        assert!(parsed.visible.content.is_empty());
-
-        assert!(parse_chat_model_output(
-            ModelOutputProtocol::HarmonyGptOss,
-            output,
-            false,
-            FinishReason::Stop,
-        )
-        .is_err());
+        for finish_reason in [FinishReason::Stop, FinishReason::Length] {
+            let parsed = parse_chat_model_output(
+                ModelOutputProtocol::HarmonyGptOss,
+                output,
+                false,
+                finish_reason,
+            )
+            .unwrap();
+            assert_eq!(parsed.visible.reasoning.as_deref(), Some("Still reasoning"));
+            assert!(parsed.visible.content.is_empty());
+        }
+        for finish_reason in [
+            FinishReason::EOS,
+            FinishReason::Cancelled,
+            FinishReason::Error,
+            FinishReason::ContentFilter,
+        ] {
+            assert!(parse_chat_model_output(
+                ModelOutputProtocol::HarmonyGptOss,
+                output,
+                false,
+                finish_reason,
+            )
+            .is_err());
+        }
     }
 
     #[tokio::test]
@@ -5764,7 +5769,7 @@ mod tests {
                 stream_tail_without_token: false,
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
-                finish_reason: FinishReason::Stop,
+                finish_reason: FinishReason::EOS,
                 execution_attribution: None,
                 lora_metrics: None,
                 pending_stream_drop_notify: None,
@@ -13258,7 +13263,7 @@ mod tests {
                     "nal<|message|>{\"answer\":",
                     "42}<|return|>",
                 ],
-                FinishReason::Stop,
+                FinishReason::EOS,
                 "",
             ),
             (
@@ -13267,12 +13272,17 @@ mod tests {
                     "<|end|><|start|>assistant<|channel|>fi",
                     "nal<|message|>{\"answer\":42}<|return|>",
                 ],
-                FinishReason::Stop,
+                FinishReason::EOS,
                 "Compute.",
             ),
             (
                 vec!["<|channel|>final<|message|>{\"answer\":", "42}"],
                 FinishReason::Length,
+                "",
+            ),
+            (
+                vec!["<|channel|>final<|message|>{\"answer\":", "42}"],
+                FinishReason::Stop,
                 "",
             ),
         ] {
@@ -13284,8 +13294,13 @@ mod tests {
                 let router = AxumServer::from_llm(Arc::new(engine))
                     .with_prompt_template(Some(harmony_json_template()))
                     .build_router();
-                let response =
-                    post_json(router, "/v1/chat/completions", harmony_json_request(stream)).await;
+                let mut request = harmony_json_request(stream);
+                if finish_reason == FinishReason::Stop {
+                    // An explicit stop at the model's terminal removes that
+                    // marker while preserving the already complete JSON value.
+                    request["stop"] = json!(["<|return|>"]);
+                }
+                let response = post_json(router, "/v1/chat/completions", request).await;
                 assert_eq!(response.status(), AxumStatusCode::OK);
                 if stream {
                     let body = response_text(response).await;

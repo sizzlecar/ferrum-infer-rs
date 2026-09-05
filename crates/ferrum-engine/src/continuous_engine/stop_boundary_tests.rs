@@ -44,7 +44,14 @@ async fn stop_boundary_outputs_with_eos(
     let mut request = policy_request();
     request.sampling_params.stop_sequences = stops.iter().map(|s| (*s).to_owned()).collect();
     request.sampling_params.max_tokens = pieces.len() + 2 + usize::from(end_with_eos);
+    stop_boundary_outputs_for_request(pieces, end_with_eos, request).await
+}
 
+async fn stop_boundary_outputs_for_request(
+    pieces: &[&str],
+    end_with_eos: bool,
+    mut request: InferenceRequest,
+) -> (InferenceResponse, Vec<StreamChunk>) {
     let engine = stop_boundary_engine(pieces, end_with_eos);
     let response = tokio::time::timeout(Duration::from_secs(2), engine.infer(request.clone()))
         .await
@@ -67,6 +74,42 @@ async fn stop_boundary_outputs_with_eos(
     .expect("fixed token stream must terminate");
     engine.shutdown().await.unwrap();
     (response, chunks)
+}
+
+#[tokio::test]
+async fn harmony_user_stop_preserves_exact_payload_and_terminal_usage() {
+    const FINAL: &str = "<|channel|>final<|message|>";
+    for pieces in [
+        vec![FINAL, "答案 ", "ST", "OPtail"],
+        vec![FINAL, "答案 STOPtail"],
+    ] {
+        let mut request = policy_request();
+        request.sampling_params.model_output_protocol =
+            ferrum_types::ModelOutputProtocol::HarmonyGptOss;
+        request.sampling_params.stop_sequences = vec!["STOP".to_string()];
+        request.sampling_params.max_tokens = pieces.len() + 2;
+        let (response, chunks) = stop_boundary_outputs_for_request(&pieces, false, request).await;
+        let expected = format!("{FINAL}答案 ");
+        let mut streamed = String::new();
+        for chunk in &chunks {
+            streamed.push_str(&chunk.text);
+            assert!(
+                expected.starts_with(&streamed),
+                "a stop prefix leaked: {streamed:?}"
+            );
+        }
+        assert_eq!(response.text, expected);
+        assert_eq!(streamed, expected);
+        assert_eq!(response.finish_reason, FinishReason::Stop);
+        let terminal = chunks.last().unwrap();
+        assert!(terminal.text.is_empty());
+        assert_eq!(terminal.finish_reason, Some(FinishReason::Stop));
+        let usage = terminal.usage.as_ref().unwrap();
+        assert_eq!(usage.prompt_tokens, response.usage.prompt_tokens);
+        assert_eq!(usage.completion_tokens, response.usage.completion_tokens);
+        assert_eq!(usage.total_tokens, response.usage.total_tokens);
+        assert_eq!(response.usage.completion_tokens, response.tokens.len());
+    }
 }
 
 #[tokio::test]
@@ -137,7 +180,7 @@ async fn stop_boundary_flushes_and_selects_the_earliest_match() {
             pieces: &["answer", "ab"],
             stops: &["abc"],
             expected: "answerab",
-            finish: FinishReason::Stop,
+            finish: FinishReason::EOS,
             end_with_eos: true,
         },
         Case {

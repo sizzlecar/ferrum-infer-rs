@@ -16,6 +16,9 @@ No unreleased changes.
 - Removed a redundant single-pass loop in runtime resource allocation.
 - Preserved stop-sequence boundaries across streamed tokens, retained legal text before a stop, and flushed buffered text consistently through `run` and `serve`.
 - Accepted `reasoning_content` in assistant history without losing it during multi-turn tool requests, while preserving model-template behavior and the existing `reasoning` response field.
+- Preserved parsed GPT-OSS Harmony assistant history across `run` turns and applied JSON constraints within the final response channel.
+- Parsed Gemma native thought channels in `run` and `serve`, including empty thought frames, tool-result continuations, and structured output.
+- Accepted GPT-OSS text truncated by explicit user stops through `run` and synchronous or streaming chat requests. The engine distinguishes user stops from model EOS so malformed natural completions and incomplete tool calls remain errors.
 
 ## [0.8.6] - 2026-09-04
 

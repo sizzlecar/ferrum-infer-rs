@@ -8,8 +8,8 @@ use console::{measure_text_width, Key, Term};
 use ferrum_models::source::{ModelFormat, ResolvedModelSource};
 use ferrum_server::chat_template::{ChatTemplateOptions, ModelChatTemplate, PromptMessage};
 use ferrum_types::{
-    has_unclosed_model_reasoning_block, model_reasoning_markers, parse_harmony_response,
-    parse_length_truncated_harmony_response, parse_model_reasoning_response,
+    has_unclosed_model_reasoning_block, model_reasoning_markers,
+    parse_harmony_response_for_finish_reason, parse_model_reasoning_response,
     should_defer_model_reasoning_stream_delta, FerrumConfigBuilder, FerrumError, FinishReason,
     InferenceRequest, InferenceResponse, ModelCapabilities, ModelOutputProtocol,
     ParsedReasoningResponse, Priority, RequestId, ResolvedFerrumConfig, ResponseCompletionBoundary,
@@ -61,7 +61,7 @@ impl RunHistoryMessage {
         match protocol {
             // Text templates own their policy for inline <think> history.
             ModelOutputProtocol::Text => {}
-            // Reuse the validated result, including valid length truncation.
+            // Reuse the validated result, including valid user/length truncation.
             // Native channel envelopes are not an assistant message's content.
             ModelOutputProtocol::HarmonyGptOss | ModelOutputProtocol::GemmaThought => {
                 message.prompt.content = parsed.content.clone();
@@ -412,11 +412,7 @@ fn parse_run_model_output(
             parse_model_reasoning_response(protocol, text, prompt_opened_thinking)
         }
         ModelOutputProtocol::HarmonyGptOss => {
-            let parsed = if finish_reason == Some(FinishReason::Length) {
-                parse_length_truncated_harmony_response(text)?
-            } else {
-                parse_harmony_response(text)?
-            };
+            let parsed = parse_harmony_response_for_finish_reason(text, finish_reason)?;
             if parsed.tool_call.is_some() {
                 return Err(FerrumError::invalid_format(
                     "GPT-OSS emitted a Harmony tool call for `ferrum run`, which has no tool executor",
@@ -4122,15 +4118,38 @@ mod tests {
     }
 
     #[test]
-    fn gpt_oss_run_accepts_length_truncated_harmony_text() {
-        let parsed = parse_run_model_output(
-            ModelOutputProtocol::HarmonyGptOss,
+    fn gpt_oss_run_accepts_user_or_length_truncated_harmony_text() {
+        for finish_reason in [FinishReason::Stop, FinishReason::Length] {
+            let parsed = parse_run_model_output(
+                ModelOutputProtocol::HarmonyGptOss,
+                "<|channel|>final<|message|>Partial answer",
+                false,
+                Some(finish_reason),
+            )
+            .unwrap();
+            assert_eq!(parsed.content, "Partial answer");
+        }
+    }
+
+    #[test]
+    fn gpt_oss_run_rejects_incomplete_harmony_after_natural_eos_or_unknown_finish() {
+        for raw in [
             "<|channel|>final<|message|>Partial answer",
-            false,
-            Some(FinishReason::Length),
-        )
-        .unwrap();
-        assert_eq!(parsed.content, "Partial answer");
+            "<|channel|>analysis<|message|>Still reasoning",
+        ] {
+            for finish_reason in [Some(FinishReason::EOS), None] {
+                assert!(
+                    parse_run_model_output(
+                        ModelOutputProtocol::HarmonyGptOss,
+                        raw,
+                        false,
+                        finish_reason,
+                    )
+                    .is_err(),
+                    "accepted incomplete output {raw:?} for {finish_reason:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4178,6 +4197,25 @@ mod tests {
                 "",
                 Some("Still reasoning"),
             ),
+            (
+                "<|channel|>final<|message|>Partial answer",
+                FinishReason::Stop,
+                "Partial answer",
+                None,
+            ),
+            (
+                "<|channel|>analysis<|message|>Still reasoning",
+                FinishReason::Stop,
+                "",
+                Some("Still reasoning"),
+            ),
+            (
+                "<|channel|>analysis<|message|>Add the numbers.<|end|>\
+                 <|start|>assistant<|channel|>final<|message|>Partial answer",
+                FinishReason::Stop,
+                "Partial answer",
+                Some("Add the numbers."),
+            ),
         ] {
             let parsed =
                 parse_run_model_output(template.output_protocol, raw, false, Some(finish_reason))
@@ -4213,6 +4251,24 @@ mod tests {
                 sha256_text(&serde_json::to_string(&original_history).unwrap()),
                 "JSONL history evidence must continue to bind the raw generated output"
             );
+            let record = jsonl_assistant_record(
+                "session",
+                0,
+                "request",
+                0,
+                &parsed.content,
+                parsed.reasoning.as_deref(),
+                &[],
+                Some(finish_reason),
+                None,
+                1,
+                1,
+                raw,
+                1.0,
+            );
+            assert_eq!(record["content"], content);
+            assert_eq!(record["raw_text_sha256"], sha256_text(raw));
+            assert_eq!(record["finish_reason"], finish_reason_str(finish_reason));
         }
     }
 

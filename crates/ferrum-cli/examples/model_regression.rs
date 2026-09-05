@@ -46,6 +46,12 @@ struct Args {
     /// Forward the public flag to both entrypoints. Otherwise keep model defaults.
     #[arg(long)]
     disable_thinking: bool,
+    /// Prompt for stop probes. Use original prose if copied text is echoed in reasoning.
+    #[arg(
+        long,
+        default_value = "Write exactly this text, without quotes or explanation: alpha beta gamma delta epsilon."
+    )]
+    stop_prompt: String,
     /// Also replay actual, nonempty tool-call reasoning through reasoning_content.
     #[arg(long)]
     reasoning_alias_replay: bool,
@@ -147,6 +153,10 @@ async fn record(
 async fn main() -> Result<()> {
     let mut args = Args::parse();
     ensure!(!args.model.trim().is_empty(), "--model must not be empty");
+    ensure!(
+        !args.stop_prompt.trim().is_empty(),
+        "--stop-prompt must not be empty"
+    );
     ensure!(
         args.checks
             .iter()

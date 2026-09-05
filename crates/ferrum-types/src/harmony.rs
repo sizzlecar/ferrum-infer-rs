@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{FerrumError, Result};
+use crate::{FerrumError, FinishReason, Result};
 
 const START: &str = "<|start|>";
 const END: &str = "<|end|>";
@@ -54,6 +54,25 @@ pub fn parse_harmony_response(output: &str) -> Result<ParsedHarmonyResponse> {
 /// complete `<|call|>` envelope.
 pub fn parse_length_truncated_harmony_response(output: &str) -> Result<ParsedHarmonyResponse> {
     parse_harmony_response_internal(output, true)
+}
+
+/// Parse decoded Harmony output using the engine's actual completion reason.
+///
+/// A caller-configured stop or token limit can cut an analysis or final text
+/// message before its terminal token. Model EOS and unknown completion reasons
+/// still require a complete envelope. Pass the engine reason before converting
+/// it to a protocol's wire finish reason, which may map EOS to `stop`.
+/// Tool calls and raw control markers retain the strict parser's validation.
+pub fn parse_harmony_response_for_finish_reason(
+    output: &str,
+    finish_reason: Option<FinishReason>,
+) -> Result<ParsedHarmonyResponse> {
+    match finish_reason {
+        Some(FinishReason::Stop | FinishReason::Length) => {
+            parse_length_truncated_harmony_response(output)
+        }
+        _ => parse_harmony_response(output),
+    }
 }
 
 fn parse_harmony_response_internal(
@@ -494,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_length_truncated_text_messages_without_weakening_strict_parser() {
+    fn parses_user_or_length_truncated_text_without_weakening_strict_parser() {
         for (output, reasoning, content) in [
             ("<|channel|>final", None, ""),
             ("<|channel|>analysis", Some(""), ""),
@@ -531,6 +550,24 @@ mod tests {
             assert_eq!(parsed.reasoning_content.as_deref(), reasoning);
             assert_eq!(parsed.content, content);
             assert!(parsed.tool_call.is_none());
+            for finish_reason in [FinishReason::Stop, FinishReason::Length] {
+                assert_eq!(
+                    parse_harmony_response_for_finish_reason(output, Some(finish_reason)).unwrap(),
+                    parsed
+                );
+            }
+            for finish_reason in [
+                None,
+                Some(FinishReason::EOS),
+                Some(FinishReason::Cancelled),
+                Some(FinishReason::Error),
+                Some(FinishReason::ContentFilter),
+            ] {
+                assert!(
+                    parse_harmony_response_for_finish_reason(output, finish_reason).is_err(),
+                    "accepted incomplete output {output:?} for {finish_reason:?}"
+                );
+            }
         }
     }
 
@@ -549,15 +586,25 @@ mod tests {
             assert_eq!(parsed.reasoning_content.as_deref(), Some("Reason."));
             assert!(parsed.content.is_empty());
             assert!(parsed.tool_call.is_none());
+            assert_eq!(
+                parse_harmony_response_for_finish_reason(output, Some(FinishReason::Stop)).unwrap(),
+                parsed
+            );
+            assert!(
+                parse_harmony_response_for_finish_reason(output, Some(FinishReason::EOS)).is_err()
+            );
         }
     }
 
     #[test]
-    fn length_truncation_keeps_tool_calls_and_control_markers_fail_closed() {
+    fn user_or_length_truncation_keeps_tool_calls_and_control_markers_fail_closed() {
         for output in [
             "<|channel|>analysis<|message|>Reason.<|end|>\
              <|start|>assistant<|channel|>commentary to=functions.weather\
              <|constrain|>json<|message|>{\"city\":\"Paris\"}",
+            "<|channel|>analysis<|message|>Reason.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.weather\
+             <|constrain|>json<|message|>{\"city\":",
             "<|channel|>final<|message|>leak <|bogus|>",
             "<|channel|>final<|message|>incomplete <|",
             "<|channel|>analysis<|message|>Reason.<|end|>\
@@ -574,6 +621,12 @@ mod tests {
                 parse_length_truncated_harmony_response(output).is_err(),
                 "accepted {output:?}"
             );
+            for finish_reason in [FinishReason::Stop, FinishReason::Length] {
+                assert!(
+                    parse_harmony_response_for_finish_reason(output, Some(finish_reason)).is_err(),
+                    "accepted {output:?} for {finish_reason:?}"
+                );
+            }
         }
     }
 
@@ -588,6 +641,12 @@ mod tests {
              <|message|>{\"city\":\"Paris\"}<|call|>",
         ] {
             let parsed = parse_harmony_response(output).unwrap();
+            for finish_reason in [FinishReason::Stop, FinishReason::Length, FinishReason::EOS] {
+                assert_eq!(
+                    parse_harmony_response_for_finish_reason(output, Some(finish_reason)).unwrap(),
+                    parsed
+                );
+            }
             assert_eq!(parsed.reasoning_content.as_deref(), Some("Need weather."));
             assert!(parsed.content.is_empty());
             assert_eq!(
