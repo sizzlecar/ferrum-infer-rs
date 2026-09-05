@@ -13016,6 +13016,132 @@ mod tests {
         );
     }
 
+    fn prompt_opened_literal_json_template() -> ModelChatTemplate {
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}[{{ message.role }}]{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant><think>{% endif %}",
+            "prompt-opened-text-test",
+        );
+        assert_eq!(template.output_protocol, ModelOutputProtocol::Text);
+        assert_eq!(
+            template.reasoning_protocol,
+            ModelReasoningProtocol::PromptOpened
+        );
+        let request = chat_request(json!({"response_format": {"type": "json_object"}}));
+        let internal =
+            convert_chat_request_with_template_model(&request, "stub-model", Some(&template))
+                .expect("convert prompt-opened Text request");
+        assert!(internal.prompt.ends_with("<think>"));
+        template
+    }
+
+    #[tokio::test]
+    async fn json_object_preserves_literal_think_tags_after_prompt_opened_reasoning_sync() {
+        let response = post_json(
+            router_with_stub_and_template(
+                "reason</think>\n{\"text\":\"<think>literal</think>\"}",
+                prompt_opened_literal_json_template(),
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Return a JSON object."}],
+                "response_format": {"type": "json_object"}
+            }),
+        )
+        .await;
+        let status = response.status();
+        let body = response_json(response).await;
+        assert_eq!(status, AxumStatusCode::OK, "{body}");
+        assert!(body.get("error").is_none(), "{body}");
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], r#"{"text":"<think>literal</think>"}"#);
+        assert_eq!(message["reasoning"], "reason");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[tokio::test]
+    async fn json_object_preserves_literal_think_tags_after_prompt_opened_reasoning_sse() {
+        for chunks in [
+            vec!["reason</think>\n{\"text\":\"<think>literal</think>\"}"],
+            vec![
+                "reason</thi",
+                "nk>\n{\"text\":\"<thi",
+                "nk>literal</thi",
+                "nk>\"}",
+            ],
+        ] {
+            let router = AxumServer::from_llm(Arc::new(StubLlm::with_stream_chunks(&chunks)))
+                .with_prompt_template(Some(prompt_opened_literal_json_template()))
+                .build_router();
+            let response = post_json(
+                router,
+                "/v1/chat/completions",
+                json!({
+                    "model": "stub-model",
+                    "messages": [{"role": "user", "content": "Return a JSON object."}],
+                    "stream": true,
+                    "stream_options": {"include_usage": true},
+                    "response_format": {"type": "json_object"}
+                }),
+            )
+            .await;
+            let status = response.status();
+            let body = response_text(response).await;
+            assert_eq!(status, AxumStatusCode::OK, "{body}");
+            let normalized = body.replace("\r\n", "\n");
+            assert_eq!(normalized.matches("data: [DONE]").count(), 1, "{body}");
+            assert!(normalized.ends_with("data: [DONE]\n\n"), "{body}");
+            let events = responses_sse_json_events(&body);
+            assert!(
+                events.iter().all(|event| event.get("error").is_none()),
+                "{body}"
+            );
+            let content: String = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
+                .collect();
+            let reasoning: String = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["delta"]["reasoning"].as_str())
+                .collect();
+            assert_eq!(content, r#"{"text":"<think>literal</think>"}"#);
+            assert_eq!(reasoning, "reason");
+            assert_eq!(
+                serde_json::from_str::<Value>(&content).expect("intact JSON body"),
+                json!({"text": "<think>literal</think>"})
+            );
+            let terminals: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| !event["choices"][0]["finish_reason"].is_null())
+                .collect();
+            assert_eq!(terminals.len(), 1, "{body}");
+            let (terminal_index, terminal) = terminals[0];
+            assert_eq!(terminal["choices"][0]["finish_reason"], "stop");
+            for event in &events[terminal_index..] {
+                for field in ["content", "reasoning", "reasoning_content"] {
+                    assert!(
+                        event["choices"][0]["delta"][field]
+                            .as_str()
+                            .unwrap_or_default()
+                            .is_empty(),
+                        "payload after terminal: {event}"
+                    );
+                }
+            }
+            let usages: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| !event["usage"].is_null())
+                .collect();
+            assert_eq!(usages.len(), 1, "{body}");
+            let (usage_index, usage) = usages[0];
+            assert!(terminal_index < usage_index, "{body}");
+            assert_eq!(usage_index, events.len() - 1, "usage must be last: {body}");
+            assert_eq!(usage["choices"], json!([]));
+        }
+    }
+
     #[tokio::test]
     async fn json_object_rejects_non_json_model_output() {
         let request = chat_request(json!({
