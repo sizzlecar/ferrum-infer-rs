@@ -12,6 +12,7 @@ No unreleased changes.
 ## [0.8.7] - 2026-09-05
 
 ### Fixed
+- Included standalone Jinja chat templates in fresh Hugging Face downloads, allowing models such as GPT-OSS to load their required template.
 - Kept active requests producing output while a later request processes a long prompt.
 - Removed a redundant single-pass loop in runtime resource allocation.
 - Preserved stop-sequence boundaries across streamed tokens, retained legal text before a stop, and flushed buffered text consistently through `run` and `serve`.

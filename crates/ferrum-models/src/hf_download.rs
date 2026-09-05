@@ -105,6 +105,7 @@ pub struct HfDownloader {
     client: Client,
     cache_dir: PathBuf,
     token: Option<String>,
+    endpoint: String,
 }
 
 impl HfDownloader {
@@ -132,6 +133,7 @@ impl HfDownloader {
             client,
             cache_dir,
             token,
+            endpoint: hf_endpoint().to_owned(),
         })
     }
 
@@ -318,6 +320,7 @@ impl HfDownloader {
                     || path.ends_with(".json")
                     || path.ends_with(".yaml")
                     || path.ends_with(".yml")
+                    || path.ends_with(".jinja") // standalone chat templates
                     || path.ends_with(".model")  // sentencepiece tokenizer
                     || path.ends_with(".txt")    // vocab.txt
                     // Image/audio assets (small)
@@ -419,17 +422,12 @@ impl HfDownloader {
             let url = if dir.is_empty() {
                 format!(
                     "{}/api/models/{}/tree/{}",
-                    hf_endpoint(),
-                    model_id,
-                    revision
+                    self.endpoint, model_id, revision
                 )
             } else {
                 format!(
                     "{}/api/models/{}/tree/{}/{}",
-                    hf_endpoint(),
-                    model_id,
-                    revision,
-                    dir
+                    self.endpoint, model_id, revision, dir
                 )
             };
 
@@ -473,9 +471,7 @@ impl HfDownloader {
     async fn get_commit_sha(&self, model_id: &str, revision: &str) -> Result<String> {
         let url = format!(
             "{}/api/models/{}/revision/{}",
-            hf_endpoint(),
-            model_id,
-            revision
+            self.endpoint, model_id, revision
         );
 
         let mut request = self.client.get(&url);
@@ -525,10 +521,7 @@ impl HfDownloader {
     ) -> Result<()> {
         let url = format!(
             "{}/{}/resolve/{}/{}",
-            hf_endpoint(),
-            model_id,
-            revision,
-            filename
+            self.endpoint, model_id, revision, filename
         );
 
         // Use a short display name for progress
@@ -777,6 +770,9 @@ fn format_size(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
+
+#[cfg(test)]
+mod download_tests;
 
 #[cfg(test)]
 mod tests {
