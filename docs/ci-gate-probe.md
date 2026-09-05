@@ -1,7 +1,7 @@
 # CI documentation gate validation
 
-Temporary protected-main negative control for PR #277; this document will not be merged.
+Temporary protected-main positive control for PR #277; this document will not be merged.
 
-[Missing file](ci-gate-probe-missing.md)
+[README](../README.md)
 
-[Missing anchor](../README.md#ci-gate-probe-missing-anchor)
+[Quick start](../README.md#quick-start)
