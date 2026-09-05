@@ -5694,6 +5694,7 @@ mod tests {
         text: String,
         stream_chunks: Option<Vec<String>>,
         stream_final_chunk_separate: bool,
+        stream_tail_without_token: bool,
         stream_usage: Option<TokenUsage>,
         api_response: Option<ferrum_types::ApiResponse>,
         finish_reason: FinishReason,
@@ -5712,6 +5713,7 @@ mod tests {
                 text: text.to_string(),
                 stream_chunks: None,
                 stream_final_chunk_separate: false,
+                stream_tail_without_token: false,
                 stream_usage: Some(TokenUsage::new(5, 1)),
                 api_response: None,
                 finish_reason: FinishReason::Stop,
@@ -5745,6 +5747,13 @@ mod tests {
                 stream_final_chunk_separate: true,
                 stream_usage: Some(TokenUsage::new(5, chunks.len())),
                 ..Self::new("")
+            }
+        }
+
+        fn with_tokenless_tail(chunks: &[&str]) -> Self {
+            Self {
+                stream_tail_without_token: true,
+                ..Self::with_separate_final_stream_chunk(chunks)
             }
         }
 
@@ -6300,7 +6309,8 @@ mod tests {
                     stream_chunks.push(Ok(StreamChunk {
                         request_id: request_id.clone(),
                         text: text.clone(),
-                        token: Some(TokenId::new(11 + index as u32)),
+                        token: (!(self.stream_tail_without_token && index == last))
+                            .then_some(TokenId::new(11 + index as u32)),
                         finish_reason: is_final_text_chunk.then_some(self.finish_reason),
                         usage: is_final_text_chunk
                             .then(|| self.stream_usage.clone())
@@ -9740,6 +9750,67 @@ mod tests {
             body.contains("\"prompt_tokens\":5"),
             "stream usage should come from engine final usage: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn route_streaming_preserves_tokenless_tail_before_terminal() {
+        for (path, chunks, expected_content, expected_reasoning) in [
+            ("/v1/chat/completions", ["hello ", "尾"], "hello 尾", ""),
+            (
+                "/v1/chat/completions",
+                ["<think>reason", "</think>"],
+                "",
+                "reason",
+            ),
+            ("/v1/completions", ["hello ", "尾"], "hello 尾", ""),
+        ] {
+            let chat = path == "/v1/chat/completions";
+            let mut request = json!({"model": "stub-model", "stream": true});
+            if chat {
+                request["messages"] = json!([{"role": "user", "content": "hello"}]);
+                request["stream_options"] = json!({"include_usage": true});
+            } else {
+                request["prompt"] = json!("hello");
+            }
+            let router = AxumServer::from_llm(Arc::new(StubLlm::with_tokenless_tail(&chunks)))
+                .build_router();
+            let response = post_json(router, path, request).await;
+            assert_eq!(response.status(), AxumStatusCode::OK);
+            let body = response_text(response).await;
+            let events = responses_sse_json_events(&body);
+            let content: String = events
+                .iter()
+                .filter_map(|event| {
+                    if chat {
+                        event["choices"][0]["delta"]["content"].as_str()
+                    } else {
+                        event["choices"][0]["text"].as_str()
+                    }
+                })
+                .collect();
+            let reasoning: String = events
+                .iter()
+                .filter_map(|event| event["choices"][0]["delta"]["reasoning"].as_str())
+                .collect();
+            assert_eq!(content, expected_content, "body: {body}");
+            assert_eq!(reasoning, expected_reasoning, "body: {body}");
+            assert_eq!(body.matches("data: [DONE]").count(), 1, "body: {body}");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["choices"][0]["finish_reason"] == "stop")
+                    .count(),
+                1,
+                "body: {body}"
+            );
+            let usage: Vec<_> = events
+                .iter()
+                .filter_map(|event| event["usage"].as_object())
+                .collect();
+            assert_eq!(usage.len(), 1, "body: {body}");
+            assert_eq!(usage[0]["prompt_tokens"], 5);
+            assert_eq!(usage[0]["completion_tokens"], 2);
+        }
     }
 
     #[tokio::test]

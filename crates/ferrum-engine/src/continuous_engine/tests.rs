@@ -27,6 +27,9 @@ use ferrum_models::{DecoderOnlyLLM, LlmExecutor, LlmRuntimeConfig};
 use ferrum_testkit::{MockKvCacheManager, MockModelExecutor, MockTensor, MockTensorFactory};
 use std::time::Duration;
 
+#[path = "stop_boundary_tests.rs"]
+mod stop_boundary_tests;
+
 fn test_execution_capacity_deferral(
     observed: ExecutorAdmissionEpochs,
     wait_condition: ferrum_interfaces::vnext::CapacityWaitCondition,
@@ -12734,7 +12737,7 @@ fn sample_resamples_hidden_non_stop_control_tokens_above_base_vocab() {
         Some(tokenizer.clone()),
     );
     state.generated_tokens.push(TokenId::new(4));
-    state.streamed_text_len = tokenizer
+    state.decoded_text_len = tokenizer
         .decode(&state.generated_tokens, true)
         .expect("generated prefix decodes")
         .len();
