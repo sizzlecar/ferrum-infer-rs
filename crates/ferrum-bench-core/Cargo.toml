@@ -12,3 +12,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rand = { workspace = true }
 sha2 = "0.10"
+
+# Structured release preparation keeps comments and dependency constraints.
+toml_edit = "0.22.27"
+semver = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
+serde_yaml = "0.9"
+clap = { workspace = true, features = ["derive"] }
