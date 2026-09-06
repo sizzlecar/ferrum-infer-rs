@@ -630,7 +630,7 @@ async fn load_inner(
             SUBMISSION_EXECUTE,
             SUBMISSION_UPLOAD,
         )?;
-        evidence.submission = Some(submission::verify(
+        let verified = submission::verify(
             &fs::read(raw.directory.path().join("submission.json")).map_err(|e| e.to_string())?,
             &SubmissionConfig {
                 tokens: 3,
@@ -639,7 +639,17 @@ async fn load_inner(
                 seed: 7,
                 max_nmse: 1e-7,
             },
-        )?);
+        )?;
+        eprintln!(
+            "Validated Metal submission: {}x{}x{}, {} phases, max NMSE {:.3e}, probe execution {:.3} ms",
+            verified.config().tokens,
+            verified.config().intermediate,
+            verified.config().k,
+            verified.metrics().len(),
+            verified.metrics().iter().map(|metric| metric.nmse).fold(0.0, f64::max),
+            verified.elapsed_ms(),
+        );
+        evidence.submission = Some(verified);
         consumed.push(raw);
     }
     if !schedule.runs.is_empty() {
