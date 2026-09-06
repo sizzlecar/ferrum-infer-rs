@@ -1,8 +1,8 @@
 # 发布回归决策方案
 
 2026-09-06。本文确定回归范围、成本和放行规则，并给出实施顺序。
-当前已有基础 CI、主分支必需检查和 Rust 模型回归 runner。范围选择器现已提供全量 diff 分析、代表选择、缺口和已声明费用估算，并接入代码 PR 的 CI 报告；真实检查器绑定、GPU 自动执行、费用历史、长尾调度和正式发布证据校验仍待完成，计划生成成功不能放行发布。
-具体运行步骤见 [Release regression](release-regression.md)。
+当前已有基础 CI、主分支必需检查和 Rust 模型回归 runner。范围选择器现已提供全量 diff 分析、代表选择、缺口和已声明费用估算，并接入代码 PR 的 CI 报告；自托管 Metal/CUDA 的必需数值检查已接入 CI，当前只覆盖 RMSNorm 的已列形状；其余检查器绑定、小合成架构、费用历史、长尾调度和正式发布证据校验仍待完成，计划生成成功不能放行发布。
+具体运行步骤见 [Release regression](release-regression.md) 和 [真实 GPU 数值检查](backend-numerics.md)。
 
 ## 最终原则
 

@@ -33,7 +33,9 @@ inside its existing CPU job, then uploads it with a job summary. Documentation-o
 PRs retain the inexpensive documentation checks; changed README promises also
 appear in the next complete release diff. Compilation failures can prevent plan
 generation and remain CI failures. Planning does not repeat the workspace suite or
-allocate GPUs. Existing CPU, Metal and CUDA checks retain their required outcomes.
+allocate GPUs. Existing CPU, Metal and CUDA checks retain their required outcomes. Code CI also
+requires the [real-device numerical lane](backend-numerics.md); the initial
+RMSNorm checks do not satisfy the entire kernel or architecture obligation set.
 
 A successful planning command means the input was parsed and the plan generated.
 It is **not** a runtime pass or publication permission. Review every reported
