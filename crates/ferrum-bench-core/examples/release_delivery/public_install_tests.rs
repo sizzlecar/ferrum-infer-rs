@@ -94,10 +94,17 @@ async fn public_install_preserves_real_nonzero_exit_observations() {
     assert_eq!(report.channel, Channel::Homebrew);
     assert_eq!(report.status, Status::Failed);
     assert_eq!(report.observations.len(), COMMANDS.len());
-    assert!(report
-        .observations
-        .iter()
-        .all(|item| item.exit_code == Some(1) && item.stdout.is_empty()));
+    // GNU false implements successful --help/--version responses; BSD false
+    // does not. Product subcommands exercise the portable nonzero behavior.
+    for arguments in [["run", "--help"], ["serve", "--help"]] {
+        let observation = report
+            .observations
+            .iter()
+            .find(|item| item.arguments == arguments)
+            .expect("each requested product subcommand must retain its observation");
+        assert_eq!(observation.exit_code, Some(1));
+        assert!(observation.stdout.is_empty());
+    }
     assert_eq!(report.binary_sha256, Some(sha256(&binary).unwrap()));
     assert_eq!(report.binary_sha256_after, report.binary_sha256);
 }
