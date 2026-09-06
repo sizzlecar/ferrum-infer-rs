@@ -1,4 +1,4 @@
-use ferrum_types::ModelOutputProtocol;
+use ferrum_types::{ModelOutputProtocol, ModelReasoningProtocol};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -40,6 +40,10 @@ pub struct PathImpact {
     pub path: String,
     pub areas: Vec<ChangeArea>,
     pub reason: String,
+    /// A content proof may narrow this path to independent execution routes.
+    /// Absent evidence retains every route; an empty list is invalid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_paths: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,6 +136,10 @@ impl CostEstimate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelProfile {
+    /// Catalog declaration checked against the loaded model's ready/health observation.
+    /// Old catalogs remain readable, but unknown cannot satisfy reasoning obligations.
+    #[serde(default)]
+    pub reasoning_protocol: ModelReasoningProtocol,
     pub id: String,
     pub model: String,
     pub target: ExecutionTarget,
@@ -149,6 +157,7 @@ pub enum Behavior {
     TemplateHistory,
     ProtocolFraming,
     ReasoningBoundaries,
+    ReasoningAbsence,
     UserStop,
     NaturalEnd,
     LengthLimit,
@@ -205,6 +214,12 @@ pub enum ObligationScope {
         protocol: ModelOutputProtocol,
         backend: Backend,
         execution_path: String,
+    },
+    Reasoning {
+        protocol: ModelOutputProtocol,
+        backend: Backend,
+        execution_path: String,
+        reasoning_protocol: ModelReasoningProtocol,
     },
     Target {
         target: ExecutionTarget,
@@ -271,6 +286,9 @@ pub enum Gap {
         path: String,
     },
     ProductContractReview,
+    UnknownReasoningCapability {
+        profile_id: String,
+    },
     EmptyInventory,
     MissingQuickStart {
         profile_id: String,
@@ -385,5 +403,28 @@ mod tests {
             value["billable_ms"] = bad;
             assert!(serde_json::from_value::<CostEstimate>(value).is_err());
         }
+    }
+
+    #[test]
+    fn older_catalog_reasoning_is_unknown_not_an_absence_declaration() {
+        let profile: ModelProfile = serde_json::from_value(serde_json::json!({
+            "id": "unresolved", "model": "fixture/model", "available": true, "estimate": null,
+            "target": {"architecture": "dense", "protocol": "text", "precision": "bf16",
+                "backend": "cpu", "execution_path": "production-plan-runtime"}
+        }))
+        .unwrap();
+        assert_eq!(profile.reasoning_protocol, ModelReasoningProtocol::Unknown);
+        for (text, expected) in [
+            ("none", ModelReasoningProtocol::None),
+            ("prompt_opened", ModelReasoningProtocol::PromptOpened),
+            ("model_generated", ModelReasoningProtocol::ModelGenerated),
+            ("unknown", ModelReasoningProtocol::Unknown),
+        ] {
+            assert_eq!(
+                serde_json::from_value::<ModelReasoningProtocol>(serde_json::json!(text)).unwrap(),
+                expected
+            );
+        }
+        assert!(serde_json::from_value::<ModelReasoningProtocol>(serde_json::Value::Null).is_err());
     }
 }

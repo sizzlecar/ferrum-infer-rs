@@ -30,6 +30,7 @@ pub(crate) fn args() -> ExecuteArgs {
 fn task(backend: Backend, id: &str) -> ExpectedModelRun {
     ExpectedModelRun {
         profile: ModelProfile {
+            reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: id.into(),
             model: "org/model".into(),
             target: ExecutionTarget {

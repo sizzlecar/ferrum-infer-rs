@@ -5,6 +5,7 @@ use serde_json::json;
 fn task(id: &str, backend: Backend, checks: Vec<ModelCheck>) -> ExpectedModelRun {
     ExpectedModelRun {
         profile: ModelProfile {
+            reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: id.into(),
             model: format!("fixture/{id}"),
             target: ExecutionTarget {
@@ -38,6 +39,7 @@ impl ReportFixture {
     fn passed(expected: &ExpectedModelRun) -> Self {
         let ready = json!({
             "event": "ready", "requested_model": expected.profile.model,
+            "reasoning_protocol": expected.profile.reasoning_protocol,
             "backend": match expected.profile.target.backend {
                 Backend::Cpu => "CPU", Backend::Metal => "Metal", Backend::Cuda => "CUDA(0)",
             }
@@ -45,7 +47,7 @@ impl ReportFixture {
         let mut cases = vec![
             json!({"case": "binary-version", "status": "passed", "evidence": {"version": format!("ferrum {}", expected.version)}}),
             json!({"case": "serve-startup", "status": "passed", "evidence": {
-                "version": expected.version, "status": "healthy",
+                "version": expected.version, "status": "healthy", "reasoning_protocol": expected.profile.reasoning_protocol,
                 "auto_config": {"hardware_capabilities": {"backend": backend_name(expected.profile.target.backend)}}
             }}),
         ];
@@ -62,7 +64,30 @@ impl ReportFixture {
             };
             for name in entries {
                 let evidence = match *name {
-                    "run-basic" | "run-stop" => json!({"ready": ready.clone()}),
+                    "run-basic" => {
+                        let answers: Vec<_> = ["42", "cobalt-731"]
+                            .into_iter()
+                            .map(|answer| {
+                                let output = boundary_fixture(answer, "", "stop", 10);
+                                json!({"content": output["message"]["content"], "reasoning": null,
+                                "finish_reason": output["finish_reason"], "usage": output["usage"]})
+                            })
+                            .collect();
+                        json!({"ready": ready.clone(), "answers": answers})
+                    }
+                    "serve-basic" => {
+                        let mut observations = json!({});
+                        for (mode, answer) in [
+                            ("sync", "42"),
+                            ("stream", "42"),
+                            ("recall", "cobalt-731"),
+                            ("stream_recall", "cobalt-731"),
+                        ] {
+                            observations[mode] = boundary_fixture(answer, "", "stop", 10);
+                        }
+                        json!({"observations": observations})
+                    }
+                    "run-stop" => json!({"ready": ready.clone()}),
                     "run-reasoning" | "serve-reasoning" => {
                         let output = boundary_fixture("42", "17 plus 25 equals 42.", "stop", 10);
                         json!({"ready": ready, "enable_thinking": true, "max_tokens": expected.max_tokens,
@@ -546,4 +571,72 @@ fn truncation_budget_cannot_accept_empty_or_overflowing_baselines() {
         )
         .is_err());
     }
+}
+
+#[test]
+fn reasoning_capability_cannot_be_faked_by_nullable_thought_or_declared_target() {
+    let mut expected = task("non-thinking", Backend::Cpu, vec![ModelCheck::Basic]);
+    expected.profile.reasoning_protocol = ModelReasoningProtocol::None;
+    let valid = ReportFixture::passed(&expected);
+    verify_model_report(&expected, &valid.value).unwrap();
+    for capability in [
+        serde_json::Value::Null,
+        json!("unknown"),
+        json!("prompt_opened"),
+        json!("model_generated"),
+    ] {
+        for case in ["run-basic", "serve-startup"] {
+            let mut bad = ReportFixture::passed(&expected);
+            let observation = if case == "run-basic" {
+                &mut bad.case_mut(case)["evidence"]["ready"]
+            } else {
+                &mut bad.case_mut(case)["evidence"]
+            };
+            observation["reasoning_protocol"] = capability.clone();
+            assert!(
+                verify_model_report(&expected, &bad.value).is_err(),
+                "accepted {case}: {capability}"
+            );
+        }
+    }
+    for mode in ["sync", "stream", "recall", "stream_recall"] {
+        let mut bad = ReportFixture::passed(&expected);
+        bad.case_mut("serve-basic")["evidence"]["observations"][mode]["message"]["reasoning"] =
+            json!("unexpected thought");
+        assert!(verify_model_report(&expected, &bad.value).is_err());
+    }
+    let mut bad = ReportFixture::passed(&expected);
+    bad.case_mut("run-basic")["evidence"]["answers"][1]["reasoning"] = json!("unexpected thought");
+    assert!(verify_model_report(&expected, &bad.value).is_err());
+    let mut bad = ReportFixture::passed(&expected);
+    bad.case_mut("serve-basic")["evidence"]["observations"] = Value::Null;
+    assert!(verify_model_report(&expected, &bad.value).is_err());
+    expected.checks = vec![ModelCheck::Reasoning];
+    let fabricated = ReportFixture::passed(&expected);
+    assert!(verify_model_report(&expected, &fabricated.value).is_err());
+    expected.profile.reasoning_protocol = ModelReasoningProtocol::Unknown;
+    let unknown = ReportFixture::passed(&expected);
+    assert!(verify_model_options(&expected, &unknown.value["options"]).is_err());
+}
+
+#[test]
+fn absence_oracle_is_distinct_from_enabled_reasoning_and_rejects_control_leaks() {
+    let absent = boundary_fixture("42", "", "stop", 10);
+    verify_reasoning_absence_observation(&absent, "42").unwrap();
+    assert!(verify_reasoning_observation(&absent).is_err());
+    for (content, thought, finish) in [
+        ("42", "private", "stop"),
+        ("<think>42", "", "stop"),
+        ("42", "", "length"),
+        ("43", "", "stop"),
+    ] {
+        assert!(verify_reasoning_absence_observation(
+            &boundary_fixture(content, thought, finish, 10),
+            "42"
+        )
+        .is_err());
+    }
+    let mut malformed = absent;
+    malformed["message"]["reasoning"] = json!(false);
+    assert!(verify_reasoning_absence_observation(&malformed, "42").is_err());
 }

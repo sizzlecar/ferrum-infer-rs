@@ -2,7 +2,8 @@
 use super::{git, resolve_revision};
 use ferrum_bench_core::release_regression::dependency_change::validation_dependency_paths;
 use ferrum_bench_core::release_regression::source_change::{
-    bench_release_exports_only, homebrew_documentation_only, rust_validation_only,
+    bench_release_exports_only, homebrew_documentation_only, legacy_metal_submission_only,
+    rust_validation_only,
 };
 use ferrum_bench_core::release_regression::{
     analyze_paths, coordinated_version_paths, ChangeArea, Impact,
@@ -44,10 +45,12 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
         Homebrew,
         Tests,
         ReleaseExports,
+        LegacyMetalSubmission,
     }
     let mut rust_paths = Vec::new();
     let mut release_tool_paths = Vec::new();
     let mut installation_paths = Vec::new();
+    let mut legacy_submission_paths = Vec::new();
     let mut unresolved = Vec::new();
     for entry in &mut impact.paths {
         let readme = matches!(entry.path.as_str(), "README.md" | "README_zh.md");
@@ -76,6 +79,10 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
                 && bench_release_exports_only(&before, &after)?
             {
                 Ok(Some(ContentProof::ReleaseExports))
+            } else if entry.path == "crates/ferrum-kernels/src/backend/metal/mod.rs"
+                && legacy_metal_submission_only(&before, &after)?
+            {
+                Ok(Some(ContentProof::LegacyMetalSubmission))
             } else {
                 Ok(None)
             }
@@ -96,6 +103,11 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
                 entry.reason = "bench-core root AST only adds reviewed release_candidate/release_regression module exports; every existing item, including observability APIs, is unchanged".into();
                 release_tool_paths.push(entry.path.clone());
             }
+            Ok(Some(ContentProof::LegacyMetalSubmission)) => {
+                entry.execution_paths = Some(vec!["legacy-model-executor".into()]);
+                entry.reason = "AST changes are confined to MetalContext submission/completion and its checked-sync API; shared state, operator bodies and Backend trait implementations are unchanged; independent production-plan queues remain outside this path's reach".into();
+                legacy_submission_paths.push(entry.path.clone());
+            }
             Ok(None) => {}
             Err(reason) => unresolved.push(json!({"path": entry.path, "reason": reason})),
         }
@@ -108,7 +120,7 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
         .into_iter()
         .filter(|area| impact.paths.iter().any(|entry| entry.areas.contains(area)))
         .collect();
-    json!({"rust_validation_paths": rust_paths, "release_tool_export_paths": release_tool_paths, "homebrew_installation_paths": installation_paths, "unresolved": unresolved})
+    json!({"rust_validation_paths": rust_paths, "release_tool_export_paths": release_tool_paths, "homebrew_installation_paths": installation_paths, "legacy_metal_submission_paths": legacy_submission_paths, "unresolved": unresolved})
 }
 
 pub(super) fn analyze(repo: &Path, base: &str, candidate: &str, paths: &[String]) -> Analysis {

@@ -10,6 +10,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+use ferrum_bench_core::release_regression::model_tasks::verify_reasoning_absence_observation;
+
+fn observation(chat: &Chat) -> Value {
+    json!({"message": chat.message, "finish_reason": chat.finish, "usage": chat.usage})
+}
+
 const FIRST_TURN: &str =
     "Remember the code cobalt-731. What is 17 + 25? Reply with only the number.";
 const SECOND_TURN: &str = "What code did I ask you to remember? Reply with only that code.";
@@ -145,6 +151,18 @@ pub(super) async fn run_basic(args: &Args) -> Result<Value> {
             .context("missing recall answer")?,
         "cobalt-731",
     )?;
+    if run.ready["reasoning_protocol"] == "none" {
+        for (assistant, answer) in run.assistants.iter().zip(["42", "cobalt-731"]) {
+            ensure!(
+                assistant.get("reasoning_content").is_none(),
+                "noncanonical run reasoning alias"
+            );
+            let output = json!({"message": {"role": "assistant", "content": assistant["content"],
+                "reasoning": assistant["reasoning"], "tool_calls": assistant["tool_calls"]},
+                "finish_reason": assistant["finish_reason"], "usage": assistant["usage"]});
+            verify_reasoning_absence_observation(&output, answer).map_err(anyhow::Error::msg)?;
+        }
+    }
     Ok(json!({"ready": run.ready, "answers": run.assistants}))
 }
 
@@ -263,8 +281,21 @@ pub(super) async fn serve_basic(server: &Server<'_>) -> Result<Value> {
     )
     .await?;
     finished_answer(&streamed, "42").context("streamed arithmetic")?;
+    let observations = json!({"sync": observation(&first), "stream": observation(&streamed),
+        "recall": observation(&recall), "stream_recall": observation(&streamed_recall)});
+    if server.health["reasoning_protocol"] == "none" {
+        for (mode, answer) in [
+            ("sync", "42"),
+            ("stream", "42"),
+            ("recall", "cobalt-731"),
+            ("stream_recall", "cobalt-731"),
+        ] {
+            verify_reasoning_absence_observation(&observations[mode], answer)
+                .map_err(anyhow::Error::msg)?;
+        }
+    }
     Ok(
-        json!({"models": models, "sync_answer": first.content(), "recall": recall.content(), "stream_recall": streamed_recall.content(), "stream_recall_usage": streamed_recall.usage, "stream_answer": streamed.content(), "stream_usage": streamed.usage}),
+        json!({"observations": observations, "models": models, "sync_answer": first.content(), "recall": recall.content(), "stream_recall": streamed_recall.content(), "stream_recall_usage": streamed_recall.usage, "stream_answer": streamed.content(), "stream_usage": streamed.usage}),
     )
 }
 

@@ -7,6 +7,7 @@ use serde_json::json;
 fn task() -> ExpectedModelRun {
     ExpectedModelRun {
         profile: ModelProfile {
+            reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: "quick-start-cuda".into(),
             model: "fixture/model".into(),
             available: true,

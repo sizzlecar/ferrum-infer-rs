@@ -82,6 +82,126 @@ pub fn bench_release_exports_only(before: &str, after: &str) -> Result<bool, Str
     Ok(before.into_token_stream().to_string() == after.into_token_stream().to_string())
 }
 
+/// Prove a change is confined to the legacy MetalContext submission lifecycle.
+/// The caller must restrict this to backend/metal/mod.rs. The independent vNext
+/// runtime owns its queues and does not use MetalContext; its own source changes
+/// still contribute unrestricted Metal reach. Keep every shared declaration,
+/// Backend trait implementation, operator body and buffer representation intact.
+/// This is a reach proof, not proof of correct synchronization or performance.
+pub fn legacy_metal_submission_only(before: &str, after: &str) -> Result<bool, String> {
+    fn function_header(vis: &syn::Visibility, sig: &syn::Signature) -> String {
+        quote::quote!(#vis #sig).to_string()
+    }
+    fn reviewed_function(
+        attrs: &[Attribute],
+        vis: &syn::Visibility,
+        sig: &syn::Signature,
+        expected: &str,
+    ) -> bool {
+        let expected: syn::ItemFn = syn::parse_str(expected).expect("fixed scope signature");
+        attrs
+            .iter()
+            .all(|attribute| attribute.path().is_ident("doc") || attribute.path().is_ident("allow"))
+            && function_header(vis, sig) == function_header(&expected.vis, &expected.sig)
+    }
+    fn retained(source: &str) -> Result<Option<String>, String> {
+        let mut file =
+            syn::parse_file(source).map_err(|error| format!("Rust scope parse: {error}"))?;
+        let mut kept = Vec::new();
+        let mut flushes = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        for mut item in file.items {
+            if matches!(&item, Item::Mod(module) if module.attrs.iter().any(test_configuration)) {
+                continue;
+            }
+            match &mut item {
+                Item::Impl(implementation)
+                    if implementation.trait_.is_none()
+                        && implementation.generics.params.is_empty()
+                        && implementation.generics.where_clause.is_none()
+                        && implementation.attrs.is_empty()
+                        && implementation.unsafety.is_none()
+                        && implementation.defaultness.is_none() =>
+                {
+                    let owner = implementation.self_ty.to_token_stream().to_string();
+                    if owner == "MetalContext" || owner == "MetalBackend" {
+                        let mut methods = Vec::new();
+                        let mut removed = false;
+                        for method in std::mem::take(&mut implementation.items) {
+                            let expected = if let syn::ImplItem::Fn(function) = &method {
+                                match (owner.as_str(), function.sig.ident.to_string().as_str()) {
+                                    ("MetalContext", "flush") => Some("pub(crate) fn flush(&mut self) {}"),
+                                    ("MetalContext", "submit_and_wait") => Some("fn submit_and_wait(&mut self) -> Option<&'static metal::CommandBufferRef> {}"),
+                                    ("MetalContext", "flush_checked") => Some("fn flush_checked(&mut self) -> Result<()> {}"),
+                                    ("MetalBackend", "sync_checked") => Some("pub fn sync_checked(ctx: &mut MetalContext) -> Result<()> {}"),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(expected) = expected {
+                                let syn::ImplItem::Fn(function) = &method else {
+                                    unreachable!()
+                                };
+                                if !reviewed_function(
+                                    &function.attrs,
+                                    &function.vis,
+                                    &function.sig,
+                                    expected,
+                                ) || !seen.insert(format!("{owner}::{}", function.sig.ident))
+                                {
+                                    return Ok(None);
+                                }
+                                if owner == "MetalContext" && function.sig.ident == "flush" {
+                                    flushes += 1;
+                                }
+                                removed = true;
+                            } else {
+                                methods.push(method);
+                            }
+                        }
+                        implementation.items = methods;
+                        // Only the reviewed checked-sync API may introduce an
+                        // otherwise empty inherent Backend implementation.
+                        if owner == "MetalBackend" && removed && implementation.items.is_empty() {
+                            continue;
+                        }
+                    }
+                }
+                Item::Fn(function) => {
+                    let expected = match function.sig.ident.to_string().as_str() {
+                        "command_buffer_error" => Some("fn command_buffer_error(cmd: &metal::CommandBufferRef) -> (Option<i64>, Option<String>) {}"),
+                        "validate_command_buffer_completion" => Some("fn validate_command_buffer_completion(status: metal::MTLCommandBufferStatus, code: Option<i64>, detail: Option<&str>) -> Result<()> {}"),
+                        _ => None,
+                    };
+                    if let Some(expected) = expected {
+                        if !reviewed_function(
+                            &function.attrs,
+                            &function.vis,
+                            &function.sig,
+                            expected,
+                        ) || !seen.insert(function.sig.ident.to_string())
+                        {
+                            return Ok(None);
+                        }
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            kept.push(item);
+        }
+        if flushes != 1 {
+            return Ok(None);
+        }
+        file.items = kept;
+        Ok(Some(file.into_token_stream().to_string()))
+    }
+    Ok(
+        matches!((retained(before)?, retained(after)?), (Some(before), Some(after)) if before == after),
+    )
+}
+
 /// The repository's explicit Homebrew blocks are the first shell block in
 /// Quick Start and Installation. Everything outside these blocks and their
 /// installation introduction must remain unchanged, including all model commands,

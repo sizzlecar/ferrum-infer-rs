@@ -90,7 +90,11 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         ("structured-sampling", StructuredSampling, http.clone(), vec![server("engine_stop_contract::structured::wire_schema_changes_actual_text_sampling"), server("engine_stop_contract::structured::wire_schema_preserves_harmony_framing_before_constraining_payload")]),
         ("structured-validity", StructuredValidity, http.clone(), vec![server("engine_stop_contract::structured::wire_schema_changes_actual_text_sampling"), server("engine_stop_contract::structured::wire_schema_preserves_harmony_framing_before_constraining_payload")]),
         ("tool-selection", ToolSelection, http.clone(), vec![server("engine_stop_contract::tools::harmony_function_handoff_rejects_a_different_named_choice"), server("engine_stop_contract::tools::harmony_final_json_cannot_impersonate_a_required_tool_call"), server("engine_stop_contract::tools::harmony_tool_choice_none_rejects_native_call_sync"), server("engine_stop_contract::tools::harmony_tool_choice_none_rejects_native_call_sse")]),
-        ("tool-handoff", ToolHandoff, http, vec![server("engine_stop_contract::tools::harmony_function_handoff_reaches_sync_and_sse")]),
+        ("tool-handoff", ToolHandoff, http.clone(), vec![server("engine_stop_contract::tools::harmony_function_handoff_reaches_sync_and_sse")]),
+        // Both routes preserve returned call IDs, arguments and tool results in
+        // the next engine request. The template case includes out-of-order
+        // results for two calls to the same function; no model semantics are inferred.
+        ("tool-continuation", ToolContinuation, http, vec![server("route_tool_request_reaches_engine_structured_boundary"), server("route_tool_request_prefers_model_chat_template")]),
         ("scheduling-progress", SchedulingProgress, all.clone(), vec![scheduler("deferred_head_does_not_block_an_eligible_smaller_request"), scheduler("release_epoch_wakes_and_admits_a_deferred_request"), scheduler("unchanged_evidence_suppresses_blind_retries")]),
         ("cancellation", Cancellation, all.clone(), vec![scheduler("cancellation_returns_the_exact_waiting_request"), engine("plan_runtime_capacity_wait_wakes_and_cancels_when_stream_is_dropped"), engine("plan_runtime_capacity_wait_wakes_and_cancels_when_sync_future_is_aborted")]),
         ("capacity-admission", CapacityAdmission, all.clone(), vec![scheduler("permanent_rejection_and_fault_leave_no_waiting_ownership"), kv("failed_allocate_rolls_back_partial_blocks"), kv("failed_extend_rolls_back_partial_blocks_and_handle_table")]),

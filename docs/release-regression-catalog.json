@@ -11,7 +11,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
     },
     {
       "id": "quick-start-cuda",
@@ -24,7 +25,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
     },
     {
       "id": "hybrid-moe-metal",
@@ -37,7 +39,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
     },
     {
       "id": "attention-moe-metal",
@@ -50,7 +53,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "model_generated"
     },
     {
       "id": "attention-moe-cuda",
@@ -63,7 +67,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "none"
     },
     {
       "id": "llama-dense-metal",
@@ -76,7 +81,8 @@
         "execution_path": "legacy-model-executor"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "none"
     },
     {
       "id": "llama-dense-cuda",
@@ -89,7 +95,8 @@
         "execution_path": "legacy-model-executor"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "none"
     },
     {
       "id": "hybrid-dense-ct-int4-cuda",
@@ -102,7 +109,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
     },
     {
       "id": "hybrid-dense-block-fp8-cuda",
@@ -115,7 +123,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
     },
     {
       "id": "hybrid-moe-block-fp8-cuda",
@@ -128,7 +137,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "prompt_opened"
     },
     {
       "id": "harmony-mxfp4-cuda",
@@ -141,7 +151,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "model_generated"
     },
     {
       "id": "gemma-ct-w4a16-cuda",
@@ -154,7 +165,8 @@
         "execution_path": "production-plan-runtime"
       },
       "available": true,
-      "estimate": null
+      "estimate": null,
+      "reasoning_protocol": "model_generated"
     }
   ],
   "quick_start_profile_ids": [

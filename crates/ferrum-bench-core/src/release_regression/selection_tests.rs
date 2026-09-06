@@ -18,6 +18,7 @@ fn target(
 
 fn profile(id: &str, target: ExecutionTarget) -> ModelProfile {
     ModelProfile {
+        reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
         id: id.into(),
         model: format!("fixture/{id}"),
         target,
@@ -1513,10 +1514,11 @@ fn backend_reach_is_per_area_and_preserves_shared_download_protocol_and_quick_st
                 |obligation| obligation.behavior == Behavior::ReasoningBoundaries
                     && obligation.layer == EvidenceLayer::ModelRuntime
                     && obligation.scope
-                        == ObligationScope::Protocol {
+                        == ObligationScope::Reasoning {
                             protocol: expected.protocol,
                             backend: expected.backend,
-                            execution_path: expected.execution_path.clone()
+                            execution_path: expected.execution_path.clone(),
+                            reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened
                         }
             ));
         assert!(result
@@ -1602,6 +1604,254 @@ fn backend_path_union_and_unknown_or_shared_kernel_reach_remain_conservative() {
                 .iter()
                 .any(|obligation| obligation.behavior == Behavior::ArchitectureState),
             "{shared}"
+        );
+    }
+}
+
+#[test]
+fn template_reasoning_modes_have_distinct_runtime_representatives() {
+    use ferrum_types::ModelReasoningProtocol as Reasoning;
+    let target = text_target("bf16", Backend::Cpu);
+    let mut profiles = Vec::new();
+    for (id, capability) in [
+        ("plain", Reasoning::None),
+        ("opened", Reasoning::PromptOpened),
+        ("generated", Reasoning::ModelGenerated),
+    ] {
+        let mut candidate = profile(id, target.clone());
+        candidate.reasoning_protocol = capability;
+        profiles.push(candidate);
+    }
+    let mut request = input(Stage::PullRequest, vec![target], profiles);
+    request.impact.areas = vec![ChangeArea::Template];
+    request.checks = super::super::contracts::contract_check_descriptors();
+    request
+        .checks
+        .extend(super::super::model_schedule::model_check_descriptors());
+    let result = plan(&request).unwrap();
+    for candidate in &request.profiles {
+        let (index, obligation) = result
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, obligation)| {
+                matches!(&obligation.scope, ObligationScope::Reasoning { reasoning_protocol, .. }
+                if *reasoning_protocol == candidate.reasoning_protocol)
+            })
+            .unwrap();
+        assert_eq!(
+            obligation.behavior,
+            if candidate.reasoning_protocol == Reasoning::None {
+                Behavior::ReasoningAbsence
+            } else {
+                Behavior::ReasoningBoundaries
+            }
+        );
+        let owner = result
+            .selected
+            .iter()
+            .find(|selected| selected.obligations.contains(&index))
+            .unwrap();
+        assert_eq!(
+            owner.profile.reasoning_protocol,
+            candidate.reasoning_protocol
+        );
+    }
+    let schedule = super::super::model_schedule::model_task_schedule(&result);
+    assert!(schedule.unsupported_obligations.is_empty());
+    let plain = schedule
+        .runs
+        .iter()
+        .find(|run| run.profile.reasoning_protocol == Reasoning::None)
+        .unwrap();
+    assert_eq!(plain.checks, [super::super::model_tasks::ModelCheck::Basic]);
+    assert!(schedule
+        .runs
+        .iter()
+        .filter(|run| run.profile.reasoning_protocol.supports_reasoning())
+        .all(|run| run
+            .checks
+            .contains(&super::super::model_tasks::ModelCheck::Reasoning)));
+}
+
+#[test]
+fn unknown_reasoning_capability_is_a_pre_execution_gap_only_when_affected() {
+    let target = text_target("bf16", Backend::Cpu);
+    let mut candidate = profile("unresolved", target.clone());
+    candidate.reasoning_protocol = ferrum_types::ModelReasoningProtocol::Unknown;
+    let mut request = input(Stage::PullRequest, vec![target], vec![candidate]);
+    request.impact.areas = vec![ChangeArea::Template];
+    let result = plan(&request).unwrap();
+    assert!(result.gaps.contains(&Gap::UnknownReasoningCapability {
+        profile_id: "unresolved".into()
+    }));
+    request.impact.areas = vec![ChangeArea::Download];
+    assert!(!plan(&request)
+        .unwrap()
+        .gaps
+        .iter()
+        .any(|gap| matches!(gap, Gap::UnknownReasoningCapability { .. })));
+}
+
+#[test]
+fn content_proven_legacy_submission_keeps_kernel_obligations_on_its_execution_route() {
+    let mut legacy = text_target("f32", Backend::Metal);
+    legacy.execution_path = "legacy-model-executor".into();
+    let production = text_target("bf16", Backend::Metal);
+    let cuda = text_target("bf16", Backend::Cuda);
+    let targets = vec![legacy.clone(), production.clone(), cuda.clone()];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| profile(&format!("route-{index}"), target.clone()))
+            .collect(),
+    );
+    request.impact =
+        super::super::analyze_paths(["crates/ferrum-kernels/src/backend/metal/mod.rs"]);
+    request.impact.paths[0].execution_paths = Some(vec![legacy.execution_path.clone()]);
+    let result = plan(&request).unwrap();
+    for (behavior, layer) in [
+        (Behavior::ModelForward, EvidenceLayer::ModelRuntime),
+        (Behavior::KernelNumerics, EvidenceLayer::BackendNumerics),
+        (Behavior::KernelBoundaries, EvidenceLayer::BackendNumerics),
+        (Behavior::Performance, EvidenceLayer::Performance),
+    ] {
+        let obligations: Vec<_> = result
+            .obligations
+            .iter()
+            .enumerate()
+            .filter(|(_, obligation)| obligation.behavior == behavior && obligation.layer == layer)
+            .collect();
+        assert!(!obligations.is_empty(), "{behavior:?}");
+        for (index, obligation) in obligations {
+            assert_eq!(
+                obligation.scope,
+                ObligationScope::Target {
+                    target: legacy.clone()
+                }
+            );
+            assert!(result
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+        }
+    }
+    // Scope restrictions cannot silently succeed when the inventory has only
+    // the independent production route, or names a nonexistent/empty route.
+    request.required_targets.retain(|target| target != &legacy);
+    assert!(plan(&request)
+        .unwrap_err()
+        .contains("no target in the declared regression inventory"));
+    request.required_targets = targets;
+    for routes in [
+        vec![],
+        vec![String::new()],
+        vec!["unknown-route".into()],
+        vec![legacy.execution_path.clone(), legacy.execution_path.clone()],
+    ] {
+        request.impact.paths[0].execution_paths = Some(routes);
+        assert!(plan(&request).is_err());
+    }
+}
+
+#[test]
+fn execution_reach_unions_each_path_without_narrowing_shared_areas_or_quick_starts() {
+    let mut legacy = text_target("f32", Backend::Metal);
+    legacy.execution_path = "legacy-model-executor".into();
+    let production = text_target("bf16", Backend::Metal);
+    let cuda = text_target("bf16", Backend::Cuda);
+    let targets = vec![legacy.clone(), production.clone(), cuda.clone()];
+    let path = "crates/ferrum-kernels/src/backend/metal/mod.rs";
+    let mut request = input(
+        Stage::Release,
+        targets.clone(),
+        vec![
+            profile("legacy", legacy.clone()),
+            profile("production", production.clone()),
+            profile("cuda", cuda.clone()),
+        ],
+    );
+    request.quick_start_profile_ids = vec!["production".into(), "cuda".into()];
+    request.impact = super::super::analyze_paths([
+        path,
+        "crates/ferrum-types/src/reasoning.rs",
+        "crates/ferrum-cli/src/source_resolver.rs",
+    ]);
+    request
+        .impact
+        .paths
+        .iter_mut()
+        .find(|entry| entry.path == path)
+        .unwrap()
+        .execution_paths = Some(vec![legacy.execution_path.clone()]);
+    assert_eq!(
+        area_targets(&request.impact, ChangeArea::Kernel, &targets).unwrap(),
+        [legacy.clone()]
+    );
+    for area in [
+        ChangeArea::Template,
+        ChangeArea::Download,
+        ChangeArea::Scheduler,
+    ] {
+        assert_eq!(
+            area_targets(&request.impact, area, &targets).unwrap(),
+            targets
+        );
+    }
+    let result = plan(&request).unwrap();
+    for id in &request.quick_start_profile_ids {
+        assert!(result.obligations.iter().any(|obligation| obligation.behavior == Behavior::QuickStart
+            && matches!(&obligation.scope, ObligationScope::Profile { profile_id, .. } if profile_id == id)));
+    }
+    for additional in [
+        "crates/ferrum-kernels/src/backend/metal/vnext_runtime.rs",
+        "crates/ferrum-kernels/src/backend/metal/quant.rs",
+    ] {
+        request.impact = super::super::analyze_paths([path, additional]);
+        request
+            .impact
+            .paths
+            .iter_mut()
+            .find(|entry| entry.path == path)
+            .unwrap()
+            .execution_paths = Some(vec![legacy.execution_path.clone()]);
+        assert_eq!(
+            area_targets(&request.impact, ChangeArea::Kernel, &targets).unwrap(),
+            [legacy.clone(), production.clone()]
+        );
+    }
+    // Backend reach and execution reach are intersected for each contributor
+    // before union, so CUDA cannot broaden the unrelated Metal production route.
+    request.impact =
+        super::super::analyze_paths([path, "crates/ferrum-kernels/src/backend/cuda/mod.rs"]);
+    request
+        .impact
+        .paths
+        .iter_mut()
+        .find(|entry| entry.path == path)
+        .unwrap()
+        .execution_paths = Some(vec![legacy.execution_path.clone()]);
+    assert_eq!(
+        area_targets(&request.impact, ChangeArea::Kernel, &targets).unwrap(),
+        [legacy.clone(), cuda]
+    );
+    for unknown in [
+        "unknown/forward.rs",
+        "crates/ferrum-kernels/src/backend/unreviewed/ops.rs",
+    ] {
+        request.impact = super::super::analyze_paths([path, unknown]);
+        request
+            .impact
+            .paths
+            .iter_mut()
+            .find(|entry| entry.path == path)
+            .unwrap()
+            .execution_paths = Some(vec![legacy.execution_path.clone()]);
+        assert_eq!(
+            area_targets(&request.impact, ChangeArea::Kernel, &targets).unwrap(),
+            targets
         );
     }
 }

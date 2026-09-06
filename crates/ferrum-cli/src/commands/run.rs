@@ -95,7 +95,13 @@ fn finish_reason_str(r: FinishReason) -> &'static str {
     }
 }
 
-fn emit_jsonl_ready(session_id: &str, requested_model: &str, resolved_model: &str, backend: &str) {
+fn emit_jsonl_ready(
+    session_id: &str,
+    requested_model: &str,
+    resolved_model: &str,
+    backend: &str,
+    template: Option<&ModelChatTemplate>,
+) {
     let record = serde_json::json!({
         "schema_version": RUN_JSONL_SCHEMA_VERSION,
         "event": "ready",
@@ -105,6 +111,7 @@ fn emit_jsonl_ready(session_id: &str, requested_model: &str, resolved_model: &st
         "requested_model": requested_model,
         "resolved_model": resolved_model,
         "backend": backend,
+        "reasoning_protocol": template.map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
     });
     emit_jsonl_record(&record);
 }
@@ -1309,7 +1316,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         let request_id_text = request_id.to_string();
         let one_shot_history = Vec::new();
         if format == OutputFormat::Jsonl {
-            emit_jsonl_ready(&run_session_id, &requested_model, &model_id, &device_label);
+            emit_jsonl_ready(
+                &run_session_id,
+                &requested_model,
+                &model_id,
+                &device_label,
+                model_chat_template.as_ref(),
+            );
             emit_jsonl_user(
                 &run_session_id,
                 0,
@@ -1554,7 +1567,13 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
             eprintln!();
         }
         OutputFormat::Jsonl => {
-            emit_jsonl_ready(&run_session_id, &requested_model, &model_id, &device_label);
+            emit_jsonl_ready(
+                &run_session_id,
+                &requested_model,
+                &model_id,
+                &device_label,
+                model_chat_template.as_ref(),
+            );
         }
     }
 

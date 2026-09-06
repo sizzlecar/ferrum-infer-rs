@@ -4,6 +4,24 @@ use crate::{FerrumError, ModelOutputProtocol, Result};
 
 mod gemma;
 
+/// Resolved reasoning behavior of the model-owned template and output protocol.
+/// Unknown is not equivalent to a template that explicitly has no reasoning mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelReasoningProtocol {
+    #[default]
+    Unknown,
+    None,
+    PromptOpened,
+    ModelGenerated,
+}
+
+impl ModelReasoningProtocol {
+    pub const fn supports_reasoning(self) -> bool {
+        matches!(self, Self::PromptOpened | Self::ModelGenerated)
+    }
+}
+
 pub const THINK_START_TAG: &str = "<think>";
 pub const THINK_END_TAG: &str = "</think>";
 pub const GEMMA_THOUGHT_START_TAG: &str = "<|channel>thought\n";
