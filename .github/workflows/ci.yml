@@ -209,7 +209,7 @@ jobs:
           # each package with a different feature selection.
           cargo test --locked --workspace --all-targets --no-run --message-format=json \
             > "$RUNNER_TEMP/contract-artifacts.jsonl"
-          cargo run --locked -p ferrum-bench-core --example contract_checks -- \
+          cargo run --locked -p ferrum-devtools --bin contract_checks -- \
             --artifacts "$RUNNER_TEMP/contract-artifacts.jsonl" \
             --output "$RUNNER_TEMP/contract-checks.json"
 

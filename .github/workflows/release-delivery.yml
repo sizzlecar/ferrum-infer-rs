@@ -159,7 +159,7 @@ jobs:
           path: ${{ runner.temp }}/staged
       - name: Bind selected tasks and inspect CPU and CUDA archive bytes
         run: |
-          cargo build --locked -p ferrum-bench-core --example release_delivery --example model_gate
+          cargo build --locked -p ferrum-devtools -p ferrum-bench-core --bin release_delivery --example model_gate
           mkdir -p "$RUNNER_TEMP/installation"
           for backend in cpu cuda; do
             asset=ferrum-linux-x86_64.tar.gz
@@ -168,7 +168,7 @@ jobs:
               asset=ferrum-linux-x86_64-cuda-sm89.tar.gz
               extra=(--extract-only)
             fi
-            target/debug/examples/release_delivery inspect \
+            target/debug/release_delivery inspect \
               --abi "$RUNNER_TEMP/staged/$asset.abi.json" --version "$VERSION" \
               --candidate-sha "$GITHUB_SHA" --extract-dir "$RUNNER_TEMP/extracted-$backend" \
               --output "$RUNNER_TEMP/installation/$backend.json" "${extra[@]}"
@@ -215,8 +215,8 @@ jobs:
           path: ${{ runner.temp }}/tasks
       - name: Execute selected Metal models from the staged archive
         run: |
-          cargo build --locked -p ferrum-bench-core --example release_delivery
-          target/debug/examples/release_delivery inspect \
+          cargo build --locked -p ferrum-devtools --bin release_delivery
+          target/debug/release_delivery inspect \
             --abi "$RUNNER_TEMP/staged-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
             --version "$VERSION" --candidate-sha "$GITHUB_SHA" \
             --extract-dir "$RUNNER_TEMP/extracted-metal" --output "$RUNNER_TEMP/installation-metal.json"
@@ -225,7 +225,7 @@ jobs:
           tar -xzf model-regression-macos-aarch64.tar.gz model_regression
           runner_sha=$(awk '{print $1}' model-regression-macos-aarch64.binary.sha256)
           cd "$GITHUB_WORKSPACE"
-          target/debug/examples/release_delivery local --backend metal \
+          target/debug/release_delivery local --backend metal \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-metal/ferrum" \
             --runner "$RUNNER_TEMP/staged-metal/model_regression" --runner-sha256 "$runner_sha" \
             --report-dir "$RUNNER_TEMP/model-metal" --task-timeout-secs 3600
@@ -265,8 +265,8 @@ jobs:
           path: ${{ runner.temp }}/tasks
       - name: Prepare controller and verified CUDA bytes before the lease clock
         run: |
-          cargo build --locked -p ferrum-bench-core --example release_delivery
-          target/debug/examples/release_delivery inspect \
+          cargo build --locked -p ferrum-devtools --bin release_delivery
+          target/debug/release_delivery inspect \
             --abi "$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
             --version "$VERSION" --candidate-sha "$GITHUB_SHA" --extract-only \
             --extract-dir "$RUNNER_TEMP/extracted-cuda" --output "$RUNNER_TEMP/cuda-extraction.json"
@@ -280,7 +280,7 @@ jobs:
           archive="$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz"
           archive_sha=$(jq -er .asset_sha256 "$archive.abi.json")
           runner_sha=$(awk '{print $1}' "$RUNNER_TEMP/staged-cuda/model-regression-linux-x86_64.binary.sha256")
-          target/debug/examples/release_delivery cloud \
+          target/debug/release_delivery cloud \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --archive "$archive" --archive-sha256 "$archive_sha" \
             --ferrum-bin "$RUNNER_TEMP/extracted-cuda/ferrum" \
             --runner "$RUNNER_TEMP/staged-cuda/model_regression" --runner-sha256 "$runner_sha" \
@@ -348,7 +348,7 @@ jobs:
           key: publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: publication-${{ github.sha }}-
       - name: Build the release controller
-        run: cargo build --locked -p ferrum-bench-core --example release_delivery
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery
       - name: Recheck all required evidence and publish missing channel outputs
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
@@ -363,7 +363,7 @@ jobs:
           gate_args+=(--installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
           while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
             < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
-          target/debug/examples/release_delivery publish "${gate_args[@]}" \
+          target/debug/release_delivery publish "${gate_args[@]}" \
             --state-dir "$RUNNER_TEMP/publication" --tap-repo sizzlecar/homebrew-ferrum
       - uses: actions/cache/save@v4
         if: always()
@@ -395,9 +395,9 @@ jobs:
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          cargo build --locked -p ferrum-bench-core --example release_delivery
+          cargo build --locked -p ferrum-devtools --bin release_delivery
           cargo install ferrum-cli --version "=$VERSION" --locked --root "$RUNNER_TEMP/public-cargo"
-          target/debug/examples/release_delivery installed --channel cargo --version "$VERSION" \
+          target/debug/release_delivery installed --channel cargo --version "$VERSION" \
             --binary "$RUNNER_TEMP/public-cargo/bin/ferrum" --output "$RUNNER_TEMP/public-cargo.json"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -435,7 +435,7 @@ jobs:
           BREW: ${{ matrix.brew }}
           FORMULA: ${{ matrix.formula }}
         run: |
-          cargo build --locked -p ferrum-bench-core --example release_delivery
+          cargo build --locked -p ferrum-devtools --bin release_delivery
           "$BREW" tap sizzlecar/ferrum
           "$BREW" update
           "$BREW" trust --formula sizzlecar/ferrum/ferrum
@@ -446,7 +446,7 @@ jobs:
             "$BREW" install "sizzlecar/ferrum/$FORMULA"
           fi
           binary="$("$BREW" --prefix "$FORMULA")/bin/ferrum"
-          target/debug/examples/release_delivery installed --channel homebrew --version "$VERSION" \
+          target/debug/release_delivery installed --channel homebrew --version "$VERSION" \
             --binary "$binary" --output "$RUNNER_TEMP/public-homebrew.json"
       - uses: actions/upload-artifact@v4
         if: always()

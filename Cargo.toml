@@ -30,6 +30,9 @@ members = [
 
     # Bench schema + variance aggregation (Phase 0 of testing system)
     "crates/ferrum-bench-core",
+
+    # Internal CI/release tooling; not published.
+    "crates/ferrum-devtools",
 ]
 resolver = "2"
 

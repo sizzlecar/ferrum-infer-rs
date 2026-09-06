@@ -158,7 +158,8 @@ pub(super) fn analyze(repo: &Path, base: &str, candidate: &str, paths: &[String]
             let dependency_refinement = match dependency {
                 Ok(refinement) => {
                     let build = refinement.coordinated_version
-                        || !refinement.validation_runtime_dependencies.is_empty();
+                        || !refinement.validation_runtime_dependencies.is_empty()
+                        || !refinement.private_tool_members.is_empty();
                     for entry in &mut impact.paths {
                         if refinement.paths.contains(&entry.path) {
                             entry.areas = if build {
@@ -176,6 +177,12 @@ pub(super) fn analyze(repo: &Path, base: &str, candidate: &str, paths: &[String]
                     json!({"applied": true, "analysis": refinement})
                 }
                 Err(reason) => {
+                    for entry in &mut impact.paths {
+                        if entry.path == "crates/ferrum-devtools/Cargo.toml" {
+                            entry.areas = ChangeArea::ALL.to_vec();
+                            entry.reason = "private tool manifest isolation could not be proven from complete Cargo snapshots; retain full impact".into();
+                        }
+                    }
                     json!({"applied": false, "reason": reason, "fallback": "conservative path impact retained"})
                 }
             };

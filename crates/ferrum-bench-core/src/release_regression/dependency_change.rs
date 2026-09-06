@@ -13,6 +13,9 @@ pub struct DependencyRefinement {
     /// These reviewed release-tool dependencies are ordinary Cargo dependencies;
     /// do not claim that adding their edges leaves the entire Cargo graph equal.
     pub validation_runtime_dependencies: Vec<String>,
+    /// Explicit private workspace tools whose addition was proven isolated.
+    #[serde(default)]
+    pub private_tool_members: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +321,144 @@ fn closure(
     Ok(seen)
 }
 
+const DEVTOOLS: &str = "ferrum-devtools";
+const DEVTOOLS_MANIFEST: &str = "crates/ferrum-devtools/Cargo.toml";
+
+/// Only this reviewed private executable crate may be added without declaring
+/// new product architecture reach. No build hook, library, feature table or
+/// alternative configuration is silently accepted under its private name.
+fn private_tool_dependencies(
+    files: &BTreeMap<String, String>,
+    root: &DocumentMut,
+    members: &BTreeMap<String, String>,
+) -> Result<BTreeSet<String>, String> {
+    if members.get(DEVTOOLS).map(String::as_str) != Some(DEVTOOLS_MANIFEST) {
+        return Err("private devtools must use its explicit workspace member path".into());
+    }
+    let document = parse(files, DEVTOOLS_MANIFEST)?;
+    if document
+        .as_table()
+        .iter()
+        .any(|(key, _)| !matches!(key, "package" | "dependencies" | "dev-dependencies" | "bin"))
+    {
+        return Err("unreviewed private devtools manifest configuration".into());
+    }
+    let package = document
+        .get("package")
+        .and_then(Item::as_table_like)
+        .ok_or("missing private devtools package")?;
+    if package.get("name").and_then(Item::as_str) != Some(DEVTOOLS)
+        || package.get("publish").and_then(Item::as_bool) != Some(false)
+        || package.iter().any(|(key, _)| {
+            !matches!(
+                key,
+                "name"
+                    | "version"
+                    | "edition"
+                    | "publish"
+                    | "license"
+                    | "description"
+                    | "authors"
+                    | "repository"
+                    | "homepage"
+                    | "rust-version"
+            )
+        })
+    {
+        return Err(
+            "private devtools must remain publish=false without new build/package configuration"
+                .into(),
+        );
+    }
+    let binaries = document
+        .get("bin")
+        .and_then(Item::as_array_of_tables)
+        .ok_or("private devtools must declare its two executable targets")?;
+    let mut seen = BTreeSet::new();
+    for binary in binaries {
+        let name = binary
+            .get("name")
+            .and_then(Item::as_str)
+            .ok_or("private tool bin needs explicit name")?;
+        let path = binary
+            .get("path")
+            .and_then(Item::as_str)
+            .ok_or("private tool bin needs explicit path")?;
+        if !matches!(name, "release_delivery" | "contract_checks")
+            || path != format!("src/bin/{name}.rs")
+            || !seen.insert(name)
+            || binary
+                .iter()
+                .any(|(key, _)| !matches!(key, "name" | "path"))
+        {
+            return Err("unreviewed private devtools executable target".into());
+        }
+    }
+    if seen.len() != 2 {
+        return Err("private devtools must declare both reviewed executable targets".into());
+    }
+    let mut dependencies = BTreeSet::new();
+    for kind in ["dependencies", "dev-dependencies"] {
+        if let Some(table) = document.get(kind) {
+            for (name, spec) in table
+                .as_table_like()
+                .ok_or("private tool dependencies must be tables")?
+                .iter()
+            {
+                let reviewed = spec.as_str().is_some()
+                    || spec.as_table_like().is_some_and(|table| {
+                        table.iter().all(|(key, value)| match key {
+                            "workspace" => value.as_bool() == Some(true),
+                            "version" | "path" | "package" => value.as_str().is_some(),
+                            "default-features" => value.as_bool().is_some(),
+                            "features" => value.as_array().is_some_and(|values| {
+                                values.iter().all(|value| value.as_str().is_some())
+                            }),
+                            _ => false,
+                        }) && (table.get("workspace").and_then(Item::as_bool) == Some(true)
+                            || table.get("version").and_then(Item::as_str).is_some()
+                            || table.get("path").and_then(Item::as_str).is_some())
+                    });
+                if !reviewed {
+                    return Err(format!("unreviewed private tool dependency {name}"));
+                }
+                dependencies.insert(package_name(name, spec, root)?);
+            }
+        }
+    }
+    for (name, path) in members.iter().filter(|(name, _)| name.as_str() != DEVTOOLS) {
+        let mut peer = parse(files, path)?;
+        let mut edges = runtime_names(&peer, root)?;
+        edges.extend(strip_dev(&mut peer, root)?);
+        if edges.contains(DEVTOOLS) {
+            return Err(format!(
+                "existing member {name} depends on private devtools"
+            ));
+        }
+    }
+    Ok(dependencies)
+}
+
+fn remove_private_member(root: &mut DocumentMut) -> Result<(), String> {
+    let members = root
+        .get_mut("workspace")
+        .and_then(|item| item.get_mut("members"))
+        .and_then(Item::as_array_mut)
+        .ok_or("workspace members must be explicit")?;
+    let indices: Vec<_> = members
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            (value.as_str() == Some("crates/ferrum-devtools")).then_some(index)
+        })
+        .collect();
+    if indices.len() != 1 {
+        return Err("private devtools member must occur once".into());
+    }
+    members.remove(indices[0]);
+    Ok(())
+}
+
 /// Complete before/after root/member manifests and Cargo.lock are required. The
 /// only reviewed ordinary additions are the semver/TOML/Rust-syntax tools in bench-core's release
 /// modules: source callers were reviewed separately, and source diffs still keep
@@ -326,15 +467,30 @@ pub fn validation_dependency_paths(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
 ) -> Result<DependencyRefinement, String> {
-    if !before.keys().eq(after.keys()) {
-        return Err("Cargo inputs were added or removed".into());
+    let added_tool =
+        !before.contains_key(DEVTOOLS_MANIFEST) && after.contains_key(DEVTOOLS_MANIFEST);
+    if !before.keys().eq(after
+        .keys()
+        .filter(|path| !(added_tool && path.as_str() == DEVTOOLS_MANIFEST)))
+    {
+        return Err("Cargo inputs were added or removed outside the private tool member".into());
     }
     let root = parse(before, "Cargo.toml")?;
     let next_root = parse(after, "Cargo.toml")?;
     let members = names(&root, before)?;
-    if members != names(&next_root, after)? {
-        return Err("workspace membership changed".into());
+    let next_members = names(&next_root, after)?;
+    let mut comparable_members = next_members.clone();
+    if added_tool {
+        comparable_members.remove(DEVTOOLS);
     }
+    if members != comparable_members {
+        return Err("workspace membership changed outside the private tool member".into());
+    }
+    let tool_dependencies = if next_members.contains_key(DEVTOOLS) {
+        Some(private_tool_dependencies(after, &next_root, &next_members)?)
+    } else {
+        None
+    };
     let version = |document: &DocumentMut| {
         document
             .get("workspace")
@@ -373,6 +529,9 @@ pub fn validation_dependency_paths(
     for path in baseline.keys().filter(|path| path.ends_with("Cargo.toml")) {
         let mut prior = parse(&baseline, path)?;
         let mut next = parse(after, path)?;
+        if added_tool && path == "Cargo.toml" {
+            remove_private_member(&mut next)?;
+        }
         let mut allowed = strip_dev(&mut prior, &baseline_root)?;
         allowed.extend(strip_dev(&mut next, &next_root)?);
         let member = members
@@ -454,10 +613,55 @@ pub fn validation_dependency_paths(
             .collect::<BTreeSet<_>>()
     };
     let member_names: BTreeSet<_> = members.keys().cloned().collect();
-    if local(&prior) != member_names || local(&next) != member_names {
+    let next_member_names: BTreeSet<_> = next_members.keys().cloned().collect();
+    if local(&prior) != member_names || local(&next) != next_member_names {
         return Err("lock local packages differ from workspace members".into());
     }
     let mut dev_seeds = BTreeSet::new();
+    if let Some(expected_dependencies) = &tool_dependencies {
+        let tool = resolve(DEVTOOLS, &next)?;
+        if tool.source.is_some() {
+            return Err("private devtools lock entry must be a local package".into());
+        }
+        let document = parse(after, DEVTOOLS_MANIFEST)?;
+        let tool_version = document
+            .get("package")
+            .and_then(|item| item.get("version"))
+            .ok_or("private devtools version missing")?;
+        let expected_version =
+            if tool_version.get("workspace").and_then(Item::as_bool) == Some(true) {
+                version(&next_root)?
+            } else {
+                tool_version
+                    .as_str()
+                    .ok_or("unsupported private devtools version")?
+                    .to_owned()
+            };
+        if tool.version != expected_version {
+            return Err("private devtools manifest and lock version differ".into());
+        }
+        let actual_dependencies: BTreeSet<_> = next[tool]
+            .dependencies
+            .iter()
+            .map(|dependency| resolve(dependency, &next).map(|package| package.name.clone()))
+            .collect::<Result<_, _>>()?;
+        if &actual_dependencies != expected_dependencies {
+            return Err("private devtools manifest and locked dependency names differ".into());
+        }
+        for (package, record) in &next {
+            for dependency in &record.dependencies {
+                if resolve(dependency, &next)? == tool {
+                    return Err(format!(
+                        "locked package {} depends on private devtools",
+                        package.name
+                    ));
+                }
+            }
+        }
+        if added_tool {
+            dev_seeds.insert(tool.clone());
+        }
+    }
     for (package, old) in &prior {
         let new = next.get(package).ok_or_else(|| {
             format!(
@@ -503,17 +707,24 @@ pub fn validation_dependency_paths(
     }
     let allowed_new = closure(dev_seeds, &next)?;
     for package in next.keys().filter(|package| !prior.contains_key(*package)) {
-        if package.source.is_none() || !allowed_new.contains(package) {
+        if (package.source.is_none() && !(added_tool && package.name == DEVTOOLS))
+            || !allowed_new.contains(package)
+        {
             return Err(format!("unexplained new lock package {}", package.name));
         }
     }
     Ok(DependencyRefinement {
-        paths: before
+        paths: after
             .iter()
-            .filter_map(|(path, text)| (after.get(path) != Some(text)).then_some(path.clone()))
+            .filter_map(|(path, text)| (before.get(path) != Some(text)).then_some(path.clone()))
             .collect(),
         coordinated_version,
         validation_runtime_dependencies: tools,
+        private_tool_members: if added_tool {
+            vec![DEVTOOLS.into()]
+        } else {
+            Vec::new()
+        },
     })
 }
 

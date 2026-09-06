@@ -209,3 +209,162 @@ fn coordinated_version_and_dev_dependency_edits_compose_without_erasing_other_ch
     );
     assert!(validation_dependency_paths(&before, &unrelated).is_err());
 }
+
+fn add_private_tool(files: &mut BTreeMap<String, String>) {
+    let root = files.get_mut("Cargo.toml").unwrap();
+    *root = root.replace(
+        "\"crates/app\"]",
+        "\"crates/app\", \"crates/ferrum-devtools\"]",
+    );
+    files.insert(
+        DEVTOOLS_MANIFEST.into(),
+        r#"[package]
+name = "ferrum-devtools"
+version.workspace = true
+edition = "2021"
+publish = false
+[[bin]]
+name = "release_delivery"
+path = "src/bin/release_delivery.rs"
+[[bin]]
+name = "contract_checks"
+path = "src/bin/contract_checks.rs"
+[dependencies]
+ferrum-bench-core.workspace = true
+serde = "1"
+"#
+        .into(),
+    );
+    append(
+        files,
+        "Cargo.lock",
+        r#"[[package]]
+name = "ferrum-devtools"
+version = "1.0.0"
+dependencies = ["ferrum-bench-core", "serde"]
+"#,
+    );
+}
+
+#[test]
+fn isolated_private_tool_addition_and_moved_development_edge_keep_runtime_resolution() {
+    let mut before = fixture();
+    add_dev(&mut before);
+    let mut after = before.clone();
+    add_private_tool(&mut after);
+    let bench = after
+        .get_mut("crates/ferrum-bench-core/Cargo.toml")
+        .unwrap();
+    *bench = bench.replace("[dev-dependencies]\nfixture_test = '1'\n", "");
+    append(
+        &mut after,
+        DEVTOOLS_MANIFEST,
+        "fixture_test = '1'\ntool_support = '1'\n",
+    );
+    let lock = after.get_mut("Cargo.lock").unwrap();
+    *lock = lock
+        .replace(
+            "dependencies = [\"serde\", \"fixture_test\"]",
+            "dependencies = [\"serde\"]",
+        )
+        .replace(
+            "dependencies = [\"ferrum-bench-core\", \"serde\"]",
+            "dependencies = [\"ferrum-bench-core\", \"serde\", \"fixture_test\", \"tool_support\"]",
+        );
+    lock.push_str("[[package]]\nname = 'tool_support'\nversion = '1.0.0'\nsource = 'registry+https://example.invalid/index'\nchecksum = 'tool-support-checksum'\ndependencies = ['serde']\n");
+    let result = validation_dependency_paths(&before, &after).unwrap();
+    assert_eq!(result.private_tool_members, [DEVTOOLS]);
+    assert!(result.paths.contains(&DEVTOOLS_MANIFEST.into()));
+    assert!(result.paths.contains(&"Cargo.toml".into()));
+    assert!(result.validation_runtime_dependencies.is_empty());
+    let mut drift = after;
+    let lock = drift.get_mut("Cargo.lock").unwrap();
+    *lock = lock.replace("serde-checksum", "changed-runtime-checksum");
+    assert!(validation_dependency_paths(&before, &drift).is_err());
+}
+
+#[test]
+fn any_existing_member_or_locked_reverse_edge_into_private_tools_prevents_refinement() {
+    let before = fixture();
+    let mut after = before.clone();
+    add_private_tool(&mut after);
+    validation_dependency_paths(&before, &after).unwrap();
+    for edge in [
+        "release_tool = { package = 'ferrum-devtools', path = '../ferrum-devtools' }\n",
+        "[build-dependencies]\nferrum-devtools = { path = '../ferrum-devtools' }\n",
+        "[dev-dependencies]\nferrum-devtools = { path = '../ferrum-devtools' }\n",
+        "[target.'cfg(unix)'.dependencies]\nrelease_tool = { package = 'ferrum-devtools', path = '../ferrum-devtools' }\n",
+        "[target.'cfg(windows)'.build-dependencies]\nferrum-devtools = { path = '../ferrum-devtools' }\n",
+    ] {
+        let mut reversed = after.clone();
+        append(&mut reversed, "crates/app/Cargo.toml", edge);
+        assert!(validation_dependency_paths(&before, &reversed).unwrap_err().contains("depends on private devtools"));
+    }
+    let mut inherited = after.clone();
+    append(
+        &mut inherited,
+        "Cargo.toml",
+        "release_tool = { package = 'ferrum-devtools', path = 'crates/ferrum-devtools' }\n",
+    );
+    append(
+        &mut inherited,
+        "crates/app/Cargo.toml",
+        "release_tool.workspace = true\n",
+    );
+    assert!(validation_dependency_paths(&before, &inherited)
+        .unwrap_err()
+        .contains("depends on private devtools"));
+    let mut lock_only = after;
+    let lock = lock_only.get_mut("Cargo.lock").unwrap();
+    *lock = lock.replace(
+        "checksum = \"serde-checksum\"",
+        "checksum = \"serde-checksum\"\ndependencies = ['ferrum-devtools']",
+    );
+    assert!(validation_dependency_paths(&before, &lock_only)
+        .unwrap_err()
+        .contains("depends on private devtools"));
+}
+
+#[test]
+fn private_tool_name_does_not_allow_publishing_build_hooks_unknown_members_or_lock_drift() {
+    let before = fixture();
+    let mut after = before.clone();
+    add_private_tool(&mut after);
+    for (old, new) in [
+        ("publish = false", "publish = true"),
+        ("publish = false", "publish = ['private-registry']"),
+        ("publish = false", "publish = false\nbuild = 'build.rs'"),
+        (
+            "serde = \"1\"",
+            "serde = { git = 'https://example.invalid/serde' }",
+        ),
+        ("[dependencies]", "[features]\nextra = []\n[dependencies]"),
+        ("src/bin/contract_checks.rs", "src/lib.rs"),
+    ] {
+        let mut invalid = after.clone();
+        let manifest = invalid.get_mut(DEVTOOLS_MANIFEST).unwrap();
+        *manifest = manifest.replace(old, new);
+        assert!(
+            validation_dependency_paths(&before, &invalid).is_err(),
+            "{new}"
+        );
+    }
+    let mut added_member = after.clone();
+    added_member.insert(
+        "crates/unreviewed/Cargo.toml".into(),
+        "[package]\nname='unreviewed'\nversion='1.0.0'\npublish=false\n".into(),
+    );
+    assert!(validation_dependency_paths(&before, &added_member).is_err());
+    let mut unexplained = after.clone();
+    append(&mut unexplained, "Cargo.lock", "[[package]]\nname='unexplained'\nversion='1.0.0'\nsource='registry+https://example.invalid/index'\n");
+    assert!(validation_dependency_paths(&before, &unexplained).is_err());
+    let mut bad_lock = after;
+    let lock = bad_lock.get_mut("Cargo.lock").unwrap();
+    *lock = lock.replace(
+        "dependencies = [\"ferrum-bench-core\", \"serde\"]",
+        "dependencies = [\"serde\"]",
+    );
+    assert!(validation_dependency_paths(&before, &bad_lock)
+        .unwrap_err()
+        .contains("manifest and locked dependency names differ"));
+}

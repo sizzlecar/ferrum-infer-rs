@@ -139,6 +139,15 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     }
     let rest = path.strip_prefix("crates/")?;
     let (component, relative) = rest.split_once('/')?;
+    if component == "ferrum-devtools" {
+        if relative == "Cargo.toml" || (relative.starts_with("src/") && relative.ends_with(".rs")) {
+            return Some((vec![Build, Validation],
+                "private development-tool crate; manifest changes require complete snapshot validation of publish=false and dependency isolation"));
+        }
+        // Build hooks, assets and additional configuration are not inferred from
+        // this private crate's name. Its reviewed Rust source boundary is explicit.
+        return None;
+    }
     if matches!(relative, "Cargo.toml" | "build.rs") {
         // A crate dependency or build hook can change behavior beyond its own source.
         return Some((
@@ -545,6 +554,37 @@ mod tests {
         assert!(combined.areas.contains(&ChangeArea::Observability));
         assert!(combined.areas.contains(&ChangeArea::Validation));
         assert!(!combined.areas.contains(&ChangeArea::Kernel));
+    }
+
+    #[test]
+    fn private_devtools_source_and_manifest_keep_build_validation_but_unknown_config_does_not() {
+        for path in [
+            "crates/ferrum-devtools/Cargo.toml",
+            "crates/ferrum-devtools/src/bin/release_delivery.rs",
+            "crates/ferrum-devtools/src/bin/contract_checks.rs",
+            "crates/ferrum-devtools/src/bin/release_delivery/cloud/api.rs",
+        ] {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, [ChangeArea::Build, ChangeArea::Validation]);
+            assert!(impact.unknown_paths.is_empty());
+        }
+        for path in [
+            "crates/ferrum-devtools/build.rs",
+            "crates/ferrum-devtools/runtime-config.toml",
+            "crates/ferrum-devtools/src/runtime-config.json",
+            "crates/new-devtools/src/bin/tool.rs",
+        ] {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, ALL_AREAS);
+            assert_eq!(impact.unknown_paths, [path]);
+        }
+        // Old release intervals still contain the removed example paths.
+        for path in [
+            "crates/ferrum-bench-core/examples/release_delivery.rs",
+            "crates/ferrum-bench-core/examples/contract_checks.rs",
+        ] {
+            assert_eq!(analyze_paths([path]).areas, [ChangeArea::Validation]);
+        }
     }
 
     #[test]

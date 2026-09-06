@@ -24,10 +24,3 @@ quote = "1"
 tempfile = "3"
 serde_yaml = "0.9"
 clap = { workspace = true, features = ["derive"] }
-
-# Thin release controllers use the same HTTP/runtime dependencies as the workspace.
-reqwest = { workspace = true }
-tokio = { workspace = true }
-
-# Local runner process-group cleanup after timeouts and cancellation.
-libc = "0.2"

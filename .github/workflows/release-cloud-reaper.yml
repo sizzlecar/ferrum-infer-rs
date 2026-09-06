@@ -46,7 +46,7 @@ jobs:
           shared-key: release-delivery-controller-rust-1.91
 
       - name: Build only the small Rust controller
-        run: cargo build --locked -p ferrum-bench-core --example release_delivery
+        run: cargo build --locked -p ferrum-devtools --bin release_delivery
 
       - name: Reap only expired owned instances
         env:
@@ -60,7 +60,7 @@ jobs:
           if [[ -n "$RELEASE_RUN_ID" ]]; then
             reap_args+=(--run-id "$RELEASE_RUN_ID")
           fi
-          target/debug/examples/release_delivery reap "${reap_args[@]}"
+          target/debug/release_delivery reap "${reap_args[@]}"
 
       - name: Retain cleanup evidence
         if: always()

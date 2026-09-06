@@ -1,0 +1,32 @@
+[package]
+name = "ferrum-devtools"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+description = "Internal Ferrum release delivery and contract-check tools."
+
+[[bin]]
+name = "release_delivery"
+path = "src/bin/release_delivery.rs"
+
+[[bin]]
+name = "contract_checks"
+path = "src/bin/contract_checks.rs"
+
+[dependencies]
+ferrum-bench-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+semver = "1.0"
+reqwest = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+libc = "0.2"
+rand = { workspace = true }
+tempfile = "3"
+
+[dev-dependencies]
+ferrum-types = { workspace = true }

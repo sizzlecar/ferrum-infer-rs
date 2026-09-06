@@ -667,6 +667,39 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
     }
 
     #[test]
+    fn private_tool_manifest_only_change_cannot_keep_validation_scope_when_isolation_fails() {
+        use ferrum_bench_core::release_regression::ChangeArea;
+        let repo = GitFixture::new();
+        workspace_fixture(&repo);
+        let root_path = repo.0.join("Cargo.toml");
+        let root = fs::read_to_string(&root_path).unwrap().replace(
+            "members = [\"crates/ferrum-engine\"]",
+            "members = [\"crates/ferrum-engine\", \"crates/ferrum-devtools\"]",
+        );
+        fs::write(root_path, root).unwrap();
+        fs::create_dir_all(repo.0.join("crates/ferrum-devtools")).unwrap();
+        let path = "crates/ferrum-devtools/Cargo.toml";
+        let manifest = "[package]\nname='ferrum-devtools'\nversion.workspace=true\npublish=false\n[[bin]]\nname='release_delivery'\npath='src/bin/release_delivery.rs'\n[[bin]]\nname='contract_checks'\npath='src/bin/contract_checks.rs'\n";
+        fs::write(repo.0.join(path), manifest).unwrap();
+        let lock_path = repo.0.join("Cargo.lock");
+        let mut lock = fs::read_to_string(&lock_path).unwrap();
+        lock.push_str("[[package]]\nname='ferrum-devtools'\nversion='1.2.3'\n");
+        fs::write(lock_path, lock).unwrap();
+        let base = repo.commit();
+        fs::write(
+            repo.0.join(path),
+            manifest.replace("publish=false", "publish=true"),
+        )
+        .unwrap();
+        let candidate = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &candidate).unwrap();
+        assert_eq!(paths, [path]);
+        let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
+        assert_eq!(analysis.dependency_refinement["applied"], false);
+        assert_eq!(analysis.impact.areas, ChangeArea::ALL);
+    }
+
+    #[test]
     fn homebrew_only_readme_changes_require_installation_while_new_models_still_require_review() {
         use ferrum_bench_core::release_regression::ChangeArea;
         let repo = GitFixture::new();
