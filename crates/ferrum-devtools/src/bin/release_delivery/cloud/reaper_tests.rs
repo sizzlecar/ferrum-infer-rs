@@ -21,11 +21,11 @@ fn owner(repository: u64, run: u64, attempt: u32, expiry: u64) -> Ownership {
 fn row(id: u64, label: &str) -> Value {
     json!({"id":id,"label":label,"actual_status":"running"})
 }
-fn run() -> Value {
+fn run(attempt: u32) -> Value {
     json!({"id":34,"repository":{"id":12,"full_name":"owner/repo"},
         "head_repository":{"id":12},"head_branch":"main",
         "path":".github/workflows/release-delivery.yml","event":"push",
-        "run_attempt":2,"status":"completed","conclusion":"cancelled"})
+        "run_attempt":attempt,"status":"completed","conclusion":"cancelled"})
 }
 fn reply(method: &'static str, path: &'static str, body: Value) -> Reply {
     Reply {
@@ -65,10 +65,10 @@ fn terminal_state_requires_actual_release_workflow_repository_and_known_conclusi
         "skipped",
         "stale",
     ] {
-        let mut value = run();
+        let mut value = run(2);
         value["conclusion"] = json!(conclusion);
         assert_eq!(
-            completed_attempt(&value, "owner/repo", 12, 34).unwrap(),
+            completed_attempt(&value, "owner/repo", 12, 34, 2).unwrap(),
             Some(2)
         );
     }
@@ -80,23 +80,25 @@ fn terminal_state_requires_actual_release_workflow_repository_and_known_conclusi
         ("/path", json!(".github/workflows/ci.yml")),
         ("/event", json!("pull_request")),
         ("/run_attempt", json!(0)),
+        ("/run_attempt", json!(1)),
+        ("/run_attempt", json!(3)),
         ("/run_attempt", json!(u64::MAX)),
         ("/status", json!("unknown")),
         ("/conclusion", Value::Null),
         ("/conclusion", json!("unknown")),
     ] {
-        let mut value = run();
+        let mut value = run(2);
         *value.pointer_mut(pointer).unwrap() = wrong;
         assert!(
-            completed_attempt(&value, "owner/repo", 12, 34).is_err(),
+            completed_attempt(&value, "owner/repo", 12, 34, 2).is_err(),
             "{pointer}: {value}"
         );
     }
-    let mut value = run();
+    let mut value = run(2);
     value["event"] = json!("workflow_dispatch");
     value["head_branch"] = json!("v0.8.8-rc.1");
     assert_eq!(
-        completed_attempt(&value, "owner/repo", 12, 34).unwrap(),
+        completed_attempt(&value, "owner/repo", 12, 34, 2).unwrap(),
         Some(2)
     );
     for invalid in [
@@ -126,7 +128,11 @@ async fn completed_run_reclaims_only_matching_owned_lease_before_expiry() {
             "/api/v0/instances/41/",
             json!({"instances":row(41, &label)}),
         ),
-        reply("GET", "/repos/owner/repo/actions/runs/34", run()),
+        reply(
+            "GET",
+            "/repos/owner/repo/actions/runs/34/attempts/1",
+            run(1),
+        ),
         reply("DELETE", "/api/v0/instances/41/", json!({"success":true})),
         listing(vec![]),
     ])
@@ -142,7 +148,7 @@ async fn completed_run_reclaims_only_matching_owned_lease_before_expiry() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["destroyed_and_absent"], true);
     assert_eq!(results[0]["reason"], "owning_workflow_completed");
-    assert_eq!(results[0]["completed_run_attempt"], 2);
+    assert_eq!(results[0]["completed_run_attempt"], 1);
     let requests = server.await.unwrap();
     let deletes: Vec<_> = requests
         .iter()
@@ -155,8 +161,8 @@ async fn completed_run_reclaims_only_matching_owned_lease_before_expiry() {
 #[tokio::test]
 async fn completion_event_does_not_delete_a_currently_active_rerun() {
     for status in ["queued", "in_progress", "waiting", "requested", "pending"] {
-        let label = owner(12, 34, 1, 999).label();
-        let mut value = run();
+        let label = owner(12, 34, 2, 999).label();
+        let mut value = run(2);
         value["status"] = json!(status);
         value["conclusion"] = Value::Null;
         let (base, server) = http_fixture(vec![
@@ -166,7 +172,7 @@ async fn completion_event_does_not_delete_a_currently_active_rerun() {
                 "/api/v0/instances/41/",
                 json!({"instances":row(41, &label)}),
             ),
-            reply("GET", "/repos/owner/repo/actions/runs/34", value),
+            reply("GET", "/repos/owner/repo/actions/runs/34/attempts/2", value),
         ])
         .await;
         let results = reap_instances(
@@ -187,21 +193,112 @@ async fn completion_event_does_not_delete_a_currently_active_rerun() {
 }
 
 #[tokio::test]
-async fn lookup_failure_wrong_repository_unknown_status_and_future_attempt_never_delete() {
-    let mut wrong_repository = run();
-    wrong_repository["repository"]["id"] = json!(13);
-    let mut unknown_status = run();
-    unknown_status["status"] = json!("new-state");
-    let mut incomplete = run();
-    incomplete["conclusion"] = Value::Null;
-    for (status, body, attempt) in [
-        (503, json!({"secret":"must not appear in errors"}), 1),
-        (200, wrong_repository, 1),
-        (200, unknown_status, 1),
-        (200, incomplete, 1),
-        (200, run(), 3),
+async fn cancelled_attempt_is_reclaimed_while_the_same_runs_new_attempt_stays_active() {
+    let old_label = owner(12, 34, 1, 999).label();
+    let mut new_owner = owner(12, 34, 2, 999);
+    new_owner.nonce = "b".repeat(32);
+    let new_label = new_owner.label();
+    let active_instance = row(42, &new_label);
+    let mut active_run = run(2);
+    active_run["status"] = json!("in_progress");
+    active_run["conclusion"] = Value::Null;
+    let (base, server) = http_fixture(vec![
+        listing(vec![row(41, &old_label), active_instance.clone()]),
+        reply(
+            "GET",
+            "/api/v0/instances/41/",
+            json!({"instances":row(41, &old_label)}),
+        ),
+        reply(
+            "GET",
+            "/repos/owner/repo/actions/runs/34/attempts/1",
+            run(1),
+        ),
+        reply("DELETE", "/api/v0/instances/41/", json!({"success":true})),
+        listing(vec![active_instance.clone()]),
+        reply(
+            "GET",
+            "/api/v0/instances/42/",
+            json!({"instances":active_instance}),
+        ),
+        reply(
+            "GET",
+            "/repos/owner/repo/actions/runs/34/attempts/2",
+            active_run,
+        ),
+    ])
+    .await;
+    let results = reap_instances(
+        &args(),
+        &api::Client::for_test(base.clone()),
+        Some(&github(base)),
+        100,
+    )
+    .await
+    .unwrap();
+    assert_eq!(results[0]["instance_id"], 41);
+    assert_eq!(results[0]["completed_run_attempt"], 1);
+    assert_eq!(results[0]["destroyed_and_absent"], true);
+    assert_eq!(results[1]["instance_id"], 42);
+    assert_eq!(results[1]["retained"], "owning_workflow_is_active");
+    let requests = server.await.unwrap();
+    let deleted: Vec<_> = requests
+        .iter()
+        .filter(|request| request["method"] == "DELETE")
+        .map(|request| request["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(deleted, ["/api/v0/instances/41/"]);
+}
+
+#[tokio::test]
+async fn different_attempt_response_never_authorizes_deletion() {
+    for (requested, returned, path) in [
+        (1, 2, "/repos/owner/repo/actions/runs/34/attempts/1"),
+        (2, 1, "/repos/owner/repo/actions/runs/34/attempts/2"),
     ] {
-        let label = owner(12, 34, attempt, 999).label();
+        let label = owner(12, 34, requested, 999).label();
+        let (base, server) = http_fixture(vec![
+            listing(vec![row(41, &label)]),
+            reply(
+                "GET",
+                "/api/v0/instances/41/",
+                json!({"instances":row(41, &label)}),
+            ),
+            reply("GET", path, run(returned)),
+        ])
+        .await;
+        let error = reap_instances(
+            &args(),
+            &api::Client::for_test(base.clone()),
+            Some(&github(base)),
+            100,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("owning attempt"));
+        assert!(server
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request["method"] != "DELETE"));
+    }
+}
+
+#[tokio::test]
+async fn lookup_failure_wrong_repository_and_unknown_status_never_delete() {
+    let mut wrong_repository = run(1);
+    wrong_repository["repository"]["id"] = json!(13);
+    let mut unknown_status = run(1);
+    unknown_status["status"] = json!("new-state");
+    let mut incomplete = run(1);
+    incomplete["conclusion"] = Value::Null;
+    for (status, body) in [
+        (503, json!({"secret":"must not appear in errors"})),
+        (200, wrong_repository),
+        (200, unknown_status),
+        (200, incomplete),
+    ] {
+        let label = owner(12, 34, 1, 999).label();
         let (base, server) = http_fixture(vec![
             listing(vec![row(41, &label)]),
             reply(
@@ -211,7 +308,7 @@ async fn lookup_failure_wrong_repository_unknown_status_and_future_attempt_never
             ),
             Reply {
                 method: "GET",
-                path: "/repos/owner/repo/actions/runs/34",
+                path: "/repos/owner/repo/actions/runs/34/attempts/1",
                 status,
                 body,
             },

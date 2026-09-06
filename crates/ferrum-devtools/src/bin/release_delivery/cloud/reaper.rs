@@ -62,11 +62,16 @@ impl Github {
         })
     }
 
-    async fn completed_attempt(&self, repository_id: u64, run: u64) -> Result<Option<u32>, String> {
+    async fn completed_attempt(
+        &self,
+        repository_id: u64,
+        run: u64,
+        expected_attempt: u32,
+    ) -> Result<Option<u32>, String> {
         let mut response = self
             .http
             .get(format!(
-                "{}/repos/{}/actions/runs/{run}",
+                "{}/repos/{}/actions/runs/{run}/attempts/{expected_attempt}",
                 self.base, self.repository
             ))
             .bearer_auth(&self.token)
@@ -90,7 +95,13 @@ impl Github {
         }
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| "GitHub run lookup invalid JSON")?;
-        completed_attempt(&value, &self.repository, repository_id, run)
+        completed_attempt(
+            &value,
+            &self.repository,
+            repository_id,
+            run,
+            expected_attempt,
+        )
     }
 }
 
@@ -99,6 +110,7 @@ fn completed_attempt(
     repository: &str,
     repository_id: u64,
     run: u64,
+    expected_attempt: u32,
 ) -> Result<Option<u32>, String> {
     if value["id"].as_u64() != Some(run)
         || value["repository"]["id"].as_u64() != Some(repository_id)
@@ -114,6 +126,9 @@ fn completed_attempt(
         .and_then(|attempt| u32::try_from(attempt).ok())
         .filter(|attempt| *attempt > 0)
         .ok_or("GitHub run omitted a valid attempt")?;
+    if attempt != expected_attempt {
+        return Err("GitHub response does not identify the lease's owning attempt".into());
+    }
     match value["status"].as_str() {
         Some("completed")
             if matches!(
@@ -167,15 +182,14 @@ async fn reap_instances(
         let completed = if expired {
             None
         } else {
-            // Read the latest run immediately before deleting. An old completed
-            // event cannot authorize deletion during a rerun of that same run ID.
+            // Each rerun creates its own instance and nonce. Check this lease's
+            // attempt so an active rerun cannot prolong a completed attempt's bill.
             match github
                 .expect("unexpired cleanup requires GitHub")
-                .completed_attempt(args.repository_id, owner.run)
+                .completed_attempt(args.repository_id, owner.run, owner.attempt)
                 .await?
             {
-                Some(attempt) if owner.attempt <= attempt => Some(attempt),
-                Some(_) => return Err("lease attempt is newer than the verified GitHub run".into()),
+                Some(attempt) => Some(attempt),
                 None => {
                     results.push(json!({"instance_id":instance.id,"label":instance.label,
                         "retained":"owning_workflow_is_active"}));
