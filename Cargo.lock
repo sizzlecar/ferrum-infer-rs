@@ -1346,11 +1346,16 @@ dependencies = [
 name = "ferrum-bench-core"
 version = "0.8.7"
 dependencies = [
+ "clap",
  "ferrum-types",
  "rand 0.9.2",
+ "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2",
+ "tempfile",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]

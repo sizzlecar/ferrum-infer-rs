@@ -1897,3 +1897,6 @@ mod tests {
         assert_eq!(record.server_request_id.as_deref(), Some("chatcmpl-123"));
     }
 }
+
+/// Version preparation and candidate asset metadata; never publication authorization.
+pub mod release_candidate;
