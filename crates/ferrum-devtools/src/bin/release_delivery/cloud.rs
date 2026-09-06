@@ -2,8 +2,11 @@
 //! Quotes/deadlines are bounded policy inputs, not a provider-enforced invoice cap.
 #[path = "cloud/api.rs"]
 mod api;
+#[path = "cloud/reaper.rs"]
+mod reaper;
 #[path = "cloud/ssh.rs"]
 mod ssh;
+pub use reaper::{reap, ReapArgs};
 
 use clap::Args;
 use ferrum_bench_core::release_regression::{
@@ -70,17 +73,6 @@ pub struct ExecuteArgs {
     /// First implementation permits exactly one create request, never retries it.
     #[arg(long)]
     pub max_create_attempts: u32,
-}
-
-#[derive(Debug, Args)]
-pub struct ReapArgs {
-    #[arg(long)]
-    pub repository_id: u64,
-    /// Omit for the scheduled repository-wide expiry reaper.
-    #[arg(long)]
-    pub run_id: Option<u64>,
-    #[arg(long)]
-    pub output: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -524,56 +516,6 @@ pub async fn execute(args: ExecuteArgs) -> Result<(), String> {
             "cloud execution or cleanup failed; see {}",
             args.report_dir.display()
         ));
-    }
-    Ok(())
-}
-
-pub async fn reap(args: ReapArgs) -> Result<(), String> {
-    if args.repository_id == 0 || args.run_id == Some(0) {
-        return Err("positive repository/run ID required".into());
-    }
-    if args.output.exists() {
-        return Err("reaper output must be new".into());
-    }
-    let client =
-        api::Client::new(std::env::var("VAST_API_KEY").map_err(|_| "VAST_API_KEY is required")?)?;
-    let observed_at = now()?;
-    let mut results = Vec::new();
-    let mut failed = false;
-    for instance in client.instances().await? {
-        let Some(owner) = instance.label.as_deref().and_then(Ownership::parse) else {
-            continue;
-        };
-        if owner.repository != args.repository_id
-            || args.run_id.is_some_and(|run| run != owner.run)
-            || owner.expiry > observed_at
-        {
-            continue;
-        }
-        // Re-read exact ownership immediately before deletion; leave changed labels alone.
-        let current = client.instance(instance.id).await?;
-        if current
-            .as_ref()
-            .is_none_or(|current| current.label != instance.label)
-        {
-            continue;
-        }
-        let result = tokio::time::timeout(
-            Duration::from_secs(120),
-            destroy_confirm(&client, instance.id),
-        )
-        .await
-        .map_err(|_| "cleanup deadline exceeded".to_string())
-        .and_then(|value| value);
-        failed |= result.is_err();
-        results.push(json!({"instance_id":instance.id,"label":instance.label,"destroyed_and_absent":result.is_ok(),"error":result.err()}));
-    }
-    write_json(
-        &args.output,
-        &json!({"schema_version":1,"repository_id":args.repository_id,"run_id":args.run_id,"observed_at":observed_at,"results":results,"passed":!failed}),
-    )?;
-    if failed {
-        return Err("some expired owned instances could not be confirmed destroyed".into());
     }
     Ok(())
 }

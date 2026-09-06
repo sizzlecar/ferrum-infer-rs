@@ -100,6 +100,18 @@ impl Client {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn for_test(base: String) -> Self {
+        let mut client = Self::new("local-fixture-token".into()).unwrap();
+        client.base = base;
+        client.http = HttpClient::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        client
+    }
+
     async fn request(
         &self,
         method: Method,
@@ -271,4 +283,4 @@ impl Client {
 
 #[cfg(test)]
 #[path = "api_tests.rs"]
-mod tests;
+pub(super) mod tests;

@@ -1,6 +1,9 @@
-name: Reap expired release GPU leases
+name: Reap release GPU leases
 
 on:
+  workflow_run:
+    workflows: [Deliver formal release]
+    types: [completed]
   schedule:
     - cron: '7,22,37,52 * * * *'
   workflow_dispatch:
@@ -13,6 +16,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: release-cloud-reaper-${{ github.repository_id }}
@@ -48,11 +52,13 @@ jobs:
       - name: Build only the small Rust controller
         run: cargo build --locked -p ferrum-devtools --bin release_delivery
 
-      - name: Reap only expired owned instances
+      - name: Reap expired leases or verify a completed owner
         env:
           VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
           REPOSITORY_ID: ${{ github.repository_id }}
-          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          RELEASE_RUN_ID: ${{ github.event.workflow_run.id || inputs.release_run_id }}
+          COMPLETED_RUN_REPOSITORY: ${{ github.event_name == 'workflow_run' && github.repository || '' }}
+          GITHUB_TOKEN: ${{ github.token }}
           REPORT_DIR: ${{ runner.temp }}/ferrum-cloud-reaper
         run: |
           mkdir -p "$REPORT_DIR"
@@ -60,7 +66,10 @@ jobs:
           if [[ -n "$RELEASE_RUN_ID" ]]; then
             reap_args+=(--run-id "$RELEASE_RUN_ID")
           fi
-          target/debug/release_delivery reap "${reap_args[@]}"
+          if [[ -n "$COMPLETED_RUN_REPOSITORY" ]]; then
+            reap_args+=(--completed-run-repository "$COMPLETED_RUN_REPOSITORY")
+          fi
+          exec target/debug/release_delivery reap "${reap_args[@]}"
 
       - name: Retain cleanup evidence
         if: always()

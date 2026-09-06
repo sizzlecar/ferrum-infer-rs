@@ -371,7 +371,7 @@ jobs:
           archive="$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz"
           archive_sha=$(jq -er .asset_sha256 "$archive.abi.json")
           runner_sha=$(awk '{print $1}' "$RUNNER_TEMP/staged-cuda/model-regression-linux-x86_64.binary.sha256")
-          target/debug/release_delivery cloud \
+          exec target/debug/release_delivery cloud \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --archive "$archive" --archive-sha256 "$archive_sha" \
             --ferrum-bin "$RUNNER_TEMP/extracted-cuda/ferrum" \
             --runner "$RUNNER_TEMP/staged-cuda/model_regression" --runner-sha256 "$runner_sha" \
