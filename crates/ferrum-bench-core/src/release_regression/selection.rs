@@ -93,6 +93,16 @@ fn scope_matches(scope: &ObligationScope, target: &ExecutionTarget, id: Option<&
                 && *backend == target.backend
                 && execution_path == &target.execution_path
         }
+        ObligationScope::Reasoning {
+            protocol,
+            backend,
+            execution_path,
+            ..
+        } => {
+            protocol == &target.protocol
+                && *backend == target.backend
+                && execution_path == &target.execution_path
+        }
         ObligationScope::Target { target: expected } => expected == target,
         ObligationScope::Profile {
             profile_id,
@@ -198,31 +208,57 @@ fn area_targets(
     if area == ChangeArea::Validation || !impact.unknown_paths.is_empty() {
         return Ok(targets.to_vec());
     }
-    let mut backends = BTreeSet::new();
-    for path in impact
+    let contributors: Vec<_> = impact
         .paths
         .iter()
         .filter(|path| path.areas.contains(&area))
-    {
-        let Some(backend) = super::impact::path_backend(&path.path) else {
-            return Ok(targets.to_vec());
-        };
-        backends.insert(backend);
-    }
-    if backends.is_empty() {
+        .collect();
+    if contributors.is_empty() {
         return Ok(targets.to_vec());
     }
-    for backend in &backends {
-        if !targets.iter().any(|target| target.backend == *backend) {
+    let mut selected = BTreeSet::new();
+    for path in contributors {
+        let backend = super::impact::path_backend(&path.path);
+        if let Some(routes) = &path.execution_paths {
+            if routes.is_empty()
+                || routes.iter().any(|route| route.trim().is_empty())
+                || routes.iter().collect::<BTreeSet<_>>().len() != routes.len()
+            {
+                return Err(format!("invalid execution-path reach for {}", path.path));
+            }
+            for route in routes {
+                if !targets.iter().any(|target| {
+                    backend.is_none_or(|backend| target.backend == backend)
+                        && target.execution_path == *route
+                }) {
+                    return Err(format!("changed path {} execution route {route} has no target in the declared regression inventory", path.path));
+                }
+            }
+        }
+        let mut matched = false;
+        for (index, target) in targets.iter().enumerate() {
+            if backend.is_none_or(|backend| target.backend == backend)
+                && path
+                    .execution_paths
+                    .as_ref()
+                    .is_none_or(|routes| routes.contains(&target.execution_path))
+            {
+                selected.insert(index);
+                matched = true;
+            }
+        }
+        if !matched {
             return Err(format!(
-                "changed {backend:?} backend has no target in the declared regression inventory"
+                "changed path {} backend has no target in the declared regression inventory",
+                path.path
             ));
         }
     }
     Ok(targets
         .iter()
-        .filter(|target| backends.contains(&target.backend))
-        .cloned()
+        .enumerate()
+        .filter(|(index, _)| selected.contains(index))
+        .map(|(_, target)| target.clone())
         .collect())
 }
 
@@ -242,7 +278,7 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
         ),
         Template => (
             &[TemplateHistory, ProtocolFraming, ReasoningBoundaries],
-            &[TemplateHistory, ProtocolFraming, ReasoningBoundaries],
+            &[TemplateHistory, ProtocolFraming],
         ),
         Termination => (
             &[UserStop, NaturalEnd, LengthLimit],
@@ -624,6 +660,53 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     for area in areas {
         let affected = area_targets(&input.impact, area, &targets)?;
         area_obligations(&mut result, area, &affected);
+        if area == ChangeArea::Template {
+            // Text framing alone cannot distinguish a non-thinking template from
+            // one with prompt-opened or model-generated reasoning. Keep positive
+            // and absence checks distinct even when they share the output protocol.
+            for scope in protocols(&affected) {
+                let matching: Vec<_> = input
+                    .profiles
+                    .iter()
+                    .filter(|profile| scope_matches(&scope, &profile.target, Some(&profile.id)))
+                    .collect();
+                if matching.is_empty() {
+                    add(
+                        &mut result,
+                        Behavior::ReasoningBoundaries,
+                        EvidenceLayer::ModelRuntime,
+                        scope.clone(),
+                        "reasoning capability has no declared representative",
+                    );
+                }
+                for profile in matching {
+                    use ferrum_types::ModelReasoningProtocol as Reasoning;
+                    let behavior = match profile.reasoning_protocol {
+                        Reasoning::Unknown => {
+                            let gap = Gap::UnknownReasoningCapability {
+                                profile_id: profile.id.clone(),
+                            };
+                            if !result.gaps.contains(&gap) {
+                                result.gaps.push(gap);
+                            }
+                            continue;
+                        }
+                        Reasoning::None => Behavior::ReasoningAbsence,
+                        Reasoning::PromptOpened | Reasoning::ModelGenerated => {
+                            Behavior::ReasoningBoundaries
+                        }
+                    };
+                    let reasoning_scope = ObligationScope::Reasoning {
+                        protocol: profile.target.protocol,
+                        backend: profile.target.backend,
+                        execution_path: profile.target.execution_path.clone(),
+                        reasoning_protocol: profile.reasoning_protocol,
+                    };
+                    add(&mut result, behavior, EvidenceLayer::ModelRuntime, reasoning_scope,
+                        "declared reasoning capability; runtime must verify the loaded capability and its matching positive or absence observation");
+                }
+            }
+        }
     }
 
     let mut profiles: Vec<_> = input
@@ -635,6 +718,19 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     let covers = |profile: &ModelProfile, obligation: &Obligation| {
         requires_model(obligation)
             && scope_matches(&obligation.scope, &profile.target, Some(&profile.id))
+            && match &obligation.scope {
+                ObligationScope::Reasoning {
+                    reasoning_protocol, ..
+                } => *reasoning_protocol == profile.reasoning_protocol,
+                _ => true,
+            }
+            && match obligation.behavior {
+                Behavior::ReasoningBoundaries => profile.reasoning_protocol.supports_reasoning(),
+                Behavior::ReasoningAbsence => {
+                    profile.reasoning_protocol == ferrum_types::ModelReasoningProtocol::None
+                }
+                _ => true,
+            }
     };
     // Reserve every required QuickStart first, then reuse it for all matching scopes.
     let mut selected = BTreeSet::<usize>::new();

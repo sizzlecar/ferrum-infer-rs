@@ -132,3 +132,29 @@ fn explicit_probe_modes_preserve_quick_start_base_arguments() {
     assert!(argv.iter().any(|arg| arg == "--disable-thinking"));
     assert!(!argv.iter().any(|arg| arg == "--enable-thinking"));
 }
+
+#[test]
+fn actual_wire_absence_is_not_a_reasoning_positive_and_rejects_thought_in_each_mode() {
+    use ferrum_bench_core::release_regression::model_tasks::verify_reasoning_absence_observation;
+    for stream in [false, true] {
+        let clean = parse(
+            &wire(
+                json!({"role": "assistant", "content": "42"}),
+                "stop",
+                3,
+                stream,
+            ),
+            stream,
+        )
+        .unwrap();
+        verify_reasoning_absence_observation(&clean, "42").unwrap();
+        assert!(verify_reasoning_observation(&clean).is_err());
+        for message in [
+            json!({"role": "assistant", "content": "42", "reasoning": "private thought"}),
+            json!({"role": "assistant", "content": "<think>private</think>42"}),
+        ] {
+            let leaked = parse(&wire(message, "stop", 3, stream), stream).unwrap();
+            assert!(verify_reasoning_absence_observation(&leaked, "42").is_err());
+        }
+    }
+}
