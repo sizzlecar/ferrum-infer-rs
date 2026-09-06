@@ -1,5 +1,8 @@
 # Release regression
 
+For the change-based selection policy, cost rules, implementation status and a
+worked example, see [发布回归决策方案](release-regression-policy.zh.md).
+
 This is a validation procedure, not a record of completed checks. Use the current
 [English](../README.md) and [Chinese](../README_zh.md) README as the product contract.
 Every Quick Start model must run on its advertised backend before release.
