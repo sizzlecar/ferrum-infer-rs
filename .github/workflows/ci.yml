@@ -304,11 +304,95 @@ jobs:
           test -n "$FERRUM_NATIVE_OPERATOR_SET_LOCK"
           cargo build --locked -p ferrum-kernels --features cuda
 
+  # Small real-device numerical checks; no model download. Keep the hosted
+  # workspace jobs above: this lane proves only the operations invoked below.
+  gpu:
+    name: GPU runtime (${{ matrix.backend }})
+    needs: prepare
+    # Personal workers only execute repository-controlled branches. A fork's
+    # skip remains a missing required result; run reviewed code from a local
+    # repository branch before merging it.
+    if: >-
+      needs.prepare.outputs.scope == 'code' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: metal
+            runner: [self-hosted, macOS, ARM64, ferrum-metal]
+          - backend: cuda
+            runner: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+
+      - name: Configure CUDA build inputs
+        if: matrix.backend == 'cuda'
+        env:
+          NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst
+          NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e
+        run: |
+          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v6.tar.zst"
+          root="$RUNNER_TEMP/ferrum-native-operator-set"
+          curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
+            --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
+          printf '%s  %s\n' "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" "$archive" \
+            | sha256sum --check --strict
+          mkdir -p "$root"
+          zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
+          lock="$root/inputs/native-operator-set.lock.json"
+          test -f "$lock"
+          echo "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" >> "$GITHUB_ENV"
+          echo "CUDA_HOME=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "CUDA_ROOT=/usr/local/cuda" >> "$GITHUB_ENV"
+          echo "CUDA_COMPUTE_CAP=89" >> "$GITHUB_ENV"
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+          nvidia-smi --query-gpu=name,compute_cap,memory.total,driver_version --format=csv
+          /usr/local/cuda/bin/nvcc --version
+
+      - name: Build required-backend numerical checker
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: cargo build --locked -p ferrum-testkit --example backend_numerics --features "$BACKEND"
+
+      - name: Require real GPU outputs for aligned and tail dimensions
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/backend-numerics"
+          ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
+            --op rms-norm --tokens 4 --dim 128 --seed 42 \
+            --report "$RUNNER_TEMP/backend-numerics/aligned.json"
+          ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
+            --op rms-norm --tokens 3 --dim 33 --seed 7 \
+            --report "$RUNNER_TEMP/backend-numerics/tail.json"
+
+      - name: Save raw numerical evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-numerics-${{ matrix.backend }}
+          if-no-files-found: error
+          path: ${{ runner.temp }}/backend-numerics/*.json
+          retention-days: 14
+
   required:
     name: CI required
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [prepare, cpu, metal, cuda]
+    needs: [prepare, cpu, metal, cuda, gpu]
     if: always()
     steps:
       - uses: actions/checkout@v4
@@ -320,7 +404,8 @@ jobs:
           CPU_RESULT: ${{ needs.cpu.result }}
           METAL_RESULT: ${{ needs.metal.result }}
           CUDA_RESULT: ${{ needs.cuda.result }}
+          GPU_RESULT: ${{ needs.gpu.result }}
         run: |
           rustc --edition=2021 --deny warnings .github/ci/policy.rs -o "$RUNNER_TEMP/policy"
           "$RUNNER_TEMP/policy" aggregate "$PREPARE_RESULT" "$CHANGE_SCOPE" \
-            "$CPU_RESULT" "$METAL_RESULT" "$CUDA_RESULT"
+            "$CPU_RESULT" "$METAL_RESULT" "$CUDA_RESULT" "$GPU_RESULT"

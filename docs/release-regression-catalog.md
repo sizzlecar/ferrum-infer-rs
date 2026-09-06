@@ -108,11 +108,17 @@ prove GPU execution: device-dependent tests can return early without a device.
 The CUDA Ubuntu container type-checks the CUDA CLI and optionally builds PTX;
 it does not execute CUDA operators.
 
-A required GPU check needs a Rust execution receipt recording actual device
-submission, completion synchronization, and the numerical assertions and results.
-Compilation and `NotRun` cannot satisfy that obligation. Actions can schedule
-suitable external or self-hosted GPU workers, but this repository has not yet
-implemented that dispatch and evidence integration.
+The separate `GPU runtime` matrix schedules repository-controlled code on the
+`ferrum-metal` and `ferrum-cuda` self-hosted workers. Its Rust checker requires the
+selected backend, completed GPU work and finite outputs within a declared
+numerical tolerance. Missing devices, missing reports and failed or skipped GPU
+jobs cannot satisfy `CI required` for code changes. See the
+[commands and current coverage](backend-numerics.md).
+
+This initial lane checks RMSNorm only, with aligned and tail dimensions. It does
+not bind all catalog kernel obligations, validate complete architectures or
+replace real-model and final-asset checks. The catalog's unassigned checks remain
+unassigned until each actual execution path has an appropriate executable binding.
 
 GitHub's [standard runners are free for public repositories](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 Its [larger runner options](https://docs.github.com/en/actions/reference/runners/larger-runners)

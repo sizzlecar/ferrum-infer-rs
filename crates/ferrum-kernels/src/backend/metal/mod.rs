@@ -524,12 +524,128 @@ impl MetalContext {
         }
     }
 
-    pub(crate) fn flush(&mut self) {
+    /// The single submission path shared by ordinary and checked synchronization.
+    fn submit_and_wait(&mut self) -> Option<&'static metal::CommandBufferRef> {
         self.compute_encoder_end();
-        if let Some(cmd) = self.cmd.take() {
-            cmd.commit();
-            cmd.wait_until_completed();
+        let cmd = self.cmd.take()?;
+        cmd.commit();
+        cmd.wait_until_completed();
+        Some(cmd)
+    }
+
+    pub(crate) fn flush(&mut self) {
+        let _ = self.submit_and_wait();
+    }
+
+    fn flush_checked(&mut self) -> Result<()> {
+        let cmd = self.submit_and_wait().ok_or_else(|| {
+            FerrumError::backend(
+                "Metal checked synchronization has no pending command buffer to submit",
+            )
+        })?;
+        let status = cmd.status();
+        let (code, detail) = if status == metal::MTLCommandBufferStatus::Completed {
+            (None, None)
+        } else {
+            command_buffer_error(cmd)
+        };
+        validate_command_buffer_completion(status, code, detail.as_deref())
+    }
+}
+
+/// Read the NSError while the waited command buffer is still alive. The metal
+/// crate exposes status but does not wrap MTLCommandBuffer.error.
+#[allow(
+    unexpected_cfgs,
+    reason = "objc 0.2 macros expand their legacy cargo-clippy feature cfg in the calling crate"
+)]
+fn command_buffer_error(cmd: &metal::CommandBufferRef) -> (Option<i64>, Option<String>) {
+    use metal::objc::runtime::Object;
+    use metal::objc::{msg_send, sel, sel_impl};
+    use std::ffi::CStr;
+
+    unsafe {
+        let error: *mut Object = msg_send![cmd, error];
+        if error.is_null() {
+            return (None, None);
         }
+        let code: metal::NSInteger = msg_send![error, code];
+        let description: *mut Object = msg_send![error, localizedDescription];
+        let detail = if description.is_null() {
+            None
+        } else {
+            let utf8: *const std::os::raw::c_char = msg_send![description, UTF8String];
+            (!utf8.is_null()).then(|| CStr::from_ptr(utf8).to_string_lossy().into_owned())
+        };
+        (Some(code as i64), detail)
+    }
+}
+
+fn validate_command_buffer_completion(
+    status: metal::MTLCommandBufferStatus,
+    code: Option<i64>,
+    detail: Option<&str>,
+) -> Result<()> {
+    if status == metal::MTLCommandBufferStatus::Completed {
+        return Ok(());
+    }
+    let mut message =
+        format!("Metal command buffer did not complete successfully: status {status:?}");
+    if let Some(code) = code {
+        message.push_str(&format!(", driver error code {code}"));
+    }
+    if let Some(detail) = detail {
+        message.push_str(": ");
+        message.push_str(detail);
+    }
+    Err(FerrumError::backend(message))
+}
+
+#[cfg(test)]
+mod checked_sync_tests {
+    use super::*;
+    use metal::MTLCommandBufferStatus as Status;
+
+    #[test]
+    fn only_completed_command_buffers_are_successful() {
+        assert!(validate_command_buffer_completion(Status::Completed, None, None).is_ok());
+        for status in [
+            Status::NotEnqueued,
+            Status::Enqueued,
+            Status::Committed,
+            Status::Scheduled,
+            Status::Error,
+        ] {
+            assert!(validate_command_buffer_completion(status, None, None).is_err());
+        }
+    }
+
+    #[test]
+    fn failed_command_buffer_preserves_driver_diagnostics() {
+        let error = validate_command_buffer_completion(
+            Status::Error,
+            Some(8),
+            Some("Insufficient memory to execute command buffer"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Error"));
+        assert!(error.contains("driver error code 8"));
+        assert!(error.contains("Insufficient memory"));
+    }
+
+    #[test]
+    fn missing_submission_is_not_success() {
+        let mut ctx = MetalContext {
+            cmd: None,
+            encoder: None,
+        };
+        let error = MetalBackend::sync_checked(&mut ctx).unwrap_err();
+        assert!(error.to_string().contains("no pending command buffer"));
+        // The legacy API and subsequent Drop still permit an empty no-op.
+        MetalBackend::sync(&mut ctx);
+        assert!(ctx.cmd.is_none());
+        assert!(ctx.encoder.is_none());
     }
 }
 
@@ -588,6 +704,17 @@ fn buffer_f16_from_f32(data: &[f32]) -> metal::Buffer {
 // ── Backend impl ──────────────────────────────────────────────────────
 
 pub struct MetalBackend;
+
+impl MetalBackend {
+    /// Submit pending work through the ordinary production command path, wait,
+    /// and require successful Metal completion before the caller reads results.
+    /// Requires pending work: an empty context returns an error, so a missing
+    /// submission cannot satisfy required operator validation. The legacy
+    /// Backend::sync and Drop APIs still permit an empty no-op.
+    pub fn sync_checked(ctx: &mut MetalContext) -> Result<()> {
+        ctx.flush_checked()
+    }
+}
 
 impl Backend for MetalBackend {
     type Buffer = MetalBuf;

@@ -37,6 +37,7 @@ pub mod kv_cache_append;
 pub mod marlin_matmul; // stub — see file docs
 pub mod paged_varlen_attn; // stub — see file docs
 pub mod qk_norm_rope;
+pub mod required;
 pub mod residual_add;
 pub mod rms_norm;
 pub mod silu_mul;
