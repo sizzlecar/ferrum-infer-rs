@@ -33,6 +33,14 @@ struct ToolObservation {
 }
 
 async fn generate(stream: bool, selected: &str) -> ToolObservation {
+    generate_with_choice(
+        stream,
+        json!({"type": "function", "function": {"name": selected}}),
+    )
+    .await
+}
+
+async fn generate_with_choice(stream: bool, choice: Value) -> ToolObservation {
     let tokenizer = Arc::new(tokenizer(&[]).await);
     // Encode headers canonically: this BPE has no merges for channel names.
     let generated = tokenizer.encode(OUTPUT, false).unwrap();
@@ -44,7 +52,6 @@ async fn generate(stream: bool, selected: &str) -> ToolObservation {
     let executor = Arc::new(ScriptedExecutor::new(tokenizer.vocab_size(), script));
     // Both tools are declared, so the negative case isolates the named selector.
     let tools = json!([tool("weather"), tool("calendar")]);
-    let choice = json!({"type": "function", "function": {"name": selected}});
     let mut wire = json!({
         "model": "protocol-contract",
         "messages": [{"role": "user", "content": "Call the selected tool."}],
@@ -72,7 +79,7 @@ async fn generate(stream: bool, selected: &str) -> ToolObservation {
     }
 }
 
-fn assert_engine_handoff(observation: &ToolObservation) {
+fn assert_engine_call_completed(observation: &ToolObservation) {
     let response = &observation.response;
     response.executor.assert_completed();
     assert_eq!(response.generated_tokens, observation.generated.len());
@@ -85,7 +92,11 @@ fn assert_engine_handoff(observation: &ToolObservation) {
         response.decoded_inputs.concat(),
         OUTPUT.strip_suffix(CALL).unwrap()
     );
+}
 
+fn assert_engine_handoff(observation: &ToolObservation) {
+    assert_engine_call_completed(observation);
+    let response = &observation.response;
     // Inspect actual model input, not an independently rendered expected prompt.
     // This tools-unaware template receives the production fallback system spec.
     let (spec, _) = response
@@ -252,44 +263,48 @@ async fn harmony_function_handoff_reaches_sync_and_sse() {
     }
 }
 
+fn assert_handoff_rejected(response: &Observation, stream: bool) {
+    if stream {
+        assert_eq!(response.status, AxumStatusCode::OK, "{}", response.body);
+        let events = sse_events(&response.body);
+        let errors: Vec<_> = events
+            .iter()
+            .filter(|event| !event["error"].is_null())
+            .collect();
+        assert_eq!(errors.len(), 1, "{}", response.body);
+        assert_eq!(errors[0]["error"]["type"], "internal_server_error");
+        assert_eq!(errors[0]["error"]["param"], "tool_choice");
+        for event in &events {
+            assert!(event["usage"].is_null());
+            if let Some(choices) = event["choices"].as_array() {
+                for choice in choices {
+                    assert!(choice["finish_reason"].is_null());
+                    assert_no_payload(&choice["delta"]);
+                    assert_no_payload(&choice["message"]);
+                }
+            }
+        }
+    } else {
+        assert_eq!(
+            response.status,
+            AxumStatusCode::INTERNAL_SERVER_ERROR,
+            "{}",
+            response.body
+        );
+        let body: Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["error"]["type"], "internal_server_error");
+        assert!(body["error"]["param"].is_null());
+        assert!(body["choices"].is_null());
+        assert!(body["usage"].is_null());
+    }
+}
+
 #[tokio::test]
 async fn harmony_function_handoff_rejects_a_different_named_choice() {
     for stream in [false, true] {
         let observation = generate(stream, "calendar").await;
         let response = &observation.response;
-        if stream {
-            assert_eq!(response.status, AxumStatusCode::OK, "{}", response.body);
-            let events = sse_events(&response.body);
-            let errors: Vec<_> = events
-                .iter()
-                .filter(|event| !event["error"].is_null())
-                .collect();
-            assert_eq!(errors.len(), 1, "{}", response.body);
-            assert_eq!(errors[0]["error"]["type"], "internal_server_error");
-            assert_eq!(errors[0]["error"]["param"], "tool_choice");
-            for event in &events {
-                assert!(event["usage"].is_null());
-                if let Some(choices) = event["choices"].as_array() {
-                    for choice in choices {
-                        assert!(choice["finish_reason"].is_null());
-                        assert_no_payload(&choice["delta"]);
-                        assert_no_payload(&choice["message"]);
-                    }
-                }
-            }
-        } else {
-            assert_eq!(
-                response.status,
-                AxumStatusCode::INTERNAL_SERVER_ERROR,
-                "{}",
-                response.body
-            );
-            let body: Value = serde_json::from_str(&response.body).unwrap();
-            assert_eq!(body["error"]["type"], "internal_server_error");
-            assert!(body["error"]["param"].is_null());
-            assert!(body["choices"].is_null());
-            assert!(body["usage"].is_null());
-        }
+        assert_handoff_rejected(response, stream);
         // The engine completes the same valid handoff before HTTP rejects its
         // disagreement with the named selector; this is not a model failure.
         assert_engine_handoff(&observation);
@@ -329,6 +344,97 @@ async fn harmony_final_json_cannot_impersonate_a_required_tool_call() {
             assert_eq!(body["error"]["type"], "invalid_request_error");
             assert_eq!(body["error"]["param"], "tool_choice");
             assert!(body["choices"].is_null());
+        }
+    }
+}
+
+async fn assert_tool_choice_none_rejects_native_call(stream: bool) {
+    let observation = generate_with_choice(stream, json!("none")).await;
+    let response = &observation.response;
+    assert_handoff_rejected(response, stream);
+    assert!(!response.body.contains(REASONING), "{}", response.body);
+    assert!(!response.body.contains("<|"), "{}", response.body);
+    // Request policy is enforced after this valid native call completes. It
+    // must not depend on whether the template still exposes tool definitions.
+    assert_engine_call_completed(&observation);
+}
+
+#[tokio::test]
+async fn harmony_tool_choice_none_rejects_native_call_sync() {
+    assert_tool_choice_none_rejects_native_call(false).await;
+}
+
+#[tokio::test]
+async fn harmony_tool_choice_none_rejects_native_call_sse() {
+    assert_tool_choice_none_rejects_native_call(true).await;
+}
+
+#[tokio::test]
+async fn harmony_tool_choice_none_accepts_native_final_sync_and_sse() {
+    const CONTENT: &str = "No tool is needed.";
+    for stream in [false, true] {
+        let response = post_json(
+            router_with_stub_and_template(
+                "<|channel|>final<|message|>No tool is needed.<|return|>",
+                template(ModelOutputProtocol::HarmonyGptOss),
+            ),
+            "/v1/chat/completions",
+            json!({
+                "model": "stub-model",
+                "messages": [{"role": "user", "content": "Answer without tools."}],
+                "tools": [tool("weather")],
+                "tool_choice": "none",
+                "stream": stream,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), AxumStatusCode::OK);
+        if stream {
+            let body = response_text(response).await;
+            let events = sse_events(&body);
+            let mut content = String::new();
+            let mut terminal = false;
+            for event in &events {
+                assert!(event["error"].is_null(), "{body}");
+                let choices = event["choices"].as_array().unwrap();
+                assert_eq!(choices.len(), 1);
+                let choice = &choices[0];
+                assert_eq!(choice["index"], 0);
+                assert!(choice["message"].is_null());
+                let delta = &choice["delta"];
+                assert!(delta.is_object());
+                assert_empty_text(&delta["reasoning"]);
+                assert_empty_text(&delta["reasoning_content"]);
+                assert!(delta["tool_calls"].is_null());
+                assert!(delta["function_call"].is_null());
+                if terminal || !choice["finish_reason"].is_null() {
+                    assert_no_payload(delta);
+                }
+                if !choice["finish_reason"].is_null() {
+                    assert!(!terminal, "duplicate terminal: {body}");
+                    assert_eq!(choice["finish_reason"], "stop");
+                    terminal = true;
+                }
+                if let Some(piece) = delta["content"].as_str() {
+                    content.push_str(piece);
+                    assert!(CONTENT.starts_with(&content), "{body}");
+                }
+            }
+            assert!(terminal, "{body}");
+            assert_eq!(content, CONTENT);
+        } else {
+            let body = response_json(response).await;
+            assert!(body["error"].is_null(), "{body}");
+            assert_eq!(body["choices"].as_array().unwrap().len(), 1);
+            let choice = &body["choices"][0];
+            assert_eq!(choice["finish_reason"], "stop");
+            let message = &choice["message"];
+            assert_eq!(message["role"], "assistant");
+            assert_eq!(message["content"], CONTENT);
+            assert_empty_text(&message["reasoning"]);
+            assert_empty_text(&message["reasoning_content"]);
+            assert!(message["tool_calls"].is_null());
+            assert!(message["function_call"].is_null());
         }
     }
 }

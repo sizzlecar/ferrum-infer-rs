@@ -4535,6 +4535,12 @@ fn validate_structured_tool_response(
         return Ok(());
     }
 
+    if tool_choice_none(request.tool_choice.as_ref()) {
+        return Err(ServerError::InternalError(
+            "model emitted a tool call while tool_choice is 'none'".to_string(),
+        ));
+    }
+
     if required {
         if !response.message.content.trim().is_empty() {
             return Err(ServerError::InternalError(
