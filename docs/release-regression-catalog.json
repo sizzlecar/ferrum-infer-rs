@@ -1,0 +1,251 @@
+{
+  "profiles": [
+    {
+      "id": "quick-start-metal",
+      "model": "qwen3.5:4b-q4_k_m",
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "metal",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "quick-start-cuda",
+      "model": "qwen3.5:4b",
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "safetensors-bf16-f32",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "hybrid-moe-metal",
+      "model": "qwen3.5:35b-a3b-q4_k_s",
+      "target": {
+        "architecture": "qwen3_5_hybrid_moe",
+        "protocol": "text",
+        "precision": "gguf-q4_k_s",
+        "backend": "metal",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "attention-moe-metal",
+      "model": "qwen3:30b-a3b-q4_k_m",
+      "target": {
+        "architecture": "qwen3_attention_moe",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "metal",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "attention-moe-cuda",
+      "model": "qwen3-coder:30b-gptq",
+      "target": {
+        "architecture": "qwen3_attention_moe",
+        "protocol": "text",
+        "precision": "gptq-int4",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "llama-dense-metal",
+      "model": "llama3.1:8b-q4_k_m",
+      "target": {
+        "architecture": "llama_dense",
+        "protocol": "text",
+        "precision": "gguf-q4_k_m",
+        "backend": "metal",
+        "execution_path": "legacy-model-executor"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "llama-dense-cuda",
+      "model": "unsloth/Meta-Llama-3.1-8B-Instruct",
+      "target": {
+        "architecture": "llama_dense",
+        "protocol": "text",
+        "precision": "safetensors-bf16",
+        "backend": "cuda",
+        "execution_path": "legacy-model-executor"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "hybrid-dense-ct-int4-cuda",
+      "model": "cyankiwi/Qwen3.8-27B-AWQ-INT4",
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "compressed-tensors-int4",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "hybrid-dense-block-fp8-cuda",
+      "model": "Qwen/Qwen3.8-27B-FP8",
+      "target": {
+        "architecture": "qwen3_5_dense_hybrid",
+        "protocol": "text",
+        "precision": "block-fp8-e4m3",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "hybrid-moe-block-fp8-cuda",
+      "model": "Qwen/Qwen3.6-35B-A3B-FP8",
+      "target": {
+        "architecture": "qwen3_5_hybrid_moe",
+        "protocol": "text",
+        "precision": "block-fp8-e4m3",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "harmony-mxfp4-cuda",
+      "model": "openai/gpt-oss-20b",
+      "target": {
+        "architecture": "gpt_oss_moe",
+        "protocol": "harmony_gpt_oss",
+        "precision": "mxfp4",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    },
+    {
+      "id": "gemma-ct-w4a16-cuda",
+      "model": "google/gemma-4-12B-it-qat-w4a16-ct",
+      "target": {
+        "architecture": "gemma4_dense",
+        "protocol": "gemma_thought",
+        "precision": "compressed-tensors-w4a16",
+        "backend": "cuda",
+        "execution_path": "production-plan-runtime"
+      },
+      "available": true,
+      "estimate": null
+    }
+  ],
+  "quick_start_profile_ids": [
+    "quick-start-metal",
+    "quick-start-cuda"
+  ],
+  "required_targets": [
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "gguf-q4_k_m",
+      "backend": "metal",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "safetensors-bf16-f32",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_hybrid_moe",
+      "protocol": "text",
+      "precision": "gguf-q4_k_s",
+      "backend": "metal",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_attention_moe",
+      "protocol": "text",
+      "precision": "gguf-q4_k_m",
+      "backend": "metal",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_attention_moe",
+      "protocol": "text",
+      "precision": "gptq-int4",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "llama_dense",
+      "protocol": "text",
+      "precision": "gguf-q4_k_m",
+      "backend": "metal",
+      "execution_path": "legacy-model-executor"
+    },
+    {
+      "architecture": "llama_dense",
+      "protocol": "text",
+      "precision": "safetensors-bf16",
+      "backend": "cuda",
+      "execution_path": "legacy-model-executor"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "compressed-tensors-int4",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_dense_hybrid",
+      "protocol": "text",
+      "precision": "block-fp8-e4m3",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "qwen3_5_hybrid_moe",
+      "protocol": "text",
+      "precision": "block-fp8-e4m3",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "gpt_oss_moe",
+      "protocol": "harmony_gpt_oss",
+      "precision": "mxfp4",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    },
+    {
+      "architecture": "gemma4_dense",
+      "protocol": "gemma_thought",
+      "precision": "compressed-tensors-w4a16",
+      "backend": "cuda",
+      "execution_path": "production-plan-runtime"
+    }
+  ],
+  "checks": []
+}

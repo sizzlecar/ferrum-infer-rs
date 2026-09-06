@@ -9,6 +9,48 @@ Every Quick Start model must run on its advertised backend before release.
 Sample performance-snapshot models by architecture, quantization and affected
 execution path; an exhaustive model-by-backend matrix is not required.
 
+## Generate the regression plan
+
+The [product catalog](release-regression-catalog.md) declares Quick Start profiles
+and advertised execution groups. Generate a plan from the **previous formal
+release to the complete candidate**, including all merged changes:
+
+```bash
+cargo run --locked -p ferrum-bench-core --example regression_plan -- \
+  --catalog docs/release-regression-catalog.json \
+  --base v0.8.7 --candidate HEAD --stage release \
+  --output /path/outside/repository/regression-plan.json \
+  --summary /path/outside/repository/regression-plan.md
+```
+
+Replace `--base` with the preceding formal release for the candidate being
+validated. `--stage pull_request` uses the PR base instead; `--stage nightly`
+plans periodic inventory coverage. Output files must be new. Git endpoints and
+the catalog digest record the planning inputs; neither proves correctness.
+
+Code PR CI generates this plan after compilation and before the workspace tests
+inside its existing CPU job, then uploads it with a job summary. Documentation-only
+PRs retain the inexpensive documentation checks; changed README promises also
+appear in the next complete release diff. Compilation failures can prevent plan
+generation and remain CI failures. Planning does not repeat the workspace suite or
+allocate GPUs. Existing CPU, Metal and CUDA checks retain their required outcomes.
+
+A successful planning command means the input was parsed and the plan generated.
+It is **not** a runtime pass or publication permission. Review every reported
+coverage gap, selected and omitted profile, and unknown estimate. The current
+catalog deliberately leaves checker assignments and costs unknown where there
+is no established executable binding or measurement. The remaining work is to
+connect actual check execution, validate its observations, and enforce that
+verification at the publication action; report generation alone does not do so.
+
+The first selector reserves each Quick Start profile, then reuses representatives
+for compatible obligations. Equal coverage is ordered by known estimated duration,
+then by price when currencies match, then by stable profile identifier. It does
+not infer currency conversion, cache availability, parallel critical paths or an
+optimal monetary schedule. Unknown estimates remain listed. Reported phase totals
+are sums of selected profile estimates, not measured end-to-end release latency;
+GPU charges use declared billable duration separately from preparation time.
+
 ## Prepare the candidate
 
 Complete the workspace and relevant backend checks in [AGENTS.md](../AGENTS.md).
