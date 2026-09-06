@@ -1,3 +1,4 @@
+use super::super::model_basic::{ARITHMETIC_PROMPT, MEMORY_PROMPT, RECALL_PROMPT};
 use super::*;
 use ferrum_types::ModelOutputProtocol;
 use serde_json::json;
@@ -30,8 +31,8 @@ fn task(id: &str, backend: Backend, checks: Vec<ModelCheck>) -> ExpectedModelRun
     }
 }
 
-/// These are runner-result fixtures, not substitutes for its answer/JSON/SSE
-/// oracles. The consuming runner retains tests of those actual assertions.
+/// Small runner-result fixtures exercise the shared semantic verifier through
+/// its actual report consumer; protocol framing remains covered by runner tests.
 struct ReportFixture {
     value: Value,
 }
@@ -69,7 +70,7 @@ impl ReportFixture {
             for name in entries {
                 let evidence = match *name {
                     "run-basic" => {
-                        let answers: Vec<_> = ["42", "cobalt-731"]
+                        let answers: Vec<_> = ["OK", "42", "cobalt-731"]
                             .into_iter()
                             .map(|answer| {
                                 let output = boundary_fixture(answer, "", "stop", 10);
@@ -77,11 +78,12 @@ impl ReportFixture {
                                 "finish_reason": output["finish_reason"], "usage": output["usage"]})
                             })
                             .collect();
-                        json!({"ready": ready.clone(), "answers": answers})
+                        json!({"ready": ready.clone(), "answers": answers, "prompts": [MEMORY_PROMPT, ARITHMETIC_PROMPT, RECALL_PROMPT]})
                     }
                     "serve-basic" => {
                         let mut observations = json!({});
                         for (mode, answer) in [
+                            ("memory_write", "OK"),
                             ("sync", "42"),
                             ("stream", "42"),
                             ("recall", "cobalt-731"),
@@ -89,7 +91,7 @@ impl ReportFixture {
                         ] {
                             observations[mode] = boundary_fixture(answer, "", "stop", 10);
                         }
-                        json!({"observations": observations})
+                        json!({"requests": basic_requests(&observations), "observations": observations})
                     }
                     "run-stop" | "serve-stop" => {
                         stop_fixture(expected, &ready, *name == "run-stop")
@@ -107,16 +109,29 @@ impl ReportFixture {
                             "output": output, "sync": output, "stream": output})
                     }
                     "serve-tools" => {
-                        let mut evidence =
-                            json!({"reasoning_alias_replayed": expected.reasoning_alias_replay});
+                        let mut evidence = json!({"reasoning_alias_replayed": expected.reasoning_alias_replay, "tool_result": 579});
                         for (mode, id) in [("sync", "sync-call"), ("stream", "stream-call")] {
+                            let message = json!({"role": "assistant", "content": null,
+                                "reasoning": expected.reasoning_alias_replay.then_some("Use calc to add the two numbers."),
+                                "tool_calls": [{"id": id, "type": "function", "function": {"name": "calc", "arguments": "{\"expression\":\"123+456\"}"}}]});
+                            let mut replayed_assistant = message.clone();
+                            if mode == "stream" && expected.reasoning_alias_replay {
+                                let thought = replayed_assistant
+                                    .as_object_mut()
+                                    .unwrap()
+                                    .remove("reasoning")
+                                    .unwrap();
+                                replayed_assistant["reasoning_content"] = thought;
+                            }
                             evidence[format!("{mode}_call")] = json!({
-                                "message": {"role": "assistant", "tool_calls": [{"id": id, "type": "function", "function": {"name": "calc", "arguments": "{\"expression\":\"123+456\"}"}}]},
+                                "message": message,
                                 "finish_reason": "tool_calls", "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
                             });
                             evidence[format!("{mode}_continuation")] = json!({
-                                "message": {"role": "assistant", "content": "579"},
-                                "finish_reason": "stop", "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}, "tool_call_id": id
+                                "message": {"role": "assistant", "content": "579", "reasoning": null},
+                                "finish_reason": "stop", "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
+                                "tool_call_id": id, "replayed_assistant": replayed_assistant,
+                                "tool_result_message": {"role": "tool", "tool_call_id": id, "content": "{\"result\":579}"}
                             });
                         }
                         evidence
@@ -166,6 +181,23 @@ impl ReportFixture {
             .unwrap()
             .retain(|case| case["case"] != name);
     }
+}
+
+fn basic_requests(observations: &Value) -> Value {
+    let memory = json!({"role": "user", "content": MEMORY_PROMPT});
+    let arithmetic = json!({"role": "user", "content": ARITHMETIC_PROMPT});
+    let recall = json!({"role": "user", "content": RECALL_PROMPT});
+    let history = vec![
+        memory.clone(),
+        observations["memory_write"]["message"].clone(),
+        arithmetic,
+    ];
+    let mut sync_recall = history.clone();
+    sync_recall.extend([observations["sync"]["message"].clone(), recall.clone()]);
+    let mut stream_recall = history.clone();
+    stream_recall.extend([observations["stream"]["message"].clone(), recall]);
+    json!({"memory_write": [memory], "sync": history, "stream": history,
+        "recall": sync_recall, "stream_recall": stream_recall})
 }
 
 fn stop_fixture(expected: &ExpectedModelRun, ready: &Value, is_run: bool) -> Value {
@@ -248,6 +280,82 @@ fn selected_checks_are_reusable_and_do_not_impose_unselected_model_work() {
         fixture.value["options"]["report_dir"] = json!("/another/report/location");
         fixture.value["options"]["precision_label"] = json!("descriptive only");
         assert_eq!(verify_model_report(&expected, &fixture.value), Ok(()));
+    }
+}
+
+#[test]
+fn basic_semantics_are_rechecked_for_every_declared_reasoning_capability() {
+    for capability in [
+        ModelReasoningProtocol::None,
+        ModelReasoningProtocol::PromptOpened,
+        ModelReasoningProtocol::ModelGenerated,
+    ] {
+        let mut expected = task("basic", Backend::Metal, vec![ModelCheck::Basic]);
+        expected.profile.reasoning_protocol = capability;
+        let valid = ReportFixture::passed(&expected);
+        verify_model_report(&expected, &valid.value).unwrap();
+        for (name, pointer, wrong) in [
+            (
+                "run-basic",
+                "/evidence/answers/0/content",
+                json!("not remembered"),
+            ),
+            ("run-basic", "/evidence/answers/1/content", json!("43")),
+            (
+                "run-basic",
+                "/evidence/answers/2/content",
+                json!("other-code"),
+            ),
+            (
+                "serve-basic",
+                "/evidence/observations/memory_write",
+                Value::Null,
+            ),
+            (
+                "serve-basic",
+                "/evidence/observations/sync/message/content",
+                json!("43"),
+            ),
+            (
+                "serve-basic",
+                "/evidence/observations/stream/message/content",
+                json!("43"),
+            ),
+            (
+                "serve-basic",
+                "/evidence/observations/recall/message/content",
+                json!("other-code"),
+            ),
+            (
+                "serve-basic",
+                "/evidence/observations/stream_recall/message/content",
+                json!("other-code"),
+            ),
+        ] {
+            let mut invalid = ReportFixture::passed(&expected);
+            *invalid.case_mut(name).pointer_mut(pointer).unwrap() = wrong;
+            assert!(
+                verify_model_report(&expected, &invalid.value).is_err(),
+                "accepted {capability:?} {name} {pointer}"
+            );
+        }
+        for (name, pointer) in [
+            ("run-basic", "/evidence/prompts/1"),
+            ("serve-basic", "/evidence/requests/stream_recall/3/content"),
+        ] {
+            let mut invalid = ReportFixture::passed(&expected);
+            *invalid.case_mut(name).pointer_mut(pointer).unwrap() = json!("rewritten request");
+            assert!(
+                verify_model_report(&expected, &invalid.value).is_err(),
+                "accepted altered {name} input {pointer}"
+            );
+        }
+        let mut missing = ReportFixture::passed(&expected);
+        missing.case_mut("run-basic")["evidence"]["answers"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        assert!(verify_model_report(&expected, &missing.value).is_err());
     }
 }
 
@@ -414,7 +522,7 @@ fn declared_alias_replay_cannot_hide_a_case_that_did_not_replay_it() {
     let mut fixture = ReportFixture::passed(&expected);
     assert_eq!(verify_model_report(&expected, &fixture.value), Ok(()));
     fixture.case_mut("serve-tools")["evidence"]["reasoning_alias_replayed"] = json!(false);
-    rejected(&expected, &fixture, "reasoning alias replay mode");
+    rejected(&expected, &fixture, "reasoning alias");
 }
 
 #[test]
@@ -508,48 +616,67 @@ fn tools_require_both_named_calls_and_their_actual_continuations() {
             .as_object_mut()
             .unwrap()
             .remove(name);
-        rejected(
-            &expected,
-            &fixture,
-            &format!("completed {name} oracle evidence"),
-        );
+        rejected(&expected, &fixture, name);
 
         let mut fixture = ReportFixture::passed(&expected);
         fixture.case_mut("serve-tools")["evidence"][name]["finish_reason"] = json!("length");
-        rejected(
-            &expected,
-            &fixture,
-            &format!("completed {name} oracle evidence"),
-        );
+        rejected(&expected, &fixture, name);
     }
     for mode in ["sync", "stream"] {
         for (field, wrong) in [("id", json!("")), ("type", json!("unknown"))] {
             let mut fixture = ReportFixture::passed(&expected);
             fixture.case_mut("serve-tools")["evidence"][format!("{mode}_call")]["message"]
                 ["tool_calls"][0][field] = wrong;
-            rejected(
-                &expected,
-                &fixture,
-                &format!("{mode}_call is missing its named tool identity"),
-            );
+            rejected(&expected, &fixture, &format!("{mode}_call"));
         }
         let mut fixture = ReportFixture::passed(&expected);
         fixture.case_mut("serve-tools")["evidence"][format!("{mode}_call")]["message"]
             ["tool_calls"][0]["function"]["name"] = json!("lookup_weather");
-        rejected(
-            &expected,
-            &fixture,
-            &format!("{mode}_call is missing its named tool identity"),
-        );
+        rejected(&expected, &fixture, &format!("{mode}_call"));
 
         let mut fixture = ReportFixture::passed(&expected);
         fixture.case_mut("serve-tools")["evidence"][format!("{mode}_continuation")]
             ["tool_call_id"] = json!("another-call");
-        rejected(
-            &expected,
-            &fixture,
-            &format!("{mode}_continuation did not replay its actual call identity"),
-        );
+        rejected(&expected, &fixture, &format!("{mode}_continuation"));
+    }
+}
+
+#[test]
+fn tool_report_cannot_substitute_expression_result_or_actual_replay_messages() {
+    let expected = task("tools", Backend::Cuda, vec![ModelCheck::Tools]);
+    let valid = ReportFixture::passed(&expected);
+    verify_model_report(&expected, &valid.value).unwrap();
+    let mut wrong_result = ReportFixture::passed(&expected);
+    wrong_result.case_mut("serve-tools")["evidence"]["tool_result"] = json!(580);
+    assert!(verify_model_report(&expected, &wrong_result.value).is_err());
+    for mode in ["sync", "stream"] {
+        // A self-consistent replay of the wrong expression still violates the task.
+        let mut invalid = ReportFixture::passed(&expected);
+        let evidence = &mut invalid.case_mut("serve-tools")["evidence"];
+        let wrong_arguments = json!("{\"expression\":\"123+457\"}");
+        evidence[format!("{mode}_call")]["message"]["tool_calls"][0]["function"]["arguments"] =
+            wrong_arguments.clone();
+        evidence[format!("{mode}_continuation")]["replayed_assistant"]["tool_calls"][0]
+            ["function"]["arguments"] = wrong_arguments;
+        assert!(verify_model_report(&expected, &invalid.value).is_err());
+        for (pointer, wrong) in [
+            ("/message/content", json!("580")),
+            ("/tool_call_id", json!("another-call")),
+            ("/replayed_assistant/tool_calls/0/id", json!("another-call")),
+            ("/tool_result_message/tool_call_id", json!("another-call")),
+            ("/tool_result_message/content", json!("{\"result\":580}")),
+            ("/replayed_assistant", Value::Null),
+            ("/usage/completion_tokens", json!(0)),
+        ] {
+            let mut invalid = ReportFixture::passed(&expected);
+            let output =
+                &mut invalid.case_mut("serve-tools")["evidence"][format!("{mode}_continuation")];
+            *output.pointer_mut(pointer).unwrap() = wrong;
+            assert!(
+                verify_model_report(&expected, &invalid.value).is_err(),
+                "accepted {mode} {pointer}"
+            );
+        }
     }
 }
 
@@ -637,7 +764,7 @@ fn reasoning_capability_cannot_be_faked_by_nullable_thought_or_declared_target()
             );
         }
     }
-    for mode in ["sync", "stream", "recall", "stream_recall"] {
+    for mode in ["memory_write", "sync", "stream", "recall", "stream_recall"] {
         let mut bad = ReportFixture::passed(&expected);
         bad.case_mut("serve-basic")["evidence"]["observations"][mode]["message"]["reasoning"] =
             json!("unexpected thought");

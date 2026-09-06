@@ -13,15 +13,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
-use ferrum_bench_core::release_regression::model_tasks::verify_reasoning_absence_observation;
+use ferrum_bench_core::release_regression::model_basic::{
+    verify_basic_run, verify_basic_serve, ARITHMETIC_PROMPT, MEMORY_PROMPT, RECALL_PROMPT,
+};
+use ferrum_bench_core::release_regression::model_tool::{verify_tool_case, ValidatedCalcCall};
 
 fn observation(chat: &Chat) -> Value {
     json!({"message": chat.message, "finish_reason": chat.finish, "usage": chat.usage})
 }
-
-const FIRST_TURN: &str =
-    "Remember the code cobalt-731. What is 17 + 25? Reply with only the number.";
-const SECOND_TURN: &str = "What code did I ask you to remember? Reply with only that code.";
 
 enum Input<'a> {
     Repl(&'a str),
@@ -167,37 +166,14 @@ async fn capture_run(
 }
 
 pub(super) async fn run_basic(args: &Args) -> Result<Value> {
-    let stdin = format!("{FIRST_TURN}\n{SECOND_TURN}\n/bye\n");
+    let prompts = [MEMORY_PROMPT, ARITHMETIC_PROMPT, RECALL_PROMPT];
+    let stdin = format!("{}\n/bye\n", prompts.join("\n"));
     let run = run_chat(args, "run-basic", Input::Repl(&stdin), None).await?;
-    ensure!(
-        run.assistants.len() == 2,
-        "expected an assistant answer for each actual REPL turn"
-    );
-    answer(
-        run.assistants[0]["content"]
-            .as_str()
-            .context("missing first answer")?,
-        "42",
-    )?;
-    answer(
-        run.assistants[1]["content"]
-            .as_str()
-            .context("missing recall answer")?,
-        "cobalt-731",
-    )?;
-    if run.ready["reasoning_protocol"] == "none" {
-        for (assistant, answer) in run.assistants.iter().zip(["42", "cobalt-731"]) {
-            ensure!(
-                assistant.get("reasoning_content").is_none(),
-                "noncanonical run reasoning alias"
-            );
-            let output = json!({"message": {"role": "assistant", "content": assistant["content"],
-                "reasoning": assistant["reasoning"], "tool_calls": assistant["tool_calls"]},
-                "finish_reason": assistant["finish_reason"], "usage": assistant["usage"]});
-            verify_reasoning_absence_observation(&output, answer).map_err(anyhow::Error::msg)?;
-        }
-    }
-    Ok(json!({"ready": run.ready, "answers": run.assistants}))
+    let protocol = serde_json::from_value(run.ready["reasoning_protocol"].clone())
+        .context("missing run reasoning capability")?;
+    let evidence = json!({"ready": run.ready, "prompts": prompts, "answers": run.assistants});
+    verify_basic_run(&evidence, protocol, args.max_tokens).map_err(anyhow::Error::msg)?;
+    Ok(evidence)
 }
 
 fn request(server: &Server<'_>, messages: Vec<Value>) -> Value {
@@ -228,57 +204,56 @@ fn finished_answer(chat: &Chat, expected: &str) -> Result<()> {
 
 pub(super) async fn serve_basic(server: &Server<'_>) -> Result<Value> {
     let models = server.models().await?;
-    let first_user = json!({"role": "user", "content": FIRST_TURN});
-    let first = chat(
-        server,
-        "serve-basic-sync",
-        request(server, vec![first_user.clone()]),
-        false,
-    )
-    .await?;
-    finished_answer(&first, "42").context("sync arithmetic")?;
-    // Feed back the actual returned assistant, including its reasoning.
-    let history = request(
+    let first_user = json!({"role": "user", "content": MEMORY_PROMPT});
+    let memory_body = request(server, vec![first_user.clone()]);
+    let memory_write = chat(server, "serve-basic-memory", memory_body.clone(), false).await?;
+    finished_answer(&memory_write, "OK").context("memory acknowledgement")?;
+    let arithmetic_body = request(
         server,
         vec![
             first_user,
-            first.message.clone(),
-            json!({"role": "user", "content": SECOND_TURN}),
+            memory_write.message.clone(),
+            json!({"role": "user", "content": ARITHMETIC_PROMPT}),
         ],
     );
-    let recall = chat(server, "serve-basic-recall", history.clone(), false).await?;
+    let first = chat(server, "serve-basic-sync", arithmetic_body.clone(), false).await?;
+    finished_answer(&first, "42").context("sync arithmetic")?;
+    let streamed = chat(server, "serve-basic-stream", arithmetic_body.clone(), true).await?;
+    finished_answer(&streamed, "42").context("streamed arithmetic")?;
+    let recall_body = |arithmetic: &Chat| -> Result<Value> {
+        let mut messages = arithmetic_body["messages"]
+            .as_array()
+            .context("arithmetic request messages")?
+            .clone();
+        // Each wire mode replays its own actual answer and reasoning.
+        messages.push(arithmetic.message.clone());
+        messages.push(json!({"role": "user", "content": RECALL_PROMPT}));
+        Ok(request(server, messages))
+    };
+    let sync_history = recall_body(&first)?;
+    let stream_history = recall_body(&streamed)?;
+    let recall = chat(server, "serve-basic-recall", sync_history.clone(), false).await?;
     finished_answer(&recall, "cobalt-731").context("actual HTTP history recall")?;
-    let streamed_recall = chat(server, "serve-basic-recall-stream", history, true).await?;
-    finished_answer(&streamed_recall, "cobalt-731").context("actual SSE history recall")?;
-    let streamed = chat(
+    let streamed_recall = chat(
         server,
-        "serve-basic-stream",
-        request(
-            server,
-            vec![
-                json!({"role": "user", "content": "What is 19 + 23? Reply with only the number."}),
-            ],
-        ),
+        "serve-basic-recall-stream",
+        stream_history.clone(),
         true,
     )
     .await?;
-    finished_answer(&streamed, "42").context("streamed arithmetic")?;
-    let observations = json!({"sync": observation(&first), "stream": observation(&streamed),
-        "recall": observation(&recall), "stream_recall": observation(&streamed_recall)});
-    if server.health["reasoning_protocol"] == "none" {
-        for (mode, answer) in [
-            ("sync", "42"),
-            ("stream", "42"),
-            ("recall", "cobalt-731"),
-            ("stream_recall", "cobalt-731"),
-        ] {
-            verify_reasoning_absence_observation(&observations[mode], answer)
-                .map_err(anyhow::Error::msg)?;
-        }
-    }
-    Ok(
-        json!({"observations": observations, "models": models, "sync_answer": first.content(), "recall": recall.content(), "stream_recall": streamed_recall.content(), "stream_recall_usage": streamed_recall.usage, "stream_answer": streamed.content(), "stream_usage": streamed.usage}),
-    )
+    finished_answer(&streamed_recall, "cobalt-731").context("actual SSE history recall")?;
+    let evidence = json!({"observations": {
+        "memory_write": observation(&memory_write),
+        "sync": observation(&first), "stream": observation(&streamed),
+        "recall": observation(&recall), "stream_recall": observation(&streamed_recall)},
+        "requests": {"memory_write": memory_body["messages"],
+        "sync": arithmetic_body["messages"], "stream": arithmetic_body["messages"],
+        "recall": sync_history["messages"], "stream_recall": stream_history["messages"]},
+        "models": models});
+    let protocol = serde_json::from_value(server.health["reasoning_protocol"].clone())
+        .context("missing serve reasoning capability")?;
+    verify_basic_serve(&evidence, protocol, server.args.max_tokens).map_err(anyhow::Error::msg)?;
+    Ok(evidence)
 }
 
 pub(super) async fn structured(server: &Server<'_>) -> Result<Value> {
@@ -329,13 +304,14 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
     // Reuse the loaded server; each HTTP mode must actually select and hand off
     // the named tool from the same declarations, including a distractor.
     let sync_called = chat(server, "tools-call-sync", body.clone(), false).await?;
-    let sync_call = protocol::calc_call(&sync_called).context("sync named tool handoff")?;
+    let sync_call = protocol::calc_call(&sync_called, server.args.max_tokens)
+        .context("sync named tool handoff")?;
     let stream_called = chat(server, "tools-call-stream", body, true).await?;
-    let stream_call = protocol::calc_call(&stream_called).context("SSE named tool handoff")?;
+    let stream_call = protocol::calc_call(&stream_called, server.args.max_tokens)
+        .context("SSE named tool handoff")?;
     // Only execute this typed local fixture. Model text is never shell code.
-    let tool_result = 123u64 + 456u64;
-    let continuation = |called: &Chat, call: &Value| {
-        let result_message = json!({"role": "tool", "tool_call_id": call["id"], "content": json!({"result": tool_result}).to_string()});
+    let continuation = |called: &Chat, call: &ValidatedCalcCall| {
+        let result_message = json!({"role": "tool", "tool_call_id": call.call["id"], "content": json!({"result": call.result}).to_string()});
         let mut body = request(
             server,
             vec![user.clone(), called.message.clone(), result_message],
@@ -344,15 +320,11 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
         body["tool_choice"] = json!("none");
         body
     };
-    let canonical = chat(
-        server,
-        "tools-final-sync",
-        continuation(&sync_called, sync_call),
-        false,
-    )
-    .await?;
-    finished_answer(&canonical, "579").context("canonical tool-result replay")?;
-    let mut final_body = continuation(&stream_called, stream_call);
+    let sync_body = continuation(&sync_called, &sync_call);
+    let canonical = chat(server, "tools-final-sync", sync_body.clone(), false).await?;
+    finished_answer(&canonical, &sync_call.result.to_string())
+        .context("canonical tool-result replay")?;
+    let mut final_body = continuation(&stream_called, &stream_call);
     if server.args.reasoning_alias_replay {
         let assistant = final_body["messages"][1]
             .as_object_mut()
@@ -363,16 +335,26 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
         ensure!(reasoning.as_str().is_some_and(|text| !text.trim().is_empty()), "alias replay requires nonempty actual tool-call reasoning; keep model thinking enabled");
         assistant.insert("reasoning_content".into(), reasoning);
     }
-    let streamed = chat(server, "tools-final-stream", final_body, true).await?;
-    finished_answer(&streamed, "579").context("streamed tool-result replay")?;
-    Ok(json!({
+    let streamed = chat(server, "tools-final-stream", final_body.clone(), true).await?;
+    finished_answer(&streamed, &stream_call.result.to_string())
+        .context("streamed tool-result replay")?;
+    let evidence = json!({
         "sync_call": {"message": sync_called.message, "finish_reason": sync_called.finish, "usage": sync_called.usage},
         "stream_call": {"message": stream_called.message, "finish_reason": stream_called.finish, "usage": stream_called.usage},
-        "sync_continuation": {"message": canonical.message, "finish_reason": canonical.finish, "usage": canonical.usage, "tool_call_id": sync_call["id"]},
-        "stream_continuation": {"message": streamed.message, "finish_reason": streamed.finish, "usage": streamed.usage, "tool_call_id": stream_call["id"]},
-        "tool_result": tool_result,
+        "sync_continuation": {"message": canonical.message, "finish_reason": canonical.finish, "usage": canonical.usage,
+            "tool_call_id": sync_call.call["id"], "replayed_assistant": sync_body["messages"][1], "tool_result_message": sync_body["messages"][2]},
+        "stream_continuation": {"message": streamed.message, "finish_reason": streamed.finish, "usage": streamed.usage,
+            "tool_call_id": stream_call.call["id"], "replayed_assistant": final_body["messages"][1], "tool_result_message": final_body["messages"][2]},
+        "tool_result": sync_call.result,
         "reasoning_alias_replayed": server.args.reasoning_alias_replay
-    }))
+    });
+    verify_tool_case(
+        &evidence,
+        server.args.max_tokens,
+        server.args.reasoning_alias_replay,
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(evidence)
 }
 
 #[cfg(test)]

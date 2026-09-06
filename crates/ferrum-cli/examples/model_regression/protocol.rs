@@ -278,57 +278,20 @@ pub(super) fn stream(text: &str) -> Result<Chat> {
 /// The same fixture oracle runs after both actual HTTP parsers. A usable
 /// handoff includes a terminal tool-call finish, an identity, and typed arguments;
 /// a merely plausible function name is not enough to execute the fixture.
-pub(super) fn calc_call(chat: &Chat) -> Result<&Value> {
-    ensure!(
-        chat.finish == "tool_calls",
-        "calc call did not finish with tool_calls"
-    );
-    let calls = chat.message["tool_calls"]
-        .as_array()
-        .context("model did not call a tool")?;
-    ensure!(calls.len() == 1, "expected one calc invocation");
-    let call = &calls[0];
-    ensure!(
-        call["type"] == "function" && call["id"].as_str().is_some_and(|id| !id.trim().is_empty()),
-        "calc call is missing a usable function identity"
-    );
-    ensure!(
-        call["function"]["name"] == "calc",
-        "model selected the wrong tool"
-    );
-    let arguments: Value = serde_json::from_str(
-        call["function"]["arguments"]
-            .as_str()
-            .context("tool arguments")?,
+pub(super) fn calc_call(
+    chat: &Chat,
+    max_tokens: u32,
+) -> Result<ferrum_bench_core::release_regression::model_tool::ValidatedCalcCall> {
+    ferrum_bench_core::release_regression::model_tool::verify_calc_call(
+        &json!({"message": chat.message, "finish_reason": chat.finish, "usage": chat.usage}),
+        max_tokens,
     )
-    .context("invalid calc arguments JSON")?;
-    ensure!(
-        arguments
-            .as_object()
-            .is_some_and(|object| object.len() == 1),
-        "tool arguments violated additionalProperties: false: {arguments}"
-    );
-    let expression = arguments["expression"]
-        .as_str()
-        .context("expression argument")?;
-    ensure!(
-        expression
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect::<String>()
-            == "123+456",
-        "wrong tool expression: {arguments}"
-    );
-    Ok(call)
+    .map_err(anyhow::Error::msg)
 }
 
 pub(super) fn answer(text: &str, expected: &str) -> Result<()> {
-    let actual = text
-        .trim()
-        .trim_matches(|c| matches!(c, '`' | '*' | '"' | '\'' | '.'))
-        .trim();
     ensure!(
-        actual == expected,
+        ferrum_bench_core::release_regression::model_tasks::probe_answer_matches(text, expected),
         "expected answer {expected:?}, received {text:?}"
     );
     Ok(())
@@ -434,7 +397,7 @@ mod tests {
             let parse = |call: &Value, finish: &str| {
                 let text = tool_response(call, finish, streamed);
                 if streamed { stream(&text) } else { sync(&text) }
-                    .and_then(|chat| calc_call(&chat).map(|_| ()))
+                    .and_then(|chat| calc_call(&chat, 512).map(|_| ()))
             };
             parse(&valid, "tool_calls").unwrap();
             for (pointer, wrong) in [

@@ -1,4 +1,7 @@
 use super::*;
+use ferrum_bench_core::release_regression::model_basic::{
+    ARITHMETIC_PROMPT, MEMORY_PROMPT, RECALL_PROMPT,
+};
 use ferrum_bench_core::release_regression::{
     model_tasks::ModelRunCapacity, Entrypoint, ExecutionTarget, Impact, ModelProfile, PlanCost,
     SelectedProfile,
@@ -82,17 +85,48 @@ fn distributions() -> BTreeMap<Backend, Distribution> {
         },
     )])
 }
-// Runner-result fixture only: semantic answer/framing assertions remain in the
-// actual runner. These cases exercise its existing consuming validator.
+// Runner-result fixture: the release gate rechecks shared semantic assertions;
+// the model runner separately checks actual protocol framing.
 fn model_report(task: &ExpectedModelRun) -> Value {
+    let observation = |answer| {
+        json!({"message":{"role":"assistant","content":answer,"reasoning":null},
+        "finish_reason":"stop","usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}})
+    };
+    let answers: Vec<_> = ["OK", "42", "cobalt-731"]
+        .into_iter()
+        .map(|answer| {
+            let output = observation(answer);
+            json!({"content":output["message"]["content"],"reasoning":null,
+            "finish_reason":output["finish_reason"],"usage":output["usage"]})
+        })
+        .collect();
+    let observations = json!({"memory_write":observation("OK"),"sync":observation("42"),"stream":observation("42"),
+        "recall":observation("cobalt-731"),"stream_recall":observation("cobalt-731")});
+    let memory = json!({"role":"user","content":MEMORY_PROMPT});
+    let history = vec![
+        memory.clone(),
+        observations["memory_write"]["message"].clone(),
+        json!({"role":"user","content":ARITHMETIC_PROMPT}),
+    ];
+    let mut sync_recall = history.clone();
+    sync_recall.extend([
+        observations["sync"]["message"].clone(),
+        json!({"role":"user","content":RECALL_PROMPT}),
+    ]);
+    let mut stream_recall = history.clone();
+    stream_recall.extend([
+        observations["stream"]["message"].clone(),
+        json!({"role":"user","content":RECALL_PROMPT}),
+    ]);
+    let requests = json!({"memory_write":[memory],"sync":history,"stream":history,"recall":sync_recall,"stream_recall":stream_recall});
     json!({"schema_version":2,"status":"passed","profile_id":task.profile.id,"target":task.profile.target,"binary_sha256":task.binary_sha256,
     "options":{"profile_id":task.profile.id,"model":task.profile.model,"backend":"cuda","checks":task.checks,"disable_thinking":true,"use_default_backend":true,"max_tokens":task.max_tokens,"context_tokens":task.runtime_capacity.as_ref().map(|capacity|capacity.context_tokens),"max_num_seqs":task.runtime_capacity.as_ref().map(|capacity|capacity.max_num_seqs),"reasoning_alias_replay":false,"stop_prompt":task.stop_prompt},
     "sampling":{"temperature":0,"seed":7,"max_tokens":task.max_tokens},"environment_policy":"remove_inherited_ferrum_overrides",
     "cases":[
         {"case":"binary-version","status":"passed","evidence":{"version":format!("ferrum {}",task.version)}},
-        {"case":"run-basic","status":"passed","evidence":{"ready":{"event":"ready","requested_model":task.profile.model,"backend":"CUDA(0)"}}},
+        {"case":"run-basic","status":"passed","evidence":{"ready":{"event":"ready","requested_model":task.profile.model,"backend":"CUDA(0)"},"answers":answers,"prompts":[MEMORY_PROMPT,ARITHMETIC_PROMPT,RECALL_PROMPT]}},
         {"case":"serve-startup","status":"passed","evidence":{"version":task.version,"status":"healthy","auto_config":{"hardware_capabilities":{"backend":"cuda"}}}},
-        {"case":"serve-basic","status":"passed","evidence":{}},
+        {"case":"serve-basic","status":"passed","evidence":{"observations":observations,"requests":requests}},
         {"case":"binary-unchanged","status":"passed","evidence":{"sha256":task.binary_sha256}}
     ]})
 }
@@ -193,6 +227,38 @@ fn prepared_capacity_cannot_override_quick_start_or_the_functional_workload() {
                     .contains("capacity")
             );
         }
+    }
+}
+
+#[test]
+fn release_gate_rejects_wrong_basic_answers_despite_passed_runner_summaries() {
+    let expected = task();
+    VerifiedModels::new(std::slice::from_ref(&expected), &[model_report(&expected)]).unwrap();
+    for (name, pointer, wrong) in [
+        ("run-basic", "/evidence/answers/1/content", json!("43")),
+        (
+            "serve-basic",
+            "/evidence/observations/memory_write",
+            Value::Null,
+        ),
+        (
+            "serve-basic",
+            "/evidence/observations/stream_recall/message/content",
+            json!("other-code"),
+        ),
+    ] {
+        let mut report = model_report(&expected);
+        let case = report["cases"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|case| case["case"] == name)
+            .unwrap();
+        *case.pointer_mut(pointer).unwrap() = wrong;
+        assert!(
+            VerifiedModels::new(std::slice::from_ref(&expected), &[report]).is_err(),
+            "accepted {name} {pointer}"
+        );
     }
 }
 
