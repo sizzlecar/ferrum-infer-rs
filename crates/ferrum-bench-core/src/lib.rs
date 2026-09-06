@@ -27,6 +27,7 @@ pub mod decode_isolation;
 pub mod env;
 pub mod jsonl_journal;
 pub mod profile;
+pub mod release_regression;
 pub mod report;
 pub mod stats;
 pub mod trace;

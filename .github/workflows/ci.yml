@@ -147,6 +147,42 @@ jobs:
       - name: Compile (workspace, all targets)
         run: cargo check --locked --workspace --all-targets
 
+      - name: Generate regression scope and cost plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            test -n "$BASE_SHA"
+            if ! git cat-file -e "$BASE_SHA^{commit}"; then
+              git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            fi
+            plan_base="$BASE_SHA"
+            plan_stage=pull_request
+          else
+            # A manual CI run inventories periodic coverage. It is not a
+            # release diff; formal release planning requires an explicit base.
+            plan_base=HEAD
+            plan_stage=nightly
+          fi
+          cargo run --locked -p ferrum-bench-core --example regression_plan -- \
+            --catalog docs/release-regression-catalog.json \
+            --base "$plan_base" --candidate HEAD --stage "$plan_stage" \
+            --output "$RUNNER_TEMP/regression-plan.json" \
+            --summary "$RUNNER_TEMP/regression-plan.md"
+          cat "$RUNNER_TEMP/regression-plan.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save regression planning report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-plan
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/regression-plan.json
+            ${{ runner.temp }}/regression-plan.md
+          retention-days: 14
+
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -A warnings
 
