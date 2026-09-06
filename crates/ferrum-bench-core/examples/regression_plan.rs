@@ -5,6 +5,9 @@ mod scope;
 
 #[cfg(test)]
 use ferrum_bench_core::release_regression::analyze_paths;
+use ferrum_bench_core::release_regression::model_schedule::{
+    model_check_descriptors, model_task_schedule,
+};
 use ferrum_bench_core::release_regression::{plan, Impact, PlanInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -171,8 +174,18 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
         "impact".into(),
         serde_json::to_value(impact).map_err(|error| error.to_string())?,
     );
-    serde_json::from_value(Value::Object(input))
-        .map_err(|error| format!("invalid product catalog: {error}"))
+    let mut input: PlanInput = serde_json::from_value(Value::Object(input))
+        .map_err(|error| format!("invalid product catalog: {error}"))?;
+    for descriptor in model_check_descriptors() {
+        if input.checks.iter().any(|check| check.id == descriptor.id) {
+            return Err(format!(
+                "catalog cannot replace built-in checker {}",
+                descriptor.id
+            ));
+        }
+        input.checks.push(descriptor);
+    }
+    Ok(input)
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -220,6 +233,7 @@ fn run(args: Args) -> Result<(), String> {
         "provenance": {"base": base, "candidate": candidate, "changed_paths": paths,
             "catalog_sha256": format!("{:x}", Sha256::digest(&catalog_bytes)),
             "release_base_tag": release_base_tag, "version_refinement": analysis.version_refinement},
+        "model_tasks": model_task_schedule(&plan),
         "plan": plan,
     });
     let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
@@ -320,6 +334,19 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_cannot_replace_a_builtin_model_checker() {
+        let mut check = serde_json::to_value(&model_check_descriptors()[0]).unwrap();
+        check["entrypoints"] = json!([]);
+        let catalog = json!({"profiles": [], "quick_start_profile_ids": [],
+            "required_targets": [], "checks": [check]});
+        assert!(
+            plan_input(catalog, "pull_request", analyze_paths(Vec::<String>::new()))
+                .unwrap_err()
+                .contains("cannot replace built-in checker")
+        );
     }
 
     struct GitFixture(PathBuf);

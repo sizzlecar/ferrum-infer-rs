@@ -129,6 +129,8 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
                 | "examples/model_regression/cases.rs"
                 | "examples/model_regression/process.rs"
                 | "examples/model_regression/protocol.rs"
+                | "examples/model_regression/identity.rs"
+                | "examples/model_regression/identity_tests.rs"
         )
     {
         return Some((
@@ -227,6 +229,8 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "src/env.rs"
             | "src/report.rs"
             | "src/stats.rs"
+            | "examples/model_gate.rs"
+            | "examples/model_gate/tests.rs"
             | "examples/regression_plan.rs"
             | "examples/regression_plan/scope.rs"
             | "examples/release_candidate.rs"

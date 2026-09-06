@@ -146,10 +146,25 @@ future shell script or third-party action can never publish.
 
 ## Remaining execution and promotion work
 
-The [existing model runner](release-regression.md#rust-model-runner) and
-[regression catalog](release-regression-catalog.md) are reusable building blocks.
+The [model runner](release-regression.md#rust-model-runner),
+[regression catalog](release-regression-catalog.md) and
+[model-task gate](release-regression.md#verify-selected-model-tasks) now connect
+a limited ModelRuntime scope. `model_gate prepare` reads a generated plan plus
+adjacent `.abi.json`/`.version.json` staging records to fix expected tasks before
+execution. The runner checks the actual staged binary digest/version, task
+options and observed backend, executes its semantic assertions, and produces a
+schema-2 terminal report. `model_gate verify` rejects missing, failed, duplicate,
+unfinished or mismatched model reports and retains remaining plan gaps.
+
+Quick Start uses the normal alias, automatic backend and disabled thinking with
+controlled prompts, without capacity/template overrides or another model load.
+Other checks for the same profile share its server instance. This validates the
+implemented model-task obligations; it does not verify archive contents,
+installation, numerical references, every declared execution path, or complete
+release correctness. The gate reports `release_approved: false` even on success.
+
 Automatic local/cloud capacity selection, full-plan execution, raw report replay,
-and the evidence gate immediately before publishing remain pending. Cloud
+and the complete evidence gate immediately before publishing remain pending. Cloud
 provider/runner selection and its integration also remain pending; the catalog's
 resource discussion is background, not a configured paid execution service.
 

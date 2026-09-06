@@ -1,0 +1,111 @@
+use super::*;
+use clap::Parser;
+use serde_json::json;
+
+fn args(expected_backend: &str) -> Args {
+    Args::try_parse_from([
+        "model-regression",
+        "--ferrum-bin",
+        "fixture-ferrum",
+        "--model",
+        "fixture:model-alias",
+        "--backend",
+        expected_backend,
+        "--report-dir",
+        "fixture-report",
+    ])
+    .unwrap()
+}
+
+fn ready(actual_backend: &str) -> Value {
+    json!({
+        "event": "ready", "requested_model": "fixture:model-alias",
+        "resolved_model": "/cache/model", "backend": actual_backend
+    })
+}
+
+fn health(actual_backend: &str) -> Value {
+    json!({"status": "healthy", "auto_config": {"hardware_capabilities": {"backend": actual_backend}}})
+}
+
+#[test]
+fn actual_run_and_serve_backend_representations_match_requested_backend() {
+    for (expected, run_backend, serve_backend) in [
+        ("cpu", "CPU", "cpu"),
+        ("metal", "Metal", "metal"),
+        ("cuda", "CUDA(0)", "cuda"),
+        ("cuda", "CUDA(12)", "cuda"),
+    ] {
+        validate_run(&args(expected), &ready(run_backend)).unwrap();
+        validate_serve(&args(expected), &health(serve_backend)).unwrap();
+    }
+}
+
+#[test]
+fn fallback_or_missing_runtime_backend_is_rejected() {
+    let expected = args("cuda");
+    for actual in [
+        "CPU",
+        "metal",
+        "unknown",
+        "",
+        "CUDA()",
+        "CUDA(-1)",
+        "CUDA(0)cpu",
+        "cuda:0",
+    ] {
+        assert!(
+            validate_run(&expected, &ready(actual)).is_err(),
+            "accepted {actual:?}"
+        );
+        assert!(
+            validate_serve(&expected, &health(actual)).is_err(),
+            "accepted {actual:?}"
+        );
+    }
+    for actual in [Value::Null, json!(0), json!({"backend": "cuda"})] {
+        let mut record = ready("CUDA(0)");
+        record["backend"] = actual.clone();
+        assert!(validate_run(&expected, &record).is_err());
+        let mut record = health("cuda");
+        record["auto_config"]["hardware_capabilities"]["backend"] = actual;
+        assert!(validate_serve(&expected, &record).is_err());
+    }
+    // A top-level declaration must not substitute for the actual health field.
+    assert!(validate_serve(&expected, &json!({"status": "healthy", "backend": "cuda"})).is_err());
+    assert!(validate_serve(
+        &expected,
+        &json!({
+            "status": "healthy", "backend": "cuda", "auto_config": {"hardware_capabilities": {"backend": "cpu"}}
+        })
+    )
+    .is_err());
+}
+
+#[test]
+fn run_must_report_the_requested_alias_even_when_resolved_source_matches() {
+    let expected = args("cpu");
+    for wrong in [Value::Null, json!("another:alias"), json!("/cache/model")] {
+        let mut record = ready("CPU");
+        record["requested_model"] = wrong;
+        assert!(validate_run(&expected, &record).is_err());
+    }
+    let mut record = ready("CPU");
+    record["event"] = json!("assistant");
+    assert!(validate_run(&expected, &record).is_err());
+}
+
+#[test]
+fn successful_http_status_cannot_replace_healthy_runtime_status() {
+    let expected = args("cuda");
+    for status in [
+        Value::Null,
+        json!("unhealthy"),
+        json!("starting"),
+        json!(true),
+    ] {
+        let mut record = health("cuda");
+        record["status"] = status;
+        assert!(validate_serve(&expected, &record).is_err());
+    }
+}

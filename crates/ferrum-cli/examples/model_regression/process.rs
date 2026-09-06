@@ -1,7 +1,8 @@
-use super::{write_json, Args};
+use super::{identity, write_json, Args};
 use anyhow::{bail, ensure, Context, Result};
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
 use std::net::TcpListener;
@@ -15,21 +16,49 @@ struct Process {
     stderr: PathBuf,
 }
 
+// Only the child command is changed. Do not clear unrelated runtime, cache,
+// authentication, or loader configuration, and never record environment values.
+fn isolate_product_environment(
+    command: &mut Command,
+    use_default_backend: bool,
+    inherited_keys: impl IntoIterator<Item = OsString>,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    if use_default_backend {
+        for key in inherited_keys {
+            if key.to_string_lossy().starts_with("FERRUM_") {
+                command.env_remove(&key);
+                removed.push(key.to_string_lossy().into_owned());
+            }
+        }
+    }
+    removed.sort();
+    removed.dedup();
+    removed
+}
+
 impl Process {
     fn spawn(args: &Args, name: &str, argv: Vec<String>, stdin: Option<&str>) -> Result<Self> {
         let stdout = args.report_dir.join(format!("{name}.stdout.txt"));
         let stderr = args.report_dir.join(format!("{name}.stderr.txt"));
+        let mut command = Command::new(&args.ferrum_bin);
+        let removed_environment_keys = isolate_product_environment(
+            &mut command,
+            args.use_default_backend,
+            std::env::vars_os().map(|(key, _)| key),
+        );
         write_json(
             args.report_dir.join(format!("{name}.command.json")),
             &json!({
                 "program": args.ferrum_bin, "args": argv, "cwd": args.report_dir,
-                "environment_overrides": {"NO_COLOR": "1"}
+                "environment_overrides": {"NO_COLOR": "1"},
+                "removed_environment_keys": removed_environment_keys
             }),
         )?;
         if let Some(input) = stdin {
             fs::write(args.report_dir.join(format!("{name}.stdin.txt")), input)?;
         }
-        let child = Command::new(&args.ferrum_bin)
+        let child = command
             .args(argv)
             .current_dir(&args.report_dir)
             .env("NO_COLOR", "1")
@@ -152,6 +181,7 @@ impl<'a> Server<'a> {
                     fs::write(args.report_dir.join("serve.health.txt"), &text)?;
                     if status.is_success() {
                         let health = serde_json::from_str(&text).context("parse /health")?;
+                        identity::validate_serve(args, &health)?;
                         return Ok(Self {
                             args,
                             health,
@@ -226,5 +256,72 @@ impl<'a> Server<'a> {
             "served alias absent from /v1/models"
         );
         Ok(models)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_backend_isolates_only_child_product_environment() {
+        const PROBE: &str = "MODEL_REGRESSION_ENV_PROBE";
+        const PRODUCT: &str = "FERRUM_ENV_ISOLATION_FIXTURE";
+        const SECRET: &str = "synthetic-fixture-value";
+        const VERIFIED_EXIT: i32 = 23;
+        if let Ok(mode) = std::env::var(PROBE) {
+            if mode == "default" {
+                assert!(std::env::vars_os()
+                    .all(|(key, _)| !key.to_string_lossy().starts_with("FERRUM_")));
+            } else {
+                assert_eq!(mode, "explicit");
+                assert_eq!(std::env::var(PRODUCT).unwrap(), SECRET);
+            }
+            for (key, value) in [
+                ("PATH", "retained-path"),
+                ("CUDA_VISIBLE_DEVICES", "7"),
+                ("HF_HOME", "retained-cache"),
+                ("HF_TOKEN", "synthetic-token"),
+            ] {
+                assert_eq!(std::env::var(key).unwrap(), value);
+            }
+            // Distinguishes execution of the probe from a test harness matching
+            // no test. A failed assertion exits differently before this point.
+            std::process::exit(VERIFIED_EXIT);
+        }
+        let original = std::env::var_os(PRODUCT);
+        for use_default in [true, false] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args([
+                "--exact",
+                "process::tests::default_backend_isolates_only_child_product_environment",
+            ]);
+            command
+                .env(PROBE, if use_default { "default" } else { "explicit" })
+                .env(PRODUCT, SECRET)
+                .env("PATH", "retained-path")
+                .env("CUDA_VISIBLE_DEVICES", "7")
+                .env("HF_HOME", "retained-cache")
+                .env("HF_TOKEN", "synthetic-token");
+            let keys = std::env::vars_os()
+                .map(|(key, _)| key)
+                .chain(std::iter::once(OsString::from(PRODUCT)));
+            let removed = isolate_product_environment(&mut command, use_default, keys);
+            if use_default {
+                assert!(removed.iter().any(|key| key == PRODUCT));
+                assert!(removed.iter().all(|key| key.starts_with("FERRUM_")));
+                assert!(!serde_json::to_string(&removed).unwrap().contains(SECRET));
+            } else {
+                assert!(removed.is_empty());
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(VERIFIED_EXIT),
+                "child environment probe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(std::env::var_os(PRODUCT), original);
+        }
     }
 }
