@@ -70,7 +70,7 @@ pub struct ExecuteArgs {
     pub bootstrap_secs: u64,
     #[arg(long)]
     pub task_timeout_secs: u64,
-    /// First implementation permits exactly one create request, never retries it.
+    /// At most three distinct offers; only confirmed unavailable offers advance.
     #[arg(long)]
     pub max_create_attempts: u32,
 }
@@ -201,9 +201,11 @@ fn validate_args(args: &ExecuteArgs) -> Result<(), String> {
     if args.repository_id == 0
         || args.run_id == 0
         || args.attempt == 0
-        || args.max_create_attempts != 1
+        || !(1..=3).contains(&args.max_create_attempts)
     {
-        return Err("positive repo/run/attempt and max-create-attempts=1 are required".into());
+        return Err(
+            "positive repo/run/attempt and max-create-attempts in 1..=3 are required".into(),
+        );
     }
     if args.disk_gib == 0
         || args.min_free_disk_gib == 0
@@ -262,19 +264,38 @@ async fn interrupted() {
     }
 }
 
-/// CREATE is never retried. A lost response is reconciled by the exact ownership
-/// label, and any discovered IDs are registered for cleanup before further work.
+/// A lost response is reconciled by the exact ownership label, never retried.
+/// None means an explicit unavailable-offer rejection and a complete empty
+/// ownership lookup; only that result permits trying another offer.
 async fn acquire(
     client: &api::Client,
     offer: u64,
     args: &ExecuteArgs,
     label: &str,
     owned: &mut Vec<u64>,
-) -> Result<u64, String> {
+) -> Result<Option<u64>, String> {
     match client.create(offer, args.disk_gib, label, IMAGE).await {
-        Ok(id) => {
+        Ok(api::CreateOutcome::Created(id)) => {
             owned.push(id);
-            Ok(id)
+            Ok(Some(id))
+        }
+        Ok(api::CreateOutcome::OfferUnavailable) => {
+            let instances = client.instances().await.map_err(|error| {
+                format!("unavailable offer ownership lookup failed; do not allocate again: {error}")
+            })?;
+            for instance in instances
+                .into_iter()
+                .filter(|instance| instance.label.as_deref() == Some(label))
+            {
+                if !owned.contains(&instance.id) {
+                    owned.push(instance.id);
+                }
+            }
+            if owned.is_empty() {
+                Ok(None)
+            } else {
+                Err("unavailable offer unexpectedly has owned instances; clean up without another allocation".into())
+            }
         }
         Err(create_error) => {
             for attempt in 0..3 {
@@ -289,7 +310,7 @@ async fn acquire(
                             }
                         }
                         match owned.as_slice() {
-                            [id]=>return Ok(*id),
+                            [id]=>return Ok(Some(*id)),
                             []=>{},
                             _=>return Err("ambiguous create produced multiple owned instances; cleaning up all, no execution".into()),
                         }
@@ -304,6 +325,60 @@ async fn acquire(
         }
     }
 }
+
+async fn acquire_from_offers(
+    client: &api::Client,
+    args: &ExecuteArgs,
+    label: &str,
+    owned: &mut Vec<u64>,
+    create_unconfirmed: &mut bool,
+    offers: &[api::Offer],
+) -> Result<u64, String> {
+    let mut seen = BTreeSet::new();
+    let mut attempts = Vec::new();
+    for offer in offers
+        .iter()
+        .filter(|offer| seen.insert(offer.id))
+        .take(args.max_create_attempts as usize)
+    {
+        let intent = json!({"schema_version":1,"label":label,"offer":offer,"image":IMAGE,
+            "disk_gib":args.disk_gib,"created_at":now()?,"lease_secs":args.lease_secs,
+            "attempt":attempts.len()+1,"max_create_attempts":args.max_create_attempts});
+        write_json(&args.report_dir.join("create-intent.json"), &intent)?;
+        attempts.push(json!({"intent":intent,"status":"requesting"}));
+        write_json(&args.report_dir.join("create-attempts.json"), &attempts)?;
+        // Set before awaiting CREATE: interruption must retain uncertainty even
+        // if the future is dropped before receiving or recording its outcome.
+        *create_unconfirmed = true;
+        let outcome = acquire(client, offer.id, args, label, owned).await;
+        let record = attempts.last_mut().unwrap();
+        match &outcome {
+            Ok(Some(id)) => {
+                *create_unconfirmed = false;
+                record["status"] = json!("allocated");
+                record["instance_id"] = json!(id);
+            }
+            Ok(None) => {
+                *create_unconfirmed = false;
+                record["status"] = json!("offer_unavailable");
+            }
+            Err(error) => {
+                record["status"] = json!("failed");
+                record["error"] = json!(error);
+            }
+        }
+        write_json(&args.report_dir.join("create-attempts.json"), &attempts)?;
+        match outcome? {
+            Some(id) => return Ok(id),
+            None => continue,
+        }
+    }
+    Err(format!(
+        "no available eligible offer after {} confirmed rejections within the create-attempt limit",
+        attempts.len()
+    ))
+}
+
 async fn destroy_confirm(client: &api::Client, id: u64) -> Result<(), String> {
     let destruction = client.destroy(id).await;
     for attempt in 0..6 {
@@ -332,22 +407,21 @@ async fn run_lease(
     key: &Path,
     label: &str,
     owned: &mut Vec<u64>,
+    create_unconfirmed: &mut bool,
     runner_sha: &str,
     binary_sha: &str,
 ) -> Result<Vec<Value>, String> {
     let offers = client.offers(args).await?;
     write_json(&args.report_dir.join("offers.json"), &offers)?;
-    let offer = offers
-        .first()
-        .ok_or("no verified native 48 GB sm89 offer within explicit resource/price limits")?;
-    write_json(
-        &args.report_dir.join("create-intent.json"),
-        &json!({"schema_version":1,"label":label,"offer":offer,"image":IMAGE,
-        "disk_gib":args.disk_gib,"created_at":now()?,"lease_secs":args.lease_secs,"max_create_attempts":1}),
-    )?;
+    if offers.is_empty() {
+        return Err(
+            "no verified native 48 GB sm89 offer within explicit resource/price limits".into(),
+        );
+    }
     let boot = Instant::now() + Duration::from_secs(args.bootstrap_secs);
     let remote = tokio::time::timeout_at(boot, async {
-        let id = acquire(client, offer.id, args, label, owned).await?;
+        let id =
+            acquire_from_offers(client, args, label, owned, create_unconfirmed, &offers).await?;
         write_json(
             &args.report_dir.join("lease.json"),
             &json!({"instance_id":id,"label":label,"image":IMAGE}),
@@ -451,6 +525,7 @@ pub async fn execute(args: ExecuteArgs) -> Result<(), String> {
     };
     let label = ownership.label();
     let mut owned = Vec::new();
+    let mut create_unconfirmed = false;
     let started = now()?;
     let result = {
         let execution = tokio::time::timeout(
@@ -462,6 +537,7 @@ pub async fn execute(args: ExecuteArgs) -> Result<(), String> {
                 &key,
                 &label,
                 &mut owned,
+                &mut create_unconfirmed,
                 &runner_sha,
                 &binary_sha,
             ),
@@ -474,7 +550,7 @@ pub async fn execute(args: ExecuteArgs) -> Result<(), String> {
     };
     // No early `?` after creation: cleanup is attempted for success and failure.
     let mut cleanup_errors = Vec::new();
-    if owned.is_empty() && args.report_dir.join("create-intent.json").exists() {
+    if owned.is_empty() && create_unconfirmed {
         // Cancellation can drop a pending CREATE response before acquire records
         // its ID. Reconcile again, without another allocation request.
         match client.instances().await {
