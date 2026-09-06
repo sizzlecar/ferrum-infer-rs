@@ -9,6 +9,7 @@ fn fixture() -> Plan {
     let profiles: Vec<_> = [Backend::Metal, Backend::Cuda]
         .into_iter()
         .map(|backend| ModelProfile {
+            reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
             id: format!("quick-{backend:?}"),
             model: format!("public-{backend:?}:small"),
             available: true,

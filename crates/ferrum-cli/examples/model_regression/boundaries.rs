@@ -107,6 +107,13 @@ pub(crate) async fn run_reasoning(args: &Args) -> Result<Value> {
         args.max_tokens,
     )
     .await?;
+    let capability: ferrum_types::ModelReasoningProtocol =
+        serde_json::from_value(ready["reasoning_protocol"].clone())
+            .context("missing actual reasoning capability")?;
+    ensure!(
+        capability.supports_reasoning(),
+        "loaded template does not support the reasoning positive probe"
+    );
     verify_reasoning_observation(&output).map_err(anyhow::Error::msg)?;
     Ok(
         json!({"ready": ready, "enable_thinking": true, "max_tokens": args.max_tokens, "output": output}),
@@ -114,6 +121,13 @@ pub(crate) async fn run_reasoning(args: &Args) -> Result<Value> {
 }
 
 pub(crate) async fn serve_reasoning(server: &process::Server<'_>) -> Result<Value> {
+    let capability: ferrum_types::ModelReasoningProtocol =
+        serde_json::from_value(server.health["reasoning_protocol"].clone())
+            .context("missing actual reasoning capability")?;
+    ensure!(
+        capability.supports_reasoning(),
+        "loaded template does not support the reasoning positive probe"
+    );
     let mut body = request(
         server,
         vec![json!({"role": "user", "content": REASONING_PROMPT})],

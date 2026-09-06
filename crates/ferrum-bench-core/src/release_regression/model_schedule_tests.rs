@@ -3,6 +3,7 @@ use ferrum_types::ModelOutputProtocol;
 
 fn profile(id: &str, backend: Backend) -> ModelProfile {
     ModelProfile {
+        reasoning_protocol: ferrum_types::ModelReasoningProtocol::PromptOpened,
         id: id.into(),
         model: "fixture/shared-model".into(),
         target: ExecutionTarget {
@@ -293,4 +294,41 @@ fn reasoning_and_length_share_selected_task_without_substituting_basic_evidence(
         [ModelCheck::Basic, ModelCheck::Reasoning, ModelCheck::Length]
     );
     assert!(schedule.runs[0].quick_start);
+}
+
+#[test]
+fn reasoning_schedule_rejects_unknown_or_wrong_capability_owners() {
+    use ferrum_types::ModelReasoningProtocol as Reasoning;
+    for capability in [Reasoning::Unknown, Reasoning::None] {
+        let mut owner = profile("wrong-owner", Backend::Cpu);
+        owner.reasoning_protocol = capability;
+        let mut plan = Plan {
+            stage: Stage::PullRequest,
+            impact: Impact {
+                areas: vec![],
+                paths: vec![],
+                unknown_paths: vec![],
+                product_contract_changed: false,
+            },
+            obligations: vec![obligation(Behavior::ReasoningBoundaries, &owner)],
+            selected: vec![selected(owner.clone(), vec![0])],
+            omitted: vec![],
+            gaps: vec![],
+            cost: PlanCost::default(),
+        };
+        assert_eq!(model_task_schedule(&plan).unsupported_obligations, [0]);
+        if capability == Reasoning::None {
+            plan.obligations[0] = obligation(Behavior::ReasoningAbsence, &owner);
+            let schedule = model_task_schedule(&plan);
+            assert!(schedule.unsupported_obligations.is_empty());
+            assert_eq!(schedule.runs[0].checks, [ModelCheck::Basic]);
+            plan.obligations[0].scope = ObligationScope::Reasoning {
+                protocol: owner.target.protocol,
+                backend: owner.target.backend,
+                execution_path: owner.target.execution_path.clone(),
+                reasoning_protocol: Reasoning::PromptOpened,
+            };
+            assert_eq!(model_task_schedule(&plan).unsupported_obligations, [0]);
+        }
+    }
 }

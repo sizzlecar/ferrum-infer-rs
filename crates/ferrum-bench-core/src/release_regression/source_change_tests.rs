@@ -125,3 +125,100 @@ fn reviewed_release_module_additions_preserve_every_observability_item() {
     assert_eq!(bench_release_exports_only(&one, &after), Ok(true));
     assert_eq!(bench_release_exports_only(before, before), Ok(false));
 }
+
+fn metal_submission_fixture() -> (String, String) {
+    let before = r#"
+        pub mod vnext_runtime;
+        pub struct MetalBackend;
+        struct MetalContext { cmd: Option<Command> }
+        impl MetalContext {
+            fn encoder(&mut self) { open_encoder(); }
+            pub(crate) fn flush(&mut self) { commit_and_wait(); }
+        }
+        impl Backend for MetalBackend {
+            fn gemm() { shader_gemm(); }
+        }
+        fn shared_queue() { create_queue(); }
+    "#;
+    let after = before.replace(
+        "pub(crate) fn flush(&mut self) { commit_and_wait(); }",
+        r#"
+        /// Submit the pending legacy command buffer.
+        fn submit_and_wait(&mut self) -> Option<&'static metal::CommandBufferRef> { submit(); None }
+        pub(crate) fn flush(&mut self) { self.submit_and_wait(); }
+        fn flush_checked(&mut self) -> Result<()> { self.submit_and_wait(); Ok(()) }
+    "#,
+    ) + r#"
+        impl MetalBackend {
+            pub fn sync_checked(ctx: &mut MetalContext) -> Result<()> { ctx.flush_checked() }
+        }
+        #[allow(unexpected_cfgs)]
+        fn command_buffer_error(cmd: &metal::CommandBufferRef) -> (Option<i64>, Option<String>) { (None, None) }
+        fn validate_command_buffer_completion(status: metal::MTLCommandBufferStatus, code: Option<i64>, detail: Option<&str>) -> Result<()> { Ok(()) }
+        #[cfg(test)] mod checked_sync_tests { #[test] fn missing_submit_fails() {} }
+    "#;
+    (before.into(), after)
+}
+
+#[test]
+fn legacy_submission_proof_keeps_shared_state_and_operator_implementations_intact() {
+    let (before, after) = metal_submission_fixture();
+    assert_eq!(legacy_metal_submission_only(&before, &after), Ok(true));
+    for changed in [
+        after.replace("shader_gemm();", "changed_precision();"),
+        after.replace("create_queue();", "different_queue();"),
+        after.replace("open_encoder();", "different_encoder();"),
+        after.replace("cmd: Option<Command>", "cmd: SharedCommand"),
+        after.replace(
+            "pub mod vnext_runtime;",
+            "#[path = \"legacy.rs\"] pub mod vnext_runtime;",
+        ),
+        after.replace(
+            "impl MetalContext {",
+            "impl MetalContext { fn other_state_change() {}",
+        ),
+        after.replace(
+            "fn flush_checked(&mut self)",
+            "pub fn flush_checked(&mut self)",
+        ),
+        after.replace(
+            "fn flush_checked(&mut self)",
+            "#[cfg(feature = \"unchecked\")] fn flush_checked(&mut self)",
+        ),
+        after.replace(
+            "pub(crate) fn flush(&mut self)",
+            "pub(crate) fn renamed_flush(&mut self)",
+        ),
+        after.replace(
+            "fn command_buffer_error(cmd:",
+            "pub fn command_buffer_error(cmd:",
+        ),
+    ] {
+        assert_eq!(
+            legacy_metal_submission_only(&before, &changed),
+            Ok(false),
+            "{changed}"
+        );
+    }
+    assert!(legacy_metal_submission_only(&before, "invalid Rust {").is_err());
+}
+
+#[test]
+fn legacy_submission_proof_cannot_ignore_new_traits_or_conditional_implementations() {
+    let (before, after) = metal_submission_fixture();
+    for changed in [
+        after.replace("impl MetalBackend {", "impl Runtime for MetalBackend {"),
+        after.replace(
+            "impl MetalBackend {",
+            "#[cfg(feature = \"alternative\")] impl MetalBackend {",
+        ),
+        after.replace("pub fn sync_checked", "pub unsafe fn sync_checked"),
+        after.clone() + "fn shared_state_change() {}",
+    ] {
+        assert_eq!(legacy_metal_submission_only(&before, &changed), Ok(false));
+    }
+    assert_eq!(
+        legacy_metal_submission_only("fn other() {}", "fn other() {}"),
+        Ok(false)
+    );
+}

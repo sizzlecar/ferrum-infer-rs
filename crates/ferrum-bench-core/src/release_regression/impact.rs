@@ -50,6 +50,7 @@ where
             path,
             areas,
             reason: reason.to_owned(),
+            execution_paths: None,
         });
     }
     // Use catalogue order without requiring an incidental enum discriminant order.
@@ -192,9 +193,25 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "independent staged-binary regression runner and its declared helper modules",
         ));
     }
+    if component == "ferrum-server"
+        && matches!(
+            relative,
+            "src/axum_server/tests/engine_stop_contract.rs"
+                | "src/axum_server/tests/engine_stop_contract/executor.rs"
+                | "src/axum_server/tests/engine_stop_contract/structured.rs"
+                | "src/axum_server/tests/engine_stop_contract/tools.rs"
+        )
+    {
+        return Some((vec![Validation],
+            "explicit production-engine protocol fixture modules reachable only through axum_server's cfg(test) tests module"));
+    }
     if component == "ferrum-cli" && relative == "src/source_resolver.rs" {
         return Some((vec![Download, Template, Scheduler, Kv],
-            "source/metadata/template selection and capacity presets: retain loading, protocol and resource obligations without inferring changed operator implementations"));
+            "source/metadata/template selection and runtime presets include paged KV routing; retain loading, protocol and resource obligations without inferring changed operators"));
+    }
+    if component == "ferrum-server" && relative == "src/axum_server.rs" {
+        return Some((vec![Template, Termination, Structured, Tools, Scheduler],
+            "HTTP request/output adaptation, conversation history and admission/cancellation; message-history caches do not implement device KV save/restore"));
     }
     if component == "ferrum-models"
         && matches!(
@@ -557,6 +574,28 @@ mod tests {
     }
 
     #[test]
+    fn reviewed_engine_protocol_fixtures_are_validation_while_unknown_helpers_remain_conservative()
+    {
+        for path in [
+            "crates/ferrum-server/src/axum_server/tests/engine_stop_contract.rs",
+            "crates/ferrum-server/src/axum_server/tests/engine_stop_contract/executor.rs",
+            "crates/ferrum-server/src/axum_server/tests/engine_stop_contract/structured.rs",
+            "crates/ferrum-server/src/axum_server/tests/engine_stop_contract/tools.rs",
+        ] {
+            assert_eq!(analyze_paths([path]).areas, [ChangeArea::Validation]);
+        }
+        for path in [
+            "crates/ferrum-server/src/axum_server/tests/engine_stop_contract/unreviewed.rs",
+            "crates/ferrum-kv/src/managers/paged.rs",
+        ] {
+            assert!(
+                analyze_paths([path]).areas.contains(&ChangeArea::Kv),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
     fn private_devtools_source_and_manifest_keep_build_validation_but_unknown_config_does_not() {
         for path in [
             "crates/ferrum-devtools/Cargo.toml",
@@ -679,10 +718,32 @@ mod tests {
                 ChangeArea::Download,
                 ChangeArea::Template,
                 ChangeArea::Scheduler,
-                ChangeArea::Kv
+                ChangeArea::Kv,
             ]
         );
         assert!(!resolver.areas.contains(&ChangeArea::Kernel));
+        let adapter = analyze_paths(["crates/ferrum-server/src/axum_server.rs"]);
+        assert_eq!(
+            adapter.areas,
+            [
+                ChangeArea::Template,
+                ChangeArea::Termination,
+                ChangeArea::Structured,
+                ChangeArea::Tools,
+                ChangeArea::Scheduler
+            ]
+        );
+        for path in [
+            "crates/ferrum-engine/src/engine.rs",
+            "crates/ferrum-kv/src/managers/paged.rs",
+            "crates/ferrum-cli/src/unreviewed.rs",
+            "crates/ferrum-server/src/unreviewed.rs",
+        ] {
+            assert!(
+                analyze_paths([path]).areas.contains(&ChangeArea::Kv),
+                "{path}"
+            );
+        }
         for path in [
             "crates/ferrum-types/src/reasoning.rs",
             "crates/ferrum-types/src/reasoning/gemma.rs",

@@ -46,6 +46,10 @@ fn capability(behavior: Behavior) -> Option<(ModelCheck, &'static str, &'static 
             ModelCheck::Reasoning,
             "model-regression.reasoning.boundaries",
         ),
+        ReasoningAbsence => (
+            ModelCheck::Basic,
+            "model-regression.basic.reasoning-absence",
+        ),
         LengthLimit => (ModelCheck::Length, "model-regression.length.limit"),
         StructuredValidity => (
             ModelCheck::Structured,
@@ -77,6 +81,7 @@ pub fn model_check_descriptors() -> Vec<CheckDescriptor> {
         Behavior::ProtocolFraming,
         Behavior::UserStop,
         Behavior::ReasoningBoundaries,
+        Behavior::ReasoningAbsence,
         Behavior::LengthLimit,
         Behavior::StructuredValidity,
         Behavior::ToolSelection,
@@ -120,6 +125,17 @@ fn scope_matches(scope: &ObligationScope, profile: &ModelProfile) -> bool {
                 && *backend == target.backend
                 && execution_path == &target.execution_path
         }
+        ObligationScope::Reasoning {
+            protocol,
+            backend,
+            execution_path,
+            reasoning_protocol,
+        } => {
+            protocol == &target.protocol
+                && *backend == target.backend
+                && execution_path == &target.execution_path
+                && *reasoning_protocol == profile.reasoning_protocol
+        }
         ObligationScope::Target { target: expected } => expected == target,
         ObligationScope::Profile {
             profile_id,
@@ -150,6 +166,16 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
             obligation.layer == EvidenceLayer::ModelRuntime
                 && owners.next().is_none()
                 && owner.profile.available
+                && match obligation.behavior {
+                    Behavior::ReasoningBoundaries => {
+                        owner.profile.reasoning_protocol.supports_reasoning()
+                    }
+                    Behavior::ReasoningAbsence => {
+                        owner.profile.reasoning_protocol
+                            == ferrum_types::ModelReasoningProtocol::None
+                    }
+                    _ => true,
+                }
                 && scope_matches(&obligation.scope, &owner.profile)
                 && !obligation.entrypoints.is_empty()
                 && obligation

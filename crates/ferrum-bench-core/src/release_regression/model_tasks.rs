@@ -5,6 +5,7 @@
 //! treats a declared target or a binary digest as numerical evidence. Success
 //! here covers only the requested model runs, not installation or release approval.
 use super::types::{Backend, ExecutionTarget, ModelProfile};
+use ferrum_types::ModelReasoningProtocol;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -179,6 +180,12 @@ fn expected_errors(expected: &ExpectedModelRun) -> Vec<String> {
         "expected model checks must not be empty",
     );
     let checks: BTreeSet<_> = expected.checks.iter().copied().collect();
+    require(
+        &mut errors,
+        !checks.contains(&ModelCheck::Reasoning)
+            || expected.profile.reasoning_protocol.supports_reasoning(),
+        "reasoning positive check requires a known reasoning-capable profile",
+    );
     require(
         &mut errors,
         checks.len() == expected.checks.len(),
@@ -383,6 +390,16 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
     }
     if let Some(case) = recorded.get("serve-startup") {
         let health = &case["evidence"];
+        if expected.checks.contains(&ModelCheck::Reasoning)
+            || (expected.profile.reasoning_protocol == ModelReasoningProtocol::None
+                && expected.checks.contains(&ModelCheck::Basic))
+        {
+            if let Err(error) =
+                verify_reasoning_identity(expected.profile.reasoning_protocol, health)
+            {
+                errors.push(format!("serve-startup: {error}"));
+            }
+        }
         require(
             &mut errors,
             health["status"] == "healthy",
@@ -403,6 +420,16 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
     for name in ["run-basic", "run-stop", "run-reasoning", "run-length"] {
         if let Some(case) = recorded.get(name) {
             let ready = &case["evidence"]["ready"];
+            if name == "run-reasoning"
+                || (name == "run-basic"
+                    && expected.profile.reasoning_protocol == ModelReasoningProtocol::None)
+            {
+                if let Err(error) =
+                    verify_reasoning_identity(expected.profile.reasoning_protocol, ready)
+                {
+                    errors.push(format!("{name}: {error}"));
+                }
+            }
             require(
                 &mut errors,
                 ready["event"] == "ready",
@@ -429,6 +456,48 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
                 && run_backend(&ready["backend"]) == Some(expected.profile.target.backend),
             "run-length baseline readiness differs from the selected model/backend",
         );
+    }
+    if expected.profile.reasoning_protocol == ModelReasoningProtocol::None
+        && expected.checks.contains(&ModelCheck::Basic)
+    {
+        if let Some(case) = recorded.get("run-basic") {
+            let answers = case["evidence"]["answers"].as_array();
+            require(
+                &mut errors,
+                answers.is_some_and(|answers| answers.len() == 2),
+                "reasoning absence requires both actual run turns",
+            );
+            if let Some(answers) = answers {
+                for (answer, expected_answer) in answers.iter().zip(["42", "cobalt-731"]) {
+                    let observation = serde_json::json!({"message": {"role": "assistant", "content": answer["content"],
+                        "reasoning": answer["reasoning"], "tool_calls": answer["tool_calls"]},
+                        "finish_reason": answer["finish_reason"], "usage": answer["usage"]});
+                    if answer.get("reasoning_content").is_some() {
+                        errors.push("run-basic exposed a noncanonical reasoning alias".into());
+                    }
+                    if let Err(error) =
+                        verify_reasoning_absence_observation(&observation, expected_answer)
+                    {
+                        errors.push(format!("run-basic: {error}"));
+                    }
+                }
+            }
+        }
+        if let Some(case) = recorded.get("serve-basic") {
+            for (mode, answer) in [
+                ("sync", "42"),
+                ("stream", "42"),
+                ("recall", "cobalt-731"),
+                ("stream_recall", "cobalt-731"),
+            ] {
+                if let Err(error) = verify_reasoning_absence_observation(
+                    &case["evidence"]["observations"][mode],
+                    answer,
+                ) {
+                    errors.push(format!("serve-basic/{mode}: {error}"));
+                }
+            }
+        }
     }
     for name in ["run-reasoning", "serve-reasoning"] {
         if let Some(case) = recorded.get(name) {
@@ -657,6 +726,40 @@ fn boundary_observation(observation: &Value) -> Result<(&str, &str, u64), String
         return Err("invalid boundary observation token usage".into());
     }
     Ok((content, reasoning, completion))
+}
+
+/// Compare a prepared declaration with the actual loaded template/protocol.
+pub fn verify_reasoning_identity(
+    expected: ModelReasoningProtocol,
+    observation: &Value,
+) -> Result<(), String> {
+    let actual =
+        serde_json::from_value::<ModelReasoningProtocol>(observation["reasoning_protocol"].clone())
+            .map_err(|_| "missing or invalid actual reasoning capability".to_string())?;
+    if expected == ModelReasoningProtocol::Unknown || actual != expected {
+        return Err(format!(
+            "loaded reasoning capability {actual:?} differs from known declaration {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Absence is a separate assertion, never a successful enabled-thinking probe.
+pub fn verify_reasoning_absence_observation(
+    observation: &Value,
+    answer: &str,
+) -> Result<(), String> {
+    let (content, reasoning, _) = boundary_observation(observation)?;
+    if !matches!(observation["finish_reason"].as_str(), Some("stop" | "eos"))
+        || !reasoning.is_empty()
+        || content.trim() != answer
+    {
+        return Err(
+            "non-thinking observation has reasoning, an incorrect answer or an unnatural finish"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Enabled-thinking integration requires an actual distinct thought and a clean

@@ -5379,6 +5379,7 @@ async fn health_handler(
 
     let health = serde_json::json!({
         "status": if runtime_admission_error.is_some() { "unhealthy" } else { "healthy" },
+        "reasoning_protocol": state.prompt_template.as_deref().map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
         "engine": {
@@ -10056,78 +10057,93 @@ mod tests {
 
     #[tokio::test]
     async fn route_tool_request_reaches_engine_structured_boundary() {
-        let (router, engine) = router_with_capturing_llm();
-        let response = post_json(
-            router,
-            "/v1/chat/completions",
-            json!({
-                "model": "qwen3",
-                "messages": [
-                    {"role": "user", "content": "Use the weather tool."},
-                    {
-                        "role": "assistant",
-                        "content": null,
-                        "tool_calls": [{
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
-                        }]
-                    },
-                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
-                ],
-                "tools": [{
-                    "type": "function",
-                    "function": {
-                        "name": "weather",
-                        "description": "Get weather",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {"city": {"type": "string"}},
-                            "required": ["city"]
+        for stream in [false, true] {
+            let (router, engine) = router_with_capturing_llm();
+            let response = post_json(
+                router,
+                "/v1/chat/completions",
+                json!({
+                    "model": "qwen3",
+                    "messages": [
+                        {"role": "user", "content": "Use the weather tool."},
+                        {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+                            }]
+                        },
+                        {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+                    ],
+                    "tools": [{
+                        "type": "function",
+                        "function": {
+                            "name": "weather",
+                            "description": "Get weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"]
+                            }
                         }
-                    }
-                }],
-                "tool_choice": "auto",
-                "functions": [{
-                    "name": "legacy_weather",
-                    "parameters": {"type": "object", "properties": {}}
-                }],
-                "function_call": "auto"
-            }),
-        )
-        .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
+                    }],
+                    "tool_choice": "auto",
+                    "functions": [{
+                        "name": "legacy_weather",
+                        "parameters": {"type": "object", "properties": {}}
+                    }],
+                    "function_call": "auto",
+                    "stream": stream
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), AxumStatusCode::OK);
 
-        let request = engine.last_request();
-        assert!(request.prompt.contains("\"tools\":[{"));
-        assert!(request.prompt.contains("\"type\":\"function\""));
-        assert!(request.prompt.contains("\"name\":\"weather\""));
-        assert!(request.prompt.contains("<|im_start|>assistant\n{"));
-        assert!(request.prompt.contains("\"tool_calls\":[{"));
-        assert!(request.prompt.contains("\"id\":\"call_1\""));
-        assert!(request.prompt.contains("<|im_start|>tool\nsunny<|im_end|>"));
-        assert_eq!(
-            request.metadata["openai_tools"][0]["function"]["name"],
-            "weather"
-        );
-        assert_eq!(request.metadata["openai_tool_choice"], "auto");
-        assert_eq!(
-            request.metadata["openai_legacy_functions"][0]["name"],
-            "legacy_weather"
-        );
-        assert_eq!(request.metadata["openai_legacy_function_call"], "auto");
-        let Some(ferrum_types::ApiRequest::Chat(api)) = request.api_request.as_ref() else {
-            panic!("expected structured chat api_request");
-        };
-        assert_eq!(api.messages.len(), 3);
-        assert_eq!(api.messages[2].role, ferrum_types::ApiMessageRole::Tool);
-        assert_eq!(api.messages[2].tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(api.tools[0].function.name, "weather");
-        assert_eq!(api.legacy_functions[0].name, "legacy_weather");
-        assert_eq!(
-            api.messages[1].tool_calls[0].function.arguments,
-            "{\"city\":\"Paris\"}"
-        );
+            if stream {
+                let body = response_text(response).await;
+                assert!(body.contains("[DONE]"), "{body}");
+                assert!(body.contains("captured"), "{body}");
+            } else {
+                let body = response_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "captured");
+                assert_eq!(body["choices"][0]["finish_reason"], "stop");
+            }
+            let request = engine.last_request();
+            assert!(request.prompt.contains("\"tools\":[{"));
+            assert!(request.prompt.contains("\"type\":\"function\""));
+            assert!(request.prompt.contains("\"name\":\"weather\""));
+            assert!(request.prompt.contains("<|im_start|>assistant\n{"));
+            assert!(request.prompt.contains("\"tool_calls\":[{"));
+            assert!(request.prompt.contains("\"id\":\"call_1\""));
+            assert!(request.prompt.contains("<|im_start|>tool\nsunny<|im_end|>"));
+            assert_eq!(
+                request.metadata["openai_tools"][0]["function"]["name"],
+                "weather"
+            );
+            assert_eq!(request.metadata["openai_tool_choice"], "auto");
+            assert_eq!(
+                request.metadata["openai_legacy_functions"][0]["name"],
+                "legacy_weather"
+            );
+            assert_eq!(request.metadata["openai_legacy_function_call"], "auto");
+            let Some(ferrum_types::ApiRequest::Chat(api)) = request.api_request.as_ref() else {
+                panic!("expected structured chat api_request");
+            };
+            assert_eq!(api.messages.len(), 3);
+            assert_eq!(api.messages[2].role, ferrum_types::ApiMessageRole::Tool);
+            assert_eq!(api.messages[2].tool_call_id.as_deref(), Some("call_1"));
+            assert_eq!(api.messages[1].tool_calls[0].id, "call_1");
+            assert_eq!(api.messages[1].tool_calls[0].function.name, "weather");
+            assert_eq!(api.messages[2].content, "sunny");
+            assert_eq!(api.tools[0].function.name, "weather");
+            assert_eq!(api.legacy_functions[0].name, "legacy_weather");
+            assert_eq!(
+                api.messages[1].tool_calls[0].function.arguments,
+                "{\"city\":\"Paris\"}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10225,12 +10241,13 @@ mod tests {
 
     #[tokio::test]
     async fn route_tool_request_prefers_model_chat_template() {
-        let template = ModelChatTemplate::new(
-            "{% if tools %}<tools>{% for tool in tools %}{{ tool.function.name }}{% endfor %}</tools>{% endif %}{% for message in messages %}[{{ message.role }}]{{ message.content }}{% if message.tool_calls %}{% for tool_call in message.tool_calls %}<tool_call>{{ tool_call.function.name }}:{{ tool_call.function.arguments }}</tool_call>{% endfor %}{% endif %}{% if message.tool_call_id %}<tool_response id=\"{{ message.tool_call_id }}\">{{ message.content }}</tool_response>{% endif %}{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
+        for stream in [false, true] {
+            let template = ModelChatTemplate::new(
+            "{% if tools %}<tools>{% for tool in tools %}{{ tool.function.name }}{% endfor %}</tools>{% endif %}{% for message in messages %}[{{ message.role }}]{{ message.content }}{% if message.tool_calls %}{% for tool_call in message.tool_calls %}<tool_call id=\"{{ tool_call.id }}\">{{ tool_call.function.name }}:{{ tool_call.function.arguments }}</tool_call>{% endfor %}{% endif %}{% if message.tool_call_id %}<tool_response id=\"{{ message.tool_call_id }}\">{{ message.content }}</tool_response>{% endif %}{% endfor %}{% if add_generation_prompt %}[assistant]{% endif %}",
             "tool-template",
         );
-        let (router, engine) = router_with_capturing_llm_and_template(template);
-        let response = post_json(
+            let (router, engine) = router_with_capturing_llm_and_template(template);
+            let response = post_json(
             router,
             "/v1/chat/completions",
             json!({
@@ -10241,12 +10258,19 @@ mod tests {
                         "role": "assistant",
                         "content": null,
                         "tool_calls": [{
-                            "id": "call_1",
+                            "id": "weather_paris",
                             "type": "function",
                             "function": {"name": "weather", "arguments": "{\"city\":\"Paris\"}"}
+                        }, {
+                            "id": "weather_rome",
+                            "type": "function",
+                            "function": {"name": "weather", "arguments": "{\"city\":\"Rome\"}"}
                         }]
                     },
-                    {"role": "tool", "tool_call_id": "call_1", "content": "sunny"}
+                    // Results may arrive in a different order than calls. IDs,
+                    // rather than positions or function names, preserve pairing.
+                    {"role": "tool", "tool_call_id": "weather_rome", "content": "rainy"},
+                    {"role": "tool", "tool_call_id": "weather_paris", "content": "sunny"}
                 ],
                 "tools": [{
                     "type": "function",
@@ -10256,34 +10280,92 @@ mod tests {
                         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
                     }
                 }],
-                "tool_choice": "auto"
+                "tool_choice": "auto",
+                "stream": stream
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::OK);
+            assert_eq!(response.status(), AxumStatusCode::OK);
 
-        let request = engine.last_request();
-        assert!(request.prompt.contains("<tools>weather</tools>"));
-        assert!(
-            request.prompt.contains("<tool_call>weather:"),
-            "{}",
-            request.prompt
-        );
-        assert!(request.prompt.contains("\"city\""), "{}", request.prompt);
-        assert!(request.prompt.contains("Paris"), "{}", request.prompt);
-        assert!(request
-            .prompt
-            .contains("<tool_response id=\"call_1\">sunny</tool_response>"));
-        assert!(
-            !request.prompt.contains("<|assistant|>"),
-            "model-template tool prompt should not use generic fallback: {}",
-            request.prompt
-        );
-        assert!(
-            !request.prompt.contains("When a tool is needed"),
-            "model-template tool prompt should not inject fallback tool instructions: {}",
-            request.prompt
-        );
+            if stream {
+                let body = response_text(response).await;
+                assert!(body.contains("[DONE]"), "{body}");
+                assert!(body.contains("captured"), "{body}");
+            } else {
+                let body = response_json(response).await;
+                assert_eq!(body["choices"][0]["message"]["content"], "captured");
+                assert_eq!(body["choices"][0]["finish_reason"], "stop");
+            }
+            let request = engine.last_request();
+            assert!(request.prompt.contains("<tools>weather</tools>"));
+            assert!(
+                request
+                    .prompt
+                    .contains("<tool_call id=\"weather_paris\">weather:"),
+                "{}",
+                request.prompt
+            );
+            assert!(request.prompt.contains("\"city\""), "{}", request.prompt);
+            assert!(request.prompt.contains("Paris"), "{}", request.prompt);
+            assert!(request
+                .prompt
+                .contains("<tool_response id=\"weather_paris\">sunny</tool_response>"));
+            assert!(request
+                .prompt
+                .contains("<tool_call id=\"weather_rome\">weather:"));
+            assert!(request.prompt.contains("Rome"));
+            assert!(request
+                .prompt
+                .contains("<tool_response id=\"weather_rome\">rainy</tool_response>"));
+            assert!(request.prompt.ends_with("[assistant]"));
+            let Some(ferrum_types::ApiRequest::Chat(api)) = request.api_request.as_ref() else {
+                panic!("expected structured continuation request");
+            };
+            assert_eq!(api.messages.len(), 4);
+            assert_eq!(api.messages[1].tool_calls.len(), 2);
+            for (call, id, city) in [
+                (&api.messages[1].tool_calls[0], "weather_paris", "Paris"),
+                (&api.messages[1].tool_calls[1], "weather_rome", "Rome"),
+            ] {
+                assert_eq!(call.id, id);
+                assert_eq!(call.function.name, "weather");
+                let args: Value = serde_json::from_str(&call.function.arguments).unwrap();
+                assert_eq!(args, json!({"city": city}));
+                let prefix = format!("<tool_call id=\"{id}\">weather:");
+                let rendered_arguments = request
+                    .prompt
+                    .split_once(&prefix)
+                    .unwrap()
+                    .1
+                    .split_once("</tool_call>")
+                    .unwrap()
+                    .0;
+                let rendered: Value = serde_json::from_str(rendered_arguments).unwrap();
+                assert_eq!(
+                    rendered,
+                    json!({"city": city}),
+                    "tool arguments lost their call ID binding"
+                );
+            }
+            for (message, id, content) in [
+                (&api.messages[2], "weather_rome", "rainy"),
+                (&api.messages[3], "weather_paris", "sunny"),
+            ] {
+                assert_eq!(message.role, ferrum_types::ApiMessageRole::Tool);
+                assert_eq!(message.tool_call_id.as_deref(), Some(id));
+                assert_eq!(message.content, content);
+            }
+            assert!(
+                !request.prompt.contains("<|assistant|>"),
+                "model-template tool prompt should not use generic fallback: {}",
+                request.prompt
+            );
+            assert!(
+                !request.prompt.contains("When a tool is needed"),
+                "model-template tool prompt should not inject fallback tool instructions: {}",
+                request.prompt
+            );
+        }
     }
 
     #[tokio::test]

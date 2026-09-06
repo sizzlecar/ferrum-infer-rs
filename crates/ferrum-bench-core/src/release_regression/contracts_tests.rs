@@ -207,11 +207,12 @@ fn descriptors_preserve_actual_entrypoints_and_leave_unimplemented_groups_unboun
         assert_eq!(descriptor.layer, EvidenceLayer::Contract);
         assert!(!group.tests.is_empty());
     }
-    // Existing structured/tool production-engine probes are HTTP-specific.
+    // Structured/tool engine probes and captured continuation requests are HTTP-specific.
     for behavior in [
         Behavior::StructuredSampling,
         Behavior::ToolHandoff,
         Behavior::ToolSelection,
+        Behavior::ToolContinuation,
     ] {
         let descriptor = descriptors
             .iter()
@@ -225,6 +226,5 @@ fn descriptors_preserve_actual_entrypoints_and_leave_unimplemented_groups_unboun
             | Behavior::KernelBoundaries
             | Behavior::ArchitectureState
             | Behavior::KvResume
-            | Behavior::ToolContinuation
     )));
 }

@@ -13,15 +13,10 @@ use serde_json::Value;
 use std::fmt;
 use std::str::FromStr;
 
-/// Model-provided chat template, usually from GGUF `tokenizer.chat_template`
-/// or HuggingFace `tokenizer_config.json`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ModelReasoningProtocol {
-    None,
-    PromptOpened,
-    ModelGenerated,
-}
+// Keep the existing server import path compatible with the shared capability type.
+pub use ferrum_types::ModelReasoningProtocol;
 
+/// Model-provided chat template, usually from GGUF or Hugging Face metadata.
 #[derive(Clone, Debug)]
 pub struct ModelChatTemplate {
     pub template: String,
@@ -55,8 +50,18 @@ impl ModelChatTemplate {
     }
 
     pub fn reasoning_enabled(&self, requested: Option<bool>) -> bool {
-        self.reasoning_protocol != ModelReasoningProtocol::None
+        self.reasoning_protocol.supports_reasoning()
             && requested.unwrap_or(self.reasoning_default_enabled)
+    }
+
+    /// The full output capability, including Harmony's separate message parser.
+    /// This observation does not change template rendering or reasoning defaults.
+    pub fn reasoning_capability(&self) -> ModelReasoningProtocol {
+        if self.output_protocol == ModelOutputProtocol::HarmonyGptOss {
+            ModelReasoningProtocol::ModelGenerated
+        } else {
+            self.reasoning_protocol
+        }
     }
 
     /// Bind the resolved model capability after loading its unchanged template
@@ -652,7 +657,7 @@ fn detect_model_reasoning_protocol(
         .ok()
     };
     let Some(enabled) = render(Some(true)) else {
-        return (ModelReasoningProtocol::None, false);
+        return (ModelReasoningProtocol::Unknown, false);
     };
     let default = render(None);
     let prompt_opened =
@@ -662,7 +667,7 @@ fn detect_model_reasoning_protocol(
         return (ModelReasoningProtocol::PromptOpened, default_enabled);
     }
     let Some(disabled) = render(Some(false)) else {
-        return (ModelReasoningProtocol::None, false);
+        return (ModelReasoningProtocol::Unknown, false);
     };
     let completed_blocks = |prompt: &str| {
         prompt
@@ -1930,5 +1935,59 @@ mod tests {
             "t",
         );
         assert!(!model_template_supports_tools(&history_only));
+    }
+
+    #[test]
+    fn reasoning_capability_observes_templates_without_model_name_inference() {
+        for source in [
+            include_str!("../tests/fixtures/chat_template/unsloth__Meta-Llama-3.1-8B-Instruct/template.jinja"),
+            include_str!("../tests/fixtures/chat_template/Qwen__Qwen3-Coder-30B-A3B-Instruct/template.jinja"),
+        ] {
+            let plain = ModelChatTemplate::new(source, "arbitrary-source-label");
+            assert_eq!(plain.reasoning_capability(), ModelReasoningProtocol::None);
+        }
+        for source in [
+            include_str!("../tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/template.jinja"),
+            include_str!("../tests/fixtures/chat_template/Qwen__Qwen3.6-35B-A3B/template.jinja"),
+            include_str!(
+                "../tests/fixtures/chat_template/cyankiwi__Qwen3.8-27B-AWQ-INT4/template.jinja"
+            ),
+        ] {
+            let thinking = ModelChatTemplate::new(source, "arbitrary-source-label");
+            assert_eq!(
+                thinking.reasoning_capability(),
+                ModelReasoningProtocol::PromptOpened
+            );
+        }
+        let model_generated = ModelChatTemplate::new(
+            include_str!("../tests/fixtures/chat_template/Qwen__Qwen3-0.6B/template.jinja"),
+            "arbitrary-source-label",
+        );
+        assert_eq!(
+            model_generated.reasoning_capability(),
+            ModelReasoningProtocol::ModelGenerated
+        );
+        let mut separate_protocol = ModelChatTemplate::new(
+            "{% if add_generation_prompt %}<assistant>{% endif %}",
+            "arbitrary-source-label",
+        );
+        separate_protocol.set_output_protocol(ModelOutputProtocol::HarmonyGptOss);
+        assert_eq!(
+            separate_protocol.reasoning_capability(),
+            ModelReasoningProtocol::ModelGenerated
+        );
+        // Harmony remains on its existing parser; capability reporting must not
+        // enable the ordinary delimited-block parsing path.
+        assert_eq!(
+            separate_protocol.reasoning_protocol,
+            ModelReasoningProtocol::None
+        );
+        assert!(!separate_protocol.reasoning_enabled(Some(true)));
+        let invalid = ModelChatTemplate::new("{{ raise_exception('cannot probe') }}", "invalid");
+        assert_eq!(
+            invalid.reasoning_capability(),
+            ModelReasoningProtocol::Unknown
+        );
+        assert!(!invalid.reasoning_enabled(Some(true)));
     }
 }
