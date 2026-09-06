@@ -101,7 +101,11 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         // CPU tiny forward and real paged-manager rollback. The tiny engine's
         // allocation handles are mocks; this does not certify GPU cache arithmetic.
         ("kv-isolation", KvIsolation, all.clone(), vec![tiny("tiny_stack_concurrent_sessions_isolated")]),
-        ("kv-release", KvRelease, all, vec![kv("failed_allocate_rolls_back_partial_blocks"), kv("failed_extend_rolls_back_partial_blocks_and_handle_table"), engine("process_batch_unified_capacity_defer_releases_existing_kv")]),
+        ("kv-release", KvRelease, all.clone(), vec![kv("failed_allocate_rolls_back_partial_blocks"), kv("failed_extend_rolls_back_partial_blocks_and_handle_table"), engine("process_batch_unified_capacity_defer_releases_existing_kv")]),
+        // Supported preemption discards physical KV and replays the preserved
+        // token history. Pair its scheduler transition with real CPU KV/logit
+        // equivalence; this does not certify GPU swapping or persistence.
+        ("kv-resume", KvResume, all, vec![engine("plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progress_victim"), engine("cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer")]),
     ];
     specifications
         .into_iter()

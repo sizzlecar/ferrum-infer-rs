@@ -459,10 +459,35 @@ fn remove_private_member(root: &mut DocumentMut) -> Result<(), String> {
     Ok(())
 }
 
+// The source proof uses a full Rust AST and its visitor. No other parser
+// feature, dependency source or default-feature override is assumed harmless.
+fn reviewed_syntax_features(spec: &Item) -> Option<bool> {
+    let table = spec.as_table_like()?;
+    if table.len() != 2 || table.get("version")?.as_str().is_none() {
+        return None;
+    }
+    let features = table.get("features")?.as_array()?;
+    let names = features
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<BTreeSet<_>>>()?;
+    if names.len() != features.len() {
+        return None;
+    }
+    if names == BTreeSet::from(["full"]) {
+        Some(false)
+    } else if names == BTreeSet::from(["full", "visit-mut"]) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Complete before/after root/member manifests and Cargo.lock are required. The
 /// only reviewed ordinary additions are the semver/TOML/Rust-syntax tools in bench-core's release
 /// modules: source callers were reviewed separately, and source diffs still keep
-/// their own impact. This is not permission to change their features or versions.
+/// their own impact. Only the reviewed AST visitor addition may extend syntax
+/// features; other feature and version changes remain conservative.
 pub fn validation_dependency_paths(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
@@ -543,7 +568,39 @@ pub fn validation_dependency_paths(
                 let before_dependency = prior
                     .get("dependencies")
                     .and_then(|item| item.get(dependency));
-                if before_dependency.is_some() {
+                if let Some(before_spec) = before_dependency {
+                    if dependency == "syn" {
+                        let before_spec = before_spec.clone();
+                        if let Some(mut after_spec) = next
+                            .get("dependencies")
+                            .and_then(|item| item.get(dependency))
+                            .cloned()
+                        {
+                            if reviewed_syntax_features(&before_spec) == Some(false)
+                                && reviewed_syntax_features(&after_spec) == Some(true)
+                            {
+                                after_spec
+                                    .as_table_like_mut()
+                                    .expect("reviewed syntax table")
+                                    .insert(
+                                        "features",
+                                        before_spec
+                                            .get("features")
+                                            .expect("reviewed features")
+                                            .clone(),
+                                    );
+                                // Only the visitor used by the scope parser may
+                                // be added. Version/default flags/source remain exact.
+                                if semantic(&after_spec) == semantic(&before_spec) {
+                                    next.get_mut("dependencies")
+                                        .and_then(Item::as_table_like_mut)
+                                        .expect("dependency table")
+                                        .insert(dependency, before_spec);
+                                    tools.push(format!("{path}:{dependency}/visit-mut"));
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 let after_dependency = next
@@ -555,16 +612,7 @@ pub fn validation_dependency_paths(
                 // These closed declarations name the syntax features actually
                 // needed by the release scope parser. Other flags remain unknown.
                 let reviewed = if dependency == "syn" {
-                    spec.as_table_like().is_some_and(|table| {
-                        table.len() == 2
-                            && table.get("version").and_then(Item::as_str).is_some()
-                            && table.get("features").and_then(Item::as_array).is_some_and(
-                                |features| {
-                                    features.len() == 1
-                                        && features.get(0).and_then(Value::as_str) == Some("full")
-                                },
-                            )
-                    })
+                    reviewed_syntax_features(spec).is_some()
                 } else {
                     spec.as_str().is_some()
                 };

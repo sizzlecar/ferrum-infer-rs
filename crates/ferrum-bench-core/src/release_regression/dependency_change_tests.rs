@@ -122,6 +122,60 @@ fn known_release_tool_additions_remain_build_changes_and_never_allow_other_runti
 }
 
 #[test]
+fn syntax_visitor_is_a_scoped_tool_feature_not_permission_to_change_parser_resolution() {
+    let mut before = fixture();
+    append(&mut before, "crates/app/Cargo.toml", "syn = '2'\n");
+    let lock = before.get_mut("Cargo.lock").unwrap();
+    *lock = lock.replace(
+        "\"serde\", \"semver\", \"toml_edit\"]",
+        "\"serde\", \"semver\", \"toml_edit\", \"syn\"]",
+    );
+    lock.push_str("[[package]]\nname = 'syn'\nversion = '2.0.1'\nsource = 'registry+https://example.invalid/index'\nchecksum = 'syntax-checksum'\n");
+    let mut full = before.clone();
+    append(
+        &mut full,
+        "crates/ferrum-bench-core/Cargo.toml",
+        "syn = { version = '2', features = ['full'] }\n",
+    );
+    let lock = full.get_mut("Cargo.lock").unwrap();
+    *lock = lock.replace(
+        "dependencies = [\"serde\"]",
+        "dependencies = [\"serde\", \"syn\"]",
+    );
+    let mut visitor = full.clone();
+    let manifest = visitor
+        .get_mut("crates/ferrum-bench-core/Cargo.toml")
+        .unwrap();
+    *manifest = manifest.replace("['full']", "['full', 'visit-mut']");
+    for base in [&before, &full] {
+        assert!(validation_dependency_paths(base, &visitor).is_ok());
+        for mutation in [
+            "syn = { version = '3', features = ['full', 'visit-mut'] }",
+            "syn = { version = '2', features = ['full', 'visit-mut', 'extra-traits'] }",
+            "syn = { version = '2', features = ['full', 'visit-mut'], default-features = false }",
+        ] {
+            let mut changed = visitor.clone();
+            let manifest = changed
+                .get_mut("crates/ferrum-bench-core/Cargo.toml")
+                .unwrap();
+            *manifest = manifest.replace(
+                "syn = { version = '2', features = ['full', 'visit-mut'] }",
+                mutation,
+            );
+            // An original addition may specify a different compatible version
+            // range; an existing dependency cannot change its declaration.
+            if base == &full || !mutation.contains("version = '3'") {
+                assert!(validation_dependency_paths(base, &changed).is_err());
+            }
+        }
+        let mut changed = visitor.clone();
+        let lock = changed.get_mut("Cargo.lock").unwrap();
+        *lock = lock.replace("syntax-checksum", "different-checksum");
+        assert!(validation_dependency_paths(base, &changed).is_err());
+    }
+}
+
+#[test]
 fn dev_dependency_cannot_hide_a_changed_runtime_version_or_registry_feature_edge() {
     let before = fixture();
     let mut after = before.clone();

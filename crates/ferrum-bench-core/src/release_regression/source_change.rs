@@ -2,6 +2,9 @@
 use quote::ToTokens;
 use syn::{Attribute, Item, Meta};
 
+mod ready;
+pub use ready::run_ready_capability_only;
+
 fn test_configuration(attribute: &Attribute) -> bool {
     let Meta::List(list) = &attribute.meta else {
         return false;
@@ -90,6 +93,8 @@ pub fn bench_release_exports_only(before: &str, after: &str) -> Result<bool, Str
 /// This is a reach proof, not proof of correct synchronization or performance.
 pub fn legacy_metal_submission_only(before: &str, after: &str) -> Result<bool, String> {
     fn function_header(vis: &syn::Visibility, sig: &syn::Signature) -> String {
+        let mut sig = sig.clone();
+        sig.inputs.pop_punct();
         quote::quote!(#vis #sig).to_string()
     }
     fn reviewed_function(

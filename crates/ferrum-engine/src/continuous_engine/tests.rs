@@ -10751,6 +10751,179 @@ fn sequence_state_prefill_context_preserves_generated_tokens_for_kv_recompute() 
     );
 }
 
+/// Recompute resumes from token history, not from serialized/swapped KV. The
+/// scheduler/deferral tests above cover requeueing; this exercises the actual CPU
+/// model cache and the SequenceState transition used by that requeueing path.
+#[test]
+fn cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer() {
+    use ferrum_models::executor::common::GenericKvCacheHandle;
+    use ferrum_models::test_support::{tiny_llama_model, TinyLlamaConfig};
+
+    fn assert_logits_equal(label: &str, expected: &[f32], actual: &[f32], vocab: usize) {
+        assert_eq!(expected.len(), vocab, "{label}: reference vocabulary");
+        assert_eq!(actual.len(), vocab, "{label}: actual vocabulary");
+        for (index, (&expected, &actual)) in expected.iter().zip(actual).enumerate() {
+            assert!(
+                expected.is_finite() && actual.is_finite(),
+                "{label}: nonfinite logit at {index}: {expected} vs {actual}"
+            );
+            assert!(
+                (expected - actual).abs() <= 1e-5,
+                "{label}: logit {index} differs: {expected} vs {actual}"
+            );
+        }
+    }
+
+    fn handle(cfg: &TinyLlamaConfig, cache_id: &str, len: usize) -> Arc<dyn KvCacheHandle> {
+        Arc::new(GenericKvCacheHandle::new(
+            cfg.num_layers,
+            cfg.num_kv_heads,
+            cfg.head_dim,
+            candle_core::Device::Cpu,
+            len,
+            cache_id.to_string(),
+        ))
+    }
+
+    // Both the first sampled token and a later decode boundary leave one
+    // generated token outside KV. Neither may be omitted when rebuilding it.
+    for completed_decodes in [0, 2] {
+        let cfg = TinyLlamaConfig::default();
+        let mut model = tiny_llama_model(&cfg);
+        let mut reference = tiny_llama_model(&cfg);
+        let mut peer_reference = tiny_llama_model(&cfg);
+        let cache_id = "recompute-request";
+        let peer_id = "independent-request";
+        let prompt = [3, 11, 6];
+        let peer_prompt = [7, 2, 13, 5];
+        let mut state = SequenceState::new(
+            policy_request(),
+            prompt.iter().copied().map(TokenId::new).collect(),
+        );
+
+        let mut logits = model.prefill(cache_id, &prompt);
+        assert_logits_equal(
+            "initial prefill",
+            &reference.prefill(cache_id, &prompt),
+            &logits,
+            cfg.vocab_size,
+        );
+        state.commit_cached_prefill_physical_resources(
+            handle(&cfg, cache_id, prompt.len()),
+            prompt.len(),
+        );
+        let mut pending = state
+            .sample_and_commit_with_processors(&mut logits)
+            .expect("sample initial CPU logits");
+        for offset in 0..completed_decodes {
+            let position = (prompt.len() + offset) as u32;
+            logits = model.decode(cache_id, pending.get(), position);
+            assert_logits_equal(
+                "decode before preemption",
+                &reference.decode(cache_id, pending.get(), position),
+                &logits,
+                cfg.vocab_size,
+            );
+            pending = state
+                .sample_and_commit_with_processors(&mut logits)
+                .expect("sample CPU decode logits");
+        }
+
+        assert_logits_equal(
+            "peer prefill",
+            &peer_reference.prefill(peer_id, &peer_prompt),
+            &model.prefill(peer_id, &peer_prompt),
+            cfg.vocab_size,
+        );
+        let peer_position = peer_prompt.len() as u32;
+        assert_logits_equal(
+            "peer decode before release",
+            &peer_reference.decode(peer_id, 17, peer_position),
+            &model.decode(peer_id, 17, peer_position),
+            cfg.vocab_size,
+        );
+        let peer_len = model.cache_len(peer_id);
+        let cached_len = model.cache_len(cache_id);
+        assert_eq!(cached_len, prompt.len() + completed_decodes);
+        assert_eq!(state.prefill_context_len(), cached_len + 1);
+        assert_eq!(state.generated_tokens.last(), Some(&pending));
+        let generated_before = state.generated_tokens.clone();
+        state.tokens_this_iteration = 1;
+
+        let released = state.take_physical_resources_for_recompute();
+        assert_eq!(released.model_cache_id(), Some(cache_id));
+        model.release(released.model_cache_id().expect("owned real model cache"));
+        assert_eq!(model.cache_len(cache_id), 0, "old physical KV must be gone");
+        assert_eq!(
+            model.cache_len(peer_id),
+            peer_len,
+            "release must be isolated"
+        );
+        assert!(state.model_cache_id().is_none());
+        assert!(!state.prefill_complete);
+        assert_eq!(state.prefill_tokens_processed, 0);
+        assert_eq!(state.tokens_this_iteration, 0);
+        assert_eq!(state.phase, RequestPhase::Waiting);
+        assert_eq!(state.generated_tokens, generated_before);
+
+        // An independent request continues while the first has no physical KV.
+        assert_logits_equal(
+            "peer decode while request is released",
+            &peer_reference.decode(peer_id, 19, peer_len as u32),
+            &model.decode(peer_id, 19, peer_len as u32),
+            cfg.vocab_size,
+        );
+        assert_eq!(model.cache_len(cache_id), 0);
+        let history: Vec<u32> = state
+            .prefill_context_tokens()
+            .iter()
+            .map(|token| token.get())
+            .collect();
+        assert_eq!(history.len(), cached_len + 1);
+        assert_eq!(history.last(), Some(&pending.get()));
+        let expected = reference.decode(cache_id, pending.get(), cached_len as u32);
+        logits = model.prefill(cache_id, &history);
+        assert_logits_equal("recomputed prefill", &expected, &logits, cfg.vocab_size);
+        assert_eq!(model.cache_len(cache_id), history.len());
+        assert_eq!(model.cache_len(peer_id), peer_len + 1);
+        state.commit_cached_prefill_physical_resources(
+            handle(&cfg, cache_id, history.len()),
+            history.len(),
+        );
+
+        // Compare the whole distribution after further autoregressive steps,
+        // not merely the greedy choice at the restoration point.
+        for _ in 0..2 {
+            let next = state
+                .sample_and_commit_with_processors(&mut logits)
+                .expect("sample resumed CPU logits");
+            let position = (state.prefill_context_len() - 1) as u32;
+            logits = model.decode(cache_id, next.get(), position);
+            assert_logits_equal(
+                "decode after recompute",
+                &reference.decode(cache_id, next.get(), position),
+                &logits,
+                cfg.vocab_size,
+            );
+        }
+        assert_logits_equal(
+            "peer decode after recompute",
+            &peer_reference.decode(peer_id, 23, (peer_len + 1) as u32),
+            &model.decode(peer_id, 23, (peer_len + 1) as u32),
+            cfg.vocab_size,
+        );
+        let peer_len = model.cache_len(peer_id);
+        let completed = state.take_completion_resources();
+        model.release(completed.physical.model_cache_id().expect("resumed cache"));
+        assert_eq!(model.cache_len(cache_id), 0);
+        assert_eq!(model.cache_len(peer_id), peer_len);
+        model.release(peer_id);
+        reference.release(cache_id);
+        peer_reference.release(peer_id);
+        assert_eq!(model.cache_len(peer_id), 0);
+    }
+}
+
 #[test]
 fn model_decode_metadata_keeps_sampling_masks_on_model_argmax_path() {
     let tokenizer: Arc<dyn Tokenizer + Send + Sync> = Arc::new(PolicyTokenizer::new(

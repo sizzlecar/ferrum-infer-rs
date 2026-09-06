@@ -222,9 +222,6 @@ fn descriptors_preserve_actual_entrypoints_and_leave_unimplemented_groups_unboun
     }
     assert!(!descriptors.iter().any(|descriptor| matches!(
         descriptor.behavior,
-        Behavior::KernelNumerics
-            | Behavior::KernelBoundaries
-            | Behavior::ArchitectureState
-            | Behavior::KvResume
+        Behavior::KernelNumerics | Behavior::KernelBoundaries | Behavior::ArchitectureState
     )));
 }
