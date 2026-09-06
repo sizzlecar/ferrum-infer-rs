@@ -34,6 +34,40 @@ weight revision and the tokenizer/config/template revisions in runtime evidence.
 A revision below explains a declaration; it is not a mandatory commit identifier
 for future tests. Upstream changes require the corresponding source checks.
 
+## Scope and assignment semantics
+
+The current CLI report uses `schema_version: 2`. Its architecture scopes contain
+`architecture`, `protocol` and `execution_path`; protocol scopes contain
+`protocol`, `backend` and `execution_path`. A production plan-runtime target
+cannot stand in for a legacy executor just because the architecture or protocol
+matches. Architecture baseline sampling may cross backends within the same
+execution path; a separate obligation retains actual execution on each backend.
+Affected compute/resource changes still use exact target combinations.
+
+Each model obligation is assigned to one profile. If the initial selection lacks
+a complete checker binding, the selector first adds an available, scope-compatible
+profile with a complete binding when one exists. It then assigns the obligation
+once, preferring a complete binding, followed by declared estimates and a stable
+ID. Missing bindings remain gaps. Other compatible profiles do not implicitly
+repeat that obligation. Each Quick Start has its own profile scope and cannot be
+merged with another Quick Start; the same profile may also satisfy shared obligations.
+These are planned assignments, not evidence that any command ran.
+
+Production request metadata and journal/profile/trace sinks contribute an
+`observability` contract and one model-runtime representative per backend.
+That does not infer kernel-numerical coverage or repeat every architecture and
+precision. Unknown modules remain conservative; the crate name or an `examples`
+directory alone is not evidence of validation-only use.
+
+For Cargo inputs, the CLI can narrow only a content-proven coordinated version
+update to build scope. Other changed paths remain in the same accumulated impact;
+additional dependency/build changes or an unsupported snapshot retain the broad
+classification. The report records the refinement decision and release tag
+baseline in provenance. See the [release procedure](release-regression.md).
+The catalog itself remains unchanged by that report schema revision, and its
+`checks: []` still exposes missing executable bindings. Planning does not rent
+hardware, execute the catalog or publish a release.
+
 ## Current representatives
 
 | Profile ID | Coverage contributed | Source |

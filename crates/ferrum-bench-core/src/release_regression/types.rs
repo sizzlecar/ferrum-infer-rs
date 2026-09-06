@@ -14,10 +14,11 @@ pub enum ChangeArea {
     Kernel,
     Architecture,
     Build,
+    Observability,
     Validation,
 }
 impl ChangeArea {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Download,
         Self::Template,
         Self::Termination,
@@ -28,6 +29,7 @@ impl ChangeArea {
         Self::Kernel,
         Self::Architecture,
         Self::Build,
+        Self::Observability,
         Self::Validation,
     ];
 }
@@ -169,6 +171,9 @@ pub enum Behavior {
     Installation,
     QuickStart,
     Performance,
+    /// Request metadata, instrumentation delivery and sink completion/error handling.
+    /// Runtime sampling does not certify every operator or numerical layout.
+    Observability,
     WorkspaceChecks,
 }
 /// Evidence categories are not an ordering: compilation does not subsume protocol,
@@ -193,10 +198,13 @@ pub enum ObligationScope {
     Architecture {
         architecture: String,
         protocol: ModelOutputProtocol,
+        /// Different production executors cannot represent one another.
+        execution_path: String,
     },
     Protocol {
         protocol: ModelOutputProtocol,
         backend: Backend,
+        execution_path: String,
     },
     Target {
         target: ExecutionTarget,
@@ -244,7 +252,9 @@ pub struct PlanInput {
 #[serde(deny_unknown_fields)]
 pub struct SelectedProfile {
     pub profile: ModelProfile,
-    /// References into Plan.obligations, for traceability rather than pass ratios.
+    /// Assigned model obligations, each owned by exactly one selected profile.
+    /// Other compatible profiles do not implicitly repeat these checks.
+    /// References into Plan.obligations are traceability, not pass ratios.
     pub obligations: Vec<usize>,
     pub reasons: Vec<String>,
 }

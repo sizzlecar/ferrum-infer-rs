@@ -67,6 +67,14 @@ fn selected_ids(plan: &Plan) -> Vec<&str> {
         .collect()
 }
 
+fn obligation_owners(plan: &Plan, obligation: usize) -> Vec<&str> {
+    plan.selected
+        .iter()
+        .filter(|selected| selected.obligations.contains(&obligation))
+        .map(|selected| selected.profile.id.as_str())
+        .collect()
+}
+
 #[test]
 fn release_keeps_every_quick_start_and_samples_architecture_with_protocol() {
     let text = text_target("bf16", Backend::Metal);
@@ -100,7 +108,8 @@ fn release_keeps_every_quick_start_and_samples_architecture_with_protocol() {
                 && obligation.scope
                     == ObligationScope::Architecture {
                         architecture: expected.architecture.clone(),
-                        protocol: expected.protocol
+                        protocol: expected.protocol,
+                        execution_path: expected.execution_path.clone()
                     }));
         assert!(result.obligations.iter().any(|obligation| obligation.layer
             == EvidenceLayer::ModelRuntime
@@ -149,7 +158,8 @@ fn protocol_changes_use_protocol_backend_representatives_not_all_precisions() {
                 && obligation.scope
                     == ObligationScope::Protocol {
                         protocol: ModelOutputProtocol::Text,
-                        backend
+                        backend,
+                        execution_path: "production-plan-runtime".into()
                     }));
     }
 }
@@ -749,10 +759,11 @@ fn checker_entrypoints_cannot_be_combined_across_different_selected_targets() {
         entrypoints: vec![Entrypoint::ServeSync, Entrypoint::ServeStream],
         target: Some(first),
     });
-    let second_still_missing_run = plan(&request).unwrap();
-    assert!(second_still_missing_run
+    let first_is_fully_bound = plan(&request).unwrap();
+    assert!(!first_is_fully_bound
         .gaps
         .contains(&Gap::UnassignedCheck { obligation: index }));
+    assert_eq!(obligation_owners(&first_is_fully_bound, index), ["first"]);
     request.checks.push(CheckDescriptor {
         id: "second-run".into(),
         behavior: Behavior::ModelForward,
@@ -764,4 +775,449 @@ fn checker_entrypoints_cannot_be_combined_across_different_selected_targets() {
     assert!(!complete
         .gaps
         .contains(&Gap::UnassignedCheck { obligation: index }));
+}
+
+#[test]
+fn cheaper_models_cannot_substitute_a_different_execution_path() {
+    let production = text_target("bf16", Backend::Metal);
+    let mut legacy = production.clone();
+    legacy.execution_path = "legacy-model-executor".into();
+    let mut small = profile("small-legacy", legacy.clone());
+    small.estimate = Some(estimate(1, Some(1), Some("USD")));
+    let mut large = profile("large-production", production.clone());
+    large.estimate = Some(estimate(10_000, Some(1), Some("USD")));
+    for (stage, area) in [
+        (Stage::Nightly, None),
+        (Stage::PullRequest, Some(ChangeArea::Termination)),
+    ] {
+        let mut request = input(
+            stage,
+            vec![legacy.clone(), production.clone()],
+            vec![small.clone(), large.clone()],
+        );
+        request.impact.areas = area.into_iter().collect();
+        let complete = plan(&request).unwrap();
+        assert_eq!(
+            selected_ids(&complete),
+            ["large-production", "small-legacy"]
+        );
+        let production_obligation = complete
+            .obligations
+            .iter()
+            .position(|obligation| {
+                matches!(&obligation.scope,
+                ObligationScope::Architecture { execution_path, .. }
+                | ObligationScope::Protocol { execution_path, .. }
+                if execution_path == &production.execution_path)
+            })
+            .unwrap();
+        assert_eq!(
+            obligation_owners(&complete, production_obligation),
+            ["large-production"]
+        );
+        // An implementation available only on the cheap executor cannot bind
+        // the production-path obligation, even though arch/protocol match.
+        let obligation = &complete.obligations[production_obligation];
+        request.checks.push(CheckDescriptor {
+            id: "legacy-only".into(),
+            behavior: obligation.behavior,
+            layer: obligation.layer,
+            entrypoints: obligation.entrypoints.clone(),
+            target: Some(legacy.clone()),
+        });
+        let wrong_check = plan(&request).unwrap();
+        assert!(wrong_check.gaps.contains(&Gap::UnassignedCheck {
+            obligation: production_obligation
+        }));
+        request
+            .profiles
+            .retain(|profile| profile.id != "large-production");
+        let missing = plan(&request).unwrap();
+        assert!(missing.gaps.contains(&Gap::MissingRepresentative {
+            obligation: production_obligation
+        }));
+        assert!(obligation_owners(&missing, production_obligation).is_empty());
+    }
+}
+
+#[test]
+fn architecture_sampling_retains_paths_without_forming_a_backend_cartesian_matrix() {
+    let production_metal = text_target("bf16", Backend::Metal);
+    let mut production_cuda = production_metal.clone();
+    production_cuda.backend = Backend::Cuda;
+    let mut legacy_metal = production_metal.clone();
+    legacy_metal.execution_path = "legacy-model-executor".into();
+    let result = plan(&input(
+        Stage::Nightly,
+        vec![
+            production_metal,
+            production_cuda.clone(),
+            legacy_metal.clone(),
+        ],
+        vec![
+            profile("production-cuda", production_cuda),
+            profile("legacy-metal", legacy_metal),
+        ],
+    ))
+    .unwrap();
+    for (index, obligation) in result
+        .obligations
+        .iter()
+        .enumerate()
+        .filter(|(_, obligation)| obligation.layer == EvidenceLayer::ModelRuntime)
+    {
+        assert!(!result
+            .gaps
+            .contains(&Gap::MissingRepresentative { obligation: index }));
+        let owner = obligation_owners(&result, index);
+        assert_eq!(
+            owner.len(),
+            1,
+            "each runtime obligation has one assigned representative"
+        );
+        if let ObligationScope::Architecture { execution_path, .. } = &obligation.scope {
+            let assigned = result
+                .selected
+                .iter()
+                .find(|selected| selected.profile.id == owner[0])
+                .unwrap();
+            assert_eq!(&assigned.profile.target.execution_path, execution_path);
+        }
+    }
+    assert!(!result
+        .obligations
+        .iter()
+        .any(|obligation| matches!(obligation.scope, ObligationScope::Target { .. })));
+}
+
+#[test]
+fn overlapping_quick_starts_keep_their_own_checks_and_share_other_model_work_once() {
+    let target = text_target("bf16", Backend::Metal);
+    let mut first = profile("first-readme", target.clone());
+    first.estimate = Some(estimate(100, Some(1), Some("USD")));
+    let mut second = profile("second-readme", target.clone());
+    second.estimate = Some(estimate(200, Some(1), Some("USD")));
+    let mut alternative = profile("cheapest-extra", target.clone());
+    alternative.estimate = Some(estimate(1, Some(1), Some("USD")));
+    let mut request = input(
+        Stage::Release,
+        vec![target],
+        vec![first, second, alternative],
+    );
+    request.quick_start_profile_ids = vec!["first-readme".into(), "second-readme".into()];
+    request.impact.areas = vec![ChangeArea::Termination];
+    let result = plan(&request).unwrap();
+    assert_eq!(selected_ids(&result), ["first-readme", "second-readme"]);
+    for (index, obligation) in result
+        .obligations
+        .iter()
+        .enumerate()
+        .filter(|(_, obligation)| requires_model(obligation))
+    {
+        match &obligation.scope {
+            ObligationScope::Profile { profile_id, .. } => {
+                assert_eq!(obligation.behavior, Behavior::QuickStart);
+                assert_eq!(obligation_owners(&result, index), [profile_id.as_str()]);
+            }
+            _ => assert_eq!(obligation_owners(&result, index), ["first-readme"]),
+        }
+    }
+    for id in &request.quick_start_profile_ids {
+        assert!(result.obligations.iter().any(|obligation| {
+            obligation.behavior == Behavior::QuickStart
+                && matches!(&obligation.scope, ObligationScope::Profile { profile_id, .. } if profile_id == id)
+        }));
+    }
+}
+
+#[test]
+fn shared_work_prefers_a_fully_bound_selected_representative_without_combining_targets() {
+    let cheap_target = text_target("bf16", Backend::Metal);
+    let bound_target = text_target("int4", Backend::Metal);
+    let mut cheap = profile("cheap-readme", cheap_target.clone());
+    cheap.estimate = Some(estimate(1, Some(1), Some("USD")));
+    let mut bound = profile("bound-readme", bound_target.clone());
+    bound.estimate = Some(estimate(100, Some(1), Some("USD")));
+    let mut request = input(
+        Stage::Release,
+        vec![cheap_target.clone(), bound_target.clone()],
+        vec![cheap, bound],
+    );
+    request.quick_start_profile_ids = vec!["cheap-readme".into(), "bound-readme".into()];
+    request.impact.areas = vec![ChangeArea::Termination];
+    request.checks.push(CheckDescriptor {
+        id: "complete-bound-target".into(),
+        behavior: Behavior::UserStop,
+        layer: EvidenceLayer::ModelRuntime,
+        entrypoints: ENTRYPOINTS.to_vec(),
+        target: Some(bound_target),
+    });
+    let complete = plan(&request).unwrap();
+    let index = complete
+        .obligations
+        .iter()
+        .position(|obligation| {
+            obligation.behavior == Behavior::UserStop
+                && obligation.layer == EvidenceLayer::ModelRuntime
+        })
+        .unwrap();
+    assert_eq!(obligation_owners(&complete, index), ["bound-readme"]);
+    assert!(!complete
+        .gaps
+        .contains(&Gap::UnassignedCheck { obligation: index }));
+    assert_eq!(
+        complete.obligations[index].checkers,
+        ["complete-bound-target"]
+    );
+    request.checks[0].entrypoints = vec![Entrypoint::ServeSync, Entrypoint::ServeStream];
+    request.checks.push(CheckDescriptor {
+        id: "cheap-run-only".into(),
+        behavior: Behavior::UserStop,
+        layer: EvidenceLayer::ModelRuntime,
+        entrypoints: vec![Entrypoint::Run],
+        target: Some(cheap_target),
+    });
+    let incomplete = plan(&request).unwrap();
+    assert!(incomplete
+        .gaps
+        .contains(&Gap::UnassignedCheck { obligation: index }));
+    assert_eq!(obligation_owners(&incomplete, index), ["cheap-readme"]);
+    assert_eq!(incomplete.obligations[index].checkers, ["cheap-run-only"]);
+}
+
+#[test]
+fn observability_requires_metadata_and_sink_checks_without_full_compute_expansion() {
+    let metal = text_target("bf16", Backend::Metal);
+    let cuda = text_target("bf16", Backend::Cuda);
+    let unrelated = target(
+        "different-architecture",
+        ModelOutputProtocol::Text,
+        "int4",
+        Backend::Metal,
+    );
+    let mut quick = profile("small-metal", metal.clone());
+    quick.estimate = Some(estimate(1, Some(1), Some("USD")));
+    let mut expensive = profile("large-metal", unrelated.clone());
+    expensive.estimate = Some(estimate(1000, Some(1), Some("USD")));
+    let mut request = input(
+        Stage::PullRequest,
+        vec![metal, cuda.clone(), unrelated],
+        vec![quick, expensive, profile("cuda", cuda)],
+    );
+    request.impact.areas = vec![ChangeArea::Observability, ChangeArea::Validation];
+    let missing = plan(&request).unwrap();
+    assert_eq!(selected_ids(&missing), ["cuda", "small-metal"]);
+    for (index, obligation) in missing.obligations.iter().enumerate() {
+        assert!(!matches!(
+            obligation.layer,
+            EvidenceLayer::BackendNumerics | EvidenceLayer::Performance
+        ));
+        assert!(!matches!(
+            obligation.scope,
+            ObligationScope::Target { .. } | ObligationScope::Architecture { .. }
+        ));
+        if obligation.behavior == Behavior::Observability {
+            assert!(missing
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+            assert_eq!(obligation.entrypoints, ENTRYPOINTS);
+            match obligation.layer {
+                EvidenceLayer::Contract => assert_eq!(obligation.scope, ObligationScope::Global),
+                EvidenceLayer::ModelRuntime => {
+                    assert!(matches!(obligation.scope, ObligationScope::Backend { .. }))
+                }
+                other => panic!("observability is not {other:?}"),
+            }
+        }
+    }
+    for layer in [EvidenceLayer::Contract, EvidenceLayer::ModelRuntime] {
+        request.checks.push(CheckDescriptor {
+            id: format!("observability-{layer:?}"),
+            behavior: Behavior::Observability,
+            layer,
+            entrypoints: ENTRYPOINTS.to_vec(),
+            target: None,
+        });
+    }
+    let bound = plan(&request).unwrap();
+    for (index, obligation) in bound
+        .obligations
+        .iter()
+        .enumerate()
+        .filter(|(_, obligation)| obligation.behavior == Behavior::Observability)
+    {
+        assert!(!bound
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
+        if requires_model(obligation) {
+            assert_eq!(obligation_owners(&bound, index).len(), 1);
+        }
+    }
+    // Narrow impact does not remove the release's independent promises.
+    request.stage = Stage::Release;
+    request.quick_start_profile_ids = vec!["small-metal".into(), "cuda".into()];
+    let release = plan(&request).unwrap();
+    assert!(release
+        .selected
+        .iter()
+        .any(|selected| selected.profile.id == "large-metal"));
+    for id in &request.quick_start_profile_ids {
+        let index = release.obligations.iter().position(|obligation| {
+            matches!(&obligation.scope, ObligationScope::Profile { profile_id, .. } if profile_id == id)
+                && obligation.behavior == Behavior::QuickStart
+        }).unwrap();
+        assert_eq!(obligation_owners(&release, index), [id.as_str()]);
+    }
+    assert!(release
+        .obligations
+        .iter()
+        .any(|obligation| matches!(obligation.scope, ObligationScope::Architecture { .. })));
+    assert!(!release
+        .obligations
+        .iter()
+        .any(|obligation| obligation.layer == EvidenceLayer::Performance));
+}
+
+fn observability_contract_bindings() -> Vec<CheckDescriptor> {
+    vec![
+        CheckDescriptor {
+            id: "workspace".into(),
+            behavior: Behavior::WorkspaceChecks,
+            layer: EvidenceLayer::Compilation,
+            entrypoints: Vec::new(),
+            target: None,
+        },
+        CheckDescriptor {
+            id: "metadata-contract".into(),
+            behavior: Behavior::Observability,
+            layer: EvidenceLayer::Contract,
+            entrypoints: ENTRYPOINTS.to_vec(),
+            target: None,
+        },
+    ]
+}
+
+fn runtime_binding(id: &str, behavior: Behavior, target: ExecutionTarget) -> CheckDescriptor {
+    CheckDescriptor {
+        id: id.into(),
+        behavior,
+        layer: EvidenceLayer::ModelRuntime,
+        entrypoints: ENTRYPOINTS.to_vec(),
+        target: Some(target),
+    }
+}
+
+#[test]
+fn scope_only_greedy_choice_cannot_hide_an_available_complete_checker_binding() {
+    let cheap_target = text_target("bf16", Backend::Metal);
+    let checked_target = text_target("int4", Backend::Metal);
+    let mut cheap = profile("cheap-unbound", cheap_target.clone());
+    cheap.estimate = Some(estimate(1, Some(1), Some("USD")));
+    let mut checked = profile("checked", checked_target.clone());
+    checked.estimate = Some(estimate(100, Some(1), Some("USD")));
+    let mut request = input(
+        Stage::PullRequest,
+        vec![cheap_target, checked_target.clone()],
+        vec![cheap, checked],
+    );
+    request.impact.areas = vec![ChangeArea::Observability];
+    request.checks = observability_contract_bindings();
+    request.checks.push(runtime_binding(
+        "metadata-runtime",
+        Behavior::Observability,
+        checked_target,
+    ));
+    let complete = plan(&request).unwrap();
+    assert!(complete.gaps.is_empty(), "{:#?}", complete.gaps);
+    let index = complete
+        .obligations
+        .iter()
+        .position(|obligation| {
+            obligation.behavior == Behavior::Observability
+                && obligation.layer == EvidenceLayer::ModelRuntime
+        })
+        .unwrap();
+    assert_eq!(obligation_owners(&complete, index), ["checked"]);
+    assert_eq!(selected_ids(&complete), ["checked"]);
+    assert_eq!(
+        complete.cost.known_total_ms, 100,
+        "do not charge the unassigned initial choice"
+    );
+    request
+        .checks
+        .retain(|check| check.layer != EvidenceLayer::ModelRuntime);
+    let missing = plan(&request).unwrap();
+    assert!(missing
+        .gaps
+        .contains(&Gap::UnassignedCheck { obligation: index }));
+    assert_eq!(obligation_owners(&missing, index), ["cheap-unbound"]);
+}
+
+#[test]
+fn mandatory_quick_start_does_not_prevent_adding_a_bound_shared_representative() {
+    let readme_target = text_target("bf16", Backend::Metal);
+    let checked_target = text_target("int4", Backend::Metal);
+    let mut readme = profile("readme", readme_target.clone());
+    readme.estimate = Some(estimate(1, Some(1), Some("USD")));
+    let mut checked = profile("checked", checked_target.clone());
+    checked.estimate = Some(estimate(100, Some(1), Some("USD")));
+    let mut request = input(
+        Stage::Release,
+        vec![readme_target.clone(), checked_target.clone()],
+        vec![readme, checked],
+    );
+    request.quick_start_profile_ids = vec!["readme".into()];
+    request.impact.areas = vec![ChangeArea::Observability];
+    request.checks = observability_contract_bindings();
+    request.checks.extend([
+        runtime_binding("readme-command", Behavior::QuickStart, readme_target),
+        runtime_binding(
+            "actual-forward",
+            Behavior::ModelForward,
+            checked_target.clone(),
+        ),
+        runtime_binding(
+            "actual-metadata-sink",
+            Behavior::Observability,
+            checked_target,
+        ),
+        CheckDescriptor {
+            id: "installation".into(),
+            behavior: Behavior::Installation,
+            layer: EvidenceLayer::Installation,
+            entrypoints: Vec::new(),
+            target: None,
+        },
+    ]);
+    let complete = plan(&request).unwrap();
+    assert!(complete.gaps.is_empty(), "{:#?}", complete.gaps);
+    assert_eq!(selected_ids(&complete), ["checked", "readme"]);
+    for (index, obligation) in complete
+        .obligations
+        .iter()
+        .enumerate()
+        .filter(|(_, obligation)| requires_model(obligation))
+    {
+        let expected = if obligation.behavior == Behavior::QuickStart {
+            "readme"
+        } else {
+            "checked"
+        };
+        assert_eq!(obligation_owners(&complete, index), [expected]);
+    }
+    // The alternate representative cannot erase a missing mandatory QuickStart
+    // check even when its other runtime bindings are complete.
+    request
+        .checks
+        .retain(|check| check.behavior != Behavior::QuickStart);
+    let missing = plan(&request).unwrap();
+    let quick_start = missing
+        .obligations
+        .iter()
+        .position(|obligation| obligation.behavior == Behavior::QuickStart)
+        .unwrap();
+    assert!(missing.gaps.contains(&Gap::UnassignedCheck {
+        obligation: quick_start
+    }));
+    assert_eq!(obligation_owners(&missing, quick_start), ["readme"]);
 }

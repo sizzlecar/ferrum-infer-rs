@@ -78,9 +78,20 @@ fn scope_matches(scope: &ObligationScope, target: &ExecutionTarget, id: Option<&
         ObligationScope::Architecture {
             architecture,
             protocol,
-        } => architecture == &target.architecture && protocol == &target.protocol,
-        ObligationScope::Protocol { protocol, backend } => {
-            protocol == &target.protocol && *backend == target.backend
+            execution_path,
+        } => {
+            architecture == &target.architecture
+                && protocol == &target.protocol
+                && execution_path == &target.execution_path
+        }
+        ObligationScope::Protocol {
+            protocol,
+            backend,
+            execution_path,
+        } => {
+            protocol == &target.protocol
+                && *backend == target.backend
+                && execution_path == &target.execution_path
         }
         ObligationScope::Target { target: expected } => expected == target,
         ObligationScope::Profile {
@@ -127,6 +138,7 @@ fn architectures(targets: &[ExecutionTarget]) -> Vec<ObligationScope> {
         let scope = ObligationScope::Architecture {
             architecture: target.architecture.clone(),
             protocol: target.protocol,
+            execution_path: target.execution_path.clone(),
         };
         if !result.contains(&scope) {
             result.push(scope);
@@ -141,6 +153,7 @@ fn protocols(targets: &[ExecutionTarget]) -> Vec<ObligationScope> {
         let scope = ObligationScope::Protocol {
             protocol: target.protocol,
             backend: target.backend,
+            execution_path: target.execution_path.clone(),
         };
         if !result.contains(&scope) {
             result.push(scope);
@@ -217,9 +230,14 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
             &[ModelLoad, ModelForward, ArchitectureState],
         ),
         Build => (&[], &[ModelLoad]),
+        ChangeArea::Observability => (&[Behavior::Observability], &[Behavior::Observability]),
         Validation => (&[], &[]),
     };
-    let reason = format!("affected component: {area:?}");
+    let reason = if area == ChangeArea::Observability {
+        "shared request metadata and instrumentation: contract checks cover propagation, sink completion and errors; runtime uses one representative per backend, not all operators/layouts".into()
+    } else {
+        format!("affected component: {area:?}")
+    };
     add_for_scopes(
         plan,
         contracts,
@@ -235,7 +253,7 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
             .collect(),
         Template | Termination | Structured | Tools => protocols(targets),
         Download => architectures(targets),
-        Build => backends(targets),
+        Build | ChangeArea::Observability => backends(targets),
         Validation => Vec::new(),
     };
     add_for_scopes(plan, runtime, ModelRuntime, &scopes, &reason);
@@ -304,6 +322,30 @@ fn estimate_cmp(left: &ModelProfile, right: &ModelProfile) -> Ordering {
         _ => Ordering::Equal,
     };
     price_order.then_with(|| left.id.cmp(&right.id))
+}
+
+fn complete_model_binding(
+    checks: &[CheckDescriptor],
+    obligation: &Obligation,
+    target: &ExecutionTarget,
+) -> bool {
+    let candidates: Vec<_> = checks
+        .iter()
+        .filter(|check| {
+            check.behavior == obligation.behavior
+                && check.layer == obligation.layer
+                && check
+                    .target
+                    .as_ref()
+                    .is_none_or(|declared| declared == target)
+        })
+        .collect();
+    !candidates.is_empty()
+        && obligation.entrypoints.iter().all(|entrypoint| {
+            candidates
+                .iter()
+                .any(|check| check.entrypoints.contains(entrypoint))
+        })
 }
 
 fn record_cost(plan: &mut Plan) -> Result<(), String> {
@@ -589,15 +631,58 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
     for obligation in remaining {
         result.gaps.push(Gap::MissingRepresentative { obligation });
     }
-    for index in selected {
-        let profile = profiles[index];
-        let obligations: Vec<_> = result
-            .obligations
+    // Scope coverage alone can reserve a cheap but unbound model, including a
+    // mandatory QuickStart. Complete any feasible checker binding before final
+    // assignment; a compatible unselected model must not be hidden by that
+    // reservation. Profile scope still prevents replacing a QuickStart itself.
+    for obligation in result
+        .obligations
+        .iter()
+        .filter(|obligation| requires_model(obligation))
+    {
+        if selected.iter().any(|index| {
+            covers(profiles[*index], obligation)
+                && complete_model_binding(&input.checks, obligation, &profiles[*index].target)
+        }) {
+            continue;
+        }
+        let representative = profiles
             .iter()
             .enumerate()
-            .filter(|(_, obligation)| covers(profile, obligation))
-            .map(|(index, _)| index)
-            .collect();
+            .filter(|(_, profile)| {
+                covers(profile, obligation)
+                    && complete_model_binding(&input.checks, obligation, &profile.target)
+            })
+            .min_by(|(_, left), (_, right)| estimate_cmp(left, right))
+            .map(|(index, _)| index);
+        if let Some(index) = representative {
+            selected.insert(index);
+        }
+    }
+    // Selection reserves models; assignment chooses one concrete execution for
+    // each obligation. Merely overlapping a scope must not duplicate checks on
+    // every QuickStart or architecture model that is already selected.
+    let mut assignments = BTreeMap::<usize, Vec<usize>>::new();
+    for (obligation_index, obligation) in result.obligations.iter().enumerate() {
+        let representative = selected
+            .iter()
+            .copied()
+            .filter(|index| covers(profiles[*index], obligation))
+            .min_by(|left, right| {
+                let left_bound =
+                    complete_model_binding(&input.checks, obligation, &profiles[*left].target);
+                let right_bound =
+                    complete_model_binding(&input.checks, obligation, &profiles[*right].target);
+                right_bound
+                    .cmp(&left_bound)
+                    .then_with(|| estimate_cmp(profiles[*left], profiles[*right]))
+            });
+        if let Some(index) = representative {
+            assignments.entry(index).or_default().push(obligation_index);
+        }
+    }
+    for (index, obligations) in assignments {
+        let profile = profiles[index];
         let reasons = obligations
             .iter()
             .map(|index| result.obligations[*index].reason.clone())
@@ -666,8 +751,8 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
                 .iter()
                 .filter(|selected| selected.obligations.contains(&index))
                 .collect();
-            // Do not combine Run on one target with HTTP on another. Every
-            // selected profile claiming this obligation needs its own binding.
+            // Do not combine Run on one target with HTTP on another. Only the
+            // assigned representative supplies this obligation's binding.
             !selected_targets.is_empty()
                 && selected_targets
                     .iter()
