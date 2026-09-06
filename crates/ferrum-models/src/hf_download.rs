@@ -4,6 +4,8 @@
 //! - SOCKS5/HTTP proxy support via environment variables
 //! - Resumable downloads (断点续传)
 //! - Progress bar with speed display
+//!
+//! Download diagnostics use stderr so callers can reserve stdout for JSON/JSONL.
 //! - HuggingFace token authentication
 
 #![allow(dead_code)]
@@ -194,7 +196,7 @@ impl HfDownloader {
         fs::create_dir_all(&snapshot_dir).await?;
 
         let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();
-        println!(
+        eprintln!(
             "📦 Downloading {} files ({:.2} GB)",
             files_to_download.len(),
             total_size as f64 / 1_073_741_824.0
@@ -366,7 +368,7 @@ impl HfDownloader {
         // Calculate total size
         let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();
         let file_count = files_to_download.len();
-        println!(
+        eprintln!(
             "📦 Selected {} files ({:.2} GiB total)",
             file_count,
             total_size as f64 / 1_073_741_824.0
@@ -439,8 +441,8 @@ impl HfDownloader {
         let ref_file = refs_dir.join(revision);
         fs::write(&ref_file, &commit_sha).await?;
 
-        println!();
-        println!("✅ Download complete: {}", snapshot_dir.display());
+        eprintln!();
+        eprintln!("✅ Download complete: {}", snapshot_dir.display());
         Ok(snapshot_dir)
     }
 
@@ -604,7 +606,7 @@ impl HfDownloader {
             if let Ok(meta) = fs::metadata(&blob_path).await {
                 if total_size == 0 || meta.len() == total_size {
                     create_symlink(&blob_path, &snapshot_file).await?;
-                    println!("  ✓ {} (cached)", display_name);
+                    eprintln!("  ✓ {} (cached)", display_name);
                     return Ok(());
                 }
             }
