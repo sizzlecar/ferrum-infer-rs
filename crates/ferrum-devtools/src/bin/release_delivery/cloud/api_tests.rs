@@ -4,21 +4,21 @@ use tokio::{
     net::TcpListener,
 };
 
-struct Reply {
-    method: &'static str,
-    path: &'static str,
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) method: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 async fn fixture(replies: Vec<Reply>) -> (Client, tokio::task::JoinHandle<Vec<Value>>) {
+    let (base, server) = http_fixture(replies).await;
+    (Client::for_test(base), server)
+}
+pub(crate) async fn http_fixture(
+    replies: Vec<Reply>,
+) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut client = Client::new("local-fixture-token".into()).unwrap();
-    client.base = format!("http://{}", listener.local_addr().unwrap());
-    client.http = HttpClient::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         let mut requests = Vec::new();
         for reply in replies {
@@ -71,7 +71,7 @@ async fn fixture(replies: Vec<Reply>) -> (Client, tokio::task::JoinHandle<Vec<Va
         }
         requests
     });
-    (client, server)
+    (base, server)
 }
 fn row(id: u64, label: &str) -> Value {
     json!({"id":id,"label":label,"actual_status":"running","ssh_host":"ssh5.vast.ai","ssh_port":12122})
