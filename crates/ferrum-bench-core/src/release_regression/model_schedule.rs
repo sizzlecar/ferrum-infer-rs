@@ -40,16 +40,26 @@ fn capability(behavior: Behavior) -> Option<(ModelCheck, &'static str, &'static 
         NaturalEnd => (ModelCheck::Basic, "model-regression.basic.natural-end"),
         QuickStart => (ModelCheck::Basic, "model-regression.basic.quick-start"),
         TemplateHistory => (ModelCheck::Basic, "model-regression.basic.template-history"),
+        ProtocolFraming => (ModelCheck::Basic, "model-regression.basic.protocol-framing"),
         UserStop => (ModelCheck::Stop, "model-regression.stop.user-stop"),
+        ReasoningBoundaries => (
+            ModelCheck::Reasoning,
+            "model-regression.reasoning.boundaries",
+        ),
+        LengthLimit => (ModelCheck::Length, "model-regression.length.limit"),
         StructuredValidity => (
             ModelCheck::Structured,
             "model-regression.structured.validity",
         ),
+        // Both initial HTTP modes execute a named call with a distractor tool;
+        // each returned identity is used for its actual continuation.
+        ToolSelection => (ModelCheck::Tools, "model-regression.tools.selection"),
+        ToolHandoff => (ModelCheck::Tools, "model-regression.tools.handoff"),
         ToolContinuation => (ModelCheck::Tools, "model-regression.tools.continuation"),
         _ => return None,
     };
     let entrypoints = match behavior {
-        StructuredValidity | ToolContinuation => HTTP_ENTRYPOINTS,
+        StructuredValidity | ToolSelection | ToolHandoff | ToolContinuation => HTTP_ENTRYPOINTS,
         _ => ALL_ENTRYPOINTS,
     };
     Some((check, id, entrypoints))
@@ -64,8 +74,13 @@ pub fn model_check_descriptors() -> Vec<CheckDescriptor> {
         Behavior::NaturalEnd,
         Behavior::QuickStart,
         Behavior::TemplateHistory,
+        Behavior::ProtocolFraming,
         Behavior::UserStop,
+        Behavior::ReasoningBoundaries,
+        Behavior::LengthLimit,
         Behavior::StructuredValidity,
+        Behavior::ToolSelection,
+        Behavior::ToolHandoff,
         Behavior::ToolContinuation,
     ]
     .into_iter()
@@ -173,6 +188,8 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
                 ModelCheck::Stop => 1,
                 ModelCheck::Structured => 2,
                 ModelCheck::Tools => 3,
+                ModelCheck::Reasoning => 4,
+                ModelCheck::Length => 5,
             });
             run
         })

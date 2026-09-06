@@ -4,6 +4,12 @@ on:
   # main requires PRs and the CI required check on an up-to-date branch.
   # Validate the proposed merge once; do not repeat the same build on push.
   # workflow_dispatch remains available for explicit backend/cache validation.
+  workflow_call:
+    inputs:
+      candidate_sha:
+        description: Immutable release candidate used by every quality job
+        type: string
+        required: true
   pull_request:
   workflow_dispatch:
     inputs:
@@ -23,6 +29,8 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
   # Treat every rustc warning as an error. Keeps the tree clean — dev
   # opts into warnings locally for iteration and silences them via
   # `#[allow(...)]` on the specific item, never at the CI level.
@@ -38,6 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
           fetch-depth: 2
 
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -56,8 +65,9 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          RELEASE_CANDIDATE: ${{ inputs.candidate_sha }}
         run: |
-          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+          if [ "$EVENT_NAME" = workflow_dispatch ] || [ -n "$RELEASE_CANDIDATE" ]; then
             echo 'scope=code' >> "$GITHUB_OUTPUT"
           elif [ "$EVENT_NAME" = pull_request ]; then
             test -n "$BASE_SHA"
@@ -108,6 +118,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
 
       # ubuntu-latest ships with ~30 GB of preinstalled SDKs (.NET, Android,
       # Haskell, etc.) that we don't need. Cargo registry + target dir +
@@ -138,8 +150,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cpu-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cpu-
+          key: ${{ runner.os }}-cpu-nodebug-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cpu-nodebug-v2-
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -189,6 +201,27 @@ jobs:
       - name: Workspace tests (all targets)
         run: cargo test --locked --workspace --all-targets
 
+      - name: Execute registered correctness boundaries
+        run: |
+          # Reuse the just-built workspace feature graph; this does not rebuild
+          # each package with a different feature selection.
+          cargo test --locked --workspace --all-targets --no-run --message-format=json \
+            > "$RUNNER_TEMP/contract-artifacts.jsonl"
+          cargo run --locked -p ferrum-bench-core --example contract_checks -- \
+            --artifacts "$RUNNER_TEMP/contract-artifacts.jsonl" \
+            --output "$RUNNER_TEMP/contract-checks.json"
+
+      - name: Save executed contract evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-checks
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/contract-checks.json
+            ${{ runner.temp }}/contract-checks.logs/
+          retention-days: 14
+
       # --all-targets does not include doctests.
       - name: Documentation tests
         run: cargo test --locked --workspace --doc
@@ -212,6 +245,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
 
       - uses: dtolnay/rust-toolchain@1.91.0
 
@@ -221,8 +256,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-metal-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-metal-
+          key: ${{ runner.os }}-metal-nodebug-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-metal-nodebug-v2-
 
       - name: Compile with Metal (all targets)
         run: cargo check --locked --workspace --all-targets --features metal
@@ -273,6 +308,8 @@ jobs:
           echo "/root/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
 
       - name: Materialize pinned CUDA native operator set
         run: |
@@ -314,7 +351,7 @@ jobs:
     # repository branch before merging it.
     if: >-
       needs.prepare.outputs.scope == 'code' &&
-      (github.event_name == 'workflow_dispatch' ||
+      (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -334,6 +371,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@1.91.0
@@ -378,6 +416,18 @@ jobs:
           ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
             --op rms-norm --tokens 3 --dim 33 --seed 7 \
             --report "$RUNNER_TEMP/backend-numerics/tail.json"
+          ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
+            --op gemm --m 64 --n 32 --k 32 --seed 42 \
+            --report "$RUNNER_TEMP/backend-numerics/gemm-aligned.json"
+          ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
+            --op gemm --m 64 --n 33 --k 35 --seed 7 \
+            --report "$RUNNER_TEMP/backend-numerics/gemm-tail.json"
+          ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
+            --op silu-mul --tokens 4 --intermediate 256 --seed 42 \
+            --report "$RUNNER_TEMP/backend-numerics/silu-aligned.json"
+          ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
+            --op silu-mul --tokens 3 --intermediate 257 --seed 7 \
+            --report "$RUNNER_TEMP/backend-numerics/silu-tail.json"
 
       - name: Save raw numerical evidence
         if: always()
@@ -396,6 +446,8 @@ jobs:
     if: always()
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.candidate_sha || github.sha }}
       - uses: dtolnay/rust-toolchain@1.91.0
       - name: Require successful checks for the selected scope
         env:

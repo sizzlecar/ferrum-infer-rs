@@ -1348,13 +1348,18 @@ version = "0.8.7"
 dependencies = [
  "clap",
  "ferrum-types",
+ "libc",
+ "quote",
  "rand 0.9.2",
+ "reqwest",
  "semver",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "syn 2.0.108",
  "tempfile",
+ "tokio",
  "toml_edit 0.22.27",
 ]
 

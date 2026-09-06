@@ -1,0 +1,475 @@
+name: Deliver formal release
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: formal-release-delivery
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  prepare:
+    if: github.repository == 'sizzlecar/ferrum-infer-rs'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    outputs:
+      active: ${{ steps.plan.outputs.active }}
+      version: ${{ steps.plan.outputs.version }}
+      rc_tag: ${{ steps.plan.outputs.rc_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-delivery-controller-rust-1.91
+      - name: Plan the complete release before building or renting hardware
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+        run: |
+          git fetch origin main --tags
+          git merge-base --is-ancestor HEAD origin/main
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "ferrum-cli") | .version')
+          if [ "$EVENT" = push ] && git show-ref --verify --quiet "refs/tags/v$version"; then
+            echo 'active=false' >> "$GITHUB_OUTPUT"
+            echo 'No new coordinated version; release delivery was not started.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          base=''
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] && \
+               git merge-base --is-ancestor "$tag" HEAD && \
+               [ "$(git rev-parse "$tag^{}")" != "$GITHUB_SHA" ]; then
+              base="$tag"
+              break
+            fi
+          done < <(git tag --sort=-version:refname)
+          test -n "$base"
+          cargo run --locked -p ferrum-bench-core --example regression_plan -- \
+            --catalog docs/release-regression-catalog.json --base "$base" --candidate HEAD \
+            --stage release --output "$RUNNER_TEMP/release-plan.json" \
+            --summary "$RUNNER_TEMP/release-plan.md"
+          cat "$RUNNER_TEMP/release-plan.md" >> "$GITHUB_STEP_SUMMARY"
+          # A missing executable binding is an implementation gap, not a reason
+          # to rent a GPU and hope a broad smoke test covers it.
+          jq -e '.plan.gaps == [] and .model_tasks.unsupported_obligations == []' "$RUNNER_TEMP/release-plan.json"
+          rc_tag="v${version}-rc.${GITHUB_RUN_NUMBER}"
+          cargo run --locked -p ferrum-bench-core --example release_candidate -- verify \
+            --workspace . --version "$version" --previous-version "${base#v}" \
+            --candidate-sha "$GITHUB_SHA" --candidate-tag "$rc_tag" --staging-label "run-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          git config user.name ferrum-release
+          git config user.email ferrum-release@users.noreply.github.com
+          if git show-ref --verify --quiet "refs/tags/$rc_tag"; then
+            test "$(git cat-file -t "refs/tags/$rc_tag")" = tag
+            test "$(git rev-parse "$rc_tag^{}")" = "$GITHUB_SHA"
+          else
+            git tag -a "$rc_tag" "$GITHUB_SHA" -m "Ferrum $version release candidate"
+            git push origin "refs/tags/$rc_tag"
+          fi
+          # Freeze generated notes with the plan; a publication-only retry
+          # must not change an existing draft's accepted text.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
+            --jq .body > "$RUNNER_TEMP/release-notes.md"
+          printf 'active=true\nversion=%s\nrc_tag=%s\n' "$version" "$rc_tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-plan
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/release-plan.json
+            ${{ runner.temp }}/release-plan.md
+            ${{ runner.temp }}/release-notes.md
+          retention-days: 30
+
+  quality:
+    name: Quality
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/ci.yml
+    with:
+      candidate_sha: ${{ github.sha }}
+
+  stage:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      release_candidate_sha: ${{ github.sha }}
+      release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
+      staging_label: run-${{ github.run_id }}-${{ github.run_attempt }}
+      publish_release: false
+
+  stage-cuda:
+    needs: prepare
+    if: needs.prepare.outputs.active == 'true'
+    uses: ./.github/workflows/release-cuda.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      release_candidate_sha: ${{ github.sha }}
+      release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
+      staging_label: run-${{ github.run_id }}-${{ github.run_attempt }}
+      publish_release: false
+
+  tasks:
+    needs: [prepare, quality, stage, stage-cuda]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-delivery-controller-rust-1.91
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/plan
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage-cuda.outputs.cuda_asset_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged
+      - name: Bind selected tasks and inspect CPU and CUDA archive bytes
+        run: |
+          cargo build --locked -p ferrum-bench-core --example release_delivery --example model_gate
+          mkdir -p "$RUNNER_TEMP/installation"
+          for backend in cpu cuda; do
+            asset=ferrum-linux-x86_64.tar.gz
+            extra=()
+            if [ "$backend" = cuda ]; then
+              asset=ferrum-linux-x86_64-cuda-sm89.tar.gz
+              extra=(--extract-only)
+            fi
+            target/debug/examples/release_delivery inspect \
+              --abi "$RUNNER_TEMP/staged/$asset.abi.json" --version "$VERSION" \
+              --candidate-sha "$GITHUB_SHA" --extract-dir "$RUNNER_TEMP/extracted-$backend" \
+              --output "$RUNNER_TEMP/installation/$backend.json" "${extra[@]}"
+          done
+          abi_args=()
+          for abi in "$RUNNER_TEMP/staged/"*.abi.json; do abi_args+=(--abi "$abi"); done
+          target/debug/examples/model_gate prepare --plan "$RUNNER_TEMP/plan/release-plan.json" \
+            --version "$VERSION" "${abi_args[@]}" --output-dir "$RUNNER_TEMP/tasks"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-tasks
+          overwrite: true
+          path: ${{ runner.temp }}/tasks/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installation-linux
+          overwrite: true
+          path: ${{ runner.temp }}/installation/
+          retention-days: 30
+
+  metal-models:
+    needs: [prepare, stage, tasks]
+    runs-on: [self-hosted, macOS, ARM64, ferrum-metal]
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage.outputs.metal_runner_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-metal
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-tasks
+          path: ${{ runner.temp }}/tasks
+      - name: Execute selected Metal models from the staged archive
+        run: |
+          cargo build --locked -p ferrum-bench-core --example release_delivery
+          target/debug/examples/release_delivery inspect \
+            --abi "$RUNNER_TEMP/staged-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
+            --version "$VERSION" --candidate-sha "$GITHUB_SHA" \
+            --extract-dir "$RUNNER_TEMP/extracted-metal" --output "$RUNNER_TEMP/installation-metal.json"
+          cd "$RUNNER_TEMP/staged-metal"
+          shasum -a 256 -c model-regression-macos-aarch64.tar.gz.sha256
+          tar -xzf model-regression-macos-aarch64.tar.gz model_regression
+          runner_sha=$(awk '{print $1}' model-regression-macos-aarch64.binary.sha256)
+          cd "$GITHUB_WORKSPACE"
+          target/debug/examples/release_delivery local --backend metal \
+            --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-metal/ferrum" \
+            --runner "$RUNNER_TEMP/staged-metal/model_regression" --runner-sha256 "$runner_sha" \
+            --report-dir "$RUNNER_TEMP/model-metal" --task-timeout-secs 3600
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-metal-evidence
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/installation-metal.json
+            ${{ runner.temp }}/model-metal/
+          if-no-files-found: error
+          retention-days: 30
+
+  cuda-models:
+    needs: [prepare, stage, stage-cuda, tasks]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 200
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-delivery-controller-rust-1.91
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage.outputs.linux_runner_id }},${{ needs.stage-cuda.outputs.cuda_asset_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-cuda
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-tasks
+          path: ${{ runner.temp }}/tasks
+      - name: Prepare controller and verified CUDA bytes before the lease clock
+        run: |
+          cargo build --locked -p ferrum-bench-core --example release_delivery
+          target/debug/examples/release_delivery inspect \
+            --abi "$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json" \
+            --version "$VERSION" --candidate-sha "$GITHUB_SHA" --extract-only \
+            --extract-dir "$RUNNER_TEMP/extracted-cuda" --output "$RUNNER_TEMP/cuda-extraction.json"
+          cd "$RUNNER_TEMP/staged-cuda"
+          sha256sum --check model-regression-linux-x86_64.tar.gz.sha256
+          tar -xzf model-regression-linux-x86_64.tar.gz model_regression
+      - name: Rent one bounded GPU, execute the selected tasks, and destroy it
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+        run: |
+          archive="$RUNNER_TEMP/staged-cuda/ferrum-linux-x86_64-cuda-sm89.tar.gz"
+          archive_sha=$(jq -er .asset_sha256 "$archive.abi.json")
+          runner_sha=$(awk '{print $1}' "$RUNNER_TEMP/staged-cuda/model-regression-linux-x86_64.binary.sha256")
+          target/debug/examples/release_delivery cloud \
+            --tasks "$RUNNER_TEMP/tasks/tasks.json" --archive "$archive" --archive-sha256 "$archive_sha" \
+            --ferrum-bin "$RUNNER_TEMP/extracted-cuda/ferrum" \
+            --runner "$RUNNER_TEMP/staged-cuda/model_regression" --runner-sha256 "$runner_sha" \
+            --report-dir "$RUNNER_TEMP/model-cuda" --repository-id "$GITHUB_REPOSITORY_ID" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --disk-gib 300 --min-free-disk-gib 180 --min-cpu-ram-mb 64000 \
+            --max-hourly-usd 0.75 --max-network-usd-per-gb 0.004 \
+            --lease-secs 10800 --bootstrap-secs 900 --task-timeout-secs 3600 --max-create-attempts 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: release-cuda-evidence
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/model-cuda/
+            !${{ runner.temp }}/model-cuda/**/private/**
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    needs: [prepare, quality, stage, stage-cuda, tasks, metal-models, cuda-models]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-delivery-publisher-rust-1.91
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.stage.outputs.linux_asset_id }},${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage-cuda.outputs.cuda_asset_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*-evidence
+          path: ${{ runner.temp }}/evidence
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/plan
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-tasks
+          path: ${{ runner.temp }}/tasks
+      - uses: actions/download-artifact@v4
+        with:
+          name: installation-linux
+          path: ${{ runner.temp }}/installation
+      - uses: actions/download-artifact@v4
+        with:
+          name: contract-checks
+          path: ${{ runner.temp }}/contracts
+      # Optional cached package checkpoints only save work. The publisher still
+      # verifies candidate inputs, archived bytes, and every public channel.
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/publication
+          key: publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: publication-${{ github.sha }}-
+      - name: Build the release controller
+        run: cargo build --locked -p ferrum-bench-core --example release_delivery
+      - name: Recheck all required evidence and publish missing channel outputs
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+        run: |
+          gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
+            --contracts "$RUNNER_TEMP/contracts/contract-checks.json" --version "$VERSION"
+            --workspace "$GITHUB_WORKSPACE" --notes "$RUNNER_TEMP/plan/release-notes.md"
+            --repo "$GITHUB_REPOSITORY" --ci-run-id "$GITHUB_RUN_ID")
+          for abi in "$RUNNER_TEMP/staged/"*.abi.json; do gate_args+=(--abi "$abi"); done
+          for install in "$RUNNER_TEMP/installation/"*.json; do gate_args+=(--installation "$install"); done
+          gate_args+=(--installation "$RUNNER_TEMP/evidence/release-metal-evidence/installation-metal.json")
+          while IFS= read -r -d '' report; do gate_args+=(--report "$report"); done \
+            < <(find "$RUNNER_TEMP/evidence" -name report.json -type f -print0)
+          target/debug/examples/release_delivery publish "${gate_args[@]}" \
+            --state-dir "$RUNNER_TEMP/publication" --tap-repo sizzlecar/homebrew-ferrum
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ${{ runner.temp }}/publication
+          key: publication-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: publication-state
+          overwrite: true
+          path: ${{ runner.temp }}/publication/
+          if-no-files-found: warn
+          retention-days: 30
+
+  install-cargo:
+    needs: [prepare, publish]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-delivery-public-cargo-rust-1.91
+      - name: Install the published crate and verify its actual program
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          cargo build --locked -p ferrum-bench-core --example release_delivery
+          cargo install ferrum-cli --version "=$VERSION" --locked --root "$RUNNER_TEMP/public-cargo"
+          target/debug/examples/release_delivery installed --channel cargo --version "$VERSION" \
+            --binary "$RUNNER_TEMP/public-cargo/bin/ferrum" --output "$RUNNER_TEMP/public-cargo.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-cargo-installation
+          overwrite: true
+          path: ${{ runner.temp }}/public-cargo.json
+          if-no-files-found: error
+          retention-days: 30
+
+  install-homebrew:
+    needs: [prepare, publish]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: metal
+            runner: [self-hosted, macOS, ARM64, ferrum-metal]
+            brew: /opt/homebrew/bin/brew
+            formula: ferrum
+          - backend: cuda
+            runner: [self-hosted, Linux, X64, ferrum-cuda, cuda-sm89]
+            brew: /home/linuxbrew/.linuxbrew/bin/brew
+            formula: ferrum-cuda
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Install or upgrade from the public tap and execute it
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          BREW: ${{ matrix.brew }}
+          FORMULA: ${{ matrix.formula }}
+        run: |
+          cargo build --locked -p ferrum-bench-core --example release_delivery
+          "$BREW" tap sizzlecar/ferrum
+          "$BREW" update
+          "$BREW" trust --formula sizzlecar/ferrum/ferrum
+          "$BREW" trust --formula sizzlecar/ferrum/ferrum-cuda
+          if "$BREW" list --versions "$FORMULA"; then
+            "$BREW" upgrade "sizzlecar/ferrum/$FORMULA"
+          else
+            "$BREW" install "sizzlecar/ferrum/$FORMULA"
+          fi
+          binary="$("$BREW" --prefix "$FORMULA")/bin/ferrum"
+          target/debug/examples/release_delivery installed --channel homebrew --version "$VERSION" \
+            --binary "$binary" --output "$RUNNER_TEMP/public-homebrew.json"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: public-homebrew-${{ matrix.backend }}-installation
+          overwrite: true
+          path: ${{ runner.temp }}/public-homebrew.json
+          if-no-files-found: error
+          retention-days: 30
+
+  complete:
+    needs: [prepare, publish, install-cargo, install-homebrew]
+    if: always() && needs.prepare.outputs.active == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require publication and actual public installations
+        env:
+          PUBLISH: ${{ needs.publish.result }}
+          CARGO_INSTALL: ${{ needs.install-cargo.result }}
+          BREW_INSTALL: ${{ needs.install-homebrew.result }}
+        run: |
+          test "$PUBLISH" = success
+          test "$CARGO_INSTALL" = success
+          test "$BREW_INSTALL" = success
+          echo 'Formal release delivered; published Cargo and Homebrew programs passed startup checks.' >> "$GITHUB_STEP_SUMMARY"

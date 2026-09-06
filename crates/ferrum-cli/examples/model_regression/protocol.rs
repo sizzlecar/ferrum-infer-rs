@@ -36,6 +36,10 @@ impl Chat {
             self.message["reasoning"].is_null() || self.message["reasoning"].is_string(),
             "invalid reasoning type"
         );
+        ensure!(
+            self.message["tool_calls"].is_null() || self.message["tool_calls"].is_array(),
+            "invalid tool_calls type"
+        );
         let calls = self.message["tool_calls"].as_array();
         ensure!(
             (self.finish == "tool_calls") == calls.is_some_and(|calls| !calls.is_empty()),
@@ -75,6 +79,32 @@ fn validate_usage(usage: &Value) -> Result<()> {
         "usage total mismatch: {usage}"
     );
     Ok(())
+}
+
+/// Machine-readable run output must remain JSONL during cold model downloads as
+/// well as generation. Keep this parser on the actual process-output path.
+pub(super) fn run_records(text: &str) -> Result<Vec<Value>> {
+    let records: Vec<Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()
+        .context("parse run JSONL")?;
+    for event in ["ready", "exit"] {
+        ensure!(
+            records
+                .iter()
+                .filter(|record| record["event"] == event)
+                .count()
+                == 1,
+            "run must emit one {event} event"
+        );
+    }
+    ensure!(
+        !records.iter().any(|record| record["event"] == "error"),
+        "run emitted an error event"
+    );
+    Ok(records)
 }
 
 pub(super) fn sync(text: &str) -> Result<Chat> {
@@ -245,6 +275,53 @@ pub(super) fn stream(text: &str) -> Result<Chat> {
     .validate()
 }
 
+/// The same fixture oracle runs after both actual HTTP parsers. A usable
+/// handoff includes a terminal tool-call finish, an identity, and typed arguments;
+/// a merely plausible function name is not enough to execute the fixture.
+pub(super) fn calc_call(chat: &Chat) -> Result<&Value> {
+    ensure!(
+        chat.finish == "tool_calls",
+        "calc call did not finish with tool_calls"
+    );
+    let calls = chat.message["tool_calls"]
+        .as_array()
+        .context("model did not call a tool")?;
+    ensure!(calls.len() == 1, "expected one calc invocation");
+    let call = &calls[0];
+    ensure!(
+        call["type"] == "function" && call["id"].as_str().is_some_and(|id| !id.trim().is_empty()),
+        "calc call is missing a usable function identity"
+    );
+    ensure!(
+        call["function"]["name"] == "calc",
+        "model selected the wrong tool"
+    );
+    let arguments: Value = serde_json::from_str(
+        call["function"]["arguments"]
+            .as_str()
+            .context("tool arguments")?,
+    )
+    .context("invalid calc arguments JSON")?;
+    ensure!(
+        arguments
+            .as_object()
+            .is_some_and(|object| object.len() == 1),
+        "tool arguments violated additionalProperties: false: {arguments}"
+    );
+    let expression = arguments["expression"]
+        .as_str()
+        .context("expression argument")?;
+    ensure!(
+        expression
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            == "123+456",
+        "wrong tool expression: {arguments}"
+    );
+    Ok(call)
+}
+
 pub(super) fn answer(text: &str, expected: &str) -> Result<()> {
     let actual = text
         .trim()
@@ -339,5 +416,100 @@ mod tests {
         answer("**42**", "42").unwrap();
         assert!(answer("41", "42").is_err());
         assert!(answer("", "42").is_err());
+    }
+    #[test]
+    fn run_framing_rejects_download_noise_and_incomplete_or_failed_processes() {
+        let valid = "{\"event\":\"ready\"}\n{\"event\":\"assistant\",\"content\":\"42\"}\n{\"event\":\"exit\"}\n";
+        assert_eq!(run_records(valid).unwrap().len(), 3);
+        for text in [
+            format!("Downloading 25%\n{valid}"),
+            valid.replace("{\"event\":\"exit\"}\n", ""),
+            format!("{valid}{{\"event\":\"exit\"}}\n"),
+            format!("{valid}{{\"event\":\"error\",\"message\":\"failed\"}}\n"),
+            format!("{valid}{{\"event\":"),
+        ] {
+            assert!(run_records(&text).is_err(), "accepted {text}");
+        }
+    }
+
+    fn tool_response(call: &Value, finish: &str, streamed: bool) -> String {
+        if streamed {
+            let mut delta = call.clone();
+            delta["index"] = json!(0);
+            event(json!({"index": 0, "delta": {"tool_calls": [delta]}}))
+                + &ending().replace("\"stop\"", &format!("\"{finish}\""))
+        } else {
+            json!({
+                "choices": [{"index": 0, "message": {"role": "assistant", "tool_calls": [call]}, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+            }).to_string()
+        }
+    }
+
+    #[test]
+    fn both_http_modes_share_named_tool_identity_arguments_and_finish_oracle() {
+        let valid = json!({"id": "call-1", "type": "function", "function": {"name": "calc", "arguments": "{\"expression\":\"123 + 456\"}"}});
+        for streamed in [false, true] {
+            let parse = |call: &Value, finish: &str| {
+                let text = tool_response(call, finish, streamed);
+                if streamed { stream(&text) } else { sync(&text) }
+                    .and_then(|chat| calc_call(&chat).map(|_| ()))
+            };
+            parse(&valid, "tool_calls").unwrap();
+            for (pointer, wrong) in [
+                ("/id", json!("")),
+                ("/type", json!("not-a-function")),
+                ("/function/name", json!("lookup_weather")),
+                ("/function/arguments", json!("invalid JSON")),
+                ("/function/arguments", json!("{\"expression\":\"123-456\"}")),
+                ("/function/arguments", json!("{\"expression\":579}")),
+                (
+                    "/function/arguments",
+                    json!("{\"expression\":\"123+456\",\"extra\":true}"),
+                ),
+            ] {
+                let mut wrong_call = valid.clone();
+                *wrong_call.pointer_mut(pointer).unwrap() = wrong;
+                assert!(
+                    parse(&wrong_call, "tool_calls").is_err(),
+                    "accepted {wrong_call} in stream={streamed}"
+                );
+            }
+            for finish in ["stop", "length", "unknown"] {
+                assert!(
+                    parse(&valid, finish).is_err(),
+                    "accepted finish {finish} in stream={streamed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sync_framing_rejects_noncanonical_fields_choices_and_usage() {
+        let valid = json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "42"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+        });
+        sync(&valid.to_string()).unwrap();
+        for (pointer, wrong) in [
+            ("/choices", json!([])),
+            ("/choices/0/index", json!(1)),
+            ("/choices/0/message/role", json!("user")),
+            ("/choices/0/message/content", json!(42)),
+            ("/choices/0/finish_reason", Value::Null),
+            ("/usage/total_tokens", json!(7)),
+        ] {
+            let mut body = valid.clone();
+            *body.pointer_mut(pointer).unwrap() = wrong;
+            assert!(sync(&body.to_string()).is_err(), "accepted {body}");
+        }
+        for (field, wrong) in [
+            ("reasoning_content", json!("thought")),
+            ("tool_calls", json!({"id": "malformed"})),
+        ] {
+            let mut body = valid.clone();
+            body["choices"][0]["message"][field] = wrong;
+            assert!(sync(&body.to_string()).is_err(), "accepted {body}");
+        }
     }
 }

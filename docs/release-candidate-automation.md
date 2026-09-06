@@ -163,13 +163,10 @@ implemented model-task obligations; it does not verify archive contents,
 installation, numerical references, every declared execution path, or complete
 release correctness. The gate reports `release_approved: false` even on success.
 
-Automatic local/cloud capacity selection, full-plan execution, raw report replay,
-and the complete evidence gate immediately before publishing remain pending. Cloud
-provider/runner selection and its integration also remain pending; the catalog's
-resource discussion is background, not a configured paid execution service.
-
-Crate dependency-order publication, resumable GitHub asset upload, formal release
-creation and Homebrew updates still require a later delivery implementation.
-That implementation must reject missing, failed, not-run or inconclusive
-required evidence and promote the same accepted asset bytes. This preparation
-command's success cannot substitute for those checks.
+The [release delivery workflow](release-delivery.md) now connects these staged
+artifacts to local Metal and bounded Vast execution, the full evidence gate,
+resumable Cargo/GitHub/Homebrew publication and public installation checks.
+Staging remains read-only and never decides publication itself. Missing bindings,
+failed/not-run evidence and unsupported numerical/performance obligations still
+block the consuming release gate. The initial end-to-end run must establish
+actual operation; definitions and local tests alone are not a completed release.

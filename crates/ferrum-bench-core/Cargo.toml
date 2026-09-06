@@ -16,8 +16,18 @@ sha2 = "0.10"
 # Structured release preparation keeps comments and dependency constraints.
 toml_edit = "0.22.27"
 semver = "1.0"
+# Parse production/test item boundaries for change-based validation scope.
+syn = { version = "2", features = ["full"] }
+quote = "1"
 
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = "0.9"
 clap = { workspace = true, features = ["derive"] }
+
+# Thin release controllers use the same HTTP/runtime dependencies as the workspace.
+reqwest = { workspace = true }
+tokio = { workspace = true }
+
+# Local runner process-group cleanup after timeouts and cancellation.
+libc = "0.2"

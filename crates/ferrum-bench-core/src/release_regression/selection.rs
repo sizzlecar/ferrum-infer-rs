@@ -186,6 +186,46 @@ fn add_for_scopes(
     }
 }
 
+/// Union the reach of paths contributing this area, not the reach of the whole
+/// diff. Missing path attribution and any shared/unrecognized contributor retain
+/// every target. Explicit unknown changes also defeat narrowing, even if their
+/// precomputed area list was incomplete.
+fn area_targets(
+    impact: &Impact,
+    area: ChangeArea,
+    targets: &[ExecutionTarget],
+) -> Result<Vec<ExecutionTarget>, String> {
+    if area == ChangeArea::Validation || !impact.unknown_paths.is_empty() {
+        return Ok(targets.to_vec());
+    }
+    let mut backends = BTreeSet::new();
+    for path in impact
+        .paths
+        .iter()
+        .filter(|path| path.areas.contains(&area))
+    {
+        let Some(backend) = super::impact::path_backend(&path.path) else {
+            return Ok(targets.to_vec());
+        };
+        backends.insert(backend);
+    }
+    if backends.is_empty() {
+        return Ok(targets.to_vec());
+    }
+    for backend in &backends {
+        if !targets.iter().any(|target| target.backend == *backend) {
+            return Err(format!(
+                "changed {backend:?} backend has no target in the declared regression inventory"
+            ));
+        }
+    }
+    Ok(targets
+        .iter()
+        .filter(|target| backends.contains(&target.backend))
+        .cloned()
+        .collect())
+}
+
 fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarget]) {
     use Behavior::*;
     use ChangeArea::*;
@@ -209,20 +249,29 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
             &[UserStop, NaturalEnd, LengthLimit],
         ),
         Structured => (
+            // Competing-logit production-engine contracts prove token masking.
+            // A model that follows the JSON prompt cannot establish that mechanism;
+            // its actual sync/SSE result still must satisfy the requested schema.
             &[StructuredSampling, StructuredValidity],
-            &[StructuredSampling, StructuredValidity],
+            &[StructuredValidity],
         ),
         Tools => (
             &[ToolSelection, ToolHandoff, ToolContinuation],
             &[ToolSelection, ToolHandoff, ToolContinuation],
         ),
         Scheduler => (
+            // Deterministic queue/production-engine assertions own waiting,
+            // cancellation and admission. A normal model answer does not prove
+            // these internal mechanisms, even when repeated on every entrypoint.
             &[SchedulingProgress, Cancellation, CapacityAdmission],
-            &[SchedulingProgress, Cancellation, CapacityAdmission],
+            &[ModelLoad, ModelForward],
         ),
         Kv => (
+            // Keep isolation, release and resume contracts mandatory. In
+            // particular, an unbound resume check remains a gap. The selected
+            // model verifies integration only; it cannot certify device state.
             &[KvIsolation, KvRelease, KvResume],
-            &[KvIsolation, KvRelease, KvResume],
+            &[ModelLoad, ModelForward],
         ),
         Kernel => (&[KernelBoundaries], &[ModelForward]),
         Architecture => (
@@ -490,6 +539,13 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
         }
     }
     let mut areas: BTreeSet<_> = input.impact.areas.iter().copied().collect();
+    areas.extend(
+        input
+            .impact
+            .paths
+            .iter()
+            .flat_map(|path| path.areas.iter().copied()),
+    );
     for path in &input.impact.unknown_paths {
         result.gaps.push(Gap::UnmappedChange { path: path.clone() });
         areas.extend(ChangeArea::ALL);
@@ -566,7 +622,8 @@ pub fn plan(input: &PlanInput) -> Result<Plan, String> {
         );
     }
     for area in areas {
-        area_obligations(&mut result, area, &targets);
+        let affected = area_targets(&input.impact, area, &targets)?;
+        area_obligations(&mut result, area, &affected);
     }
 
     let mut profiles: Vec<_> = input

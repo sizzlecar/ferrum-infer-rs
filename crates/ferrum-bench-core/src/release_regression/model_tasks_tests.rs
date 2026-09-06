@@ -57,12 +57,38 @@ impl ReportFixture {
                 ModelCheck::Stop => &["run-stop", "serve-stop"],
                 ModelCheck::Structured => &["serve-structured"],
                 ModelCheck::Tools => &["serve-tools"],
+                ModelCheck::Reasoning => &["run-reasoning", "serve-reasoning"],
+                ModelCheck::Length => &["run-length", "serve-length"],
             };
             for name in entries {
                 let evidence = match *name {
                     "run-basic" | "run-stop" => json!({"ready": ready.clone()}),
+                    "run-reasoning" | "serve-reasoning" => {
+                        let output = boundary_fixture("42", "17 plus 25 equals 42.", "stop", 10);
+                        json!({"ready": ready, "enable_thinking": true, "max_tokens": expected.max_tokens,
+                            "output": output, "sync": output, "stream": output})
+                    }
+                    "run-length" | "serve-length" => {
+                        let baseline = boundary_fixture("alpha beta gamma delta", "", "stop", 10);
+                        let output = boundary_fixture("alpha beta gamma", "", "length", 8);
+                        json!({"ready": ready, "baseline_ready": ready, "enable_thinking": false,
+                            "baseline_max_tokens": expected.max_tokens, "budget": 8, "baseline": baseline,
+                            "output": output, "sync": output, "stream": output})
+                    }
                     "serve-tools" => {
-                        json!({"reasoning_alias_replayed": expected.reasoning_alias_replay})
+                        let mut evidence =
+                            json!({"reasoning_alias_replayed": expected.reasoning_alias_replay});
+                        for (mode, id) in [("sync", "sync-call"), ("stream", "stream-call")] {
+                            evidence[format!("{mode}_call")] = json!({
+                                "message": {"role": "assistant", "tool_calls": [{"id": id, "type": "function", "function": {"name": "calc", "arguments": "{\"expression\":\"123+456\"}"}}]},
+                                "finish_reason": "tool_calls", "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                            });
+                            evidence[format!("{mode}_continuation")] = json!({
+                                "message": {"role": "assistant", "content": "579"},
+                                "finish_reason": "stop", "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}, "tool_call_id": id
+                            });
+                        }
+                        evidence
                     }
                     _ => json!({}),
                 };
@@ -124,6 +150,8 @@ fn checks_have_strict_round_trip_names() {
         ModelCheck::Stop,
         ModelCheck::Structured,
         ModelCheck::Tools,
+        ModelCheck::Reasoning,
+        ModelCheck::Length,
     ] {
         let text = check.to_string();
         assert_eq!(text.parse::<ModelCheck>().unwrap(), check);
@@ -401,4 +429,121 @@ fn passed_summary_cannot_contradict_health_or_task_verification_errors() {
     rejected(&expected, &fixture, "task verification errors");
     fixture.value["task_verification_errors"] = json!([]);
     assert_eq!(verify_model_report(&expected, &fixture.value), Ok(()));
+}
+
+#[test]
+fn tools_require_both_named_calls_and_their_actual_continuations() {
+    let expected = task("selected", Backend::Cuda, vec![ModelCheck::Tools]);
+    for name in [
+        "sync_call",
+        "stream_call",
+        "sync_continuation",
+        "stream_continuation",
+    ] {
+        let mut fixture = ReportFixture::passed(&expected);
+        fixture.case_mut("serve-tools")["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove(name);
+        rejected(
+            &expected,
+            &fixture,
+            &format!("completed {name} oracle evidence"),
+        );
+
+        let mut fixture = ReportFixture::passed(&expected);
+        fixture.case_mut("serve-tools")["evidence"][name]["finish_reason"] = json!("length");
+        rejected(
+            &expected,
+            &fixture,
+            &format!("completed {name} oracle evidence"),
+        );
+    }
+    for mode in ["sync", "stream"] {
+        for (field, wrong) in [("id", json!("")), ("type", json!("unknown"))] {
+            let mut fixture = ReportFixture::passed(&expected);
+            fixture.case_mut("serve-tools")["evidence"][format!("{mode}_call")]["message"]
+                ["tool_calls"][0][field] = wrong;
+            rejected(
+                &expected,
+                &fixture,
+                &format!("{mode}_call is missing its named tool identity"),
+            );
+        }
+        let mut fixture = ReportFixture::passed(&expected);
+        fixture.case_mut("serve-tools")["evidence"][format!("{mode}_call")]["message"]
+            ["tool_calls"][0]["function"]["name"] = json!("lookup_weather");
+        rejected(
+            &expected,
+            &fixture,
+            &format!("{mode}_call is missing its named tool identity"),
+        );
+
+        let mut fixture = ReportFixture::passed(&expected);
+        fixture.case_mut("serve-tools")["evidence"][format!("{mode}_continuation")]
+            ["tool_call_id"] = json!("another-call");
+        rejected(
+            &expected,
+            &fixture,
+            &format!("{mode}_continuation did not replay its actual call identity"),
+        );
+    }
+}
+
+fn boundary_fixture(content: &str, reasoning: &str, finish: &str, tokens: u64) -> Value {
+    json!({"message": {"role": "assistant", "content": content, "reasoning": reasoning},
+        "finish_reason": finish, "usage": {"prompt_tokens": 5, "completion_tokens": tokens, "total_tokens": 5 + tokens}})
+}
+
+#[test]
+fn boundary_reports_cannot_replace_observations_with_a_passed_parent() {
+    let expected = task(
+        "boundaries",
+        Backend::Metal,
+        vec![ModelCheck::Reasoning, ModelCheck::Length],
+    );
+    let valid = ReportFixture::passed(&expected);
+    verify_model_report(&expected, &valid.value).unwrap();
+    for name in [
+        "run-reasoning",
+        "serve-reasoning",
+        "run-length",
+        "serve-length",
+    ] {
+        let mut fixture = ReportFixture::passed(&expected);
+        fixture.case_mut(name)["evidence"] = json!({"passed": true});
+        rejected(&expected, &fixture, name);
+    }
+    let mut fixture = ReportFixture::passed(&expected);
+    fixture.case_mut("serve-reasoning")["evidence"]["stream"]["message"]["reasoning"] = Value::Null;
+    rejected(&expected, &fixture, "no distinct nonempty thought");
+    let mut fixture = ReportFixture::passed(&expected);
+    fixture.case_mut("run-length")["evidence"]["output"]["finish_reason"] = json!("eos");
+    rejected(&expected, &fixture, "length finish");
+    let mut fixture = ReportFixture::passed(&expected);
+    fixture.case_mut("serve-length")["evidence"]["stream"]["usage"]["completion_tokens"] = json!(7);
+    rejected(&expected, &fixture, "token usage");
+    let mut fixture = ReportFixture::passed(&expected);
+    fixture.case_mut("run-length")["evidence"]["baseline_ready"]["backend"] = json!("CPU");
+    rejected(&expected, &fixture, "baseline readiness");
+    let mut fixture = ReportFixture::passed(&expected);
+    fixture.case_mut("serve-reasoning")["evidence"]["enable_thinking"] = json!(false);
+    rejected(&expected, &fixture, "explicitly enable thinking");
+}
+
+#[test]
+fn truncation_budget_cannot_accept_empty_or_overflowing_baselines() {
+    for tokens in [0, 1, 2, u64::MAX] {
+        assert!(length_probe_budget(tokens).is_err());
+    }
+    assert_eq!(length_probe_budget(10).unwrap(), 8);
+    let baseline = boundary_fixture("alpha beta", "", "stop", 10);
+    for content in ["", "alpha beta", "different", "<|channel>final"] {
+        assert!(verify_length_observations(
+            &baseline,
+            &boundary_fixture(content, "", "length", 8),
+            8
+        )
+        .is_err());
+    }
 }

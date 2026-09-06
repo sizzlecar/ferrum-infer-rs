@@ -35,6 +35,9 @@ enum Command {
         candidate: CandidateArgs,
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
+        /// Require advancement from this previous formal version (without v).
+        #[arg(long)]
+        previous_version: Option<String>,
     },
     /// Generate new adjacent checksum, version, dependency and ABI records.
     Manifest {
@@ -167,9 +170,13 @@ fn execute(cli: Cli) -> Result<(), String> {
         Command::Verify {
             candidate,
             workspace,
+            previous_version,
         } => {
             let input = candidate.input();
             staging::validate_candidate(&input)?;
+            if let Some(previous) = previous_version {
+                staging::validate_version_progression(&previous, &input.version)?;
+            }
             let metadata = workspace::metadata(&workspace)?;
             staging::validate_workspace_versions(&metadata, &input.version)?;
             println!(

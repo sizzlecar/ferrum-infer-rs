@@ -1,0 +1,522 @@
+//! Narrow development/tool dependency changes from complete immutable Cargo inputs.
+//! Unknown runtime, feature, build, workspace or existing registry changes retain
+//! conservative impact. This is dependency classification, never test evidence.
+use crate::release_candidate::version::{plan_version_update, MemberManifest};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use toml_edit::{DocumentMut, Item, TableLike, Value};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyRefinement {
+    pub paths: Vec<String>,
+    pub coordinated_version: bool,
+    /// These reviewed release-tool dependencies are ordinary Cargo dependencies;
+    /// do not claim that adding their edges leaves the entire Cargo graph equal.
+    pub validation_runtime_dependencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Semantic {
+    String(String),
+    Integer(i64),
+    Float(String),
+    Bool(bool),
+    Datetime(String),
+    Array(Vec<Semantic>),
+    Table(BTreeMap<String, Semantic>),
+    None,
+}
+fn semantic_value(value: &Value) -> Semantic {
+    match value {
+        Value::String(v) => Semantic::String(v.value().clone()),
+        Value::Integer(v) => Semantic::Integer(*v.value()),
+        Value::Float(v) => Semantic::Float(v.value().to_string()),
+        Value::Boolean(v) => Semantic::Bool(*v.value()),
+        Value::Datetime(v) => Semantic::Datetime(v.value().to_string()),
+        Value::Array(v) => Semantic::Array(v.iter().map(semantic_value).collect()),
+        Value::InlineTable(v) => Semantic::Table(
+            v.iter()
+                .map(|(key, v)| (key.into(), semantic_value(v)))
+                .collect(),
+        ),
+    }
+}
+fn semantic(item: &Item) -> Semantic {
+    match item {
+        Item::None => Semantic::None,
+        Item::Value(v) => semantic_value(v),
+        Item::Table(table) => Semantic::Table(
+            table
+                .iter()
+                .map(|(key, item)| (key.into(), semantic(item)))
+                .collect(),
+        ),
+        Item::ArrayOfTables(tables) => Semantic::Array(
+            tables
+                .iter()
+                .map(|table| {
+                    Semantic::Table(
+                        table
+                            .iter()
+                            .map(|(key, item)| (key.into(), semantic(item)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+fn parse(files: &BTreeMap<String, String>, path: &str) -> Result<DocumentMut, String> {
+    files
+        .get(path)
+        .ok_or_else(|| format!("missing Cargo input {path}"))?
+        .parse()
+        .map_err(|error| format!("invalid {path}: {error}"))
+}
+fn names(
+    root: &DocumentMut,
+    files: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
+    let workspace = root
+        .get("workspace")
+        .and_then(Item::as_table_like)
+        .ok_or("missing workspace")?;
+    if !matches!(
+        workspace.get("resolver").and_then(Item::as_str),
+        Some("2" | "3")
+    ) {
+        return Err("dev dependency refinement requires resolver 2 or 3".into());
+    }
+    if workspace
+        .get("exclude")
+        .is_some_and(|item| !item.as_array().is_some_and(|array| array.is_empty()))
+    {
+        return Err("workspace exclusions are not refined".into());
+    }
+    let members = workspace
+        .get("members")
+        .and_then(Item::as_array)
+        .ok_or("workspace members must be explicit")?;
+    let mut paths = Vec::new();
+    for member in members {
+        let member = member.as_str().ok_or("workspace member must be a path")?;
+        if member.contains(['*', '?', '[', ']', '{', '}', ':', '\\'])
+            || member
+                .split('/')
+                .any(|part| matches!(part, "" | "." | ".."))
+        {
+            return Err("nonliteral workspace member is not refined".into());
+        }
+        paths.push(format!("{member}/Cargo.toml"));
+    }
+    if root.get("package").is_some() {
+        paths.push("Cargo.toml".into());
+    }
+    let mut result = BTreeMap::new();
+    for path in paths {
+        let document = parse(files, &path)?;
+        let name = document
+            .get("package")
+            .and_then(|item| item.get("name"))
+            .and_then(Item::as_str)
+            .ok_or("member package.name must be explicit")?;
+        if result.insert(name.into(), path).is_some() {
+            return Err("duplicate workspace package".into());
+        }
+    }
+    Ok(result)
+}
+fn package_name(key: &str, spec: &Item, root: &DocumentMut) -> Result<String, String> {
+    if spec.get("workspace").and_then(Item::as_bool) == Some(true) {
+        let inherited = root
+            .get("workspace")
+            .and_then(|item| item.get("dependencies"))
+            .and_then(|item| item.get(key))
+            .ok_or("missing workspace dependency")?;
+        return Ok(inherited
+            .get("package")
+            .and_then(Item::as_str)
+            .unwrap_or(key)
+            .into());
+    }
+    Ok(spec
+        .get("package")
+        .and_then(Item::as_str)
+        .unwrap_or(key)
+        .into())
+}
+fn remove_dev(
+    table: &mut dyn TableLike,
+    root: &DocumentMut,
+    names: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    if let Some(dependencies) = table.remove("dev-dependencies") {
+        let dependencies = dependencies
+            .as_table_like()
+            .ok_or("dev-dependencies must be a table")?;
+        for (key, spec) in dependencies.iter() {
+            names.insert(package_name(key, spec, root)?);
+        }
+    }
+    Ok(())
+}
+fn strip_dev(document: &mut DocumentMut, root: &DocumentMut) -> Result<BTreeSet<String>, String> {
+    let mut names = BTreeSet::new();
+    remove_dev(document.as_table_mut(), root, &mut names)?;
+    if let Some(targets) = document.get_mut("target") {
+        let targets = targets
+            .as_table_like_mut()
+            .ok_or("target must be a table")?;
+        let keys: Vec<_> = targets.iter().map(|(key, _)| key.to_owned()).collect();
+        for key in keys {
+            let target = targets
+                .get_mut(&key)
+                .and_then(Item::as_table_like_mut)
+                .ok_or("target condition must be a table")?;
+            remove_dev(target, root, &mut names)?;
+            if target.is_empty() {
+                targets.remove(&key);
+            }
+        }
+        if targets.is_empty() {
+            document.as_table_mut().remove("target");
+        }
+    }
+    Ok(names)
+}
+
+fn runtime_names(document: &DocumentMut, root: &DocumentMut) -> Result<BTreeSet<String>, String> {
+    let mut result = BTreeSet::new();
+    let mut collect = |table: &dyn TableLike| -> Result<(), String> {
+        for kind in ["dependencies", "build-dependencies"] {
+            if let Some(dependencies) = table.get(kind) {
+                let dependencies = dependencies
+                    .as_table_like()
+                    .ok_or("dependencies must be tables")?;
+                for (name, spec) in dependencies.iter() {
+                    result.insert(package_name(name, spec, root)?);
+                }
+            }
+        }
+        Ok(())
+    };
+    collect(document.as_table())?;
+    if let Some(targets) = document.get("target") {
+        for (_, target) in targets
+            .as_table_like()
+            .ok_or("target must be a table")?
+            .iter()
+        {
+            collect(
+                target
+                    .as_table_like()
+                    .ok_or("target condition must be a table")?,
+            )?;
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Package {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
+struct Locked {
+    body: Semantic,
+    dependencies: BTreeSet<String>,
+}
+fn locks(document: &DocumentMut) -> Result<BTreeMap<Package, Locked>, String> {
+    let records = document
+        .get("package")
+        .and_then(Item::as_array_of_tables)
+        .ok_or("lock is missing packages")?;
+    let mut result = BTreeMap::new();
+    for record in records {
+        let field = |name| {
+            record
+                .get(name)
+                .and_then(Item::as_str)
+                .ok_or("invalid lock package identity")
+        };
+        let package = Package {
+            name: field("name")?.into(),
+            version: field("version")?.into(),
+            source: record
+                .get("source")
+                .and_then(Item::as_str)
+                .map(str::to_owned),
+        };
+        let dependencies = match record.get("dependencies") {
+            None => BTreeSet::new(),
+            Some(item) => item
+                .as_array()
+                .ok_or("lock dependencies must be an array")?
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or("invalid lock dependency")
+                })
+                .collect::<Result<_, _>>()?,
+        };
+        let mut body = record.clone();
+        body.remove("dependencies");
+        if result
+            .insert(
+                package,
+                Locked {
+                    body: semantic(&Item::Table(body)),
+                    dependencies,
+                },
+            )
+            .is_some()
+        {
+            return Err("duplicate lock identity".into());
+        }
+    }
+    Ok(result)
+}
+fn resolve<'a>(
+    reference: &str,
+    records: &'a BTreeMap<Package, Locked>,
+) -> Result<&'a Package, String> {
+    let pieces: Vec<_> = reference.split_whitespace().collect();
+    let name = pieces.first().ok_or("empty lock dependency")?;
+    let candidates: Vec<_> = records
+        .keys()
+        .filter(|package| {
+            package.name == *name
+                && pieces
+                    .get(1)
+                    .is_none_or(|version| package.version == *version)
+                && pieces.get(2).is_none_or(|source| {
+                    Some(source.trim_matches(['(', ')'])) == package.source.as_deref()
+                })
+        })
+        .collect();
+    if pieces.len() > 3 || candidates.len() != 1 {
+        return Err(format!("ambiguous lock dependency {reference}"));
+    }
+    Ok(candidates[0])
+}
+fn closure(
+    seeds: BTreeSet<Package>,
+    records: &BTreeMap<Package, Locked>,
+) -> Result<BTreeSet<Package>, String> {
+    let mut todo: Vec<_> = seeds.into_iter().collect();
+    let mut seen = BTreeSet::new();
+    while let Some(package) = todo.pop() {
+        if !seen.insert(package.clone()) {
+            continue;
+        }
+        for dependency in &records[&package].dependencies {
+            todo.push(resolve(dependency, records)?.clone());
+        }
+    }
+    Ok(seen)
+}
+
+/// Complete before/after root/member manifests and Cargo.lock are required. The
+/// only reviewed ordinary additions are the semver/TOML/Rust-syntax tools in bench-core's release
+/// modules: source callers were reviewed separately, and source diffs still keep
+/// their own impact. This is not permission to change their features or versions.
+pub fn validation_dependency_paths(
+    before: &BTreeMap<String, String>,
+    after: &BTreeMap<String, String>,
+) -> Result<DependencyRefinement, String> {
+    if !before.keys().eq(after.keys()) {
+        return Err("Cargo inputs were added or removed".into());
+    }
+    let root = parse(before, "Cargo.toml")?;
+    let next_root = parse(after, "Cargo.toml")?;
+    let members = names(&root, before)?;
+    if members != names(&next_root, after)? {
+        return Err("workspace membership changed".into());
+    }
+    let version = |document: &DocumentMut| {
+        document
+            .get("workspace")
+            .and_then(|item| item.get("package"))
+            .and_then(|item| item.get("version"))
+            .and_then(Item::as_str)
+            .map(str::to_owned)
+            .ok_or("workspace version must be explicit")
+    };
+    let coordinated_version = version(&root)? != version(&next_root)?;
+    let mut baseline = before.clone();
+    if coordinated_version {
+        let member_inputs: Vec<_> = members
+            .iter()
+            .map(|(name, path)| MemberManifest {
+                package_name: name.clone(),
+                manifest_path: path.clone(),
+                text: before[path].clone(),
+            })
+            .collect();
+        let update = plan_version_update(
+            &before["Cargo.toml"],
+            &member_inputs,
+            before.get("Cargo.lock").ok_or("missing Cargo.lock")?,
+            &version(&next_root)?,
+        )?;
+        baseline.insert("Cargo.toml".into(), update.workspace_manifest);
+        baseline.insert("Cargo.lock".into(), update.lockfile);
+        for member in update.members {
+            baseline.insert(member.manifest_path, member.text);
+        }
+    }
+    let baseline_root = parse(&baseline, "Cargo.toml")?;
+    let mut allowed_edges = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut tools = Vec::new();
+    for path in baseline.keys().filter(|path| path.ends_with("Cargo.toml")) {
+        let mut prior = parse(&baseline, path)?;
+        let mut next = parse(after, path)?;
+        let mut allowed = strip_dev(&mut prior, &baseline_root)?;
+        allowed.extend(strip_dev(&mut next, &next_root)?);
+        let member = members
+            .iter()
+            .find(|(_, member_path)| *member_path == path)
+            .map(|(name, _)| name);
+        if member.is_some_and(|name| name == "ferrum-bench-core") {
+            for dependency in ["semver", "toml_edit", "syn", "quote"] {
+                let before_dependency = prior
+                    .get("dependencies")
+                    .and_then(|item| item.get(dependency));
+                if before_dependency.is_some() {
+                    continue;
+                }
+                let after_dependency = next
+                    .get("dependencies")
+                    .and_then(|item| item.get(dependency));
+                let Some(spec) = after_dependency else {
+                    continue;
+                };
+                // These closed declarations name the syntax features actually
+                // needed by the release scope parser. Other flags remain unknown.
+                let reviewed = if dependency == "syn" {
+                    spec.as_table_like().is_some_and(|table| {
+                        table.len() == 2
+                            && table.get("version").and_then(Item::as_str).is_some()
+                            && table.get("features").and_then(Item::as_array).is_some_and(
+                                |features| {
+                                    features.len() == 1
+                                        && features.get(0).and_then(Value::as_str) == Some("full")
+                                },
+                            )
+                    })
+                } else {
+                    spec.as_str().is_some()
+                };
+                if !reviewed {
+                    return Err(format!(
+                        "unreviewed release-tool dependency declaration {dependency}"
+                    ));
+                }
+                next.get_mut("dependencies")
+                    .and_then(Item::as_table_like_mut)
+                    .ok_or("missing dependencies")?
+                    .remove(dependency);
+                allowed.insert(dependency.into());
+                tools.push(format!("{path}:{dependency}"));
+            }
+        }
+        if semantic(prior.as_item()) != semantic(next.as_item()) {
+            return Err(format!(
+                "{path} changes runtime/build/features or unsupported manifest metadata"
+            ));
+        }
+        // If a dependency serves both normal/build and development consumers,
+        // an edge/version change is ambiguous and must remain conservative.
+        let runtime = runtime_names(&prior, &baseline_root)?;
+        allowed.retain(|name| !runtime.contains(name));
+        if let Some(member) = member {
+            allowed_edges.insert(member.clone(), allowed);
+        }
+    }
+    let prior_lock = parse(&baseline, "Cargo.lock")?;
+    let next_lock = parse(after, "Cargo.lock")?;
+    let mut prior_header = prior_lock.clone();
+    prior_header.as_table_mut().remove("package");
+    let mut next_header = next_lock.clone();
+    next_header.as_table_mut().remove("package");
+    if semantic(prior_header.as_item()) != semantic(next_header.as_item()) {
+        return Err("lock metadata changed".into());
+    }
+    let prior = locks(&prior_lock)?;
+    let next = locks(&next_lock)?;
+    let local = |records: &BTreeMap<Package, Locked>| {
+        records
+            .keys()
+            .filter(|package| package.source.is_none())
+            .map(|package| package.name.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let member_names: BTreeSet<_> = members.keys().cloned().collect();
+    if local(&prior) != member_names || local(&next) != member_names {
+        return Err("lock local packages differ from workspace members".into());
+    }
+    let mut dev_seeds = BTreeSet::new();
+    for (package, old) in &prior {
+        let new = next.get(package).ok_or_else(|| {
+            format!(
+                "existing locked package {} {} changed or disappeared",
+                package.name, package.version
+            )
+        })?;
+        if old.body != new.body {
+            return Err(format!(
+                "locked package {} identity/checksum changed",
+                package.name
+            ));
+        }
+        if package.source.is_some() {
+            if old.dependencies != new.dependencies {
+                return Err(format!(
+                    "existing registry dependency graph changed at {}",
+                    package.name
+                ));
+            }
+        } else {
+            let allowed = &allowed_edges[&package.name];
+            for dependency in old.dependencies.symmetric_difference(&new.dependencies) {
+                let changed = resolve(
+                    dependency,
+                    if new.dependencies.contains(dependency) {
+                        &next
+                    } else {
+                        &prior
+                    },
+                )?;
+                if !allowed.contains(&changed.name) {
+                    return Err(format!(
+                        "runtime lock edge changed: {} -> {}",
+                        package.name, dependency
+                    ));
+                }
+                if new.dependencies.contains(dependency) {
+                    dev_seeds.insert(changed.clone());
+                }
+            }
+        }
+    }
+    let allowed_new = closure(dev_seeds, &next)?;
+    for package in next.keys().filter(|package| !prior.contains_key(*package)) {
+        if package.source.is_none() || !allowed_new.contains(package) {
+            return Err(format!("unexplained new lock package {}", package.name));
+        }
+    }
+    Ok(DependencyRefinement {
+        paths: before
+            .iter()
+            .filter_map(|(path, text)| (after.get(path) != Some(text)).then_some(path.clone()))
+            .collect(),
+        coordinated_version,
+        validation_runtime_dependencies: tools,
+    })
+}
+
+#[cfg(test)]
+#[path = "dependency_change_tests.rs"]
+mod tests;

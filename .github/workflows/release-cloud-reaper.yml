@@ -1,0 +1,74 @@
+name: Reap expired release GPU leases
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: Optional release workflow run ID; blank checks all expired leases for this repository
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-cloud-reaper-${{ github.repository_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
+jobs:
+  reap:
+    # Manual runs from another ref and forks must not receive this controller secret.
+    if: github.repository == 'sizzlecar/ferrum-infer-rs' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out trusted main controller
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@1.91.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-delivery-controller-rust-1.91
+
+      - name: Build only the small Rust controller
+        run: cargo build --locked -p ferrum-bench-core --example release_delivery
+
+      - name: Reap only expired owned instances
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          RELEASE_RUN_ID: ${{ inputs.release_run_id }}
+          REPORT_DIR: ${{ runner.temp }}/ferrum-cloud-reaper
+        run: |
+          mkdir -p "$REPORT_DIR"
+          reap_args=(--repository-id "$REPOSITORY_ID" --output "$REPORT_DIR/reap.json")
+          if [[ -n "$RELEASE_RUN_ID" ]]; then
+            reap_args+=(--run-id "$RELEASE_RUN_ID")
+          fi
+          target/debug/examples/release_delivery reap "${reap_args[@]}"
+
+      - name: Retain cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloud-reaper-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ferrum-cloud-reaper/
+            !${{ runner.temp }}/ferrum-cloud-reaper/**/private/**
+          if-no-files-found: warn
+          retention-days: 14

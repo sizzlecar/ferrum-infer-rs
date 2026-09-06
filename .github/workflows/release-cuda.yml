@@ -1,6 +1,32 @@
 name: Stage CUDA sm89 release asset
 
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      release_candidate_sha:
+        description: Exact release-candidate commit to build
+        required: true
+        type: string
+      release_candidate_tag:
+        description: Annotated RC tag whose peeled commit is release_candidate_sha
+        required: true
+        type: string
+      staging_label:
+        description: Immutable artifact label; this does not create a tag or release
+        required: true
+        type: string
+      publish_release:
+        description: Safety lock; production staging requires false
+        required: true
+        type: boolean
+    outputs:
+      cuda_asset_id:
+        description: Immutable uploaded artifact ID
+        value: ${{ jobs.linux-x86_64-cuda-sm89.outputs.asset_id }}
   workflow_dispatch:
     inputs:
       version:
@@ -50,6 +76,8 @@ env:
 
 jobs:
   linux-x86_64-cuda-sm89:
+    outputs:
+      asset_id: ${{ steps.asset_id.outputs.artifact-id }}
     name: Stage Linux x86_64 CUDA sm89
     runs-on: ubuntu-22.04
     timeout-minutes: 120
@@ -194,6 +222,7 @@ jobs:
           fi
 
       - name: Upload staged CUDA asset
+        id: asset_id
         uses: actions/upload-artifact@v4
         with:
           name: ferrum-linux-x86_64-cuda-sm89-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}

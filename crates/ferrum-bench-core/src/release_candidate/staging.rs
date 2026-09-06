@@ -69,6 +69,23 @@ fn release_version(value: &str) -> Result<Version, String> {
     Ok(version)
 }
 
+/// A new formal candidate must advance its previous formal release. Callers
+/// supply the preceding release (excluding a candidate's own tag on retries).
+/// This ordering check neither establishes release provenance nor code quality.
+pub fn validate_version_progression(previous: &str, target: &str) -> Result<(), String> {
+    let previous_version = release_version(previous)?;
+    let target_version = release_version(target)?;
+    if previous_version.to_string() != previous || target_version.to_string() != target {
+        return Err("release progression requires canonical formal semantic versions".into());
+    }
+    if target_version <= previous_version {
+        return Err(format!(
+            "target release {target} must be newer than previous formal release {previous}"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate identity syntax and the RC/version relationship, not code quality.
 pub fn validate_candidate(input: &CandidateInput) -> Result<(), String> {
     let version = release_version(&input.version)?;
