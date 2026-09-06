@@ -283,9 +283,11 @@ pub(super) fn validate_release_base(
             latest = Some((version, reference.to_owned(), commit));
         }
     }
-    let (_, reference, commit) = latest.ok_or("no previous reachable formal release tag found; fetch release tags before release planning")?;
+    let (version, reference, commit) = latest.ok_or("no previous reachable formal release tag found; fetch release tags before release planning")?;
     if base != commit {
         return Err(format!("release base must resolve to latest reachable formal tag {reference}; a shorter diff can omit earlier release changes"));
     }
-    Ok(reference)
+    // Git lookup uses the unambiguous full ref. Delivery and GitHub's release
+    // API consume the tag name; the exact commit remains separate provenance.
+    Ok(format!("v{version}"))
 }

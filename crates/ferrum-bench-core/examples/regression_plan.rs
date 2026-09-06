@@ -560,7 +560,7 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         assert!(scope::validate_release_base(&repo.0, &only_last_pr, &candidate).is_err());
         assert_eq!(
             scope::validate_release_base(&repo.0, &base, &candidate).unwrap(),
-            "refs/tags/v1.2.3"
+            "v1.2.3"
         );
         let manifest = repo.0.join("Cargo.toml");
         let mut text = fs::read_to_string(&manifest).unwrap();
@@ -599,11 +599,78 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         repo.git(&["tag", "ferrum-native-cuda12.4-sm89-v6"]);
         assert_eq!(
             scope::validate_release_base(&repo.0, &previous, &candidate).unwrap(),
-            "refs/tags/v1.3.0"
+            "v1.3.0"
         );
         assert!(scope::validate_release_base(&repo.0, &older, &candidate).is_err());
         assert!(scope::validate_release_base(&repo.0, &candidate, &candidate).is_err());
     }
+
+    #[test]
+    fn generated_release_plan_exposes_a_formal_tag_name_for_delivery_consumers() {
+        use ferrum_bench_core::release_candidate::staging::validate_version_progression;
+        use ferrum_bench_core::release_regression::{Backend, ExecutionTarget, ModelProfile};
+        use ferrum_types::{ModelOutputProtocol, ModelReasoningProtocol};
+        let repo = GitFixture::new();
+        workspace_fixture(&repo);
+        let base = repo.commit();
+        repo.git(&["tag", "-a", "v1.2.3", "-m", "formal release"]);
+        bump_fixture(&repo);
+        let candidate = repo.commit();
+        // A branch with the same short name must not change the verified base.
+        repo.git(&["branch", "v1.2.3", &candidate]);
+        let profile = ModelProfile {
+            id: "quick-start".into(),
+            model: "fixture".into(),
+            target: ExecutionTarget {
+                architecture: "dense".into(),
+                protocol: ModelOutputProtocol::Text,
+                precision: "f32".into(),
+                backend: Backend::Cpu,
+                execution_path: "production-plan-runtime".into(),
+            },
+            available: true,
+            estimate: None,
+            reasoning_protocol: ModelReasoningProtocol::None,
+        };
+        let targets =
+            [Backend::Cpu, Backend::Metal, Backend::Cuda].map(|backend| ExecutionTarget {
+                backend,
+                ..profile.target.clone()
+            });
+        let catalog = repo.0.join("catalog.json");
+        fs::write(
+            &catalog,
+            serde_json::to_vec(&json!({
+                "profiles": [profile], "quick_start_profile_ids": ["quick-start"],
+                "required_targets": targets
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let output = repo.0.join("release-plan.json");
+        run(Args {
+            catalog,
+            base: "refs/tags/v1.2.3".into(),
+            candidate: candidate.clone(),
+            stage: "release".into(),
+            repo: repo.0.clone(),
+            output: Some(output.clone()),
+            summary: None,
+        })
+        .unwrap();
+        let document: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        let tag = document["provenance"]["release_base_tag"].as_str().unwrap();
+        assert_eq!(tag, "v1.2.3");
+        // Consume the generated document using the delivery version contract.
+        validate_version_progression(tag.strip_prefix('v').unwrap(), "1.2.4").unwrap();
+        assert_eq!(
+            resolve_revision(&repo.0, &format!("refs/tags/{tag}")).unwrap(),
+            base
+        );
+        assert_eq!(document["provenance"]["base"], base);
+        assert_eq!(document["provenance"]["candidate"], candidate);
+    }
+
     #[test]
     fn content_scope_uses_committed_rust_and_preserves_actual_metal_changes() {
         use ferrum_bench_core::release_regression::ChangeArea;
