@@ -17,6 +17,14 @@ use std::sync::{Arc, OnceLock};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
+mod selection;
+
+#[derive(Clone, Copy)]
+enum DownloadLayout {
+    Repository,
+    RootSafetensors,
+}
+
 /// HuggingFace API base URL (override with `HF_ENDPOINT`, e.g.
 /// `https://hf-mirror.com` — same convention as huggingface_hub).
 const HF_API_URL: &str = "https://huggingface.co";
@@ -279,8 +287,31 @@ impl HfDownloader {
         Ok(snapshot_dir)
     }
 
-    /// Download a model from HuggingFace
+    /// Download a root SafeTensors checkpoint and its companion assets.
+    /// A root index selects its referenced shards when no canonical single-file
+    /// checkpoint is present. Other layouts retain repository selection.
+    /// Composite models that require separate component weights use [`Self::download`].
+    pub async fn download_safetensors(
+        &self,
+        model_id: &str,
+        revision: Option<&str>,
+    ) -> Result<PathBuf> {
+        self.download_with_layout(model_id, revision, DownloadLayout::RootSafetensors)
+            .await
+    }
+
+    /// Download model-related files, including weights for auxiliary components.
     pub async fn download(&self, model_id: &str, revision: Option<&str>) -> Result<PathBuf> {
+        self.download_with_layout(model_id, revision, DownloadLayout::Repository)
+            .await
+    }
+
+    async fn download_with_layout(
+        &self,
+        model_id: &str,
+        revision: Option<&str>,
+        layout: DownloadLayout,
+    ) -> Result<PathBuf> {
         let revision = revision.unwrap_or("main");
 
         // Create cache directory structure: hub/models--org--name/snapshots/revision/
@@ -294,58 +325,58 @@ impl HfDownloader {
         fs::create_dir_all(&blobs_dir).await?;
         fs::create_dir_all(&refs_dir).await?;
 
-        // Get file list from HuggingFace API
-        let files = self.list_files(model_id, revision).await?;
+        // Resolve once so the inventory, index and payloads belong to one snapshot.
+        let commit_sha = self.get_commit_sha(model_id, revision).await?;
+        if commit_sha.len() != 40 || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FerrumError::model(
+                "HuggingFace returned an invalid commit SHA",
+            ));
+        }
+        let files = self.list_files(model_id, &commit_sha).await?;
+        let snapshot_dir = snapshots_dir.join(&commit_sha);
+        fs::create_dir_all(&snapshot_dir).await?;
 
-        // Determine which files to download (only files, not directories).
-        // Download all model-related files: weights (.safetensors, .pt, .bin, .onnx),
-        // configs (.json, .yaml), tokenizers, and other assets.
-        let files_to_download: Vec<_> = files
-            .iter()
-            .filter(|f| {
-                if f.file_type.as_deref() == Some("directory") {
-                    return false;
-                }
-                let path = f.path.as_str();
-                // Skip large non-essential files
-                if path.ends_with(".md") || path.starts_with(".git") {
-                    return false;
-                }
-                // Include all model weight formats
-                path.ends_with(".safetensors")
-                    || path.ends_with(".pt")
-                    || path.ends_with(".bin")
-                    || path.ends_with(".onnx")
-                    // Config and tokenizer files
-                    || path.ends_with(".json")
-                    || path.ends_with(".yaml")
-                    || path.ends_with(".yml")
-                    || path.ends_with(".jinja") // standalone chat templates
-                    || path.ends_with(".model")  // sentencepiece tokenizer
-                    || path.ends_with(".txt")    // vocab.txt
-                    // Image/audio assets (small)
-                    || path.ends_with(".png")
-                    || path.ends_with(".wav")
-            })
-            .collect();
-
+        let index_file = match layout {
+            DownloadLayout::Repository => None,
+            DownloadLayout::RootSafetensors => selection::authoritative_index(&files),
+        };
+        let index = if let Some(file) = index_file {
+            self.download_file_concurrent(
+                model_id,
+                &commit_sha,
+                &file.path,
+                file.size.unwrap_or(0),
+                &blobs_dir,
+                &snapshot_dir,
+                None,
+            )
+            .await?;
+            Some(fs::read(snapshot_dir.join(&file.path)).await?)
+        } else {
+            None
+        };
+        let mut files_to_download = match layout {
+            DownloadLayout::Repository => selection::repository_files(&files),
+            DownloadLayout::RootSafetensors => selection::selected_files(&files, index.as_deref())?,
+        };
         if files_to_download.is_empty() {
             return Err(FerrumError::model("No model files found in repository"));
         }
-
-        // Get commit SHA for snapshot directory
-        let commit_sha = self.get_commit_sha(model_id, revision).await?;
-        let snapshot_dir = snapshots_dir.join(&commit_sha);
-        fs::create_dir_all(&snapshot_dir).await?;
 
         // Calculate total size
         let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();
         let file_count = files_to_download.len();
         println!(
-            "📦 Downloading {} files ({:.2} GB)",
+            "📦 Selected {} files ({:.2} GiB total)",
             file_count,
             total_size as f64 / 1_073_741_824.0
         );
+
+        // The index already passed through the normal cache/transfer path.
+        if index.is_some() {
+            files_to_download.retain(|file| file.path != selection::SAFETENSORS_INDEX);
+        }
+        let file_count = files_to_download.len();
 
         // Use concurrent downloads for multiple files (up to 3 concurrent)
         let concurrency = std::cmp::min(3, file_count);
@@ -360,7 +391,7 @@ impl HfDownloader {
                 let downloader = self_arc.clone();
                 let mp = mp.clone();
                 let model_id = model_id.to_string();
-                let revision = revision.to_string();
+                let revision = commit_sha.clone();
                 let filename = file_info.path.clone();
                 let size = file_info.size.unwrap_or(0);
                 let blobs = blobs_dir.clone();
@@ -393,7 +424,7 @@ impl HfDownloader {
             for file_info in &files_to_download {
                 self.download_file_concurrent(
                     model_id,
-                    revision,
+                    &commit_sha,
                     &file_info.path,
                     file_info.size.unwrap_or(0),
                     &blobs_dir,

@@ -1130,6 +1130,12 @@ pub enum DownloadPolicy {
     NoDownload,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DownloadArtifacts {
+    Repository,
+    RootSafetensors,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProductSourceComposition {
     ResolveColocated,
@@ -1260,6 +1266,7 @@ pub async fn resolve_model_source(
         download,
         autosize,
         ProductSourceComposition::ResolveColocated,
+        DownloadArtifacts::Repository,
     )
     .await
 }
@@ -1270,6 +1277,7 @@ async fn resolve_model_source_internal(
     download: DownloadPolicy,
     autosize: Option<(AutoSizeProfile, f32)>,
     source_composition: ProductSourceComposition,
+    download_artifacts: DownloadArtifacts,
 ) -> Result<Resolved> {
     let defer_colocated_product_sources =
         source_composition == ProductSourceComposition::DeferUntilExplicitSemantic;
@@ -1450,7 +1458,12 @@ async fn resolve_model_source_internal(
         .or_else(|_| std::env::var("HUGGING_FACE_HUB_TOKEN"))
         .ok();
     let downloader = ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
-    let snapshot_path = downloader.download(&model_id, None).await?;
+    let snapshot_path = match download_artifacts {
+        DownloadArtifacts::Repository => downloader.download(&model_id, None).await?,
+        DownloadArtifacts::RootSafetensors => {
+            downloader.download_safetensors(&model_id, None).await?
+        }
+    };
     let format = detect_format(&snapshot_path);
     if format == ModelFormat::Unknown {
         return Err(FerrumError::model(
@@ -1485,6 +1498,8 @@ async fn resolve_model_source_internal(
 /// semantic/tokenizer roles. This keeps the positional MODEL as the sole
 /// weight source while allowing quantized checkpoints to consume canonical
 /// base-model semantics without a model-name mapping or hidden environment.
+/// Fresh SafeTensors downloads for run/serve select the root checkpoint's shards;
+/// the generic resolver retains all model artifacts for callers such as pull.
 pub async fn resolve_model_source_with_product_sources(
     model: &str,
     cache_dir: &Path,
@@ -1502,6 +1517,7 @@ pub async fn resolve_model_source_with_product_sources(
         } else {
             ProductSourceComposition::ResolveColocated
         },
+        DownloadArtifacts::RootSafetensors,
     )
     .await?;
     resolved.requested_model = model.to_owned();
