@@ -105,6 +105,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          overwrite: true
           name: docs-links
           path: ${{ runner.temp }}/docs-links.json
           retention-days: 7
@@ -188,6 +189,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          overwrite: true
           name: regression-plan
           if-no-files-found: error
           path: |
@@ -215,6 +217,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          overwrite: true
           name: contract-checks
           if-no-files-found: error
           path: |
@@ -433,6 +436,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
+          overwrite: true
           name: backend-numerics-${{ matrix.backend }}
           if-no-files-found: error
           path: ${{ runner.temp }}/backend-numerics/*.json

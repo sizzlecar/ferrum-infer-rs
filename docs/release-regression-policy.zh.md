@@ -162,21 +162,3 @@ checksum 用于识别资产，不能证明行为正确。
 - SGLang 登记测试资源和预计耗时，按变更与耗时安排任务：[测试注册](https://github.com/sgl-project/sglang/blob/f5819b09bf6eb58c3f91381274e8fec994e4746a/python/sglang/test/ci/ci_register.py#L42)、[任务选择](https://github.com/sgl-project/sglang/blob/f5819b09bf6eb58c3f91381274e8fec994e4746a/.github/workflows/_pr-test-check-changes.yml#L69)。
 
 这些来源说明机制可借鉴，不提供任意抽样比例的正确率保证，也不表示 Ferrum 已实现同样的覆盖。
-
-
-## 自动执行与发布入口
-
-日常 PR 的 CPU CI 会从 Cargo 的实际测试产物中找到已登记的边界用例，
-确认测试仍存在，再执行断言；删除测试、遗漏执行、断言失败、超时都会失败。
-真实 GPU lane 在局域网 Mac 和 4050 上执行 RMSNorm、GEMM、SiLU Mul 的
-对齐及尾部数值用例。编译通过、CPU 参考值或跳过不能替代 GPU 实际输出。
-该范围不代表量化矩阵乘、Attention、KV 等算子已全部覆盖。
-
-正式版使用 **Prepare formal release** 工作流输入版本号，自动生成协调版本
-PR，通过必需 CI 后合并。版本合入主分支后，**Deliver formal release**
-生成完整发布差异的计划，先阻断覆盖缺口，再构建候选包、执行选定模型回归、
-核验全部证据并发布 Cargo、GitHub Release 和 Homebrew。最后实际安装公开
-Cargo 包和 Metal/CUDA Homebrew 公式，执行启动验证，全部成功才算交付完成。
-
-流程和失败恢复边界见[自动发版说明](release-delivery.md)。初次真实发布演练
-仍需成功完成；不能把工作流文件、计划报告或局部测试通过当作正式发版已完成。
