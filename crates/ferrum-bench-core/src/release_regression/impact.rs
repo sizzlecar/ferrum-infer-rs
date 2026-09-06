@@ -120,6 +120,25 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "crate build/dependency change: conservatively include all components",
         ));
     }
+    // These modules are only connected to the independent staged-binary test
+    // executable; do not infer the same for other CLI tests or examples.
+    if component == "ferrum-cli"
+        && matches!(
+            relative,
+            "examples/model_regression.rs"
+                | "examples/model_regression/cases.rs"
+                | "examples/model_regression/process.rs"
+                | "examples/model_regression/protocol.rs"
+        )
+    {
+        return Some((
+            vec![Validation],
+            "independent staged-binary regression runner and its declared helper modules",
+        ));
+    }
+    if component == "ferrum-bench-core" {
+        return classify_bench_core(relative);
+    }
     let (areas, reason) = match component {
         "ferrum-types" | "ferrum-interfaces" => (
             ALL_AREAS.to_vec(),
@@ -178,13 +197,52 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             ALL_AREAS.to_vec(),
             "product entrypoints share source resolution, configuration and execution",
         ),
-        "ferrum-bench-core" | "ferrum-testkit" => (
+        "ferrum-testkit" => (
             vec![Validation],
             "validation oracles, workload selection and measurement infrastructure",
         ),
         _ => return None,
     };
     Some((areas, reason))
+}
+
+fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
+    use ChangeArea::*;
+    if matches!(
+        relative,
+        "src/lib.rs" | "src/jsonl_journal.rs" | "src/profile.rs" | "src/trace.rs"
+    ) {
+        // lib.rs parses headers on the real Chat endpoint. The journal/profile/
+        // trace modules are called by engine lifecycle and backend execution,
+        // as well as benchmark producers; crate naming cannot erase that reach.
+        return Some((
+            vec![Observability, Validation],
+            "shared production request metadata, profile sinks and runtime journals",
+        ));
+    }
+    if matches!(
+        relative,
+        "src/arrivals.rs"
+            | "src/decode_isolation.rs"
+            | "src/env.rs"
+            | "src/report.rs"
+            | "src/stats.rs"
+            | "examples/regression_plan.rs"
+            | "examples/regression_plan/scope.rs"
+            | "examples/release_candidate.rs"
+            | "tests/release_staging_workflows.rs"
+    ) || relative.starts_with("src/release_regression/")
+        || relative.starts_with("src/release_candidate/")
+        || relative.starts_with("examples/release_candidate/")
+    {
+        return Some((
+            vec![Validation],
+            "declared benchmark measurement, regression planning and candidate preparation tools",
+        ));
+    }
+    // New modules need their callers reviewed. They may enter production just
+    // as the existing journal and profile modules do.
+    None
 }
 
 fn valid_relative_path(path: &str) -> bool {
@@ -288,6 +346,73 @@ mod tests {
         ]);
         assert!(validation.areas.contains(&ChangeArea::Validation));
         assert!(validation.areas.contains(&ChangeArea::Build));
+    }
+
+    #[test]
+    fn production_headers_and_sinks_retain_observability_without_inferred_numerics() {
+        for path in [
+            "crates/ferrum-bench-core/src/lib.rs",
+            "crates/ferrum-bench-core/src/jsonl_journal.rs",
+            "crates/ferrum-bench-core/src/profile.rs",
+            "crates/ferrum-bench-core/src/trace.rs",
+        ] {
+            let impact = analyze_paths([path]);
+            assert!(impact.unknown_paths.is_empty());
+            for area in ALL_AREAS {
+                assert_eq!(
+                    impact.areas.contains(area),
+                    matches!(area, ChangeArea::Observability | ChangeArea::Validation),
+                    "unexpected production observability scope for {path}: {area:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn known_regression_tools_do_not_inherit_inference_component_scope() {
+        for path in [
+            "crates/ferrum-cli/examples/model_regression.rs",
+            "crates/ferrum-cli/examples/model_regression/cases.rs",
+            "crates/ferrum-cli/examples/model_regression/process.rs",
+            "crates/ferrum-cli/examples/model_regression/protocol.rs",
+            "crates/ferrum-bench-core/src/release_regression/selection.rs",
+            "crates/ferrum-bench-core/src/release_candidate/staging.rs",
+            "crates/ferrum-bench-core/examples/regression_plan.rs",
+            "crates/ferrum-bench-core/examples/release_candidate/workspace.rs",
+            "crates/ferrum-bench-core/src/stats.rs",
+        ] {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, [ChangeArea::Validation], "{path}");
+            assert!(impact.unknown_paths.is_empty());
+        }
+        let combined = analyze_paths([
+            "crates/ferrum-cli/examples/model_regression/protocol.rs",
+            "crates/ferrum-bench-core/src/jsonl_journal.rs",
+        ]);
+        assert!(combined.areas.contains(&ChangeArea::Observability));
+        assert!(combined.areas.contains(&ChangeArea::Validation));
+        assert!(!combined.areas.contains(&ChangeArea::Kernel));
+    }
+
+    #[test]
+    fn unreviewed_modules_and_other_examples_are_not_assumed_validation_only() {
+        for path in [
+            "crates/ferrum-bench-core/src/new_runtime_sink.rs",
+            "crates/ferrum-bench-core/examples/new_runner.rs",
+            "crates/ferrum-bench-core/tests/new_shared_fixture.rs",
+        ] {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.unknown_paths, [path]);
+            assert_eq!(impact.areas, ALL_AREAS);
+        }
+        for path in [
+            "crates/ferrum-cli/src/commands/run.rs",
+            "crates/ferrum-cli/examples/new_runtime.rs",
+            "crates/ferrum-cli/examples/model_regression/new_helper.rs",
+            "crates/ferrum-cli/tests/new_fixture.rs",
+        ] {
+            assert_eq!(analyze_paths([path]).areas, ALL_AREAS, "{path}");
+        }
     }
 
     #[test]

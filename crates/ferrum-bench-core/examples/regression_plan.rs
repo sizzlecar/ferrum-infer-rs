@@ -1,6 +1,11 @@
 //! Generate a reviewable regression plan from a complete Git diff and product catalog.
 //! Planning does not execute checks or authorize a release.
-use ferrum_bench_core::release_regression::{analyze_paths, plan, PlanInput};
+#[path = "regression_plan/scope.rs"]
+mod scope;
+
+#[cfg(test)]
+use ferrum_bench_core::release_regression::analyze_paths;
+use ferrum_bench_core::release_regression::{plan, Impact, PlanInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -13,7 +18,7 @@ use std::process::{Command, ExitCode};
 const USAGE: &str = "regression_plan --catalog PATH --base REV [--candidate REV] \
     [--stage pull_request|release|nightly] [--repo PATH] [--output PATH] [--summary PATH]\n\
     Uses git diff --no-renames to include both sides of renames.\n\
-    Release base must be the previous formal release. Output is a plan, not passing evidence.\n\
+    Release base must resolve to the latest reachable formal vMAJOR.MINOR.PATCH tag. Output is a plan, not passing evidence.\n\
     Missing coverage is recorded in gaps; it never authorizes promotion.";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -148,7 +153,7 @@ fn changed_paths_between(repo: &Path, base: &str, candidate: &str) -> Result<Vec
     )?)
 }
 
-fn plan_input(catalog: Value, stage: &str, paths: &[String]) -> Result<PlanInput, String> {
+fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, String> {
     let mut input = catalog
         .as_object()
         .cloned()
@@ -164,7 +169,7 @@ fn plan_input(catalog: Value, stage: &str, paths: &[String]) -> Result<PlanInput
     input.insert("stage".into(), json!(stage));
     input.insert(
         "impact".into(),
-        serde_json::to_value(analyze_paths(paths)).map_err(|error| error.to_string())?,
+        serde_json::to_value(impact).map_err(|error| error.to_string())?,
     );
     serde_json::from_value(Value::Object(input))
         .map_err(|error| format!("invalid product catalog: {error}"))
@@ -196,18 +201,25 @@ fn render_summary(document: &Value) -> String {
 fn run(args: Args) -> Result<(), String> {
     let base = resolve_revision(&args.repo, &args.base)?;
     let candidate = resolve_revision(&args.repo, &args.candidate)?;
+    let release_base_tag = if args.stage == "release" {
+        Some(scope::validate_release_base(&args.repo, &base, &candidate)?)
+    } else {
+        None
+    };
     let paths = changed_paths_between(&args.repo, &base, &candidate)?;
+    let analysis = scope::analyze(&args.repo, &base, &candidate, &paths);
     let catalog_bytes = fs::read(&args.catalog)
         .map_err(|error| format!("read {}: {error}", args.catalog.display()))?;
     let catalog = serde_json::from_slice(&catalog_bytes)
         .map_err(|error| format!("read product catalog JSON: {error}"))?;
-    let input = plan_input(catalog, &args.stage, &paths)?;
+    let input = plan_input(catalog, &args.stage, analysis.impact)?;
     let plan = plan(&input)?;
     let document = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": args.stage,
         "provenance": {"base": base, "candidate": candidate, "changed_paths": paths,
-            "catalog_sha256": format!("{:x}", Sha256::digest(&catalog_bytes))},
+            "catalog_sha256": format!("{:x}", Sha256::digest(&catalog_bytes)),
+            "release_base_tag": release_base_tag, "version_refinement": analysis.version_refinement},
         "plan": plan,
     });
     let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
@@ -303,7 +315,10 @@ mod tests {
             let mut catalog =
                 json!({"profiles": [], "quick_start_profile_ids": [], "required_targets": []});
             catalog[field] = json!(true);
-            assert!(plan_input(catalog, "release", &[]).is_err(), "{field}");
+            assert!(
+                plan_input(catalog, "release", analyze_paths(Vec::<String>::new())).is_err(),
+                "{field}"
+            );
         }
     }
 
@@ -378,5 +393,149 @@ mod tests {
         assert!(changed_paths_between(&repo.0, &candidate, &candidate)
             .unwrap()
             .is_empty());
+    }
+
+    fn workspace_fixture(repo: &GitFixture) {
+        fs::create_dir_all(repo.0.join("crates/ferrum-engine/src")).unwrap();
+        fs::write(
+            repo.0.join("Cargo.toml"),
+            r#"[workspace]
+members = ["crates/ferrum-engine"]
+resolver = "2"
+[workspace.package]
+version = "1.2.3"
+[workspace.dependencies]
+ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            repo.0.join("crates/ferrum-engine/Cargo.toml"),
+            "[package]\nname = \"ferrum-engine\"\nversion.workspace = true\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.0.join("crates/ferrum-engine/src/lib.rs"),
+            "pub fn forward() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.0.join("Cargo.lock"),
+            "version = 4\n[[package]]\nname = \"ferrum-engine\"\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
+    }
+
+    fn bump_fixture(repo: &GitFixture) {
+        use ferrum_bench_core::release_candidate::version::{plan_version_update, MemberManifest};
+        let members = [MemberManifest {
+            package_name: "ferrum-engine".into(),
+            manifest_path: "crates/ferrum-engine/Cargo.toml".into(),
+            text: fs::read_to_string(repo.0.join("crates/ferrum-engine/Cargo.toml")).unwrap(),
+        }];
+        let plan = plan_version_update(
+            &fs::read_to_string(repo.0.join("Cargo.toml")).unwrap(),
+            &members,
+            &fs::read_to_string(repo.0.join("Cargo.lock")).unwrap(),
+            "1.2.4",
+        )
+        .unwrap();
+        fs::write(repo.0.join("Cargo.toml"), plan.workspace_manifest).unwrap();
+        fs::write(repo.0.join("Cargo.lock"), plan.lockfile).unwrap();
+        for member in plan.members {
+            fs::write(repo.0.join(member.manifest_path), member.text).unwrap();
+        }
+    }
+
+    #[test]
+    fn version_refinement_reads_git_content_and_retains_build_validation() {
+        use ferrum_bench_core::release_regression::ChangeArea;
+        let repo = GitFixture::new();
+        workspace_fixture(&repo);
+        let base = repo.commit();
+        bump_fixture(&repo);
+        let candidate = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &candidate).unwrap();
+        // Current checkout edits must not change the declared Git comparison.
+        fs::write(repo.0.join("Cargo.toml"), "uncommitted unrelated text").unwrap();
+        let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
+        assert_eq!(analysis.version_refinement["applied"], true);
+        assert!(analysis.impact.areas.contains(&ChangeArea::Build));
+        for unrelated in [
+            ChangeArea::Kernel,
+            ChangeArea::Architecture,
+            ChangeArea::Termination,
+        ] {
+            assert!(!analysis.impact.areas.contains(&unrelated));
+        }
+    }
+
+    #[test]
+    fn version_refinement_cannot_hide_earlier_runtime_changes_or_added_build_flags() {
+        use ferrum_bench_core::release_regression::ChangeArea;
+        let repo = GitFixture::new();
+        workspace_fixture(&repo);
+        let base = repo.commit();
+        repo.git(&["tag", "-a", "v1.2.3", "-m", "formal release"]);
+        fs::write(
+            repo.0.join("crates/ferrum-engine/src/lib.rs"),
+            "pub fn forward() { panic!(\"regression\"); }\n",
+        )
+        .unwrap();
+        let only_last_pr = repo.commit();
+        repo.git(&["tag", "v1.2.4-rc.1"]);
+        bump_fixture(&repo);
+        let candidate = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &candidate).unwrap();
+        let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
+        assert_eq!(analysis.version_refinement["applied"], true);
+        assert!(analysis.impact.areas.contains(&ChangeArea::Kernel));
+        assert!(analysis.impact.areas.contains(&ChangeArea::Termination));
+        assert!(scope::validate_release_base(&repo.0, &only_last_pr, &candidate).is_err());
+        assert_eq!(
+            scope::validate_release_base(&repo.0, &base, &candidate).unwrap(),
+            "refs/tags/v1.2.3"
+        );
+        let manifest = repo.0.join("Cargo.toml");
+        let mut text = fs::read_to_string(&manifest).unwrap();
+        text.push_str("\n[profile.release]\nopt-level = 1\n");
+        fs::write(manifest, text).unwrap();
+        let changed_flags = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &changed_flags).unwrap();
+        let analysis = scope::analyze(&repo.0, &base, &changed_flags, &paths);
+        assert_eq!(analysis.version_refinement["applied"], false);
+        let root = analysis
+            .impact
+            .paths
+            .iter()
+            .find(|entry| entry.path == "Cargo.toml")
+            .unwrap();
+        assert!(root.areas.contains(&ChangeArea::Kernel));
+        assert!(root.areas.contains(&ChangeArea::Architecture));
+    }
+
+    #[test]
+    fn release_base_uses_reachable_formal_tags_and_rejects_truncated_intervals() {
+        let repo = GitFixture::new();
+        fs::write(repo.0.join("source"), "first release").unwrap();
+        let older = repo.commit();
+        repo.git(&["tag", "v1.2.3"]);
+        fs::write(repo.0.join("source"), "next release").unwrap();
+        let previous = repo.commit();
+        repo.git(&["tag", "v1.3.0"]);
+        fs::write(repo.0.join("source"), "candidate").unwrap();
+        let candidate = repo.commit();
+        repo.git(&["tag", "v1.4.0-rc.1"]);
+        // A future/unreachable tag and component asset tags are not the base.
+        fs::write(repo.0.join("future"), "separate future commit").unwrap();
+        repo.commit();
+        repo.git(&["tag", "v99.0.0"]);
+        repo.git(&["tag", "ferrum-native-cuda12.4-sm89-v6"]);
+        assert_eq!(
+            scope::validate_release_base(&repo.0, &previous, &candidate).unwrap(),
+            "refs/tags/v1.3.0"
+        );
+        assert!(scope::validate_release_base(&repo.0, &older, &candidate).is_err());
+        assert!(scope::validate_release_base(&repo.0, &candidate, &candidate).is_err());
     }
 }

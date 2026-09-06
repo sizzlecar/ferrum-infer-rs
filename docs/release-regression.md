@@ -24,9 +24,29 @@ cargo run --locked -p ferrum-bench-core --example regression_plan -- \
 ```
 
 Replace `--base` with the preceding formal release for the candidate being
-validated. `--stage pull_request` uses the PR base instead; `--stage nightly`
-plans periodic inventory coverage. Output files must be new. Git endpoints and
-the catalog digest record the planning inputs; neither proves correctness.
+validated. For `--stage release`, the CLI requires the highest semantic version
+among reachable `vMAJOR.MINOR.PATCH` tags, excluding tags on the candidate itself.
+Fetch the relevant complete history and tags first. This follows the repository's
+formal-tag convention; it does not query the GitHub Release API or prove a tag
+was publicly released. `--stage pull_request` uses the PR base instead;
+`--stage nightly` plans periodic inventory coverage without the formal-tag check.
+Output files must be new. Git endpoints and the catalog digest identify planning
+inputs; neither proves correctness.
+
+The CLI compares Cargo inputs from those Git revisions. It narrows only the
+manifest/lock changes that exactly match a coordinated version update produced
+by the release preparer. Those paths retain build scope and release baseline
+checks. Other paths in the same diff keep contributing their impact. Extra
+dependency/build settings, unsupported membership or incomplete snapshots retain
+the conservative classification, with an explanation. The path-only library API
+does not perform this refinement.
+
+The report envelope is now `schema_version: 2`, with `release_base_tag` and
+`version_refinement` in provenance. Architecture and protocol obligation scopes
+also carry `execution_path`; consumers must preserve that dimension. The
+[scope analysis](../crates/ferrum-bench-core/examples/regression_plan/scope.rs) and
+[version recognizer](../crates/ferrum-bench-core/src/release_regression/version_change.rs)
+implement these rules.
 
 Code PR CI generates this plan after compilation and before the workspace tests
 inside its existing CPU job, then uploads it with a job summary. Documentation-only
@@ -45,13 +65,25 @@ is no established executable binding or measurement. The remaining work is to
 connect actual check execution, validate its observations, and enforce that
 verification at the publication action; report generation alone does not do so.
 
-The first selector reserves each Quick Start profile, then reuses representatives
-for compatible obligations. Equal coverage is ordered by known estimated duration,
-then by price when currencies match, then by stable profile identifier. It does
-not infer currency conversion, cache availability, parallel critical paths or an
-optimal monetary schedule. Unknown estimates remain listed. Reported phase totals
-are sums of selected profile estimates, not measured end-to-end release latency;
-GPU charges use declared billable duration separately from preparation time.
+The selector reserves each Quick Start profile, then adds representatives that
+cover remaining obligations. Equal coverage is ordered by known estimated duration,
+then by price when currencies match, then by stable profile identifier. Architecture
+sampling retains architecture, protocol and execution path; protocol sampling also
+retains backend. Different execution paths cannot represent one another.
+
+Before assigning model obligations, the selector adds an available, scope-compatible
+profile with a complete checker binding if the initial selection lacks one and
+such a profile exists. It then assigns each obligation once, preferring a complete
+binding before the estimate ordering. Missing bindings remain gaps. A shared check
+is not assigned again to every compatible selected model. Quick Start obligations
+remain bound to their individual profiles and cannot be filled by another profile.
+The current catalog's `checks: []` means these checker assignments are still gaps, not completed executions.
+
+The selector does not infer currency conversion, cache availability, parallel
+critical paths or an optimal monetary schedule. Unknown estimates remain listed.
+Reported phase totals are sums of selected profile estimates, not measured
+end-to-end release latency; GPU charges use declared billable duration separately
+from preparation time. Neither planning nor assignment rents hardware or publishes.
 
 ## Prepare the candidate
 
