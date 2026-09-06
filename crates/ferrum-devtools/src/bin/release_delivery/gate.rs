@@ -26,6 +26,9 @@ use std::{
 };
 use tokio::process::Command;
 
+#[path = "ci_evidence.rs"]
+mod ci_evidence;
+
 #[derive(Debug, Args)]
 pub struct GateArgs {
     #[arg(long)]
@@ -147,7 +150,19 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     let contracts: ContractReport = read(&args.contracts)?;
     verify_contract_report(&contract_groups(), &contracts)
         .map_err(|issues| format!("CPU contract evidence: {}", issues.join("; ")))?;
-    verify_obligations(&plan)?;
+    verify_ci(&args.repo, args.ci_run_id, &candidate).await?;
+    let ci_evidence = ci_evidence::load(
+        &args.repo,
+        args.ci_run_id,
+        &candidate,
+        &plan,
+        &text(&document["provenance"], "release_base_tag")?,
+        &args.version,
+        &distributions[&Backend::Metal].binary_sha256,
+    )
+    .await?;
+    verify_obligations_with(&plan, &ci_evidence)?;
+    // A rerun that began while artifacts were inspected must not reuse old Quality.
     verify_ci(&args.repo, args.ci_run_id, &candidate).await?;
     let notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
     if notes.trim().is_empty() {
@@ -560,7 +575,11 @@ fn descriptors_cover(obligation: &Obligation, descriptors: &[CheckDescriptor]) -
         .iter()
         .all(|entry| covered.contains(entry))
 }
+#[cfg(test)]
 fn verify_obligations(plan: &Plan) -> Result<(), String> {
+    verify_obligations_with(plan, &ci_evidence::CiEvidence::default())
+}
+fn verify_obligations_with(plan: &Plan, evidence: &ci_evidence::CiEvidence) -> Result<(), String> {
     let contracts = contract_check_descriptors();
     let models = model_check_descriptors();
     let distribution = distribution_check_descriptors();
@@ -581,7 +600,9 @@ fn verify_obligations(plan: &Plan) -> Result<(), String> {
                     && matches!(obligation.scope, ObligationScope::Backend { .. })
                     && descriptors_cover(obligation, &distribution)
             }
-            EvidenceLayer::BackendNumerics | EvidenceLayer::Performance => false,
+            EvidenceLayer::BackendNumerics | EvidenceLayer::Performance => {
+                evidence.covers(index, obligation)
+            }
         };
         if !covered {
             return Err(format!(

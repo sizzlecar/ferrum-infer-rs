@@ -35,6 +35,7 @@ pub mod fused_add_rms_norm;
 pub mod gemm;
 pub mod kv_cache_append;
 pub mod marlin_matmul; // stub — see file docs
+pub mod metal_context;
 pub mod paged_varlen_attn; // stub — see file docs
 pub mod qk_norm_rope;
 pub mod required;
@@ -49,42 +50,7 @@ pub const NMSE_FP32_TOL: f64 = 1e-7;
 /// fp16 storage / Metal accumulation — slightly larger tol.
 pub const NMSE_FP16_TOL: f64 = 1e-6;
 
-/// Normalized mean-squared error.
-///
-/// NMSE = mse(a, b) / mse(a, 0). Returns the raw `mse(a, b)` when the
-/// reference is degenerate (all zeros) — falls back gracefully so tests
-/// for ops that legitimately output zero don't divide by zero.
-///
-/// # Panics
-/// Panics if `a.len() != b.len()`.
-pub fn nmse(a: &[f32], b: &[f32]) -> f64 {
-    assert_eq!(a.len(), b.len(), "nmse: length mismatch");
-    if a.is_empty() {
-        return 0.0;
-    }
-    let n = a.len() as f64;
-    let mse_ab: f64 = a
-        .iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = (*x as f64) - (*y as f64);
-            d * d
-        })
-        .sum::<f64>()
-        / n;
-    let mse_a0: f64 = a
-        .iter()
-        .map(|x| {
-            let d = *x as f64;
-            d * d
-        })
-        .sum::<f64>()
-        / n;
-    if mse_a0 < 1e-30 {
-        return mse_ab;
-    }
-    mse_ab / mse_a0
-}
+pub use ferrum_bench_core::release_regression::numerics::nmse;
 
 /// Output of a single op invocation. Each backend produces its own
 /// `Vec<f32>` after `to_vec()`-ing its buffer to host.
@@ -172,31 +138,6 @@ pub fn random_vec(n: usize, lo: f32, hi: f32, seed: u64) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn nmse_identical_is_zero() {
-        let a = vec![1.0, 2.0, 3.0];
-        assert!(nmse(&a, &a) < 1e-30);
-    }
-
-    #[test]
-    fn nmse_scaled_b_proportional() {
-        // b = 1.01 * a → relative error 0.01, NMSE ≈ 0.0001
-        let a = vec![1.0, 2.0, 3.0, 4.0];
-        let b: Vec<f32> = a.iter().map(|x| x * 1.01).collect();
-        let n = nmse(&a, &b);
-        // NMSE = mse(0.01*a, 0) / mse(a, 0) = 0.0001
-        assert!((n - 1e-4).abs() < 1e-5);
-    }
-
-    #[test]
-    fn nmse_zero_reference_falls_back() {
-        // a all-zero: NMSE returns raw MSE.
-        let a = vec![0.0, 0.0, 0.0];
-        let b = vec![0.1, 0.1, 0.1];
-        let n = nmse(&a, &b);
-        assert!((n - 0.01).abs() < 1e-9);
-    }
 
     #[test]
     fn random_vec_determinism() {

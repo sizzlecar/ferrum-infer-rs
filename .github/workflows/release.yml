@@ -36,6 +36,9 @@ on:
       metal_runner_id:
         description: Immutable uploaded artifact ID
         value: ${{ jobs.macos-aarch64.outputs.runner_id }}
+      metal_controller_id:
+        description: Immutable uploaded release controller artifact ID
+        value: ${{ jobs.macos-aarch64.outputs.controller_id }}
   workflow_dispatch:
     inputs:
       version:
@@ -238,6 +241,7 @@ jobs:
     outputs:
       asset_id: ${{ steps.asset_id.outputs.artifact-id }}
       runner_id: ${{ steps.runner_id.outputs.artifact-id }}
+      controller_id: ${{ steps.controller_id.outputs.artifact-id }}
     name: Stage macOS aarch64 Metal
     runs-on: macos-14
     timeout-minutes: 90
@@ -293,8 +297,8 @@ jobs:
           restore-keys: |
             stage-rust1.91.0-macos-aarch64-
 
-      - name: Build release metadata tool once
-        run: cargo build --release --locked -p ferrum-bench-core --example release_candidate
+      - name: Build CPU-feature release metadata tool and controller once
+        run: cargo build --release --locked -p ferrum-bench-core -p ferrum-devtools --example release_candidate --bin release_delivery
 
       - name: Verify all workspace release versions
         run: |
@@ -350,6 +354,24 @@ jobs:
           tar -C target/release/examples -czf model-regression-macos-aarch64.tar.gz model_regression
           shasum -a 256 model-regression-macos-aarch64.tar.gz > model-regression-macos-aarch64.tar.gz.sha256
           shasum -a 256 target/release/examples/model_regression > model-regression-macos-aarch64.binary.sha256
+
+      - name: Package macOS release controller
+        run: |
+          tar -C target/release -czf release-delivery-macos-aarch64.tar.gz release_delivery
+          shasum -a 256 release-delivery-macos-aarch64.tar.gz > release-delivery-macos-aarch64.tar.gz.sha256
+          (cd target/release && shasum -a 256 release_delivery) > release-delivery-macos-aarch64.binary.sha256
+
+      - name: Upload macOS release controller
+        id: controller_id
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-delivery-macos-aarch64-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            release-delivery-macos-aarch64.tar.gz
+            release-delivery-macos-aarch64.tar.gz.sha256
+            release-delivery-macos-aarch64.binary.sha256
 
       - name: Upload Metal regression runner
         id: runner_id

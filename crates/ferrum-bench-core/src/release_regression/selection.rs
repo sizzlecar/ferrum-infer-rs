@@ -75,6 +75,10 @@ fn scope_matches(scope: &ObligationScope, target: &ExecutionTarget, id: Option<&
     match scope {
         ObligationScope::Global => false,
         ObligationScope::Backend { backend } => *backend == target.backend,
+        ObligationScope::ExecutionPath {
+            backend,
+            execution_path,
+        } => *backend == target.backend && execution_path == &target.execution_path,
         ObligationScope::Architecture {
             architecture,
             protocol,
@@ -125,17 +129,39 @@ fn add(
     scope: ObligationScope,
     reason: &str,
 ) {
-    if plan
+    add_with_entrypoints(
+        plan,
+        behavior,
+        layer,
+        scope,
+        reason,
+        behavior_entrypoints(behavior, layer),
+    );
+}
+
+fn add_with_entrypoints(
+    plan: &mut Plan,
+    behavior: Behavior,
+    layer: EvidenceLayer,
+    scope: ObligationScope,
+    reason: &str,
+    entrypoints: Vec<Entrypoint>,
+) {
+    if let Some(existing) = plan
         .obligations
-        .iter()
-        .any(|item| item.behavior == behavior && item.layer == layer && item.scope == scope)
+        .iter_mut()
+        .find(|item| item.behavior == behavior && item.layer == layer && item.scope == scope)
     {
+        // A narrow contributor must not erase another path's broader reach.
+        existing.entrypoints.extend(entrypoints);
+        existing.entrypoints.sort();
+        existing.entrypoints.dedup();
         return;
     }
     plan.obligations.push(Obligation {
         behavior,
         layer,
-        entrypoints: behavior_entrypoints(behavior, layer),
+        entrypoints,
         scope,
         reason: reason.into(),
         checkers: Vec::new(),
@@ -303,12 +329,13 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
             &[ModelLoad, ModelForward],
         ),
         Kv => (
-            // Keep isolation, release and resume contracts mandatory. In
-            // particular, an unbound resume check remains a gap. The selected
-            // model verifies integration only; it cannot certify device state.
+            // CPU contracts check isolation, release and recomputation after
+            // supported preemption. Selected models verify integration; these
+            // checks cannot certify GPU KV arithmetic or swapping.
             &[KvIsolation, KvRelease, KvResume],
             &[ModelLoad, ModelForward],
         ),
+        BackendSubmission => (&[], &[ModelLoad, ModelForward]),
         Kernel => (&[KernelBoundaries], &[ModelForward]),
         Architecture => (
             &[ModelLoad, ArchitectureState],
@@ -331,7 +358,7 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
         &reason,
     );
     let scopes = match area {
-        Kernel | Architecture | Scheduler | Kv => targets
+        Kernel | BackendSubmission | Architecture | Scheduler | Kv => targets
             .iter()
             .cloned()
             .map(|target| ObligationScope::Target { target })
@@ -342,6 +369,25 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
         Validation => Vec::new(),
     };
     add_for_scopes(plan, runtime, ModelRuntime, &scopes, &reason);
+    if area == BackendSubmission {
+        let routes: Vec<_> = targets
+            .iter()
+            .map(|target| (target.backend, target.execution_path.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|(backend, execution_path)| ObligationScope::ExecutionPath {
+                backend,
+                execution_path,
+            })
+            .collect();
+        add_for_scopes(
+            plan,
+            &[SubmissionCompletion],
+            BackendNumerics,
+            &routes,
+            &reason,
+        );
+    }
     if matches!(area, Kernel | Architecture) {
         let exact: Vec<_> = targets
             .iter()
@@ -355,13 +401,32 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
             &exact,
             &reason,
         );
-        add_for_scopes(
-            plan,
-            &[Performance],
-            EvidenceLayer::Performance,
-            &exact,
-            &reason,
-        );
+    }
+    if matches!(area, Kernel | BackendSubmission | Architecture) {
+        let exact: Vec<_> = targets
+            .iter()
+            .cloned()
+            .map(|target| ObligationScope::Target { target })
+            .collect();
+        for scope in exact {
+            // The proven change only alters shared backend submission. One
+            // measured streaming path exercises its latency; model correctness
+            // still requires run and both HTTP modes above. Unproven kernel or
+            // architecture edits retain their independent entrypoint reach.
+            let entrypoints = if area == BackendSubmission {
+                vec![Entrypoint::ServeStream]
+            } else {
+                behavior_entrypoints(Performance, EvidenceLayer::Performance)
+            };
+            add_with_entrypoints(
+                plan,
+                Performance,
+                EvidenceLayer::Performance,
+                scope,
+                &reason,
+                entrypoints,
+            );
+        }
     }
     if matches!(area, Download | Build) {
         add_for_scopes(

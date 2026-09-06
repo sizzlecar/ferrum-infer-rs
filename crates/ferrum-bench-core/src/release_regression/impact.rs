@@ -123,9 +123,20 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "shared dependency/toolchain change: conservatively include all components",
         ));
     }
+    if path == ".gitignore" {
+        return Some((
+            vec![Build],
+            "source packaging inputs; retain build and installation checks",
+        ));
+    }
     if path.starts_with(".github/workflows/")
         || path.starts_with(".github/ci/")
-        || matches!(path, ".github/actionlint.yaml" | ".github/actionlint.yml")
+        || matches!(
+            path,
+            ".github/actionlint.yaml"
+                | ".github/actionlint.yml"
+                | ".github/release-performance.json"
+        )
     {
         return Some((
             vec![Build, Validation],
@@ -154,6 +165,14 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return Some((
             ALL_AREAS.to_vec(),
             "crate build/dependency change: conservatively include all components",
+        ));
+    }
+    // continuous_engine.rs declares this exact module under cfg(test). A
+    // changed production parent/import still contributes its own full reach.
+    if component == "ferrum-engine" && relative == "src/continuous_engine/tests.rs" {
+        return Some((
+            vec![Validation],
+            "engine unit-test module declared only under cfg(test)",
         ));
     }
     // Cargo's top-level tests/*.rs files are independent integration targets.
@@ -396,6 +415,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn isolated_engine_tests_and_packaging_do_not_erase_parent_execution_changes() {
+        let tests = "crates/ferrum-engine/src/continuous_engine/tests.rs";
+        assert_eq!(analyze_paths([tests]).areas, [ChangeArea::Validation]);
+        assert_eq!(analyze_paths([".gitignore"]).areas, [ChangeArea::Build]);
+        for parent in [
+            "crates/ferrum-engine/src/continuous_engine.rs",
+            "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+            "crates/ferrum-engine/src/continuous_engine/tests/unreviewed.rs",
+        ] {
+            assert!(analyze_paths([tests, ".gitignore", parent])
+                .areas
+                .contains(&ChangeArea::Kernel));
+        }
+    }
+
+    #[test]
     fn shared_contracts_and_engine_expand_interacting_behaviors() {
         for path in [
             "crates/ferrum-types/src/sampling.rs",
@@ -483,6 +518,10 @@ mod tests {
             assert_eq!(path_backend(path), Some(backend));
             let impact = analyze_paths([path]);
             assert_eq!(impact.areas, [ChangeArea::Kernel]);
+            assert!(
+                !impact.areas.contains(&ChangeArea::BackendSubmission),
+                "path names do not prove submission-only changes"
+            );
             assert!(impact.unknown_paths.is_empty());
         }
         for path in [

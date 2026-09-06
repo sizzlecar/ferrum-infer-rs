@@ -360,6 +360,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -431,6 +432,28 @@ jobs:
           ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
             --op silu-mul --tokens 3 --intermediate 257 --seed 7 \
             --report "$RUNNER_TEMP/backend-numerics/silu-tail.json"
+
+      - name: Require MetalContext submission and completion outputs
+        if: matrix.backend == 'metal'
+        run: |
+          ./target/debug/examples/backend_numerics --require-backend metal \
+            --op metal-context --tokens 3 --intermediate 33 --k 35 --seed 7 \
+            --report "$RUNNER_TEMP/backend-numerics/submission.json"
+
+      - name: Record numerical evidence producer
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          job_id=$(jq -er --arg suffix "GPU runtime ($BACKEND)" \
+            '[.jobs[] | select(.name | endswith($suffix)) | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          mkdir -p "$RUNNER_TEMP/backend-numerics"
+          jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
+            '{schema_version:1,run_id:$run_id,run_attempt:$run_attempt,head_sha:$head_sha,job_id:$job_id}' \
+            > "$RUNNER_TEMP/backend-numerics/ci-origin.json"
 
       - name: Save raw numerical evidence
         if: always()

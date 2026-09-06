@@ -222,3 +222,217 @@ fn legacy_submission_proof_cannot_ignore_new_traits_or_conditional_implementatio
         Ok(false)
     );
 }
+
+fn ready_observation_fixture() -> (String, String, String) {
+    let before = r#"
+        fn emit_jsonl_ready(session_id: &str, requested_model: &str, resolved_model: &str, backend: &str) {
+            let record = serde_json::json!({
+                "event": "ready", "session_id": session_id,
+                "requested_model": requested_model, "resolved_model": resolved_model,
+                "backend": backend,
+            });
+            emit_jsonl_record(&record);
+        }
+        fn execute(one_shot: bool) {
+            let model_chat_template = match one_shot { true => Some(load_template()), false => None };
+            configure_runtime();
+            if one_shot {
+                emit_jsonl_ready(&session, &requested, &resolved, &backend);
+                generate();
+            } else {
+                emit_jsonl_ready(&session, &requested, &resolved, &backend);
+                interactive();
+            }
+        }
+    "#;
+    let after = before
+        .replace("backend: &str)", "backend: &str, template: Option<&ModelChatTemplate>,)")
+        .replace("\"backend\": backend,", "\"backend\": backend, \"reasoning_protocol\": template.map(ModelChatTemplate::reasoning_capability).unwrap_or_default(),")
+        .replace("&resolved, &backend);", "&resolved, &backend, model_chat_template.as_ref(),);");
+    let getter = r#"
+        use ferrum_types::{ModelOutputProtocol, ModelReasoningProtocol};
+        pub struct ModelChatTemplate {
+            pub output_protocol: ModelOutputProtocol,
+            pub reasoning_protocol: ModelReasoningProtocol,
+        }
+        impl ModelChatTemplate {
+            /// Read the declared scalar capability.
+            pub fn reasoning_capability(&self) -> ModelReasoningProtocol {
+                if self.output_protocol == ModelOutputProtocol::HarmonyGptOss {
+                    ModelReasoningProtocol::ModelGenerated
+                } else { self.reasoning_protocol }
+            }
+        }
+    "#;
+    (before.into(), after, getter.into())
+}
+
+#[test]
+fn ready_observation_preserves_the_existing_wire_record_and_all_caller_control_flow() {
+    let (before, after, getter) = ready_observation_fixture();
+    assert_eq!(
+        run_ready_capability_only(&before, &after, &getter),
+        Ok(true)
+    );
+    let with_test = format!("{after} #[cfg(test)] mod tests {{ #[test] fn new_test() {{}} }}");
+    assert_eq!(
+        run_ready_capability_only(&before, &with_test, &getter),
+        Ok(true)
+    );
+    // The number of calls is not a fixed matrix. Both trees must preserve their
+    // actual calls and positions, even for a pre-existing additional path.
+    let old_extra = before.replace(
+        "interactive();",
+        "interactive(); emit_jsonl_ready(&session, &requested, &resolved, &backend);",
+    );
+    let new_extra = after.replace("interactive();", "interactive(); emit_jsonl_ready(&session, &requested, &resolved, &backend, model_chat_template.as_ref());");
+    assert_eq!(
+        run_ready_capability_only(&old_extra, &new_extra, &getter),
+        Ok(true)
+    );
+    for changed in [
+        after.replace("\"event\": \"ready\"", "\"event\": \"done\""),
+        after.replace("\"backend\": backend", "\"backend\": resolved_model"),
+        after.replace("&session, &requested", "&requested, &session"),
+        after.replace("configure_runtime();", "configure_different_kv();"),
+        after.replace("if one_shot {", "if !one_shot {"),
+        after.replace("generate();", "emit_jsonl_ready(&session, &requested, &resolved, &backend, model_chat_template.as_ref()); generate();"),
+        after.replace("emit_jsonl_record(&record);", "mutate_engine(); emit_jsonl_record(&record);"),
+        after.replace("emit_jsonl_record(&record);", "other_sink(&record);"),
+        after.replace("&resolved, &backend, model_chat_template.as_ref(),);", "&resolved, &backend, model_chat_template.as_ref(),); changed();"),
+    ] {
+        assert_eq!(run_ready_capability_only(&before, &changed, &getter), Ok(false), "{changed}");
+    }
+}
+
+#[test]
+fn ready_observation_rejects_unproven_borrowing_and_hidden_record_effects() {
+    let (before, after, getter) = ready_observation_fixture();
+    for changed in [
+        after.replace(
+            "model_chat_template.as_ref()",
+            "model_chat_template.as_mut()",
+        ),
+        after.replace(
+            "model_chat_template.as_ref()",
+            "model_chat_template.take().as_ref()",
+        ),
+        after.replace("model_chat_template.as_ref()", "other_template.as_ref()"),
+        after.replace(
+            "model_chat_template.as_ref()",
+            "{ mutate_engine(); model_chat_template.as_ref() }",
+        ),
+        after.replace(
+            "template.map(ModelChatTemplate::reasoning_capability)",
+            "template.map(ModelChatTemplate::change_configuration)",
+        ),
+        after.replace(
+            "unwrap_or_default()",
+            "unwrap_or_else(change_configuration)",
+        ),
+        after.replace(
+            "Option<&ModelChatTemplate>",
+            "Option<&mut ModelChatTemplate>",
+        ),
+        after.replace(
+            "\"reasoning_protocol\": template",
+            "\"replacement_field\": template",
+        ),
+    ] {
+        assert_eq!(
+            run_ready_capability_only(&before, &changed, &getter),
+            Ok(false),
+            "{changed}"
+        );
+    }
+    for (old, new) in [
+        (
+            before.replace("Some(load_template())", "custom_wrapper()"),
+            after.replace("Some(load_template())", "custom_wrapper()"),
+        ),
+        (
+            before.replace(
+                "configure_runtime();",
+                "configure_runtime(); let model_chat_template = other();",
+            ),
+            after.replace(
+                "configure_runtime();",
+                "configure_runtime(); let model_chat_template = other();",
+            ),
+        ),
+        (
+            before.replace("\"backend\": backend", "\"backend\": template"),
+            after.replace("\"backend\": backend", "\"backend\": template"),
+        ),
+        (
+            before.replace(
+                "\"backend\": backend",
+                "\"backend\": macro_value!(template)",
+            ),
+            after.replace(
+                "\"backend\": backend",
+                "\"backend\": macro_value!(template)",
+            ),
+        ),
+    ] {
+        assert_eq!(run_ready_capability_only(&old, &new, &getter), Ok(false));
+    }
+}
+
+#[test]
+fn ready_observation_checks_the_actual_candidate_getter_and_its_scalar_field_types() {
+    let (before, after, getter) = ready_observation_fixture();
+    for changed in [
+        getter.replace("if self.output_protocol", "mutate_engine(); if self.output_protocol"),
+        getter.replace("else { self.reasoning_protocol }", "else { self.update_state() }"),
+        getter.replace("else { self.reasoning_protocol }", "else { mutate!(); self.reasoning_protocol }"),
+        getter.replace("&self", "&mut self"),
+        getter.replace("pub fn reasoning_capability", "#[cfg(feature = \"alternative\")] pub fn reasoning_capability"),
+        getter.replace("pub fn reasoning_capability", "pub async fn reasoning_capability"),
+        getter.replace("pub output_protocol: ModelOutputProtocol", "pub output_protocol: InteriorMutableProtocol"),
+        getter.replace("use ferrum_types::", "use arbitrary_custom_types::"),
+        getter.replace("impl ModelChatTemplate", "impl Unreviewed for ModelChatTemplate"),
+        format!("{getter} impl ModelChatTemplate {{ pub fn reasoning_capability(&self) -> ModelReasoningProtocol {{ self.reasoning_protocol }} }}"),
+        "struct ModelChatTemplate;".into(),
+    ] {
+        assert_eq!(run_ready_capability_only(&before, &after, &changed), Ok(false), "{changed}");
+    }
+    // Pure output changes still require protocol/capability checks. The proof
+    // establishes execution reach, not that a reported capability is correct.
+    let different_observation = getter.replace(
+        "else { self.reasoning_protocol }",
+        "else { ModelReasoningProtocol::None }",
+    );
+    assert_eq!(
+        run_ready_capability_only(&before, &after, &different_observation),
+        Ok(true)
+    );
+    assert!(run_ready_capability_only(&before, &after, "invalid Rust {").is_err());
+    assert_eq!(
+        run_ready_capability_only(&before, &before, &getter),
+        Ok(false)
+    );
+}
+
+#[test]
+fn legacy_submission_signature_trailing_commas_do_not_hide_parameter_changes() {
+    let (before, after) = metal_submission_fixture();
+    let multiline = after
+        .replace("detail: Option<&str>)", "detail: Option<&str>,)")
+        .replace("ctx: &mut MetalContext)", "ctx: &mut MetalContext,)");
+    assert_eq!(legacy_metal_submission_only(&before, &multiline), Ok(true));
+    assert_eq!(
+        legacy_metal_submission_only(
+            &before,
+            &multiline.replace("detail: Option<&str>,", "detail: Option<&mut str>,")
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        legacy_metal_submission_only(
+            &before,
+            &multiline.replace("ctx: &mut MetalContext,", "ctx: &MetalContext,")
+        ),
+        Ok(false)
+    );
+}

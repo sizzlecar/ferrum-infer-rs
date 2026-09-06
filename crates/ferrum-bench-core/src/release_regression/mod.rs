@@ -5,8 +5,11 @@ pub mod distribution;
 mod impact;
 pub mod model_schedule;
 pub mod model_tasks;
+pub mod numerics;
+pub mod performance;
 mod selection;
 pub mod source_change;
+pub mod submission;
 mod types;
 mod version_change;
 

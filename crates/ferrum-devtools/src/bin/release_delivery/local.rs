@@ -176,10 +176,10 @@ fn runner_arguments(
 // teardown. Killing the runner externally skips that Drop, so its descendants
 // must inherit a separate process group owned by this controller.
 #[cfg(unix)]
-struct ProcessGroup {
-    child: tokio::process::Child,
-    id: i32,
-    armed: bool,
+pub(super) struct ProcessGroup {
+    pub(super) child: tokio::process::Child,
+    pub(super) id: i32,
+    pub(super) armed: bool,
 }
 #[cfg(unix)]
 impl ProcessGroup {
@@ -197,7 +197,7 @@ impl ProcessGroup {
             Err(format!("kill runner process group: {error}"))
         }
     }
-    async fn cleanup(&mut self) -> Result<(), String> {
+    pub(super) async fn cleanup(&mut self) -> Result<(), String> {
         let killed = self.kill();
         let waited = tokio::time::timeout(Duration::from_secs(5), self.child.wait())
             .await
@@ -220,7 +220,11 @@ impl Drop for ProcessGroup {
 }
 
 #[cfg(unix)]
-async fn run_command(mut command: Command, log: &Path, timeout: Duration) -> Result<(), String> {
+pub(super) async fn run_command(
+    mut command: Command,
+    log: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     use tokio::signal::unix::{signal, SignalKind};
     // Register before spawning model work, rather than after a termination signal.
@@ -272,7 +276,11 @@ async fn run_command(mut command: Command, log: &Path, timeout: Duration) -> Res
     }
 }
 #[cfg(not(unix))]
-async fn run_command(_command: Command, _log: &Path, _timeout: Duration) -> Result<(), String> {
+pub(super) async fn run_command(
+    _command: Command,
+    _log: &Path,
+    _timeout: Duration,
+) -> Result<(), String> {
     Err("local model execution requires Unix process-group cleanup".into())
 }
 

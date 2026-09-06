@@ -17,7 +17,7 @@ sha2 = "0.10"
 toml_edit = "0.22.27"
 semver = "1.0"
 # Parse production/test item boundaries for change-based validation scope.
-syn = { version = "2", features = ["full"] }
+syn = { version = "2", features = ["full", "visit-mut"] }
 quote = "1"
 
 [dev-dependencies]

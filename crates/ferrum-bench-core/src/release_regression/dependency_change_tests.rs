@@ -122,6 +122,60 @@ fn known_release_tool_additions_remain_build_changes_and_never_allow_other_runti
 }
 
 #[test]
+fn syntax_visitor_is_a_scoped_tool_feature_not_permission_to_change_parser_resolution() {
+    let mut before = fixture();
+    append(&mut before, "crates/app/Cargo.toml", "syn = '2'\n");
+    let lock = before.get_mut("Cargo.lock").unwrap();
+    *lock = lock.replace(
+        "\"serde\", \"semver\", \"toml_edit\"]",
+        "\"serde\", \"semver\", \"toml_edit\", \"syn\"]",
+    );
+    lock.push_str("[[package]]\nname = 'syn'\nversion = '2.0.1'\nsource = 'registry+https://example.invalid/index'\nchecksum = 'syntax-checksum'\n");
+    let mut full = before.clone();
+    append(
+        &mut full,
+        "crates/ferrum-bench-core/Cargo.toml",
+        "syn = { version = '2', features = ['full'] }\n",
+    );
+    let lock = full.get_mut("Cargo.lock").unwrap();
+    *lock = lock.replace(
+        "dependencies = [\"serde\"]",
+        "dependencies = [\"serde\", \"syn\"]",
+    );
+    let mut visitor = full.clone();
+    let manifest = visitor
+        .get_mut("crates/ferrum-bench-core/Cargo.toml")
+        .unwrap();
+    *manifest = manifest.replace("['full']", "['full', 'visit-mut']");
+    for base in [&before, &full] {
+        assert!(validation_dependency_paths(base, &visitor).is_ok());
+        for mutation in [
+            "syn = { version = '3', features = ['full', 'visit-mut'] }",
+            "syn = { version = '2', features = ['full', 'visit-mut', 'extra-traits'] }",
+            "syn = { version = '2', features = ['full', 'visit-mut'], default-features = false }",
+        ] {
+            let mut changed = visitor.clone();
+            let manifest = changed
+                .get_mut("crates/ferrum-bench-core/Cargo.toml")
+                .unwrap();
+            *manifest = manifest.replace(
+                "syn = { version = '2', features = ['full', 'visit-mut'] }",
+                mutation,
+            );
+            // An original addition may specify a different compatible version
+            // range; an existing dependency cannot change its declaration.
+            if base == &full || !mutation.contains("version = '3'") {
+                assert!(validation_dependency_paths(base, &changed).is_err());
+            }
+        }
+        let mut changed = visitor.clone();
+        let lock = changed.get_mut("Cargo.lock").unwrap();
+        *lock = lock.replace("syntax-checksum", "different-checksum");
+        assert!(validation_dependency_paths(base, &changed).is_err());
+    }
+}
+
+#[test]
 fn dev_dependency_cannot_hide_a_changed_runtime_version_or_registry_feature_edge() {
     let before = fixture();
     let mut after = before.clone();
@@ -367,4 +421,242 @@ fn private_tool_name_does_not_allow_publishing_build_hooks_unknown_members_or_lo
     assert!(validation_dependency_paths(&before, &bad_lock)
         .unwrap_err()
         .contains("manifest and locked dependency names differ"));
+}
+
+const TESTKIT_MANIFEST: &str = "crates/ferrum-testkit/Cargo.toml";
+fn lock_edge(files: &mut BTreeMap<String, String>, package: &str, dependency: &str) {
+    let mut lock = parse(files, "Cargo.lock").unwrap();
+    let record = lock["package"]
+        .as_array_of_tables_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["name"].as_str() == Some(package))
+        .unwrap();
+    if record.get("dependencies").is_none() {
+        record["dependencies"] = toml_edit::value(toml_edit::Array::new());
+    }
+    record["dependencies"]
+        .as_array_mut()
+        .unwrap()
+        .push(dependency);
+    files.insert("Cargo.lock".into(), lock.to_string());
+}
+fn validation_tools_fixture(private_tool: bool) -> BTreeMap<String, String> {
+    let mut files = fixture();
+    if private_tool {
+        add_private_tool(&mut files);
+    }
+    let root = files.get_mut("Cargo.toml").unwrap();
+    *root = root.replace("members = [", "members = [\"crates/ferrum-testkit\", ");
+    root.push_str("ferrum-testkit = {path='crates/ferrum-testkit',version='1.0.0'}\nchrono = {version='0.4',features=['serde']}\n");
+    files.insert(TESTKIT_MANIFEST.into(),"[package]\nname='ferrum-testkit'\nversion.workspace=true\n[dependencies]\nserde='1'\n[features]\ndefault=[]\nmetal=[]\n".into());
+    append(&mut files,"crates/app/Cargo.toml", "chrono.workspace=true\nzip={version='7.2.0',default-features=false}\nflate2='1'\n[dev-dependencies]\nferrum-testkit.workspace=true\n");
+    append(
+        &mut files,
+        "Cargo.lock",
+        r#"
+[[package]]
+name = "ferrum-testkit"
+version = "1.0.0"
+dependencies = ["serde"]
+[[package]]
+name = "chrono"
+version = "0.4.42"
+source = "registry+https://example.invalid/index"
+checksum = "chrono-checksum"
+[[package]]
+name = "zip"
+version = "7.2.0"
+source = "registry+https://example.invalid/index"
+checksum = "zip-checksum"
+dependencies = ["crc32fast"]
+[[package]]
+name = "flate2"
+version = "1.1.2"
+source = "registry+https://example.invalid/index"
+checksum = "flate-checksum"
+dependencies = ["crc32fast"]
+[[package]]
+name = "crc32fast"
+version = "1.5.0"
+source = "registry+https://example.invalid/index"
+checksum = "crc-checksum"
+"#,
+    );
+    for dependency in ["chrono", "zip", "flate2", TESTKIT] {
+        lock_edge(&mut files, "app", dependency);
+    }
+    files
+}
+fn add_numerical_sharing(files: &mut BTreeMap<String, String>) {
+    let manifest = files.get_mut(TESTKIT_MANIFEST).unwrap();
+    *manifest = manifest.replace(
+        "[dependencies]",
+        "[dependencies]\nferrum-bench-core.workspace=true",
+    );
+    lock_edge(files, TESTKIT, BENCH_CORE);
+}
+fn add_artifact_tools(files: &mut BTreeMap<String, String>) {
+    append(files,DEVTOOLS_MANIFEST,"chrono.workspace=true\nzip={version='7.2.0',default-features=false,features=['deflate-flate2']}\nflate2='1'\n");
+    for dependency in ["chrono", "zip", "flate2"] {
+        lock_edge(files, DEVTOOLS, dependency);
+    }
+    lock_edge(files, "zip", "flate2");
+}
+
+#[test]
+fn dev_only_testkit_can_share_existing_local_numerics_without_changing_product_edges() {
+    let before = validation_tools_fixture(true);
+    let mut after = before.clone();
+    add_numerical_sharing(&mut after);
+    let result = validation_dependency_paths(&before, &after).unwrap();
+    assert_eq!(
+        result.validation_runtime_dependencies,
+        [format!("{TESTKIT_MANIFEST}:{BENCH_CORE}")]
+    );
+    for section in [
+        "dependencies",
+        "build-dependencies",
+        "target.'cfg(unix)'.dependencies",
+        "target.'cfg(windows)'.build-dependencies",
+    ] {
+        let mut runtime_before = before.clone();
+        let manifest = runtime_before.get_mut("crates/app/Cargo.toml").unwrap();
+        *manifest = manifest.replace("[dev-dependencies]", &format!("[{section}]"));
+        // The normal dependency table already exists: insert a renamed edge
+        // there instead of creating invalid TOML for the normal case.
+        if section == "dependencies" {
+            *manifest = before["crates/app/Cargo.toml"]
+                .replace("[dev-dependencies]\nferrum-testkit.workspace=true\n", "")
+                .replace("[dependencies]",
+                    "[dependencies]\nrenamed_testkit={package='ferrum-testkit',path='../ferrum-testkit'}");
+        }
+        let mut invalid = runtime_before.clone();
+        add_numerical_sharing(&mut invalid);
+        // The runtime consumer already existed at the base: only the new
+        // testkit edge changes, so manifest equality alone cannot detect reach.
+        assert!(
+            validation_dependency_paths(&runtime_before, &invalid)
+                .unwrap_err()
+                .contains("runtime/build dependency on testkit"),
+            "{section}"
+        );
+    }
+    for bad in [
+        "ferrum-bench-core='1'",
+        "ferrum-bench-core={workspace=true,features=['extra']}",
+    ] {
+        let mut invalid = after.clone();
+        let manifest = invalid.get_mut(TESTKIT_MANIFEST).unwrap();
+        *manifest = manifest.replace("ferrum-bench-core.workspace=true", bad);
+        assert!(validation_dependency_paths(&before, &invalid).is_err());
+    }
+    let mut invalid = after;
+    let mut lock = parse(&invalid, "Cargo.lock").unwrap();
+    let record = lock["package"]
+        .as_array_of_tables_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["name"].as_str() == Some(TESTKIT))
+        .unwrap();
+    let edges = record["dependencies"].as_array_mut().unwrap();
+    let index = edges
+        .iter()
+        .position(|edge| edge.as_str() == Some(BENCH_CORE))
+        .unwrap();
+    edges.remove(index);
+    invalid.insert("Cargo.lock".into(), lock.to_string());
+    assert!(validation_dependency_paths(&before, &invalid).is_err());
+}
+
+#[test]
+fn private_artifact_readers_extend_only_reviewed_locked_zip_feature_edge() {
+    for added_tool in [false, true] {
+        let before = validation_tools_fixture(!added_tool);
+        let mut after = before.clone();
+        if added_tool {
+            add_private_tool(&mut after);
+        }
+        add_artifact_tools(&mut after);
+        add_numerical_sharing(&mut after);
+        let result = validation_dependency_paths(&before, &after).unwrap();
+        assert!(result
+            .validation_runtime_dependencies
+            .contains(&format!("{DEVTOOLS_MANIFEST}:zip/deflate-flate2")));
+        assert!(result
+            .validation_runtime_dependencies
+            .contains(&format!("{DEVTOOLS_MANIFEST}:chrono")));
+        for (old, new) in [
+            (
+                "default-features=false,features=['deflate-flate2']",
+                "default-features=true,features=['deflate-flate2']",
+            ),
+            (
+                "features=['deflate-flate2']",
+                "features=['deflate-flate2','aes-crypto']",
+            ),
+            (
+                "version='7.2.0',default-features=false,features=['deflate-flate2']",
+                "version='8',default-features=false,features=['deflate-flate2']",
+            ),
+            (
+                "chrono.workspace=true",
+                "chrono={workspace=true,features=['unstable-locales']}",
+            ),
+            ("flate2='1'", "flate2={version='1',default-features=false}"),
+        ] {
+            let mut invalid = after.clone();
+            let manifest = invalid.get_mut(DEVTOOLS_MANIFEST).unwrap();
+            *manifest = manifest.replace(old, new);
+            assert!(
+                validation_dependency_paths(&before, &invalid).is_err(),
+                "{new}"
+            );
+        }
+    }
+}
+
+#[test]
+fn private_feature_exception_does_not_hide_shared_registry_or_product_changes() {
+    let before = validation_tools_fixture(true);
+    let mut after = before.clone();
+    add_artifact_tools(&mut after);
+    for (old, new) in [
+        ("zip-checksum", "changed"),
+        ("flate-checksum", "changed"),
+        ("version = \"7.2.0\"", "version = \"7.2.1\""),
+        (
+            "registry+https://example.invalid/index",
+            "registry+https://other.invalid/index",
+        ),
+    ] {
+        let mut invalid = after.clone();
+        let lock = invalid.get_mut("Cargo.lock").unwrap();
+        *lock = lock.replace(old, new);
+        assert!(
+            validation_dependency_paths(&before, &invalid).is_err(),
+            "{old}"
+        );
+    }
+    for (package, dependency) in [("zip", "serde"), ("flate2", "serde"), ("serde", "flate2")] {
+        let mut invalid = after.clone();
+        lock_edge(&mut invalid, package, dependency);
+        assert!(
+            validation_dependency_paths(&before, &invalid).is_err(),
+            "{package} -> {dependency}"
+        );
+    }
+    let mut invalid = after.clone();
+    let manifest = invalid.get_mut("crates/app/Cargo.toml").unwrap();
+    *manifest = manifest.replace("default-features=false", "default-features=true");
+    assert!(validation_dependency_paths(&before, &invalid).is_err());
+    let mut invalid = after.clone();
+    append(&mut invalid,"crates/app/Cargo.toml","[target.'cfg(unix)'.build-dependencies]\nprivate_tool={package='ferrum-devtools',path='../ferrum-devtools'}\n");
+    assert!(validation_dependency_paths(&before, &invalid)
+        .unwrap_err()
+        .contains("depends on private devtools"));
+    let mut invalid = after;
+    let manifest = invalid.get_mut(DEVTOOLS_MANIFEST).unwrap();
+    *manifest = manifest.replace("publish = false", "publish = true");
+    assert!(validation_dependency_paths(&before, &invalid).is_err());
 }

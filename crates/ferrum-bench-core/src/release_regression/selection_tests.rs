@@ -1262,16 +1262,10 @@ fn deterministic_resource_mechanisms_do_not_multiply_large_model_checks() {
                 .count(),
             1
         );
-        if behavior == Behavior::KvResume {
-            assert!(result
-                .gaps
-                .contains(&Gap::UnassignedCheck { obligation: index }));
-        } else {
-            assert!(!obligation.checkers.is_empty());
-            assert!(!result
-                .gaps
-                .contains(&Gap::UnassignedCheck { obligation: index }));
-        }
+        assert!(!obligation.checkers.is_empty());
+        assert!(!result
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
     }
     for target in [cpu, cuda] {
         for behavior in [Behavior::ModelLoad, Behavior::ModelForward] {
@@ -1694,7 +1688,7 @@ fn unknown_reasoning_capability_is_a_pre_execution_gap_only_when_affected() {
 }
 
 #[test]
-fn content_proven_legacy_submission_keeps_kernel_obligations_on_its_execution_route() {
+fn execution_route_restriction_alone_retains_kernel_obligations() {
     let mut legacy = text_target("f32", Backend::Metal);
     legacy.execution_path = "legacy-model-executor".into();
     let production = text_target("bf16", Backend::Metal);
@@ -1853,5 +1847,289 @@ fn execution_reach_unions_each_path_without_narrowing_shared_areas_or_quick_star
             area_targets(&request.impact, ChangeArea::Kernel, &targets).unwrap(),
             targets
         );
+    }
+}
+
+fn submission_scope_set(scopes: &[ObligationScope]) -> BTreeSet<String> {
+    scopes
+        .iter()
+        .map(|scope| serde_json::to_string(scope).unwrap())
+        .collect()
+}
+
+fn mark_submission_proof(impact: &mut Impact) {
+    let entry = impact
+        .paths
+        .iter_mut()
+        .find(|entry| entry.path == "crates/ferrum-kernels/src/backend/metal/mod.rs")
+        .unwrap();
+    entry.areas = vec![ChangeArea::BackendSubmission];
+    entry.execution_paths = Some(vec!["legacy-model-executor".into()]);
+    impact.areas = ChangeArea::ALL
+        .into_iter()
+        .filter(|area| impact.paths.iter().any(|path| path.areas.contains(area)))
+        .collect();
+}
+
+#[test]
+fn submission_completion_is_shared_by_route_while_model_and_performance_targets_remain_exact() {
+    let mut floating = text_target("f32", Backend::Metal);
+    floating.execution_path = "legacy-model-executor".into();
+    let mut quantized = floating.clone();
+    quantized.architecture = "attention-moe".into();
+    quantized.precision = "gguf-q4_k_m".into();
+    let production = text_target("bf16", Backend::Metal);
+    let cuda = text_target("bf16", Backend::Cuda);
+    let targets = vec![floating.clone(), quantized.clone(), production, cuda];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| profile(&format!("submission-{index}"), target.clone()))
+            .collect(),
+    );
+    request.impact =
+        super::super::analyze_paths(["crates/ferrum-kernels/src/backend/metal/mod.rs"]);
+    mark_submission_proof(&mut request.impact);
+    let result = plan(&request).unwrap();
+    let submission: Vec<_> = result
+        .obligations
+        .iter()
+        .enumerate()
+        .filter(|(_, obligation)| obligation.behavior == Behavior::SubmissionCompletion)
+        .collect();
+    let scopes: Vec<_> = submission
+        .iter()
+        .map(|(_, obligation)| obligation.scope.clone())
+        .collect();
+    assert_eq!(
+        scopes,
+        [ObligationScope::ExecutionPath {
+            backend: Backend::Metal,
+            execution_path: floating.execution_path.clone()
+        }]
+    );
+    for (index, obligation) in submission {
+        assert_eq!(obligation.layer, EvidenceLayer::BackendNumerics);
+        assert!(obligation.entrypoints.is_empty());
+        assert!(obligation.checkers.is_empty());
+        assert!(result
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
+    }
+    for (behavior, layer) in [
+        (Behavior::ModelLoad, EvidenceLayer::ModelRuntime),
+        (Behavior::ModelForward, EvidenceLayer::ModelRuntime),
+        (Behavior::Performance, EvidenceLayer::Performance),
+    ] {
+        let scopes: Vec<_> = result
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.behavior == behavior && obligation.layer == layer)
+            .map(|obligation| obligation.scope.clone())
+            .collect();
+        assert_eq!(
+            submission_scope_set(&scopes),
+            submission_scope_set(&[
+                ObligationScope::Target {
+                    target: floating.clone()
+                },
+                ObligationScope::Target {
+                    target: quantized.clone()
+                }
+            ]),
+            "{behavior:?}"
+        );
+    }
+    assert!(!result.obligations.iter().any(|obligation| matches!(
+        obligation.behavior,
+        Behavior::KernelNumerics | Behavior::KernelBoundaries | Behavior::ArchitectureState
+    )));
+}
+
+#[test]
+fn submission_proof_cannot_replace_any_unproven_kernel_contributor() {
+    let mut floating = text_target("f32", Backend::Metal);
+    floating.execution_path = "legacy-model-executor".into();
+    let mut quantized = floating.clone();
+    quantized.precision = "gguf-q4_k_m".into();
+    let production = text_target("bf16", Backend::Metal);
+    let cuda = text_target("bf16", Backend::Cuda);
+    let targets = vec![floating, quantized, production, cuda];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| profile(&format!("mixed-{index}"), target.clone()))
+            .collect(),
+    );
+    for (additional, affected_backend) in [
+        (
+            "crates/ferrum-kernels/src/backend/metal/quant.rs",
+            Some(Backend::Metal),
+        ),
+        (
+            "crates/ferrum-kernels/src/backend/cuda/mod.rs",
+            Some(Backend::Cuda),
+        ),
+        ("crates/ferrum-kernels/src/backend/traits.rs", None),
+        ("crates/ferrum-cli/src/commands/run.rs", None),
+        ("unreviewed-runtime/forward.rs", None),
+    ] {
+        request.impact = super::super::analyze_paths([
+            "crates/ferrum-kernels/src/backend/metal/mod.rs",
+            additional,
+        ]);
+        mark_submission_proof(&mut request.impact);
+        let result = plan(&request).unwrap();
+        for behavior in [Behavior::KernelNumerics, Behavior::KernelBoundaries] {
+            let observed: Vec<_> = result
+                .obligations
+                .iter()
+                .filter(|obligation| {
+                    obligation.behavior == behavior
+                        && obligation.layer == EvidenceLayer::BackendNumerics
+                })
+                .map(|obligation| obligation.scope.clone())
+                .collect();
+            let expected: Vec<_> = targets
+                .iter()
+                .filter(|target| affected_backend.is_none_or(|backend| target.backend == backend))
+                .cloned()
+                .map(|target| ObligationScope::Target { target })
+                .collect();
+            assert_eq!(
+                submission_scope_set(&observed),
+                submission_scope_set(&expected),
+                "{additional}: {behavior:?}"
+            );
+        }
+        assert!(result
+            .obligations
+            .iter()
+            .any(|obligation| obligation.behavior == Behavior::SubmissionCompletion));
+        assert!(result
+            .obligations
+            .iter()
+            .any(
+                |obligation| obligation.behavior == Behavior::KernelBoundaries
+                    && obligation.layer == EvidenceLayer::Contract
+            ));
+    }
+}
+
+#[test]
+fn submission_scope_distinguishes_backends_and_independent_routes() {
+    let mut legacy = text_target("f32", Backend::Metal);
+    legacy.execution_path = "legacy-model-executor".into();
+    let mut quantized = legacy.clone();
+    quantized.precision = "gguf-q4_k_m".into();
+    quantized.architecture = "different-architecture".into();
+    let production = text_target("bf16", Backend::Metal);
+    let cuda = text_target("bf16", Backend::Cuda);
+    let targets = vec![
+        legacy.clone(),
+        quantized.clone(),
+        production.clone(),
+        cuda.clone(),
+    ];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| profile(&format!("scope-{index}"), target.clone()))
+            .collect(),
+    );
+    request.impact.areas = vec![ChangeArea::BackendSubmission];
+    let result = plan(&request).unwrap();
+    let scopes: Vec<_> = result
+        .obligations
+        .iter()
+        .filter(|obligation| obligation.behavior == Behavior::SubmissionCompletion)
+        .map(|obligation| obligation.scope.clone())
+        .collect();
+    assert_eq!(
+        scopes,
+        [
+            ObligationScope::ExecutionPath {
+                backend: Backend::Metal,
+                execution_path: legacy.execution_path.clone()
+            },
+            ObligationScope::ExecutionPath {
+                backend: Backend::Metal,
+                execution_path: production.execution_path.clone()
+            },
+            ObligationScope::ExecutionPath {
+                backend: Backend::Cuda,
+                execution_path: cuda.execution_path.clone()
+            },
+        ]
+    );
+    assert!(scope_matches(&scopes[0], &quantized, None));
+    assert!(!scope_matches(&scopes[0], &production, None));
+    let mut other_backend = legacy.clone();
+    other_backend.backend = Backend::Cuda;
+    assert!(!scope_matches(&scopes[0], &other_backend, None));
+    let wire = serde_json::to_value(&scopes[0]).unwrap();
+    assert_eq!(wire["kind"], "execution_path");
+    assert_eq!(
+        serde_json::from_value::<ObligationScope>(wire).unwrap(),
+        scopes[0]
+    );
+}
+
+#[test]
+fn submission_latency_sample_never_narrows_an_independent_kernel_requirement() {
+    let target = text_target("gguf-q4_k_m", Backend::Metal);
+    let scope = ObligationScope::Target { target };
+    for narrow_first in [true, false] {
+        let mut result = plan(&input(Stage::PullRequest, Vec::new(), Vec::new())).unwrap();
+        result.obligations.clear();
+        let narrow = vec![Entrypoint::ServeStream];
+        let broad = ENTRYPOINTS.to_vec();
+        let ordered = if narrow_first {
+            [narrow, broad]
+        } else {
+            [broad, narrow]
+        };
+        for entrypoints in ordered {
+            add_with_entrypoints(
+                &mut result,
+                Behavior::Performance,
+                EvidenceLayer::Performance,
+                scope.clone(),
+                "changed execution path",
+                entrypoints,
+            );
+        }
+        assert_eq!(result.obligations.len(), 1);
+        assert_eq!(result.obligations[0].entrypoints, ENTRYPOINTS);
+    }
+    let mut target = text_target("gguf-q4_k_m", Backend::Metal);
+    target.execution_path = "legacy-model-executor".into();
+    let mut request = input(
+        Stage::PullRequest,
+        vec![target.clone()],
+        vec![profile("sample", target)],
+    );
+    request.impact =
+        super::super::analyze_paths(["crates/ferrum-kernels/src/backend/metal/mod.rs"]);
+    mark_submission_proof(&mut request.impact);
+    let result = plan(&request).unwrap();
+    for obligation in &result.obligations {
+        if obligation.behavior == Behavior::Performance {
+            assert_eq!(obligation.entrypoints, [Entrypoint::ServeStream]);
+        } else if matches!(
+            obligation.behavior,
+            Behavior::ModelLoad | Behavior::ModelForward
+        ) {
+            assert_eq!(obligation.entrypoints, ENTRYPOINTS);
+        }
     }
 }

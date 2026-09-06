@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "workload": {
+      "input_tokens": 512,
+      "output_tokens": 128,
+      "measured_requests": 5,
+      "warmup_requests": 2,
+      "repeats": 3,
+      "seed": 42,
+      "max_model_len": 1024
+    },
+    "limits": {
+      "ttft_max_relative_increase": 0.1,
+      "tpot_max_relative_increase": 0.1
+    },
+    "runtime_memory_budget_bytes": 12884901888,
+    "startup_timeout_secs": 180,
+    "request_timeout_secs": 60,
+    "task_timeout_secs": 1800
+  },
+  "sources": [
+    {
+      "model": "llama3.1:8b-q4_k_m",
+      "gguf": {
+        "repository": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+      },
+      "tokenizer": {
+        "repository": "unsloth/Meta-Llama-3.1-8B-Instruct"
+      }
+    }
+  ]
+}

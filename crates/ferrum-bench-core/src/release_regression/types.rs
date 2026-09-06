@@ -11,6 +11,8 @@ pub enum ChangeArea {
     Tools,
     Scheduler,
     Kv,
+    /// Proven submission/completion lifecycle changes without operator changes.
+    BackendSubmission,
     Kernel,
     Architecture,
     Build,
@@ -18,7 +20,7 @@ pub enum ChangeArea {
     Validation,
 }
 impl ChangeArea {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Download,
         Self::Template,
         Self::Termination,
@@ -26,6 +28,7 @@ impl ChangeArea {
         Self::Tools,
         Self::Scheduler,
         Self::Kv,
+        Self::BackendSubmission,
         Self::Kernel,
         Self::Architecture,
         Self::Build,
@@ -171,7 +174,10 @@ pub enum Behavior {
     CapacityAdmission,
     KvIsolation,
     KvRelease,
+    /// Resume supported preemption by recomputing preserved prompt/generated
+    /// history after physical KV release; does not imply KV swapping support.
     KvResume,
+    SubmissionCompletion,
     KernelNumerics,
     KernelBoundaries,
     ModelLoad,
@@ -203,6 +209,12 @@ pub enum ObligationScope {
     Global,
     Backend {
         backend: Backend,
+    },
+    /// Backend command submission is shared across model weight precisions and
+    /// architectures, but independent execution routes cannot represent it.
+    ExecutionPath {
+        backend: Backend,
+        execution_path: String,
     },
     Architecture {
         architecture: String,
