@@ -9,7 +9,9 @@ use ferrum_bench_core::{
         },
         distribution::distribution_check_descriptors,
         model_schedule::{model_check_descriptors, model_task_schedule, ModelTaskSchedule},
-        model_tasks::{verify_model_reports, ExpectedModelRun, ModelCheck},
+        model_tasks::{
+            verify_model_reports, ExpectedModelRun, ModelCheck, DEFAULT_FUNCTIONAL_CAPACITY,
+        },
         Backend, Behavior, CheckDescriptor, EvidenceLayer, Gap, Obligation, ObligationScope, Plan,
         Stage,
     },
@@ -460,12 +462,14 @@ fn validate_tasks(
             || expected.binary_sha256 != binary.binary_sha256
             || expected.disable_thinking != run.quick_start
             || expected.use_default_backend != run.quick_start
+            || expected.runtime_capacity
+                != (!run.quick_start).then_some(DEFAULT_FUNCTIONAL_CAPACITY)
             || expected.checks.iter().copied().collect::<BTreeSet<_>>()
                 != run.checks.iter().copied().collect::<BTreeSet<_>>()
             || expected.checks.len() != run.checks.len()
         {
             return Err(format!(
-                "model task {} differs from selected profile/checks/Quick Start/staged bytes",
+                "model task {} differs from selected profile/checks/Quick Start/capacity/staged bytes",
                 expected.profile.id
             ));
         }

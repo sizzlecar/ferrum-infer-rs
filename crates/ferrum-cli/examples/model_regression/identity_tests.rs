@@ -109,3 +109,83 @@ fn successful_http_status_cannot_replace_healthy_runtime_status() {
         assert!(validate_serve(&expected, &record).is_err());
     }
 }
+
+#[test]
+fn functional_capacity_uses_public_flags_in_both_entrypoints_and_actual_health() {
+    let mut functional = args("metal");
+    functional.context_tokens = Some(2048);
+    functional.max_num_seqs = Some(1);
+    functional
+        .runtime_capacity()
+        .unwrap()
+        .validate(functional.max_tokens)
+        .unwrap();
+    for entrypoint in ["run", "serve"] {
+        let command = functional.common_args(entrypoint);
+        assert_eq!(
+            command.iter().any(|arg| arg == "--no-context-shift"),
+            entrypoint == "run"
+        );
+        for pair in [
+            ["--kv-capacity", "2048"],
+            ["--max-model-len", "2048"],
+            ["--max-num-seqs", "1"],
+        ] {
+            assert!(command.windows(2).any(|args| args == pair));
+        }
+        let defaults = args("metal").common_args(entrypoint);
+        assert!(!defaults.iter().any(|arg| matches!(
+            arg.as_str(),
+            "--kv-capacity" | "--max-model-len" | "--max-num-seqs" | "--no-context-shift"
+        )));
+    }
+    let mut observed = health("metal");
+    observed["auto_config"]["selected_max_model_len"] = json!(2048);
+    observed["auto_config"]["selected_kv_capacity"] = json!(2048);
+    observed["auto_config"]["selected_max_sequences"] = json!(1);
+    validate_serve(&functional, &observed).unwrap();
+    for (field, value) in [
+        ("selected_max_model_len", json!(4096)),
+        ("selected_kv_capacity", json!(512)),
+        ("selected_max_sequences", json!(2)),
+    ] {
+        let mut mismatched = observed.clone();
+        mismatched["auto_config"][field] = value;
+        assert!(validate_serve(&functional, &mismatched).is_err());
+    }
+    functional.context_tokens = Some(functional.max_tokens);
+    assert!(functional
+        .runtime_capacity()
+        .unwrap()
+        .validate(functional.max_tokens)
+        .is_err());
+}
+
+#[test]
+fn capacity_cli_requires_both_positive_limits() {
+    let base = [
+        "model-regression",
+        "--ferrum-bin",
+        "fixture",
+        "--model",
+        "fixture:model",
+        "--backend",
+        "metal",
+        "--report-dir",
+        "fixture",
+    ];
+    for extra in [
+        vec!["--context-tokens", "2048"],
+        vec!["--max-num-seqs", "1"],
+        vec!["--context-tokens", "0", "--max-num-seqs", "1"],
+    ] {
+        assert!(Args::try_parse_from(base.into_iter().chain(extra)).is_err());
+    }
+    assert!(Args::try_parse_from(base.into_iter().chain([
+        "--context-tokens",
+        "2048",
+        "--max-num-seqs",
+        "1"
+    ]))
+    .is_ok());
+}

@@ -201,6 +201,8 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
                 | "examples/model_regression/cases.rs"
                 | "examples/model_regression/process.rs"
                 | "examples/model_regression/protocol.rs"
+                | "examples/model_regression/stop.rs"
+                | "examples/model_regression/stop_tests.rs"
                 | "examples/model_regression/identity.rs"
                 | "examples/model_regression/identity_tests.rs"
                 | "examples/model_regression/boundaries.rs"
@@ -590,6 +592,8 @@ mod tests {
             "crates/ferrum-cli/examples/model_regression/cases.rs",
             "crates/ferrum-cli/examples/model_regression/process.rs",
             "crates/ferrum-cli/examples/model_regression/protocol.rs",
+            "crates/ferrum-cli/examples/model_regression/stop.rs",
+            "crates/ferrum-cli/examples/model_regression/stop_tests.rs",
             "crates/ferrum-bench-core/src/release_regression/selection.rs",
             "crates/ferrum-bench-core/src/release_candidate/staging.rs",
             "crates/ferrum-bench-core/examples/release_delivery.rs",

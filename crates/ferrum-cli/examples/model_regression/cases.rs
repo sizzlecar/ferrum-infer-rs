@@ -1,6 +1,9 @@
 #[path = "boundaries.rs"]
 mod boundaries;
+#[path = "stop.rs"]
+mod stop;
 pub(super) use boundaries::{run_length, run_reasoning, serve_length, serve_reasoning};
+pub(super) use stop::{run_stop, serve_stop};
 
 use super::process::{self, Server};
 use super::protocol::{self, answer, Chat};
@@ -70,8 +73,39 @@ fn run_deltas(
     Ok(Some(text))
 }
 
+#[derive(Clone, Copy)]
+enum RunCaptureMode {
+    Natural,
+    Stop { disable_thinking: bool },
+}
+
+impl RunCaptureMode {
+    fn accepts(self, finish: Option<&str>) -> bool {
+        matches!(finish, Some("stop" | "eos"))
+            || matches!((self, finish), (Self::Stop { .. }, Some("length")))
+    }
+}
+
 async fn run_chat(args: &Args, name: &str, input: Input<'_>, stop: Option<&str>) -> Result<Run> {
+    capture_run(args, name, input, stop, RunCaptureMode::Natural).await
+}
+
+async fn capture_run(
+    args: &Args,
+    name: &str,
+    input: Input<'_>,
+    stop: Option<&str>,
+    mode: RunCaptureMode,
+) -> Result<Run> {
     let mut argv = args.common_args("run");
+    if let RunCaptureMode::Stop {
+        disable_thinking: true,
+    } = mode
+    {
+        if !argv.iter().any(|arg| arg == "--disable-thinking") {
+            argv.push("--disable-thinking".into());
+        }
+    }
     argv.extend([
         "--output-format".into(),
         "jsonl".into(),
@@ -114,8 +148,8 @@ async fn run_chat(args: &Args, name: &str, input: Input<'_>, stop: Option<&str>)
         .collect();
     for assistant in &assistants {
         ensure!(
-            matches!(assistant["finish_reason"].as_str(), Some("stop" | "eos")),
-            "run did not finish naturally: {assistant}"
+            mode.accepts(assistant["finish_reason"].as_str()),
+            "run finish reason is invalid for this probe: {assistant}"
         );
         ensure!(
             assistant["usage"]["completion_tokens"]
@@ -164,58 +198,6 @@ pub(super) async fn run_basic(args: &Args) -> Result<Value> {
         }
     }
     Ok(json!({"ready": run.ready, "answers": run.assistants}))
-}
-
-pub(super) async fn run_stop(args: &Args) -> Result<Value> {
-    let baseline = run_chat(
-        args,
-        "run-stop-baseline",
-        Input::Prompt(&args.stop_prompt),
-        None,
-    )
-    .await?;
-    ensure!(
-        baseline.assistants.len() == 1,
-        "baseline must return one answer"
-    );
-    let content = baseline.assistants[0]["content"]
-        .as_str()
-        .context("baseline content")?;
-    let reasoning = baseline.assistants[0]["reasoning"].as_str().unwrap_or("");
-    let baseline_streamed =
-        run_deltas(&baseline.records, &baseline.assistants[0], false)?.is_some();
-    let (expected, stop) = protocol::stop_from_baseline(content, reasoning)?;
-    let stopped = run_chat(
-        args,
-        "run-stop-replay",
-        Input::Prompt(&args.stop_prompt),
-        Some(&stop),
-    )
-    .await?;
-    ensure!(
-        stopped.assistants.len() == 1,
-        "stop replay must return one answer"
-    );
-    let actual = stopped.assistants[0]["content"]
-        .as_str()
-        .context("stopped content")?;
-    ensure!(
-        actual.trim_end() == expected.trim_end(),
-        "run stop prefix mismatch: expected {expected:?}, received {actual:?}"
-    );
-    ensure!(
-        stopped.assistants[0]["finish_reason"] == "stop",
-        "run did not hit the selected stop"
-    );
-    let deltas = run_deltas(&stopped.records, &stopped.assistants[0], baseline_streamed)?
-        .unwrap_or_default();
-    ensure!(
-        !deltas.contains(&stop),
-        "run streamed the stop sentinel before hiding it in the final answer"
-    );
-    Ok(
-        json!({"ready": stopped.ready, "baseline_ready": baseline.ready, "baseline": content, "stop": stop, "expected_prefix": expected, "actual": actual}),
-    )
 }
 
 fn request(server: &Server<'_>, messages: Vec<Value>) -> Value {
@@ -296,48 +278,6 @@ pub(super) async fn serve_basic(server: &Server<'_>) -> Result<Value> {
     }
     Ok(
         json!({"observations": observations, "models": models, "sync_answer": first.content(), "recall": recall.content(), "stream_recall": streamed_recall.content(), "stream_recall_usage": streamed_recall.usage, "stream_answer": streamed.content(), "stream_usage": streamed.usage}),
-    )
-}
-
-pub(super) async fn serve_stop(server: &Server<'_>) -> Result<Value> {
-    let mut body = request(
-        server,
-        vec![json!({"role": "user", "content": server.args.stop_prompt})],
-    );
-    let baseline = chat(server, "serve-stop-baseline", body.clone(), false).await?;
-    ensure!(
-        baseline.finish == "stop",
-        "baseline exhausted its output budget"
-    );
-    let (expected, stop) = protocol::stop_from_baseline(
-        baseline.content(),
-        baseline.message["reasoning"].as_str().unwrap_or(""),
-    )?;
-    body["stop"] = json!([stop]);
-    let mut outputs = Vec::new();
-    for (name, stream) in [("serve-stop-sync", false), ("serve-stop-stream", true)] {
-        let actual = chat(server, name, body.clone(), stream).await?;
-        ensure!(
-            actual.finish == "stop",
-            "stop replay did not hit the selected boundary"
-        );
-        ensure!(
-            actual.content().trim_end() == expected.trim_end(),
-            "{name} stop prefix mismatch: expected {expected:?}, received {:?}",
-            actual.content()
-        );
-        ensure!(
-            !actual.content().contains(&stop)
-                && !actual.message["reasoning"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains(&stop),
-            "{name} leaked stop sentinel"
-        );
-        outputs.push(actual.message);
-    }
-    Ok(
-        json!({"baseline": baseline.message, "stop": stop, "expected_prefix": expected, "outputs": outputs}),
     )
 }
 

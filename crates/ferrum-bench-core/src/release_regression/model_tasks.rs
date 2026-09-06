@@ -1,9 +1,10 @@
 //! Match selected real-model tasks to the existing runner's terminal results.
 //!
-//! The runner owns the semantic oracles. This module detects missing execution,
-//! failed checks and mismatched inputs; it neither replays raw responses nor
-//! treats a declared target or a binary digest as numerical evidence. Success
-//! here covers only the requested model runs, not installation or release approval.
+//! The runner parses the actual product protocols. This module detects missing
+//! execution and mismatched inputs, and rechecks the recorded behavior
+//! observations, including available raw stop prefixes. Declared targets and
+//! binary digests are not numerical evidence or release approval.
+pub use super::model_stop_evidence::verify_stop_raw_observations;
 use super::types::{Backend, ExecutionTarget, ModelProfile};
 use ferrum_types::ModelReasoningProtocol;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,10 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
+
+/// Workload text; stop boundaries come from actual observed output channels.
+/// A reasoning stop never substitutes for the independently required final stop.
+pub const DEFAULT_STOP_PROMPT: &str = "Write a short original paragraph about rain falling on a quiet street. Use your own wording and provide only the paragraph.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -65,6 +70,53 @@ impl ModelCheck {
     }
 }
 
+/// Explicit capacity for a functional workload, separate from product defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRunCapacity {
+    pub context_tokens: u32,
+    pub max_num_seqs: u32,
+}
+
+/// Functional correctness workload policy; Quick Start retains product defaults.
+pub const DEFAULT_FUNCTIONAL_CAPACITY: ModelRunCapacity = ModelRunCapacity {
+    context_tokens: 2048,
+    max_num_seqs: 1,
+};
+
+impl ModelRunCapacity {
+    pub fn validate(self, max_tokens: u32) -> Result<(), String> {
+        if self.max_num_seqs == 0 || max_tokens == 0 || max_tokens >= self.context_tokens {
+            return Err("functional capacity must have positive concurrency and room for prompt plus output".into());
+        }
+        Ok(())
+    }
+
+    pub fn verify_health(self, health: &Value) -> Result<(), String> {
+        let actual = &health["auto_config"];
+        for field in ["selected_max_model_len", "selected_kv_capacity"] {
+            if !actual[field]
+                .as_u64()
+                .is_some_and(|n| n == u64::from(self.context_tokens))
+            {
+                return Err(format!(
+                    "runtime {field} differs from the declared functional context"
+                ));
+            }
+        }
+        if !actual["selected_max_sequences"]
+            .as_u64()
+            .is_some_and(|n| n > 0 && n <= u64::from(self.max_num_seqs))
+        {
+            return Err(
+                "runtime concurrency exceeds or does not expose the functional capacity ceiling"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Inputs fixed before the runner starts. The target is a declared execution
 /// class; readiness observations independently check the selected backend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +129,8 @@ pub struct ExpectedModelRun {
     pub disable_thinking: bool,
     pub use_default_backend: bool,
     pub max_tokens: u32,
+    #[serde(default)]
+    pub runtime_capacity: Option<ModelRunCapacity>,
     pub reasoning_alias_replay: bool,
     pub stop_prompt: String,
 }
@@ -109,7 +163,7 @@ fn digest_matches(value: &Value, expected: &str) -> bool {
         .is_some_and(|value| sha256(value) && value.eq_ignore_ascii_case(expected))
 }
 
-fn backend_name(backend: Backend) -> &'static str {
+pub(super) fn backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::Cpu => "cpu",
         Backend::Metal => "metal",
@@ -117,7 +171,7 @@ fn backend_name(backend: Backend) -> &'static str {
     }
 }
 
-fn run_backend(value: &Value) -> Option<Backend> {
+pub(super) fn run_backend(value: &Value) -> Option<Backend> {
     match value.as_str()? {
         "CPU" => Some(Backend::Cpu),
         "Metal" => Some(Backend::Metal),
@@ -179,6 +233,11 @@ fn expected_errors(expected: &ExpectedModelRun) -> Vec<String> {
         !expected.checks.is_empty(),
         "expected model checks must not be empty",
     );
+    if let Some(capacity) = expected.runtime_capacity {
+        if let Err(error) = capacity.validate(expected.max_tokens) {
+            errors.push(error);
+        }
+    }
     let checks: BTreeSet<_> = expected.checks.iter().copied().collect();
     require(
         &mut errors,
@@ -235,6 +294,22 @@ pub fn verify_model_options(
         options["max_tokens"].as_u64() == Some(u64::from(expected.max_tokens)),
         "options.max_tokens differs from the expected task",
     );
+    for (field, value) in [
+        (
+            "context_tokens",
+            expected.runtime_capacity.map(|c| c.context_tokens),
+        ),
+        (
+            "max_num_seqs",
+            expected.runtime_capacity.map(|c| c.max_num_seqs),
+        ),
+    ] {
+        require(
+            &mut errors,
+            options[field] == serde_json::json!(value),
+            format!("options.{field} differs from the expected runtime capacity"),
+        );
+    }
     match serde_json::from_value::<Vec<ModelCheck>>(options["checks"].clone()) {
         Ok(checks) => {
             let actual: BTreeSet<_> = checks.iter().copied().collect();
@@ -390,6 +465,11 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
     }
     if let Some(case) = recorded.get("serve-startup") {
         let health = &case["evidence"];
+        if let Some(capacity) = expected.runtime_capacity {
+            if let Err(error) = capacity.verify_health(health) {
+                errors.push(error);
+            }
+        }
         if expected.checks.contains(&ModelCheck::Reasoning)
             || (expected.profile.reasoning_protocol == ModelReasoningProtocol::None
                 && expected.checks.contains(&ModelCheck::Basic))
@@ -445,6 +525,17 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
                 run_backend(&ready["backend"]) == Some(expected.profile.target.backend),
                 format!("{name} backend is unobservable or differs from the expected backend"),
             );
+        }
+    }
+    for name in ["run-stop", "serve-stop"] {
+        if let Some(case) = recorded.get(name) {
+            if let Err(error) = super::model_stop_evidence::verify_case(
+                expected,
+                &case["evidence"],
+                name == "run-stop",
+            ) {
+                errors.push(format!("{name}: {error}"));
+            }
         }
     }
     if let Some(case) = recorded.get("run-length") {

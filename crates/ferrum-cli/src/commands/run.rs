@@ -4129,6 +4129,80 @@ mod tests {
     }
 
     #[test]
+    fn no_context_shift_preserves_history_at_capacity_and_rejects_overflow() {
+        let mut cmd = test_run_cmd();
+        cmd.no_context_shift = true;
+        cmd.max_tokens = 8;
+        let history = vec![
+            RunHistoryMessage::new("user", "Remember the identifier cobalt-731."),
+            RunHistoryMessage::new("assistant", "I will remember cobalt-731."),
+        ];
+        let input = "What identifier did I ask you to remember?";
+        let options = default_template_options();
+        let template = ModelChatTemplate::new(
+            "{% for message in messages %}{{ message.role }} {{ message.content }} {% endfor %}{% if add_generation_prompt %}assistant{% endif %}",
+            "context-budget-fixture",
+        );
+        let full_prompt =
+            build_chat_prompt(&history, input, None, "fixture", Some(&template), &options).unwrap();
+        let prompt_tokens = full_prompt.split_whitespace().count();
+        let output_tokens = usize::try_from(cmd.max_tokens).unwrap();
+        let capacity = prompt_tokens + output_tokens;
+        let budget = whitespace_budget(capacity);
+        let plan = build_run_prompt_plan(
+            &history,
+            input,
+            None,
+            "fixture",
+            Some(&template),
+            &options,
+            &cmd,
+            &budget,
+        )
+        .expect("no-context-shift accepts the complete history at the exact boundary");
+
+        assert_eq!(plan.prompt, full_prompt);
+        assert!(plan.prompt.contains(&history[0].prompt.content));
+        assert!(plan.prompt.contains(&history[1].prompt.content));
+        assert_eq!(plan.prompt_tokens, Some(prompt_tokens));
+        assert_eq!(plan.sampling_params.max_tokens, output_tokens);
+        assert_eq!(plan.dropped_history_messages, 0);
+        assert_eq!(plan.dropped_history_turns, 0);
+        assert_eq!(plan.max_tokens_clamped_from, None);
+
+        cmd.max_tokens += 1;
+        assert!(
+            build_run_prompt_plan(
+                &history,
+                input,
+                None,
+                "fixture",
+                Some(&template),
+                &options,
+                &cmd,
+                &budget,
+            )
+            .is_err(),
+            "no-context-shift must not silently reduce the output budget"
+        );
+
+        assert!(
+            build_run_prompt_plan(
+                &history,
+                input,
+                None,
+                "fixture",
+                Some(&template),
+                &options,
+                &cmd,
+                &whitespace_budget(prompt_tokens),
+            )
+            .is_err(),
+            "no-context-shift must not discard history to create output space"
+        );
+    }
+
+    #[test]
     fn kv_budget_accepts_request_inside_capacity() {
         assert!(fits_kv_budget(&default_params(512), Some(64), Some(2048)));
     }

@@ -64,7 +64,11 @@ pub(super) fn validate_serve(args: &Args, health: &Value) -> Result<()> {
         args,
         &health["auto_config"]["hardware_capabilities"]["backend"],
     )
-    .context("serve runtime identity")
+    .context("serve runtime identity")?;
+    if let Some(capacity) = args.runtime_capacity() {
+        capacity.verify_health(health).map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

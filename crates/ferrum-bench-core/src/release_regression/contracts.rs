@@ -97,7 +97,7 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         ("tool-continuation", ToolContinuation, http, vec![server("route_tool_request_reaches_engine_structured_boundary"), server("route_tool_request_prefers_model_chat_template")]),
         ("scheduling-progress", SchedulingProgress, all.clone(), vec![scheduler("deferred_head_does_not_block_an_eligible_smaller_request"), scheduler("release_epoch_wakes_and_admits_a_deferred_request"), scheduler("unchanged_evidence_suppresses_blind_retries")]),
         ("cancellation", Cancellation, all.clone(), vec![scheduler("cancellation_returns_the_exact_waiting_request"), engine("plan_runtime_capacity_wait_wakes_and_cancels_when_stream_is_dropped"), engine("plan_runtime_capacity_wait_wakes_and_cancels_when_sync_future_is_aborted")]),
-        ("capacity-admission", CapacityAdmission, all.clone(), vec![scheduler("permanent_rejection_and_fault_leave_no_waiting_ownership"), kv("failed_allocate_rolls_back_partial_blocks"), kv("failed_extend_rolls_back_partial_blocks_and_handle_table")]),
+        ("capacity-admission", CapacityAdmission, all.clone(), vec![scheduler("permanent_rejection_and_fault_leave_no_waiting_ownership"), kv("failed_allocate_rolls_back_partial_blocks"), kv("failed_extend_rolls_back_partial_blocks_and_handle_table"), engine("explicit_request_budget_accepts_exact_capacity_and_rejects_one_token_over"), lib("ferrum-cli", "commands::run::tests::no_context_shift_preserves_history_at_capacity_and_rejects_overflow")]),
         // CPU tiny forward and real paged-manager rollback. The tiny engine's
         // allocation handles are mocks; this does not certify GPU cache arithmetic.
         ("kv-isolation", KvIsolation, all.clone(), vec![tiny("tiny_stack_concurrent_sessions_isolated")]),

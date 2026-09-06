@@ -189,6 +189,8 @@ fn cuda_tasks(
         }
         verify_model_options(&task,&json!({"profile_id":task.profile.id,"model":task.profile.model,"backend":"cuda",
             "stop_prompt":task.stop_prompt,"disable_thinking":task.disable_thinking,"use_default_backend":task.use_default_backend,
+            "context_tokens":task.runtime_capacity.as_ref().map(|capacity|capacity.context_tokens),
+            "max_num_seqs":task.runtime_capacity.as_ref().map(|capacity|capacity.max_num_seqs),
             "reasoning_alias_replay":task.reasoning_alias_replay,"max_tokens":task.max_tokens,"checks":task.checks}))
             .map_err(|issues|issues.join("; "))?;
         cuda.push(task);
