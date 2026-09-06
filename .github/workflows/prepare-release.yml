@@ -1,0 +1,79 @@
+name: Prepare formal release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Formal MAJOR.MINOR.PATCH version to prepare
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: prepare-formal-release
+  cancel-in-progress: false
+
+jobs:
+  version-pr:
+    if: github.repository == 'sizzlecar/ferrum-infer-rs' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ inputs.version }}
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      # This token needs repository/workflow permission. Unlike GITHUB_TOKEN,
+      # its branch/PR events start ordinary required CI before automatic merge.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.91.0
+      - name: Prepare coordinated version inputs
+        id: version
+        run: |
+          cargo run --locked -p ferrum-bench-core --example release_candidate -- \
+            prepare --workspace . --version "$VERSION"
+          git diff --check
+          git config user.name ferrum-release
+          git config user.email ferrum-release@users.noreply.github.com
+          git switch -c "release/v$VERSION"
+          # The preparer edits only coordinated manifests and Cargo.lock.
+          git add -- Cargo.lock Cargo.toml 'crates/*/Cargo.toml'
+          if git diff --cached --quiet; then
+            echo 'Version is unchanged; no release PR is necessary.' >> "$GITHUB_STEP_SUMMARY"
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A retry may follow a successful push but a failed API request.
+          # Reuse the existing branch only if its complete proposed tree agrees.
+          if git show-ref --verify --quiet "refs/remotes/origin/release/v$VERSION"; then
+            test "$(git write-tree)" = "$(git rev-parse "origin/release/v$VERSION^{tree}")"
+          else
+            git commit -m "chore: prepare v$VERSION"
+            git push origin "HEAD:refs/heads/release/v$VERSION"
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - name: Open version PR and enable merge after required CI
+        if: steps.version.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+        run: |
+          body="$RUNNER_TEMP/release-pr.md"
+          printf 'Prepare Ferrum v%s with coordinated workspace and internal dependency versions.\n\nRequired PR CI must pass before merge. The merged version starts candidate staging, selected real-model regression, gated publication, and public installation checks.\n' "$VERSION" > "$body"
+          pr=$(gh pr list --head "release/v$VERSION" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -z "$pr" ]; then
+            gh pr create --head "release/v$VERSION" --base main \
+              --title "chore: prepare v$VERSION" --body-file "$body"
+            pr=$(gh pr list --head "release/v$VERSION" --base main --state open --json number --jq '.[0].number')
+          fi
+          test -n "$pr"
+          gh pr merge "$pr" --auto --squash

@@ -5,6 +5,8 @@ mod scope;
 
 #[cfg(test)]
 use ferrum_bench_core::release_regression::analyze_paths;
+use ferrum_bench_core::release_regression::contracts::contract_check_descriptors;
+use ferrum_bench_core::release_regression::distribution::distribution_check_descriptors;
 use ferrum_bench_core::release_regression::model_schedule::{
     model_check_descriptors, model_task_schedule,
 };
@@ -176,7 +178,11 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
     );
     let mut input: PlanInput = serde_json::from_value(Value::Object(input))
         .map_err(|error| format!("invalid product catalog: {error}"))?;
-    for descriptor in model_check_descriptors() {
+    for descriptor in model_check_descriptors()
+        .into_iter()
+        .chain(contract_check_descriptors())
+        .chain(distribution_check_descriptors())
+    {
         if input.checks.iter().any(|check| check.id == descriptor.id) {
             return Err(format!(
                 "catalog cannot replace built-in checker {}",
@@ -232,7 +238,9 @@ fn run(args: Args) -> Result<(), String> {
         "stage": args.stage,
         "provenance": {"base": base, "candidate": candidate, "changed_paths": paths,
             "catalog_sha256": format!("{:x}", Sha256::digest(&catalog_bytes)),
-            "release_base_tag": release_base_tag, "version_refinement": analysis.version_refinement},
+            "release_base_tag": release_base_tag, "version_refinement": analysis.version_refinement,
+            "dependency_refinement": analysis.dependency_refinement,
+            "content_refinement": analysis.content_refinement},
         "model_tasks": model_task_schedule(&plan),
         "plan": plan,
     });
@@ -332,6 +340,30 @@ mod tests {
             assert!(
                 plan_input(catalog, "release", analyze_paths(Vec::<String>::new())).is_err(),
                 "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_cpu_contracts_are_executable_bindings_and_cannot_be_shadowed() {
+        let empty = json!({"profiles": [], "quick_start_profile_ids": [], "required_targets": []});
+        let input = plan_input(
+            empty.clone(),
+            "pull_request",
+            analyze_paths(Vec::<String>::new()),
+        )
+        .unwrap();
+        for descriptor in contract_check_descriptors()
+            .into_iter()
+            .chain(distribution_check_descriptors())
+        {
+            assert!(input.checks.contains(&descriptor));
+            let mut catalog = empty.clone();
+            catalog["checks"] = json!([descriptor]);
+            assert!(
+                plan_input(catalog, "pull_request", analyze_paths(Vec::<String>::new()))
+                    .unwrap_err()
+                    .contains("cannot replace built-in checker")
             );
         }
     }
@@ -564,5 +596,137 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         );
         assert!(scope::validate_release_base(&repo.0, &older, &candidate).is_err());
         assert!(scope::validate_release_base(&repo.0, &candidate, &candidate).is_err());
+    }
+    #[test]
+    fn content_scope_uses_committed_rust_and_preserves_actual_metal_changes() {
+        use ferrum_bench_core::release_regression::ChangeArea;
+        let repo = GitFixture::new();
+        fs::create_dir_all(repo.0.join("crates/ferrum-cli/src/commands")).unwrap();
+        fs::create_dir_all(repo.0.join("crates/ferrum-kernels/src/backend/metal")).unwrap();
+        let run = "crates/ferrum-cli/src/commands/run.rs";
+        let metal = "crates/ferrum-kernels/src/backend/metal/mod.rs";
+        fs::write(repo.0.join(run), "pub fn run() {}\n").unwrap();
+        fs::write(
+            repo.0.join(metal),
+            "pub fn synchronize() -> bool { true }\n",
+        )
+        .unwrap();
+        let base = repo.commit();
+        fs::write(repo.0.join(run), "pub fn run() {}\n#[cfg(test)] mod tests { #[test] fn boundary() { assert_eq!(1 + 1, 2); } }\n").unwrap();
+        let test_candidate = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &test_candidate).unwrap();
+        let analysis = scope::analyze(&repo.0, &base, &test_candidate, &paths);
+        assert_eq!(analysis.impact.areas, [ChangeArea::Validation]);
+        assert_eq!(
+            analysis.content_refinement["rust_validation_paths"],
+            json!([run])
+        );
+        fs::write(
+            repo.0.join(metal),
+            "pub fn synchronize() -> bool { false }\n",
+        )
+        .unwrap();
+        let candidate = repo.commit();
+        // Uncommitted text must not replace the candidate's production AST.
+        fs::write(
+            repo.0.join(run),
+            "pub fn run() { panic!(\"dirty unrelated source\"); }\n",
+        )
+        .unwrap();
+        let paths = changed_paths_between(&repo.0, &base, &candidate).unwrap();
+        let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
+        assert!(analysis.impact.areas.contains(&ChangeArea::Kernel));
+        assert!(!analysis.impact.areas.contains(&ChangeArea::Architecture));
+        assert!(analysis.impact.areas.contains(&ChangeArea::Validation));
+        assert!(!analysis.impact.areas.contains(&ChangeArea::Download));
+    }
+
+    #[test]
+    fn dev_dependency_git_snapshot_refinement_does_not_infer_changed_kernels() {
+        use ferrum_bench_core::release_regression::ChangeArea;
+        let repo = GitFixture::new();
+        workspace_fixture(&repo);
+        let base = repo.commit();
+        let member = repo.0.join("crates/ferrum-engine/Cargo.toml");
+        let mut text = fs::read_to_string(&member).unwrap();
+        text.push_str("[dev-dependencies]\nfixture_test = '1'\n");
+        fs::write(member, text).unwrap();
+        let lock = repo.0.join("Cargo.lock");
+        let mut text = fs::read_to_string(&lock).unwrap();
+        text.push_str("dependencies = ['fixture_test']\n[[package]]\nname = 'fixture_test'\nversion = '1.0.0'\nsource = 'registry+https://example.invalid/index'\nchecksum = 'fixture'\n");
+        fs::write(lock, text).unwrap();
+        let candidate = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &candidate).unwrap();
+        let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
+        assert_eq!(
+            analysis.dependency_refinement["applied"], true,
+            "{:?}",
+            analysis.dependency_refinement
+        );
+        assert_eq!(analysis.impact.areas, [ChangeArea::Validation]);
+    }
+
+    #[test]
+    fn private_tool_manifest_only_change_cannot_keep_validation_scope_when_isolation_fails() {
+        use ferrum_bench_core::release_regression::ChangeArea;
+        let repo = GitFixture::new();
+        workspace_fixture(&repo);
+        let root_path = repo.0.join("Cargo.toml");
+        let root = fs::read_to_string(&root_path).unwrap().replace(
+            "members = [\"crates/ferrum-engine\"]",
+            "members = [\"crates/ferrum-engine\", \"crates/ferrum-devtools\"]",
+        );
+        fs::write(root_path, root).unwrap();
+        fs::create_dir_all(repo.0.join("crates/ferrum-devtools")).unwrap();
+        let path = "crates/ferrum-devtools/Cargo.toml";
+        let manifest = "[package]\nname='ferrum-devtools'\nversion.workspace=true\npublish=false\n[[bin]]\nname='release_delivery'\npath='src/bin/release_delivery.rs'\n[[bin]]\nname='contract_checks'\npath='src/bin/contract_checks.rs'\n";
+        fs::write(repo.0.join(path), manifest).unwrap();
+        let lock_path = repo.0.join("Cargo.lock");
+        let mut lock = fs::read_to_string(&lock_path).unwrap();
+        lock.push_str("[[package]]\nname='ferrum-devtools'\nversion='1.2.3'\n");
+        fs::write(lock_path, lock).unwrap();
+        let base = repo.commit();
+        fs::write(
+            repo.0.join(path),
+            manifest.replace("publish=false", "publish=true"),
+        )
+        .unwrap();
+        let candidate = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &candidate).unwrap();
+        assert_eq!(paths, [path]);
+        let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
+        assert_eq!(analysis.dependency_refinement["applied"], false);
+        assert_eq!(analysis.impact.areas, ChangeArea::ALL);
+    }
+
+    #[test]
+    fn homebrew_only_readme_changes_require_installation_while_new_models_still_require_review() {
+        use ferrum_bench_core::release_regression::ChangeArea;
+        let repo = GitFixture::new();
+        let before = "# Product\n## Quick Start\nInstall Ferrum:\n```bash\nbrew install ferrum\n```\n```bash\nferrum run stable-model\n```\n## Installation\nHomebrew:\n```bash\nbrew install ferrum\n```\n";
+        fs::write(repo.0.join("README.md"), before).unwrap();
+        let base = repo.commit();
+        let installation = before.replace(
+            "brew install ferrum",
+            "brew trust --formula owner/project/ferrum\nbrew install ferrum",
+        );
+        fs::write(repo.0.join("README.md"), &installation).unwrap();
+        let candidate = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &candidate).unwrap();
+        let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
+        assert_eq!(analysis.impact.areas, [ChangeArea::Build]);
+        assert!(!analysis.impact.product_contract_changed);
+        fs::write(
+            repo.0.join("README.md"),
+            installation.replace("stable-model", "new-model"),
+        )
+        .unwrap();
+        let new_model = repo.commit();
+        let paths = changed_paths_between(&repo.0, &base, &new_model).unwrap();
+        assert!(
+            scope::analyze(&repo.0, &base, &new_model, &paths)
+                .impact
+                .product_contract_changed
+        );
     }
 }

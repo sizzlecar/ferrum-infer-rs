@@ -144,32 +144,28 @@ publication requests and injection strings. These checks establish the tested
 input and declared credential boundaries. They are not a general proof that any
 future shell script or third-party action can never publish.
 
-## Remaining execution and promotion work
+## Publish a formal release
 
-The [model runner](release-regression.md#rust-model-runner),
-[regression catalog](release-regression-catalog.md) and
-[model-task gate](release-regression.md#verify-selected-model-tasks) now connect
-a limited ModelRuntime scope. `model_gate prepare` reads a generated plan plus
-adjacent `.abi.json`/`.version.json` staging records to fix expected tasks before
-execution. The runner checks the actual staged binary digest/version, task
-options and observed backend, executes its semantic assertions, and produces a
-schema-2 terminal report. `model_gate verify` rejects missing, failed, duplicate,
-unfinished or mismatched model reports and retains remaining plan gaps.
+Start [Prepare formal release](../.github/workflows/prepare-release.yml) on `main`
+with a higher formal version. It opens a version PR and enables merge after CI.
+Merging starts [release delivery](../.github/workflows/release-delivery.yml):
+candidate builds, selected model checks, Cargo/GitHub/Homebrew publication and
+actual public installation checks. Require the final `complete` job to succeed.
 
-Quick Start uses the normal alias, automatic backend and disabled thinking with
-controlled prompts, without capacity/template overrides or another model load.
-Other checks for the same profile share its server instance. This validates the
-implemented model-task obligations; it does not verify archive contents,
-installation, numerical references, every declared execution path, or complete
-release correctness. The gate reports `release_approved: false` even on success.
+Configure these repository Actions secrets before starting:
 
-Automatic local/cloud capacity selection, full-plan execution, raw report replay,
-and the complete evidence gate immediately before publishing remain pending. Cloud
-provider/runner selection and its integration also remain pending; the catalog's
-resource discussion is background, not a configured paid execution service.
+- `RELEASE_GITHUB_TOKEN`: repository/workflow and tap write access; must trigger PR CI.
+- `CARGO_TOKEN`: crates.io publishing credential.
+- `VAST_API_KEY`: Vast account credential for GPU rental and cleanup.
 
-Crate dependency-order publication, resumable GitHub asset upload, formal release
-creation and Homebrew updates still require a later delivery implementation.
-That implementation must reject missing, failed, not-run or inconclusive
-required evidence and promote the same accepted asset bytes. This preparation
-command's success cannot substitute for those checks.
+Use **Re-run failed jobs** to reuse successful model results after a publication
+or installation failure. Keep the original run and its evidence artifacts;
+missing or failed evidence blocks publication. Do not restart the whole workflow
+solely to retry an upload.
+
+Current rental limits: one 48 GB sm89 GPU, 300 GiB disk, $0.75/hour maximum,
+$0.004 per transfer GB, three hours per lease, 15 minutes to bootstrap and one
+hour per model task. Storage and transfer still contribute to the bill.
+[Expired-lease cleanup](../.github/workflows/release-cloud-reaper.yml) is scheduled,
+but delays or provider failures prevent a hard billing cap. Check cleanup results
+and the Vast account after a failed run.

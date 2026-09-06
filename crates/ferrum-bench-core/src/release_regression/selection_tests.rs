@@ -1221,3 +1221,387 @@ fn mandatory_quick_start_does_not_prevent_adding_a_bound_shared_representative()
     }));
     assert_eq!(obligation_owners(&missing, quick_start), ["readme"]);
 }
+
+#[test]
+fn deterministic_resource_mechanisms_do_not_multiply_large_model_checks() {
+    let cpu = text_target("bf16", Backend::Cpu);
+    let cuda = text_target("int4", Backend::Cuda);
+    let mut request = input(
+        Stage::PullRequest,
+        vec![cpu.clone(), cuda.clone()],
+        vec![profile("cpu", cpu.clone()), profile("cuda", cuda.clone())],
+    );
+    request.impact.areas = vec![ChangeArea::Scheduler, ChangeArea::Kv];
+    request.checks = super::super::contracts::contract_check_descriptors();
+    request
+        .checks
+        .extend(super::super::model_schedule::model_check_descriptors());
+    let result = plan(&request).unwrap();
+    for behavior in [
+        Behavior::SchedulingProgress,
+        Behavior::Cancellation,
+        Behavior::CapacityAdmission,
+        Behavior::KvIsolation,
+        Behavior::KvRelease,
+        Behavior::KvResume,
+    ] {
+        let (index, obligation) = result
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, obligation)| obligation.behavior == behavior)
+            .unwrap();
+        assert_eq!(obligation.layer, EvidenceLayer::Contract);
+        assert_eq!(obligation.scope, ObligationScope::Global);
+        assert_eq!(
+            result
+                .obligations
+                .iter()
+                .filter(|obligation| obligation.behavior == behavior)
+                .count(),
+            1
+        );
+        if behavior == Behavior::KvResume {
+            assert!(result
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+        } else {
+            assert!(!obligation.checkers.is_empty());
+            assert!(!result
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+        }
+    }
+    for target in [cpu, cuda] {
+        for behavior in [Behavior::ModelLoad, Behavior::ModelForward] {
+            let obligation = result
+                .obligations
+                .iter()
+                .find(|obligation| {
+                    obligation.behavior == behavior
+                        && obligation.scope
+                            == ObligationScope::Target {
+                                target: target.clone(),
+                            }
+                })
+                .unwrap();
+            assert_eq!(obligation.layer, EvidenceLayer::ModelRuntime);
+            assert_eq!(obligation.entrypoints, ENTRYPOINTS);
+            assert!(!obligation.checkers.is_empty());
+        }
+    }
+    assert!(result
+        .obligations
+        .iter()
+        .filter(|obligation| obligation.layer == EvidenceLayer::ModelRuntime)
+        .all(|obligation| matches!(
+            obligation.behavior,
+            Behavior::ModelLoad | Behavior::ModelForward
+        )));
+    let schedule = super::super::model_schedule::model_task_schedule(&result);
+    assert!(schedule.unsupported_obligations.is_empty());
+    assert!(schedule
+        .runs
+        .iter()
+        .all(|run| run.checks == [super::super::model_tasks::ModelCheck::Basic]));
+}
+
+#[test]
+fn structured_masking_keeps_its_real_contract_and_actual_http_validity_sample() {
+    let target = text_target("bf16", Backend::Cpu);
+    let mut request = input(
+        Stage::PullRequest,
+        vec![target.clone()],
+        vec![profile("cpu", target)],
+    );
+    request.impact.areas = vec![ChangeArea::Structured];
+    request.checks = super::super::contracts::contract_check_descriptors();
+    request
+        .checks
+        .extend(super::super::model_schedule::model_check_descriptors());
+    let result = plan(&request).unwrap();
+    let sampling: Vec<_> = result
+        .obligations
+        .iter()
+        .enumerate()
+        .filter(|(_, obligation)| obligation.behavior == Behavior::StructuredSampling)
+        .collect();
+    assert_eq!(sampling.len(), 1);
+    assert_eq!(sampling[0].1.layer, EvidenceLayer::Contract);
+    assert!(sampling[0]
+        .1
+        .checkers
+        .contains(&"cpu-contract.structured-sampling".into()));
+    assert!(!result.gaps.contains(&Gap::UnassignedCheck {
+        obligation: sampling[0].0
+    }));
+    assert!(result
+        .obligations
+        .iter()
+        .any(
+            |obligation| obligation.behavior == Behavior::StructuredValidity
+                && obligation.layer == EvidenceLayer::ModelRuntime
+                && obligation.entrypoints == [Entrypoint::ServeSync, Entrypoint::ServeStream]
+        ));
+}
+
+#[test]
+fn protocol_bindings_cannot_substitute_for_unimplemented_device_state() {
+    let target = text_target("bf16", Backend::Cuda);
+    let mut request = input(
+        Stage::PullRequest,
+        vec![target.clone()],
+        vec![profile("cuda", target)],
+    );
+    request.impact.areas = vec![
+        ChangeArea::Architecture,
+        ChangeArea::Template,
+        ChangeArea::Termination,
+    ];
+    request.checks = super::super::contracts::contract_check_descriptors();
+    request
+        .checks
+        .extend(super::super::model_schedule::model_check_descriptors());
+    let result = plan(&request).unwrap();
+    let schedule = super::super::model_schedule::model_task_schedule(&result);
+    for behavior in [
+        Behavior::ArchitectureState,
+        Behavior::ReasoningBoundaries,
+        Behavior::LengthLimit,
+    ] {
+        let (index, obligation) = result
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, obligation)| {
+                obligation.behavior == behavior && obligation.layer == EvidenceLayer::ModelRuntime
+            })
+            .unwrap();
+        if behavior == Behavior::ArchitectureState {
+            assert!(obligation.checkers.is_empty());
+            assert!(result
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+            assert!(schedule.unsupported_obligations.contains(&index));
+        } else {
+            // Dedicated protocol checks are implementations, not evidence that
+            // they ran or that another device-state obligation was satisfied.
+            assert!(!obligation.checkers.is_empty());
+            assert!(!result
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+            assert!(!schedule.unsupported_obligations.contains(&index));
+        }
+    }
+}
+
+#[test]
+fn isolated_backend_change_keeps_its_forward_numerics_and_performance_unbound() {
+    let targets = vec![
+        text_target("f32", Backend::Cpu),
+        text_target("bf16", Backend::Metal),
+        text_target("bf16", Backend::Cuda),
+    ];
+    for (path, expected) in [
+        ("crates/ferrum-kernels/src/backend/cpu.rs", Backend::Cpu),
+        (
+            "crates/ferrum-kernels/src/backend/metal/mod.rs",
+            Backend::Metal,
+        ),
+        (
+            "crates/ferrum-kernels/src/backend/cuda/fused_silu_mul.rs",
+            Backend::Cuda,
+        ),
+    ] {
+        let mut request = input(
+            Stage::PullRequest,
+            targets.clone(),
+            targets
+                .iter()
+                .enumerate()
+                .map(|(index, target)| profile(&format!("backend-{index}"), target.clone()))
+                .collect(),
+        );
+        request.impact = super::super::analyze_paths([path]);
+        let result = plan(&request).unwrap();
+        assert!(result
+            .obligations
+            .iter()
+            .all(|obligation| obligation.behavior != Behavior::ArchitectureState));
+        for (behavior, layer) in [
+            (Behavior::ModelForward, EvidenceLayer::ModelRuntime),
+            (Behavior::KernelNumerics, EvidenceLayer::BackendNumerics),
+            (Behavior::KernelBoundaries, EvidenceLayer::BackendNumerics),
+            (Behavior::Performance, EvidenceLayer::Performance),
+        ] {
+            let obligations: Vec<_> = result
+                .obligations
+                .iter()
+                .enumerate()
+                .filter(|(_, obligation)| {
+                    obligation.behavior == behavior && obligation.layer == layer
+                })
+                .collect();
+            assert!(!obligations.is_empty(), "missing {behavior:?}");
+            for (index, obligation) in obligations {
+                let ObligationScope::Target { target } = &obligation.scope else {
+                    panic!("exact backend target required")
+                };
+                assert_eq!(target.backend, expected);
+                assert!(obligation.checkers.is_empty());
+                assert!(result
+                    .gaps
+                    .contains(&Gap::UnassignedCheck { obligation: index }));
+            }
+        }
+        assert!(result
+            .obligations
+            .iter()
+            .any(
+                |obligation| obligation.behavior == Behavior::KernelBoundaries
+                    && obligation.layer == EvidenceLayer::Contract
+            ));
+        assert!(result
+            .selected
+            .iter()
+            .all(|selected| selected.profile.target.backend == expected));
+        request
+            .required_targets
+            .retain(|target| target.backend != expected);
+        assert!(plan(&request)
+            .unwrap_err()
+            .contains("no target in the declared regression inventory"));
+    }
+}
+
+#[test]
+fn backend_reach_is_per_area_and_preserves_shared_download_protocol_and_quick_starts() {
+    let metal = text_target("bf16", Backend::Metal);
+    let cuda = text_target("bf16", Backend::Cuda);
+    let other = target(
+        "hybrid",
+        ModelOutputProtocol::GemmaThought,
+        "int4",
+        Backend::Cuda,
+    );
+    let mut request = input(
+        Stage::Release,
+        vec![metal.clone(), cuda.clone(), other.clone()],
+        vec![
+            profile("metal-quick-start", metal.clone()),
+            profile("cuda-quick-start", cuda.clone()),
+            profile("other-architecture", other.clone()),
+        ],
+    );
+    request.quick_start_profile_ids = vec!["metal-quick-start".into(), "cuda-quick-start".into()];
+    request.impact = super::super::analyze_paths([
+        "crates/ferrum-kernels/src/backend/metal/mod.rs",
+        "crates/ferrum-types/src/reasoning.rs",
+        "crates/ferrum-models/src/hf_download.rs",
+    ]);
+    let result = plan(&request).unwrap();
+    for id in &request.quick_start_profile_ids {
+        assert!(result.obligations.iter().any(|obligation| obligation.behavior == Behavior::QuickStart
+            && matches!(&obligation.scope, ObligationScope::Profile { profile_id, .. } if profile_id == id)));
+        assert!(selected_ids(&result).contains(&id.as_str()));
+    }
+    for expected in [&metal, &cuda, &other] {
+        assert!(result
+            .obligations
+            .iter()
+            .any(
+                |obligation| obligation.behavior == Behavior::ReasoningBoundaries
+                    && obligation.layer == EvidenceLayer::ModelRuntime
+                    && obligation.scope
+                        == ObligationScope::Protocol {
+                            protocol: expected.protocol,
+                            backend: expected.backend,
+                            execution_path: expected.execution_path.clone()
+                        }
+            ));
+        assert!(result
+            .obligations
+            .iter()
+            .any(|obligation| obligation.behavior == Behavior::ModelLoad
+                && obligation.layer == EvidenceLayer::ModelRuntime
+                && obligation.scope
+                    == ObligationScope::Architecture {
+                        architecture: expected.architecture.clone(),
+                        protocol: expected.protocol,
+                        execution_path: expected.execution_path.clone()
+                    }));
+    }
+    for obligation in result.obligations.iter().filter(|obligation| {
+        obligation.layer == EvidenceLayer::BackendNumerics
+            || obligation.layer == EvidenceLayer::Performance
+    }) {
+        assert!(
+            matches!(&obligation.scope, ObligationScope::Target { target } if target.backend == Backend::Metal)
+        );
+    }
+    assert!(!result
+        .obligations
+        .iter()
+        .any(|obligation| obligation.behavior == Behavior::ArchitectureState));
+}
+
+#[test]
+fn backend_path_union_and_unknown_or_shared_kernel_reach_remain_conservative() {
+    let targets = vec![
+        text_target("f32", Backend::Cpu),
+        text_target("bf16", Backend::Metal),
+        text_target("bf16", Backend::Cuda),
+    ];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| profile(&format!("backend-{index}"), target.clone()))
+            .collect(),
+    );
+    let metal = "crates/ferrum-kernels/src/backend/metal/mod.rs";
+    request.impact =
+        super::super::analyze_paths([metal, "crates/ferrum-kernels/src/backend/cuda/mod.rs"]);
+    // Path contributors cannot disappear because the aggregate was incomplete.
+    request.impact.areas.clear();
+    let result = plan(&request).unwrap();
+    let numerical_targets = |result: &Plan| -> Vec<Backend> {
+        result
+            .obligations
+            .iter()
+            .filter(|obligation| obligation.behavior == Behavior::KernelNumerics)
+            .filter_map(|obligation| match &obligation.scope {
+                ObligationScope::Target { target } => Some(target.backend),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut observed = numerical_targets(&result);
+    observed.sort();
+    assert_eq!(observed, [Backend::Metal, Backend::Cuda]);
+    for shared in [
+        "crates/ferrum-kernels/src/backend/traits.rs",
+        "crates/ferrum-kernels/src/backend/unreviewed/ops.rs",
+        "crates/ferrum-kernels/src/metal/ops.rs",
+        "unknown-runtime/forward.rs",
+    ] {
+        request.impact = super::super::analyze_paths([metal, shared]);
+        let result = plan(&request).unwrap();
+        let mut observed = numerical_targets(&result);
+        observed.sort();
+        assert_eq!(
+            observed,
+            [Backend::Cpu, Backend::Metal, Backend::Cuda],
+            "{shared}"
+        );
+        assert!(
+            result
+                .obligations
+                .iter()
+                .any(|obligation| obligation.behavior == Behavior::ArchitectureState),
+            "{shared}"
+        );
+    }
+}

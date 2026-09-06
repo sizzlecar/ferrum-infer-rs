@@ -1,8 +1,12 @@
 //! Change-based regression planning. A plan is not execution evidence or release approval.
+pub mod contracts;
+pub mod dependency_change;
+pub mod distribution;
 mod impact;
 pub mod model_schedule;
 pub mod model_tasks;
 mod selection;
+pub mod source_change;
 mod types;
 mod version_change;
 

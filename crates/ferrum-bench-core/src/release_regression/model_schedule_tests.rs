@@ -64,6 +64,9 @@ fn model_schedule_coalesces_behavior_checks_without_claiming_release_approval() 
     let owner = profile("shared", Backend::Cuda);
     let obligations = [
         Behavior::ToolContinuation,
+        Behavior::ToolSelection,
+        Behavior::ToolHandoff,
+        Behavior::ProtocolFraming,
         Behavior::UserStop,
         Behavior::ModelForward,
         Behavior::ModelLoad,
@@ -74,7 +77,7 @@ fn model_schedule_coalesces_behavior_checks_without_claiming_release_approval() 
     .into_iter()
     .map(|behavior| obligation(behavior, &owner))
     .collect();
-    let plan = make_plan(obligations, vec![selected(owner, (0..7).collect())]);
+    let plan = make_plan(obligations, vec![selected(owner, (0..10).collect())]);
     let original = plan.clone();
     let schedule = model_task_schedule(&plan);
     assert_eq!(schedule.runs.len(), 1);
@@ -87,7 +90,7 @@ fn model_schedule_coalesces_behavior_checks_without_claiming_release_approval() 
             ModelCheck::Tools,
         ]
     );
-    assert_eq!(schedule.runs[0].obligations, (0..7).collect::<Vec<_>>());
+    assert_eq!(schedule.runs[0].obligations, (0..10).collect::<Vec<_>>());
     assert!(!schedule.runs[0].quick_start);
     assert!(schedule.unsupported_obligations.is_empty());
     assert_eq!(plan, original);
@@ -141,6 +144,9 @@ fn model_schedule_rejects_missing_entrypoints_and_unsupported_evidence() {
     obligations[2].entrypoints.clear();
     obligations[4].layer = EvidenceLayer::Performance;
     obligations[5].layer = EvidenceLayer::Performance;
+    obligations[6].entrypoints.clear();
+    obligations[7].entrypoints = vec![Entrypoint::Run];
+    obligations[8].entrypoints.clear();
     let plan = make_plan(obligations, vec![selected(owner, (0..9).collect())]);
     let schedule = model_task_schedule(&plan);
     assert!(schedule.runs.is_empty());
@@ -182,7 +188,10 @@ fn model_schedule_descriptors_bind_only_implemented_product_flows() {
         Behavior::NaturalEnd,
         Behavior::QuickStart,
         Behavior::TemplateHistory,
+        Behavior::ProtocolFraming,
         Behavior::UserStop,
+        Behavior::ReasoningBoundaries,
+        Behavior::LengthLimit,
     ] {
         let descriptor = descriptors
             .iter()
@@ -192,7 +201,12 @@ fn model_schedule_descriptors_bind_only_implemented_product_flows() {
         assert_eq!(descriptor.layer, EvidenceLayer::ModelRuntime);
         assert!(descriptor.target.is_none());
     }
-    for behavior in [Behavior::StructuredValidity, Behavior::ToolContinuation] {
+    for behavior in [
+        Behavior::StructuredValidity,
+        Behavior::ToolSelection,
+        Behavior::ToolHandoff,
+        Behavior::ToolContinuation,
+    ] {
         let descriptor = descriptors
             .iter()
             .find(|descriptor| descriptor.behavior == behavior)
@@ -234,4 +248,49 @@ fn model_schedule_descriptors_bind_only_implemented_product_flows() {
         .gaps
         .iter()
         .any(|gap| matches!(gap, Gap::UnassignedCheck { .. })));
+}
+
+#[test]
+fn framing_requires_dedicated_reasoning_and_length_observations() {
+    let owner = profile("framing", Backend::Metal);
+    let plan = make_plan(
+        [
+            Behavior::ProtocolFraming,
+            Behavior::ReasoningBoundaries,
+            Behavior::LengthLimit,
+        ]
+        .into_iter()
+        .map(|behavior| obligation(behavior, &owner))
+        .collect(),
+        vec![selected(owner, vec![0, 1, 2])],
+    );
+    let schedule = model_task_schedule(&plan);
+    assert_eq!(schedule.runs.len(), 1);
+    assert_eq!(
+        schedule.runs[0].checks,
+        [ModelCheck::Basic, ModelCheck::Reasoning, ModelCheck::Length]
+    );
+    assert_eq!(schedule.runs[0].obligations, [0, 1, 2]);
+    assert!(schedule.unsupported_obligations.is_empty());
+}
+
+#[test]
+fn reasoning_and_length_share_selected_task_without_substituting_basic_evidence() {
+    let owner = profile("reasoning-model", Backend::Metal);
+    let plan = make_plan(
+        vec![
+            obligation(Behavior::QuickStart, &owner),
+            obligation(Behavior::ReasoningBoundaries, &owner),
+            obligation(Behavior::LengthLimit, &owner),
+        ],
+        vec![selected(owner, vec![0, 1, 2])],
+    );
+    let schedule = model_task_schedule(&plan);
+    assert!(schedule.unsupported_obligations.is_empty());
+    assert_eq!(schedule.runs.len(), 1);
+    assert_eq!(
+        schedule.runs[0].checks,
+        [ModelCheck::Basic, ModelCheck::Reasoning, ModelCheck::Length]
+    );
+    assert!(schedule.runs[0].quick_start);
 }

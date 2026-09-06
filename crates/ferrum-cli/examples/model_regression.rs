@@ -273,6 +273,12 @@ async fn main() -> Result<()> {
     if args.checks.contains(&Check::Stop) {
         record(&mut report, "run-stop", cases::run_stop(&args)).await?;
     }
+    if args.checks.contains(&Check::Reasoning) {
+        record(&mut report, "run-reasoning", cases::run_reasoning(&args)).await?;
+    }
+    if args.checks.contains(&Check::Length) {
+        record(&mut report, "run-length", cases::run_length(&args)).await?;
+    }
     let started = Instant::now();
     match process::Server::start(&args).await {
         Ok(server) => {
@@ -288,6 +294,17 @@ async fn main() -> Result<()> {
                     }
                     Check::Stop => {
                         record(&mut report, "serve-stop", cases::serve_stop(&server)).await?
+                    }
+                    Check::Reasoning => {
+                        record(
+                            &mut report,
+                            "serve-reasoning",
+                            cases::serve_reasoning(&server),
+                        )
+                        .await?
+                    }
+                    Check::Length => {
+                        record(&mut report, "serve-length", cases::serve_length(&server)).await?
                     }
                     Check::Structured => {
                         record(&mut report, "serve-structured", cases::structured(&server)).await?

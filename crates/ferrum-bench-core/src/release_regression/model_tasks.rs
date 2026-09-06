@@ -18,6 +18,8 @@ pub enum ModelCheck {
     Stop,
     Structured,
     Tools,
+    Reasoning,
+    Length,
 }
 
 impl fmt::Display for ModelCheck {
@@ -27,6 +29,8 @@ impl fmt::Display for ModelCheck {
             Self::Stop => "stop",
             Self::Structured => "structured",
             Self::Tools => "tools",
+            Self::Reasoning => "reasoning",
+            Self::Length => "length",
         })
     }
 }
@@ -40,6 +44,8 @@ impl FromStr for ModelCheck {
             "stop" => Ok(Self::Stop),
             "structured" => Ok(Self::Structured),
             "tools" => Ok(Self::Tools),
+            "reasoning" => Ok(Self::Reasoning),
+            "length" => Ok(Self::Length),
             _ => Err(format!("unknown model check {value:?}")),
         }
     }
@@ -52,6 +58,8 @@ impl ModelCheck {
             Self::Stop => &["run-stop", "serve-stop"],
             Self::Structured => &["serve-structured"],
             Self::Tools => &["serve-tools"],
+            Self::Reasoning => &["run-reasoning", "serve-reasoning"],
+            Self::Length => &["run-length", "serve-length"],
         }
     }
 }
@@ -392,7 +400,7 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             "serve-startup version differs from the expected version",
         );
     }
-    for name in ["run-basic", "run-stop"] {
+    for name in ["run-basic", "run-stop", "run-reasoning", "run-length"] {
         if let Some(case) = recorded.get(name) {
             let ready = &case["evidence"]["ready"];
             require(
@@ -412,7 +420,128 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             );
         }
     }
+    if let Some(case) = recorded.get("run-length") {
+        let ready = &case["evidence"]["baseline_ready"];
+        require(
+            &mut errors,
+            ready["event"] == "ready"
+                && ready["requested_model"].as_str() == Some(expected.profile.model.as_str())
+                && run_backend(&ready["backend"]) == Some(expected.profile.target.backend),
+            "run-length baseline readiness differs from the selected model/backend",
+        );
+    }
+    for name in ["run-reasoning", "serve-reasoning"] {
+        if let Some(case) = recorded.get(name) {
+            let evidence = &case["evidence"];
+            require(
+                &mut errors,
+                evidence["enable_thinking"] == true,
+                format!("{name} did not explicitly enable thinking"),
+            );
+            require(
+                &mut errors,
+                evidence["max_tokens"].as_u64() == Some(u64::from(expected.max_tokens)),
+                format!("{name} reasoning budget differs from task"),
+            );
+            let modes: &[&str] = if name.starts_with("run-") {
+                &["output"]
+            } else {
+                &["sync", "stream"]
+            };
+            for mode in modes {
+                require(
+                    &mut errors,
+                    evidence[*mode]["usage"]["completion_tokens"]
+                        .as_u64()
+                        .is_some_and(|n| n <= u64::from(expected.max_tokens)),
+                    format!("{name}/{mode} exceeds task token budget"),
+                );
+                if let Err(error) = verify_reasoning_observation(&evidence[*mode]) {
+                    errors.push(format!("{name}/{mode}: {error}"));
+                }
+            }
+        }
+    }
+    for name in ["run-length", "serve-length"] {
+        if let Some(case) = recorded.get(name) {
+            let evidence = &case["evidence"];
+            require(
+                &mut errors,
+                evidence["baseline_max_tokens"].as_u64() == Some(u64::from(expected.max_tokens))
+                    && evidence["baseline"]["usage"]["completion_tokens"]
+                        .as_u64()
+                        .is_some_and(|n| n <= u64::from(expected.max_tokens)),
+                format!("{name} baseline budget differs from task"),
+            );
+            let budget = evidence["budget"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok());
+            require(
+                &mut errors,
+                evidence["enable_thinking"] == false,
+                format!("{name} is missing its explicit truncation configuration"),
+            );
+            let modes: &[&str] = if name.starts_with("run-") {
+                &["output"]
+            } else {
+                &["sync", "stream"]
+            };
+            for mode in modes {
+                let result = budget
+                    .ok_or_else(|| "missing truncation budget".to_owned())
+                    .and_then(|budget| {
+                        verify_length_observations(&evidence["baseline"], &evidence[*mode], budget)
+                    });
+                if let Err(error) = result {
+                    errors.push(format!("{name}/{mode}: {error}"));
+                }
+            }
+        }
+    }
     if let Some(case) = recorded.get("serve-tools") {
+        // A passed parent case from the older SSE-only tool probe cannot satisfy
+        // the new sync/SSE selection and handoff obligations. Require both actual
+        // calls and their ID-linked continuations, without replaying raw HTTP.
+        for (call_name, continuation_name) in [
+            ("sync_call", "sync_continuation"),
+            ("stream_call", "stream_continuation"),
+        ] {
+            let call = &case["evidence"][call_name];
+            let continuation = &case["evidence"][continuation_name];
+            for (name, step, finish) in [
+                (call_name, call, "tool_calls"),
+                (continuation_name, continuation, "stop"),
+            ] {
+                require(
+                    &mut errors,
+                    step.is_object()
+                        && step["message"].is_object()
+                        && step["message"]["role"] == "assistant"
+                        && step["finish_reason"] == finish
+                        && step["usage"].is_object(),
+                    format!("serve-tools is missing completed {name} oracle evidence"),
+                );
+            }
+            let calls = call["message"]["tool_calls"].as_array();
+            let identity = calls.filter(|calls| calls.len() == 1).and_then(|calls| {
+                let observed = &calls[0];
+                (observed["type"] == "function"
+                    && observed["function"]["name"] == "calc"
+                    && observed["function"]["arguments"].is_string())
+                .then(|| observed["id"].as_str().filter(|id| !id.trim().is_empty()))
+                .flatten()
+            });
+            require(
+                &mut errors,
+                identity.is_some(),
+                format!("serve-tools {call_name} is missing its named tool identity"),
+            );
+            require(
+                &mut errors,
+                identity.is_some() && continuation["tool_call_id"].as_str() == identity,
+                format!("serve-tools {continuation_name} did not replay its actual call identity"),
+            );
+        }
         require(
             &mut errors,
             case["evidence"]["reasoning_alias_replayed"].as_bool()
@@ -481,3 +610,111 @@ pub fn verify_model_reports(
 #[cfg(test)]
 #[path = "model_tasks_tests.rs"]
 mod tests;
+
+/// Small observation oracles shared by the actual runner and its report consumer.
+/// Wire framing is checked by the runner before these observations are produced.
+/// These functions do not turn a report into a proof of arbitrary model behavior.
+fn boundary_observation(observation: &Value) -> Result<(&str, &str, u64), String> {
+    let message = &observation["message"];
+    let content = message["content"]
+        .as_str()
+        .ok_or("missing visible content")?;
+    let reasoning = match message.get("reasoning") {
+        None | Some(Value::Null) => "",
+        Some(value) => value.as_str().ok_or("invalid reasoning type")?,
+    };
+    if message["role"] != "assistant"
+        || message.get("reasoning_content").is_some()
+        || !(message["tool_calls"].is_null()
+            || message["tool_calls"].as_array().is_some_and(Vec::is_empty))
+    {
+        return Err("invalid canonical assistant text observation".into());
+    }
+    // These probes never ask for literal control syntax. Raw JSONL evidence may
+    // retain it; parsed content/reasoning must not expose full or partial frames.
+    for text in [content, reasoning] {
+        if ["<|", "|>", "<think", "</think", "<channel|"]
+            .iter()
+            .any(|marker| text.contains(marker))
+        {
+            return Err("parsed text leaked protocol framing".into());
+        }
+    }
+    if content.contains(['<', '>']) {
+        return Err("parsed visible probe text leaked a partial control delimiter".into());
+    }
+    let usage = &observation["usage"];
+    let prompt = usage["prompt_tokens"]
+        .as_u64()
+        .ok_or("missing prompt usage")?;
+    let completion = usage["completion_tokens"]
+        .as_u64()
+        .ok_or("missing completion usage")?;
+    if prompt == 0
+        || completion == 0
+        || prompt.checked_add(completion) != usage["total_tokens"].as_u64()
+    {
+        return Err("invalid boundary observation token usage".into());
+    }
+    Ok((content, reasoning, completion))
+}
+
+/// Enabled-thinking integration requires an actual distinct thought and a clean
+/// final answer; nullable/empty reasoning is explicitly unsupported, not success.
+pub fn verify_reasoning_observation(observation: &Value) -> Result<(), String> {
+    let (content, reasoning, _) = boundary_observation(observation)?;
+    if !matches!(observation["finish_reason"].as_str(), Some("stop" | "eos")) {
+        return Err("reasoning probe did not finish naturally".into());
+    }
+    if reasoning.trim().is_empty() || reasoning.trim() == "42" {
+        return Err("unsupported reasoning probe: no distinct nonempty thought observed".into());
+    }
+    if content.trim() != "42" {
+        return Err(
+            "reasoning leaked into visible output or final arithmetic answer was wrong".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Leave room before a naturally observed ending, rather than blindly cutting
+/// the first protocol header token. The replay must still prove a proper visible
+/// prefix: token counts alone cannot establish where a model's header ends.
+pub fn length_probe_budget(natural_completion_tokens: u64) -> Result<u32, String> {
+    natural_completion_tokens
+        .checked_sub(2)
+        .filter(|budget| *budget > 0)
+        .and_then(|budget| u32::try_from(budget).ok())
+        .ok_or_else(|| {
+            "unsupported length probe: natural baseline too short or budget unrepresentable".into()
+        })
+}
+
+pub fn verify_length_observations(
+    baseline: &Value,
+    truncated: &Value,
+    budget: u32,
+) -> Result<(), String> {
+    let (full, _, natural_tokens) = boundary_observation(baseline)?;
+    let (partial, _, actual_tokens) = boundary_observation(truncated)?;
+    if !matches!(baseline["finish_reason"].as_str(), Some("stop" | "eos")) {
+        return Err("length baseline did not finish naturally".into());
+    }
+    if length_probe_budget(natural_tokens)? != budget
+        || truncated["finish_reason"] != "length"
+        || actual_tokens != u64::from(budget)
+    {
+        return Err(
+            "length finish or observed completion usage differs from the derived budget".into(),
+        );
+    }
+    let full = full.trim();
+    let partial = partial.trim();
+    if partial.is_empty() || partial.len() >= full.len() || !full.starts_with(partial) {
+        return Err(
+            "unsupported length probe: no safe nonempty proper visible baseline prefix observed"
+                .into(),
+        );
+    }
+    Ok(())
+}

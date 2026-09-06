@@ -323,3 +323,38 @@ fn checksum_filenames_and_empty_payloads_cannot_create_misleading_manifests() {
     )
     .is_err());
 }
+
+#[test]
+fn formal_version_progression_uses_semver_and_rejects_equal_backward_or_injected_inputs() {
+    for (previous, target) in [
+        ("0.8.9", "0.8.10"),
+        ("0.99.99", "1.0.0"),
+        ("9.1.0", "10.0.0"),
+    ] {
+        validate_version_progression(previous, target).unwrap();
+    }
+    for (previous, target) in [
+        ("0.8.9", "0.8.9"),
+        ("0.8.10", "0.8.9"),
+        ("1.0.0", "0.99.99"),
+    ] {
+        assert!(validate_version_progression(previous, target)
+            .unwrap_err()
+            .contains("must be newer"));
+    }
+    for invalid in [
+        "v1.2.3",
+        "1.2",
+        "01.2.3",
+        "1.2.3-rc.1",
+        "1.2.3+build",
+        "1.2.3\n",
+        "$(touch x)",
+    ] {
+        assert!(validate_version_progression(invalid, "9.0.0").is_err());
+        assert!(validate_version_progression("0.1.0", invalid).is_err());
+    }
+    // A retry of 1.2.4 still advances its unchanged previous release, 1.2.3.
+    validate_version_progression("1.2.3", "1.2.4").unwrap();
+    validate_version_progression("1.2.3", "1.2.4").unwrap();
+}

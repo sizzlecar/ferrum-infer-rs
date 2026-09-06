@@ -1,6 +1,41 @@
 name: Stage CPU and Metal release assets
 
 on:
+  workflow_call:
+    inputs:
+      version:
+        description: Formal workspace and binary version (MAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      release_candidate_sha:
+        description: Exact release-candidate commit to build
+        required: true
+        type: string
+      release_candidate_tag:
+        description: Annotated RC tag whose peeled commit is release_candidate_sha
+        required: true
+        type: string
+      staging_label:
+        description: Immutable artifact label; this does not create a tag or release
+        required: true
+        type: string
+      publish_release:
+        description: Safety lock; production staging requires false
+        required: true
+        type: boolean
+    outputs:
+      linux_asset_id:
+        description: Immutable uploaded artifact ID
+        value: ${{ jobs.linux-x86_64.outputs.asset_id }}
+      linux_runner_id:
+        description: Immutable uploaded artifact ID
+        value: ${{ jobs.linux-x86_64.outputs.runner_id }}
+      metal_asset_id:
+        description: Immutable uploaded artifact ID
+        value: ${{ jobs.macos-aarch64.outputs.asset_id }}
+      metal_runner_id:
+        description: Immutable uploaded artifact ID
+        value: ${{ jobs.macos-aarch64.outputs.runner_id }}
   workflow_dispatch:
     inputs:
       version:
@@ -43,6 +78,9 @@ env:
 
 jobs:
   linux-x86_64:
+    outputs:
+      asset_id: ${{ steps.asset_id.outputs.artifact-id }}
+      runner_id: ${{ steps.runner_id.outputs.artifact-id }}
     name: Stage Linux x86_64 CPU
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -162,15 +200,26 @@ jobs:
           test "$version_output" = "ferrum $VERSION"
           ./smoke/ferrum --help >/dev/null
 
+      - name: Package Linux regression runner
+        run: |
+          tar -C target/release/examples -czf model-regression-linux-x86_64.tar.gz model_regression
+          sha256sum model-regression-linux-x86_64.tar.gz > model-regression-linux-x86_64.tar.gz.sha256
+          sha256sum target/release/examples/model_regression > model-regression-linux-x86_64.binary.sha256
+
       - name: Upload Linux regression runner
+        id: runner_id
         uses: actions/upload-artifact@v4
         with:
           name: model-regression-linux-x86_64-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
           if-no-files-found: error
           retention-days: 14
-          path: target/release/examples/model_regression
+          path: |
+            model-regression-linux-x86_64.tar.gz
+            model-regression-linux-x86_64.tar.gz.sha256
+            model-regression-linux-x86_64.binary.sha256
 
       - name: Upload staged CPU asset
+        id: asset_id
         uses: actions/upload-artifact@v4
         with:
           name: ferrum-linux-x86_64-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
@@ -186,6 +235,9 @@ jobs:
             ferrum-linux-x86_64.dependencies.txt
 
   macos-aarch64:
+    outputs:
+      asset_id: ${{ steps.asset_id.outputs.artifact-id }}
+      runner_id: ${{ steps.runner_id.outputs.artifact-id }}
     name: Stage macOS aarch64 Metal
     runs-on: macos-14
     timeout-minutes: 90
@@ -293,15 +345,26 @@ jobs:
           test "$version_output" = "ferrum $VERSION"
           ./smoke/ferrum --help >/dev/null
 
+      - name: Package Metal regression runner
+        run: |
+          tar -C target/release/examples -czf model-regression-macos-aarch64.tar.gz model_regression
+          shasum -a 256 model-regression-macos-aarch64.tar.gz > model-regression-macos-aarch64.tar.gz.sha256
+          shasum -a 256 target/release/examples/model_regression > model-regression-macos-aarch64.binary.sha256
+
       - name: Upload Metal regression runner
+        id: runner_id
         uses: actions/upload-artifact@v4
         with:
           name: model-regression-macos-aarch64-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}
           if-no-files-found: error
           retention-days: 14
-          path: target/release/examples/model_regression
+          path: |
+            model-regression-macos-aarch64.tar.gz
+            model-regression-macos-aarch64.tar.gz.sha256
+            model-regression-macos-aarch64.binary.sha256
 
       - name: Upload staged Metal asset
+        id: asset_id
         uses: actions/upload-artifact@v4
         with:
           name: ferrum-macos-aarch64-${{ inputs.staging_label }}-${{ inputs.release_candidate_sha }}

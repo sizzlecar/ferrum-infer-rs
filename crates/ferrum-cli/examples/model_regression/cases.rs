@@ -1,3 +1,7 @@
+#[path = "boundaries.rs"]
+mod boundaries;
+pub(super) use boundaries::{run_length, run_reasoning, serve_length, serve_reasoning};
+
 use super::process::{self, Server};
 use super::protocol::{self, answer, Chat};
 use super::{identity, Args};
@@ -90,38 +94,13 @@ async fn run_chat(args: &Args, name: &str, input: Input<'_>, stop: Option<&str>)
         Duration::from_secs(args.run_timeout_secs),
     )
     .await?;
-    let records: Vec<Value> = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(serde_json::from_str)
-        .collect::<std::result::Result<_, _>>()
-        .context("parse run JSONL")?;
-    ensure!(
-        records
-            .iter()
-            .filter(|record| record["event"] == "ready")
-            .count()
-            == 1,
-        "run must emit one ready event"
-    );
+    let records = protocol::run_records(&stdout)?;
     let ready = records
         .iter()
         .find(|record| record["event"] == "ready")
         .context("missing run ready event")?
         .clone();
     identity::validate_run(args, &ready)?;
-    ensure!(
-        records
-            .iter()
-            .filter(|record| record["event"] == "exit")
-            .count()
-            == 1,
-        "run must exit cleanly"
-    );
-    ensure!(
-        !records.iter().any(|record| record["event"] == "error"),
-        "run emitted an error event"
-    );
     let assistants: Vec<_> = records
         .iter()
         .filter(|record| record["event"] == "assistant")
@@ -363,51 +342,46 @@ pub(super) async fn structured(server: &Server<'_>) -> Result<Value> {
 
 pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
     let user = json!({"role": "user", "content": "Use the calc tool to evaluate 123+456. After receiving its result, reply with only the resulting number."});
-    let declarations = json!([{"type": "function", "function": {
-        "name": "calc", "description": "Evaluate an arithmetic expression.",
-        "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"], "additionalProperties": false}
-    }}]);
+    let declarations = json!([
+        {"type": "function", "function": {
+            "name": "calc", "description": "Evaluate an arithmetic expression.",
+            "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"], "additionalProperties": false}
+        }},
+        {"type": "function", "function": {
+            "name": "lookup_weather", "description": "Look up current weather in a city.",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"], "additionalProperties": false}
+        }}
+    ]);
     let mut body = request(server, vec![user.clone()]);
     body["tools"] = declarations.clone();
     body["tool_choice"] = json!({"type": "function", "function": {"name": "calc"}});
-    let called = chat(server, "tools-call-stream", body, true).await?;
-    let calls = called.message["tool_calls"]
-        .as_array()
-        .context("model did not call a tool")?;
-    ensure!(
-        calls.len() == 1 && calls[0]["function"]["name"] == "calc",
-        "expected one calc invocation"
-    );
-    let arguments: Value = serde_json::from_str(
-        calls[0]["function"]["arguments"]
-            .as_str()
-            .context("tool arguments")?,
-    )?;
-    let expression = arguments["expression"]
-        .as_str()
-        .context("expression argument")?;
-    ensure!(
-        arguments
-            .as_object()
-            .is_some_and(|object| object.len() == 1),
-        "tool arguments violated additionalProperties: false: {arguments}"
-    );
-    ensure!(
-        expression
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect::<String>()
-            == "123+456",
-        "wrong tool expression: {arguments}"
-    );
+    // Reuse the loaded server; each HTTP mode must actually select and hand off
+    // the named tool from the same declarations, including a distractor.
+    let sync_called = chat(server, "tools-call-sync", body.clone(), false).await?;
+    let sync_call = protocol::calc_call(&sync_called).context("sync named tool handoff")?;
+    let stream_called = chat(server, "tools-call-stream", body, true).await?;
+    let stream_call = protocol::calc_call(&stream_called).context("SSE named tool handoff")?;
     // Only execute this typed local fixture. Model text is never shell code.
     let tool_result = 123u64 + 456u64;
-    let result_message = json!({"role": "tool", "tool_call_id": calls[0]["id"], "content": json!({"result": tool_result}).to_string()});
-    let mut final_body = request(server, vec![user, called.message.clone(), result_message]);
-    final_body["tools"] = declarations;
-    final_body["tool_choice"] = json!("none");
-    let canonical = chat(server, "tools-final-sync", final_body.clone(), false).await?;
+    let continuation = |called: &Chat, call: &Value| {
+        let result_message = json!({"role": "tool", "tool_call_id": call["id"], "content": json!({"result": tool_result}).to_string()});
+        let mut body = request(
+            server,
+            vec![user.clone(), called.message.clone(), result_message],
+        );
+        body["tools"] = declarations.clone();
+        body["tool_choice"] = json!("none");
+        body
+    };
+    let canonical = chat(
+        server,
+        "tools-final-sync",
+        continuation(&sync_called, sync_call),
+        false,
+    )
+    .await?;
     finished_answer(&canonical, "579").context("canonical tool-result replay")?;
+    let mut final_body = continuation(&stream_called, stream_call);
     if server.args.reasoning_alias_replay {
         let assistant = final_body["messages"][1]
             .as_object_mut()
@@ -420,9 +394,14 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
     }
     let streamed = chat(server, "tools-final-stream", final_body, true).await?;
     finished_answer(&streamed, "579").context("streamed tool-result replay")?;
-    Ok(
-        json!({"tool_call": called.message, "tool_result": tool_result, "canonical_answer": canonical.content(), "stream_answer": streamed.content(), "reasoning_alias_replayed": server.args.reasoning_alias_replay}),
-    )
+    Ok(json!({
+        "sync_call": {"message": sync_called.message, "finish_reason": sync_called.finish, "usage": sync_called.usage},
+        "stream_call": {"message": stream_called.message, "finish_reason": stream_called.finish, "usage": stream_called.usage},
+        "sync_continuation": {"message": canonical.message, "finish_reason": canonical.finish, "usage": canonical.usage, "tool_call_id": sync_call["id"]},
+        "stream_continuation": {"message": streamed.message, "finish_reason": streamed.finish, "usage": streamed.usage, "tool_call_id": stream_call["id"]},
+        "tool_result": tool_result,
+        "reasoning_alias_replayed": server.args.reasoning_alias_replay
+    }))
 }
 
 #[cfg(test)]
