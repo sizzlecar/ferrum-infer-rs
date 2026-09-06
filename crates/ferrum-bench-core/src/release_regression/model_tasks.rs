@@ -548,45 +548,19 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             "run-length baseline readiness differs from the selected model/backend",
         );
     }
-    if expected.profile.reasoning_protocol == ModelReasoningProtocol::None
-        && expected.checks.contains(&ModelCheck::Basic)
-    {
-        if let Some(case) = recorded.get("run-basic") {
-            let answers = case["evidence"]["answers"].as_array();
-            require(
-                &mut errors,
-                answers.is_some_and(|answers| answers.len() == 2),
-                "reasoning absence requires both actual run turns",
-            );
-            if let Some(answers) = answers {
-                for (answer, expected_answer) in answers.iter().zip(["42", "cobalt-731"]) {
-                    let observation = serde_json::json!({"message": {"role": "assistant", "content": answer["content"],
-                        "reasoning": answer["reasoning"], "tool_calls": answer["tool_calls"]},
-                        "finish_reason": answer["finish_reason"], "usage": answer["usage"]});
-                    if answer.get("reasoning_content").is_some() {
-                        errors.push("run-basic exposed a noncanonical reasoning alias".into());
-                    }
-                    if let Err(error) =
-                        verify_reasoning_absence_observation(&observation, expected_answer)
-                    {
-                        errors.push(format!("run-basic: {error}"));
-                    }
-                }
-            }
-        }
-        if let Some(case) = recorded.get("serve-basic") {
-            for (mode, answer) in [
-                ("sync", "42"),
-                ("stream", "42"),
-                ("recall", "cobalt-731"),
-                ("stream_recall", "cobalt-731"),
-            ] {
-                if let Err(error) = verify_reasoning_absence_observation(
-                    &case["evidence"]["observations"][mode],
-                    answer,
-                ) {
-                    errors.push(format!("serve-basic/{mode}: {error}"));
-                }
+    for name in ["run-basic", "serve-basic"] {
+        if let Some(case) = recorded.get(name) {
+            let verify = if name == "run-basic" {
+                super::model_basic::verify_basic_run
+            } else {
+                super::model_basic::verify_basic_serve
+            };
+            if let Err(error) = verify(
+                &case["evidence"],
+                expected.profile.reasoning_protocol,
+                expected.max_tokens,
+            ) {
+                errors.push(format!("{name}: {error}"));
             }
         }
     }
@@ -659,55 +633,13 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
         }
     }
     if let Some(case) = recorded.get("serve-tools") {
-        // A passed parent case from the older SSE-only tool probe cannot satisfy
-        // the new sync/SSE selection and handoff obligations. Require both actual
-        // calls and their ID-linked continuations, without replaying raw HTTP.
-        for (call_name, continuation_name) in [
-            ("sync_call", "sync_continuation"),
-            ("stream_call", "stream_continuation"),
-        ] {
-            let call = &case["evidence"][call_name];
-            let continuation = &case["evidence"][continuation_name];
-            for (name, step, finish) in [
-                (call_name, call, "tool_calls"),
-                (continuation_name, continuation, "stop"),
-            ] {
-                require(
-                    &mut errors,
-                    step.is_object()
-                        && step["message"].is_object()
-                        && step["message"]["role"] == "assistant"
-                        && step["finish_reason"] == finish
-                        && step["usage"].is_object(),
-                    format!("serve-tools is missing completed {name} oracle evidence"),
-                );
-            }
-            let calls = call["message"]["tool_calls"].as_array();
-            let identity = calls.filter(|calls| calls.len() == 1).and_then(|calls| {
-                let observed = &calls[0];
-                (observed["type"] == "function"
-                    && observed["function"]["name"] == "calc"
-                    && observed["function"]["arguments"].is_string())
-                .then(|| observed["id"].as_str().filter(|id| !id.trim().is_empty()))
-                .flatten()
-            });
-            require(
-                &mut errors,
-                identity.is_some(),
-                format!("serve-tools {call_name} is missing its named tool identity"),
-            );
-            require(
-                &mut errors,
-                identity.is_some() && continuation["tool_call_id"].as_str() == identity,
-                format!("serve-tools {continuation_name} did not replay its actual call identity"),
-            );
+        if let Err(error) = super::model_tool::verify_tool_case(
+            &case["evidence"],
+            expected.max_tokens,
+            expected.reasoning_alias_replay,
+        ) {
+            errors.push(format!("serve-tools: {error}"));
         }
-        require(
-            &mut errors,
-            case["evidence"]["reasoning_alias_replayed"].as_bool()
-                == Some(expected.reasoning_alias_replay),
-            "serve-tools did not execute the expected reasoning alias replay mode",
-        );
     }
     finish(errors)
 }
@@ -774,7 +706,19 @@ mod tests;
 /// Small observation oracles shared by the actual runner and its report consumer.
 /// Wire framing is checked by the runner before these observations are produced.
 /// These functions do not turn a report into a proof of arbitrary model behavior.
-fn boundary_observation(observation: &Value) -> Result<(&str, &str, u64), String> {
+pub fn probe_answer_matches(text: &str, expected: &str) -> bool {
+    fn trim_markup(text: &str) -> &str {
+        text.trim()
+            .trim_matches(|c| matches!(c, '`' | '*' | '"' | '\''))
+            .trim()
+    }
+    let text = trim_markup(text);
+    // A trailing sentence period is cosmetic; a leading decimal point changes
+    // the numeric answer and must never be discarded.
+    trim_markup(text.strip_suffix('.').unwrap_or(text)) == expected
+}
+
+pub(super) fn boundary_observation(observation: &Value) -> Result<(&str, &str, u64), String> {
     let message = &observation["message"];
     let content = message["content"]
         .as_str()
@@ -810,10 +754,10 @@ fn boundary_observation(observation: &Value) -> Result<(&str, &str, u64), String
     let completion = usage["completion_tokens"]
         .as_u64()
         .ok_or("missing completion usage")?;
-    if prompt == 0
-        || completion == 0
-        || prompt.checked_add(completion) != usage["total_tokens"].as_u64()
-    {
+    let total = prompt
+        .checked_add(completion)
+        .ok_or("token usage overflows")?;
+    if prompt == 0 || completion == 0 || Some(total) != usage["total_tokens"].as_u64() {
         return Err("invalid boundary observation token usage".into());
     }
     Ok((content, reasoning, completion))
