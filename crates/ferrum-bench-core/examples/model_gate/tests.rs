@@ -6,6 +6,10 @@ use ferrum_bench_core::release_regression::{
 };
 use ferrum_types::ModelOutputProtocol;
 fn fixture() -> Plan {
+    fixture_with_quick_start(true)
+}
+
+fn fixture_with_quick_start(all_quick_start: bool) -> Plan {
     let profiles: Vec<_> = [Backend::Metal, Backend::Cuda]
         .into_iter()
         .map(|backend| ModelProfile {
@@ -26,7 +30,11 @@ fn fixture() -> Plan {
     plan(&PlanInput {
         stage: Stage::Release,
         impact: analyze_paths(Vec::<String>::new()),
-        quick_start_profile_ids: profiles.iter().map(|p| p.id.clone()).collect(),
+        quick_start_profile_ids: profiles
+            .iter()
+            .take(if all_quick_start { profiles.len() } else { 1 })
+            .map(|p| p.id.clone())
+            .collect(),
         required_targets: profiles.iter().map(|p| p.target.clone()).collect(),
         profiles,
         checks: model_check_descriptors(),
@@ -56,6 +64,7 @@ fn prepares_distinct_quick_start_defaults_and_keeps_other_release_gaps() {
         assert_eq!(task.profile, selected.profile);
         assert_eq!(task.checks, vec![ModelCheck::Basic]);
         assert!(task.use_default_backend && task.disable_thinking);
+        assert_eq!(task.runtime_capacity, None);
         assert_eq!(
             task.binary_sha256,
             assets()
@@ -119,4 +128,28 @@ fn cli_verifier_saves_failure_for_missing_required_model_results() {
     assert_eq!(report["model_tasks_passed"], false);
     assert_eq!(report["release_approved"], false);
     assert!(!report["issues"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn functional_tasks_declare_context_room_without_changing_output_budget() {
+    let tasks = prepare(&fixture_with_quick_start(false), &assets(), "1.2.3", 512).unwrap();
+    assert!(tasks
+        .expectations
+        .iter()
+        .any(|task| task.use_default_backend));
+    assert!(tasks
+        .expectations
+        .iter()
+        .any(|task| !task.use_default_backend));
+    for task in tasks.expectations {
+        let expected_capacity = if task.profile.target.backend == Backend::Metal {
+            None
+        } else {
+            Some(DEFAULT_FUNCTIONAL_CAPACITY)
+        };
+        assert_eq!(task.runtime_capacity, expected_capacity);
+        assert_eq!(task.max_tokens, 512);
+        assert_eq!(task.use_default_backend, expected_capacity.is_none());
+    }
+    assert!(prepare(&fixture_with_quick_start(false), &assets(), "1.2.3", 2048).is_err());
 }

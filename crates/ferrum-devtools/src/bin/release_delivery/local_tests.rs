@@ -1,7 +1,8 @@
 use super::*;
 use clap::Parser;
 use ferrum_bench_core::release_regression::{
-    model_tasks::ModelCheck, ExecutionTarget, ModelProfile,
+    model_tasks::{ModelCheck, ModelRunCapacity},
+    ExecutionTarget, ModelProfile,
 };
 use ferrum_types::ModelOutputProtocol;
 
@@ -27,6 +28,7 @@ fn task(backend: Backend, id: &str) -> ExpectedModelRun {
         disable_thinking: true,
         use_default_backend: true,
         max_tokens: 512,
+        runtime_capacity: None,
         reasoning_alias_replay: true,
         stop_prompt: "quotes ' $(literal)\nline".into(),
     }
@@ -137,6 +139,8 @@ fn local_runner_arguments_preserve_task_flags_without_a_shell() {
     assert_eq!(after("--stop-prompt"), Some(expected.stop_prompt.as_str()));
     assert_eq!(after("--checks"), Some("basic,tools"));
     assert_eq!(after("--max-tokens"), Some("512"));
+    assert_eq!(after("--context-tokens"), None);
+    assert_eq!(after("--max-num-seqs"), None);
     for flag in [
         "--disable-thinking",
         "--use-default-backend",
@@ -148,13 +152,49 @@ fn local_runner_arguments_preserve_task_flags_without_a_shell() {
     explicit.disable_thinking = false;
     explicit.use_default_backend = false;
     explicit.reasoning_alias_replay = false;
+    explicit.runtime_capacity = Some(ModelRunCapacity {
+        context_tokens: 2048,
+        max_num_seqs: 1,
+    });
     let words = runner_arguments(&input, &explicit, Path::new("task"), Path::new("report"));
+    for (flag, value) in [("--context-tokens", "2048"), ("--max-num-seqs", "1")] {
+        assert!(words
+            .windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value));
+    }
     for flag in [
         "--disable-thinking",
         "--use-default-backend",
         "--reasoning-alias-replay",
     ] {
         assert!(!words.iter().any(|word| word == flag));
+    }
+}
+#[test]
+fn local_capacity_preflight_rejects_an_exhausted_context_or_empty_sequence_pool() {
+    let mut expected = task(Backend::Metal, "metal");
+    expected.runtime_capacity = Some(ModelRunCapacity {
+        context_tokens: 2048,
+        max_num_seqs: 1,
+    });
+    let document = |task| PreparedTasks {
+        schema_version: 1,
+        expectations: vec![task],
+        unsupported_obligations: vec![],
+        remaining_plan_gaps: vec![],
+    };
+    assert_eq!(
+        select(document(expected.clone()), LocalBackend::Metal)
+            .unwrap()
+            .0,
+        vec![expected.clone()]
+    );
+    for (context_tokens, max_num_seqs) in [(512, 1), (0, 1), (2048, 0)] {
+        expected.runtime_capacity = Some(ModelRunCapacity {
+            context_tokens,
+            max_num_seqs,
+        });
+        assert!(select(document(expected.clone()), LocalBackend::Metal).is_err());
     }
 }
 fn inputs(directory: &Path, tasks: Vec<ExpectedModelRun>) -> LocalArgs {

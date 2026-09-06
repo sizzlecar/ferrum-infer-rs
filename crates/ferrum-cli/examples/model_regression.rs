@@ -14,6 +14,7 @@ use anyhow::{ensure, Context, Result};
 use clap::Parser;
 use ferrum_bench_core::release_regression::model_tasks::{
     verify_model_options, verify_model_report, ExpectedModelRun, ModelCheck as Check,
+    ModelRunCapacity, DEFAULT_STOP_PROMPT,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -51,14 +52,17 @@ struct Args {
     #[arg(long)]
     disable_thinking: bool,
     /// Prompt for stop probes. Use original prose if copied text is echoed in reasoning.
-    #[arg(
-        long,
-        default_value = "Write exactly this text, without quotes or explanation: alpha beta gamma delta epsilon."
-    )]
+    #[arg(long, default_value = DEFAULT_STOP_PROMPT)]
     stop_prompt: String,
     /// Also replay actual, nonempty tool-call reasoning through reasoning_content.
     #[arg(long)]
     reasoning_alias_replay: bool,
+    /// Explicit functional context; omit both capacity flags to test product defaults.
+    #[arg(long, requires = "max_num_seqs", value_parser = clap::value_parser!(u32).range(1..))]
+    context_tokens: Option<u32>,
+    /// Functional concurrency ceiling, paired with --context-tokens.
+    #[arg(long, requires = "context_tokens", value_parser = clap::value_parser!(u32).range(1..))]
+    max_num_seqs: Option<u32>,
     /// Per-generation test output budget; does not change context or concurrency.
     #[arg(long, default_value = "512", value_parser = clap::value_parser!(u32).range(1..))]
     max_tokens: u32,
@@ -77,6 +81,15 @@ struct Args {
 }
 
 impl Args {
+    fn runtime_capacity(&self) -> Option<ModelRunCapacity> {
+        self.context_tokens
+            .zip(self.max_num_seqs)
+            .map(|(context_tokens, max_num_seqs)| ModelRunCapacity {
+                context_tokens,
+                max_num_seqs,
+            })
+    }
+
     fn common_args(&self, entrypoint: &str) -> Vec<String> {
         let mut args = vec![entrypoint.into(), self.model.clone()];
         if !self.use_default_backend {
@@ -84,6 +97,19 @@ impl Args {
         }
         if self.disable_thinking {
             args.push("--disable-thinking".into());
+        }
+        if let Some(capacity) = self.runtime_capacity() {
+            if entrypoint == "run" {
+                args.push("--no-context-shift".into());
+            }
+            args.extend([
+                "--kv-capacity".into(),
+                capacity.context_tokens.to_string(),
+                "--max-model-len".into(),
+                capacity.context_tokens.to_string(),
+                "--max-num-seqs".into(),
+                capacity.max_num_seqs.to_string(),
+            ]);
         }
         args
     }
@@ -184,6 +210,11 @@ async fn main() -> Result<()> {
         if args.profile_id.is_none() {
             args.profile_id = Some(expected.profile.id.clone());
         }
+    }
+    if let Some(capacity) = args.runtime_capacity() {
+        capacity
+            .validate(args.max_tokens)
+            .map_err(anyhow::Error::msg)?;
     }
     ensure!(!args.model.trim().is_empty(), "--model must not be empty");
     ensure!(

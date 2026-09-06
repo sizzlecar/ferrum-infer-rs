@@ -1,6 +1,7 @@
 use super::*;
 use ferrum_bench_core::release_regression::{
-    model_tasks::ModelCheck, ExecutionTarget, ModelProfile,
+    model_tasks::{ModelCheck, ModelRunCapacity},
+    ExecutionTarget, ModelProfile,
 };
 use ferrum_types::ModelOutputProtocol;
 
@@ -49,6 +50,7 @@ fn task(backend: Backend, id: &str) -> ExpectedModelRun {
         disable_thinking: true,
         use_default_backend: true,
         max_tokens: 512,
+        runtime_capacity: None,
         reasoning_alias_replay: false,
         stop_prompt: "alpha 'beta' $(never-run)\nnext".into(),
     }
@@ -125,6 +127,8 @@ fn cloud_runner_arguments_preserve_expected_semantics_and_quote_shell_data() {
     assert_eq!(after("--stop-prompt"), Some(task.stop_prompt.as_str()));
     assert_eq!(after("--checks"), Some("basic,stop,tools"));
     assert_eq!(after("--max-tokens"), Some("512"));
+    assert_eq!(after("--context-tokens"), None);
+    assert_eq!(after("--max-num-seqs"), None);
     for flag in [
         "--disable-thinking",
         "--use-default-backend",
@@ -133,6 +137,41 @@ fn cloud_runner_arguments_preserve_expected_semantics_and_quote_shell_data() {
         assert!(words.iter().any(|word| word == flag));
     }
     assert_eq!(ssh::quote("a'b $(x)\n"), "'a'\\''b $(x)\n'");
+    task.runtime_capacity = Some(ModelRunCapacity {
+        context_tokens: 2048,
+        max_num_seqs: 1,
+    });
+    let words = ssh::runner_command(&task, "/workspace/release", "task", "report", 1800);
+    for (flag, value) in [("--context-tokens", "2048"), ("--max-num-seqs", "1")] {
+        assert!(words
+            .windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value));
+    }
+}
+#[test]
+fn cloud_capacity_preflight_rejects_an_exhausted_context_before_rental() {
+    let mut expected = task(Backend::Cuda, "cuda");
+    expected.runtime_capacity = Some(ModelRunCapacity {
+        context_tokens: 2048,
+        max_num_seqs: 1,
+    });
+    let document = |task| PreparedTasks {
+        schema_version: 1,
+        expectations: vec![task],
+        unsupported_obligations: vec![],
+        remaining_plan_gaps: vec![],
+    };
+    assert_eq!(
+        cuda_tasks(document(expected.clone())).unwrap().0,
+        vec![expected.clone()]
+    );
+    for (context_tokens, max_num_seqs) in [(512, 1), (0, 1), (2048, 0)] {
+        expected.runtime_capacity = Some(ModelRunCapacity {
+            context_tokens,
+            max_num_seqs,
+        });
+        assert!(cuda_tasks(document(expected.clone())).is_err());
+    }
 }
 #[test]
 fn cloud_device_rejects_nominal_or_wrong_gpu_capacity_and_backend() {

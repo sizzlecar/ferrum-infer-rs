@@ -123,6 +123,8 @@ fn select(
         }
         verify_model_options(&task,&json!({"profile_id":task.profile.id,"model":task.profile.model,"backend":backend.name(),
             "stop_prompt":task.stop_prompt,"checks":task.checks,"max_tokens":task.max_tokens,
+            "context_tokens":task.runtime_capacity.as_ref().map(|capacity|capacity.context_tokens),
+            "max_num_seqs":task.runtime_capacity.as_ref().map(|capacity|capacity.max_num_seqs),
             "disable_thinking":task.disable_thinking,"use_default_backend":task.use_default_backend,"reasoning_alias_replay":task.reasoning_alias_replay}))
             .map_err(|issues|issues.join("; "))?;
         selected.push(task);
@@ -160,6 +162,14 @@ fn runner_arguments(
         "--stop-prompt".into(),
         task.stop_prompt.clone().into(),
     ];
+    if let Some(capacity) = &task.runtime_capacity {
+        words.extend([
+            "--context-tokens".into(),
+            capacity.context_tokens.to_string().into(),
+            "--max-num-seqs".into(),
+            capacity.max_num_seqs.to_string().into(),
+        ]);
+    }
     if task.disable_thinking {
         words.push("--disable-thinking".into());
     }

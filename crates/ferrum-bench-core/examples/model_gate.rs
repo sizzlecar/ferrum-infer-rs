@@ -2,7 +2,9 @@
 //! This gate covers model execution only; it never authorizes publication.
 use clap::{Parser, Subcommand};
 use ferrum_bench_core::release_regression::model_schedule::model_task_schedule;
-use ferrum_bench_core::release_regression::model_tasks::{verify_model_reports, ExpectedModelRun};
+use ferrum_bench_core::release_regression::model_tasks::{
+    verify_model_reports, ExpectedModelRun, DEFAULT_FUNCTIONAL_CAPACITY, DEFAULT_STOP_PROMPT,
+};
 use ferrum_bench_core::release_regression::{Backend, Gap, Plan};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -143,11 +145,25 @@ fn prepare(
         let asset = by_backend
             .get(&run.profile.target.backend)
             .ok_or_else(|| format!("no staged binary for profile {}", run.profile.id))?;
+        let runtime_capacity = if run.quick_start {
+            None
+        } else {
+            Some(DEFAULT_FUNCTIONAL_CAPACITY)
+        };
+        if let Some(capacity) = runtime_capacity {
+            capacity.validate(max_tokens)?;
+        }
         expectations.push(ExpectedModelRun {
-            profile:run.profile, binary_sha256:asset.sha256.clone(), version:version.into(),
-            checks:run.checks, disable_thinking:run.quick_start, use_default_backend:run.quick_start,
-            max_tokens, reasoning_alias_replay:false,
-            stop_prompt:"Write exactly this text, without quotes or explanation: alpha beta gamma delta epsilon.".into(),
+            profile: run.profile,
+            binary_sha256: asset.sha256.clone(),
+            version: version.into(),
+            checks: run.checks,
+            disable_thinking: run.quick_start,
+            use_default_backend: run.quick_start,
+            max_tokens,
+            runtime_capacity,
+            reasoning_alias_replay: false,
+            stop_prompt: DEFAULT_STOP_PROMPT.into(),
         });
     }
     Ok(PreparedTasks {

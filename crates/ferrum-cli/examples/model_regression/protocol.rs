@@ -1,4 +1,4 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -334,17 +334,6 @@ pub(super) fn answer(text: &str, expected: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn stop_from_baseline(content: &str, reasoning: &str) -> Result<(String, String)> {
-    let boundaries: Vec<_> = content.char_indices().map(|(index, _)| index).collect();
-    for start in boundaries.iter().skip((boundaries.len() / 2).max(1)) {
-        let sentinel = &content[*start..];
-        if content.find(sentinel) == Some(*start) && !reasoning.contains(sentinel) {
-            return Ok((content[..*start].to_owned(), sentinel.to_owned()));
-        }
-    }
-    bail!("baseline has no distinct visible stop suffix outside reasoning: {content:?}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,14 +391,6 @@ mod tests {
             result.message["tool_calls"][0]["function"]["arguments"],
             "{\"expression\":\"123+456\"}"
         );
-    }
-    #[test]
-    fn stop_suffix_respects_unicode_and_existing_reasoning() {
-        let content = "开头 alpha 结束";
-        let (prefix, stop) = stop_from_baseline(content, "earlier reasoning").unwrap();
-        assert_eq!(prefix + &stop, content);
-        assert!(stop_from_baseline(content, content).is_err());
-        assert!(stop_from_baseline("", "").is_err());
     }
     #[test]
     fn semantic_check_rejects_wrong_or_missing_answers() {

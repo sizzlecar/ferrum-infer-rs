@@ -402,6 +402,14 @@ pub(super) fn runner_command(
         "--stop-prompt".into(),
         task.stop_prompt.clone(),
     ];
+    if let Some(capacity) = &task.runtime_capacity {
+        words.extend([
+            "--context-tokens".into(),
+            capacity.context_tokens.to_string(),
+            "--max-num-seqs".into(),
+            capacity.max_num_seqs.to_string(),
+        ]);
+    }
     if task.disable_thinking {
         words.push("--disable-thinking".into());
     }

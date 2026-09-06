@@ -1,6 +1,7 @@
 use super::*;
 use ferrum_bench_core::release_regression::{
-    Entrypoint, ExecutionTarget, Impact, ModelProfile, PlanCost, SelectedProfile,
+    model_tasks::ModelRunCapacity, Entrypoint, ExecutionTarget, Impact, ModelProfile, PlanCost,
+    SelectedProfile,
 };
 use serde_json::json;
 
@@ -26,6 +27,7 @@ fn task() -> ExpectedModelRun {
         disable_thinking: true,
         use_default_backend: true,
         max_tokens: 128,
+        runtime_capacity: None,
         reasoning_alias_replay: false,
         stop_prompt: "Write a sentence.".into(),
     }
@@ -84,7 +86,7 @@ fn distributions() -> BTreeMap<Backend, Distribution> {
 // actual runner. These cases exercise its existing consuming validator.
 fn model_report(task: &ExpectedModelRun) -> Value {
     json!({"schema_version":2,"status":"passed","profile_id":task.profile.id,"target":task.profile.target,"binary_sha256":task.binary_sha256,
-    "options":{"profile_id":task.profile.id,"model":task.profile.model,"backend":"cuda","checks":task.checks,"disable_thinking":true,"use_default_backend":true,"max_tokens":task.max_tokens,"reasoning_alias_replay":false,"stop_prompt":task.stop_prompt},
+    "options":{"profile_id":task.profile.id,"model":task.profile.model,"backend":"cuda","checks":task.checks,"disable_thinking":true,"use_default_backend":true,"max_tokens":task.max_tokens,"context_tokens":task.runtime_capacity.as_ref().map(|capacity|capacity.context_tokens),"max_num_seqs":task.runtime_capacity.as_ref().map(|capacity|capacity.max_num_seqs),"reasoning_alias_replay":false,"stop_prompt":task.stop_prompt},
     "sampling":{"temperature":0,"seed":7,"max_tokens":task.max_tokens},"environment_policy":"remove_inherited_ferrum_overrides",
     "cases":[
         {"case":"binary-version","status":"passed","evidence":{"version":format!("ferrum {}",task.version)}},
@@ -146,6 +148,52 @@ fn release_plan_recomputes_schedule_and_rejects_removed_gap_or_stale_assignments
     prepared.expectations[0].binary_sha256 = "b".repeat(64);
     prepared.expectations[0].use_default_backend = false;
     assert!(validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4").is_err());
+}
+
+#[test]
+fn prepared_capacity_cannot_override_quick_start_or_the_functional_workload() {
+    for quick_start in [true, false] {
+        let mut expected = task();
+        expected.disable_thinking = quick_start;
+        expected.use_default_backend = quick_start;
+        expected.runtime_capacity = (!quick_start).then_some(DEFAULT_FUNCTIONAL_CAPACITY);
+        let mut plan = make_plan(&expected);
+        if !quick_start {
+            plan.obligations[0].behavior = Behavior::ModelForward;
+            plan.obligations[0].checkers = vec!["model-regression.basic.model-forward".into()];
+        }
+        let schedule = model_task_schedule(&plan);
+        assert_eq!(schedule.runs[0].quick_start, quick_start);
+        let mut prepared = PreparedTasks {
+            schema_version: 1,
+            expectations: vec![expected.clone()],
+            unsupported_obligations: vec![],
+            remaining_plan_gaps: vec![],
+        };
+        validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4").unwrap();
+        for capacity in [
+            None,
+            Some(DEFAULT_FUNCTIONAL_CAPACITY),
+            Some(ModelRunCapacity {
+                context_tokens: DEFAULT_FUNCTIONAL_CAPACITY.context_tokens * 2,
+                ..DEFAULT_FUNCTIONAL_CAPACITY
+            }),
+            Some(ModelRunCapacity {
+                max_num_seqs: DEFAULT_FUNCTIONAL_CAPACITY.max_num_seqs + 1,
+                ..DEFAULT_FUNCTIONAL_CAPACITY
+            }),
+        ] {
+            if capacity == expected.runtime_capacity {
+                continue;
+            }
+            prepared.expectations[0].runtime_capacity = capacity;
+            assert!(
+                validate_tasks(&plan, &schedule, &prepared, &distributions(), "2.3.4")
+                    .unwrap_err()
+                    .contains("capacity")
+            );
+        }
+    }
 }
 
 #[test]

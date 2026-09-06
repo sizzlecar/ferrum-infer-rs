@@ -7798,6 +7798,38 @@ fn request_context_capacity_uses_executor_kv_capacity_when_smaller() {
 }
 
 #[test]
+fn explicit_request_budget_accepts_exact_capacity_and_rejects_one_token_over() {
+    let capacity = 512;
+    let prompt_tokens = 59;
+    let config = EngineConfig::default();
+    let runtime = ContinuousEngineRuntimeConfig::from_env_vars(None, Vec::<(&str, &str)>::new());
+    let mut request = InferenceRequest::new("test", "test").with_sampling_params(SamplingParams {
+        max_tokens: capacity - prompt_tokens,
+        ..SamplingParams::default()
+    });
+
+    validate_request_context_budget(&request, prompt_tokens, &config, &runtime, Some(capacity))
+        .expect("an explicit budget may exactly fill the available context");
+
+    request.sampling_params.max_tokens += 1;
+    clamp_default_max_tokens_to_context(
+        &mut request,
+        prompt_tokens,
+        &config,
+        &runtime,
+        Some(capacity),
+    );
+    assert_eq!(
+        request.sampling_params.max_tokens,
+        capacity - prompt_tokens + 1
+    );
+    let error =
+        validate_request_context_budget(&request, prompt_tokens, &config, &runtime, Some(capacity))
+            .expect_err("one explicit output token beyond the context must be rejected");
+    assert!(matches!(error, FerrumError::RequestValidation { .. }));
+}
+
+#[test]
 fn opencode_sized_prompt_rejects_an_explicit_4096_context() {
     const INPUT_TOKENS: usize = 7_470;
     const OUTPUT_TOKENS: usize = 512;

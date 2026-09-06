@@ -120,11 +120,40 @@ impl Drop for Process {
 pub(super) async fn run(
     args: &Args,
     name: &str,
-    argv: Vec<String>,
+    mut argv: Vec<String>,
     stdin: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
-    Process::spawn(args, name, argv, stdin)?.wait(timeout).await
+    let capacity_evidence = if argv.first().is_some_and(|entrypoint| entrypoint == "run") {
+        args.runtime_capacity().map(|capacity| {
+            let path = args
+                .report_dir
+                .join(format!("{name}.effective-config.json"));
+            argv.extend([
+                "--effective-config-json".into(),
+                path.to_string_lossy().into_owned(),
+            ]);
+            (capacity, path)
+        })
+    } else {
+        None
+    };
+    let stdout = Process::spawn(args, name, argv, stdin)?
+        .wait(timeout)
+        .await?;
+    if let Some((capacity, path)) = capacity_evidence {
+        // This is the configuration written by the same product process that
+        // generated stdout, not a separate inspection or a copy of task inputs.
+        let config: Value = serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .context("parse run effective capacity configuration")?;
+        capacity
+            .verify_health(&json!({"auto_config": config}))
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("{name} actual run capacity"))?;
+    }
+    Ok(stdout)
 }
 
 pub(super) struct Server<'a> {

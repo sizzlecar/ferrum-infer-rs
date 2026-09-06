@@ -24,6 +24,7 @@ fn task(id: &str, backend: Backend, checks: Vec<ModelCheck>) -> ExpectedModelRun
         disable_thinking: true,
         use_default_backend: true,
         max_tokens: 128,
+        runtime_capacity: None,
         reasoning_alias_replay: false,
         stop_prompt: "Write an original sentence about rain.".into(),
     }
@@ -48,7 +49,10 @@ impl ReportFixture {
             json!({"case": "binary-version", "status": "passed", "evidence": {"version": format!("ferrum {}", expected.version)}}),
             json!({"case": "serve-startup", "status": "passed", "evidence": {
                 "version": expected.version, "status": "healthy", "reasoning_protocol": expected.profile.reasoning_protocol,
-                "auto_config": {"hardware_capabilities": {"backend": backend_name(expected.profile.target.backend)}}
+                "auto_config": {"hardware_capabilities": {"backend": backend_name(expected.profile.target.backend)},
+                    "selected_max_model_len": expected.runtime_capacity.map(|c| c.context_tokens),
+                    "selected_kv_capacity": expected.runtime_capacity.map(|c| c.context_tokens),
+                    "selected_max_sequences": expected.runtime_capacity.map(|c| c.max_num_seqs)}
             }}),
         ];
         for check in &expected.checks {
@@ -87,7 +91,9 @@ impl ReportFixture {
                         }
                         json!({"observations": observations})
                     }
-                    "run-stop" => json!({"ready": ready.clone()}),
+                    "run-stop" | "serve-stop" => {
+                        stop_fixture(expected, &ready, *name == "run-stop")
+                    }
                     "run-reasoning" | "serve-reasoning" => {
                         let output = boundary_fixture("42", "17 plus 25 equals 42.", "stop", 10);
                         json!({"ready": ready, "enable_thinking": true, "max_tokens": expected.max_tokens,
@@ -130,6 +136,8 @@ impl ReportFixture {
                     "backend": backend_name(expected.profile.target.backend), "checks": expected.checks,
                     "disable_thinking": expected.disable_thinking, "use_default_backend": expected.use_default_backend,
                     "max_tokens": expected.max_tokens, "reasoning_alias_replay": expected.reasoning_alias_replay,
+                    "context_tokens": expected.runtime_capacity.map(|c| c.context_tokens),
+                    "max_num_seqs": expected.runtime_capacity.map(|c| c.max_num_seqs),
                     "stop_prompt": expected.stop_prompt,
                     "ferrum_bin": "/staging/ferrum", "source_label": null, "precision_label": null,
                     "report_dir": "/reports/model", "startup_timeout_secs": 600,
@@ -158,6 +166,36 @@ impl ReportFixture {
             .unwrap()
             .retain(|case| case["case"] != name);
     }
+}
+
+fn stop_fixture(expected: &ExpectedModelRun, ready: &Value, is_run: bool) -> Value {
+    use super::super::model_stop::{select_stop_boundary, StopMode};
+    use sha2::{Digest, Sha256};
+    let baseline_text = "alpha beta gamma delta epsilon and some more words";
+    let mut baseline = boundary_fixture(baseline_text, "", "stop", 30);
+    let boundary = select_stop_boundary(&baseline).unwrap();
+    let mut output = boundary_fixture(&boundary.expected_prefix, "", "stop", 12);
+    for (value, text) in [
+        (&mut baseline, baseline_text),
+        (&mut output, boundary.expected_prefix.as_str()),
+    ] {
+        value["raw_availability"] = json!(if is_run { "captured" } else { "not_exposed" });
+        if is_run {
+            value["ready"] = ready.clone();
+            value["raw_text"] = json!(text);
+            value["raw_text_sha256"] = json!(format!("{:x}", Sha256::digest(text.as_bytes())));
+        }
+    }
+    let outputs = if is_run {
+        json!({"run": output})
+    } else {
+        json!({"sync": output, "stream": output})
+    };
+    json!({"ready": ready, "probes": [{"mode": StopMode::TaskDefault,
+        "inputs": {"prompt": expected.stop_prompt, "temperature": 0, "seed": 7,
+            "max_tokens": expected.max_tokens, "runtime_capacity": expected.runtime_capacity,
+            "enable_thinking": if expected.disable_thinking { Some(false) } else { None }},
+        "boundary": boundary, "baseline": baseline, "outputs": outputs}]})
 }
 
 fn rejected(expected: &ExpectedModelRun, fixture: &ReportFixture, reason: &str) {
@@ -639,4 +677,158 @@ fn absence_oracle_is_distinct_from_enabled_reasoning_and_rejects_control_leaks()
     let mut malformed = absent;
     malformed["message"]["reasoning"] = json!(false);
     assert!(verify_reasoning_absence_observation(&malformed, "42").is_err());
+}
+
+#[test]
+fn stop_report_replays_channel_prefix_usage_and_entrypoint_observations() {
+    let expected = task("selected", Backend::Metal, vec![ModelCheck::Stop]);
+    let valid = ReportFixture::passed(&expected);
+    verify_model_report(&expected, &valid.value).unwrap();
+    for (case, pointer, value) in [
+        (
+            "run-stop",
+            "/evidence/probes/0/outputs/run/message/content",
+            json!("wrong prefix"),
+        ),
+        (
+            "run-stop",
+            "/evidence/probes/0/outputs/run/raw_text",
+            json!("invented raw text"),
+        ),
+        (
+            "serve-stop",
+            "/evidence/probes/0/outputs/stream/finish_reason",
+            json!("length"),
+        ),
+        (
+            "serve-stop",
+            "/evidence/probes/0/outputs/stream/usage/completion_tokens",
+            json!(30),
+        ),
+        (
+            "serve-stop",
+            "/evidence/probes/0/outputs/stream",
+            Value::Null,
+        ),
+        (
+            "serve-stop",
+            "/evidence/probes/0/inputs/enable_thinking",
+            json!(true),
+        ),
+        (
+            "serve-stop",
+            "/evidence/probes/0/mode",
+            json!("disabled_thinking"),
+        ),
+        (
+            "serve-stop",
+            "/evidence/probes/0/boundary/channel",
+            json!("reasoning"),
+        ),
+    ] {
+        let mut changed = ReportFixture::passed(&expected);
+        *changed.case_mut(case).pointer_mut(pointer).unwrap() = value;
+        assert!(
+            verify_model_report(&expected, &changed.value).is_err(),
+            "accepted {case}{pointer}"
+        );
+    }
+    let mut old = ReportFixture::passed(&expected);
+    old.case_mut("serve-stop")["evidence"] = json!({"expected_prefix":"alpha", "outputs":[]});
+    rejected(&expected, &old, "missing channel observations");
+}
+
+#[test]
+fn a_reasoning_stop_requires_separate_final_evidence_even_when_false_still_reasons() {
+    use super::super::model_stop::{select_stop_boundary, StopMode};
+    let mut expected = task("selected", Backend::Metal, vec![ModelCheck::Stop]);
+    expected.disable_thinking = false;
+    let mut fixture = ReportFixture::passed(&expected);
+    let mut final_probe = fixture.case_mut("serve-stop")["evidence"]["probes"][0].clone();
+    final_probe["mode"] = json!(StopMode::DisabledThinking);
+    final_probe["inputs"]["enable_thinking"] = json!(false);
+    for pointer in ["/baseline", "/outputs/sync", "/outputs/stream"] {
+        final_probe.pointer_mut(pointer).unwrap()["message"]["reasoning"] =
+            json!("A retained thought.");
+    }
+    let mut baseline = boundary_fixture("", "I will examine the street and describe its reflections before composing my final paragraph.", "length", u64::from(expected.max_tokens));
+    baseline["raw_availability"] = json!("not_exposed");
+    let boundary = select_stop_boundary(&baseline).unwrap();
+    let mut output = boundary_fixture("", &boundary.expected_prefix, "stop", 20);
+    output["raw_availability"] = json!("not_exposed");
+    let mut thought_probe = final_probe.clone();
+    thought_probe["mode"] = json!(StopMode::TaskDefault);
+    thought_probe["inputs"]["enable_thinking"] = Value::Null;
+    thought_probe["boundary"] = json!(boundary);
+    thought_probe["baseline"] = baseline;
+    thought_probe["outputs"] = json!({"sync": output, "stream": output});
+    fixture.case_mut("serve-stop")["evidence"]["probes"] = json!([thought_probe]);
+    rejected(&expected, &fixture, "final-channel stop uncovered");
+    fixture.case_mut("serve-stop")["evidence"]["probes"]
+        .as_array_mut()
+        .unwrap()
+        .push(final_probe);
+    verify_model_report(&expected, &fixture.value).unwrap();
+    fixture.case_mut("serve-stop")["evidence"]["probes"][1]["outputs"]["stream"]["message"]
+        ["reasoning"] = json!("discarded previous thought");
+    assert!(verify_model_report(&expected, &fixture.value).is_err());
+}
+
+#[test]
+fn only_buffered_harmony_can_record_unavailable_run_raw_prefix_evidence() {
+    let mut expected = task("selected", Backend::Metal, vec![ModelCheck::Stop]);
+    expected.profile.target.protocol = ModelOutputProtocol::HarmonyGptOss;
+    let mut fixture = ReportFixture::passed(&expected);
+    let probe = &mut fixture.case_mut("run-stop")["evidence"]["probes"][0];
+    for pointer in ["/baseline", "/outputs/run"] {
+        let observation = probe.pointer_mut(pointer).unwrap();
+        observation["raw_availability"] = json!("unavailable");
+        observation["raw_text"] = Value::Null;
+    }
+    verify_model_report(&expected, &fixture.value).unwrap();
+    expected.profile.target.protocol = ModelOutputProtocol::Text;
+    fixture.value["target"] = json!(expected.profile.target);
+    rejected(&expected, &fixture, "actual raw delta evidence");
+}
+
+#[test]
+fn explicit_functional_capacity_is_bound_before_execution_and_observed_at_startup() {
+    let mut expected = task("functional", Backend::Metal, vec![ModelCheck::Stop]);
+    let capacity = ModelRunCapacity {
+        context_tokens: 2048,
+        max_num_seqs: 1,
+    };
+    expected.runtime_capacity = Some(capacity);
+    let valid = ReportFixture::passed(&expected);
+    verify_model_report(&expected, &valid.value).unwrap();
+    for (field, value) in [
+        ("context_tokens", json!(1024)),
+        ("context_tokens", Value::Null),
+        ("max_num_seqs", json!(2)),
+    ] {
+        let mut changed = valid.value["options"].clone();
+        changed[field] = value;
+        assert!(verify_model_options(&expected, &changed).is_err());
+    }
+    for (field, value) in [
+        ("selected_max_model_len", json!(512)),
+        ("selected_max_model_len", json!(4096)),
+        ("selected_kv_capacity", Value::Null),
+        ("selected_max_sequences", json!(2)),
+    ] {
+        let mut changed = ReportFixture::passed(&expected);
+        changed.case_mut("serve-startup")["evidence"]["auto_config"][field] = value;
+        assert!(verify_model_report(&expected, &changed.value).is_err());
+    }
+    for tokens in [2048, 2049] {
+        expected.max_tokens = tokens;
+        let fixture = ReportFixture::passed(&expected);
+        assert!(verify_model_options(&expected, &fixture.value["options"]).is_err());
+    }
+    assert!(ModelRunCapacity {
+        context_tokens: 2048,
+        max_num_seqs: 0
+    }
+    .validate(512)
+    .is_err());
 }
