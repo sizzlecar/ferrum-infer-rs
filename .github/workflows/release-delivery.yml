@@ -379,7 +379,7 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
             --disk-gib 300 --min-free-disk-gib 180 --min-cpu-ram-mb 64000 \
             --max-hourly-usd 0.75 --max-network-usd-per-gb 0.004 \
-            --lease-secs 10800 --bootstrap-secs 900 --task-timeout-secs 3600 --max-create-attempts 1
+            --lease-secs 10800 --bootstrap-secs 900 --task-timeout-secs 3600 --max-create-attempts 3
       - uses: actions/upload-artifact@v4
         if: always()
         with:

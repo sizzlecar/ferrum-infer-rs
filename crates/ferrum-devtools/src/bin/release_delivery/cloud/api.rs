@@ -10,6 +10,26 @@ pub(super) struct Client {
     token: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CreateOutcome {
+    Created(u64),
+    OfferUnavailable,
+}
+
+fn unavailable_offer(status: reqwest::StatusCode, value: &Value, offer: u64) -> bool {
+    // Vast also returns its documented no_such_ask rejection as HTTP 400 with
+    // error=invalid_args and the original 404/3603 code in msg. Match that
+    // specific rejection, never a generic 4xx, timeout or arbitrary error text.
+    matches!(status.as_u16(), 400 | 404 | 410)
+        && value["success"] == false
+        && value["ask_id"].as_u64() == Some(offer)
+        && (value["error"] == "no_such_ask"
+            || (value["error"] == "invalid_args"
+                && value["msg"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("error 404/3603: no_such_ask "))))
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(super) struct Instance {
     pub id: u64,
@@ -119,6 +139,20 @@ impl Client {
         body: Option<Value>,
         query: &[(&str, String)],
     ) -> Result<Value, String> {
+        let (status, value) = self.response(method.clone(), path, body, query).await?;
+        if !status.is_success() {
+            return Err(format!("Vast {method} {path}: HTTP {}", status.as_u16()));
+        }
+        Ok(value)
+    }
+
+    async fn response(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        query: &[(&str, String)],
+    ) -> Result<(reqwest::StatusCode, Value), String> {
         let mut request = self
             .http
             .request(method.clone(), format!("{}{path}", self.base))
@@ -130,12 +164,7 @@ impl Client {
         let mut response = request.send().await.map_err(|_| {
             format!("Vast {method} {path}: transport failure (outcome may be ambiguous)")
         })?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "Vast {method} {path}: HTTP {}",
-                response.status().as_u16()
-            ));
-        }
+        let status = response.status();
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
@@ -147,8 +176,13 @@ impl Client {
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes)
-            .map_err(|_| format!("Vast {method} {path}: invalid JSON response"))
+        let value = serde_json::from_slice(&bytes).map_err(|_| {
+            format!(
+                "Vast {method} {path}: HTTP {} with invalid JSON response",
+                status.as_u16()
+            )
+        })?;
+        Ok((status, value))
     }
 
     pub async fn offers(&self, args: &super::ExecuteArgs) -> Result<Vec<Offer>, String> {
@@ -179,11 +213,19 @@ impl Client {
         disk_gib: u64,
         label: &str,
         image: &str,
-    ) -> Result<u64, String> {
-        let value = self.request(Method::PUT, &format!("/api/v0/asks/{offer}/"), Some(json!({
+    ) -> Result<CreateOutcome, String> {
+        let path = format!("/api/v0/asks/{offer}/");
+        let (status, value) = self.response(Method::PUT, &path, Some(json!({
             "client_id":"me", "image":image, "disk":disk_gib, "label":label,
             "runtype":"ssh_proxy", "cancel_unavail":true, "onstart":"touch /root/.no_auto_tmux"
         })), &[]).await?;
+        if unavailable_offer(status, &value, offer) {
+            return Ok(CreateOutcome::OfferUnavailable);
+        }
+        if !status.is_success() {
+            // Do not echo a provider's arbitrary response body into CI logs.
+            return Err(format!("Vast PUT {path}: HTTP {}", status.as_u16()));
+        }
         if value["success"] != true {
             return Err(
                 "Vast create did not confirm success; reconcile label before further action".into(),
@@ -192,6 +234,7 @@ impl Client {
         value["new_contract"]
             .as_u64()
             .filter(|id| *id > 0)
+            .map(CreateOutcome::Created)
             .ok_or_else(|| "Vast create omitted contract ID; reconcile label".into())
     }
 

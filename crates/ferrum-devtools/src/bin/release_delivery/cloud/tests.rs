@@ -193,6 +193,12 @@ fn cloud_price_limits_and_create_count_are_explicit() {
     let mut input = args();
     assert!(validate_args(&input).is_ok());
     input.max_create_attempts = 2;
+    assert!(validate_args(&input).is_ok());
+    input.max_create_attempts = 3;
+    assert!(validate_args(&input).is_ok());
+    input.max_create_attempts = 4;
+    assert!(validate_args(&input).is_err());
+    input.max_create_attempts = 0;
     assert!(validate_args(&input).is_err());
     input = args();
     input.max_hourly_usd = f64::NAN;
