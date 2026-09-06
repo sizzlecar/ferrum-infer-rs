@@ -10,10 +10,14 @@ mod gate;
 mod installation;
 #[path = "release_delivery/local.rs"]
 mod local;
+#[path = "release_delivery/performance.rs"]
+mod performance;
 #[path = "release_delivery/public_install.rs"]
 mod public_install;
 #[path = "release_delivery/publish.rs"]
 mod publish;
+#[path = "release_delivery/submission.rs"]
+mod submission;
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct AcceptedAsset {
@@ -46,6 +50,8 @@ enum Action {
         output: PathBuf,
     },
     Local(local::LocalArgs),
+    Performance(performance::PerformanceArgs),
+    PerformancePrepare(performance::PerformancePrepareArgs),
     Cloud(cloud::ExecuteArgs),
     Reap(cloud::ReapArgs),
     Publish {
@@ -70,6 +76,8 @@ async fn run(action: Action) -> Result<(), String> {
         }
         Action::Inspect(args) => installation::inspect(args).await,
         Action::Local(args) => local::execute(args).await,
+        Action::Performance(args) => performance::execute(args).await,
+        Action::PerformancePrepare(args) => performance::prepare(args).await,
         Action::Cloud(args) => cloud::execute(args).await,
         Action::Reap(args) => cloud::reap(args).await,
         Action::Publish {

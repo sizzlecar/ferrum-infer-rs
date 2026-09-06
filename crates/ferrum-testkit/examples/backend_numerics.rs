@@ -2,7 +2,10 @@
 #[path = "backend_numerics/config.rs"]
 mod config;
 use config::{parse_args, Args, Config, Precision, USAGE};
-use ferrum_testkit::op_diff::required::{RequiredReport, RequiredStatus};
+use ferrum_testkit::op_diff::metal_context::{
+    compare_submission_segments, MetalContextOp, SubmissionPhase, SUBMISSION_PHASES,
+};
+use ferrum_testkit::op_diff::required::{NumericalMetrics, RequiredReport, RequiredStatus};
 use serde::Serialize;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, Write};
@@ -21,6 +24,10 @@ struct Document {
     executed_precision: Option<Precision>,
     execution_path: &'static str,
     coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submission_phases: Option<&'static [SubmissionPhase]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    submission_metrics: Option<Vec<NumericalMetrics>>,
     started_at: String,
     completed: bool,
     finished_at: Option<String>,
@@ -53,6 +60,43 @@ fn bind_output_shape(report: &mut RequiredReport, expected_elements: usize) {
     }
 }
 
+fn bind_submission_segments(
+    report: &mut RequiredReport,
+    config: &Config,
+) -> Option<Vec<NumericalMetrics>> {
+    let config::Operation::MetalContext {
+        tokens,
+        intermediate,
+        k,
+    } = config.op
+    else {
+        return None;
+    };
+    let (Some(reference), Some(actual)) = (&report.reference, &report.actual) else {
+        return None;
+    };
+    match compare_submission_segments(
+        &MetalContextOp {
+            tokens,
+            intermediate,
+            k,
+        },
+        &reference.to_f32(),
+        &actual.to_f32(),
+        config.max_nmse,
+    ) {
+        Ok(metrics) => Some(metrics),
+        Err(error) => {
+            report.status = RequiredStatus::Failed;
+            report.reason = Some(match report.reason.take() {
+                Some(previous) => format!("{previous}; {error}"),
+                None => error,
+            });
+            None
+        }
+    }
+}
+
 fn write_document(file: &mut File, document: &Document) -> Result<(), String> {
     // Serialize first, so a serialization error leaves the previous incomplete
     // record intact. A write failure still exits nonzero and cannot authorize use.
@@ -76,18 +120,33 @@ fn run(args: Args) -> Result<(), String> {
         .create_new(true)
         .open(&args.report)
         .map_err(|error| format!("create report {}: {error}", args.report.display()))?;
+    let is_context = matches!(args.config.op, config::Operation::MetalContext { .. });
     let mut document = Document {
-        schema_version: 1, output_shape: args.config.op.output_shape(), expected_output_elements: expected_elements,
-        configured_precision: args.config.precision(), executed_precision: None,
+        schema_version: 1,
+        output_shape: args.config.op.output_shape(),
+        expected_output_elements: expected_elements,
+        configured_precision: args.config.precision(),
+        executed_precision: None,
         execution_path: args.config.op.execution_path(),
-        coverage: "Only the selected Backend trait operation, shape and fixed adapter precision; excludes production-plan dispatch, quantized Marlin, paged attention, full models and performance claims",
-        started_at: chrono::Utc::now().to_rfc3339(), completed: false, finished_at: None,
-        execution_elapsed_ms: None, result: None, config: args.config,
+        coverage: if is_context {
+            "Legacy MetalContext F32 compute/blit/compute, checked initial/reused/independent submissions and post-Drop data. Drop exposes no driver status. Excludes quantized kernels, production-plan dispatch and model performance."
+        } else {
+            "Only the selected Backend trait operation, shape and fixed adapter precision; excludes production-plan dispatch, quantized Marlin, paged attention, full models and performance claims"
+        },
+        submission_phases: is_context.then_some(&SUBMISSION_PHASES),
+        submission_metrics: None,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        completed: false,
+        finished_at: None,
+        execution_elapsed_ms: None,
+        result: None,
+        config: args.config,
     };
     write_document(&mut file, &document)?;
     let started = Instant::now();
     let mut result = document.config.execute();
     bind_output_shape(&mut result, expected_elements);
+    document.submission_metrics = bind_submission_segments(&mut result, &document.config);
     document.execution_elapsed_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
     if result.actual.is_some() {
         document.executed_precision = Some(document.config.precision());

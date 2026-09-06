@@ -268,3 +268,96 @@ fn each_uncompiled_required_operation_writes_not_run_and_exits_nonzero() {
         assert_eq!(document["output_shape"], serde_json::json!(shape));
     }
 }
+
+#[test]
+fn metal_context_requires_metal_and_records_lifecycle_output_segments() {
+    let mut arguments = argv("metal", "report.json");
+    arguments[3] = "metal-context".into();
+    let args = parse_args(arguments.clone()).unwrap().unwrap();
+    assert_eq!(
+        args.config.op.output_shape(),
+        [SUBMISSION_PHASES.len(), 3 * 33]
+    );
+    assert_eq!(
+        args.config.validate().unwrap(),
+        SUBMISSION_PHASES.len() * 3 * 33
+    );
+    assert_eq!(
+        args.config.precision().backend_input_storage,
+        StoragePrecision::F32
+    );
+    assert!(args.config.op.execution_path().contains("MetalContext"));
+    arguments[1] = "cuda".into();
+    assert!(parse_args(arguments)
+        .unwrap_err()
+        .contains("requires the Metal backend"));
+    for (flag, value) in [
+        ("--tokens", "0"),
+        ("--intermediate", "0"),
+        ("--k", "0"),
+        ("--dim", "33"),
+        ("--eps", "1e-6"),
+    ] {
+        let mut arguments = argv("metal", "report.json");
+        arguments[3] = "metal-context".into();
+        arguments.extend([flag.into(), value.into()]);
+        assert!(parse_args(arguments).is_err());
+    }
+}
+
+#[test]
+fn context_segment_failure_overrides_a_successful_aggregate_report() {
+    let reference = [1e8, 1.0, 2.0, 3.0];
+    let actual = [1e8, 0.0, 2.0, 3.0];
+    let config = Config {
+        require_backend: RequiredBackend::Metal,
+        op: Operation::MetalContext {
+            tokens: 1,
+            intermediate: 1,
+            k: 1,
+        },
+        seed: 7,
+        max_nmse: NMSE_FP32_TOL,
+    };
+    let mut report = RequiredReport {
+        schema_version: 1,
+        op: "metal_context".into(),
+        backend: RequiredBackend::Metal,
+        seed: 7,
+        tolerance: Some(NMSE_FP32_TOL),
+        tolerance_f64_bits: NMSE_FP32_TOL.to_bits(),
+        status: RequiredStatus::Passed,
+        reason: None,
+        reference: Some(RawOutput::from_f32(&reference)),
+        actual: Some(RawOutput::from_f32(&actual)),
+        metrics: Some(compare_outputs(&reference, &actual, NMSE_FP32_TOL).unwrap()),
+    };
+    bind_output_shape(&mut report, config.validate().unwrap());
+    assert!(report.is_passed());
+    assert!(bind_submission_segments(&mut report, &config).is_none());
+    assert_eq!(report.status, RequiredStatus::Failed);
+    assert!(report.reason.unwrap().contains("ReusedContext"));
+}
+
+#[cfg(not(all(target_os = "macos", feature = "metal")))]
+#[test]
+fn uncompiled_metal_context_writes_not_run_without_output_or_segment_metrics() {
+    let directory = TempDir::new();
+    let path = directory.0.join("metal-context.json");
+    let mut arguments = argv("metal", path.to_str().unwrap());
+    arguments[3] = "metal-context".into();
+    assert_eq!(entry(arguments), ExitCode::FAILURE);
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(document["result"]["status"], "not_run");
+    assert!(document["result"]["actual"].is_null());
+    assert!(document["submission_metrics"].is_null());
+    assert_eq!(
+        document["submission_phases"],
+        serde_json::json!([
+            "initial",
+            "reused_context",
+            "independent_context",
+            "drop_flush"
+        ])
+    );
+}

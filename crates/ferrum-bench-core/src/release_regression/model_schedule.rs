@@ -102,11 +102,15 @@ pub fn model_check_descriptors() -> Vec<CheckDescriptor> {
     .collect()
 }
 
-fn scope_matches(scope: &ObligationScope, profile: &ModelProfile) -> bool {
+pub(super) fn scope_matches(scope: &ObligationScope, profile: &ModelProfile) -> bool {
     let target = &profile.target;
     match scope {
         ObligationScope::Global => false,
         ObligationScope::Backend { backend } => *backend == target.backend,
+        ObligationScope::ExecutionPath {
+            backend,
+            execution_path,
+        } => *backend == target.backend && execution_path == &target.execution_path,
         ObligationScope::Architecture {
             architecture,
             protocol,
@@ -147,9 +151,19 @@ fn scope_matches(scope: &ObligationScope, profile: &ModelProfile) -> bool {
 /// Coalesce assigned obligations without selecting replacement models. Missing
 /// representatives and unsupported behaviors stay visible; Plan.gaps is untouched.
 pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
+    let performance = super::performance::performance_task_schedule(plan);
+    let performance_owned: Vec<_> = performance
+        .runs
+        .iter()
+        .flat_map(|run| &run.obligations)
+        .copied()
+        .collect();
     let mut runs = BTreeMap::<String, ModelRunRequirements>::new();
     let mut unsupported_obligations = Vec::new();
     for (index, obligation) in plan.obligations.iter().enumerate() {
+        if performance_owned.contains(&index) {
+            continue;
+        }
         if !matches!(
             obligation.layer,
             EvidenceLayer::ModelRuntime | EvidenceLayer::Performance

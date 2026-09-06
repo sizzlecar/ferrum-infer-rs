@@ -360,6 +360,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -381,16 +382,32 @@ jobs:
 
       - name: Configure CUDA build inputs
         if: matrix.backend == 'cuda'
+        timeout-minutes: 15
         env:
           NATIVE_OPERATOR_SET_ARCHIVE_URL: https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst
           NATIVE_OPERATOR_SET_ARCHIVE_SHA256: d4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e
         run: |
-          archive="$RUNNER_TEMP/native-operator-set-cuda12.4-sm89-v6.tar.zst"
+          # Persist verified bytes outside checkout and the per-job temp directory.
+          cache_root="${RUNNER_TOOL_CACHE:?}/ferrum-native-operator-set"
+          mkdir -p "$cache_root"
+          archive="$cache_root/$NATIVE_OPERATOR_SET_ARCHIVE_SHA256.tar.zst"
+          if [[ -f "$archive" ]] && printf '%s  %s\n' "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" "$archive" \
+            | sha256sum --check --strict; then
+            echo "Using verified native operator archive cache"
+          else
+            pending_archive=$(mktemp "$cache_root/.$NATIVE_OPERATOR_SET_ARCHIVE_SHA256.XXXXXX")
+            trap 'rm -f -- "$pending_archive"' EXIT
+            curl --fail --location --silent --show-error \
+              --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 600 \
+              --connect-timeout 15 --max-time 300 \
+              --output "$pending_archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
+            printf '%s  %s\n' "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" "$pending_archive" \
+              | sha256sum --check --strict
+            # Only a complete, verified download becomes a reusable cache entry.
+            mv -- "$pending_archive" "$archive"
+            trap - EXIT
+          fi
           root="$RUNNER_TEMP/ferrum-native-operator-set"
-          curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
-            --output "$archive" "$NATIVE_OPERATOR_SET_ARCHIVE_URL"
-          printf '%s  %s\n' "$NATIVE_OPERATOR_SET_ARCHIVE_SHA256" "$archive" \
-            | sha256sum --check --strict
           mkdir -p "$root"
           zstd --decompress --stdout "$archive" | tar -xf - -C "$root"
           lock="$root/inputs/native-operator-set.lock.json"
@@ -431,6 +448,28 @@ jobs:
           ./target/debug/examples/backend_numerics --require-backend "$BACKEND" \
             --op silu-mul --tokens 3 --intermediate 257 --seed 7 \
             --report "$RUNNER_TEMP/backend-numerics/silu-tail.json"
+
+      - name: Require MetalContext submission and completion outputs
+        if: matrix.backend == 'metal'
+        run: |
+          ./target/debug/examples/backend_numerics --require-backend metal \
+            --op metal-context --tokens 3 --intermediate 33 --k 35 --seed 7 \
+            --report "$RUNNER_TEMP/backend-numerics/submission.json"
+
+      - name: Record numerical evidence producer
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          job_id=$(jq -er --arg suffix "GPU runtime ($BACKEND)" \
+            '[.jobs[] | select(.name | endswith($suffix)) | select(.status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          mkdir -p "$RUNNER_TEMP/backend-numerics"
+          jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
+            '{schema_version:1,run_id:$run_id,run_attempt:$run_attempt,head_sha:$head_sha,job_id:$job_id}' \
+            > "$RUNNER_TEMP/backend-numerics/ci-origin.json"
 
       - name: Save raw numerical evidence
         if: always()

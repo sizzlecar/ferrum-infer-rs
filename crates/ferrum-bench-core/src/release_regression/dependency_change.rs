@@ -10,7 +10,7 @@ use toml_edit::{DocumentMut, Item, TableLike, Value};
 pub struct DependencyRefinement {
     pub paths: Vec<String>,
     pub coordinated_version: bool,
-    /// These reviewed release-tool dependencies are ordinary Cargo dependencies;
+    /// These reviewed validation dependencies are ordinary Cargo dependencies;
     /// do not claim that adding their edges leaves the entire Cargo graph equal.
     pub validation_runtime_dependencies: Vec<String>,
     /// Explicit private workspace tools whose addition was proven isolated.
@@ -459,6 +459,74 @@ fn remove_private_member(root: &mut DocumentMut) -> Result<(), String> {
     Ok(())
 }
 
+const TESTKIT: &str = "ferrum-testkit";
+const BENCH_CORE: &str = "ferrum-bench-core";
+
+fn workspace_only(spec: &Item) -> bool {
+    spec.as_table_like().is_some_and(|table| {
+        table.len() == 1 && table.get("workspace").and_then(Item::as_bool) == Some(true)
+    })
+}
+fn isolated_testkit(
+    files: &BTreeMap<String, String>,
+    root: &DocumentMut,
+    members: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    for (name, path) in members.iter().filter(|(name, _)| name.as_str() != TESTKIT) {
+        if runtime_names(&parse(files, path)?, root)?.contains(TESTKIT) {
+            return Err(format!(
+                "member {name} has a runtime/build dependency on testkit"
+            ));
+        }
+    }
+    Ok(())
+}
+fn reviewed_local_bench_edge(
+    spec: &Item,
+    root: &DocumentMut,
+    members: &BTreeMap<String, String>,
+) -> bool {
+    if !workspace_only(spec) {
+        return false;
+    }
+    let inherited = root
+        .get("workspace")
+        .and_then(|v| v.get("dependencies"))
+        .and_then(|v| v.get(BENCH_CORE))
+        .and_then(Item::as_table_like);
+    inherited.is_some_and(|table| {
+        table.len() == 2
+            && table.get("version").and_then(Item::as_str).is_some()
+            && table.get("path").and_then(Item::as_str)
+                == members
+                    .get(BENCH_CORE)
+                    .and_then(|path| path.strip_suffix("/Cargo.toml"))
+    })
+}
+fn reviewed_zip_feature(spec: &Item) -> bool {
+    spec.as_table_like().is_some_and(|table| {
+        table.len() == 3
+            && table.get("version").and_then(Item::as_str) == Some("7.2.0")
+            && table.get("default-features").and_then(Item::as_bool) == Some(false)
+            && table
+                .get("features")
+                .and_then(Item::as_array)
+                .is_some_and(|features| {
+                    features.len() == 1
+                        && features.get(0).and_then(Value::as_str) == Some("deflate-flate2")
+                })
+    })
+}
+
+fn reviewed_private_addition(dependency: &str, spec: &Item) -> bool {
+    match dependency {
+        "chrono" => workspace_only(spec),
+        "zip" => reviewed_zip_feature(spec),
+        "flate2" => spec.as_str() == Some("1"),
+        _ => false,
+    }
+}
+
 // The source proof uses a full Rust AST and its visitor. No other parser
 // feature, dependency source or default-feature override is assumed harmless.
 fn reviewed_syntax_features(spec: &Item) -> Option<bool> {
@@ -484,10 +552,10 @@ fn reviewed_syntax_features(spec: &Item) -> Option<bool> {
 }
 
 /// Complete before/after root/member manifests and Cargo.lock are required. The
-/// only reviewed ordinary additions are the semver/TOML/Rust-syntax tools in bench-core's release
-/// modules: source callers were reviewed separately, and source diffs still keep
-/// their own impact. Only the reviewed AST visitor addition may extend syntax
-/// features; other feature and version changes remain conservative.
+/// reviewed ordinary additions are the release parser tools, isolated testkit
+/// numerical sharing, and private artifact readers. Source diffs retain their
+/// own impact. The syntax visitor and isolated ZIP/flate2 feature edge are the
+/// only reviewed extensions; other shared flags and resolution stay conservative.
 pub fn validation_dependency_paths(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
@@ -551,6 +619,29 @@ pub fn validation_dependency_paths(
     let baseline_root = parse(&baseline, "Cargo.toml")?;
     let mut allowed_edges = BTreeMap::<String, BTreeSet<String>>::new();
     let mut tools = Vec::new();
+    let mut testkit_bench_added = false;
+    let mut private_additions = BTreeSet::new();
+    if added_tool {
+        let tool = parse(after, DEVTOOLS_MANIFEST)?;
+        for dependency in ["chrono", "zip", "flate2"] {
+            if let Some(spec) = tool.get("dependencies").and_then(|v| v.get(dependency)) {
+                if !reviewed_private_addition(dependency, spec) {
+                    return Err(format!(
+                        "unreviewed private dependency declaration {dependency}"
+                    ));
+                }
+                private_additions.insert(dependency.to_owned());
+                tools.push(format!(
+                    "{DEVTOOLS_MANIFEST}:{dependency}{}",
+                    if dependency == "zip" {
+                        "/deflate-flate2"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
+    }
     for path in baseline.keys().filter(|path| path.ends_with("Cargo.toml")) {
         let mut prior = parse(&baseline, path)?;
         let mut next = parse(after, path)?;
@@ -629,6 +720,61 @@ pub fn validation_dependency_paths(
                 tools.push(format!("{path}:{dependency}"));
             }
         }
+        if member.is_some_and(|name| name == TESTKIT)
+            && prior
+                .get("dependencies")
+                .and_then(|v| v.get(BENCH_CORE))
+                .is_none()
+        {
+            if let Some(spec) = next.get("dependencies").and_then(|v| v.get(BENCH_CORE)) {
+                if !reviewed_local_bench_edge(spec, &next_root, &next_members) {
+                    return Err("testkit numerical sharing requires the unchanged local workspace bench-core edge".into());
+                }
+                isolated_testkit(&baseline, &baseline_root, &members)?;
+                isolated_testkit(after, &next_root, &next_members)?;
+                next.get_mut("dependencies")
+                    .and_then(Item::as_table_like_mut)
+                    .ok_or("missing testkit dependencies")?
+                    .remove(BENCH_CORE);
+                allowed.insert(BENCH_CORE.into());
+                tools.push(format!("{path}:{BENCH_CORE}"));
+                testkit_bench_added = true;
+            }
+        }
+        if member.is_some_and(|name| name == DEVTOOLS) {
+            for dependency in ["chrono", "zip", "flate2"] {
+                if prior
+                    .get("dependencies")
+                    .and_then(|v| v.get(dependency))
+                    .is_some()
+                {
+                    continue;
+                }
+                let Some(spec) = next.get("dependencies").and_then(|v| v.get(dependency)) else {
+                    continue;
+                };
+                let reviewed = reviewed_private_addition(dependency, spec);
+                if !reviewed {
+                    return Err(format!(
+                        "unreviewed private dependency declaration {dependency}"
+                    ));
+                }
+                next.get_mut("dependencies")
+                    .and_then(Item::as_table_like_mut)
+                    .ok_or("missing private dependencies")?
+                    .remove(dependency);
+                allowed.insert(dependency.into());
+                private_additions.insert(dependency.to_owned());
+                tools.push(format!(
+                    "{path}:{dependency}{}",
+                    if dependency == "zip" {
+                        "/deflate-flate2"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+        }
         if semantic(prior.as_item()) != semantic(next.as_item()) {
             return Err(format!(
                 "{path} changes runtime/build/features or unsupported manifest metadata"
@@ -664,6 +810,58 @@ pub fn validation_dependency_paths(
     let next_member_names: BTreeSet<_> = next_members.keys().cloned().collect();
     if local(&prior) != member_names || local(&next) != next_member_names {
         return Err("lock local packages differ from workspace members".into());
+    }
+    if testkit_bench_added {
+        let bench = resolve(BENCH_CORE, &next)?;
+        let testkit = resolve(TESTKIT, &next)?;
+        if bench.source.is_some()
+            || testkit.source.is_some()
+            || !next[testkit]
+                .dependencies
+                .iter()
+                .any(|edge| resolve(edge, &next).ok() == Some(bench))
+        {
+            return Err(
+                "testkit numerical sharing is missing its local locked bench-core edge".into(),
+            );
+        }
+        for (package, record) in &next {
+            if package.source.is_some()
+                && record
+                    .dependencies
+                    .iter()
+                    .any(|edge| resolve(edge, &next).ok() == Some(testkit))
+            {
+                return Err(
+                    "registry dependency cannot be a runtime consumer of local testkit".into(),
+                );
+            }
+        }
+    }
+    // These new private edges reuse exact existing locked identities. They
+    // cannot introduce a second version or redirect a shared registry package.
+    for name in &private_additions {
+        let old = resolve(name, &prior)?;
+        let new = resolve(name, &next)?;
+        if old != new
+            || !old
+                .source
+                .as_deref()
+                .is_some_and(|source| source.starts_with("registry+"))
+            || (name == "zip" && old.version != "7.2.0")
+        {
+            return Err(format!(
+                "private tool dependency {name} must reuse its existing registry identity"
+            ));
+        }
+        let tool = resolve(DEVTOOLS, &next)?;
+        if !next[tool]
+            .dependencies
+            .iter()
+            .any(|edge| resolve(edge, &next).ok() == Some(new))
+        {
+            return Err(format!("missing private tool lock edge to {name}"));
+        }
     }
     let mut dev_seeds = BTreeSet::new();
     if let Some(expected_dependencies) = &tool_dependencies {
@@ -725,10 +923,31 @@ pub fn validation_dependency_paths(
         }
         if package.source.is_some() {
             if old.dependencies != new.dependencies {
-                return Err(format!(
-                    "existing registry dependency graph changed at {}",
-                    package.name
-                ));
+                // The reviewed private ZIP consumer enables exactly one
+                // already-locked optional edge. Product manifests and build
+                // flags remain unchanged; no private tool is a reverse runtime
+                // dependency. This does change workspace-wide feature unification.
+                let added: Vec<_> = new.dependencies.difference(&old.dependencies).collect();
+                let private_zip_extension = package.name == "zip"
+                    && package.version == "7.2.0"
+                    && private_additions.contains("zip")
+                    && private_additions.contains("flate2")
+                    && old.dependencies.is_subset(&new.dependencies)
+                    && added.len() == 1
+                    && resolve(added[0], &next).is_ok_and(|dependency| {
+                        dependency.name == "flate2"
+                            && prior.contains_key(dependency)
+                            && dependency
+                                .source
+                                .as_deref()
+                                .is_some_and(|source| source.starts_with("registry+"))
+                    });
+                if !private_zip_extension {
+                    return Err(format!(
+                        "existing registry dependency graph changed at {}",
+                        package.name
+                    ));
+                }
             }
         } else {
             let allowed = &allowed_edges[&package.name];

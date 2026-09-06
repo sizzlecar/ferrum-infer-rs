@@ -118,6 +118,11 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
                 release_tool_paths.push(entry.path.clone());
             }
             Ok(Some(ContentProof::LegacyMetalSubmission)) => {
+                for area in &mut entry.areas {
+                    if *area == ChangeArea::Kernel {
+                        *area = ChangeArea::BackendSubmission;
+                    }
+                }
                 entry.execution_paths = Some(vec!["legacy-model-executor".into()]);
                 entry.reason = "AST changes are confined to MetalContext submission/completion and its checked-sync API; shared state, operator bodies and Backend trait implementations are unchanged; independent production-plan queues remain outside this path's reach".into();
                 legacy_submission_paths.push(entry.path.clone());
@@ -199,7 +204,7 @@ pub(super) fn analyze(repo: &Path, base: &str, candidate: &str, paths: &[String]
                                 vec![ChangeArea::Validation]
                             };
                             entry.reason = if build {
-                                "verified development/release-tool dependency changes with unchanged existing registry resolution; retain build and installation checks, while production source changes retain their own impact"
+                                "verified development/release-tool dependency changes with preserved registry identities and explicitly isolated private-tool feature edges; retain build and installation checks, while production source changes retain their own impact"
                             } else {
                                 "verified development dependency changes without altered normal/build dependencies or existing registry resolution"
                             }.into();

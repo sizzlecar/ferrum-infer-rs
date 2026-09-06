@@ -32,6 +32,7 @@ jobs:
       active: ${{ steps.plan.outputs.active }}
       version: ${{ steps.plan.outputs.version }}
       rc_tag: ${{ steps.plan.outputs.rc_tag }}
+      baseline_tag: ${{ steps.plan.outputs.baseline_tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,7 +74,14 @@ jobs:
           cat "$RUNNER_TEMP/release-plan.md" >> "$GITHUB_STEP_SUMMARY"
           # A missing executable binding is an implementation gap, not a reason
           # to rent a GPU and hope a broad smoke test covers it.
-          jq -e '.plan.gaps == [] and .model_tasks.unsupported_obligations == []' "$RUNNER_TEMP/release-plan.json"
+          jq -e '.plan.gaps == [] and .model_tasks.unsupported_obligations == [] and .performance_tasks.unsupported_obligations == []' "$RUNNER_TEMP/release-plan.json"
+          # Freeze source selectors and latency policy before staging or rental.
+          # Every newly selected performance target needs an explicit source;
+          # a missing mapping cannot silently reuse a different model.
+          jq -e --slurpfile config .github/release-performance.json \
+            '[.performance_tasks.runs[].profile.model as $model | [$config[0].sources[] | select(.model == $model)] | length == 1] | all' \
+            "$RUNNER_TEMP/release-plan.json"
+          cp .github/release-performance.json "$RUNNER_TEMP/release-performance.json"
           rc_tag="v${version}-rc.${GITHUB_RUN_NUMBER}"
           cargo run --locked -p ferrum-bench-core --example release_candidate -- verify \
             --workspace . --version "$version" --previous-version "${base#v}" \
@@ -92,7 +100,7 @@ jobs:
           gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
-          printf 'active=true\nversion=%s\nrc_tag=%s\n' "$version" "$rc_tag" >> "$GITHUB_OUTPUT"
+          printf 'active=true\nversion=%s\nrc_tag=%s\nbaseline_tag=%s\n' "$version" "$rc_tag" "$base" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -102,6 +110,7 @@ jobs:
             ${{ runner.temp }}/release-plan.json
             ${{ runner.temp }}/release-plan.md
             ${{ runner.temp }}/release-notes.md
+            ${{ runner.temp }}/release-performance.json
           retention-days: 30
 
   quality:
@@ -194,42 +203,122 @@ jobs:
           retention-days: 30
 
   metal-models:
+    name: Metal release models
     needs: [prepare, stage, tasks]
-    runs-on: [self-hosted, macOS, ARM64, ferrum-metal]
+    runs-on: [self-hosted, macOS, ARM64, ferrum-metal-large]
     timeout-minutes: 120
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      BASELINE_TAG: ${{ needs.prepare.outputs.baseline_tag }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.91.0
       - uses: actions/download-artifact@v4
         with:
-          artifact-ids: ${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage.outputs.metal_runner_id }}
+          artifact-ids: ${{ needs.stage.outputs.metal_asset_id }},${{ needs.stage.outputs.metal_runner_id }},${{ needs.stage.outputs.metal_controller_id }}
           merge-multiple: true
           path: ${{ runner.temp }}/staged-metal
       - uses: actions/download-artifact@v4
         with:
           name: release-tasks
           path: ${{ runner.temp }}/tasks
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/plan
       - name: Execute selected Metal models from the staged archive
         run: |
-          cargo build --locked -p ferrum-devtools --bin release_delivery
-          target/debug/release_delivery inspect \
+          cd "$RUNNER_TEMP/staged-metal"
+          shasum -a 256 -c release-delivery-macos-aarch64.tar.gz.sha256
+          tar -xzf release-delivery-macos-aarch64.tar.gz release_delivery
+          shasum -a 256 -c release-delivery-macos-aarch64.binary.sha256
+          ./release_delivery inspect \
             --abi "$RUNNER_TEMP/staged-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
             --version "$VERSION" --candidate-sha "$GITHUB_SHA" \
             --extract-dir "$RUNNER_TEMP/extracted-metal" --output "$RUNNER_TEMP/installation-metal.json"
-          cd "$RUNNER_TEMP/staged-metal"
           shasum -a 256 -c model-regression-macos-aarch64.tar.gz.sha256
           tar -xzf model-regression-macos-aarch64.tar.gz model_regression
           runner_sha=$(awk '{print $1}' model-regression-macos-aarch64.binary.sha256)
-          cd "$GITHUB_WORKSPACE"
-          target/debug/release_delivery local --backend metal \
+          ./release_delivery local --backend metal \
             --tasks "$RUNNER_TEMP/tasks/tasks.json" --ferrum-bin "$RUNNER_TEMP/extracted-metal/ferrum" \
             --runner "$RUNNER_TEMP/staged-metal/model_regression" --runner-sha256 "$runner_sha" \
             --report-dir "$RUNNER_TEMP/model-metal" --task-timeout-secs 3600
-      - uses: actions/upload-artifact@v4
+      - name: Prepare registered performance tasks
+        id: performance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100")
+          job_id=$(jq -er '[.jobs[] | select(.name == "Metal release models" and .status == "in_progress")] | if length == 1 then .[0].id else error("ambiguous producer job") end' <<< "$jobs")
+          mkdir -p "$RUNNER_TEMP/performance-tasks" "$RUNNER_TEMP/performance"
+          jq -n --argjson run_id "$GITHUB_RUN_ID" --argjson run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg head_sha "$GITHUB_SHA" --argjson job_id "$job_id" \
+            '{schema_version:1,run_id:$run_id,run_attempt:$run_attempt,head_sha:$head_sha,job_id:$job_id}' \
+            > "$RUNNER_TEMP/ci-origin.json"
+          cp "$RUNNER_TEMP/ci-origin.json" "$RUNNER_TEMP/performance-tasks/ci-origin.json"
+          if [ "$(jq '.performance_tasks.runs | length' "$RUNNER_TEMP/plan/release-plan.json")" = 0 ]; then
+            echo 'active=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/baseline-metal"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$BASELINE_TAG" > "$RUNNER_TEMP/baseline-metal/release.json"
+          for suffix in '' .abi.json .version.json .binary.sha256 .sha256 .dependency.json; do
+            asset="ferrum-macos-aarch64.tar.gz$suffix"
+            url=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .browser_download_url' "$RUNNER_TEMP/baseline-metal/release.json")
+            digest=$(jq -er --arg name "$asset" '.assets[] | select(.name == $name) | .digest | select(startswith("sha256:")) | ltrimstr("sha256:")' "$RUNNER_TEMP/baseline-metal/release.json")
+            curl --fail --location --retry 2 --retry-all-errors --connect-timeout 15 --max-time 180 \
+              --output "$RUNNER_TEMP/baseline-metal/$asset" "$url"
+            printf '%s  %s\n' "$digest" "$RUNNER_TEMP/baseline-metal/$asset" | shasum -a 256 -c -
+          done
+          controller="$RUNNER_TEMP/staged-metal/release_delivery"
+          baseline_sha=$(jq -er '.provenance.base' "$RUNNER_TEMP/plan/release-plan.json")
+          "$controller" inspect --abi "$RUNNER_TEMP/baseline-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
+            --version "${BASELINE_TAG#v}" --candidate-sha "$baseline_sha" \
+            --extract-dir "$RUNNER_TEMP/extracted-baseline-metal" --output "$RUNNER_TEMP/baseline-installation.json"
+          jq '.policy' "$RUNNER_TEMP/plan/release-performance.json" > "$RUNNER_TEMP/performance-policy.json"
+          while IFS= read -r profile; do
+            model=$(jq -er --arg profile "$profile" '.performance_tasks.runs[] | select(.profile.id == $profile) | .profile.model' "$RUNNER_TEMP/plan/release-plan.json")
+            jq -e --arg model "$model" '.sources[] | select(.model == $model)' \
+              "$RUNNER_TEMP/plan/release-performance.json" > "$RUNNER_TEMP/performance-source.json"
+            "$controller" performance-prepare --plan "$RUNNER_TEMP/plan/release-plan.json" --profile-id "$profile" \
+              --candidate-abi "$RUNNER_TEMP/staged-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
+              --baseline-abi "$RUNNER_TEMP/baseline-metal/ferrum-macos-aarch64.tar.gz.abi.json" \
+              --policy "$RUNNER_TEMP/performance-policy.json" --hf-cache "$HOME/.cache/huggingface/hub" \
+              --source-selector "$RUNNER_TEMP/performance-source.json" --output-dir "$RUNNER_TEMP/performance-tasks"
+          done < <(jq -er '.performance_tasks.runs[].profile.id' "$RUNNER_TEMP/plan/release-plan.json")
+          echo 'active=true' >> "$GITHUB_OUTPUT"
+      - name: Save registered performance tasks
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-performance-tasks
+          overwrite: true
+          path: ${{ runner.temp }}/performance-tasks/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Execute registered performance comparison
+        if: steps.performance.outputs.active == 'true'
+        run: |
+          while IFS= read -r profile; do
+            task="$RUNNER_TEMP/performance-tasks/$profile/expected-task.json"
+            args=(--expected-task "$task" --source-manifest "$RUNNER_TEMP/performance-tasks/$profile/source-manifest.json"
+              --baseline-bin "$RUNNER_TEMP/extracted-baseline-metal/ferrum"
+              --candidate-bin "$RUNNER_TEMP/extracted-metal/ferrum" --client-bin "$RUNNER_TEMP/extracted-metal/ferrum"
+              --report-dir "$RUNNER_TEMP/performance/$profile")
+            for role in baseline candidate client; do
+              args+=("--$role-version" "$(jq -er --arg role "$role" '.[$role + "_version"]' "$task")"
+                "--$role-sha256" "$(jq -er --arg role "$role" '.[$role + "_sha256"]' "$task")")
+            done
+            for field in input_tokens output_tokens measured_requests warmup_requests repeats seed max_model_len; do
+              args+=("--${field//_/-}" "$(jq -er --arg field "$field" '.policy.workload[$field]' "$task")")
+            done
+            for field in runtime_memory_budget_bytes startup_timeout_secs request_timeout_secs task_timeout_secs; do
+              args+=("--${field//_/-}" "$(jq -er --arg field "$field" '.policy[$field]' "$task")")
+            done
+            for field in ttft_max_relative_increase tpot_max_relative_increase; do
+              args+=("--${field//_/-}" "$(jq -er --arg field "$field" '.policy.limits[$field]' "$task")")
+            done
+            "$RUNNER_TEMP/staged-metal/release_delivery" performance "${args[@]}"
+          done < <(jq -er '.performance_tasks.runs[].profile.id' "$RUNNER_TEMP/plan/release-plan.json")
+      - name: Save Metal release evidence
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: release-metal-evidence
@@ -237,6 +326,8 @@ jobs:
           path: |
             ${{ runner.temp }}/installation-metal.json
             ${{ runner.temp }}/model-metal/
+            ${{ runner.temp }}/performance/
+            ${{ runner.temp }}/ci-origin.json
           if-no-files-found: error
           retention-days: 30
 

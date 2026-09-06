@@ -27,6 +27,9 @@ clap = { workspace = true, features = ["derive"] }
 libc = "0.2"
 rand = { workspace = true }
 tempfile = "3"
+chrono = { workspace = true }
+zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
 
 [dev-dependencies]
 ferrum-types = { workspace = true }

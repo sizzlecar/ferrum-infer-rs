@@ -10,6 +10,10 @@ use ferrum_bench_core::release_regression::distribution::distribution_check_desc
 use ferrum_bench_core::release_regression::model_schedule::{
     model_check_descriptors, model_task_schedule,
 };
+use ferrum_bench_core::release_regression::performance::{
+    performance_check_descriptors, performance_task_schedule,
+};
+use ferrum_bench_core::release_regression::submission::submission_check_descriptors;
 use ferrum_bench_core::release_regression::{plan, Impact, PlanInput};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -182,6 +186,8 @@ fn plan_input(catalog: Value, stage: &str, impact: Impact) -> Result<PlanInput, 
         .into_iter()
         .chain(contract_check_descriptors())
         .chain(distribution_check_descriptors())
+        .chain(submission_check_descriptors(&input.required_targets))
+        .chain(performance_check_descriptors(&input.required_targets))
     {
         if input.checks.iter().any(|check| check.id == descriptor.id) {
             return Err(format!(
@@ -242,6 +248,7 @@ fn run(args: Args) -> Result<(), String> {
             "dependency_refinement": analysis.dependency_refinement,
             "content_refinement": analysis.content_refinement},
         "model_tasks": model_task_schedule(&plan),
+        "performance_tasks": performance_task_schedule(&plan),
         "plan": plan,
     });
     let mut bytes = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;

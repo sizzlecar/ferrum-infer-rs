@@ -1,5 +1,6 @@
 self-hosted-runner:
   labels:
     - ferrum-metal
+    - ferrum-metal-large
     - ferrum-cuda
     - cuda-sm89

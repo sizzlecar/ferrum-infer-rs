@@ -332,3 +332,181 @@ fn reasoning_schedule_rejects_unknown_or_wrong_capability_owners() {
         }
     }
 }
+
+#[test]
+fn execution_path_scope_never_substitutes_an_independent_backend_or_executor() {
+    let mut owner = profile("owner", Backend::Metal);
+    owner.target.execution_path = "legacy-model-executor".into();
+    let scope = ObligationScope::ExecutionPath {
+        backend: Backend::Metal,
+        execution_path: owner.target.execution_path.clone(),
+    };
+    assert!(scope_matches(&scope, &owner));
+    let mut same_route = owner.clone();
+    same_route.target.precision = "gguf-q4_k_m".into();
+    same_route.target.architecture = "different-architecture".into();
+    assert!(scope_matches(&scope, &same_route));
+    let mut different = same_route.clone();
+    different.target.execution_path = "production-plan-runtime".into();
+    assert!(!scope_matches(&scope, &different));
+    different = same_route;
+    different.target.backend = Backend::Cuda;
+    assert!(!scope_matches(&scope, &different));
+}
+
+fn performance_profile() -> ModelProfile {
+    let mut owner = profile("same-host-legacy", Backend::Metal);
+    owner.target.execution_path = "legacy-model-executor".into();
+    owner.target.precision = "gguf-q4_k_m".into();
+    owner
+}
+fn performance_obligation(owner: &ModelProfile) -> Obligation {
+    let descriptor =
+        super::super::performance::performance_check_descriptors(&[owner.target.clone()])
+            .pop()
+            .expect("supported test target");
+    Obligation {
+        behavior: Behavior::Performance,
+        layer: EvidenceLayer::Performance,
+        entrypoints: descriptor.entrypoints,
+        scope: ObligationScope::Target {
+            target: owner.target.clone(),
+        },
+        reason: "registered same-host HTTP latency task".into(),
+        checkers: vec![descriptor.id],
+    }
+}
+
+#[test]
+fn registered_performance_is_scheduled_separately_without_extra_basic_execution() {
+    use super::super::performance::performance_task_schedule;
+    let owner = performance_profile();
+    let plan = make_plan(
+        vec![
+            obligation(Behavior::ModelForward, &owner),
+            performance_obligation(&owner),
+            performance_obligation(&owner),
+        ],
+        vec![selected(owner, vec![0, 1, 2])],
+    );
+    let original = plan.clone();
+    let model = model_task_schedule(&plan);
+    assert_eq!(model.runs.len(), 1);
+    assert_eq!(model.runs[0].checks, [ModelCheck::Basic]);
+    assert_eq!(model.runs[0].obligations, [0]);
+    assert!(model.unsupported_obligations.is_empty());
+    let performance = performance_task_schedule(&plan);
+    assert_eq!(performance.runs.len(), 1);
+    assert_eq!(performance.runs[0].obligations, [1, 2]);
+    assert!(performance.unsupported_obligations.is_empty());
+    assert_eq!(
+        plan, original,
+        "scheduling cannot remove an original plan gap"
+    );
+    let owner = performance_profile();
+    let only_performance = make_plan(
+        vec![performance_obligation(&owner)],
+        vec![selected(owner, vec![0])],
+    );
+    assert!(model_task_schedule(&only_performance).runs.is_empty());
+    assert_eq!(
+        performance_task_schedule(&only_performance).runs[0].obligations,
+        [0]
+    );
+}
+
+#[test]
+fn performance_without_matching_checker_or_supported_entrypoint_remains_unsupported() {
+    use super::super::performance::performance_task_schedule;
+    let owner = performance_profile();
+    let mut bad = Vec::new();
+    let mut obligation = performance_obligation(&owner);
+    obligation.checkers.clear();
+    bad.push(obligation);
+    let mut obligation = performance_obligation(&owner);
+    obligation.checkers = vec!["model-regression.basic.model-forward".into()];
+    bad.push(obligation);
+    let other_target = ExecutionTarget {
+        precision: "gguf-q8_0".into(),
+        ..owner.target.clone()
+    };
+    let mut obligation = performance_obligation(&owner);
+    obligation.checkers = super::super::performance::performance_check_descriptors(&[other_target])
+        .into_iter()
+        .map(|check| check.id)
+        .collect();
+    bad.push(obligation);
+    let mut obligation = performance_obligation(&owner);
+    obligation.entrypoints.clear();
+    bad.push(obligation);
+    let mut obligation = performance_obligation(&owner);
+    obligation.entrypoints = ALL_ENTRYPOINTS.to_vec();
+    bad.push(obligation);
+    let mut obligation = performance_obligation(&owner);
+    obligation.entrypoints = vec![Entrypoint::ServeSync];
+    bad.push(obligation);
+    let mut obligation = performance_obligation(&owner);
+    obligation.behavior = Behavior::ModelForward;
+    bad.push(obligation);
+    let mut obligation = performance_obligation(&owner);
+    if let ObligationScope::Target { target } = &mut obligation.scope {
+        target.precision = "gguf-q8_0".into();
+    }
+    bad.push(obligation);
+    let count = bad.len();
+    let plan = make_plan(bad, vec![selected(owner, (0..count).collect())]);
+    let model = model_task_schedule(&plan);
+    let performance = performance_task_schedule(&plan);
+    assert!(model.runs.is_empty());
+    assert!(performance.runs.is_empty());
+    assert_eq!(
+        model.unsupported_obligations,
+        (0..count).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        performance.unsupported_obligations,
+        (0..count).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn performance_cannot_reuse_another_target_or_ambiguous_owner() {
+    use super::super::performance::performance_task_schedule;
+    let owner = performance_profile();
+    let registered = performance_obligation(&owner);
+    for target in [
+        ExecutionTarget {
+            backend: Backend::Cuda,
+            ..owner.target.clone()
+        },
+        ExecutionTarget {
+            execution_path: "production-plan-runtime".into(),
+            ..owner.target.clone()
+        },
+        ExecutionTarget {
+            protocol: ModelOutputProtocol::HarmonyGptOss,
+            ..owner.target.clone()
+        },
+    ] {
+        // Each wrong route still carries the known Metal descriptor's id, which
+        // must not make CUDA/vNext/Harmony executable by this SSE measurement.
+        let wrong = ModelProfile {
+            target,
+            ..owner.clone()
+        };
+        let plan = make_plan(vec![registered.clone()], vec![selected(wrong, vec![0])]);
+        assert_eq!(model_task_schedule(&plan).unsupported_obligations, [0]);
+        assert_eq!(
+            performance_task_schedule(&plan).unsupported_obligations,
+            [0]
+        );
+    }
+    let plan = make_plan(vec![registered.clone()], vec![]);
+    assert_eq!(model_task_schedule(&plan).unsupported_obligations, [0]);
+    let plan = make_plan(
+        vec![registered],
+        vec![selected(owner.clone(), vec![0]), selected(owner, vec![0])],
+    );
+    assert!(performance_task_schedule(&plan).runs.is_empty());
+    assert_eq!(model_task_schedule(&plan).unsupported_obligations, [0]);
+}

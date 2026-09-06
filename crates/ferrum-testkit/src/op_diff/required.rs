@@ -7,9 +7,14 @@
 //! missing/incomplete reports. Neither an op label nor this report proves an
 //! unexecuted shape, precision, execution path, model, or performance claim.
 use super::{OpUnderTest, Output};
+pub use ferrum_bench_core::release_regression::numerics::{
+    compare_outputs, NumericalFailure, NumericalMetrics, RawOutput,
+};
+use ferrum_bench_core::release_regression::numerics::{
+    validate_reference as valid_reference, validate_tolerance as valid_tolerance,
+};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,56 +31,6 @@ pub enum RequiredStatus {
     Failed,
     NotRun,
 }
-
-/// Exact IEEE-754 output representation, including non-finite and signed-zero
-/// values. Unlike JSON float arrays this does not silently turn NaN into null.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RawOutput {
-    pub f32_bits: Vec<u32>,
-}
-
-impl RawOutput {
-    pub fn from_f32(values: &[f32]) -> Self {
-        Self {
-            f32_bits: values.iter().map(|value| value.to_bits()).collect(),
-        }
-    }
-
-    pub fn to_f32(&self) -> Vec<f32> {
-        self.f32_bits
-            .iter()
-            .map(|bits| f32::from_bits(*bits))
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NumericalMetrics {
-    pub element_count: usize,
-    pub nmse: f64,
-    pub max_abs: f64,
-    pub reference_mse: f64,
-    /// Matches the existing op-diff definition: for reference MSE < 1e-30,
-    /// the reported error is absolute MSE rather than a normalized ratio.
-    pub uses_absolute_mse: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NumericalFailure {
-    pub reason: String,
-    pub metrics: Option<NumericalMetrics>,
-}
-
-impl fmt::Display for NumericalFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.reason)
-    }
-}
-
-impl std::error::Error for NumericalFailure {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,87 +62,6 @@ impl RequiredReport {
         self.status = RequiredStatus::Failed;
         self.reason = Some(reason.into());
     }
-}
-
-fn failure(reason: impl Into<String>) -> NumericalFailure {
-    NumericalFailure {
-        reason: reason.into(),
-        metrics: None,
-    }
-}
-
-fn valid_tolerance(tolerance: f64) -> Result<(), NumericalFailure> {
-    if !tolerance.is_finite() || tolerance <= 0.0 {
-        return Err(failure("tolerance must be finite and strictly positive"));
-    }
-    Ok(())
-}
-
-fn valid_reference(reference: &[f32]) -> Result<(), NumericalFailure> {
-    if reference.is_empty() {
-        return Err(failure("CPU reference output is empty"));
-    }
-    if let Some(index) = reference.iter().position(|value| !value.is_finite()) {
-        return Err(failure(format!(
-            "CPU reference contains a non-finite value at {index}"
-        )));
-    }
-    Ok(())
-}
-
-/// Shared pure comparator for live execution and raw-output replay. A finite,
-/// positive tolerance is required before observing results; equality to the
-/// threshold fails, matching the existing op-diff strict inequality.
-pub fn compare_outputs(
-    reference: &[f32],
-    actual: &[f32],
-    tolerance: f64,
-) -> Result<NumericalMetrics, NumericalFailure> {
-    valid_tolerance(tolerance)?;
-    valid_reference(reference)?;
-    if actual.is_empty() {
-        return Err(failure("required backend output is empty"));
-    }
-    if actual.len() != reference.len() {
-        return Err(failure(format!(
-            "output length mismatch: reference={} actual={}",
-            reference.len(),
-            actual.len()
-        )));
-    }
-    if let Some(index) = actual.iter().position(|value| !value.is_finite()) {
-        return Err(failure(format!(
-            "required backend contains a non-finite value at {index}"
-        )));
-    }
-    let nmse = super::nmse(reference, actual);
-    let reference_mse = reference
-        .iter()
-        .map(|value| f64::from(*value).powi(2))
-        .sum::<f64>()
-        / reference.len() as f64;
-    let max_abs = reference
-        .iter()
-        .zip(actual)
-        .map(|(expected, observed)| (f64::from(*expected) - f64::from(*observed)).abs())
-        .fold(0.0, f64::max);
-    if !nmse.is_finite() || nmse < 0.0 || !reference_mse.is_finite() || !max_abs.is_finite() {
-        return Err(failure("numerical measurement is non-finite or invalid"));
-    }
-    let metrics = NumericalMetrics {
-        element_count: reference.len(),
-        nmse,
-        max_abs,
-        reference_mse,
-        uses_absolute_mse: reference_mse < 1e-30,
-    };
-    if nmse >= tolerance {
-        return Err(NumericalFailure {
-            reason: format!("NMSE {nmse} is not below tolerance {tolerance}; max_abs={max_abs}"),
-            metrics: Some(metrics),
-        });
-    }
-    Ok(metrics)
 }
 
 #[derive(Debug)]
@@ -389,44 +263,6 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
-    fn finite_equal_outputs_pass_and_zero_reference_uses_absolute_mse() {
-        let metric = compare_outputs(&[1.0, -2.0, 3.0], &[1.0, -2.0, 3.0], 1e-7).unwrap();
-        assert_eq!(metric.nmse, 0.0);
-        assert_eq!(metric.element_count, 3);
-        assert!(!metric.uses_absolute_mse);
-        let zero = compare_outputs(&[0.0, 0.0], &[0.0, 0.0], 1e-7).unwrap();
-        assert!(zero.uses_absolute_mse);
-        assert_eq!(zero.max_abs, 0.0);
-    }
-
-    #[test]
-    fn invalid_arrays_and_tolerances_never_produce_a_numerical_pass() {
-        for (reference, actual) in [
-            (vec![], vec![]),
-            (vec![1.0], vec![]),
-            (vec![1.0], vec![1.0, 2.0]),
-            (vec![f32::NAN], vec![1.0]),
-            (vec![1.0], vec![f32::NAN]),
-            (vec![f32::INFINITY], vec![1.0]),
-            (vec![1.0], vec![f32::NEG_INFINITY]),
-        ] {
-            assert!(compare_outputs(&reference, &actual, 1e-7).is_err());
-        }
-        for tolerance in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(compare_outputs(&[1.0], &[1.0], tolerance).is_err());
-        }
-    }
-
-    #[test]
-    fn perturbed_output_fails_and_retains_the_measured_error() {
-        let failure = compare_outputs(&[1.0, 2.0], &[2.0, 4.0], 1e-7).unwrap_err();
-        let metrics = failure.metrics.unwrap();
-        assert_eq!(metrics.nmse, 1.0);
-        assert_eq!(metrics.max_abs, 2.0);
-        assert!(compare_outputs(&[1.0], &[2.0], 1.0).is_err());
-    }
-
-    #[test]
     fn missing_backend_does_not_even_run_the_reference() {
         let report = run_with(
             "fixture",
@@ -549,24 +385,6 @@ mod tests {
         assert_eq!(result.status, RequiredStatus::Failed);
         assert_eq!(result.tolerance, None);
         assert_eq!(result.tolerance_f64_bits, f64::NAN.to_bits());
-    }
-
-    #[test]
-    fn raw_json_roundtrip_preserves_non_finite_payloads_and_signed_zero() {
-        let bits = vec![
-            0x7fc0_1234,
-            f32::INFINITY.to_bits(),
-            f32::NEG_INFINITY.to_bits(),
-            (-0.0_f32).to_bits(),
-            1.0_f32.to_bits(),
-        ];
-        let raw = RawOutput {
-            f32_bits: bits.clone(),
-        };
-        let json = serde_json::to_string(&raw).unwrap();
-        let decoded: RawOutput = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.f32_bits, bits);
-        assert_eq!(RawOutput::from_f32(&decoded.to_f32()), raw);
     }
 
     struct MustNotExecute;

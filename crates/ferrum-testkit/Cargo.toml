@@ -8,6 +8,7 @@ description = "Testing utilities for Ferrum LLM inference engine"
 readme = "../../README.md"
 
 [dependencies]
+ferrum-bench-core = { workspace = true }
 ferrum-types = { workspace = true }
 ferrum-interfaces = { workspace = true }
 ferrum-kv = { workspace = true }

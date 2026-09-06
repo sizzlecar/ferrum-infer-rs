@@ -131,7 +131,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     }
     if path.starts_with(".github/workflows/")
         || path.starts_with(".github/ci/")
-        || matches!(path, ".github/actionlint.yaml" | ".github/actionlint.yml")
+        || matches!(
+            path,
+            ".github/actionlint.yaml"
+                | ".github/actionlint.yml"
+                | ".github/release-performance.json"
+        )
     {
         return Some((
             vec![Build, Validation],
@@ -513,6 +518,10 @@ mod tests {
             assert_eq!(path_backend(path), Some(backend));
             let impact = analyze_paths([path]);
             assert_eq!(impact.areas, [ChangeArea::Kernel]);
+            assert!(
+                !impact.areas.contains(&ChangeArea::BackendSubmission),
+                "path names do not prove submission-only changes"
+            );
             assert!(impact.unknown_paths.is_empty());
         }
         for path in [
