@@ -3,13 +3,18 @@
 
 #[path = "model_regression/cases.rs"]
 mod cases;
+#[path = "model_regression/identity.rs"]
+mod identity;
 #[path = "model_regression/process.rs"]
 mod process;
 #[path = "model_regression/protocol.rs"]
 mod protocol;
 
 use anyhow::{ensure, Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
+use ferrum_bench_core::release_regression::model_tasks::{
+    verify_model_options, verify_model_report, ExpectedModelRun, ModelCheck as Check,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,15 +23,6 @@ use std::future::Future;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-enum Check {
-    Basic,
-    Stop,
-    Structured,
-    Tools,
-}
 
 #[derive(Debug, Parser, Serialize)]
 #[command(about = "Real-model regression against an explicitly selected staged binary")]
@@ -38,10 +34,18 @@ struct Args {
     model: String,
     #[arg(long, value_parser = ["cpu", "metal", "cuda"])]
     backend: String,
+    /// Link this execution to a prepared model task. Its configuration is checked before loading.
+    #[arg(long)]
+    expected_task: Option<PathBuf>,
+    #[arg(long)]
+    profile_id: Option<String>,
+    /// Exercise automatic device selection; --backend remains the expected observed backend.
+    #[arg(long)]
+    use_default_backend: bool,
     /// A new or empty directory; raw requests, responses and child logs stay here.
     #[arg(long)]
     report_dir: PathBuf,
-    #[arg(long, value_enum, value_delimiter = ',', default_value = "basic")]
+    #[arg(long, value_delimiter = ',', default_value = "basic")]
     checks: Vec<Check>,
     /// Forward the public flag to both entrypoints. Otherwise keep model defaults.
     #[arg(long)]
@@ -74,12 +78,10 @@ struct Args {
 
 impl Args {
     fn common_args(&self, entrypoint: &str) -> Vec<String> {
-        let mut args = vec![
-            entrypoint.into(),
-            self.model.clone(),
-            "--backend".into(),
-            self.backend.clone(),
-        ];
+        let mut args = vec![entrypoint.into(), self.model.clone()];
+        if !self.use_default_backend {
+            args.extend(["--backend".into(), self.backend.clone()]);
+        }
         if self.disable_thinking {
             args.push("--disable-thinking".into());
         }
@@ -137,6 +139,24 @@ impl Report {
             .push(case);
         self.save()
     }
+    fn finish(&mut self, expected: Option<&ExpectedModelRun>) -> Result<()> {
+        self.document["status"] = json!(if self.failed { "failed" } else { "passed" });
+        self.document["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
+        if let Some(expected) = expected {
+            if let Err(issues) = verify_model_report(expected, &self.document) {
+                self.failed = true;
+                self.document["status"] = json!("failed");
+                self.document["task_verification_errors"] = json!(issues);
+            }
+        }
+        self.save()?;
+        ensure!(
+            !self.failed,
+            "regression failed; see {}",
+            self.path.display()
+        );
+        Ok(())
+    }
 }
 
 async fn record(
@@ -152,6 +172,19 @@ async fn record(
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = Args::parse();
+    let expected: Option<ExpectedModelRun> = args
+        .expected_task
+        .as_ref()
+        .map(|path| {
+            serde_json::from_slice(&fs::read(path)?)
+                .with_context(|| format!("read expected model task {}", path.display()))
+        })
+        .transpose()?;
+    if let Some(expected) = &expected {
+        if args.profile_id.is_none() {
+            args.profile_id = Some(expected.profile.id.clone());
+        }
+    }
     ensure!(!args.model.trim().is_empty(), "--model must not be empty");
     ensure!(
         !args.stop_prompt.trim().is_empty(),
@@ -175,6 +208,14 @@ async fn main() -> Result<()> {
             .context("model path is not UTF-8")?
             .to_owned();
     }
+    if let Some(expected) = &expected {
+        if Path::new(&expected.profile.model).exists() {
+            ensure!(args.model == expected.profile.model,
+                "bound local model tasks must declare the canonical absolute model path; prepare the task with {}", args.model);
+        }
+        verify_model_options(expected, &serde_json::to_value(&args)?)
+            .map_err(|issues| anyhow::anyhow!("model task configuration: {}", issues.join("; ")))?;
+    }
     fs::create_dir_all(&args.report_dir)?;
     ensure!(
         fs::read_dir(&args.report_dir)?.next().is_none(),
@@ -182,13 +223,21 @@ async fn main() -> Result<()> {
     );
     args.report_dir = fs::canonicalize(&args.report_dir)?;
     let digest = binary_sha256(&args.ferrum_bin)?;
+    if let Some(expected) = &expected {
+        ensure!(
+            digest == expected.binary_sha256,
+            "staged binary differs from the prepared task"
+        );
+    }
     let mut report = Report {
         path: args.report_dir.join("report.json"),
         document: json!({
-            "schema_version": 1, "status": "running", "options": args,
+            "schema_version": 2, "status": "running", "options": args,
+            "profile_id": args.profile_id,
+            "target": expected.as_ref().map(|task| &task.profile.target),
             "binary_sha256": digest, "started_at": chrono::Utc::now().to_rfc3339(),
             "sampling": {"temperature": 0, "seed": 7, "max_tokens": args.max_tokens},
-            "capacity_overrides": [], "cases": []
+            "environment_policy": if args.use_default_backend { "remove_inherited_ferrum_overrides" } else { "inherit" }, "cases": []
         }),
         failed: false,
     };
@@ -206,9 +255,18 @@ async fn main() -> Result<()> {
             !version.trim().is_empty(),
             "binary returned an empty version"
         );
+        if let Some(expected) = &expected {
+            ensure!(
+                version.trim() == format!("ferrum {}", expected.version),
+                "binary returned an unexpected version"
+            );
+        }
         Ok(json!({"version": version.trim()}))
     })
     .await?;
+    if report.failed {
+        return report.finish(expected.as_ref());
+    }
     if args.checks.contains(&Check::Basic) {
         record(&mut report, "run-basic", cases::run_basic(&args)).await?;
     }
@@ -255,13 +313,36 @@ async fn main() -> Result<()> {
             Err(anyhow::anyhow!("staged binary changed during regression"))
         },
     )?;
-    report.document["status"] = json!(if report.failed { "failed" } else { "passed" });
-    report.document["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
-    report.save()?;
-    ensure!(
-        !report.failed,
-        "regression failed; see {}",
-        report.path.display()
-    );
-    Ok(())
+    report.finish(expected.as_ref())
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+    #[test]
+    fn a_real_answer_oracle_failure_survives_successful_later_cases() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut report = Report {
+            path: directory.path().join("report.json"),
+            document: json!({"cases": [], "status": "running"}),
+            failed: false,
+        };
+        let wrong_answer = protocol::answer("43", "42").map(|()| json!({"answer": "43"}));
+        assert!(wrong_answer.is_err());
+        report
+            .record("serve-basic", Duration::ZERO, wrong_answer)
+            .unwrap();
+        report
+            .record(
+                "binary-unchanged",
+                Duration::ZERO,
+                Ok(json!({"sha256": "unchanged"})),
+            )
+            .unwrap();
+        assert!(report.finish(None).is_err());
+        let document: Value = serde_json::from_slice(&fs::read(&report.path).unwrap()).unwrap();
+        assert_eq!(document["status"], "failed");
+        assert_eq!(document["cases"][0]["status"], "failed");
+        assert!(document["cases"][0]["error"].as_str().is_some());
+    }
 }

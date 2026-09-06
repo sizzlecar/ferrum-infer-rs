@@ -60,10 +60,11 @@ RMSNorm checks do not satisfy the entire kernel or architecture obligation set.
 A successful planning command means the input was parsed and the plan generated.
 It is **not** a runtime pass or publication permission. Review every reported
 coverage gap, selected and omitted profile, and unknown estimate. The current
-catalog deliberately leaves checker assignments and costs unknown where there
-is no established executable binding or measurement. The remaining work is to
-connect actual check execution, validate its observations, and enforce that
-verification at the publication action; report generation alone does not do so.
+catalog deliberately leaves costs unknown without measurements. The CLI now adds
+built-in bindings for the model runner's implemented behaviors and emits
+`model_tasks`; other obligations remain gaps. The model-task gate below consumes
+actual runner results for that limited scope. Full-plan execution and verification
+at the publication action remain pending; generating a plan does not do either.
 
 The selector reserves each Quick Start profile, then adds representatives that
 cover remaining obligations. Equal coverage is ordered by known estimated duration,
@@ -77,7 +78,9 @@ such a profile exists. It then assigns each obligation once, preferring a comple
 binding before the estimate ordering. Missing bindings remain gaps. A shared check
 is not assigned again to every compatible selected model. Quick Start obligations
 remain bound to their individual profiles and cannot be filled by another profile.
-The current catalog's `checks: []` means these checker assignments are still gaps, not completed executions.
+The catalog's `checks: []` supplies no additional bindings. The CLI's built-in
+model bindings are executable capabilities, not completed executions; unsupported
+behaviors and other evidence layers still retain their gaps.
 
 The selector does not infer currency conversion, cache availability, parallel
 critical paths or an optimal monetary schedule. Unknown estimates remain listed.
@@ -136,14 +139,15 @@ cargo build --release --locked -p ferrum-cli --example model_regression
   --ferrum-bin /path/to/staged/ferrum \
   --model qwen3.5:4b-q4_k_m --backend metal \
   --report-dir /path/outside/repository/metal-quickstart \
-  --checks basic,stop,structured,tools --disable-thinking
+  --checks basic,stop,structured,tools --disable-thinking --use-default-backend
 ```
 
 Use `--model qwen3.5:4b --backend cuda` for the CUDA Quick Start and a separate
 report directory. Reports must use a new or empty directory. `--checks` defaults
 to `basic`; explicitly select the checks relevant to the release:
 
-- `basic`: two `run` turns; server non-streaming, streaming and history replay.
+- `basic`: two `run` turns; server non-streaming and streaming answers plus
+  actual assistant-history replay through both HTTP modes.
 - `stop`: termination behavior through both entrypoints, including stream text.
 - `structured`: server JSON/schema behavior and valid structured responses.
 - `tools`: server tool calls and a tool-result continuation.
@@ -162,10 +166,89 @@ by omitting `--disable-thinking`. It must replay actual, non-empty reasoning;
 an empty reasoning field or a fabricated trace does not cover the behavior.
 Choose a capable model and report a failure to produce that trace explicitly.
 
-The runner complements separate literal README commands and installation checks.
-It records an explicit backend, temperature 0, seed 7 and an output budget
-(`--max-tokens`, default 512), without changing context, memory or concurrency.
-It does not prove download behavior, general answer quality or throughput.
+The runner complements literal README commands and installation checks. With
+`--use-default-backend`, `--backend` is the expected observation: child commands
+omit the explicit backend flag and remove inherited `FERRUM_*` overrides. Command
+records list removed key names only. Other environment settings, including PATH,
+CUDA device visibility and Hugging Face cache/authentication, remain inherited.
+Without this option the child receives `--backend` and retains its environment.
+Every run-ready event must report the requested model selector and matching actual
+backend; server readiness requires `status: healthy` and checks
+`auto_config.hardware_capabilities.backend`. HTTP 200 alone is insufficient.
+Missing, unknown or mismatched backend observations fail the check.
+
+Sampling uses temperature 0, seed 7 and a controlled output budget (`--max-tokens`,
+default 512), without context, memory, concurrency or template overrides. This is
+not download, general answer quality, throughput or a numerical reference check.
+All selected HTTP cases share one server process. `basic` uses one separate run
+process; `stop` uses its existing baseline and replay run processes. A Quick Start
+binding reuses that profile's basic cases, without another model load.
+
+## Verify selected model tasks
+
+The Rust [model_gate example](../crates/ferrum-bench-core/examples/model_gate.rs)
+prepares typed expectations from the plan's assigned model obligations and staged
+asset metadata. It groups checks by profile, preserves each Quick Start's own
+profile, and rejects unsupported model obligations before hardware allocation.
+It does not start runners or rent hardware itself. For example, using the actual
+candidate version and adjacent staging metadata:
+
+```bash
+cargo run --locked -p ferrum-bench-core --example model_gate -- \
+  prepare --plan /path/outside/repository/regression-plan.json \
+  --version 0.8.8 \
+  --abi /path/to/staged/ferrum-macos-aarch64.tar.gz.abi.json \
+  --abi /path/to/staged/ferrum-linux-x86_64-cuda-sm89.tar.gz.abi.json \
+  --output-dir /path/outside/repository/model-tasks
+```
+
+Supply the staged binary for each selected backend; paths and `0.8.8` above are
+illustrative. The output directory must be new. Each `task-N.json` fixes the
+profile, model selector, declared target, binary digest, version, checks, thinking
+mode, backend-selection mode and sampling inputs. Run the existing example once
+per task with `--expected-task /path/to/model-tasks/task-N.json` and its matching
+`--model`, `--backend`, `--checks` and other options. The runner supplies the task's
+profile ID if omitted, checks configuration before loading, and verifies its
+terminal report against the expectation. It does not silently apply other task
+options: choose them explicitly from the prepared task. For a bound local model,
+prepare the task with its canonical absolute path; the runner canonicalizes the
+supplied path before comparison and rejects a mismatch before loading. Public
+aliases retain their ordinary selector. A failed binary-version check also stops
+before model loading.
+
+Quick Start tasks retain the normal README alias, require automatic backend
+selection and `--disable-thinking`, and use the controlled prompts above. They
+exercise the default capacity and template configuration in the same basic
+run/serve cases; installed `--help`, `doctor`, literal README requests and fresh
+download checks remain separate obligations.
+
+Then supply every actual schema-2 runner report:
+
+```bash
+cargo run --locked -p ferrum-bench-core --example model_gate -- \
+  verify --tasks /path/outside/repository/model-tasks/tasks.json \
+  --report /path/outside/repository/metal-model/report.json \
+  --report /path/outside/repository/cuda-model/report.json \
+  --output /path/outside/repository/model-gate.json
+```
+
+Use as many reports as the prepared tasks require; the examples do not define a
+fixed matrix. Missing, duplicate, unfinished, failed or mismatched reports fail.
+The runner's Rust answer, stop, JSON, tool and SSE assertions determine each case
+result. The gate checks those terminal results and their task/identity bindings;
+it does not independently replay the raw responses or authenticate arbitrary
+hand-edited reports. Counts, PASS text and binary hashes do not replace the
+semantic assertions. The target's architecture/precision/execution-path fields
+remain declared configuration; observing the backend does not measure every
+kernel or establish those fields independently.
+
+The output is explicitly scoped to `model_runtime`, retains remaining plan gaps
+and always records `release_approved: false`. Current bindings cover model load,
+basic forward/natural completion, Quick Start, history, user stop, structured
+validity and tool-result continuation in their implemented entrypoints. Tool
+selection/handoff, reasoning-alias coverage, length boundaries, scheduling/KV,
+performance and other unimplemented obligations remain unsupported. This gate
+cannot approve the complete release, installation, CI or backend-numerical work.
 
 ## Representative coverage and cost
 

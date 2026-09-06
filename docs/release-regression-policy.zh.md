@@ -1,7 +1,7 @@
 # 发布回归决策方案
 
 2026-09-06。本文确定回归范围、成本和放行规则，并给出实施顺序。
-当前已有基础 CI、主分支必需检查和 Rust 模型回归 runner。范围选择器现已提供全量 diff 分析、代表选择、缺口和已声明费用估算，并接入代码 PR 的 CI 报告；自托管 Metal/CUDA 的必需数值检查已接入 CI，当前只覆盖 RMSNorm 的已列形状；其余检查器绑定、小合成架构、费用历史、长尾调度和正式发布证据校验仍待完成，计划生成成功不能放行发布。
+当前已有基础 CI、主分支必需检查和 Rust 模型回归 runner。范围选择器现已提供全量 diff 分析、代表选择、缺口和已声明费用估算，并接入代码 PR 的 CI 报告；自托管 Metal/CUDA 的必需数值检查已接入 CI，当前只覆盖 RMSNorm 的已列形状；现已把模型 runner 已实现的行为接成按 profile 合并的任务，并增加实际报告与预先任务的校验。它只覆盖 ModelRuntime，其他检查器绑定、小合成架构、费用历史、长尾调度和完整发布证据校验仍待完成，计划或模型任务通过都不能放行发布。
 具体运行步骤见 [Release regression](release-regression.md)、[真实 GPU 数值检查](backend-numerics.md) 和 [候选版本与安装包准备](release-candidate-automation.md)。候选准备工具已统一工作区版本、内部依赖及锁文件更新，staging 接收目标版本；它们尚未接通自动租卡回归与正式发布。
 
 ## 最终原则
@@ -44,11 +44,21 @@ README 快速开始必须按宣传的模型、后端、默认容量和命令运�
 
 [纯版本识别](../crates/ferrum-bench-core/src/release_regression/version_change.rs)比较两端的根 manifest、成员 manifest 和锁文件。只有后态完整符合候选准备器生成的协调版本更新，才把这些已证明的 Cargo 路径收窄为 `Build`，保留构建、安装及发布基线要求。额外依赖、features、构建参数、成员变化或其他文本差异都会保留原来的保守分类；不支持的成员通配符、排除项、缺失输入也不能收窄。同一区间中的 engine、模板、kernel 等改动仍累积加入计划，不会被最后的版本更新抹掉。只接收路径的库接口没有这个内容证明能力，仍保守处理 Cargo 改动。
 
-[路径映射](../crates/ferrum-bench-core/src/release_regression/impact.rs)也区分已经核实的调用关系：`bench-core` 的请求关联头、JSONL journal、profile 和 trace 被生产代码使用，产生 `Observability` 契约与每个后端的有限真模型抽样义务；不会仅因观测改动推断全部算子数值或精度矩阵需要重跑。已声明的版本/回归工具和 CLI 模型回归器四个模块只归验证范围；未知模块仍扩大范围并报告缺口，不把所有 tests/examples 都当作验证专用。
+[路径映射](../crates/ferrum-bench-core/src/release_regression/impact.rs)也区分已经核实的调用关系：`bench-core` 的请求关联头、JSONL journal、profile 和 trace 被生产代码使用，产生 `Observability` 契约与每个后端的有限真模型抽样义务；不会仅因观测改动推断全部算子数值或精度矩阵需要重跑。已核实的版本/回归工具和 CLI 模型回归模块只归验证范围；未知模块仍扩大范围并报告缺口，不把所有 tests/examples 都当作验证专用。
 
 [代表选择](../crates/ferrum-bench-core/src/release_regression/selection.rs)使用实际 `execution_path`：架构抽样按架构、协议和执行路径分组，协议义务还保留后端区别。不同执行路径不能互相代替；共享计算等改动仍按精确目标组合展开。每项需要模型的共享义务只分配给一个代表。若初选集合没有完整检查器绑定，会先从可用且 scope 匹配的配置中补入有完整绑定的代表，再唯一指派；没有可用绑定仍报告缺口。不会因多个模型都兼容而重复分配；每条 Quick Start 则绑定自己的 profile，各自必测，不能由别的配置补位。
 
-CLI 输出当前为 `schema_version: 2`，记录 `release_base_tag` 和 `version_refinement` 的结果、路径或回退原因；架构/协议 scope 也包含 `execution_path`。目录仍为 `checks: []`，表示尚无检查器绑定，不能写成已执行或通过。以上只是生成和分配义务；计划生成本身不执行租卡、模型回归或正式发布，自动执行与放行闭环仍待接通。
+CLI 输出当前为 `schema_version: 2`，记录 `release_base_tag` 和 `version_refinement` 的结果、路径或回退原因；架构/协议 scope 也包含 `execution_path`。目录仍为 `checks: []`，表示目录没有额外声明绑定；CLI 会加入现有模型 runner 的内置能力，并输出 `model_tasks`。能力声明不能写成已执行或通过，未实现的行为和其他证据层仍保留缺口。计划生成本身不执行租卡、模型回归或正式发布。
+
+### 已接入的小型模型任务门禁
+
+[model_gate](../crates/ferrum-bench-core/examples/model_gate.rs) 的 `prepare` 从计划的实际指派生成每个 profile 的预期任务，绑定 staging 二进制、版本、模型、后端与检查配置；不支持的模型义务会在租卡前报错。它不负责启动机器或 runner。执行时给现有 runner 传入 `--expected-task` 和相符参数，Rust 的答案、stop、JSON、工具及 SSE 断言产生逐项结果，再由 `verify` 校验完整任务集合。缺失、重复、失败、未结束或配置不符的报告都不能通过，不能用测试数或 PASS 文本补齐。
+
+Quick Start 使用正常 README alias、自动选择后端和 `--disable-thinking`，保留默认容量和模板，使用受控提示词与输出预算。子进程省略显式 `--backend` 并去掉继承的 `FERRUM_*` 配置，只记录去除的键名；PATH、CUDA 可见设备及 HF 缓存/认证等仍保留。run-ready 与 serve-health 必须给出相符的实际后端，run 还须记录正确的请求模型；serve 的状态必须为 healthy，HTTP 200 不能替代就绪。绑定本地模型任务须预先记录规范绝对路径，执行器在加载前规范实际路径并比较；普通 public alias 保留原选择器。配置或二进制版本不符会在加载前失败。Quick Start 复用同一 profile 的 basic 检查，不新增模型加载；HTTP 检查共用一个 server，run 的 basic 与 stop 基线/回放仍保留原有独立进程。
+
+当前绑定包括加载、基本推理/自然结束、Quick Start、历史回放、用户 stop、结构合法性及工具结果续接的已实现入口；工具选择/交接、reasoning alias、长度、scheduler/KV、性能等未实现义务仍不能补位。门禁消费 runner 实际断言链产生的报告，不独立重放原始响应，也不是任意手写报告的真实性证明。architecture/precision/execution_path 仍是任务声明，后端观测不能替代各项数值或路径证明。
+
+输出只声明 `model_runtime`，保留其他计划缺口且固定 `release_approved: false`。安装、help/doctor、首次下载、数值、CI 和正式发布前的完整证据门禁仍需单独完成；自动租卡、全计划执行与发布闭环尚未接通。
 
 ## 可执行的量化标准
 
@@ -73,7 +83,7 @@ CLI 输出当前为 `schema_version: 2`，记录 `release_base_tag` 和 `version
 分别登记构建、排队、下载、模型加载、用例执行、导出和释放资源的时间。并行设备分钟用于费用，实际关键路径用于等待时间。
 历史样本不足时给观测值和估算区间，不声称已有可靠 p95。
 
-执行流程按以下规则建设；当前只实现计划与估算，不承诺全局最优调度或自动缓存调度：
+执行流程按以下规则建设；当前实现计划、估算与有限模型任务校验，不承诺全局最优调度、自动租卡或自动缓存调度：
 
 1. 固定 README、联合改动和适用历史缺陷的必测项。
 2. 当前先固定 Quick Start，再优先选择覆盖更多剩余义务的代表；同等覆盖按已登记总耗时、同币种费用和稳定 ID 排序。分配义务前优先补齐可用的完整检查器绑定，再在匹配代表中按绑定和估算排序；缓存是否可用仍需执行准备时核实。

@@ -25,9 +25,10 @@ binary and the actual installation and first-use paths.
 - `required_targets` keeps advertised capability groups visible. Selection must
   consider stage and changed behavior; the number of profiles is not a gate.
   Additional precision-specific work belongs to affected loader/kernel changes.
-- `checks` is initially empty: this catalog has not yet assigned executable
-  checks to its obligations. The planner must report those assignments as gaps;
-  model availability alone must never make the plan complete.
+- `checks` is empty: the catalog supplies no extra executable bindings. The
+  regression-plan CLI adds the existing model runner's built-in capabilities;
+  all other missing bindings remain gaps. Neither declaration nor model
+  availability means a check ran or passed.
 
 Resolve aliases through the production resolver. Record the selected immutable
 weight revision and the tokenizer/config/template revisions in runtime evidence.
@@ -64,9 +65,35 @@ update to build scope. Other changed paths remain in the same accumulated impact
 additional dependency/build changes or an unsupported snapshot retain the broad
 classification. The report records the refinement decision and release tag
 baseline in provenance. See the [release procedure](release-regression.md).
-The catalog itself remains unchanged by that report schema revision, and its
-`checks: []` still exposes missing executable bindings. Planning does not rent
-hardware, execute the catalog or publish a release.
+The catalog itself remains unchanged by that report schema revision. Its
+`checks: []` does not remove the CLI's built-in model bindings, and bindings
+outside that supported set still need an executable checker. Planning does not
+rent hardware, execute the catalog or publish a release.
+
+## Model task bindings
+
+The [model schedule](../crates/ferrum-bench-core/src/release_regression/model_schedule.rs)
+connects only the runner's implemented behaviors: basic model load/forward/natural
+completion, Quick Start, history replay, user stop, structured validity and
+canonical tool-result continuation. Each binding lists its real entrypoints;
+tool selection/handoff, reasoning-alias replay, length limits, scheduling/KV and
+performance obligations are not satisfied by those nearby checks.
+
+The CLI emits `model_tasks` alongside the plan. The
+[model-task gate](release-regression.md#verify-selected-model-tasks) groups assigned
+checks by profile without selecting replacement models. It uses staged metadata
+to prepare an expected task before execution, then consumes actual schema-2
+runner reports. Quick Start uses its own normal alias, default backend selection
+and disabled thinking with controlled prompts, sharing that profile's basic
+cases. Selected HTTP checks share one server; separate run baseline/replay cases
+retain their existing processes. There is no extra Quick Start model launch.
+
+Missing or failed execution, wrong observed backend, mismatched task inputs and
+unsupported model obligations fail this limited gate. The target remains a
+declaration of architecture, precision and execution path; backend observation
+does not prove every declared dimension or kernel. Success is ModelRuntime-only,
+retains other plan gaps and never approves publication. Installation, numerical
+checks, fresh downloads and unimplemented behavior checks remain separate.
 
 ## Current representatives
 

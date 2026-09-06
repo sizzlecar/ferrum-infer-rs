@@ -1,6 +1,6 @@
 use super::process::{self, Server};
 use super::protocol::{self, answer, Chat};
-use super::Args;
+use super::{identity, Args};
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -16,6 +16,7 @@ enum Input<'a> {
 }
 
 struct Run {
+    ready: Value,
     records: Vec<Value>,
     assistants: Vec<Value>,
 }
@@ -103,6 +104,12 @@ async fn run_chat(args: &Args, name: &str, input: Input<'_>, stop: Option<&str>)
             == 1,
         "run must emit one ready event"
     );
+    let ready = records
+        .iter()
+        .find(|record| record["event"] == "ready")
+        .context("missing run ready event")?
+        .clone();
+    identity::validate_run(args, &ready)?;
     ensure!(
         records
             .iter()
@@ -134,6 +141,7 @@ async fn run_chat(args: &Args, name: &str, input: Input<'_>, stop: Option<&str>)
         run_deltas(&records, assistant, false)?;
     }
     Ok(Run {
+        ready,
         records,
         assistants,
     })
@@ -158,9 +166,7 @@ pub(super) async fn run_basic(args: &Args) -> Result<Value> {
             .context("missing recall answer")?,
         "cobalt-731",
     )?;
-    Ok(
-        json!({"ready": run.records.iter().find(|record| record["event"] == "ready"), "answers": run.assistants}),
-    )
+    Ok(json!({"ready": run.ready, "answers": run.assistants}))
 }
 
 pub(super) async fn run_stop(args: &Args) -> Result<Value> {
@@ -210,7 +216,9 @@ pub(super) async fn run_stop(args: &Args) -> Result<Value> {
         !deltas.contains(&stop),
         "run streamed the stop sentinel before hiding it in the final answer"
     );
-    Ok(json!({"baseline": content, "stop": stop, "expected_prefix": expected, "actual": actual}))
+    Ok(
+        json!({"ready": stopped.ready, "baseline_ready": baseline.ready, "baseline": content, "stop": stop, "expected_prefix": expected, "actual": actual}),
+    )
 }
 
 fn request(server: &Server<'_>, messages: Vec<Value>) -> Value {
@@ -251,21 +259,18 @@ pub(super) async fn serve_basic(server: &Server<'_>) -> Result<Value> {
     .await?;
     finished_answer(&first, "42").context("sync arithmetic")?;
     // Feed back the actual returned assistant, including its reasoning.
-    let recall = chat(
+    let history = request(
         server,
-        "serve-basic-recall",
-        request(
-            server,
-            vec![
-                first_user,
-                first.message.clone(),
-                json!({"role": "user", "content": SECOND_TURN}),
-            ],
-        ),
-        false,
-    )
-    .await?;
+        vec![
+            first_user,
+            first.message.clone(),
+            json!({"role": "user", "content": SECOND_TURN}),
+        ],
+    );
+    let recall = chat(server, "serve-basic-recall", history.clone(), false).await?;
     finished_answer(&recall, "cobalt-731").context("actual HTTP history recall")?;
+    let streamed_recall = chat(server, "serve-basic-recall-stream", history, true).await?;
+    finished_answer(&streamed_recall, "cobalt-731").context("actual SSE history recall")?;
     let streamed = chat(
         server,
         "serve-basic-stream",
@@ -280,7 +285,7 @@ pub(super) async fn serve_basic(server: &Server<'_>) -> Result<Value> {
     .await?;
     finished_answer(&streamed, "42").context("streamed arithmetic")?;
     Ok(
-        json!({"models": models, "sync_answer": first.content(), "recall": recall.content(), "stream_answer": streamed.content(), "stream_usage": streamed.usage}),
+        json!({"models": models, "sync_answer": first.content(), "recall": recall.content(), "stream_recall": streamed_recall.content(), "stream_recall_usage": streamed_recall.usage, "stream_answer": streamed.content(), "stream_usage": streamed.usage}),
     )
 }
 
