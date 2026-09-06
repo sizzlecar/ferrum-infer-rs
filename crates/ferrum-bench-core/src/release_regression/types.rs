@@ -171,6 +171,8 @@ pub enum Behavior {
     CapacityAdmission,
     KvIsolation,
     KvRelease,
+    /// Resume supported preemption by recomputing preserved prompt/generated
+    /// history after physical KV release; does not imply KV swapping support.
     KvResume,
     KernelNumerics,
     KernelBoundaries,

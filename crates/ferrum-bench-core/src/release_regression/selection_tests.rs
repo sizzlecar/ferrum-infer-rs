@@ -1262,16 +1262,10 @@ fn deterministic_resource_mechanisms_do_not_multiply_large_model_checks() {
                 .count(),
             1
         );
-        if behavior == Behavior::KvResume {
-            assert!(result
-                .gaps
-                .contains(&Gap::UnassignedCheck { obligation: index }));
-        } else {
-            assert!(!obligation.checkers.is_empty());
-            assert!(!result
-                .gaps
-                .contains(&Gap::UnassignedCheck { obligation: index }));
-        }
+        assert!(!obligation.checkers.is_empty());
+        assert!(!result
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
     }
     for target in [cpu, cuda] {
         for behavior in [Behavior::ModelLoad, Behavior::ModelForward] {

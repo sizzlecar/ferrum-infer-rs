@@ -303,9 +303,9 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
             &[ModelLoad, ModelForward],
         ),
         Kv => (
-            // Keep isolation, release and resume contracts mandatory. In
-            // particular, an unbound resume check remains a gap. The selected
-            // model verifies integration only; it cannot certify device state.
+            // CPU contracts check isolation, release and recomputation after
+            // supported preemption. Selected models verify integration; these
+            // checks cannot certify GPU KV arithmetic or swapping.
             &[KvIsolation, KvRelease, KvResume],
             &[ModelLoad, ModelForward],
         ),
