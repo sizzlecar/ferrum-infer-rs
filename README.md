@@ -17,24 +17,20 @@
 
 Install Ferrum:
 
-On Homebrew 6, review the [formula definitions](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)
-before granting trust: loading them executes Ruby code with your user privileges.
-Homebrew reads both formulas to check their mutual conflict, so trust both below
-and install the one for your platform. Older Homebrew versions can skip the two
-`brew trust` commands. See [Homebrew's trust documentation](https://docs.brew.sh/Tap-Trust).
+Choose the install command for your platform; it automatically adds the tap.
+Homebrew 6 also needs both [formula definitions](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)
+trusted for its conflict check. Review them before running the trust command;
+older Homebrew versions can skip it. See [Homebrew's trust documentation](https://docs.brew.sh/Tap-Trust).
 
 ```bash
-brew tap sizzlecar/ferrum
-
 # Homebrew 6: trust the reviewed formula definitions
-brew trust --formula sizzlecar/ferrum/ferrum
-brew trust --formula sizzlecar/ferrum/ferrum-cuda
+brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon
-brew install ferrum
+brew install sizzlecar/ferrum/ferrum
 
 # Linux x86_64, NVIDIA CUDA sm89
-brew install ferrum-cuda
+brew install sizzlecar/ferrum/ferrum-cuda
 ```
 
 Inspect the installed binary before downloading weights:
@@ -105,7 +101,7 @@ commands without downloading the model or starting an inference engine.
 - Apple Silicon Metal and NVIDIA CUDA from the same runtime.
 - Continuous batching, paged KV cache, prefix cache, and typed admission control.
 - GGUF on Metal and GPTQ/safetensors on CUDA.
-- v0.8 covers language-model inference only. Release scope: Qwen3.5 4B,
+- Ferrum covers language-model inference only. Supported models include Qwen3.5 4B,
   Qwen3.5 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense.
 
 ## Performance Snapshot
@@ -150,42 +146,39 @@ and session caching.
 Homebrew (see the formula trust explanation in [Quick Start](#quick-start)):
 
 ```bash
-brew tap sizzlecar/ferrum
-
 # Homebrew 6: trust the reviewed formula definitions
-brew trust --formula sizzlecar/ferrum/ferrum
-brew trust --formula sizzlecar/ferrum/ferrum-cuda
+brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon Metal
-brew install ferrum
+brew install sizzlecar/ferrum/ferrum
 
 # Linux x86_64 CUDA sm89
-brew install ferrum-cuda
+brew install sizzlecar/ferrum/ferrum-cuda
 ```
 
-Prebuilt release tarballs:
+Prebuilt tarballs from the latest stable release:
 
 ```bash
 # Linux x86_64 CUDA sm89
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-linux-x86_64-cuda-sm89.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
 
 # macOS Apple Silicon Metal
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-macos-aarch64.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-macos-aarch64.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz.sha256
 shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
 tar -xzf ferrum-macos-aarch64.tar.gz
 ./ferrum --version
 ```
 
-Install the Metal build from crates.io:
+Install the latest Metal build from crates.io:
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.7 --locked --features metal
+cargo install ferrum-cli --locked --features metal
 ```
 
 The official prebuilt CUDA asset targets `sm89`. CUDA installation requires a

@@ -17,23 +17,19 @@
 
 安装 Ferrum：
 
-使用 Homebrew 6 时，授予信任前请先查看[公式定义](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)：
-加载这些定义会以当前用户权限执行 Ruby 代码。Homebrew 会读取两条公式来检查互斥安装，
-因此需要分别信任两条，再只安装适合当前平台的一条。旧版 Homebrew 可跳过两条
-`brew trust` 命令。详见 [Homebrew 信任说明](https://docs.brew.sh/Tap-Trust)。
+选择与你的平台对应的安装命令，会自动添加 tap。Homebrew 6 检查互斥安装时还需要信任
+两条[公式定义](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)，请先查看定义再运行
+信任命令；旧版 Homebrew 可跳过该命令。详见 [Homebrew 信任说明](https://docs.brew.sh/Tap-Trust)。
 
 ```bash
-brew tap sizzlecar/ferrum
-
-# Homebrew 6：分别信任已查看的公式定义
-brew trust --formula sizzlecar/ferrum/ferrum
-brew trust --formula sizzlecar/ferrum/ferrum-cuda
+# Homebrew 6：信任已查看的两条公式定义
+brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon
-brew install ferrum
+brew install sizzlecar/ferrum/ferrum
 
 # Linux x86_64，NVIDIA CUDA sm89
-brew install ferrum-cuda
+brew install sizzlecar/ferrum/ferrum-cuda
 ```
 
 下载权重前先检查安装的二进制：
@@ -100,7 +96,7 @@ curl http://localhost:8000/v1/chat/completions \
 - 同一 runtime 覆盖 Apple Silicon Metal 与 NVIDIA CUDA。
 - 支持 continuous batching、paged KV cache、prefix cache 和 typed admission。
 - Metal 使用 GGUF，CUDA 使用 GPTQ/safetensors。
-- v0.8 只覆盖语言模型推理。发布范围：Qwen3.5 4B、Qwen3.5 35B-A3B、
+- Ferrum 只覆盖语言模型推理。支持的模型包括 Qwen3.5 4B、Qwen3.5 35B-A3B、
   Qwen3 30B-A3B 和 Llama 3.1 8B dense。
 
 ## 性能快照
@@ -142,42 +138,39 @@ Ferrum 支持：
 Homebrew（公式信任说明见[快速开始](#快速开始)）：
 
 ```bash
-brew tap sizzlecar/ferrum
-
-# Homebrew 6：分别信任已查看的公式定义
-brew trust --formula sizzlecar/ferrum/ferrum
-brew trust --formula sizzlecar/ferrum/ferrum-cuda
+# Homebrew 6：信任已查看的两条公式定义
+brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
 
 # macOS Apple Silicon Metal
-brew install ferrum
+brew install sizzlecar/ferrum/ferrum
 
 # Linux x86_64 CUDA sm89
-brew install ferrum-cuda
+brew install sizzlecar/ferrum/ferrum-cuda
 ```
 
-预编译 release tarball：
+最新正式版的预编译 tarball：
 
 ```bash
 # Linux x86_64 CUDA sm89
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-linux-x86_64-cuda-sm89.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 sha256sum --check ferrum-linux-x86_64-cuda-sm89.tar.gz.sha256
 tar -xzf ferrum-linux-x86_64-cuda-sm89.tar.gz
 LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./ferrum --version
 
 # macOS Apple Silicon Metal
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-macos-aarch64.tar.gz
-curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v0.8.7/ferrum-macos-aarch64.tar.gz.sha256
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz
+curl --fail --location --remote-name https://github.com/sizzlecar/ferrum-infer-rs/releases/latest/download/ferrum-macos-aarch64.tar.gz.sha256
 shasum -a 256 --check ferrum-macos-aarch64.tar.gz.sha256
 tar -xzf ferrum-macos-aarch64.tar.gz
 ./ferrum --version
 ```
 
-从 crates.io 安装 Metal build：
+从 crates.io 安装最新版 Metal build：
 
 ```bash
 # macOS Apple Silicon Metal
-cargo install ferrum-cli --version 0.8.7 --locked --features metal
+cargo install ferrum-cli --locked --features metal
 ```
 
 官方预编译 CUDA 资产的目标为 `sm89`。CUDA 安装需要兼容的 NVIDIA driver、

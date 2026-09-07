@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 No unreleased changes.
 
+## [0.8.8] - 2026-09-07
+
+### Fixed
+
+- Preserved literal thinking tags in final text after a prompt-opened reasoning block closes.
+- Preserved native Harmony tool-call identity when validating named tool choices, and rejected native tool calls when `tool_choice` is `none`.
+- Selected the root checkpoint's indexed SafeTensors shards for fresh `run` and `serve` downloads, while retaining full-repository downloads for other consumers.
+- Kept cold-download progress on stderr so `run --output-format jsonl` emits only JSONL on stdout.
+- Loaded standalone Hugging Face chat templates in production Qwen packages, beyond downloading the template file.
+- Accepted omitted GPTQ v1 format metadata and materialized supported symmetric GPTQ MoE routers as dense execution weights.
+
+### Added
+
+- Added explicit `HF_REPO@<40-hex-commit>` source selection for `run`, `serve`, and `pull`.
+- Added CPU contract tests across HTTP, engine, and CLI boundaries, required real Metal/CUDA numerical checks, and selected real-model acceptance checks. These are validation improvements, not additional model-support claims.
+- Automated candidate staging, evidence verification, and publication to crates.io, GitHub Releases, and Homebrew, with installation startup checks.
+
 ## [0.8.7] - 2026-09-05
 
 ### Fixed
