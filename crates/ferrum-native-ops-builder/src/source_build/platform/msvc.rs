@@ -251,7 +251,7 @@ pub(crate) fn target(compiler: &Path) -> Result<String> {
     Ok(MSVC_TARGET.to_string())
 }
 
-pub(crate) fn tool_version(path: &Path) -> Result<String> {
+fn tool_version_command(path: &Path) -> Result<Command> {
     let mut command = Command::new(path);
     command.arg(
         if basename(&path.display().to_string()).eq_ignore_ascii_case("nvcc.exe") {
@@ -263,10 +263,41 @@ pub(crate) fn tool_version(path: &Path) -> Result<String> {
     command.env_clear().env("VSLANG", "1033");
     for key in ["SystemRoot", "TEMP", "TMP"] {
         let value = std::env::var(key).map_err(|_| {
-            NativeOperatorBuilderError::Invalid(format!("Windows tool probe is missing {key}"))
+            NativeOperatorBuilderError::Invalid(format!(
+                "Windows tool probe is missing {key}: program={:?} args={:?} status=not_started stdout=\"\" stderr=\"\"",
+                command.get_program(),
+                command.get_args().collect::<Vec<_>>()
+            ))
         })?;
         command.env(key, value);
     }
+    Ok(command)
+}
+
+fn bounded_probe_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut characters = text.chars();
+    let mut bounded: String = characters.by_ref().take(4000).collect();
+    if characters.next().is_some() {
+        bounded.push_str(" [output truncated]");
+    }
+    bounded
+}
+
+fn probe_output_diagnostic(command: &Command, output: &std::process::Output) -> String {
+    format!(
+        "program={:?} args={:?} status={} code={:?} stdout={:?} stderr={:?}",
+        command.get_program(),
+        command.get_args().collect::<Vec<_>>(),
+        output.status,
+        output.status.code(),
+        bounded_probe_text(&output.stdout),
+        bounded_probe_text(&output.stderr)
+    )
+}
+
+pub(crate) fn tool_version(path: &Path) -> Result<String> {
+    let mut command = tool_version_command(path)?;
     let output = command
         .output()
         .map_err(|source| NativeOperatorBuilderError::Io {
@@ -281,7 +312,7 @@ pub(crate) fn tool_version(path: &Path) -> Result<String> {
     if !output.status.success() || text.trim().is_empty() {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "Windows tool version probe failed: {}",
-            path.display()
+            probe_output_diagnostic(&command, &output)
         )));
     }
     Ok(text.trim().chars().take(4000).collect())
@@ -290,6 +321,104 @@ pub(crate) fn tool_version(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_version_failure_diagnostic_keeps_status_arguments_and_bounded_channels() {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+
+        #[cfg(unix)]
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        #[cfg(windows)]
+        let status = std::process::ExitStatus::from_raw(1);
+
+        let mut command = Command::new("nvcc.exe");
+        command.arg("--version");
+        let output = std::process::Output {
+            status,
+            stdout: b"compiler version output\n".to_vec(),
+            stderr: format!("missing dependency: {}unbounded-tail", "x".repeat(4100)).into_bytes(),
+        };
+        let diagnostic = probe_output_diagnostic(&command, &output);
+        for expected in [
+            "program=\"nvcc.exe\"",
+            "args=[\"--version\"]",
+            "code=Some(1)",
+            "stdout=\"compiler version output\\n\"",
+            "stderr=\"missing dependency:",
+            "[output truncated]",
+        ] {
+            assert!(diagnostic.contains(expected), "{diagnostic}");
+        }
+        assert!(!diagnostic.contains("unbounded-tail"));
+        assert_eq!(bounded_probe_text(b"short stderr"), "short stderr");
+        assert_eq!(
+            bounded_probe_text("界".repeat(4001).as_bytes()),
+            format!("{} [output truncated]", "界".repeat(4000))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires configured CUDA Toolkit"]
+    fn configured_nvcc_version_probe() {
+        let toolkit = std::env::var_os("CUDA_PATH").expect("CUDA_PATH must select a real Toolkit");
+        let input_path = PathBuf::from(toolkit).join("bin").join("nvcc.exe");
+        let canonical_path = input_path
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("resolve selected NVCC {:?}: {error}", input_path));
+        match tool_version(&canonical_path) {
+            Ok(version) => {
+                assert!(!version.is_empty());
+                eprintln!(
+                    "production NVCC version probe succeeded: input={input_path:?} canonical={canonical_path:?} version={version:?}"
+                );
+            }
+            Err(error) => {
+                eprintln!("production NVCC version probe failed: {error}");
+                // Compare only the selected executable's two path spellings and
+                // the current versus production environment. No environment
+                // values are printed or changed in the parent test process.
+                for (path_label, path) in [
+                    ("input", input_path.as_path()),
+                    ("canonical", canonical_path.as_path()),
+                ] {
+                    for isolated in [false, true] {
+                        let environment_label = if isolated { "production" } else { "inherited" };
+                        let command = if isolated {
+                            tool_version_command(path)
+                        } else {
+                            let mut command = Command::new(path);
+                            command.arg("--version");
+                            Ok(command)
+                        };
+                        let label = format!(
+                            "NVCC comparison path={path_label} environment={environment_label}"
+                        );
+                        match command {
+                            Ok(mut command) => match command.output() {
+                                Ok(output) => eprintln!(
+                                    "{label}: {}",
+                                    probe_output_diagnostic(&command, &output)
+                                ),
+                                Err(error) => eprintln!(
+                                    "{label}: program={:?} args={:?} status=not_started stdout=\"\" stderr=\"\" error={error}",
+                                    command.get_program(),
+                                    command.get_args().collect::<Vec<_>>()
+                                ),
+                            },
+                            Err(error) => eprintln!(
+                                "{label}: program={path:?} args=[\"--version\"] status=not_started stdout=\"\" stderr=\"\" error={error}"
+                            ),
+                        }
+                    }
+                }
+                panic!("selected NVCC must pass the production version probe: {error}");
+            }
+        }
+    }
 
     fn manifest_fixture() -> NativeOperatorHostToolchainManifest {
         let compiler = NativeOperatorToolFileIdentity {

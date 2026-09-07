@@ -563,6 +563,11 @@ jobs:
           key: windows-msvc1938-cuda1241-${{ hashFiles('Cargo.lock', 'crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/cuda/**') }}
           restore-keys: |
             windows-msvc1938-cuda1241-
+      - name: Verify the Windows NVCC version probe
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test --locked -p ferrum-native-ops-builder --lib source_build::platform::msvc::tests::configured_nvcc_version_probe -- --ignored --exact --nocapture
       - name: Check and test the native Windows workspace
         run: |
           $ErrorActionPreference = 'Stop'
