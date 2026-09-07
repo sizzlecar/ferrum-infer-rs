@@ -161,7 +161,7 @@ pub(super) fn verify_evidence(
             )?;
         }
         let health: Value = read_json(&local.join("health.json"))?;
-        process::health_identity(&health, version)?;
+        process::health_identity(&health, version, args.max_model_len)?;
         let execution: Value = read_json(&local.join("execution.json"))?;
         require(
             execution["server_pid"].as_u64().is_some_and(|pid| pid > 0)
