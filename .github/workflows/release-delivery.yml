@@ -5,6 +5,12 @@ on:
     branches: [main]
     paths: [Cargo.toml]
   workflow_dispatch:
+    inputs:
+      reuse_cuda_run_id:
+        description: "Optional completed main release run whose original CUDA evidence can be reverified; otherwise execute CUDA normally"
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -364,7 +370,107 @@ jobs:
           cd "$RUNNER_TEMP/staged-cuda"
           sha256sum --check model-regression-linux-x86_64.tar.gz.sha256
           tar -xzf model-regression-linux-x86_64.tar.gz model_regression
+      - name: Reverify optional CUDA evidence against current tasks and binaries
+        id: reuse-cuda
+        if: github.event_name == 'workflow_dispatch' && inputs.reuse_cuda_run_id != ''
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ inputs.reuse_cuda_run_id }}
+        run: |
+          [[ "$SOURCE_RUN" =~ ^[1-9][0-9]*$ ]]
+          reuse="$RUNNER_TEMP/cuda-reuse"
+          mkdir "$reuse"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" > "$reuse/run.json"
+          jq -e --argjson id "$SOURCE_RUN" --argjson repo "$GITHUB_REPOSITORY_ID" '
+            .id == $id and .repository.id == $repo and .head_repository.id == $repo and
+            .head_branch == "main" and .status == "completed" and .run_attempt > 0 and
+            (.event == "push" or .event == "workflow_dispatch") and
+            (.path | split("@")[0]) == ".github/workflows/release-delivery.yml" and
+            (.head_sha | test("^[0-9a-f]{40}$"))' "$reuse/run.json"
+          source_sha=$(jq -r .head_sha "$reuse/run.json")
+          gh api "repos/$GITHUB_REPOSITORY/compare/$source_sha...main" | \
+            jq -e '.status == "ahead" or .status == "identical"'
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/jobs?filter=all&per_page=100" > "$reuse/jobs.json"
+          jq -e --slurpfile run "$reuse/run.json" '
+            [.[].jobs[] | select(.name == "cuda-models")] | group_by(.run_attempt) |
+            if any(.[]; length != 1) then error("ambiguous CUDA job") else flatten end |
+            last as $job | select($job != null) | $job |
+            select(.run_id == $run[0].id and .head_sha == $run[0].head_sha and
+              .run_attempt > 0 and .run_attempt <= $run[0].run_attempt and
+              .status == "completed" and .conclusion == "success")' "$reuse/jobs.json" > "$reuse/job.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/artifacts?per_page=100" | \
+            jq -e '[.[].artifacts[] | select(.name == "release-cuda-evidence")] | if length == 1 then .[0] else error("ambiguous CUDA artifact") end' > "$reuse/artifact.json"
+          jq -e --slurpfile job "$reuse/job.json" --slurpfile run "$reuse/run.json" '
+            def time: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+            def successful($name): [$job[0].steps[] | select(.name == $name)] |
+              if length == 1 and .[0].status == "completed" and .[0].conclusion == "success"
+              then .[0] else error("CUDA execution/upload did not succeed") end;
+            successful("Rent one bounded GPU, execute the selected tasks, and destroy it") as $execute |
+            successful("Run actions/upload-artifact@v4") as $upload |
+            .expired == false and .id > 0 and .size_in_bytes > 0 and .size_in_bytes <= 268435456 and
+            .workflow_run.id == $run[0].id and .workflow_run.head_sha == $run[0].head_sha and
+            .workflow_run.repository_id == $run[0].repository.id and
+            .workflow_run.head_repository_id == $run[0].head_repository.id and
+            (.digest | test("^sha256:[0-9a-f]{64}$")) and
+            $execute.number < $upload.number and
+            ($execute.started_at | time) >= ($job[0].started_at | time) and
+            ($execute.completed_at | time) <= ($upload.started_at | time) and
+            (.created_at | time) >= ($upload.started_at | time) and
+            (.updated_at | time) >= (.created_at | time) and
+            (.updated_at | time) <= ($upload.completed_at | time) and
+            ($upload.completed_at | time) <= ($job[0].completed_at | time)' "$reuse/artifact.json"
+          artifact_id=$(jq -r .id "$reuse/artifact.json")
+          digest=$(jq -r '.digest | ltrimstr("sha256:")' "$reuse/artifact.json")
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$reuse/evidence.zip"
+          printf '%s  %s\n' "$digest" "$reuse/evidence.zip" | sha256sum --check -
+          unzip -Z1 "$reuse/evidence.zip" | awk '
+            /(^\/|(^|\/)\.\.(\/|$))/ || /[^A-Za-z0-9._\/-]/ {bad=1} END {exit bad}'
+          zipinfo -l "$reuse/evidence.zip" | awk '$1 ~ /^l/ {bad=1} END {exit bad}'
+          zipinfo -t "$reuse/evidence.zip" | awk '
+            $3 ~ /^[0-9]+$/ && $4 == "bytes" && $5 == "uncompressed," && $3 > 0 && $3 <= 536870912 {valid=1}
+            END {exit !valid}'
+          unzip -q "$reuse/evidence.zip" -d "$reuse/raw"
+          binary_sha=$(sha256sum "$RUNNER_TEMP/extracted-cuda/ferrum" | awk '{print $1}')
+          runner_sha=$(sha256sum "$RUNNER_TEMP/staged-cuda/model_regression" | awk '{print $1}')
+          jq -e --arg binary "$binary_sha" --arg runner "$runner_sha" --slurpfile job "$reuse/job.json" '
+            def time: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+            .schema_version == 1 and .status == "passed" and .error == null and .cleanup_errors == [] and
+            .binary_sha256 == $binary and .runner_sha256 == $runner and
+            .started_at >= ($job[0].started_at | time) and .finished_at >= .started_at and
+            .finished_at <= ($job[0].completed_at | time)' "$reuse/raw/execution.json"
+          jq '.expectations |= map(select(.profile.target.backend == "cuda"))' \
+            "$RUNNER_TEMP/tasks/tasks.json" > "$reuse/current-tasks.json"
+          jq -s 'sort_by(.profile.id)' "$reuse/raw"/task-*.json > "$reuse/source-tasks.json"
+          jq -e --slurpfile source "$reuse/source-tasks.json" \
+            '(.expectations | length) > 0 and (.expectations | sort_by(.profile.id)) == $source[0]' "$reuse/current-tasks.json"
+          cargo build --locked -p ferrum-bench-core --example model_gate
+          reports=()
+          while IFS= read -r -d '' report; do reports+=(--report "$report"); done \
+            < <(find "$reuse/raw" -name report.json -type f -print0)
+          target/debug/examples/model_gate verify --tasks "$reuse/current-tasks.json" \
+            "${reports[@]}" --output "$reuse/model-verification.json"
+          # Reject a rerun or artifact replacement while download/reverification was in progress.
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" | \
+            jq -e --slurpfile before "$reuse/run.json" \
+              '[.id,.run_attempt,.status,.head_sha] == [$before[0].id,$before[0].run_attempt,$before[0].status,$before[0].head_sha]'
+          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id" | \
+            jq -e --slurpfile before "$reuse/artifact.json" '
+              def identity: [.id,.name,.digest,.created_at,.updated_at,.expired,.size_in_bytes,.workflow_run];
+              identity == ($before[0] | identity)'
+          jq -n --slurpfile run "$reuse/run.json" --slurpfile job "$reuse/job.json" \
+            --slurpfile artifact "$reuse/artifact.json" --arg candidate "$GITHUB_SHA" \
+            '{schema_version:1,source_run:$run[0],source_cuda_job:$job[0],source_artifact:$artifact[0],verified_for_candidate:$candidate}' > "$reuse/raw/reuse-origin.json"
+          cp "$reuse/model-verification.json" "$reuse/raw/reuse-verification.json"
+          mv "$reuse/raw" "$RUNNER_TEMP/model-cuda"
+          echo 'reused=true' >> "$GITHUB_OUTPUT"
+          echo "Reverified original CUDA evidence from run $SOURCE_RUN, artifact $artifact_id, digest $digest; no GPU lease needed." >> "$GITHUB_STEP_SUMMARY"
+      - name: Explain CUDA evidence reuse fallback
+        if: github.event_name == 'workflow_dispatch' && inputs.reuse_cuda_run_id != '' && steps.reuse-cuda.outcome != 'success'
+        run: echo '::notice::CUDA evidence reuse was not verified. The original cloud execution will run; see the reuse step for the failed source, digest, binary, runner or task check.'
       - name: Rent one bounded GPU, execute the selected tasks, and destroy it
+        if: steps.reuse-cuda.outputs.reused != 'true'
         env:
           VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
         run: |
