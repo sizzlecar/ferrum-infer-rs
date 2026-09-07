@@ -103,7 +103,7 @@ checks, fresh downloads and unimplemented behavior checks remain separate.
 | `quick-start-cuda` | Dense hybrid, safetensors BF16 + F32, CUDA | `qwen3.5:4b` |
 | `hybrid-moe-metal` | Hybrid MoE, GGUF Q4_K_S, Metal | `qwen3.5:35b-a3b-q4_k_s` |
 | `attention-moe-metal` | Attention-only MoE, GGUF Q4_K_M, Metal | `qwen3:30b-a3b-q4_k_m` |
-| `attention-moe-cuda` | Attention-only MoE, GPTQ INT4, CUDA | `qwen3-coder:30b-gptq` |
+| `attention-moe-cuda` | Attention-only MoE, GPTQ INT4, CUDA | `Qwen/Qwen3-30B-A3B-GPTQ-Int4@9b534e4318b7ebc3c961a839f13eb18b1833f441` |
 | `llama-dense-metal` | Llama dense, GGUF Q4_K_M, legacy Metal path | `llama3.1:8b-q4_k_m` |
 | `llama-dense-cuda` | Llama dense, safetensors BF16, legacy CUDA path | `unsloth/Meta-Llama-3.1-8B-Instruct` |
 | `hybrid-dense-ct-int4-cuda` | Dense hybrid, compressed-tensors INT4, CUDA | `cyankiwi/Qwen3.8-27B-AWQ-INT4` |
@@ -116,8 +116,9 @@ The [alias table](../crates/ferrum-cli/src/source_resolver.rs) supplies the GGUF
 filenames and semantic sidecar repositories. The
 [family registrations](../crates/ferrum-models/src/vnext/mod.rs) distinguish
 production plan-runtime families from explicitly registered legacy families.
-The Qwen3 Coder profile is an existing same-architecture alternative for CUDA;
-it does not reproduce the original Qwen3 30B performance row.
+The Qwen3 CUDA profile uses the original M3 GPTQ checkpoint and immutable
+revision from the v0.8.0 source lock. Its functional checks do not reproduce
+the original performance workload.
 
 The two dense block-FP8 snapshot rows, Qwen3.8 27B and Qwen3.6 27B, contribute the
 same registered dense-hybrid execution group. Only one representative is listed.
@@ -132,17 +133,20 @@ family name proves interchangeability.
   reports BF16 weights and a small F32 component. The catalog preserves both.
 - The Llama CUDA representative reports BF16 weights at
   [a2856192](https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/tree/a2856192dd7c25b842431f39c179a6c2c2f627d1).
-  The Qwen3 Coder GPTQ alias resolves to
-  [fd445bf6](https://huggingface.co/jart25/Qwen3-Coder-30B-A3B-Instruct-Int4-gptq/tree/fd445bf690e2f0b34337ec6ce3be95486550296a),
-  whose declared architecture is `Qwen3MoeForCausalLM`.
+  The Qwen3 CUDA representative pins
+  [9b534e43](https://huggingface.co/Qwen/Qwen3-30B-A3B-GPTQ-Int4/tree/9b534e4318b7ebc3c961a839f13eb18b1833f441),
+  the historical M3 checkpoint with `Qwen3MoeForCausalLM`, F16 dense weights,
+  and symmetric GPTQ INT4 groups of 128. Its config, tokenizer config, and
+  quantization config hashes match the historical source lock.
 - Qwen3.8's AWQ-labelled model declares `compressed-tensors`, not a generic
   AWQ loader contract; see its checked-in
   [config fixture](../crates/ferrum-models/tests/fixtures/qwen38_awq_int4_config.contract.json).
   The [FP8 fixture](../crates/ferrum-models/tests/fixtures/qwen38_fp8_config.contract.json)
   binds the separate dense block-FP8 recipe.
 - The README links immutable sources for the FP8, GPT-OSS, and Gemma snapshots.
-  Its first three performance rows do not identify their precise weight
-  source/revision and quantization. The representatives above cover declared
+  Its first three performance rows do not themselves identify precise weight
+  source/revision and quantization. The historical M3 source lock identifies
+  the Qwen3 CUDA checkpoint above. Other representatives cover declared
   execution groups; they do not reconstruct those benchmark inputs.
 - Reproducing a snapshot therefore needs its original source, workload,
   configuration, hardware, and baseline evidence. Until supplied, performance

@@ -124,34 +124,38 @@ pub(super) async fn run(
     stdin: Option<&str>,
     timeout: Duration,
 ) -> Result<String> {
-    let capacity_evidence = if argv.first().is_some_and(|entrypoint| entrypoint == "run") {
-        args.runtime_capacity().map(|capacity| {
-            let path = args
-                .report_dir
-                .join(format!("{name}.effective-config.json"));
-            argv.extend([
-                "--effective-config-json".into(),
-                path.to_string_lossy().into_owned(),
-            ]);
-            (capacity, path)
-        })
+    let configuration_evidence = if argv.first().is_some_and(|entrypoint| entrypoint == "run")
+        && (args.runtime_capacity().is_some() || identity::requires_source_evidence(args)?)
+    {
+        let path = args
+            .report_dir
+            .join(format!("{name}.effective-config.json"));
+        argv.extend([
+            "--effective-config-json".into(),
+            path.to_string_lossy().into_owned(),
+        ]);
+        Some(path)
     } else {
         None
     };
     let stdout = Process::spawn(args, name, argv, stdin)?
         .wait(timeout)
         .await?;
-    if let Some((capacity, path)) = capacity_evidence {
+    if let Some(path) = configuration_evidence {
         // This is the configuration written by the same product process that
         // generated stdout, not a separate inspection or a copy of task inputs.
         let config: Value = serde_json::from_slice(
             &fs::read(&path).with_context(|| format!("read {}", path.display()))?,
         )
-        .context("parse run effective capacity configuration")?;
-        capacity
-            .verify_health(&json!({"auto_config": config}))
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("{name} actual run capacity"))?;
+        .context("parse run effective configuration")?;
+        if let Some(capacity) = args.runtime_capacity() {
+            capacity
+                .verify_health(&json!({"auto_config": &config}))
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("{name} actual run capacity"))?;
+        }
+        identity::validate_source_config(args, &config)
+            .with_context(|| format!("{name} actual source selection"))?;
     }
     Ok(stdout)
 }
@@ -159,6 +163,7 @@ pub(super) async fn run(
 pub(super) struct Server<'a> {
     pub args: &'a Args,
     pub health: Value,
+    pub source_identity: Value,
     url: String,
     client: Client,
     _process: Process,
@@ -178,6 +183,15 @@ impl<'a> Server<'a> {
             "--served-model-name".into(),
             "regression-model".into(),
         ]);
+        if identity::requires_source_evidence(args)? {
+            argv.extend([
+                "--effective-config-json".into(),
+                args.report_dir
+                    .join("serve.effective-config.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ]);
+        }
         let mut process = Process::spawn(args, "serve", argv, None)?;
         let client = Client::builder()
             .no_proxy()
@@ -211,9 +225,11 @@ impl<'a> Server<'a> {
                     if status.is_success() {
                         let health = serde_json::from_str(&text).context("parse /health")?;
                         identity::validate_serve(args, &health)?;
+                        let source_identity = identity::source_evidence(args, "serve")?;
                         return Ok(Self {
                             args,
                             health,
+                            source_identity,
                             url,
                             client,
                             _process: process,

@@ -165,7 +165,7 @@ jobs:
             --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Build release CPU binary and regression runner once
-        run: cargo build --release --locked -p ferrum-cli --bin ferrum --example model_regression
+        run: cargo build --release --locked -p ferrum-cli -p ferrum-devtools --bin ferrum --bin model_regression
 
       - name: Strip and audit binary
         shell: bash
@@ -205,9 +205,9 @@ jobs:
 
       - name: Package Linux regression runner
         run: |
-          tar -C target/release/examples -czf model-regression-linux-x86_64.tar.gz model_regression
+          tar -C target/release -czf model-regression-linux-x86_64.tar.gz model_regression
           sha256sum model-regression-linux-x86_64.tar.gz > model-regression-linux-x86_64.tar.gz.sha256
-          sha256sum target/release/examples/model_regression > model-regression-linux-x86_64.binary.sha256
+          sha256sum target/release/model_regression > model-regression-linux-x86_64.binary.sha256
 
       - name: Upload Linux regression runner
         id: runner_id
@@ -297,8 +297,8 @@ jobs:
           restore-keys: |
             stage-rust1.91.0-macos-aarch64-
 
-      - name: Build CPU-feature release metadata tool and controller once
-        run: cargo build --release --locked -p ferrum-bench-core -p ferrum-devtools --example release_candidate --bin release_delivery
+      - name: Build CPU-feature release metadata tool, controller and regression runner once
+        run: cargo build --release --locked -p ferrum-bench-core -p ferrum-devtools --example release_candidate --bin release_delivery --bin model_regression
 
       - name: Verify all workspace release versions
         run: |
@@ -309,8 +309,8 @@ jobs:
             --workflow-run-id "$GITHUB_RUN_ID" \
             --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
 
-      - name: Build release Metal binary and regression runner once
-        run: cargo build --release --locked -p ferrum-cli --bin ferrum --example model_regression --features metal
+      - name: Build release Metal binary once
+        run: cargo build --release --locked -p ferrum-cli --bin ferrum --features metal
 
       - name: Strip and audit binary
         shell: bash
@@ -351,9 +351,9 @@ jobs:
 
       - name: Package Metal regression runner
         run: |
-          tar -C target/release/examples -czf model-regression-macos-aarch64.tar.gz model_regression
+          tar -C target/release -czf model-regression-macos-aarch64.tar.gz model_regression
           shasum -a 256 model-regression-macos-aarch64.tar.gz > model-regression-macos-aarch64.tar.gz.sha256
-          shasum -a 256 target/release/examples/model_regression > model-regression-macos-aarch64.binary.sha256
+          shasum -a 256 target/release/model_regression > model-regression-macos-aarch64.binary.sha256
 
       - name: Package macOS release controller
         run: |

@@ -5,6 +5,7 @@ pub mod distribution;
 mod impact;
 pub mod model_basic;
 pub mod model_schedule;
+pub mod model_sources;
 pub mod model_stop;
 mod model_stop_evidence;
 pub mod model_tasks;

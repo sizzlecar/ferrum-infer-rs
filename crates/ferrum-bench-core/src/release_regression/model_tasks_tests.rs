@@ -239,6 +239,81 @@ fn rejected(expected: &ExpectedModelRun, fixture: &ReportFixture, reason: &str) 
 }
 
 #[test]
+fn pinned_model_reports_require_actual_sources_from_both_product_entrypoints() {
+    let revision = "a".repeat(40);
+    let mut expected = task("pinned", Backend::Cuda, vec![ModelCheck::Basic]);
+    expected.profile.model = format!("fixture/model@{revision}");
+    let mut identity = json!({"schema_version": 1, "resolved_model": "fixture/model", "requested_model": expected.profile.model,
+        "original_sources": {}, "resolved_sources": {}});
+    for role in ["weights", "semantic", "tokenizer"] {
+        identity["original_sources"][role] = json!({
+            "kind": "repository", "location": "fixture/model", "requested_revision": revision});
+        identity["resolved_sources"][role] = json!({
+            "canonical_location": "fixture/model", "resolved_revision": revision,
+            "files": [{"relative_path": format!("{role}.bin"), "size_bytes": 16, "sha256": "c".repeat(64)}]});
+    }
+    let mut valid = ReportFixture::passed(&expected);
+    for name in ["run-basic", "serve-startup"] {
+        valid.case_mut(name)["evidence"]["source_identity"] = identity.clone();
+    }
+    verify_model_report(&expected, &valid.value).unwrap();
+    for name in ["run-basic", "serve-startup"] {
+        let mut changed = ReportFixture {
+            value: valid.value.clone(),
+        };
+        changed.case_mut(name)["evidence"]["source_identity"] = Value::Null;
+        rejected(&expected, &changed, "source evidence is missing");
+        for (field, value) in [
+            ("schema_version", Value::Null),
+            ("schema_version", json!(999)),
+            ("resolved_model", json!("fixture/other")),
+        ] {
+            let mut changed = ReportFixture {
+                value: valid.value.clone(),
+            };
+            changed.case_mut(name)["evidence"]["source_identity"][field] = value;
+            rejected(
+                &expected,
+                &changed,
+                "source identity schema or resolved public model",
+            );
+        }
+        for role in ["weights", "semantic", "tokenizer"] {
+            for (parent, field, replacement) in [
+                ("original_sources", "location", json!("fixture/other")),
+                ("original_sources", "requested_revision", Value::Null),
+                (
+                    "resolved_sources",
+                    "canonical_location",
+                    json!("fixture/other"),
+                ),
+                (
+                    "resolved_sources",
+                    "resolved_revision",
+                    json!("b".repeat(40)),
+                ),
+                ("resolved_sources", "files", json!([])),
+                (
+                    "resolved_sources",
+                    "files",
+                    json!([{"relative_path":"weights.bin","size_bytes":16}]),
+                ),
+            ] {
+                let mut changed = ReportFixture {
+                    value: valid.value.clone(),
+                };
+                changed.case_mut(name)["evidence"]["source_identity"][parent][role][field] =
+                    replacement;
+                assert!(
+                    verify_model_report(&expected, &changed.value).is_err(),
+                    "{name}/{role}/{field}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn checks_have_strict_round_trip_names() {
     for check in [
         ModelCheck::Basic,

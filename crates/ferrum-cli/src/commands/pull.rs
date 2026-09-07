@@ -7,7 +7,7 @@ use ferrum_types::Result;
 
 #[derive(Args)]
 pub struct PullCommand {
-    /// Model to download (for example `qwen3.5:4b-q4_k_m` on Metal or `qwen3.5:4b` on CUDA)
+    /// Model to download: alias or HF repository, optionally pinned as OWNER/REPO@40-hex-commit
     pub model: String,
 }
 

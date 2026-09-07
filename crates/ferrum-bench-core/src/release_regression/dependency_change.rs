@@ -373,7 +373,7 @@ fn private_tool_dependencies(
     let binaries = document
         .get("bin")
         .and_then(Item::as_array_of_tables)
-        .ok_or("private devtools must declare its two executable targets")?;
+        .ok_or("private devtools must declare its reviewed executable targets")?;
     let mut seen = BTreeSet::new();
     for binary in binaries {
         let name = binary
@@ -384,8 +384,10 @@ fn private_tool_dependencies(
             .get("path")
             .and_then(Item::as_str)
             .ok_or("private tool bin needs explicit path")?;
-        if !matches!(name, "release_delivery" | "contract_checks")
-            || path != format!("src/bin/{name}.rs")
+        if !matches!(
+            name,
+            "release_delivery" | "contract_checks" | "model_regression"
+        ) || path != format!("src/bin/{name}.rs")
             || !seen.insert(name)
             || binary
                 .iter()
@@ -394,8 +396,8 @@ fn private_tool_dependencies(
             return Err("unreviewed private devtools executable target".into());
         }
     }
-    if seen.len() != 2 {
-        return Err("private devtools must declare both reviewed executable targets".into());
+    if !seen.contains("release_delivery") || !seen.contains("contract_checks") {
+        return Err("private devtools must retain release_delivery and contract_checks".into());
     }
     let mut dependencies = BTreeSet::new();
     for kind in ["dependencies", "dev-dependencies"] {
@@ -437,6 +439,68 @@ fn private_tool_dependencies(
         }
     }
     Ok(dependencies)
+}
+
+/// The runner migration changes private executable selection and two dependency
+/// declarations. Normalize only that addition; the caller still compares every
+/// other manifest value and all existing locked identities and registry edges.
+fn normalize_model_runner_migration(
+    prior: &DocumentMut,
+    next: &mut DocumentMut,
+) -> Result<BTreeSet<String>, String> {
+    let runner_index = |document: &DocumentMut| {
+        document
+            .get("bin")
+            .and_then(Item::as_array_of_tables)
+            .and_then(|bins| {
+                bins.iter().position(|bin| {
+                    bin.get("name").and_then(Item::as_str) == Some("model_regression")
+                })
+            })
+    };
+    let Some(index) = runner_index(next).filter(|_| runner_index(prior).is_none()) else {
+        return Ok(BTreeSet::new());
+    };
+    // private_tool_dependencies already checked the full target declaration,
+    // required existing tools, publish=false and absence of reverse consumers.
+    next["bin"]
+        .as_array_of_tables_mut()
+        .expect("checked bin table")
+        .remove(index);
+    let mut edges = BTreeSet::new();
+    for name in ["anyhow", "ferrum-types"] {
+        if prior
+            .get("dependencies")
+            .and_then(|v| v.get(name))
+            .is_some()
+        {
+            continue;
+        }
+        let Some(spec) = next.get("dependencies").and_then(|v| v.get(name)) else {
+            continue;
+        };
+        let reviewed = if name == "anyhow" {
+            spec.as_table_like().is_some_and(|table| {
+                table.len() == 1 && table.get("workspace").and_then(Item::as_bool) == Some(true)
+            })
+        } else {
+            prior
+                .get("dev-dependencies")
+                .and_then(|v| v.get(name))
+                .is_some_and(|old| semantic(old) == semantic(spec))
+        };
+        if !reviewed {
+            return Err(format!(
+                "unreviewed model runner dependency migration {name}"
+            ));
+        }
+        next.get_mut("dependencies")
+            .and_then(Item::as_table_like_mut)
+            .expect("checked dependencies")
+            .remove(name);
+        edges.insert(name.to_owned());
+    }
+    Ok(edges)
 }
 
 fn remove_private_member(root: &mut DocumentMut) -> Result<(), String> {
@@ -648,12 +712,22 @@ pub fn validation_dependency_paths(
         if added_tool && path == "Cargo.toml" {
             remove_private_member(&mut next)?;
         }
-        let mut allowed = strip_dev(&mut prior, &baseline_root)?;
-        allowed.extend(strip_dev(&mut next, &next_root)?);
         let member = members
             .iter()
             .find(|(_, member_path)| *member_path == path)
             .map(|(name, _)| name);
+        let mut allowed = if member.is_some_and(|name| name == DEVTOOLS) {
+            let edges = normalize_model_runner_migration(&prior, &mut next)?;
+            if edges.contains("anyhow") {
+                private_additions.insert("anyhow".to_owned());
+            }
+            tools.extend(edges.iter().map(|name| format!("{path}:{name}")));
+            edges
+        } else {
+            BTreeSet::new()
+        };
+        allowed.extend(strip_dev(&mut prior, &baseline_root)?);
+        allowed.extend(strip_dev(&mut next, &next_root)?);
         if member.is_some_and(|name| name == "ferrum-bench-core") {
             for dependency in ["semver", "toml_edit", "syn", "quote"] {
                 let before_dependency = prior

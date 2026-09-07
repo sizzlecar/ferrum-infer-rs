@@ -130,12 +130,12 @@ timeouts, output errors and resource limits instead of silently changing flags.
 
 ## Rust model runner
 
-Use the [model_regression example](../crates/ferrum-cli/examples/model_regression.rs)
+Use the [model_regression development tool](../crates/ferrum-devtools/src/bin/model_regression.rs)
 for repeatable checks against an explicit binary. For example, on Metal:
 
 ```bash
-cargo build --release --locked -p ferrum-cli --example model_regression
-./target/release/examples/model_regression \
+cargo build --release --locked -p ferrum-devtools --bin model_regression
+./target/release/model_regression \
   --ferrum-bin /path/to/staged/ferrum \
   --model qwen3.5:4b-q4_k_m --backend metal \
   --report-dir /path/outside/repository/metal-quickstart \

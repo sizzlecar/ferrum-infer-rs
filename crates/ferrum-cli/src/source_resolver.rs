@@ -914,6 +914,81 @@ fn token_value(value: &serde_json::Value, key: &str) -> Option<String> {
     }
 }
 
+/// An explicit immutable repository selection. Local paths are handled before
+/// this syntax so a real directory or GGUF file containing `@` stays local.
+#[derive(Debug, PartialEq, Eq)]
+struct PinnedHfRepository<'a> {
+    repo_id: &'a str,
+    revision: String,
+}
+
+fn parse_pinned_hf_repository(model: &str) -> Result<Option<PinnedHfRepository<'_>>> {
+    let Some((repo_id, revision)) = model.split_once('@') else {
+        return Ok(None);
+    };
+    if resolve_gguf_alias(repo_id).is_some() {
+        return Err(FerrumError::unsupported(
+            "GGUF alias@commit is not supported: its weight and metadata repositories require independent revisions; use explicit local sources",
+        ));
+    }
+    let valid_component = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with(['.', '-'])
+            && !part.ends_with(['.', '-'])
+            && !part.contains("..")
+            && !part.contains("--")
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    };
+    let valid_repo = repo_id
+        .split_once('/')
+        .is_some_and(|(owner, name)| valid_component(owner) && valid_component(name));
+    if !valid_repo || revision.len() != 40 || !revision.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(FerrumError::config(
+            "pinned model must be HF_REPO@<40-hex-commit> with an explicit owner/repository; aliases, tags and branch names are not supported",
+        ));
+    }
+    Ok(Some(PinnedHfRepository {
+        repo_id,
+        revision: revision.to_ascii_lowercase(),
+    }))
+}
+
+impl PinnedHfRepository<'_> {
+    fn cached(&self, cache_dir: &Path, requested_model: &str) -> Option<ResolvedModelSource> {
+        // A pin never follows refs/main or another available snapshot.
+        let local_path = cache_dir
+            .join("hub")
+            .join(format!("models--{}", self.repo_id.replace('/', "--")))
+            .join("snapshots")
+            .join(&self.revision);
+        let format = detect_format(&local_path);
+        (format != ModelFormat::Unknown).then(|| ResolvedModelSource {
+            original: requested_model.to_owned(),
+            local_path,
+            format,
+            from_cache: true,
+        })
+    }
+
+    fn verify_snapshot(&self, path: &Path) -> Result<()> {
+        let identity = huggingface_snapshot_identity(path);
+        if !identity.is_some_and(|identity| {
+            identity.repository_id == self.repo_id
+                && identity.revision.eq_ignore_ascii_case(&self.revision)
+        }) {
+            return Err(FerrumError::model(format!(
+                "resolved snapshot does not match requested repository {} at commit {}: {}",
+                self.repo_id,
+                self.revision,
+                path.display(),
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Look up `model_id` in the HF cache (`hub/models--owner--repo/snapshots/<rev>`).
 /// Returns the resolved snapshot path + detected format, or `None` if not cached.
 pub fn find_cached_model(cache_dir: &Path, model_id: &str) -> Option<ResolvedModelSource> {
@@ -1240,7 +1315,7 @@ impl Resolved {
 }
 
 /// One-stop model resolution. Caller passes the user's model arg
-/// (alias / HF id / local dir / `.gguf` path), the HF cache dir, and a
+/// (alias / HF id / `HF_REPO@40-hex-commit` / local dir / `.gguf` path), the HF cache dir, and a
 /// download policy + autosize profile. Returns a resolved source.
 ///
 /// Resolution order:
@@ -1425,12 +1500,24 @@ async fn resolve_model_source_internal(
         }
     }
 
-    // 4. HF cache hit.
-    let model_id = resolve_model_alias(model);
-    if let Some(source) = find_cached_model(cache_dir, &model_id) {
+    // 4. HF cache hit. Parse pins only after existing local sources.
+    let pinned = parse_pinned_hf_repository(model)?;
+    let model_id = pinned
+        .as_ref()
+        .map(|pin| pin.repo_id.to_owned())
+        .unwrap_or_else(|| resolve_model_alias(model));
+    let revision = pinned.as_ref().map(|pin| pin.revision.as_str());
+    let cached = match &pinned {
+        Some(pin) => pin.cached(cache_dir, model),
+        None => find_cached_model(cache_dir, &model_id),
+    };
+    if let Some(source) = cached {
+        if let Some(pin) = &pinned {
+            pin.verify_snapshot(&source.local_path)?;
+        }
         let original_source = ModelSource::HuggingFace {
             repo_id: model_id,
-            revision: None,
+            revision: revision.map(str::to_owned),
             cache_dir: Some(cache_dir.display().to_string()),
         };
         let model_sources = if defer_colocated_product_sources {
@@ -1450,7 +1537,7 @@ async fn resolve_model_source_internal(
     if download != DownloadPolicy::AutoDownload {
         return Err(FerrumError::model(format!(
             "model '{}' not found locally and DownloadPolicy::NoDownload set",
-            model_id
+            if pinned.is_some() { model } else { &model_id }
         )));
     }
 
@@ -1459,11 +1546,14 @@ async fn resolve_model_source_internal(
         .ok();
     let downloader = ferrum_models::HfDownloader::new(cache_dir.to_path_buf(), token)?;
     let snapshot_path = match download_artifacts {
-        DownloadArtifacts::Repository => downloader.download(&model_id, None).await?,
+        DownloadArtifacts::Repository => downloader.download(&model_id, revision).await?,
         DownloadArtifacts::RootSafetensors => {
-            downloader.download_safetensors(&model_id, None).await?
+            downloader.download_safetensors(&model_id, revision).await?
         }
     };
+    if let Some(pin) = &pinned {
+        pin.verify_snapshot(&snapshot_path)?;
+    }
     let format = detect_format(&snapshot_path);
     if format == ModelFormat::Unknown {
         return Err(FerrumError::model(
@@ -1471,14 +1561,18 @@ async fn resolve_model_source_internal(
         ));
     }
     let source = ResolvedModelSource {
-        original: model_id.clone(),
+        original: if pinned.is_some() {
+            model.to_owned()
+        } else {
+            model_id.clone()
+        },
         local_path: snapshot_path,
         format,
         from_cache: false,
     };
     let original_source = ModelSource::HuggingFace {
         repo_id: model_id,
-        revision: None,
+        revision: revision.map(str::to_owned),
         cache_dir: Some(cache_dir.display().to_string()),
     };
     let model_sources = if defer_colocated_product_sources {
@@ -1857,6 +1951,204 @@ mod tests {
             .is_some());
         let _ = std::fs::remove_dir_all(weights);
         let _ = std::fs::remove_dir_all(semantic);
+    }
+
+    fn cached_hf_fixture(cache: &Path, repo: &str, revision: &str) -> PathBuf {
+        let snapshot = cache
+            .join("hub")
+            .join(format!("models--{}", repo.replace('/', "--")))
+            .join("snapshots")
+            .join(revision);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        for (name, bytes) in [
+            ("model.safetensors", b"fixture-weights".as_slice()),
+            ("config.json", br#"{"architectures":["Qwen3ForCausalLM"]}"#),
+            ("tokenizer.json", br#"{"version":"1.0"}"#),
+            (
+                "tokenizer_config.json",
+                br#"{"chat_template":"fixture-template"}"#,
+            ),
+        ] {
+            std::fs::write(snapshot.join(name), bytes).unwrap();
+        }
+        snapshot
+    }
+
+    #[test]
+    fn pinned_hf_specifier_requires_explicit_repository_and_full_commit() {
+        let sha = "ABCDEF01".repeat(5);
+        let spec = format!("Owner/Model.GPTQ_Int4@{sha}");
+        let pin = parse_pinned_hf_repository(&spec).unwrap().unwrap();
+        assert_eq!(pin.repo_id, "Owner/Model.GPTQ_Int4");
+        assert_eq!(pin.revision, sha.to_ascii_lowercase());
+        for invalid in [
+            "Owner/Model@main".to_owned(),
+            "Owner/Model@".to_owned(),
+            format!("Owner/Model@{}", "a".repeat(39)),
+            format!("Owner/Model@{}", "g".repeat(40)),
+            format!("Owner/Model@{sha}@{sha}"),
+            format!("Owner@{sha}"),
+            format!("/Model@{sha}"),
+            format!("Owner/Model/extra@{sha}"),
+            format!("../Model@{sha}"),
+            format!("Owner/../Model@{sha}"),
+            format!("https://huggingface.co/Owner/Model@{sha}"),
+            format!("Owner/Model @{sha}"),
+            format!("qwen3:1.7b@{sha}"),
+        ] {
+            assert!(parse_pinned_hf_repository(&invalid).is_err(), "{invalid}");
+        }
+        let gguf = format!("qwen3:4b-q4_k_m@{sha}");
+        let error = parse_pinned_hf_repository(&gguf).unwrap_err().to_string();
+        assert!(error.contains("independent revisions"), "{error}");
+        for unpinned in ["Qwen/Qwen3-1.7B", "qwen3:1.7b", "qwen3:4b-q4_k_m"] {
+            assert!(parse_pinned_hf_repository(unpinned).unwrap().is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_hf_cache_ignores_main_and_preserves_product_source_identity() {
+        let cache = tempfile::tempdir().unwrap();
+        let repo = "Owner/Model";
+        let revision = "a".repeat(40);
+        let other_revision = "b".repeat(40);
+        let requested = format!("{repo}@{revision}");
+        let selected = cached_hf_fixture(cache.path(), repo, &revision);
+        let other = cached_hf_fixture(cache.path(), repo, &other_revision);
+        let refs = cache.path().join("hub/models--Owner--Model/refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), &other_revision).unwrap();
+
+        // `run` and `serve` share the product resolver; `pull` uses the generic
+        // resolver. Both must select the same pinned physical and metadata source.
+        for product_entrypoint in [false, true] {
+            let resolved = if product_entrypoint {
+                resolve_model_source_with_product_sources(
+                    &requested,
+                    cache.path(),
+                    DownloadPolicy::NoDownload,
+                    None,
+                    &ProductSourceArgs::default(),
+                )
+                .await
+            } else {
+                resolve_model_source(&requested, cache.path(), DownloadPolicy::NoDownload, None)
+                    .await
+            }
+            .unwrap();
+            let product = resolved.into_product_engine_input();
+            assert_eq!(product.source.local_path, selected);
+            assert!(product.source.from_cache);
+            assert_eq!(product.requested_model, requested);
+            assert_eq!(product.public_model_id, repo);
+            assert!(
+                matches!(product.engine_config.model.source.as_ref().unwrap(),
+                ModelSource::HuggingFace { repo_id, revision: Some(actual), .. }
+                    if repo_id == repo && actual == &revision)
+            );
+            let sources = product.model_sources.as_ref().unwrap();
+            for original in [
+                &sources.original_sources().semantic,
+                &sources.original_sources().tokenizer,
+                &sources.original_sources().weights,
+            ] {
+                assert_eq!(original.location, repo);
+                assert_eq!(
+                    original.requested_revision.as_deref(),
+                    Some(revision.as_str())
+                );
+            }
+            assert_eq!(sources.semantic_root(), selected.canonicalize().unwrap());
+            assert_eq!(sources.tokenizer_root(), selected.canonicalize().unwrap());
+            assert_eq!(sources.weights().path(), selected.canonicalize().unwrap());
+            let identity = sources
+                .product_source_identity(
+                    &requested,
+                    repo,
+                    "tokenizer_config.json",
+                    "fixture-template",
+                )
+                .unwrap();
+            ferrum_bench_core::release_regression::model_sources::verify_pinned_source(
+                &requested,
+                &serde_json::to_value(identity).unwrap(),
+            )
+            .expect("the actual product source identity must satisfy the release source verifier");
+        }
+        let unpinned = resolve_model_source(repo, cache.path(), DownloadPolicy::NoDownload, None)
+            .await
+            .unwrap();
+        assert_eq!(unpinned.source.local_path, other);
+        assert!(matches!(
+            unpinned.original_source,
+            ModelSource::HuggingFace { revision: None, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_pinned_hf_snapshot_never_falls_back_to_another_revision() {
+        let cache = tempfile::tempdir().unwrap();
+        let revision = "a".repeat(40);
+        let other = "b".repeat(40);
+        cached_hf_fixture(cache.path(), "Owner/Model", &other);
+        let refs = cache.path().join("hub/models--Owner--Model/refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), other).unwrap();
+        let requested = format!("Owner/Model@{revision}");
+        for with_main_ref in [true, false] {
+            if !with_main_ref {
+                std::fs::remove_file(refs.join("main")).unwrap();
+            }
+            let error =
+                resolve_model_source(&requested, cache.path(), DownloadPolicy::NoDownload, None)
+                    .await
+                    .err()
+                    .expect("missing pinned snapshot must fail")
+                    .to_string();
+            assert!(error.contains(&requested), "{error}");
+            assert!(error.contains("NoDownload"), "{error}");
+        }
+    }
+
+    #[test]
+    fn pinned_hf_download_result_must_match_repository_and_commit() {
+        let revision = "a".repeat(40);
+        let requested = format!("Owner/Model@{revision}");
+        let pin = parse_pinned_hf_repository(&requested).unwrap().unwrap();
+        let root = Path::new("/cache/hub/models--Owner--Model/snapshots");
+        pin.verify_snapshot(&root.join(&revision)).unwrap();
+        for wrong in [
+            root.join("b".repeat(40)),
+            PathBuf::from(format!(
+                "/cache/hub/models--Other--Model/snapshots/{revision}"
+            )),
+            PathBuf::from(format!("/cache/{revision}")),
+        ] {
+            assert!(pin.verify_snapshot(&wrong).is_err(), "{}", wrong.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_local_sources_with_at_sign_keep_path_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let local = root.path().join("model@main");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("model.safetensors"), b"fixture").unwrap();
+        let gguf = root.path().join("weights@main.gguf");
+        std::fs::write(&gguf, []).unwrap();
+        for path in [&local, &gguf] {
+            let resolved = resolve_model_source(
+                path.to_str().unwrap(),
+                &root.path().join("unused"),
+                DownloadPolicy::NoDownload,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(&resolved.source.local_path, path);
+            assert_eq!(resolved.requested_model, path.to_str().unwrap());
+            assert!(matches!(resolved.original_source, ModelSource::Local(_)));
+        }
     }
 
     #[test]

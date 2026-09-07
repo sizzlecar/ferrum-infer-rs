@@ -313,11 +313,9 @@ async fn main() -> Result<()> {
     let started = Instant::now();
     match process::Server::start(&args).await {
         Ok(server) => {
-            report.record(
-                "serve-startup",
-                started.elapsed(),
-                Ok(server.health.clone()),
-            )?;
+            let mut startup_evidence = server.health.clone();
+            startup_evidence["source_identity"] = server.source_identity.clone();
+            report.record("serve-startup", started.elapsed(), Ok(startup_evidence))?;
             for check in &args.checks {
                 match check {
                     Check::Basic => {

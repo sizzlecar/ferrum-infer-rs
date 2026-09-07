@@ -444,6 +444,16 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             format!("missing required model case {name}"),
         );
     }
+    for name in ["run-basic", "serve-startup"] {
+        if let Some(case) = recorded.get(name) {
+            if let Err(error) = super::model_sources::verify_pinned_source(
+                &expected.profile.model,
+                &case["evidence"]["source_identity"],
+            ) {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+    }
     if let Some(case) = recorded.get("binary-version") {
         let words: Vec<_> = case["evidence"]["version"]
             .as_str()
