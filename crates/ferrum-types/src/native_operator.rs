@@ -29,6 +29,76 @@ pub enum NativeOperatorLinkage {
     Dynamic,
 }
 
+/// Host linker and C/C++ runtime contract, separate from CUDA compute capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeOperatorHostAbi {
+    pub target: String,
+    pub compiler_flavor: NativeOperatorCompilerFlavor,
+    pub crt: NativeOperatorCrt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorCompilerFlavor {
+    Gnu,
+    Msvc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeOperatorCrt {
+    PlatformDefault,
+    MsvcDynamic,
+}
+
+impl NativeOperatorHostAbi {
+    pub fn for_target(target: &str) -> Result<Self, String> {
+        let windows = target.contains("windows");
+        let value = Self {
+            target: target.to_owned(),
+            compiler_flavor: if windows {
+                NativeOperatorCompilerFlavor::Msvc
+            } else {
+                NativeOperatorCompilerFlavor::Gnu
+            },
+            crt: if windows {
+                NativeOperatorCrt::MsvcDynamic
+            } else {
+                NativeOperatorCrt::PlatformDefault
+            },
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.target.is_empty()
+            || self.target.len() > 256
+            || self.target.chars().any(char::is_whitespace)
+            || !self.target.contains('-')
+        {
+            return Err("native host ABI requires a valid compiler target".into());
+        }
+        if self.target.contains("windows") {
+            if self.target != "x86_64-pc-windows-msvc"
+                || self.compiler_flavor != NativeOperatorCompilerFlavor::Msvc
+                || self.crt != NativeOperatorCrt::MsvcDynamic
+            {
+                return Err("native Windows operators require x86_64-pc-windows-msvc and the release dynamic MSVC CRT (/MD)".into());
+            }
+        } else if self.compiler_flavor != NativeOperatorCompilerFlavor::Gnu
+            || self.crt != NativeOperatorCrt::PlatformDefault
+        {
+            return Err(
+                "non-Windows native host ABI requires the platform compiler/runtime contract"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeOperatorSourcePackage {
     pub kind: String,
@@ -280,6 +350,8 @@ pub struct NativeOperatorManifest {
     pub inputs_sha256: String,
     pub binary_sha256: String,
     pub linkage: NativeOperatorLinkage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_abi: Option<NativeOperatorHostAbi>,
     #[serde(default)]
     pub g03_catalog_sha256: Option<String>,
     #[serde(default)]
@@ -362,6 +434,9 @@ pub struct NativeOperatorResolution {
 
 impl NativeOperatorManifest {
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if let Some(host_abi) = &self.host_abi {
+            host_abi.validate()?;
+        }
         if ![
             LEGACY_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
             PROVIDER_BOUND_NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
@@ -809,6 +884,7 @@ mod tests {
             inputs_sha256: digest('b'),
             binary_sha256: digest('c'),
             linkage: NativeOperatorLinkage::Static,
+            host_abi: None,
             g03_catalog_sha256: Some(digest('d')),
             abi_contract_sha256: Some(digest('e')),
             descriptor_export: Some("ferrum_native_fa2_descriptor_v2".to_string()),
@@ -845,6 +921,28 @@ mod tests {
         let mut bad_capability = manifest();
         bad_capability.compute_capabilities = vec!["rtx4090".to_string()];
         assert!(bad_capability.validate().is_err());
+    }
+
+    #[test]
+    fn host_abi_is_optional_for_legacy_bytes_but_msvc_contract_is_exact() {
+        let legacy = manifest();
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("host_abi").is_none());
+        assert_eq!(
+            serde_json::from_value::<NativeOperatorManifest>(encoded).unwrap(),
+            legacy
+        );
+        let mut current = legacy;
+        let host = NativeOperatorHostAbi::for_target("x86_64-pc-windows-msvc").unwrap();
+        current.host_abi = Some(host.clone());
+        current.validate().unwrap();
+        current.host_abi.as_mut().unwrap().crt = NativeOperatorCrt::PlatformDefault;
+        assert!(current.validate().is_err());
+        current.host_abi = Some(host);
+        current.host_abi.as_mut().unwrap().compiler_flavor = NativeOperatorCompilerFlavor::Gnu;
+        assert!(current.validate().is_err());
+        assert!(NativeOperatorHostAbi::for_target("aarch64-pc-windows-msvc").is_err());
+        assert!(NativeOperatorHostAbi::for_target("x86_64-pc-windows-gnu").is_err());
     }
 
     #[test]

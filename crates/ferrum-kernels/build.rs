@@ -6,11 +6,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+#[path = "build_support/host.rs"]
+mod host;
+use host::HostTools;
+
 use ferrum_native_ops::{
-    legacy_signature_matches_without_numeric_line, load_manifest, CudaNativeBuildUnit,
-    NativeBuildArtifactCache, NativeBuildArtifactLookup, NativeBuildArtifactSpec,
-    NativeOperatorArtifactSetLock, NativeOperatorResolveRequest, NativeOperatorResolver,
-    NativeOperatorSystemLibrary, ResolvedCudaNativeBuildCoverage,
+    legacy_signature_matches_without_numeric_line, load_manifest,
+    native_artifact_link_name_for_target, CudaNativeBuildUnit, NativeBuildArtifactCache,
+    NativeBuildArtifactLookup, NativeBuildArtifactSpec, NativeOperatorArtifactSetLock,
+    NativeOperatorResolveRequest, NativeOperatorResolver, NativeOperatorSystemLibrary,
+    ResolvedCudaNativeBuildCoverage,
 };
 use ferrum_types::{
     resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorLinkage,
@@ -132,21 +137,30 @@ fn sha256_file_digest(path: &Path) -> String {
 }
 
 fn resolve_program(program: &Path) -> PathBuf {
+    let candidates = HostTools::current().executable_candidates(program);
     if program.components().count() > 1 {
-        return program
+        return candidates
+            .iter()
+            .find(|candidate| candidate.is_file())
+            .map(PathBuf::as_path)
+            .unwrap_or(program)
             .canonicalize()
             .unwrap_or_else(|_| program.to_path_buf());
     }
     env::var_os("PATH")
         .into_iter()
         .flat_map(|value| env::split_paths(&value).collect::<Vec<_>>())
-        .map(|directory| directory.join(program))
+        .flat_map(|directory| {
+            candidates
+                .iter()
+                .map(move |candidate| directory.join(candidate))
+        })
         .find(|candidate| candidate.is_file())
         .and_then(|candidate| candidate.canonicalize().ok())
         .unwrap_or_else(|| program.to_path_buf())
 }
 
-fn command_version_fingerprint(program: &Path) -> String {
+fn command_version_fingerprint(program: &Path, version_args: &[&str]) -> String {
     let resolved = resolve_program(program);
     let metadata = fs::metadata(&resolved)
         .ok()
@@ -160,27 +174,32 @@ fn command_version_fingerprint(program: &Path) -> String {
             format!("len={}:mtime={modified}", metadata.len())
         })
         .unwrap_or_else(|| "metadata=unavailable".to_string());
+    let content = fs::read(&resolved)
+        .map(|bytes| format!("sha256={:x}", Sha256::digest(bytes)))
+        .unwrap_or_else(|_| "sha256=unavailable".to_owned());
     let output = std::process::Command::new(&resolved)
-        .arg("--version")
+        .args(version_args)
         .output();
     match output {
         Ok(output) => {
             let mut bytes = output.stdout;
             bytes.extend_from_slice(&output.stderr);
             format!(
-                "program={}:resolved={}:{}:status={:?}:sha256={:x}",
+                "program={}:resolved={}:{}:{}:status={:?}:sha256={:x}",
                 program.display(),
                 resolved.display(),
                 metadata,
+                content,
                 output.status.code(),
                 Sha256::digest(&bytes)
             )
         }
         Err(error) => format!(
-            "program={}:resolved={}:{}:spawn_error={error}",
+            "program={}:resolved={}:{}:{}:spawn_error={error}",
             program.display(),
             resolved.display(),
-            metadata
+            metadata,
+            content
         ),
     }
 }
@@ -200,20 +219,28 @@ fn cuda_native_toolchain_identity() -> &'static str {
             println!("cargo:rerun-if-env-changed={key}");
         }
         let cuda_root = cuda_root_from_env();
-        let nvcc = cuda_root
-            .as_ref()
-            .map(|root| root.join("bin").join("nvcc"))
-            .unwrap_or_else(|| PathBuf::from("nvcc"));
+        let host_tools = HostTools::current();
+        let nvcc = resolve_program(&host_tools.nvcc(cuda_root.as_deref()));
         if nvcc.is_absolute() && nvcc.is_file() {
             println!("cargo:rerun-if-changed={}", nvcc.display());
         }
         let ccbin = env::var_os("NVCC_CCBIN")
             .or_else(|| env::var_os("CC"))
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("cc"));
+            .unwrap_or_else(|| PathBuf::from(host_tools.c_compiler()));
         let cxx = env::var_os("CXX")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("c++"));
+            .unwrap_or_else(|| PathBuf::from(host_tools.cpp_compiler()));
+        let compiler_args: &[&str] = if host_tools == HostTools::WindowsMsvc {
+            &["/Bv"]
+        } else {
+            &["--version"]
+        };
+        let archiver_args: &[&str] = if host_tools == HostTools::WindowsMsvc {
+            &["/?"]
+        } else {
+            &["--version"]
+        };
         let mut lines = vec![
             format!("schema={CUDA_NATIVE_SIGNATURE_SCHEMA}"),
             format!("target={}", env::var("TARGET").unwrap_or_default()),
@@ -226,10 +253,19 @@ fn cuda_native_toolchain_identity() -> &'static str {
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "<path-search>".to_string())
             ),
-            format!("nvcc={}", command_version_fingerprint(&nvcc)),
-            format!("ccbin={}", command_version_fingerprint(&ccbin)),
-            format!("cxx={}", command_version_fingerprint(&cxx)),
-            format!("ar={}", command_version_fingerprint(&PathBuf::from("ar"))),
+            format!(
+                "nvcc={}",
+                command_version_fingerprint(&nvcc, &["--version"])
+            ),
+            format!(
+                "ccbin={}",
+                command_version_fingerprint(&ccbin, compiler_args)
+            ),
+            format!("cxx={}", command_version_fingerprint(&cxx, compiler_args)),
+            format!(
+                "ar={}",
+                command_version_fingerprint(&PathBuf::from(host_tools.archiver()), archiver_args)
+            ),
         ];
         for key in [
             "NVCC_CCBIN",
@@ -242,6 +278,22 @@ fn cuda_native_toolchain_identity() -> &'static str {
                 "env.{key}={}",
                 env::var(key).unwrap_or_else(|_| "<unset>".to_string())
             ));
+        }
+        if host_tools == HostTools::WindowsMsvc {
+            for key in [
+                "INCLUDE",
+                "LIB",
+                "LIBPATH",
+                "VCToolsInstallDir",
+                "WindowsSdkDir",
+                "WindowsSDKVersion",
+                "WindowsSdkVerBinPath",
+                "UniversalCRTSdkDir",
+                "UCRTVersion",
+            ] {
+                println!("cargo:rerun-if-env-changed={key}");
+                lines.push(format!("env.{key}={}", env::var(key).unwrap_or_default()));
+            }
         }
         if let Some(cuda_root) = cuda_root {
             for relative in ["include/cuda.h", "include/cuda_runtime.h"] {
@@ -467,31 +519,9 @@ fn normalize_compute_capability(raw: &str) -> String {
 }
 
 fn native_static_link_name(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| {
-            panic!(
-                "native operator artifact has no UTF-8 file name: {}",
-                path.display()
-            )
-        });
-    let Some(stripped) = name
-        .strip_prefix("lib")
-        .and_then(|name| name.strip_suffix(".a"))
-    else {
-        panic!(
-            "static native operator artifact must be named lib<name>.a, got {}",
-            path.display()
-        );
-    };
-    if stripped.is_empty() {
-        panic!(
-            "static native operator artifact link name is empty: {}",
-            path.display()
-        );
-    }
-    stripped.to_string()
+    let target = env::var("TARGET").expect("TARGET must be set by Cargo");
+    native_artifact_link_name_for_target(path, NativeOperatorLinkage::Static, &target)
+        .unwrap_or_else(|error| panic!("{error}"))
 }
 
 fn native_dynamic_link_name(path: &Path) -> String {
@@ -591,14 +621,18 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
     let compute_capability = normalize_compute_capability(
         &env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| detect_cuda_compute_cap()),
     );
-    let resolved_set =
-        NativeOperatorArtifactSetLock::load_and_resolve(&lock_path, Some(&compute_capability))
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to resolve native operator artifact set {}: {error}",
-                    lock_path.display()
-                )
-            });
+    let target = env::var("TARGET").expect("TARGET must be set by Cargo");
+    let resolved_set = NativeOperatorArtifactSetLock::load_and_resolve_for_target(
+        &lock_path,
+        Some(&compute_capability),
+        &target,
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "failed to resolve native operator artifact set {}: {error}",
+            lock_path.display()
+        )
+    });
     let build_coverage =
         match ResolvedCudaNativeBuildCoverage::resolve(&resolved_set, required_build_units) {
             Ok(coverage) => coverage,
@@ -607,9 +641,10 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
 
     let cuda_root = cuda_root_from_env();
     if let Some(cuda_root) = cuda_root.as_ref() {
-        let lib64 = cuda_root.join("lib64");
-        if lib64.is_dir() {
-            println!("cargo:rustc-link-search=native={}", lib64.display());
+        let target = env::var("TARGET").expect("TARGET must be set by Cargo");
+        let library_dir = host::cuda_library_directory(cuda_root, &target);
+        if library_dir.is_dir() {
+            println!("cargo:rustc-link-search=native={}", library_dir.display());
         }
     }
     let mut system_libraries = BTreeSet::new();
@@ -669,6 +704,15 @@ fn link_native_operator_artifact_set() -> Option<ResolvedCudaNativeBuildCoverage
             NativeOperatorSystemLibrary::CudaRuntime => "cudart",
             NativeOperatorSystemLibrary::Cublas => "cublas",
             NativeOperatorSystemLibrary::CublasLt => "cublasLt",
+            NativeOperatorSystemLibrary::MsvcRuntime => {
+                assert_eq!(
+                    env::var("TARGET").as_deref(),
+                    Ok("x86_64-pc-windows-msvc"),
+                    "MSVC runtime libraries require the Windows MSVC target"
+                );
+                println!("cargo:rustc-link-lib=dylib=msvcrt");
+                "msvcprt"
+            }
             NativeOperatorSystemLibrary::StdCxx => {
                 if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
                     "c++"
@@ -1134,13 +1178,30 @@ sha256={} import_dir={}",
 fn main() {
     initialize_cuda_build_summary_receipt();
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=build_support/host.rs");
+    if env::var_os("CARGO_FEATURE_CUDA").is_some()
+        && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+    {
+        assert_eq!(
+            env::var("TARGET").as_deref(),
+            Ok("x86_64-pc-windows-msvc"),
+            "native Windows CUDA requires the x86_64 MSVC target"
+        );
+        assert!(
+            !env::var("CARGO_CFG_TARGET_FEATURE")
+                .unwrap_or_default()
+                .split(',')
+                .any(|feature| feature == "crt-static"),
+            "native Windows CUDA operators require the dynamic MSVC CRT; remove crt-static"
+        );
+    }
     let native_artifact_coverage = link_native_operator_artifact_set();
     if native_artifact_coverage.is_none() {
         link_fa2_native_operator_artifact();
     }
 
     // Link Accelerate framework on macOS (provides cblas_sgemm, vDSP_*)
-    if env::consts::OS == "macos" {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
 
@@ -1292,10 +1353,7 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
             cuda_include.display()
         );
     }
-    let nvcc = cuda_root
-        .as_ref()
-        .map(|r| r.join("bin").join("nvcc"))
-        .unwrap_or_else(|| PathBuf::from("nvcc"));
+    let nvcc = resolve_program(&HostTools::current().nvcc(cuda_root.as_deref()));
     let compute_cap = detect_cuda_compute_cap();
     let ccbin = env::var("NVCC_CCBIN").ok();
     let mut flags = vec![
@@ -1386,9 +1444,11 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     command.arg(format!("-I{}", cuda_include.display()));
                 }
                 if let Some(ccbin) = &ccbin {
-                    command
-                        .arg("-allow-unsupported-compiler")
-                        .args(["-ccbin", ccbin]);
+                    if HostTools::current() == HostTools::Unix {
+                        // Preserve the existing Unix build configuration.
+                        command.arg("-allow-unsupported-compiler");
+                    }
+                    command.args(["-ccbin", ccbin]);
                 }
                 command.arg(kernel);
                 let output = command

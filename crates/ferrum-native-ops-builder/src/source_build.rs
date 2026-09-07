@@ -14,12 +14,21 @@ use ferrum_native_ops::{
     NativeBuildArtifactSpec,
 };
 use ferrum_types::{is_sha256_digest, NativeOperatorBackend, NativeOperatorSourcePackage};
+use ferrum_types::{NativeOperatorCompilerFlavor, NativeOperatorHostAbi};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use super::{
     read_json, require_file, sha256_bytes, sha256_file, symbol_slug, validate_relative_path,
     write_json, NativeOperatorBuilderError, NativeOperatorEvidenceFile, Result,
+};
+
+mod depfile;
+pub(crate) mod platform;
+#[cfg(test)]
+mod windows_tests;
+pub use ferrum_native_ops::{
+    NativeOperatorObjectEndianness, NativeOperatorObjectFormat, NativeOperatorObjectIdentity,
 };
 
 pub const NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION: u32 = 3;
@@ -227,6 +236,10 @@ pub struct NativeOperatorHostToolchainIdentity {
     pub compiler: NativeOperatorToolFileIdentity,
     pub compiler_version: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_abi: Option<NativeOperatorHostAbi>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
     pub manifest: NativeOperatorEvidenceFile,
 }
 
@@ -236,6 +249,10 @@ pub struct NativeOperatorHostToolchainManifest {
     pub compiler: NativeOperatorToolFileIdentity,
     pub compiler_version: String,
     pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_abi: Option<NativeOperatorHostAbi>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
     pub executable_inputs: Vec<NativeOperatorToolFileIdentity>,
     pub include_roots: Vec<String>,
     pub include_probe_sha256: String,
@@ -281,29 +298,6 @@ pub struct NativeOperatorToolIdentity {
     pub path: String,
     pub sha256: String,
     pub version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeOperatorObjectIdentity {
-    pub format: NativeOperatorObjectFormat,
-    pub class_bits: u8,
-    pub endianness: NativeOperatorObjectEndianness,
-    pub machine: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NativeOperatorObjectFormat {
-    Elf,
-    MachO,
-    Coff,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NativeOperatorObjectEndianness {
-    Little,
-    Big,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -875,7 +869,12 @@ pub fn run_native_operator_source_build(
                     }
                 };
                 commands[index].object_size_bytes = Some(object_size_bytes);
-                let object_identity = match native_object_identity_file(&object_path) {
+                let object_identity = match native_object_identity_for_host(
+                    &object_path,
+                    receipt.toolchain.as_ref().and_then(|toolchain| {
+                        toolchain.static_identity.host_toolchain.host_abi.as_ref()
+                    }),
+                ) {
                     Ok(identity) => identity,
                     Err(error) => {
                         commands[index].object_cache_status =
@@ -1080,7 +1079,13 @@ pub fn run_native_operator_source_build(
         commands[index].depfile_bindings = validated_depfile.bindings.clone();
         commands[index].observed_dependencies = validated_depfile.observed_dependencies.clone();
         commands[index].dependency_validation = Some(NativeOperatorDependencyValidation::Depfile);
-        let object_identity = match native_object_identity_file(&object_path) {
+        let object_identity = match native_object_identity_for_host(
+            &object_path,
+            receipt
+                .toolchain
+                .as_ref()
+                .and_then(|toolchain| toolchain.static_identity.host_toolchain.host_abi.as_ref()),
+        ) {
             Ok(identity) => identity,
             Err(error) => {
                 commands[index].object_cache_status =
@@ -1216,7 +1221,16 @@ pub fn run_native_operator_source_build(
         return reject_source_build(&receipt_path, &mut receipt, "archive_failed".to_string());
     }
 
-    let archive_path = request.output_dir.join(&plan.archive_file);
+    let archive_file = platform::archive_file(
+        &plan.archive_file,
+        platform::is_msvc(
+            receipt
+                .toolchain
+                .as_ref()
+                .and_then(|toolchain| toolchain.static_identity.host_toolchain.host_abi.as_ref()),
+        ),
+    );
+    let archive_path = request.output_dir.join(&archive_file);
     if let Err(error) = require_file(&archive_path) {
         return reject_source_build(
             &receipt_path,
@@ -1240,6 +1254,17 @@ pub fn run_native_operator_source_build(
         .expect("actual source build has a resolved toolchain")
         .static_identity
         .clone();
+    if let Err(error) = validate_msvc_archive_against_commands(
+        &archive_path,
+        &receipt.commands,
+        static_identity.host_toolchain.host_abi.as_ref(),
+    ) {
+        return reject_source_build(
+            &receipt_path,
+            &mut receipt,
+            format!("archive_members_invalid:{error}"),
+        );
+    }
     if let Err(error) = validate_tool_file_unchanged(&static_identity.archiver) {
         return reject_source_build(
             &receipt_path,
@@ -1268,7 +1293,7 @@ pub fn run_native_operator_source_build(
         }
     }
     receipt.archive_sha256 = Some(archive_sha256);
-    receipt.archive_file = Some(plan.archive_file);
+    receipt.archive_file = Some(archive_file);
     receipt.status = NativeOperatorSourceBuildStatus::Pass;
     receipt.failure_class = None;
     receipt.elapsed_ms = millis(started.elapsed());
@@ -1565,11 +1590,20 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
     })?;
     validate_static_toolchain_identity(&receipt.operator, &toolchain.static_identity)?;
     let static_identity = &toolchain.static_identity;
-    let expected_environment = effective_environment_for_tool_paths([
+    let tool_paths = [
         static_identity.cuda_toolkit.nvcc.path.as_str(),
         static_identity.host_toolchain.compiler.path.as_str(),
         static_identity.archiver.path.as_str(),
-    ])?;
+    ];
+    let msvc = platform::is_msvc(static_identity.host_toolchain.host_abi.as_ref());
+    let expected_environment = if msvc {
+        platform::msvc_environment_for_tools(
+            tool_paths,
+            &static_identity.host_toolchain.environment,
+        )?
+    } else {
+        effective_environment_for_tool_paths(tool_paths)?
+    };
     if receipt.effective_environment != expected_environment {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} source-build effective environment differs from the deterministic policy",
@@ -1609,16 +1643,25 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         .zip(receipt.commands.iter())
         .enumerate()
     {
-        let expected_object_file = object_file_name(index, translation_unit);
+        let expected_object_file = object_file_name_for_host(index, translation_unit, msvc);
+        if msvc
+            && command.object_identity.as_ref().is_none_or(|identity| {
+                identity.format != NativeOperatorObjectFormat::Coff
+                    || identity.class_bits != 64
+                    || identity.endianness != NativeOperatorObjectEndianness::Little
+                    || identity.machine != 0x8664
+            })
+        {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "MSVC source command has no matching x64 COFF identity".to_string(),
+            ));
+        }
         let closure = &plan.dependency_closures[index];
         if command.translation_unit.as_deref() != Some(translation_unit.path.as_str())
             || command.object_cache_key.as_deref() != Some(object_spec.input_signature_sha256())
             || command.dependency_closure_sha256.as_deref() != Some(closure.closure_sha256.as_str())
-            || command
-                .object_file
-                .as_deref()
-                .and_then(|path| Path::new(path).file_name())
-                != Some(std::ffi::OsStr::new(&expected_object_file))
+            || command.object_file.as_deref().map(platform::basename)
+                != Some(expected_object_file.as_str())
         {
             return Err(NativeOperatorBuilderError::Invalid(format!(
                 "{} source-build object identity for {} differs from its plan",
@@ -1640,7 +1683,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
             expected_architecture.clone(),
             "-ccbin".to_string(),
             static_identity.host_toolchain.compiler.path.clone(),
-            "-MMD".to_string(),
+            if msvc { "-MD" } else { "-MMD" }.to_string(),
             "-MF".to_string(),
             expected_compiler_depfile.clone(),
             "-MT".to_string(),
@@ -1648,24 +1691,16 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         ];
         expected_argv.extend(plan.include_dirs.iter().map(|path| format!("-I{path}")));
         expected_argv.extend(plan.defines.iter().map(|define| format!("-D{define}")));
-        expected_argv.extend(nvcc_policy_flags(&plan.nvcc_policy));
+        expected_argv.extend(nvcc_policy_flags_for_host(&plan.nvcc_policy, msvc));
         expected_argv.push("--threads".to_string());
         expected_argv.push(receipt.nvcc_threads.to_string());
         let mut actual_argv = command.argv.clone();
         if let Some(output) = actual_argv.get_mut(4) {
-            *output = Path::new(output)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
+            *output = platform::basename(output).to_string();
         }
         for argument in [10_usize, 12] {
             if let Some(path) = actual_argv.get_mut(argument) {
-                *path = Path::new(path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
+                *path = platform::basename(path).to_string();
             }
         }
         if actual_argv != expected_argv {
@@ -1734,14 +1769,20 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
                     && command
                         .depfile_producer_working_directory
                         .as_deref()
-                        .is_some_and(|path| Path::new(path).is_absolute())
+                        .is_some_and(|path| {
+                            validate_normalized_absolute_path(
+                                path,
+                                "cached producer working directory",
+                            )
+                            .is_ok()
+                        })
                     && command
                         .depfile_producer_object_file
                         .as_deref()
                         .is_some_and(|path| {
-                            Path::new(path).is_absolute()
-                                && Path::new(path).file_name()
-                                    == Some(std::ffi::OsStr::new(&expected_object_file))
+                            validate_normalized_absolute_path(path, "cached producer object")
+                                .is_ok()
+                                && platform::basename(path) == expected_object_file
                         })
                     && binding_dependencies == command.observed_dependencies => {}
             _ => {
@@ -1770,35 +1811,58 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         }
     }
     let archive_command = receipt.commands.last().expect("command count checked");
+    if msvc
+        && (archive_command
+            .argv
+            .iter()
+            .skip(3)
+            .any(|value| value != platform::basename(value))
+            || receipt
+                .commands
+                .iter()
+                .filter_map(|command| command.object_file.as_deref())
+                .any(|path| {
+                    platform::parent(path).is_none_or(|parent| {
+                        !platform::same_path(parent, &archive_command.working_directory)
+                    })
+                }))
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "MSVC librarian must archive the exact object basenames from their recorded directory"
+                .to_string(),
+        ));
+    }
     let actual_archive_argv = archive_command
         .argv
         .iter()
         .enumerate()
         .map(|(index, value)| {
-            if index >= 2 {
-                Path::new(value)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned()
+            if index == 2 && msvc {
+                value
+                    .strip_prefix("/OUT:")
+                    .map(|path| format!("/OUT:{}", platform::basename(path)))
+                    .unwrap_or_else(|| value.clone())
+            } else if index >= 2 {
+                platform::basename(value).to_string()
             } else {
                 value.clone()
             }
         })
         .collect::<Vec<_>>();
-    let mut expected_archive_argv = vec![
-        static_identity.archiver.path.clone(),
-        "rcs".to_string(),
-        plan.archive_file.clone(),
-    ];
-    expected_archive_argv.extend(
+    let expected_archive_file = platform::archive_file(&plan.archive_file, msvc);
+    let expected_archive_argv = platform::archive_argv(
+        &static_identity.archiver.path,
+        &expected_archive_file,
         plan.translation_units
             .iter()
             .enumerate()
-            .map(|(index, translation_unit)| object_file_name(index, translation_unit)),
+            .map(|(index, translation_unit)| {
+                object_file_name_for_host(index, translation_unit, msvc)
+            }),
+        msvc,
     );
     if actual_archive_argv != expected_archive_argv
-        || receipt.archive_file.as_deref() != Some(plan.archive_file.as_str())
+        || receipt.archive_file.as_deref() != Some(expected_archive_file.as_str())
     {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} source-build archive command differs from its locked plan",
@@ -1839,11 +1903,29 @@ pub(crate) fn verify_source_build_evidence(
     if host_manifest.compiler != host_identity.compiler
         || host_manifest.compiler_version != host_identity.compiler_version
         || host_manifest.target != host_identity.target
+        || host_manifest.host_abi != host_identity.host_abi
+        || host_manifest.environment != host_identity.environment
     {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} host toolchain manifest differs from its receipt identity",
             receipt.operator
         )));
+    }
+    if platform::is_msvc(host_identity.host_abi.as_ref()) {
+        let archive_file = receipt.archive_file.as_deref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid("MSVC receipt has no archive".to_string())
+        })?;
+        let archive = resolve_source_build_relative_file(receipt_root, archive_file)?;
+        if receipt.archive_sha256.as_deref() != Some(sha256_file(&archive)?.as_str()) {
+            return Err(NativeOperatorBuilderError::Invalid(
+                "MSVC source archive hash differs from receipt".to_string(),
+            ));
+        }
+        validate_msvc_archive_against_commands(
+            &archive,
+            &receipt.commands,
+            host_identity.host_abi.as_ref(),
+        )?;
     }
     let toolchain_dependency_scope =
         toolchain_dependency_scope(&toolchain.static_identity, &manifest, &host_manifest)?;
@@ -2037,9 +2119,16 @@ fn validate_cuda_toolkit_manifest(
         )));
     }
     let mut scopes = BTreeSet::new();
+    let windows = platform::basename(&identity.nvcc.path).eq_ignore_ascii_case("nvcc.exe");
     let mut required_files = REQUIRED_CUDA_TOOLKIT_FILES
         .iter()
-        .copied()
+        .map(|path| {
+            if windows {
+                format!("{path}.exe")
+            } else {
+                (*path).to_string()
+            }
+        })
         .collect::<BTreeSet<_>>();
     let mut selected_nvcc = None;
     for entry in &manifest.entries {
@@ -2057,13 +2146,19 @@ fn validate_cuda_toolkit_manifest(
             }
         }
         required_files.remove(entry.logical_path.as_str());
-        if Path::new(&identity.canonical_root).join(&entry.resolved_path)
-            == Path::new(&identity.nvcc.path)
-        {
+        if platform::same_path(
+            &format!("{}/{}", identity.canonical_root, entry.resolved_path),
+            &identity.nvcc.path,
+        ) {
             selected_nvcc = Some(entry);
         }
     }
-    if scopes.len() != REQUIRED_CUDA_TOOLKIT_SCOPES.len() || !required_files.is_empty() {
+    let required_scopes: &[&str] = if windows {
+        &["include/", "nvvm/bin/", "nvvm/libdevice/"]
+    } else {
+        &["bin/crt/", "include/", "nvvm/bin/", "nvvm/libdevice/"]
+    };
+    if required_scopes.iter().any(|scope| !scopes.contains(scope)) || !required_files.is_empty() {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{operator} cuda toolkit manifest does not cover every required compiler input; missing={}",
             required_files.into_iter().collect::<Vec<_>>().join(",")
@@ -2303,6 +2398,7 @@ fn insert_toolchain_dependency(
     dependency: NativeOperatorObservedDependency,
 ) -> Result<()> {
     validate_normalized_absolute_path(&absolute_path, "toolchain dependency path")?;
+    let absolute_path = platform::comparison_path(&absolute_path)?;
     if let Some(existing) = dependencies.get(&absolute_path) {
         if existing != &dependency {
             return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -2338,7 +2434,9 @@ fn validate_observed_dependency(
         | NativeOperatorDependencyDomain::BackendToolchain => {
             validate_relative_path(&dependency.path).is_ok()
         }
-        NativeOperatorDependencyDomain::HostToolchain => Path::new(&dependency.path).is_absolute(),
+        NativeOperatorDependencyDomain::HostToolchain => {
+            validate_normalized_absolute_path(&dependency.path, "host dependency").is_ok()
+        }
     };
     if !path_is_valid || !is_sha256_digest(&dependency.sha256) {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -2405,7 +2503,7 @@ fn validate_translation_unit_depfile(
     let (target, dependencies) = parse_make_depfile(raw_text, compiler_depfile_path)?;
     let expected_target = object_path.display().to_string();
     validate_normalized_absolute_path(&expected_target, "compiler depfile object target")?;
-    if target != expected_target {
+    if !platform::same_path(&target, &expected_target) {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "compiler depfile target differs from its exact -MT object: expected={expected_target} actual={target}"
         )));
@@ -2452,8 +2550,8 @@ fn validate_translation_unit_depfile(
             let canonical_path = canonical.display().to_string();
             let identity = toolchain_scope
                 .by_absolute_path
-                .get(&candidate_path)
-                .or_else(|| toolchain_scope.by_absolute_path.get(&canonical_path))
+                .get(&platform::comparison_path(&candidate_path)?)
+                .or_else(|| platform::comparison_path(&canonical_path).ok().and_then(|path| toolchain_scope.by_absolute_path.get(&path)))
                 .ok_or_else(|| {
                     NativeOperatorBuilderError::Invalid(format!(
                         "compiler depfile dependency is outside the locked source and toolchain manifests: {}",
@@ -2582,7 +2680,7 @@ fn serialize_portable_depfile(target: &str, dependencies: &[String]) -> Result<V
     let mut result = escape_make_word(target)?;
     result.push(':');
     for dependency in dependencies {
-        if Path::new(dependency).is_absolute() {
+        if Path::new(dependency).is_absolute() || platform::windows_path(dependency) {
             validate_normalized_absolute_path(dependency, "portable depfile dependency")?;
         } else {
             validate_relative_path(dependency)?;
@@ -2597,7 +2695,7 @@ fn serialize_portable_depfile(target: &str, dependencies: &[String]) -> Result<V
         )));
     }
     let (parsed_target, parsed_dependencies) =
-        parse_make_depfile(&result, Path::new("<portable-depfile>"))?;
+        parse_portable_make_depfile(&result, Path::new("<portable-depfile>"))?;
     if parsed_target != target || parsed_dependencies != dependencies {
         return Err(NativeOperatorBuilderError::Invalid(
             "portable depfile serialization did not round-trip".to_string(),
@@ -2927,8 +3025,8 @@ fn validate_existing_dependency_proof(
         closure,
         toolchain_scope,
     )?;
-    if Path::new(&validated.proof.producer_object_file).file_name()
-        != Path::new(producer_object_file).file_name()
+    if platform::basename(&validated.proof.producer_object_file)
+        != platform::basename(producer_object_file)
     {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "published dependency proof object name differs from the current object: {}",
@@ -2962,7 +3060,9 @@ fn restore_object_dependency_proof(
         closure,
         toolchain_scope,
     )?;
-    if Path::new(&validated.proof.producer_object_file).file_name() != object_path.file_name() {
+    if platform::basename(&validated.proof.producer_object_file)
+        != platform::basename(&object_path.display().to_string())
+    {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "cached dependency proof object name differs from restored object: {}",
             proof_dir.display()
@@ -3085,16 +3185,15 @@ fn validate_portable_depfile_pair(
 ) -> Result<Vec<NativeOperatorObservedDependency>> {
     let (compiler_target, compiler_dependencies) =
         parse_make_depfile(compiler_raw, compiler_depfile_path)?;
-    let (target, dependencies) = parse_make_depfile(portable_raw, depfile_path)?;
+    let (target, dependencies) = parse_portable_make_depfile(portable_raw, depfile_path)?;
     validate_normalized_absolute_path(object_path, "portable depfile producer object")?;
-    if compiler_target != object_path || target != object_path {
+    if !platform::same_path(&compiler_target, object_path) || target != object_path {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "compiler or portable depfile target differs from object file: depfile={} compiler_target={compiler_target} portable_target={target}",
             depfile_path.display()
         )));
     }
     validate_normalized_absolute_path(working_directory, "portable depfile working directory")?;
-    let working_directory = Path::new(working_directory);
     let expected = expected_source_dependencies(translation_unit, closure);
     let observed = validate_depfile_bindings_basic("<portable-depfile>", bindings)?;
     let expected_compiler_dependencies = bindings
@@ -3136,18 +3235,9 @@ fn validate_portable_depfile_pair(
     for binding in bindings {
         match binding.dependency.domain {
             NativeOperatorDependencyDomain::Source => {
-                let producer = Path::new(&binding.producer_path);
-                let relative = if producer.is_absolute() {
-                    producer.strip_prefix(working_directory).map_err(|_| {
-                        NativeOperatorBuilderError::Invalid(format!(
-                            "source compiler depfile path escapes its recorded working directory: {}",
-                            binding.producer_path
-                        ))
-                    })?
-                } else {
-                    producer
-                };
-                if normalize_portable_relative_path(relative)? != binding.dependency.path {
+                if platform::source_relative_path(&binding.producer_path, working_directory)?
+                    != binding.dependency.path
+                {
                     return Err(NativeOperatorBuilderError::Invalid(format!(
                         "source compiler depfile path differs from its locked identity: {}",
                         binding.producer_path
@@ -3162,7 +3252,9 @@ fn validate_portable_depfile_pair(
                 )?;
                 if toolchain_scope.by_absolute_path.get(&normalized_producer)
                     != Some(&binding.dependency)
-                    || toolchain_scope.by_absolute_path.get(&binding.portable_path)
+                    || toolchain_scope
+                        .by_absolute_path
+                        .get(&platform::comparison_path(&binding.portable_path)?)
                         != Some(&binding.dependency)
                 {
                     return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -3199,6 +3291,9 @@ fn validate_portable_depfile_pair(
 }
 
 fn normalize_absolute_posix_path_lexically(value: &str, label: &str) -> Result<String> {
+    if platform::windows_path(value) {
+        return platform::normalize_windows_path(value);
+    }
     if !value.starts_with('/')
         || value.contains('\\')
         || value
@@ -3231,6 +3326,18 @@ fn normalize_absolute_posix_path_lexically(value: &str, label: &str) -> Result<S
 }
 
 fn validate_normalized_absolute_path(value: &str, label: &str) -> Result<()> {
+    if platform::windows_path(value) {
+        platform::normalize_windows_path(value)?;
+        if value
+            .split(['/', '\\'])
+            .any(|part| matches!(part, "." | ".."))
+        {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "{label} is not normalized: {value}"
+            )));
+        }
+        return Ok(());
+    }
     if value == "/" {
         return Ok(());
     }
@@ -3377,6 +3484,9 @@ fn atomic_write_bytes(destination: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn parse_make_depfile(raw: &str, path: &Path) -> Result<(String, Vec<String>)> {
+    if depfile::is_windows_rule(raw) {
+        return depfile::parse_windows_rule(raw, path);
+    }
     if raw.len() > MAX_DEPFILE_BYTES || raw.trim().is_empty() || raw.as_bytes().contains(&0) {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "depfile is too large, empty, or contains NUL: {}",
@@ -3429,6 +3539,14 @@ fn parse_make_depfile(raw: &str, path: &Path) -> Result<(String, Vec<String>)> {
         )));
     }
     Ok((targets[0].clone(), dependencies))
+}
+
+fn parse_portable_make_depfile(raw: &str, path: &Path) -> Result<(String, Vec<String>)> {
+    if depfile::is_windows_rule(raw) {
+        depfile::parse_windows_portable_rule(raw, path)
+    } else {
+        parse_make_depfile(raw, path)
+    }
 }
 
 fn parse_make_words(value: &str, path: &Path, max_words: usize) -> Result<Vec<String>> {
@@ -3598,7 +3716,7 @@ fn resolve_static_toolchain(
         size_bytes: manifest_size,
     };
     let host_toolchain = resolve_host_toolchain(request)?;
-    Ok(NativeOperatorSourceBuildToolchain {
+    let toolchain = NativeOperatorSourceBuildToolchain {
         static_identity: NativeOperatorSourceBuildStaticToolchain {
             backend: NativeOperatorBackend::Cuda,
             compiler_driver: NativeOperatorSourceCompilerDriver::CudaNvcc,
@@ -3613,7 +3731,9 @@ fn resolve_static_toolchain(
             archiver: tool_file_identity(&request.ar_path)?,
         },
         miss_probe: None,
-    })
+    };
+    validate_static_toolchain_identity("<source-build-preflight>", &toolchain.static_identity)?;
+    Ok(toolchain)
 }
 
 fn resolve_host_toolchain(
@@ -3670,6 +3790,8 @@ fn resolve_host_toolchain(
         compiler: manifest.compiler.clone(),
         compiler_version: manifest.compiler_version.clone(),
         target: manifest.target.clone(),
+        host_abi: manifest.host_abi.clone(),
+        environment: manifest.environment.clone(),
         manifest: NativeOperatorEvidenceFile {
             path: relative.to_string(),
             sha256: sha256_file(&output_path)?,
@@ -3682,6 +3804,9 @@ fn probe_host_toolchain_manifest(
     compiler: &NativeOperatorToolFileIdentity,
     environment: &BTreeMap<String, String>,
 ) -> Result<NativeOperatorHostToolchainManifest> {
+    if platform::is_msvc_compiler(&compiler.path) {
+        return platform::msvc::probe_manifest(compiler, environment);
+    }
     let compiler_path = Path::new(&compiler.path);
     let compiler_version = host_compiler_output(compiler_path, &["--version"], b"", environment)?;
     let target = host_compiler_output(compiler_path, &["-dumpmachine"], b"", environment)?;
@@ -3728,6 +3853,8 @@ fn probe_host_toolchain_manifest(
         compiler: compiler.clone(),
         compiler_version,
         target,
+        host_abi: None,
+        environment: BTreeMap::new(),
         executable_inputs: executable_inputs.into_values().collect(),
         include_roots: discovery_probe.include_roots,
         include_probe_sha256: discovery_probe.include_probe_sha256,
@@ -3761,6 +3888,8 @@ fn rebuild_host_toolchain_manifest(
         compiler,
         compiler_version: recorded.compiler_version.clone(),
         target: recorded.target.clone(),
+        host_abi: recorded.host_abi.clone(),
+        environment: recorded.environment.clone(),
         executable_inputs,
         include_roots: recorded.include_roots.clone(),
         include_probe_sha256: recorded.include_probe_sha256.clone(),
@@ -3821,6 +3950,9 @@ fn host_toolchain_manifest_matches_current(
 ) -> Result<bool> {
     if &recorded.compiler != compiler || rebuild_host_toolchain_manifest(recorded)? != *recorded {
         return Ok(false);
+    }
+    if platform::is_msvc(recorded.host_abi.as_ref()) {
+        return Ok(platform::msvc::probe_manifest(compiler, environment)? == *recorded);
     }
     let discovery = probe_host_compiler_discovery(Path::new(&compiler.path), environment)?;
     Ok(discovery.include_roots == recorded.include_roots
@@ -4079,6 +4211,13 @@ fn validate_host_toolchain_manifest(
     context: &str,
     manifest: &NativeOperatorHostToolchainManifest,
 ) -> Result<()> {
+    platform::validate_host_contract(
+        manifest.host_abi.as_ref(),
+        &manifest.target,
+        &manifest.compiler.path,
+        &manifest.environment,
+    )?;
+    let msvc = platform::is_msvc(manifest.host_abi.as_ref());
     if manifest.schema_version != NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION
         || manifest.compiler_version.trim().is_empty()
         || manifest.target.trim().is_empty()
@@ -4133,23 +4272,27 @@ fn validate_host_toolchain_manifest(
         .iter()
         .any(|tool| tool == &manifest.compiler)
         || manifest.executable_inputs.iter().any(|tool| {
-            Path::new(&tool.path).parent().map_or(true, |parent| {
+            platform::parent(&tool.path).is_none_or(|parent| {
                 !manifest
                     .discovery_roots
                     .iter()
-                    .any(|root| Path::new(root) == parent)
+                    .any(|root| platform::same_path(root, parent))
             })
         })
-        || manifest.discovery_roots.iter().any(|root| {
-            !manifest
-                .executable_inputs
-                .iter()
-                .any(|tool| Path::new(&tool.path).parent() == Some(Path::new(root)))
-        })
+        || (!msvc
+            && manifest.discovery_roots.iter().any(|root| {
+                !manifest.executable_inputs.iter().any(|tool| {
+                    platform::parent(&tool.path)
+                        .is_some_and(|parent| platform::same_path(parent, root))
+                })
+            }))
     {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{context} host toolchain manifest does not bind its compiler/search roots"
         )));
+    }
+    if msvc {
+        platform::msvc::validate_manifest_roots(manifest)?;
     }
     for file in &manifest.files {
         validate_normalized_absolute_path(
@@ -4165,7 +4308,7 @@ fn validate_host_toolchain_manifest(
                 .include_roots
                 .iter()
                 .chain(manifest.discovery_roots.iter())
-                .any(|root| Path::new(&file.logical_path).starts_with(root))
+                .any(|root| platform::path_is_within(&file.logical_path, root))
         {
             return Err(NativeOperatorBuilderError::Invalid(format!(
                 "{context} host toolchain file identity is invalid: {}",
@@ -4184,17 +4327,34 @@ fn build_cuda_toolkit_manifest(root: &Path) -> Result<NativeOperatorCudaToolkitM
             source,
         })?;
     let root = canonical_root.as_path();
+    let windows = root.join("bin/nvcc.exe").is_file();
     let mut entries = Vec::new();
     for relative in REQUIRED_CUDA_TOOLKIT_FILES {
-        collect_cuda_toolkit_single_file(root, relative, &mut entries)?;
+        let relative = if windows {
+            format!("{relative}.exe")
+        } else {
+            relative.to_string()
+        };
+        collect_cuda_toolkit_single_file(root, &relative, &mut entries)?;
     }
-    for optional in ["bin/cudafe", "bin/nvcc.profile"] {
+    for optional in [
+        if windows {
+            "bin/cudafe.exe"
+        } else {
+            "bin/cudafe"
+        },
+        "bin/nvcc.profile",
+    ] {
         if root.join(optional).exists() {
             collect_cuda_toolkit_single_file(root, optional, &mut entries)?;
         }
     }
     for scope in REQUIRED_CUDA_TOOLKIT_SCOPES {
         let scope_path = root.join(scope);
+        // Windows places CRT headers below include/crt; Linux additionally needs bin/crt stubs.
+        if windows && scope == "bin/crt" && !scope_path.exists() {
+            continue;
+        }
         if !scope_path.is_dir() {
             return Err(NativeOperatorBuilderError::Invalid(format!(
                 "cuda toolkit compiler scope is missing: {scope}"
@@ -4481,9 +4641,10 @@ fn validate_static_toolchain_identity(
             )));
         }
     }
-    if !Path::new(&toolchain.cuda_toolkit.nvcc.path)
-        .starts_with(&toolchain.cuda_toolkit.canonical_root)
-    {
+    if !platform::path_is_within(
+        &toolchain.cuda_toolkit.nvcc.path,
+        &toolchain.cuda_toolkit.canonical_root,
+    ) {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{operator} nvcc identity escapes cuda toolkit root"
         )));
@@ -4498,6 +4659,19 @@ fn validate_static_toolchain_identity(
         )));
     }
     let host = &toolchain.host_toolchain;
+    platform::validate_host_contract(
+        host.host_abi.as_ref(),
+        &host.target,
+        &host.compiler.path,
+        &host.environment,
+    )?;
+    if platform::is_msvc(host.host_abi.as_ref())
+        != platform::basename(&toolchain.cuda_toolkit.nvcc.path).eq_ignore_ascii_case("nvcc.exe")
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "CUDA nvcc platform differs from the declared host ABI".to_string(),
+        ));
+    }
     if host.compiler_version.trim().is_empty()
         || host.target.trim().is_empty()
         || host.target.len() > 256
@@ -4568,6 +4742,8 @@ fn validate_host_toolchain_unchanged(
     if recorded.compiler != identity.compiler
         || recorded.compiler_version != identity.compiler_version
         || recorded.target != identity.target
+        || recorded.host_abi != identity.host_abi
+        || recorded.environment != identity.environment
     {
         return Err(NativeOperatorBuilderError::Invalid(
             "host toolchain identity differs from its manifest".to_string(),
@@ -4582,6 +4758,9 @@ fn validate_host_toolchain_unchanged(
 }
 
 pub(crate) fn compiler_target(path: &Path) -> Result<String> {
+    if platform::is_msvc_compiler(&path.display().to_string()) {
+        return platform::msvc::target(path);
+    }
     require_file(path)?;
     let canonical = path
         .canonicalize()
@@ -4620,6 +4799,71 @@ pub(crate) fn native_object_identity_file(path: &Path) -> Result<NativeOperatorO
         source,
     })?;
     native_object_identity_bytes(&bytes, &path.display().to_string())
+}
+
+fn native_object_identity_for_host(
+    path: &Path,
+    abi: Option<&NativeOperatorHostAbi>,
+) -> Result<NativeOperatorObjectIdentity> {
+    if let Some(abi) = abi.filter(|abi| platform::is_msvc(Some(abi))) {
+        let bytes = fs::read(path).map_err(|source| NativeOperatorBuilderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        return ferrum_native_ops::inspect_msvc_object(&bytes, &abi.target)
+            .map(|inspection| inspection.identity)
+            .map_err(NativeOperatorBuilderError::Invalid);
+    }
+    native_object_identity_file(path)
+}
+
+fn validate_msvc_archive_against_commands(
+    path: &Path,
+    commands: &[NativeOperatorSourceBuildCommand],
+    abi: Option<&NativeOperatorHostAbi>,
+) -> Result<()> {
+    let Some(abi) = abi.filter(|abi| platform::is_msvc(Some(abi))) else {
+        return Ok(());
+    };
+    let bytes = fs::read(path).map_err(|source| NativeOperatorBuilderError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let archive = ferrum_native_ops::inspect_msvc_archive(&bytes, &abi.target)
+        .map_err(NativeOperatorBuilderError::Invalid)?;
+    let members = archive
+        .members
+        .iter()
+        .map(|member| (member.name.as_str(), member))
+        .collect::<BTreeMap<_, _>>();
+    let object_commands = commands
+        .iter()
+        .filter(|command| command.translation_unit.is_some())
+        .collect::<Vec<_>>();
+    if members.len() != object_commands.len() || members.len() != archive.members.len() {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "MSVC archive members differ from compiled object inventory".to_string(),
+        ));
+    }
+    for command in object_commands {
+        let name = command
+            .object_file
+            .as_deref()
+            .map(platform::basename)
+            .ok_or_else(|| {
+                NativeOperatorBuilderError::Invalid("MSVC command has no object path".to_string())
+            })?;
+        if members.get(name).is_none_or(|member| {
+            command.object_sha256.as_deref() != Some(member.sha256.as_str())
+                || command.object_size_bytes != Some(member.bytes.len() as u64)
+                || command.object_identity.as_ref() != Some(&member.object.identity)
+        }) {
+            return Err(NativeOperatorBuilderError::Invalid(format!(
+                "MSVC archive member differs from its compiled or cached object: {name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn native_object_size(path: &Path) -> Result<u64> {
@@ -4767,6 +5011,12 @@ pub(crate) fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
 }
 
 fn tool_version(path: &Path) -> Result<String> {
+    if path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return platform::msvc::tool_version(path);
+    }
     require_file(path)?;
     let canonical = path
         .canonicalize()
@@ -4850,10 +5100,24 @@ fn effective_build_environment(
             request.ar_path.to_str().unwrap_or(""),
         ]
     };
+    if let Some(toolchain) = toolchain {
+        if platform::is_msvc(toolchain.static_identity.host_toolchain.host_abi.as_ref()) {
+            return platform::msvc_environment_for_tools(
+                tool_paths,
+                &toolchain.static_identity.host_toolchain.environment,
+            );
+        }
+    }
     effective_environment_for_tool_paths(tool_paths)
 }
 
 fn effective_environment_for_tool_paths(tool_paths: [&str; 3]) -> Result<BTreeMap<String, String>> {
+    if platform::is_msvc_compiler(tool_paths[1]) {
+        return platform::msvc_environment_for_tools(
+            tool_paths,
+            &platform::capture_msvc_environment()?,
+        );
+    }
     let mut path_entries = tool_paths
         .iter()
         .filter_map(|path| Path::new(path).parent())
@@ -4934,7 +5198,7 @@ fn build_object_cache_specs(
             })?;
             NativeBuildArtifactSpec::new(
                 format!("{}.object.{index:02}", plan.operator),
-                object_file_name(index, translation_unit),
+                object_file_name_for_host(index, translation_unit, platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref())),
                 input_signature,
             )
             .map_err(NativeOperatorBuilderError::from)
@@ -4943,18 +5207,31 @@ fn build_object_cache_specs(
 }
 
 fn object_file_name(index: usize, translation_unit: &NativeOperatorSourceFileLock) -> String {
+    object_file_name_for_host(index, translation_unit, false)
+}
+
+fn object_file_name_for_host(
+    index: usize,
+    translation_unit: &NativeOperatorSourceFileLock,
+    msvc: bool,
+) -> String {
     let stem = Path::new(&translation_unit.path)
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("translation_unit");
     format!(
-        "{index:08}_{}_{}.o",
+        "{index:08}_{}_{}.{}",
         safe_component(stem),
-        &translation_unit.sha256[..8]
+        &translation_unit.sha256[..8],
+        if msvc { "obj" } else { "o" }
     )
 }
 
 fn nvcc_policy_flags(policy: &NativeOperatorNvccPolicy) -> Vec<String> {
+    nvcc_policy_flags_for_host(policy, false)
+}
+
+fn nvcc_policy_flags_for_host(policy: &NativeOperatorNvccPolicy, msvc: bool) -> Vec<String> {
     let mut flags = vec![
         match policy.cpp_standard {
             NativeOperatorCppStandard::Cpp17 => "-std=c++17",
@@ -4974,10 +5251,13 @@ fn nvcc_policy_flags(policy: &NativeOperatorNvccPolicy) -> Vec<String> {
     if policy.extended_lambda {
         flags.push("--expt-extended-lambda".to_string());
     }
-    if policy.host_position_independent_code {
+    if msvc {
+        flags.extend(["-Xcompiler".to_string(), "/MD,/EHsc,/bigobj".to_string()]);
+    }
+    if policy.host_position_independent_code && !msvc {
         flags.extend(["-Xcompiler".to_string(), "-fPIC".to_string()]);
     }
-    if policy.host_default_visibility {
+    if policy.host_default_visibility && !msvc {
         flags.extend(["-Xcompiler".to_string(), "-fvisibility=default".to_string()]);
     }
     flags
@@ -5009,6 +5289,11 @@ fn build_commands(
     let ar_path = toolchain
         .map(|toolchain| toolchain.static_identity.archiver.path.as_str())
         .unwrap_or_else(|| request.ar_path.to_str().unwrap_or("<non-utf8-ar>"));
+    let msvc = toolchain
+        .map(|toolchain| {
+            platform::is_msvc(toolchain.static_identity.host_toolchain.host_abi.as_ref())
+        })
+        .unwrap_or_else(|| platform::is_msvc_compiler(ccbin_path));
     let mut commands = Vec::with_capacity(plan.translation_units.len() + 1);
     let mut object_paths = Vec::with_capacity(plan.translation_units.len());
     for (index, translation_unit) in plan.translation_units.iter().enumerate() {
@@ -5016,7 +5301,7 @@ fn build_commands(
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or("translation_unit");
-        let object_name = object_file_name(index, translation_unit);
+        let object_name = object_file_name_for_host(index, translation_unit, msvc);
         let object_path = objects_dir.join(object_name);
         let depfile_name = format!("{index:08}-{stem}.d");
         let depfile_relative = format!("depfiles/{depfile_name}");
@@ -5032,7 +5317,7 @@ fn build_commands(
             architecture_argument.to_string(),
             "-ccbin".to_string(),
             ccbin_path.to_string(),
-            "-MMD".to_string(),
+            if msvc { "-MD" } else { "-MMD" }.to_string(),
             "-MF".to_string(),
             compiler_depfile_path.display().to_string(),
             "-MT".to_string(),
@@ -5040,7 +5325,7 @@ fn build_commands(
         ];
         argv.extend(plan.include_dirs.iter().map(|path| format!("-I{path}")));
         argv.extend(plan.defines.iter().map(|define| format!("-D{define}")));
-        argv.extend(nvcc_policy_flags(&plan.nvcc_policy));
+        argv.extend(nvcc_policy_flags_for_host(&plan.nvcc_policy, msvc));
         argv.push("--threads".to_string());
         argv.push(request.nvcc_threads.to_string());
         commands.push(NativeOperatorSourceBuildCommand {
@@ -5082,16 +5367,29 @@ fn build_commands(
             return_code: None,
         });
     }
-    let archive_path = request.output_dir.join(&plan.archive_file);
-    let mut archive_argv = vec![
-        ar_path.to_string(),
-        "rcs".to_string(),
-        archive_path.display().to_string(),
-    ];
-    archive_argv.extend(object_paths.iter().map(|path| path.display().to_string()));
+    let archive_path = request
+        .output_dir
+        .join(platform::archive_file(&plan.archive_file, msvc));
+    let archive_argv = platform::archive_argv(
+        ar_path,
+        &archive_path.display().to_string(),
+        object_paths.iter().map(|path| {
+            if msvc {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                path.display().to_string()
+            }
+        }),
+        msvc,
+    );
     commands.push(NativeOperatorSourceBuildCommand {
         translation_unit: None,
-        working_directory: source_root.display().to_string(),
+        working_directory: if msvc { objects_dir } else { source_root }
+            .display()
+            .to_string(),
         argv: archive_argv,
         object_file: None,
         stdout_log: relative_log(logs_dir, "archive.stdout.log"),
@@ -5281,7 +5579,7 @@ fn millis(duration: std::time::Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
 

@@ -10,6 +10,7 @@ description = "Native operator ABI and artifact resolver for Ferrum"
 [dependencies]
 ferrum-types = { workspace = true }
 libc = "0.2"
+object = { version = "=0.37.3", default-features = false, features = ["read_core", "archive", "coff", "unaligned", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"

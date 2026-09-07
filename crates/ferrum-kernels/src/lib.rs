@@ -92,10 +92,20 @@ pub mod int8_kv;
 pub mod quant;
 
 #[cfg(feature = "cuda")]
-pub use backend::cuda::{cublas, decode_buffers, gpu_paged_kv, marlin, nccl_comm};
+pub use backend::cuda::{cublas, decode_buffers, gpu_paged_kv, marlin};
+
+#[cfg(all(feature = "cuda", not(target_os = "windows")))]
+pub use backend::cuda::nccl_comm;
 
 #[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
-pub use backend::cuda::{cuda_decode, cuda_graph, tp_decode, weight_store};
+pub use backend::cuda::{cuda_decode, cuda_graph, weight_store};
+
+#[cfg(all(
+    feature = "cuda",
+    feature = "candle-cuda-compat",
+    not(target_os = "windows")
+))]
+pub use backend::cuda::tp_decode;
 
 #[cfg(all(feature = "cuda", feature = "candle-cuda-compat"))]
 pub use backend::cuda::decode_attention::decode_attention;

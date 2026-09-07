@@ -83,10 +83,12 @@ libc = "0.2"
 [dev-dependencies]
 axum = "0.7"
 rstest = "0.23"
-rexpect = "0.6"
 async-openai = { version = "0.27", default-features = false, features = ["rustls"] }
 safetensors = { workspace = true }
 tempfile = "3.8"
+
+[target.'cfg(unix)'.dev-dependencies]
+rexpect = "0.6"
 
 [features]
 default = []

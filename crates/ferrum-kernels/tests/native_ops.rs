@@ -144,6 +144,7 @@ fn write_manifest(
     inputs_sha256: String,
 ) {
     let manifest = NativeOperatorManifest {
+        host_abi: None,
         schema_version: NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
         operator: FA2_NATIVE_OPERATOR.to_string(),
         operator_abi_version: "1".to_string(),

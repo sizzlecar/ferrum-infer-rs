@@ -25,6 +25,11 @@ cudarc = { version = "0.19", default-features = false, features = ["std", "drive
 metal = { version = "0.31", optional = true }
 libc = "0.2"
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+# NCCL is unavailable on native Windows. Keep the existing CUDA feature
+# set on other targets while Windows uses the single-device backend.
+cudarc = { version = "0.19", default-features = false, features = ["nccl"], optional = true }
+
 [build-dependencies]
 bindgen_cuda = "0.1.6"
 ferrum-native-ops = { workspace = true }
@@ -34,7 +39,7 @@ sha2 = "0.10"
 
 [features]
 default = []
-cuda = ["dep:cudarc", "marlin", "native-op-artifact", "cudarc?/nccl"]
+cuda = ["dep:cudarc", "marlin", "native-op-artifact"]
 candle-cuda-compat = ["cuda", "candle-core/cuda"]
 metal = ["dep:metal"]  # Metal backend (macOS) — also gates the fused-transformer Metal pipelines
 marlin = []  # Marlin INT4xFP16 native artifact (auto-enabled by cuda).
@@ -52,7 +57,7 @@ native-op-artifact = []  # Internal build-graph marker, enabled by `cuda`.
                         # CUDA native units fail closed when the explicit
                         # artifact-set lock is absent or partial; product builds
                         # never compile third-party CUDA/C++.
-tensor-parallel = ["cuda"]  # Kept as alias for backward compat; cuda already includes NCCL
+tensor-parallel = ["cuda"]  # Kept as alias for backward compatibility.
 # Use triton-rs-compiled PTX in place of hand-written .cu kernels.
 # Requires `cuda` (we still launch via cudarc) and pre-generated PTX files
 # under `triton_ptx/`, produced from triton-rs on Linux+CUDA.
