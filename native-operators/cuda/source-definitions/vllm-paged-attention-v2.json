@@ -2,7 +2,7 @@
   "schema_version": 3,
   "operator": "ferrum.cuda.vllm_paged_attention_v2",
   "source_package_kind": "ferrum-native-source-bundle",
-  "source_package_revision": "ferrum-native-cuda-v1+sha256.885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
+  "source_package_revision": "ferrum-native-cuda-v1+sha256.9b5df9f8abcba9783025b8ec3e066e54c38ecd88f131e1e3c1c2596f6f250471",
   "upstream_sources": [
     {
       "repository": "https://github.com/vllm-project/vllm.git",

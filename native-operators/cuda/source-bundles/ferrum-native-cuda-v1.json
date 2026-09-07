@@ -1,18 +1,18 @@
 {
   "archive": {
-    "file_name": "ferrum-native-cuda-sources-a6.tar.gz",
+    "file_name": "ferrum-native-cuda-sources-a7.tar.gz",
     "format": "tar.gz",
-    "sha256": "7974bba221dfea88db55a33170bcfb92ea267a0508c0de41bf4d61d7b4ecc666",
-    "size_bytes": 119373
+    "sha256": "84b7085ccea0f43c4cd37537c1d31c149630d6a1e8cb8f107eed47ae64b941d7",
+    "size_bytes": 123157
   },
-  "bundle_id": "ferrum-native-cuda-v1+sha256.885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
+  "bundle_id": "ferrum-native-cuda-v1+sha256.9b5df9f8abcba9783025b8ec3e066e54c38ecd88f131e1e3c1c2596f6f250471",
   "distribution": {
-    "asset_name": "ferrum-native-cuda-sources-a6.tar.gz",
+    "asset_name": "ferrum-native-cuda-sources-a7.tar.gz",
     "kind": "github-release-asset",
     "repository": "sizzlecar/ferrum-infer-rs",
-    "tag": "ferrum-native-cuda12.4-sm89-v6"
+    "tag": "ferrum-native-cuda-sources-a7"
   },
-  "member_set_sha256": "885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
+  "member_set_sha256": "9b5df9f8abcba9783025b8ec3e066e54c38ecd88f131e1e3c1c2596f6f250471",
   "members": [
     {
       "path": "kernels/marlin_cuda_kernel.cu",
@@ -161,8 +161,8 @@
     },
     {
       "path": "vllm_marlin/marlin_dtypes.cuh",
-      "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415",
-      "size_bytes": 3977
+      "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244",
+      "size_bytes": 3993
     },
     {
       "path": "vllm_marlin/marlin_mma.h",
