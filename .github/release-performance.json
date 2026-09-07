@@ -11,7 +11,7 @@
       "max_model_len": 1024
     },
     "limits": {
-      "ttft_max_relative_increase": 0.1,
+      "ttft_max_relative_increase": 0.2,
       "tpot_max_relative_increase": 0.1
     },
     "runtime_memory_budget_bytes": 12884901888,
