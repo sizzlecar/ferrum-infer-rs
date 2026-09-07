@@ -3095,28 +3095,21 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-#[cfg(all(test, unix))]
-mod tests {
+#[cfg(test)]
+mod canonical_input_tests {
     use super::*;
-    use ferrum_native_ops::NativeOperatorArtifactSetLock;
-    use std::os::unix::fs::PermissionsExt;
-
-    fn digest(character: char) -> String {
-        std::iter::repeat(character).take(64).collect()
-    }
-
-    fn write_executable_script(path: &Path, contents: &str) {
-        fs::write(path, contents).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
-    }
 
     #[test]
     fn checked_in_native_package_definitions_and_abi_are_canonical() {
         let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let abi_path = repository_root.join("native-operators/abi/ferrum-native-abi-v2.json");
-        let abi: NativeOperatorAbiContract = read_json(&abi_path).unwrap();
+        let (abi, abi_sha256): (NativeOperatorAbiContract, String) =
+            read_json_with_sha256(&abi_path).unwrap();
+        assert_eq!(
+            abi_sha256,
+            abi.canonical_sha256().unwrap(),
+            "checked-out ABI bytes must satisfy the package SHA256 contract"
+        );
         assert_eq!(
             fs::read(&abi_path).unwrap(),
             abi.canonical_json_bytes().unwrap()
@@ -3149,6 +3142,24 @@ mod tests {
             assert_eq!(definition.operator, source_definition.operator);
             assert_eq!(definition.operator, source_plan.operator);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use ferrum_native_ops::NativeOperatorArtifactSetLock;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn digest(character: char) -> String {
+        std::iter::repeat(character).take(64).collect()
+    }
+
+    fn write_executable_script(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn run_source_build_fixture(

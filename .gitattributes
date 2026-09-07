@@ -4,3 +4,7 @@
 # Preserve upstream chat-template bytes and exact rendered-prompt goldens.
 /crates/ferrum-server/tests/fixtures/chat_template/**/template.jinja text eol=lf
 /crates/ferrum-server/tests/fixtures/chat_template/**/golden_*.txt text eol=lf
+
+# Native package inputs with canonical JSON byte contracts.
+/native-operators/abi/ferrum-native-abi-v2.json text eol=lf
+/native-operators/cuda/package-definitions/*.json text eol=lf

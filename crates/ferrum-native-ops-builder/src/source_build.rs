@@ -1,7 +1,7 @@
 //! Locked, independently runnable native source-build plans.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -2902,8 +2902,9 @@ fn validate_dependency_proof_directory(proof_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn sync_directory(path: &Path) -> Result<()> {
-    let directory = File::open(path).map_err(|source| NativeOperatorBuilderError::Io {
+    let directory = fs::File::open(path).map_err(|source| NativeOperatorBuilderError::Io {
         path: path.to_path_buf(),
         source,
     })?;
@@ -2913,6 +2914,16 @@ fn sync_directory(path: &Path) -> Result<()> {
             path: path.to_path_buf(),
             source,
         })
+}
+
+#[cfg(windows)]
+fn sync_directory(_path: &Path) -> Result<()> {
+    // Windows does not support this Unix directory-fsync operation. Every proof
+    // file is still synced before the same-parent staging directory is renamed,
+    // and the published proof is fully revalidated before use. We do not promise
+    // that the directory rename survives power loss on Windows; incomplete or
+    // damaged proofs remain cache errors rather than valid cache hits.
+    Ok(())
 }
 
 struct ValidatedCachedDependencyProof {

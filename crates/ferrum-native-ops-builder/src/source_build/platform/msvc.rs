@@ -153,7 +153,10 @@ fn environment_roots(environment: &BTreeMap<String, String>, keys: &[&str]) -> R
                     "MSVC {key} search root is not a directory: {value}"
                 )));
             }
-            let root = root.display().to_string();
+            // Bind the spelling searched by the compiler. Canonicalization above
+            // validates the directory; the inventory separately records each
+            // file's resolved path and bytes without replacing its logical root.
+            let root = normalize_windows_path(value)?;
             if !roots.contains(&root) {
                 roots.push(root);
             }
@@ -203,10 +206,25 @@ pub(crate) fn validate_manifest_roots(
             })
             .collect::<Result<Vec<_>>>()?,
     );
-    if includes != environment_paths(&["INCLUDE"])? || discovered != expected {
-        return Err(NativeOperatorBuilderError::Invalid(
-            "MSVC manifest does not bind its exact INCLUDE/LIB/LIBPATH search scopes".to_string(),
-        ));
+    let expected_includes = environment_paths(&["INCLUDE"])?;
+    if includes != expected_includes {
+        let index = includes
+            .iter()
+            .zip(&expected_includes)
+            .position(|(actual, expected)| actual != expected)
+            .unwrap_or(includes.len().min(expected_includes.len()));
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "MSVC manifest INCLUDE search roots differ at index {index}: expected={:?} recorded={:?}",
+            expected_includes.get(index),
+            includes.get(index)
+        )));
+    }
+    if discovered != expected {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "MSVC manifest LIB/LIBPATH and tool discovery roots differ: first_missing={:?} first_extra={:?}",
+            expected.difference(&discovered).next(),
+            discovered.difference(&expected).next()
+        )));
     }
     Ok(())
 }
@@ -273,14 +291,13 @@ pub(crate) fn tool_version(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn manifest_include_order_preserves_first_search_priority() {
+    fn manifest_fixture() -> NativeOperatorHostToolchainManifest {
         let compiler = NativeOperatorToolFileIdentity {
             path: "C:/MSVC/bin/cl.exe".to_string(),
             sha256: "a".repeat(64),
             size_bytes: 128,
         };
-        let mut manifest = NativeOperatorHostToolchainManifest {
+        NativeOperatorHostToolchainManifest {
             schema_version: NATIVE_OPERATOR_HOST_TOOLCHAIN_MANIFEST_SCHEMA_VERSION,
             compiler: compiler.clone(),
             compiler_version: "MSVC 1938 full 193833130".to_string(),
@@ -309,7 +326,12 @@ mod tests {
                 sha256: "d".repeat(64),
                 size_bytes: 128,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn manifest_include_order_preserves_first_search_priority() {
+        let mut manifest = manifest_fixture();
         validate_host_toolchain_manifest("ordered-include", &manifest).unwrap();
         manifest.include_roots.swap(0, 1);
         assert!(validate_host_toolchain_manifest("reordered-include", &manifest).is_err());
@@ -319,6 +341,127 @@ mod tests {
             "C:/SDK/include;C:/MSVC/include".to_string(),
         );
         assert!(validate_host_toolchain_manifest("changed-search-priority", &manifest).is_err());
+    }
+
+    #[test]
+    fn manifest_search_scope_validation_rejects_missing_extra_and_changed_roots() {
+        let manifest = manifest_fixture();
+        let mut missing_include = manifest.clone();
+        missing_include.include_roots.pop();
+        let error = validate_manifest_roots(&missing_include)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("INCLUDE search roots differ at index 1"),
+            "{error}"
+        );
+
+        let mut changed_spelling = manifest.clone();
+        changed_spelling.include_roots[0] = "C:/msvc/include".to_string();
+        assert!(validate_manifest_roots(&changed_spelling).is_err());
+
+        let mut missing_library = manifest.clone();
+        missing_library
+            .discovery_roots
+            .retain(|root| root != "C:/MSVC/lib");
+        let error = validate_manifest_roots(&missing_library)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("first_missing=Some(\"C:/MSVC/lib\")"),
+            "{error}"
+        );
+
+        let mut extra_library = manifest;
+        extra_library
+            .discovery_roots
+            .push("C:/Undeclared/lib".to_string());
+        let error = validate_manifest_roots(&extra_library)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("first_extra=Some(\"C:/Undeclared/lib\")"),
+            "{error}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn environment_scope_inventory_preserves_windows_search_spelling() {
+        let workspace = tempfile::tempdir().unwrap();
+        let include = workspace.path().join("SDK-Include");
+        let library = workspace.path().join("SDK-Lib");
+        let bin = workspace.path().join("Bin");
+        for path in [&include, &library, &bin] {
+            fs::create_dir(path).unwrap();
+        }
+        let header = include.join("scope_fixture.h");
+        fs::write(&header, b"// recorded header bytes\n").unwrap();
+        fs::write(library.join("fixture.lib"), b"recorded library bytes").unwrap();
+        let compiler = bin.join("cl.exe");
+        fs::write(&compiler, b"scope fixture, never executed").unwrap();
+
+        let include_alias = workspace.path().join("sdk-include");
+        let library_alias = workspace.path().join("sdk-lib");
+        assert_eq!(
+            include_alias.canonicalize().unwrap(),
+            include.canonicalize().unwrap()
+        );
+        assert_eq!(
+            library_alias.canonicalize().unwrap(),
+            library.canonicalize().unwrap()
+        );
+
+        let mut manifest = manifest_fixture();
+        manifest.compiler = tool_file_identity(&compiler).unwrap();
+        manifest.executable_inputs = vec![manifest.compiler.clone()];
+        manifest
+            .environment
+            .insert("INCLUDE".to_string(), include_alias.display().to_string());
+        for key in ["LIB", "LIBPATH"] {
+            manifest
+                .environment
+                .insert(key.to_string(), library_alias.display().to_string());
+        }
+        manifest.include_roots = environment_roots(&manifest.environment, &["INCLUDE"]).unwrap();
+        manifest.discovery_roots =
+            environment_roots(&manifest.environment, &["LIB", "LIBPATH"]).unwrap();
+        manifest
+            .discovery_roots
+            .push(parent(&manifest.compiler.path).unwrap().to_string());
+        manifest.discovery_roots.sort();
+        manifest.discovery_roots.dedup();
+        let scopes = manifest
+            .include_roots
+            .iter()
+            .chain(&manifest.discovery_roots)
+            .cloned()
+            .collect::<Vec<_>>();
+        manifest.files = collect_host_toolchain_scope_files(&scopes).unwrap();
+
+        validate_host_toolchain_manifest("actual-windows-search-roots", &manifest).unwrap();
+        let recorded_header = manifest
+            .files
+            .iter()
+            .find(|file| basename(&file.logical_path) == "scope_fixture.h")
+            .unwrap();
+        assert_eq!(
+            comparison_path(&recorded_header.logical_path).unwrap(),
+            normalize_windows_path(&include_alias.join("scope_fixture.h").display().to_string())
+                .unwrap()
+        );
+        assert_eq!(
+            recorded_header.resolved_path,
+            header.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(
+            recorded_header.sha256,
+            sha256_bytes(b"// recorded header bytes\n")
+        );
+        assert_eq!(
+            rebuild_host_toolchain_manifest(&manifest).unwrap(),
+            manifest
+        );
     }
 
     #[test]

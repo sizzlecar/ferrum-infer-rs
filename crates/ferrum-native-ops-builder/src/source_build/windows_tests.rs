@@ -101,6 +101,103 @@ fn plan(root: &Path) -> (NativeOperatorSourceBuildPlan, PathBuf) {
     )
 }
 
+#[test]
+fn dependency_proof_publication_reopens_and_rejects_damaged_members() {
+    let root = tempfile::tempdir().unwrap();
+    let (plan, _) = plan(root.path());
+    let source = root.path().join("source").canonicalize().unwrap();
+    let output = root.path().join("build");
+    let cache_entry = root.path().join("cache-entry");
+    fs::create_dir(&output).unwrap();
+    fs::create_dir(&cache_entry).unwrap();
+    let object = output.join("fixture.obj");
+    fs::write(&object, b"object bytes bound by the dependency proof").unwrap();
+    let object_sha256 = sha256_file(&object).unwrap();
+    let cache_key = sha256_bytes(b"dependency-proof-publication-fixture");
+    let compiler_depfile = output.join("compiler.raw.d");
+    let portable_depfile = output.join("dependency.d");
+    let translation_unit = &plan.translation_units[0];
+    let closure = &plan.dependency_closures[0];
+    let dependencies = std::iter::once(translation_unit.path.clone())
+        .chain(closure.headers.iter().map(|header| header.path.clone()))
+        .collect::<Vec<_>>();
+    fs::write(
+        &compiler_depfile,
+        serialize_portable_depfile(&object.display().to_string(), &dependencies).unwrap(),
+    )
+    .unwrap();
+    let toolchain_scope = NativeOperatorToolchainDependencyScope {
+        by_absolute_path: BTreeMap::new(),
+    };
+    let validated = validate_translation_unit_depfile(
+        &compiler_depfile,
+        &portable_depfile,
+        &object,
+        &source,
+        translation_unit,
+        closure,
+        &toolchain_scope,
+    )
+    .unwrap();
+    publish_object_dependency_proof(
+        &cache_entry,
+        &cache_key,
+        &object_sha256,
+        translation_unit,
+        closure,
+        &validated.compiler_raw,
+        &validated.compiler_sha256,
+        &validated.portable_raw,
+        &validated.portable_sha256,
+        &source.display().to_string(),
+        &object.display().to_string(),
+        &validated.bindings,
+        &validated.observed_dependencies,
+        &toolchain_scope,
+    )
+    .unwrap();
+
+    let restored = root.path().join("restored");
+    let restored_compiler = restored.join("compiler.raw.d");
+    let restored_portable = restored.join("dependency.d");
+    let restore = || {
+        restore_object_dependency_proof(
+            &cache_entry,
+            &cache_key,
+            &object_sha256,
+            closure,
+            translation_unit,
+            &restored.join("fixture.obj"),
+            &restored_compiler,
+            &restored_portable,
+            &toolchain_scope,
+        )
+    };
+    let proof = restore().unwrap().expect("published proof is reusable");
+    assert_eq!(proof.observed_dependencies, validated.observed_dependencies);
+    assert_eq!(
+        fs::read(&restored_compiler).unwrap(),
+        validated.compiler_raw
+    );
+    assert_eq!(
+        fs::read(&restored_portable).unwrap(),
+        validated.portable_raw
+    );
+
+    for member in ["compiler-dependency.raw.d", "dependency.d", "proof.json"] {
+        let path = cache_entry.join("dependency-proof").join(member);
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, b"damaged cached evidence\n").unwrap();
+        fs::remove_file(&restored_compiler).unwrap();
+        fs::remove_file(&restored_portable).unwrap();
+        assert!(restore().is_err(), "damaged {member} must be rejected");
+        assert!(!restored_compiler.exists());
+        assert!(!restored_portable.exists());
+        fs::write(&path, original).unwrap();
+        assert!(restore().unwrap().is_some());
+    }
+}
+
 fn receipt(
     plan: &NativeOperatorSourceBuildPlan,
     plan_path: &Path,
