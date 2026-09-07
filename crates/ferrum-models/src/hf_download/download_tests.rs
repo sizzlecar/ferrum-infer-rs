@@ -526,6 +526,57 @@ async fn indexed_transfer_failure_preserves_ref_and_retry_completes() {
 }
 
 #[tokio::test]
+async fn sidecar_inventory_and_payloads_keep_the_resolved_commit_when_main_moves() {
+    let files = single_files(true);
+    let mut branch_files = files.clone();
+    branch_files
+        .iter_mut()
+        .find(|file| file.path == "chat_template.jinja")
+        .unwrap()
+        .bytes = b"different branch template and length".to_vec();
+    let hub = HubFixture::with_files(files, Some(branch_files)).await;
+    let downloader = hub.downloader();
+    let selected = ["config.json", "tokenizer.json", "chat_template.jinja"];
+    let snapshot = downloader
+        .download_sidecar_files(MODEL_ID, None, &selected)
+        .await
+        .unwrap();
+    hub.assert_pinned_reads();
+    assert_eq!(
+        std::fs::read(snapshot.join("chat_template.jinja")).unwrap(),
+        TEMPLATE.as_bytes()
+    );
+    assert_eq!(std::fs::read_to_string(hub.main_ref()).unwrap(), REVISION);
+    assert_eq!(
+        super::inspect_cached_metadata_inventory(&snapshot).unwrap(),
+        None
+    );
+    assert_eq!(hub.file_requests("GET", "model.safetensors"), 0);
+
+    // Repair the same commit after its optional template link is lost. A record
+    // of main's different size must not survive and make this cache incomplete.
+    std::fs::remove_file(snapshot.join("chat_template.jinja")).unwrap();
+    let reason = super::inspect_cached_metadata_inventory(&snapshot)
+        .unwrap()
+        .unwrap();
+    assert!(reason.contains("chat_template.jinja"), "{reason}");
+    let restored = downloader
+        .download_sidecar_files(MODEL_ID, None, &selected)
+        .await
+        .unwrap();
+    assert_eq!(restored, snapshot);
+    hub.assert_pinned_reads();
+    assert_eq!(
+        std::fs::read(restored.join("chat_template.jinja")).unwrap(),
+        TEMPLATE.as_bytes()
+    );
+    assert_eq!(
+        super::inspect_cached_metadata_inventory(&restored).unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn ordinary_download_keeps_indexed_and_auxiliary_model_weights() {
     let mut files = indexed_files();
     files.push(HubFile::new(

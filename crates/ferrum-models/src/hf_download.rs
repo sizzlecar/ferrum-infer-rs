@@ -19,7 +19,12 @@ use std::sync::{Arc, OnceLock};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
+mod metadata_inventory;
 mod selection;
+
+pub use metadata_inventory::{
+    inspect_cached_metadata_inventory, inspect_cached_metadata_selection,
+};
 
 #[derive(Clone, Copy)]
 enum DownloadLayout {
@@ -253,7 +258,15 @@ impl HfDownloader {
         fs::create_dir_all(&blobs_dir).await?;
         fs::create_dir_all(&refs_dir).await?;
 
-        let files = self.list_files(model_id, revision).await?;
+        // The inventory's sizes and the payloads must describe the same commit,
+        // even when the requested branch moves during metadata downloads.
+        let commit_sha = self.get_commit_sha(model_id, revision).await?;
+        if commit_sha.len() != 40 || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FerrumError::model(
+                "HuggingFace returned an invalid commit SHA",
+            ));
+        }
+        let files = self.list_files(model_id, &commit_sha).await?;
         let files_to_download: Vec<_> = files
             .iter()
             .filter(|f| {
@@ -267,14 +280,15 @@ impl HfDownloader {
             )));
         }
 
-        let commit_sha = self.get_commit_sha(model_id, revision).await?;
         let snapshot_dir = snapshots_dir.join(&commit_sha);
         fs::create_dir_all(&snapshot_dir).await?;
+
+        metadata_inventory::record_selected_metadata(&snapshot_dir, &files_to_download).await?;
 
         for f in &files_to_download {
             self.download_file_concurrent(
                 model_id,
-                revision,
+                &commit_sha,
                 &f.path,
                 f.size.unwrap_or(0),
                 &blobs_dir,
@@ -364,6 +378,10 @@ impl HfDownloader {
         if files_to_download.is_empty() {
             return Err(FerrumError::model("No model files found in repository"));
         }
+
+        // Retain the selected sidecars outside the snapshot so a failed optional
+        // template/tokenizer transfer cannot become a successful warm cache hit.
+        metadata_inventory::record_selected_metadata(&snapshot_dir, &files_to_download).await?;
 
         // Calculate total size
         let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();

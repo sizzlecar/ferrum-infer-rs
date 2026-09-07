@@ -8,6 +8,9 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
+pub(crate) mod cached_weights;
+pub use cached_weights::{inspect_cached_weights, CachedWeights};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelSourceRuntimeEnv {
     hf_home: Option<String>,

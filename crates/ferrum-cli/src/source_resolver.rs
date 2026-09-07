@@ -26,6 +26,9 @@
 
 use std::path::{Path, PathBuf};
 
+pub(crate) mod cache;
+use cache::{CacheRequirements, CachedModel};
+
 /// Small, release-supported starter models used by CLI guidance. These are
 /// intentionally not implicit defaults: users should see what will download.
 pub const METAL_FIRST_SUCCESS_MODEL: &str = "qwen3.5:4b-q4_k_m";
@@ -956,20 +959,19 @@ fn parse_pinned_hf_repository(model: &str) -> Result<Option<PinnedHfRepository<'
 }
 
 impl PinnedHfRepository<'_> {
-    fn cached(&self, cache_dir: &Path, requested_model: &str) -> Option<ResolvedModelSource> {
+    fn cached(
+        &self,
+        cache_dir: &Path,
+        requested_model: &str,
+        requirements: CacheRequirements,
+    ) -> Result<CachedModel> {
         // A pin never follows refs/main or another available snapshot.
         let local_path = cache_dir
             .join("hub")
             .join(format!("models--{}", self.repo_id.replace('/', "--")))
             .join("snapshots")
             .join(&self.revision);
-        let format = detect_format(&local_path);
-        (format != ModelFormat::Unknown).then(|| ResolvedModelSource {
-            original: requested_model.to_owned(),
-            local_path,
-            format,
-            from_cache: true,
-        })
+        cache::inspect_snapshot(&local_path, requested_model, requirements)
     }
 
     fn verify_snapshot(&self, path: &Path) -> Result<()> {
@@ -992,50 +994,9 @@ impl PinnedHfRepository<'_> {
 /// Look up `model_id` in the HF cache (`hub/models--owner--repo/snapshots/<rev>`).
 /// Returns the resolved snapshot path + detected format, or `None` if not cached.
 pub fn find_cached_model(cache_dir: &Path, model_id: &str) -> Option<ResolvedModelSource> {
-    let repo_dir = cache_dir
-        .join("hub")
-        .join(format!("models--{}", model_id.replace('/', "--")));
-    let snapshots_dir = repo_dir.join("snapshots");
-
-    // Prefer the revision pointed to by refs/main.
-    let ref_main = repo_dir.join("refs").join("main");
-    if let Ok(rev) = std::fs::read_to_string(&ref_main) {
-        let rev = rev.trim();
-        if !rev.is_empty() {
-            let snapshot = snapshots_dir.join(rev);
-            if snapshot.exists() {
-                let format = detect_format(&snapshot);
-                if format != ModelFormat::Unknown {
-                    return Some(ResolvedModelSource {
-                        original: model_id.to_string(),
-                        local_path: snapshot,
-                        format,
-                        from_cache: true,
-                    });
-                }
-            }
-        }
-    }
-
-    // Fallback: first snapshot directory with valid weights.
-    if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let format = detect_format(&path);
-                if format != ModelFormat::Unknown {
-                    return Some(ResolvedModelSource {
-                        original: model_id.to_string(),
-                        local_path: path,
-                        format,
-                        from_cache: true,
-                    });
-                }
-            }
-        }
-    }
-
-    None
+    cache::inspect_cached_model(cache_dir, model_id, CacheRequirements::Product)
+        .ok()?
+        .into_source()
 }
 
 /// Locate one exact GGUF artifact in the Hugging Face cache.
@@ -1043,24 +1004,18 @@ pub fn find_cached_gguf(cache_dir: &Path, repo: &str, filename: &str) -> Option<
     let repo_dir = cache_dir
         .join("hub")
         .join(format!("models--{}", repo.replace('/', "--")));
-    let snapshots_dir = repo_dir.join("snapshots");
-
-    let ref_main = repo_dir.join("refs").join("main");
-    if let Ok(revision) = std::fs::read_to_string(&ref_main) {
-        let revision = revision.trim();
-        if !revision.is_empty() {
-            let candidate = snapshots_dir.join(revision).join(filename);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    std::fs::read_dir(&snapshots_dir)
+    cache::snapshot_candidates(&repo_dir)
         .ok()?
-        .flatten()
-        .map(|entry| entry.path().join(filename))
-        .find(|candidate| candidate.is_file())
+        .into_iter()
+        .map(|snapshot| snapshot.join(filename))
+        .find(|candidate| {
+            matches!(
+                ferrum_models::source::inspect_cached_weights(candidate),
+                Ok(ferrum_models::source::CachedWeights::Ready(
+                    ModelFormat::GGUF
+                ))
+            )
+        })
 }
 
 const PRODUCT_SOURCE_FILES: [&str; 7] = [
@@ -1073,33 +1028,49 @@ const PRODUCT_SOURCE_FILES: [&str; 7] = [
     "generation_config.json",
 ];
 
-fn is_complete_product_metadata_snapshot(path: &Path) -> bool {
-    path.is_dir() && path.join("config.json").is_file() && path.join("tokenizer.json").is_file()
+fn is_complete_product_metadata_snapshot(path: &Path) -> Result<bool> {
+    let missing =
+        ferrum_models::hf_download::inspect_cached_metadata_selection(path, &PRODUCT_SOURCE_FILES)?;
+    for filename in ["config.json", "tokenizer.json"] {
+        let file = path.join(filename);
+        match std::fs::metadata(&file) {
+            Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(FerrumError::model(format!(
+                    "Cached model metadata {} is not a file",
+                    file.display()
+                )));
+            }
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(missing.is_none())
 }
 
 /// Locate a sidecar-only repository snapshot. Unlike `find_cached_model`, this
 /// intentionally does not require a weight shard.
-fn find_cached_product_metadata(cache_dir: &Path, repo: &str) -> Option<PathBuf> {
+fn find_cached_product_metadata(cache_dir: &Path, repo: &str) -> Result<Option<PathBuf>> {
     let repo_dir = cache_dir
         .join("hub")
         .join(format!("models--{}", repo.replace('/', "--")));
-    let snapshots_dir = repo_dir.join("snapshots");
-
-    if let Ok(revision) = std::fs::read_to_string(repo_dir.join("refs/main")) {
-        let revision = revision.trim();
-        if !revision.is_empty() {
-            let candidate = snapshots_dir.join(revision);
-            if is_complete_product_metadata_snapshot(&candidate) {
-                return Some(candidate);
+    let mut invalid = None;
+    for candidate in cache::snapshot_candidates(&repo_dir)? {
+        match is_complete_product_metadata_snapshot(&candidate) {
+            Ok(true) => return Ok(Some(candidate)),
+            Ok(false) => {}
+            Err(error) => {
+                if invalid.is_none() {
+                    invalid = Some(error);
+                }
             }
         }
     }
-
-    std::fs::read_dir(&snapshots_dir)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .find(|candidate| is_complete_product_metadata_snapshot(candidate))
+    match invalid {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
 }
 
 fn repository_source(repo: impl Into<String>) -> OriginalModelSource {
@@ -1142,7 +1113,7 @@ fn open_colocated_product_sources(
     original_source: &ModelSource,
 ) -> Result<Option<Arc<ProductionModelSourceBundle>>> {
     let (metadata_root, weights, original_sources) = match source.format {
-        ModelFormat::SafeTensors if is_complete_product_metadata_snapshot(&source.local_path) => {
+        ModelFormat::SafeTensors if is_complete_product_metadata_snapshot(&source.local_path)? => {
             let original = original_product_source(original_source, &source.local_path)?;
             (
                 source.local_path.as_path(),
@@ -1160,7 +1131,7 @@ fn open_colocated_product_sources(
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new("."));
-            if !is_complete_product_metadata_snapshot(metadata_root) {
+            if !is_complete_product_metadata_snapshot(metadata_root)? {
                 return Ok(None);
             }
             let metadata_original = OriginalModelSource {
@@ -1214,6 +1185,7 @@ enum DownloadArtifacts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProductSourceComposition {
     ResolveColocated,
+    ResolveWithExplicitTokenizer,
     DeferUntilExplicitSemantic,
 }
 
@@ -1356,6 +1328,18 @@ async fn resolve_model_source_internal(
 ) -> Result<Resolved> {
     let defer_colocated_product_sources =
         source_composition == ProductSourceComposition::DeferUntilExplicitSemantic;
+    let defer_repository_product_sources =
+        source_composition != ProductSourceComposition::ResolveColocated;
+    let cache_requirements = match source_composition {
+        ProductSourceComposition::DeferUntilExplicitSemantic => CacheRequirements::WeightsOnly,
+        ProductSourceComposition::ResolveWithExplicitTokenizer => {
+            CacheRequirements::ExplicitTokenizer
+        }
+        ProductSourceComposition::ResolveColocated => match download_artifacts {
+            DownloadArtifacts::RootSafetensors => CacheRequirements::Product,
+            DownloadArtifacts::Repository => CacheRequirements::Repository,
+        },
+    };
     // 1. Curated GGUF alias. Resolve this before the general HF alias table:
     // a GGUF alias names one exact file, not a safetensors repository.
     if let Some((repo, filename)) = resolve_gguf_alias(model) {
@@ -1391,7 +1375,7 @@ async fn resolve_model_source_internal(
                 ))
             })?;
             let (metadata_root, metadata_from_cache) =
-                match find_cached_product_metadata(cache_dir, &metadata_repo) {
+                match find_cached_product_metadata(cache_dir, &metadata_repo)? {
                     Some(path) => (path, true),
                     None if download == DownloadPolicy::AutoDownload => {
                         let downloader =
@@ -1399,7 +1383,7 @@ async fn resolve_model_source_internal(
                         let path = downloader
                             .download_sidecar_files(&metadata_repo, None, &PRODUCT_SOURCE_FILES)
                             .await?;
-                        if !is_complete_product_metadata_snapshot(&path) {
+                        if !is_complete_product_metadata_snapshot(&path)? {
                             return Err(FerrumError::model(format!(
                                 "semantic/tokenizer source '{metadata_repo}' did not provide config.json and tokenizer.json"
                             )));
@@ -1486,7 +1470,7 @@ async fn resolve_model_source_internal(
                 from_cache: false,
             };
             let original_source = ModelSource::Local(model.to_owned());
-            let model_sources = if defer_colocated_product_sources {
+            let model_sources = if defer_repository_product_sources {
                 None
             } else {
                 open_colocated_product_sources(&source, &original_source)?
@@ -1498,6 +1482,10 @@ async fn resolve_model_source_internal(
                 autosize,
             ));
         }
+        return Err(FerrumError::model(format!(
+            "local model directory '{}' has no supported weights",
+            direct.display()
+        )));
     }
 
     // 4. HF cache hit. Parse pins only after existing local sources.
@@ -1508,8 +1496,12 @@ async fn resolve_model_source_internal(
         .unwrap_or_else(|| resolve_model_alias(model));
     let revision = pinned.as_ref().map(|pin| pin.revision.as_str());
     let cached = match &pinned {
-        Some(pin) => pin.cached(cache_dir, model),
-        None => find_cached_model(cache_dir, &model_id),
+        Some(pin) => pin.cached(cache_dir, model, cache_requirements)?,
+        None => cache::inspect_cached_model(cache_dir, &model_id, cache_requirements)?,
+    };
+    let (cached, incomplete_reason) = match cached {
+        CachedModel::Ready(source) => (Some(source), None),
+        CachedModel::Missing(reason) => (None, reason),
     };
     if let Some(source) = cached {
         if let Some(pin) = &pinned {
@@ -1520,7 +1512,7 @@ async fn resolve_model_source_internal(
             revision: revision.map(str::to_owned),
             cache_dir: Some(cache_dir.display().to_string()),
         };
-        let model_sources = if defer_colocated_product_sources {
+        let model_sources = if defer_repository_product_sources {
             None
         } else {
             open_colocated_product_sources(&source, &original_source)?
@@ -1535,10 +1527,19 @@ async fn resolve_model_source_internal(
 
     // 5. HF download.
     if download != DownloadPolicy::AutoDownload {
+        if let Some(reason) = incomplete_reason {
+            return Err(FerrumError::model(format!(
+                "model '{}' has an incomplete cache and DownloadPolicy::NoDownload is set: {reason}",
+                if pinned.is_some() { model } else { &model_id }
+            )));
+        }
         return Err(FerrumError::model(format!(
             "model '{}' not found locally and DownloadPolicy::NoDownload set",
             if pinned.is_some() { model } else { &model_id }
         )));
+    }
+    if let Some(reason) = incomplete_reason {
+        eprintln!("Cached model needs download recovery: {reason}");
     }
 
     let token = std::env::var("HF_TOKEN")
@@ -1554,28 +1555,26 @@ async fn resolve_model_source_internal(
     if let Some(pin) = &pinned {
         pin.verify_snapshot(&snapshot_path)?;
     }
-    let format = detect_format(&snapshot_path);
-    if format == ModelFormat::Unknown {
-        return Err(FerrumError::model(
-            "downloaded model has unknown format (no safetensors / pytorch_model.bin)",
-        ));
-    }
-    let source = ResolvedModelSource {
-        original: if pinned.is_some() {
-            model.to_owned()
-        } else {
-            model_id.clone()
-        },
-        local_path: snapshot_path,
-        format,
-        from_cache: false,
+    let mut source = match cache::inspect_snapshot(
+        &snapshot_path,
+        if pinned.is_some() { model } else { &model_id },
+        cache_requirements,
+    )? {
+        CachedModel::Ready(source) => source,
+        CachedModel::Missing(reason) => {
+            return Err(FerrumError::model(format!(
+                "downloaded model is incomplete: {}",
+                reason.as_deref().unwrap_or("no supported weights found")
+            )));
+        }
     };
+    source.from_cache = false;
     let original_source = ModelSource::HuggingFace {
         repo_id: model_id,
         revision: revision.map(str::to_owned),
         cache_dir: Some(cache_dir.display().to_string()),
     };
-    let model_sources = if defer_colocated_product_sources {
+    let model_sources = if defer_repository_product_sources {
         None
     } else {
         open_colocated_product_sources(&source, &original_source)?
@@ -1608,6 +1607,8 @@ pub async fn resolve_model_source_with_product_sources(
         autosize,
         if source_args.semantic_source.is_some() {
             ProductSourceComposition::DeferUntilExplicitSemantic
+        } else if source_args.tokenizer_source.is_some() {
+            ProductSourceComposition::ResolveWithExplicitTokenizer
         } else {
             ProductSourceComposition::ResolveColocated
         },
@@ -1660,12 +1661,18 @@ fn apply_explicit_product_sources(
         location: path.display().to_string(),
         requested_revision: None,
     };
-    let semantic_original = source_args
+    let semantic_original = match source_args
         .semantic_source
         .as_deref()
         .map(explicit_original)
         .or_else(|| existing.map(|sources| sources.original_sources().semantic.clone()))
-        .unwrap_or_else(|| explicit_original(semantic_root));
+    {
+        Some(original) => original,
+        None if matches!(&resolved.original_source, ModelSource::HuggingFace { .. }) => {
+            original_product_source(&resolved.original_source, semantic_root)?
+        }
+        None => explicit_original(semantic_root),
+    };
     let tokenizer_original = source_args
         .tokenizer_source
         .as_deref()
@@ -1972,6 +1979,60 @@ mod tests {
             std::fs::write(snapshot.join(name), bytes).unwrap();
         }
         snapshot
+    }
+
+    #[test]
+    fn incomplete_indexed_cache_is_not_a_hit() {
+        let cache = tempfile::tempdir().unwrap();
+        let repo = "Owner/Interrupted";
+        let revision = "a".repeat(40);
+        let snapshot = cached_hf_fixture(cache.path(), repo, &revision);
+        std::fs::remove_file(snapshot.join("model.safetensors")).unwrap();
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            br#"{"weight_map":{"first":"part-1.safetensors","last":"part-2.safetensors"}}"#,
+        )
+        .unwrap();
+        std::fs::write(snapshot.join("part-1.safetensors"), b"first shard").unwrap();
+
+        // The downloader writes the index before all shards and only writes
+        // refs/main on success, so both fallback and referenced lookup matter.
+        assert!(find_cached_model(cache.path(), repo).is_none());
+        let refs = snapshot.parent().unwrap().parent().unwrap().join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("main"), &revision).unwrap();
+        assert!(find_cached_model(cache.path(), repo).is_none());
+
+        std::fs::write(snapshot.join("part-2.safetensors"), b"last shard").unwrap();
+        assert_eq!(
+            find_cached_model(cache.path(), repo).unwrap().local_path,
+            snapshot
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_pinned_cache_reports_missing_shard_without_falling_back() {
+        let cache = tempfile::tempdir().unwrap();
+        let revision = "a".repeat(40);
+        let repo = "Owner/Interrupted";
+        let requested = format!("{repo}@{revision}");
+        let snapshot = cached_hf_fixture(cache.path(), repo, &revision);
+        cached_hf_fixture(cache.path(), repo, &"b".repeat(40));
+        std::fs::remove_file(snapshot.join("model.safetensors")).unwrap();
+        std::fs::write(
+            snapshot.join("model.safetensors.index.json"),
+            br#"{"weight_map":{"weight":"missing.safetensors"}}"#,
+        )
+        .unwrap();
+
+        let error =
+            resolve_model_source(&requested, cache.path(), DownloadPolicy::NoDownload, None)
+                .await
+                .err()
+                .expect("a pinned incomplete snapshot cannot satisfy an offline request")
+                .to_string();
+        assert!(error.contains("missing.safetensors"), "{error}");
+        assert!(error.contains("NoDownload"), "{error}");
     }
 
     #[test]

@@ -1,3 +1,6 @@
+// Each integration-test binary uses a different subset of this local Hub fixture.
+#![allow(dead_code)]
+
 use axum::{
     body::Body,
     extract::State,
@@ -9,7 +12,7 @@ use safetensors::tensor::{serialize, Dtype, TensorView};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::Cursor,
     sync::{Arc, Mutex},
 };
@@ -22,6 +25,7 @@ pub type ModelFiles = BTreeMap<String, Files>;
 struct HubState {
     files: ModelFiles,
     requests: Mutex<Vec<(Method, String)>>,
+    failing_gets: Mutex<BTreeSet<(String, String)>>,
 }
 
 pub struct Hub {
@@ -37,6 +41,7 @@ impl Hub {
         let state = Arc::new(HubState {
             files,
             requests: Mutex::new(Vec::new()),
+            failing_gets: Mutex::new(BTreeSet::new()),
         });
         let router = Router::new().fallback(handle).with_state(state.clone());
         let server = tokio::spawn(async move {
@@ -66,6 +71,32 @@ impl Hub {
     pub fn clear_requests(&self) {
         self.state.requests.lock().unwrap().clear();
     }
+
+    pub fn fail_get(&self, repo: &str, filename: &str) {
+        self.state
+            .failing_gets
+            .lock()
+            .unwrap()
+            .insert((repo.to_owned(), filename.to_owned()));
+    }
+
+    pub fn allow_get(&self, repo: &str, filename: &str) {
+        self.state
+            .failing_gets
+            .lock()
+            .unwrap()
+            .remove(&(repo.to_owned(), filename.to_owned()));
+    }
+
+    pub fn request_paths(&self) -> Vec<String> {
+        self.state
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
 }
 
 impl Drop for Hub {
@@ -90,14 +121,34 @@ async fn handle(State(state): State<Arc<HubState>>, method: Method, uri: Uri) ->
                 );
             }
             if path == format!("/api/models/{repo}/tree/{revision}") {
-                let entries: Vec<_> = files
-                    .iter()
+                let failing_gets = state.failing_gets.lock().unwrap();
+                let mut ordered_files: Vec<_> = files.iter().collect();
+                // Listing order is not a Hub API guarantee. Put the injected
+                // failure last so earlier transfers can finish before the
+                // downloader reports the interruption to the CLI.
+                ordered_files.sort_by_key(|(name, _)| {
+                    failing_gets.contains(&(repo.clone(), (*name).clone()))
+                });
+                let entries: Vec<_> = ordered_files
+                    .into_iter()
                     .map(|(name, bytes)| json!({"path": name, "size": bytes.len(), "type": "file"}))
                     .collect();
                 return response(&method, serde_json::to_vec(&entries).unwrap());
             }
             if let Some(name) = path.strip_prefix(&format!("/{repo}/resolve/{revision}/")) {
                 if let Some(bytes) = files.get(name) {
+                    if method == Method::GET
+                        && state
+                            .failing_gets
+                            .lock()
+                            .unwrap()
+                            .contains(&(repo.clone(), name.to_owned()))
+                    {
+                        return Response::builder()
+                            .status(503)
+                            .body(Body::from("fixture download interrupted"))
+                            .unwrap();
+                    }
                     return response(&method, bytes.clone());
                 }
             }
