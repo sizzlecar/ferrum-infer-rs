@@ -1684,7 +1684,7 @@ mod tests {
             "rms_norm_eps":0.000001,"rope_theta":1000000,"tie_word_embeddings":false,
             "hidden_act":"silu","torch_dtype":"float16","attention_bias":false,
             "decoder_sparse_step":1,"mlp_only_layers":[],
-            "quantization_config":{"quant_method":"gptq","checkpoint_format":"gptq","bits":4,"group_size":128,"desc_act":false,"sym":true}
+            "quantization_config":{"quant_method":"gptq","bits":4,"group_size":128,"desc_act":false,"sym":true}
         });
         fs::write(
             directory.path().join("config.json"),

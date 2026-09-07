@@ -368,10 +368,21 @@ fn parse_quantization(root: &Map<String, Value>) -> Result<Qwen3MoeGptqConfig, S
         .get("quantization_config")
         .and_then(Value::as_object)
         .ok_or_else(|| "quantization_config must be an object".to_owned())?;
-    if required_string(quantization, "quant_method")? != "gptq"
-        || required_string(quantization, "checkpoint_format")? != "gptq"
-    {
+    if required_string(quantization, "quant_method")? != "gptq" {
         return Err("quantization_config must describe a GPTQ checkpoint".to_owned());
+    }
+    // HF GPTQ defaults to v1 when its optional format is absent (including
+    // AutoRound's GPTQ exports). Honor both field spellings; an explicit v2,
+    // conflicting value or malformed declaration must never fall back to v1.
+    for field in ["checkpoint_format", "format"] {
+        if quantization
+            .get(field)
+            .is_some_and(|value| value.as_str() != Some("gptq"))
+        {
+            return Err(format!(
+                "quantization_config.{field} must describe a GPTQ v1 checkpoint"
+            ));
+        }
     }
     if quantization
         .get("static_groups")
@@ -475,6 +486,42 @@ mod tests {
                 "sym": true
             }
         })
+    }
+
+    #[test]
+    fn gptq_format_defaults_to_v1_but_explicit_formats_remain_binding() {
+        let mut raw = reference_config();
+        let expected = Qwen3MoeSemanticConfig::parse(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        raw["quantization_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("checkpoint_format");
+        assert_eq!(
+            Qwen3MoeSemanticConfig::parse(&serde_json::to_vec(&raw).unwrap()).unwrap(),
+            expected
+        );
+        for field in ["checkpoint_format", "format"] {
+            let mut valid = raw.clone();
+            valid["quantization_config"][field] = serde_json::json!("gptq");
+            assert_eq!(
+                Qwen3MoeSemanticConfig::parse(&serde_json::to_vec(&valid).unwrap()).unwrap(),
+                expected
+            );
+            for value in [
+                Value::Null,
+                serde_json::json!("gptq_v2"),
+                serde_json::json!("awq"),
+                serde_json::json!(4),
+            ] {
+                valid["quantization_config"][field] = value;
+                assert!(
+                    Qwen3MoeSemanticConfig::parse(&serde_json::to_vec(&valid).unwrap()).is_err()
+                );
+            }
+        }
+        raw["quantization_config"]["checkpoint_format"] = serde_json::json!("gptq");
+        raw["quantization_config"]["format"] = serde_json::json!("gptq_v2");
+        assert!(Qwen3MoeSemanticConfig::parse(&serde_json::to_vec(&raw).unwrap()).is_err());
     }
 
     #[test]
