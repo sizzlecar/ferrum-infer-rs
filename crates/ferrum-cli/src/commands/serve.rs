@@ -49,13 +49,13 @@ pub struct ServeCommand {
     )]
     pub served_model_name: Vec<String>,
 
-    /// Enable model reasoning by default when a request omits
-    /// `chat_template_kwargs.enable_thinking`.
+    /// Enable model reasoning by default unless a request supplies standard
+    /// reasoning effort or `chat_template_kwargs.enable_thinking`.
     #[arg(long, conflicts_with = "disable_thinking")]
     pub enable_thinking: bool,
 
-    /// Disable model reasoning by default when a request omits
-    /// `chat_template_kwargs.enable_thinking`.
+    /// Disable model reasoning by default unless a request supplies standard
+    /// reasoning effort or `chat_template_kwargs.enable_thinking`.
     #[arg(long, conflicts_with = "enable_thinking")]
     pub disable_thinking: bool,
 

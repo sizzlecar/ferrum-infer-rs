@@ -88,7 +88,9 @@ explicit limit must fit the rendered input plus the requested output budget.
 The Quick Start uses `--disable-thinking` so the first response is short and
 direct. Omit the flag to preserve the model template's default reasoning
 behavior; an HTTP request can override the server default with
-`chat_template_kwargs.enable_thinking`.
+`chat_template_kwargs.enable_thinking`, Chat `reasoning_effort`, or Responses
+`reasoning.effort`. See [reasoning control behavior](docs/openai-api-compatibility.md#chat-fields)
+for model support and compatibility details.
 
 `ferrum doctor <MODEL>` resolves an alias and prints the next `run` and `serve`
 commands without downloading the model or starting an inference engine.

@@ -283,14 +283,19 @@ fn run_request_metadata(
     prompt: &str,
     chat_template_options: &ChatTemplateOptions,
     protocol: ModelOutputProtocol,
+    model_template: Option<&ModelChatTemplate>,
 ) -> HashMap<String, serde_json::Value> {
     let mut metadata = HashMap::new();
     if !has_unclosed_model_reasoning_block(protocol, prompt) {
         let mut forbidden = model_reasoning_markers(protocol)
             .map(|(_, closing)| vec![serde_json::Value::String(closing.to_string())])
             .unwrap_or_default();
+        // A template may ignore the thinking option. Only an observed
+        // reasoning protocol gives this opener a control-token meaning.
         if protocol == ModelOutputProtocol::Text
             && chat_template_options.enable_thinking == Some(false)
+            && model_template
+                .is_some_and(|template| template.reasoning_protocol.supports_reasoning())
         {
             forbidden.push(serde_json::Value::String(THINK_START_TAG.to_string()));
         }
@@ -1309,8 +1314,12 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
         let model_output_protocol = plan.sampling_params.model_output_protocol;
         let prompt_opened_thinking =
             has_unclosed_model_reasoning_block(model_output_protocol, &plan.prompt);
-        let metadata =
-            run_request_metadata(&plan.prompt, &chat_template_options, model_output_protocol);
+        let metadata = run_request_metadata(
+            &plan.prompt,
+            &chat_template_options,
+            model_output_protocol,
+            model_chat_template.as_ref(),
+        );
         let prompt_chars = plan.prompt.chars().count();
         let request_id = RequestId(Uuid::new_v4());
         let request_id_text = request_id.to_string();
@@ -1657,6 +1666,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
                     &plan.prompt,
                     &chat_template_options,
                     model_output_protocol,
+                    model_chat_template.as_ref(),
                 );
                 let request_id = RequestId(Uuid::new_v4());
                 let expected_request_id = request_id.clone();
@@ -3525,6 +3535,7 @@ mod tests {
             "<|im_start|>assistant\n",
             &ChatTemplateOptions::default(),
             ModelOutputProtocol::Text,
+            None,
         );
         let forbidden = metadata
             .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
@@ -3565,25 +3576,124 @@ mod tests {
 
     #[test]
     fn run_metadata_forbids_initial_thinking_start_when_template_disables_thinking() {
-        let metadata = run_request_metadata(
-            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
-            &ChatTemplateOptions {
-                enable_thinking: Some(false),
-                ..Default::default()
-            },
-            ModelOutputProtocol::Text,
+        for (source, expected_protocol) in [
+            (
+                "<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% else %}<think>\n{% endif %}",
+                ferrum_types::ModelReasoningProtocol::PromptOpened,
+            ),
+            (
+                "<assistant>{% if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>\n\n{% endif %}",
+                ferrum_types::ModelReasoningProtocol::ModelGenerated,
+            ),
+        ] {
+            let template = ModelChatTemplate::new(source, "thinking-contract");
+            assert_eq!(template.reasoning_protocol, expected_protocol);
+            let mut cmd = test_run_cmd();
+            cmd.disable_thinking = true;
+            let options = build_chat_template_options(&cmd, Some(&template));
+            let prompt = build_chat_prompt(
+                &[],
+                "hello",
+                None,
+                "served-alias",
+                Some(&template),
+                &options,
+            )
+            .unwrap();
+            let metadata = run_request_metadata(
+                &prompt,
+                &options,
+                template.output_protocol,
+                Some(&template),
+            );
+            assert_eq!(
+                metadata[RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY],
+                serde_json::json!([THINK_END_TAG, THINK_START_TAG]),
+                "{expected_protocol:?}",
+            );
+
+            cmd.disable_thinking = false;
+            let options = build_chat_template_options(&cmd, Some(&template));
+            let prompt = build_chat_prompt(
+                &[],
+                "hello",
+                None,
+                "served-alias",
+                Some(&template),
+                &options,
+            )
+            .unwrap();
+            let metadata = run_request_metadata(
+                &prompt,
+                &options,
+                template.output_protocol,
+                Some(&template),
+            );
+            let forbidden = metadata
+                .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
+                .and_then(serde_json::Value::as_array);
+            assert!(forbidden.is_none_or(|tokens| !tokens.contains(&serde_json::json!(THINK_START_TAG))));
+        }
+    }
+
+    #[test]
+    fn run_disabling_thinking_preserves_sampling_for_plain_or_unknown_templates() {
+        let requires_system_message = concat!(
+            "{% if messages[0].role != 'system' %}",
+            "{{ raise_exception('a system message is required') }}{% endif %}",
+            "{{ messages[0].content }}|{{ messages[1].content }}",
         );
-        let forbidden = metadata
-            .get(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY)
-            .and_then(|value| value.as_array())
-            .expect("initial forbidden token texts");
-        assert_eq!(
-            forbidden,
-            &[
-                serde_json::Value::String(THINK_END_TAG.to_string()),
-                serde_json::Value::String(THINK_START_TAG.to_string()),
-            ]
-        );
+        for (source, expected_protocol) in [
+            (
+                "{{ messages[-1].content }}",
+                ferrum_types::ModelReasoningProtocol::None,
+            ),
+            (
+                requires_system_message,
+                ferrum_types::ModelReasoningProtocol::Unknown,
+            ),
+        ] {
+            let template = ModelChatTemplate::new(source, "conversation-contract");
+            assert_eq!(template.reasoning_protocol, expected_protocol);
+            let mut cmd = test_run_cmd();
+            let omitted = build_chat_template_options(&cmd, Some(&template));
+            cmd.disable_thinking = true;
+            let disabled = build_chat_template_options(&cmd, Some(&template));
+            let render = |options: &ChatTemplateOptions| {
+                build_chat_prompt(
+                    &[],
+                    "hello",
+                    Some("Be concise."),
+                    "served-alias",
+                    Some(&template),
+                    options,
+                )
+                .unwrap()
+            };
+            let original_prompt = render(&omitted);
+            let disabled_prompt = render(&disabled);
+            assert_eq!(original_prompt, disabled_prompt);
+            let original_metadata = run_request_metadata(
+                &original_prompt,
+                &omitted,
+                template.output_protocol,
+                Some(&template),
+            );
+            let disabled_metadata = run_request_metadata(
+                &disabled_prompt,
+                &disabled,
+                template.output_protocol,
+                Some(&template),
+            );
+            assert_eq!(
+                original_metadata, disabled_metadata,
+                "{expected_protocol:?}"
+            );
+            assert_eq!(
+                disabled_metadata[RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY],
+                serde_json::json!([THINK_END_TAG]),
+            );
+        }
     }
 
     #[test]
@@ -3592,6 +3702,7 @@ mod tests {
             "<|im_start|>assistant\n<think>\n",
             &ChatTemplateOptions::default(),
             ModelOutputProtocol::Text,
+            None,
         );
         assert!(!metadata.contains_key(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
     }
@@ -3612,7 +3723,7 @@ mod tests {
                 true,
             ),
         ] {
-            let metadata = run_request_metadata(prompt, &options, protocol);
+            let metadata = run_request_metadata(prompt, &options, protocol, None);
             if opened {
                 assert!(!metadata.contains_key(RUN_INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY));
             } else {

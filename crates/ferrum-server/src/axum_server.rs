@@ -248,8 +248,8 @@ impl AxumServer {
         self
     }
 
-    /// Set the server-wide reasoning default for requests that omit
-    /// `chat_template_kwargs.enable_thinking`. Per-request values still win.
+    /// Set the server-wide reasoning default. Explicit standard effort or
+    /// `chat_template_kwargs.enable_thinking` overrides this default.
     pub fn with_default_enable_thinking(mut self, enable_thinking: Option<bool>) -> Self {
         self.state = self.state.with_default_enable_thinking(enable_thinking);
         self
@@ -3527,6 +3527,8 @@ fn convert_chat_request_with_template_model_and_default(
         }
         if model_output_protocol == ModelOutputProtocol::Text
             && chat_template_options.enable_thinking == Some(false)
+            && model_template
+                .is_some_and(|template| template.reasoning_protocol.supports_reasoning())
         {
             push_unique_forbidden_token_text(&mut forbidden, THINK_START_TAG);
         }
@@ -3652,29 +3654,51 @@ fn chat_template_options_for_request(
     default_enable_thinking: Option<bool>,
 ) -> ferrum_types::Result<ChatTemplateOptions> {
     let mut options = ChatTemplateOptions::default_for_template(model_template);
-    options.enable_thinking = default_enable_thinking;
-    let Some(kwargs) = request.chat_template_kwargs.as_ref() else {
-        return Ok(options);
-    };
-    if let Some(value) = kwargs.get("enable_thinking") {
-        let Some(enable_thinking) = value.as_bool() else {
-            return Err(Error::invalid_request(
-                "chat_template_kwargs.enable_thinking must be a boolean",
-            ));
-        };
-        options.enable_thinking = Some(enable_thinking);
-    }
-    if let Some(value) = kwargs.get("reasoning_effort") {
-        let Some(reasoning_effort) = value.as_str() else {
-            return Err(Error::invalid_request(
-                "chat_template_kwargs.reasoning_effort must be one of: minimal, low, medium, high, xhigh",
-            ));
-        };
-        options.reasoning_effort = Some(reasoning_effort.parse::<ReasoningEffort>().map_err(
-            |error| {
+    let kwargs = request.chat_template_kwargs.as_ref();
+    let explicit_thinking = kwargs
+        .and_then(|values| values.get("enable_thinking"))
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                Error::invalid_request("chat_template_kwargs.enable_thinking must be a boolean")
+            })
+        })
+        .transpose()?;
+    let extension_effort = kwargs
+        .and_then(|values| values.get("reasoning_effort"))
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<ReasoningEffort>(value.clone()).map_err(|error| {
                 Error::invalid_request(format!("chat_template_kwargs.reasoning_effort: {error}"))
-            },
-        )?);
+            })
+        })
+        .transpose()?;
+    if let (Some(standard), Some(extension)) = (request.reasoning_effort, extension_effort) {
+        if standard != extension {
+            return Err(Error::invalid_request(
+                "reasoning_effort conflicts with chat_template_kwargs.reasoning_effort",
+            ));
+        }
+    }
+    options.reasoning_effort = request.reasoning_effort.or(extension_effort);
+    let effort_thinking = request
+        .reasoning_effort
+        .map(|effort| effort != ReasoningEffort::None);
+    if let (Some(explicit), Some(derived)) = (explicit_thinking, effort_thinking) {
+        if explicit != derived {
+            return Err(Error::invalid_request(
+                "reasoning_effort conflicts with chat_template_kwargs.enable_thinking",
+            ));
+        }
+    }
+    // Standard effort overrides product defaults and supplies both variables.
+    // Legacy-only kwargs keep their template-level behavior: an effort alone
+    // must not change their thinking switch or acquire new capability checks.
+    options.enable_thinking = explicit_thinking
+        .or(effort_thinking)
+        .or(default_enable_thinking);
+    if let (Some(template), Some(effort)) = (model_template, request.reasoning_effort) {
+        template.validate_reasoning_effort(effort)?;
     }
     Ok(options)
 }
@@ -5618,6 +5642,7 @@ mod tests {
     mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;
+    mod reasoning_controls;
     use super::*;
     use async_trait::async_trait;
     use axum::{
@@ -7517,9 +7542,12 @@ mod tests {
             "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}[{{ message.role }}]{{ message.content }}{% endfor %}",
             "strict-leading-system-template",
         );
+        let mut engine = CapturingLlm::new();
+        engine.config.model.model_id = ModelId::new("stub-model");
+        let engine = Arc::new(engine);
         let router = AxumServer::from_state(
             AppState::default()
-                .with_llm(Arc::new(StubLlm::new("ok")))
+                .with_llm(engine.clone())
                 .with_prompt_template(Some(template))
                 .with_interleaved_system_coalescing(false),
         )
@@ -7537,8 +7565,10 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(response.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.status(), AxumStatusCode::BAD_REQUEST);
         let body = response_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(!engine.has_captured_request());
         assert!(
             body.to_string()
                 .contains("System message must be at the beginning."),
@@ -7588,16 +7618,21 @@ mod tests {
         .await;
         assert_eq!(consecutive.status(), AxumStatusCode::OK);
 
+        let mut engine = CapturingLlm::new();
+        engine.config.model.model_id = ModelId::new("stub-model");
+        let engine = Arc::new(engine);
         let disabled_router = AxumServer::from_state(
             AppState::default()
-                .with_llm(Arc::new(StubLlm::new("ok")))
+                .with_llm(engine.clone())
                 .with_prompt_template(Some(template()))
                 .with_interleaved_system_coalescing(false),
         )
         .build_router();
         let disabled = post_json(disabled_router, "/v1/chat/completions", request()).await;
-        assert_eq!(disabled.status(), AxumStatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(disabled.status(), AxumStatusCode::BAD_REQUEST);
         let body = response_json(disabled).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(!engine.has_captured_request());
         assert!(
             body.to_string()
                 .contains("System message must be at the beginning."),

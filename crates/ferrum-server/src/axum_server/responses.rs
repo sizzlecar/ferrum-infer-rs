@@ -1103,12 +1103,8 @@ mod tests {
         );
         assert!(!converted.response.parallel_tool_calls);
         assert_eq!(
-            converted
-                .chat
-                .chat_template_kwargs
-                .as_ref()
-                .and_then(|kwargs| kwargs.get("reasoning_effort")),
-            Some(&json!("high"))
+            converted.chat.reasoning_effort,
+            Some(ferrum_types::ReasoningEffort::High)
         );
         let format = converted.chat.response_format.expect("response format");
         assert_eq!(format.format_type, "json_schema");

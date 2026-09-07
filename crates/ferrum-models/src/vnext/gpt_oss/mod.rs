@@ -10,7 +10,7 @@ use ferrum_interfaces::vnext::{
     WeightComponentSource, WeightSchema,
 };
 use ferrum_quantization::{Mxfp4SafetensorsSource, SafetensorsArchive};
-use ferrum_types::{DataType, ModelOutputProtocol};
+use ferrum_types::{DataType, ModelOutputProtocol, ReasoningEffort, ReasoningEffortSupport};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -264,7 +264,15 @@ fn production_descriptor(
         })?,
         DataType::FP16,
     )?
-    .with_output_protocol(ModelOutputProtocol::HarmonyGptOss))
+    .with_output_protocol(ModelOutputProtocol::HarmonyGptOss)
+    // The model provider owns this contract; Harmony framing alone does not
+    // establish which effort values a model supports.
+    // https://openai.com/index/introducing-gpt-oss/
+    .with_reasoning_effort_support(ReasoningEffortSupport::Declared(BTreeSet::from([
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+    ]))))
 }
 
 pub(super) fn family_registration() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>> {
@@ -351,6 +359,28 @@ mod tests {
         assert!(serde_json::to_vec(&family).unwrap().len() <= MAX_PREPARED_MODEL_FAMILY_WIRE_BYTES);
         assert_eq!(family.program().states().len(), 2);
         assert_eq!(family.external_metadata_id().as_str(), EXTERNAL_METADATA_ID);
+    }
+
+    #[test]
+    fn production_family_declares_only_documented_reasoning_efforts() {
+        let descriptor = production_descriptor(&tiny_config()).unwrap();
+        let support = descriptor.reasoning_effort_support();
+        assert_eq!(
+            support.declared_efforts(),
+            Some(&BTreeSet::from([
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ]))
+        );
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::XHigh,
+            ReasoningEffort::Max,
+        ] {
+            assert_eq!(support.supports(effort), Some(false));
+        }
     }
 
     #[test]

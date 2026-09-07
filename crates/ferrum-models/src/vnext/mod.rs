@@ -15,7 +15,7 @@ use ferrum_interfaces::vnext::{
 };
 use ferrum_types::{
     DataType, Device, ModelCapabilities, ModelId, ModelInfo, ModelOutputProtocol, ModelType,
-    MoeCapabilities,
+    MoeCapabilities, ReasoningEffortSupport,
 };
 use serde_json::Value;
 
@@ -211,6 +211,7 @@ pub struct CausalLanguageModelDescriptor {
     maximum_sequence_tokens: NonZeroUsize,
     execution_dtype: DataType,
     output_protocol: ModelOutputProtocol,
+    reasoning_effort_support: ReasoningEffortSupport,
 }
 
 impl CausalLanguageModelDescriptor {
@@ -289,12 +290,22 @@ impl CausalLanguageModelDescriptor {
             maximum_sequence_tokens,
             execution_dtype,
             output_protocol: ModelOutputProtocol::Text,
+            reasoning_effort_support: ReasoningEffortSupport::Unknown,
         })
     }
 
     pub fn with_output_protocol(mut self, output_protocol: ModelOutputProtocol) -> Self {
         self.output_protocol = output_protocol;
         self
+    }
+
+    pub fn with_reasoning_effort_support(mut self, support: ReasoningEffortSupport) -> Self {
+        self.reasoning_effort_support = support;
+        self
+    }
+
+    pub fn reasoning_effort_support(&self) -> &ReasoningEffortSupport {
+        &self.reasoning_effort_support
     }
 
     pub fn architecture(&self) -> &str {
@@ -1118,6 +1129,25 @@ mod tests {
         };
         assert!(error.contains("metadata identity changed"), "{error}");
         assert!(error.contains(qwen35::EXTERNAL_METADATA_ID), "{error}");
+    }
+
+    #[test]
+    fn causal_language_descriptor_requires_an_explicit_effort_declaration() {
+        let descriptor =
+            CausalLanguageModelDescriptor::new("test", 1, 16, 2, 2, 1, 4, 32, 128, DataType::FP16)
+                .unwrap()
+                .with_output_protocol(ModelOutputProtocol::HarmonyGptOss);
+        assert_eq!(
+            descriptor.reasoning_effort_support(),
+            &ReasoningEffortSupport::Unknown
+        );
+
+        let declared = ReasoningEffortSupport::Declared(BTreeSet::from([
+            ferrum_types::ReasoningEffort::Low,
+            ferrum_types::ReasoningEffort::High,
+        ]));
+        let descriptor = descriptor.with_reasoning_effort_support(declared.clone());
+        assert_eq!(descriptor.reasoning_effort_support(), &declared);
     }
 
     #[test]

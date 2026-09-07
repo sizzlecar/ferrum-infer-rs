@@ -8,9 +8,10 @@ use crate::openai::{
     AssistantMessagePhase, ChatCompletionsRequest, ChatFunctionCall, ChatMessage, ChatToolCall,
     MessageRole, OpenAiJsonSchema, OpenAiResponseFormat, StreamOptions,
 };
+use ferrum_types::ReasoningEffort;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,7 +102,7 @@ impl ResponsesRequest {
         let (chat_tool_choice, response_tool_choice) =
             parse_tool_choice(self.tool_choice.as_ref(), &tool_names)?;
         let (response_format, response_text) = parse_text_controls(self.text.as_ref())?;
-        let (chat_template_kwargs, response_reasoning) =
+        let (reasoning_effort, response_reasoning) =
             parse_reasoning_controls(self.reasoning.as_ref())?;
         let include_encrypted_reasoning = parse_include(self.include.as_deref())?;
         validate_prompt_cache_key(self.prompt_cache_key.as_deref())?;
@@ -138,6 +139,7 @@ impl ResponsesRequest {
             user: self.user.clone(),
             seed: None,
             response_format,
+            reasoning_effort,
             tools: (!chat_tools.is_empty()).then_some(chat_tools),
             tool_choice: chat_tool_choice,
             stream_options: stream.then_some(StreamOptions {
@@ -146,7 +148,7 @@ impl ResponsesRequest {
             functions: None,
             function_call: None,
             metadata: None,
-            chat_template_kwargs,
+            chat_template_kwargs: None,
         };
         let response = ResponseContext {
             id: format!("resp_{}", Uuid::new_v4().simple()),
@@ -355,7 +357,7 @@ fn parse_text_controls(
 
 fn parse_reasoning_controls(
     reasoning: Option<&Value>,
-) -> std::result::Result<(Option<HashMap<String, Value>>, Value), ServerError> {
+) -> std::result::Result<(Option<ReasoningEffort>, Value), ServerError> {
     let Some(reasoning) = reasoning.filter(|value| !value.is_null()) else {
         return Ok((None, Value::Null));
     };
@@ -364,29 +366,18 @@ fn parse_reasoning_controls(
     })?;
     reject_unknown_object_fields(object, &["effort", "summary"], "reasoning")?;
 
-    let mut kwargs = HashMap::new();
-    if let Some(effort) = object.get("effort").filter(|value| !value.is_null()) {
-        let effort = effort.as_str().ok_or_else(|| {
-            ServerError::invalid_request(
-                "reasoning.effort must be a string",
-                Some("reasoning.effort"),
-            )
-        })?;
-        match effort {
-            "none" => {
-                kwargs.insert("enable_thinking".to_string(), Value::Bool(false));
-            }
-            "minimal" | "low" | "medium" | "high" | "xhigh" => {
-                kwargs.insert("reasoning_effort".to_string(), json!(effort));
-            }
-            unsupported_effort => {
-                return Err(unsupported(
-                    format!("reasoning effort `{unsupported_effort}` is not supported"),
-                    "reasoning.effort",
-                ))
-            }
-        }
-    }
+    let effort = object
+        .get("effort")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            serde_json::from_value::<ReasoningEffort>(value.clone()).map_err(|error| {
+                ServerError::invalid_request(
+                    format!("reasoning.effort: {error}"),
+                    Some("reasoning.effort"),
+                )
+            })
+        })
+        .transpose()?;
     if let Some(summary) = object.get("summary").filter(|value| !value.is_null()) {
         if !matches!(
             summary.as_str(),
@@ -399,7 +390,7 @@ fn parse_reasoning_controls(
         }
     }
 
-    Ok(((!kwargs.is_empty()).then_some(kwargs), reasoning.clone()))
+    Ok((effort, reasoning.clone()))
 }
 
 pub(super) fn reject_unknown_object_fields(
