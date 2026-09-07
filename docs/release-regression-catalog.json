@@ -58,7 +58,7 @@
     },
     {
       "id": "attention-moe-cuda",
-      "model": "qwen3-coder:30b-gptq",
+      "model": "Qwen/Qwen3-30B-A3B-GPTQ-Int4@9b534e4318b7ebc3c961a839f13eb18b1833f441",
       "target": {
         "architecture": "qwen3_attention_moe",
         "protocol": "text",
@@ -68,7 +68,7 @@
       },
       "available": true,
       "estimate": null,
-      "reasoning_protocol": "none"
+      "reasoning_protocol": "model_generated"
     },
     {
       "id": "llama-dense-metal",

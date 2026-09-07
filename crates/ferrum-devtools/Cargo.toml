@@ -15,8 +15,14 @@ path = "src/bin/release_delivery.rs"
 name = "contract_checks"
 path = "src/bin/contract_checks.rs"
 
+[[bin]]
+name = "model_regression"
+path = "src/bin/model_regression.rs"
+
 [dependencies]
+anyhow = { workspace = true }
 ferrum-bench-core = { workspace = true }
+ferrum-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
@@ -30,6 +36,3 @@ tempfile = "3"
 chrono = { workspace = true }
 zip = { version = "7.2.0", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
-
-[dev-dependencies]
-ferrum-types = { workspace = true }

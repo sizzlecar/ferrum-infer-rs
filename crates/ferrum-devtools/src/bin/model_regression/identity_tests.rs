@@ -29,6 +29,36 @@ fn health(actual_backend: &str) -> Value {
 }
 
 #[test]
+fn pinned_source_capture_requires_the_same_process_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut args = args("cuda");
+    args.report_dir = directory.path().to_owned();
+    let revision = "a".repeat(40);
+    args.model = format!("fixture/model@{revision}");
+    let mut evidence = json!({"schema_version": 1, "resolved_model": "fixture/model", "requested_model": args.model,
+        "original_sources": {}, "resolved_sources": {}});
+    for role in ["weights", "semantic", "tokenizer"] {
+        evidence["original_sources"][role] = json!({
+            "kind": "repository", "location": "fixture/model", "requested_revision": revision});
+        evidence["resolved_sources"][role] = json!({
+            "canonical_location": "fixture/model", "resolved_revision": revision,
+            "files": [{"relative_path": format!("{role}.bin"), "size_bytes": 16, "sha256": "c".repeat(64)}]});
+    }
+    for name in ["run-basic", "serve"] {
+        assert!(source_evidence(&args, name).is_err());
+        let path = args
+            .report_dir
+            .join(format!("{name}.effective-config.json"));
+        crate::write_json(&path, &json!({"resolution_evidence": evidence})).unwrap();
+        assert_eq!(source_evidence(&args, name).unwrap(), evidence);
+        let mut wrong = evidence.clone();
+        wrong["resolved_sources"]["weights"]["resolved_revision"] = json!("b".repeat(40));
+        crate::write_json(&path, &json!({"resolution_evidence": wrong})).unwrap();
+        assert!(source_evidence(&args, name).is_err());
+    }
+}
+
+#[test]
 fn actual_run_and_serve_backend_representations_match_requested_backend() {
     for (expected, run_backend, serve_backend) in [
         ("cpu", "CPU", "cpu"),

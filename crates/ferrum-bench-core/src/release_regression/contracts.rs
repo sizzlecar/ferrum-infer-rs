@@ -58,6 +58,7 @@ pub fn contract_groups() -> Vec<ContractGroup> {
             &format!("hf_download::download_tests::{name}"),
         )
     };
+    let source = |name: &str| lib("ferrum-cli", &format!("source_resolver::tests::{name}"));
     let engine = |name: &str| {
         lib(
             "ferrum-engine",
@@ -88,7 +89,14 @@ pub fn contract_groups() -> Vec<ContractGroup> {
     let http = vec![Entrypoint::ServeSync, Entrypoint::ServeStream];
     let specifications = vec![
         ("source-closure", SourceClosure, all.clone(), vec![download("indexed_fresh_download_fetches_only_referenced_shards_and_sidecars"), download("fresh_download_preserves_standalone_chat_template_in_source_bundle")]),
-        ("source-revision", SourceRevision, all.clone(), vec![download("indexed_download_uses_resolved_snapshot_when_main_moves")]),
+        ("source-revision", SourceRevision, all.clone(), vec![
+            download("indexed_download_uses_resolved_snapshot_when_main_moves"),
+            source("pinned_hf_specifier_requires_explicit_repository_and_full_commit"),
+            source("pinned_hf_cache_ignores_main_and_preserves_product_source_identity"),
+            source("missing_pinned_hf_snapshot_never_falls_back_to_another_revision"),
+            source("pinned_hf_download_result_must_match_repository_and_commit"),
+            lib("ferrum-bench-core", "release_regression::model_tasks::tests::pinned_model_reports_require_actual_sources_from_both_product_entrypoints"),
+        ]),
         ("download-recovery", DownloadRecovery, all.clone(), vec![download("indexed_transfer_failure_preserves_ref_and_retry_completes"), download("failed_template_download_does_not_publish_ref_and_can_retry")]),
         ("cache-completeness", CacheCompleteness, all.clone(), vec![download("indexed_invalid_index_stops_before_weights_and_preserves_ref")]),
         ("template-history", TemplateHistory, all.clone(), vec![integration("ferrum-server", "chat_template_golden", "chat_template_goldens_match_transformers"), tiny("tiny_stack_multi_turn_five_rounds")]),

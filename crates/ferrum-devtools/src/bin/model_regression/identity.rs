@@ -2,7 +2,36 @@
 
 use super::Args;
 use anyhow::{ensure, Context, Result};
+use ferrum_bench_core::release_regression::model_sources::{
+    pinned_hf_source, verify_pinned_source,
+};
 use serde_json::Value;
+
+pub(super) fn requires_source_evidence(args: &Args) -> Result<bool> {
+    Ok(pinned_hf_source(&args.model)
+        .map_err(anyhow::Error::msg)?
+        .is_some())
+}
+
+pub(super) fn validate_source_config(args: &Args, config: &Value) -> Result<()> {
+    verify_pinned_source(&args.model, &config["resolution_evidence"]).map_err(anyhow::Error::msg)
+}
+
+pub(super) fn source_evidence(args: &Args, process_name: &str) -> Result<Value> {
+    if !requires_source_evidence(args)? {
+        return Ok(Value::Null);
+    }
+    let path = args
+        .report_dir
+        .join(format!("{process_name}.effective-config.json"));
+    let config: Value = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("read actual source evidence {}", path.display()))?,
+    )
+    .context("parse actual source configuration")?;
+    validate_source_config(args, &config)?;
+    Ok(config["resolution_evidence"].clone())
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum Backend {

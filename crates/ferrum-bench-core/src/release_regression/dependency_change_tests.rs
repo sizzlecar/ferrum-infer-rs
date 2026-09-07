@@ -660,3 +660,171 @@ fn private_feature_exception_does_not_hide_shared_registry_or_product_changes() 
     *manifest = manifest.replace("publish = false", "publish = true");
     assert!(validation_dependency_paths(&before, &invalid).is_err());
 }
+
+fn model_runner_migration_fixture() -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut before = fixture();
+    add_private_tool(&mut before);
+    let root = before.get_mut("Cargo.toml").unwrap();
+    *root = root.replace("members = [", "members = [\"crates/ferrum-types\", ");
+    root.push_str("ferrum-types = {path='crates/ferrum-types',version='1.0.0'}\nanyhow = '1'\n");
+    before.insert(
+        "crates/ferrum-types/Cargo.toml".into(),
+        "[package]\nname='ferrum-types'\nversion.workspace=true\n".into(),
+    );
+    append(
+        &mut before,
+        "crates/app/Cargo.toml",
+        "anyhow.workspace=true\n",
+    );
+    append(
+        &mut before,
+        DEVTOOLS_MANIFEST,
+        "[dev-dependencies]\nferrum-types.workspace=true\n",
+    );
+    append(&mut before, "Cargo.lock", "[[package]]\nname='ferrum-types'\nversion='1.0.0'\n[[package]]\nname='anyhow'\nversion='1.0.100'\nsource='registry+https://example.invalid/index'\nchecksum='anyhow-checksum'\n");
+    lock_edge(&mut before, "app", "anyhow");
+    lock_edge(&mut before, DEVTOOLS, "ferrum-types");
+    let mut after = before.clone();
+    let manifest = after.get_mut(DEVTOOLS_MANIFEST).unwrap();
+    *manifest = manifest.replace("[dependencies]",
+        "[[bin]]\nname = \"model_regression\"\npath = \"src/bin/model_regression.rs\"\n[dependencies]\nanyhow.workspace=true\nferrum-types.workspace=true")
+        .replace("[dev-dependencies]\nferrum-types.workspace=true\n", "");
+    lock_edge(&mut after, DEVTOOLS, "anyhow");
+    (before, after)
+}
+
+#[test]
+fn model_runner_migration_preserves_product_and_locked_dependency_identities() {
+    let (before, after) = model_runner_migration_fixture();
+    // Both the original private two-bin layout and the migrated layout remain
+    // accepted; no product normal/build dependency or shared package changes.
+    validation_dependency_paths(&before, &before).unwrap();
+    let result = validation_dependency_paths(&before, &after).unwrap();
+    assert_eq!(result.paths, ["Cargo.lock", DEVTOOLS_MANIFEST]);
+    assert!(result
+        .validation_runtime_dependencies
+        .contains(&format!("{DEVTOOLS_MANIFEST}:anyhow")));
+    assert!(result
+        .validation_runtime_dependencies
+        .contains(&format!("{DEVTOOLS_MANIFEST}:ferrum-types")));
+    validation_dependency_paths(&after, &after).unwrap();
+}
+
+#[test]
+fn model_runner_migration_cannot_remove_existing_tools_or_add_unreviewed_targets_and_hooks() {
+    let (before, after) = model_runner_migration_fixture();
+    for (old, new) in [
+        (
+            "[[bin]]\nname = \"release_delivery\"\npath = \"src/bin/release_delivery.rs\"\n",
+            "",
+        ),
+        (
+            "[[bin]]\nname = \"contract_checks\"\npath = \"src/bin/contract_checks.rs\"\n",
+            "",
+        ),
+        ("model_regression", "unknown_runner"),
+        ("src/bin/model_regression.rs", "src/lib.rs"),
+        ("publish = false", "publish = true"),
+        ("publish = false", "publish = false\nbuild = 'build.rs'"),
+        (
+            "[dependencies]",
+            "[[bin]]\nname='unreviewed'\npath='src/bin/unreviewed.rs'\n[dependencies]",
+        ),
+        (
+            "[dependencies]",
+            "[target.'cfg(unix)'.dependencies]\nserde='1'\n[dependencies]",
+        ),
+    ] {
+        let mut invalid = after.clone();
+        let manifest = invalid.get_mut(DEVTOOLS_MANIFEST).unwrap();
+        assert!(manifest.contains(old), "missing fixture mutation {old}");
+        *manifest = manifest.replace(old, new);
+        assert!(
+            validation_dependency_paths(&before, &invalid).is_err(),
+            "{old} -> {new}"
+        );
+    }
+    for edge in [
+        "private_tool={package='ferrum-devtools',path='../ferrum-devtools'}\n",
+        "[target.'cfg(unix)'.build-dependencies]\nprivate_tool={package='ferrum-devtools',path='../ferrum-devtools'}\n",
+    ] {
+        let mut invalid = after.clone();
+        append(&mut invalid, "crates/app/Cargo.toml", edge);
+        assert!(validation_dependency_paths(&before, &invalid).unwrap_err().contains("depends on private devtools"));
+    }
+    let mut invalid = after;
+    lock_edge(&mut invalid, "serde", DEVTOOLS);
+    assert!(validation_dependency_paths(&before, &invalid)
+        .unwrap_err()
+        .contains("depends on private devtools"));
+}
+
+#[test]
+fn model_runner_migration_does_not_relax_shared_flags_versions_or_lock_edges() {
+    let (before, after) = model_runner_migration_fixture();
+    for (old, new) in [
+        (
+            "anyhow.workspace=true",
+            "anyhow={workspace=true,default-features=false}",
+        ),
+        (
+            "ferrum-types.workspace=true",
+            "ferrum-types={workspace=true,features=['extra']}",
+        ),
+        ("ferrum-types.workspace=true", "ferrum-types='1'"),
+        ("serde = \"1\"", "serde = '2'"),
+    ] {
+        let mut invalid = after.clone();
+        let manifest = invalid.get_mut(DEVTOOLS_MANIFEST).unwrap();
+        *manifest = manifest.replace(old, new);
+        assert!(
+            validation_dependency_paths(&before, &invalid).is_err(),
+            "{new}"
+        );
+    }
+    for (old, new) in [
+        ("anyhow-checksum", "different-checksum"),
+        ("1.0.100", "1.0.101"),
+        (
+            "registry+https://example.invalid/index",
+            "registry+https://elsewhere.invalid/index",
+        ),
+    ] {
+        let mut invalid = after.clone();
+        let lock = invalid.get_mut("Cargo.lock").unwrap();
+        assert!(lock.contains(old));
+        *lock = lock.replace(old, new);
+        assert!(
+            validation_dependency_paths(&before, &invalid).is_err(),
+            "{new}"
+        );
+    }
+    for (package, dependency) in [("anyhow", "serde"), ("app", "ferrum-types")] {
+        let mut invalid = after.clone();
+        lock_edge(&mut invalid, package, dependency);
+        assert!(
+            validation_dependency_paths(&before, &invalid).is_err(),
+            "{package} -> {dependency}"
+        );
+    }
+    let mut incomplete = after;
+    let mut lock = parse(&incomplete, "Cargo.lock").unwrap();
+    let tool = lock["package"]
+        .as_array_of_tables_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|record| record["name"].as_str() == Some(DEVTOOLS))
+        .unwrap();
+    let dependencies = tool["dependencies"].as_array_mut().unwrap();
+    let index = dependencies
+        .iter()
+        .position(|value| value.as_str() == Some("anyhow"))
+        .unwrap();
+    dependencies.remove(index);
+    incomplete.insert("Cargo.lock".into(), lock.to_string());
+    let error = validation_dependency_paths(&before, &incomplete).unwrap_err();
+    assert!(
+        error.contains("missing private tool lock edge to anyhow"),
+        "{error}"
+    );
+}

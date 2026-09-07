@@ -690,6 +690,8 @@ mod tests {
             "crates/ferrum-devtools/Cargo.toml",
             "crates/ferrum-devtools/src/bin/release_delivery.rs",
             "crates/ferrum-devtools/src/bin/contract_checks.rs",
+            "crates/ferrum-devtools/src/bin/model_regression.rs",
+            "crates/ferrum-devtools/src/bin/model_regression/identity.rs",
             "crates/ferrum-devtools/src/bin/release_delivery/cloud/api.rs",
         ] {
             let impact = analyze_paths([path]);

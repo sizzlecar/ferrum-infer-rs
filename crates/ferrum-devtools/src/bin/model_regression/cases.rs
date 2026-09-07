@@ -171,7 +171,8 @@ pub(super) async fn run_basic(args: &Args) -> Result<Value> {
     let run = run_chat(args, "run-basic", Input::Repl(&stdin), None).await?;
     let protocol = serde_json::from_value(run.ready["reasoning_protocol"].clone())
         .context("missing run reasoning capability")?;
-    let evidence = json!({"ready": run.ready, "prompts": prompts, "answers": run.assistants});
+    let evidence = json!({"ready": run.ready, "prompts": prompts, "answers": run.assistants,
+        "source_identity": identity::source_evidence(args, "run-basic")?});
     verify_basic_run(&evidence, protocol, args.max_tokens).map_err(anyhow::Error::msg)?;
     Ok(evidence)
 }

@@ -1416,6 +1416,7 @@ dependencies = [
 name = "ferrum-devtools"
 version = "0.8.8"
 dependencies = [
+ "anyhow",
  "chrono",
  "clap",
  "ferrum-bench-core",

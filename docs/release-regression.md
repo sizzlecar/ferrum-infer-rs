@@ -130,12 +130,12 @@ timeouts, output errors and resource limits instead of silently changing flags.
 
 ## Rust model runner
 
-Use the [model_regression example](../crates/ferrum-cli/examples/model_regression.rs)
+Use the [model_regression development tool](../crates/ferrum-devtools/src/bin/model_regression.rs)
 for repeatable checks against an explicit binary. For example, on Metal:
 
 ```bash
-cargo build --release --locked -p ferrum-cli --example model_regression
-./target/release/examples/model_regression \
+cargo build --release --locked -p ferrum-devtools --bin model_regression
+./target/release/model_regression \
   --ferrum-bin /path/to/staged/ferrum \
   --model qwen3.5:4b-q4_k_m --backend metal \
   --report-dir /path/outside/repository/metal-quickstart \
@@ -151,6 +151,12 @@ to `basic`; explicitly select the checks relevant to the release:
 - `stop`: termination behavior through both entrypoints, including stream text.
 - `structured`: server JSON/schema behavior and valid structured responses.
 - `tools`: server tool calls and a tool-result continuation.
+
+For a fixed Hugging Face snapshot, `ferrum run`, `ferrum serve`, `ferrum pull`,
+and the runner accept `OWNER/REPOSITORY@FULL_40_HEX_COMMIT` as the model.
+This selects the exact snapshot through Ferrum's downloader and cache; aliases,
+branches and tags cannot be used as pins. The runner verifies the actual
+repository, revision and file fingerprints reported by both product entrypoints.
 
 A stop probe derives an internal boundary from actual reasoning or final text.
 Baseline and replay keep the same prompt, mode and budget; checks require the
