@@ -302,6 +302,12 @@ configured increase; wider uncertainty remains inconclusive. The 20% TTFT budget
 does not exclude regressions between 10% and 20%. Correctness checks are unchanged,
 and changing this file does not reclassify evidence from an earlier release run.
 
+For a manual release retry, `reuse_cuda_run_id` can name a completed main-branch
+release run. The workflow rechecks its original successful CUDA execution,
+artifact digest, product and test-runner bytes, complete task inputs and model
+reports before reusing evidence. Any mismatch falls back to normal cloud
+regression. Performance is measured again under the newly registered policy.
+
 Resolve failures in mandatory Quick Start paths and selected required regressions
 before publishing. Publish the validated staged bytes and verify the public
 tarballs and checksums.
