@@ -234,6 +234,14 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return Some((vec![Template, Termination, Structured, Tools, Scheduler],
             "HTTP request/output adaptation, conversation history and admission/cancellation; message-history caches do not implement device KV save/restore"));
     }
+    if component == "ferrum-models" && relative == "src/vnext/qwen3_moe/config.rs" {
+        return Some((vec![Download, Architecture],
+            "typed model semantics and GPTQ configuration feed source compatibility, model programs and capacity; physical weight transforms and device operators are separate modules"));
+    }
+    if component == "ferrum-models" && relative == "src/vnext/hf_metadata.rs" {
+        return Some((vec![Download, Template, Termination],
+            "Hugging Face chat-template selection and special-token metadata; actual model configuration, weight layouts and operators live in separate modules"));
+    }
     if component == "ferrum-models"
         && matches!(
             relative,
@@ -809,9 +817,35 @@ mod tests {
         assert!(mixed.areas.contains(&ChangeArea::Download));
         assert!(mixed.areas.contains(&ChangeArea::Kernel));
         assert!(!mixed.areas.contains(&ChangeArea::Architecture));
+        let metadata = "crates/ferrum-models/src/vnext/hf_metadata.rs";
+        assert_eq!(
+            analyze_paths([metadata]).areas,
+            [
+                ChangeArea::Download,
+                ChangeArea::Template,
+                ChangeArea::Termination
+            ]
+        );
+        // A separate model-program change cannot inherit the metadata scope.
+        assert!(
+            analyze_paths([metadata, "crates/ferrum-models/src/vnext/qwen35.rs"])
+                .areas
+                .contains(&ChangeArea::Kernel)
+        );
         assert_ne!(
             analyze_paths(["crates/ferrum-models/src/hf_download/unknown.rs"]).areas,
             [ChangeArea::Download]
         );
+        let config = "crates/ferrum-models/src/vnext/qwen3_moe/config.rs";
+        assert_eq!(
+            analyze_paths([config]).areas,
+            [ChangeArea::Download, ChangeArea::Architecture]
+        );
+        assert!(analyze_paths([
+            config,
+            "crates/ferrum-models/src/vnext/qwen3_moe/weights.rs"
+        ])
+        .areas
+        .contains(&ChangeArea::Kernel));
     }
 }

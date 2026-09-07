@@ -16,6 +16,13 @@ use std::time::Duration;
 mod support;
 use support::*;
 
+// Both contracts use the same fixture DeviceId, whose capacity account is
+// process-wide. A permit held by the capacity test must not keep the old
+// runtime fingerprint alive during the authority test's after-drop check.
+// Serialize only these top-level fixtures; the capacity contract still races
+// its own caller and worker against the same account.
+static DEVICE_ACCOUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn runtime_implementation_authority_contract(plan: &ExecutionPlan, passed: &mut usize) {
     check(
         passed,
@@ -382,6 +389,9 @@ fn device_global_capacity_contract(base_plan: &ExecutionPlan, passed: &mut usize
 
 #[test]
 fn resource_capacity_concurrency_is_bounded() {
+    let _fixture_guard = DEVICE_ACCOUNT_TEST_LOCK
+        .lock()
+        .expect("device account fixture lock poisoned by another contract test");
     let plan = execution_plan();
     let mut passed = 0;
     device_global_capacity_contract(&plan, &mut passed);
@@ -393,6 +403,9 @@ fn resource_capacity_concurrency_is_bounded() {
 
 #[test]
 fn runtime_implementation_authority_is_exact() {
+    let _fixture_guard = DEVICE_ACCOUNT_TEST_LOCK
+        .lock()
+        .expect("device account fixture lock poisoned by another contract test");
     const EXPECTED_CASES: usize = 13;
     let plan = execution_plan();
     let mut passed = 0;

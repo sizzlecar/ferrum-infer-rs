@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    hf_metadata::parse_hf_model_semantic_metadata, CausalLanguageModelDescriptor,
-    PreparedProductionModel, ProductionModelSourceBundle, ProductionWeightArtifact,
+    hf_metadata::{is_hf_template_source, parse_hf_model_semantic_metadata},
+    CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
+    ProductionWeightArtifact,
 };
 
 mod config;
@@ -60,7 +61,7 @@ impl Qwen3MoeFamilyProvider {
             .map_err(|reason| invalid_config("semantic", reason))?;
         config.weights.validate(&config.semantic)?;
         if config.metadata.template.template.is_empty()
-            || config.metadata.template.source_file != "tokenizer_config.json"
+            || !is_hf_template_source(&config.metadata.template.source_file)
             || config.metadata.special_tokens.eos_token_ids.is_empty()
         {
             return Err(invalid_config(
@@ -162,8 +163,13 @@ pub(super) fn prepare_from_sources(
     })?;
     let model_config: Value = serde_json::from_slice(sources.config_json())
         .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?;
-    let metadata = parse_hf_model_semantic_metadata(&model_config, tokenizer_config)
-        .map_err(ferrum_types::FerrumError::model)?;
+    let metadata = parse_hf_model_semantic_metadata(
+        &model_config,
+        tokenizer_config,
+        sources.chat_template_jinja(),
+        sources.chat_template_json(),
+    )
+    .map_err(ferrum_types::FerrumError::model)?;
     match sources.weights() {
         ProductionWeightArtifact::SafetensorsDirectory(weight_root) => {
             let weight_config = sources.weight_config_json().ok_or_else(|| {
