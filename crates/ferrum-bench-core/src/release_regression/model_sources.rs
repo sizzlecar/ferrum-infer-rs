@@ -7,8 +7,15 @@ pub fn pinned_hf_source(model: &str) -> Result<Option<(&str, &str)>, String> {
     let Some((repo, revision)) = model.rsplit_once('@') else {
         return Ok(None);
     };
-    // Canonical local paths are not HF specifications, even when they contain @.
+    // Evidence can name a file on a worker running a different OS. Recognize
+    // POSIX and Windows absolute paths without the replay host's path rules.
     if std::path::Path::new(model).is_absolute()
+        || model.starts_with('/')
+        || (model
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && model.as_bytes().get(1..3) == Some(b":/"))
         || model.starts_with("./")
         || model.starts_with("../")
         || model.contains('\\')
@@ -101,7 +108,16 @@ mod tests {
     #[test]
     fn pinned_sources_require_an_explicit_repository_and_immutable_revision() {
         assert_eq!(pinned_hf_source("org/model").unwrap(), None);
-        assert_eq!(pinned_hf_source("/cache/model@revision").unwrap(), None);
+        for local in [
+            "/cache/model@revision",
+            "C:/cache/model@revision",
+            r"C:\cache\model@revision",
+            r"\\worker\cache\model@revision",
+            "./cache/model@revision",
+            "../cache/model@revision",
+        ] {
+            assert_eq!(pinned_hf_source(local).unwrap(), None, "{local}");
+        }
         let revision = "a".repeat(40);
         let model = format!("org/model@{revision}");
         assert_eq!(

@@ -257,7 +257,23 @@ async fn failed_server_start_is_invalid_and_reaped_before_return() {
 
 fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
     use ferrum_bench_core::release_regression::performance::ExpectedPerformanceRun;
-    let mut input = args(Path::new("/missing-mac-worker"));
+    fn mac_wire_arguments(args: Vec<std::ffi::OsString>) -> serde_json::Value {
+        json!(args
+            .iter()
+            .map(|arg| json!({"Unix": arg.to_str().unwrap().as_bytes()}))
+            .collect::<Vec<_>>())
+    }
+    // Preserve the actual POSIX spelling a Mac worker writes; the replay host
+    // must not manufacture different command evidence with its own path joins.
+    let mut input = PerformanceArgs {
+        baseline_bin: "/missing-mac-worker/baseline".into(),
+        candidate_bin: "/missing-mac-worker/candidate".into(),
+        client_bin: "/missing-mac-worker/client".into(),
+        source_manifest: "/missing-mac-worker/source.json".into(),
+        expected_task: "/missing-mac-worker/task.json".into(),
+        report_dir: "/missing-mac-worker/reports".into(),
+        ..args(directory)
+    };
     input.input_tokens = 32;
     input.output_tokens = 8;
     input.measured_requests = 2;
@@ -359,8 +375,9 @@ fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
         }})).unwrap();
         write_json(&location.join("execution.json"),&json!({"server_pid":123,"client_exit_code":0,"client_cleanup_completed":true,
             "client_completed_successfully":true,"cleanup_completed":true,"error":null,"cleanup_error":null})).unwrap();
-        write_json(&location.join("commands.json"),&json!({"port":1234,"server":{"program":path,"args":process::server_arguments(&input,&bundle,1234)},
-            "client":{"program":input.client_bin,"args":process::client_arguments(&input,&bundle,1234,&input.report_dir.join(phase).join("bench.json"))}})).unwrap();
+        let worker_report = format!("/missing-mac-worker/reports/{phase}/bench.json");
+        write_json(&location.join("commands.json"),&json!({"port":1234,"server":{"program":path,"args":mac_wire_arguments(process::server_arguments(&input,&bundle,1234))},
+            "client":{"program":input.client_bin,"args":mac_wire_arguments(process::client_arguments(&input,&bundle,1234,Path::new(&worker_report)))}})).unwrap();
     }
     let comparison = compare::compare(
         &baseline,
@@ -388,6 +405,16 @@ fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
 fn performance_replay_uses_original_measurements_without_opening_remote_model_paths() {
     let root = tempfile::tempdir().unwrap();
     let expected = replay_fixture(root.path());
+    let commands: serde_json::Value =
+        read_json(&root.path().join("candidate/commands.json")).unwrap();
+    let client_args = commands["client"]["args"].as_array().unwrap();
+    assert_eq!(
+        client_args
+            .windows(2)
+            .find(|args| args[0] == json!({"Unix": "--out".as_bytes()}))
+            .unwrap()[1],
+        json!({"Unix": "/missing-mac-worker/reports/candidate/bench.json".as_bytes()})
+    );
     verify_evidence(&expected, root.path()).unwrap();
     write_json(
         &root.path().join("candidate/bench.json"),
@@ -398,10 +425,96 @@ fn performance_replay_uses_original_measurements_without_opening_remote_model_pa
         .unwrap_err()
         .contains("raw benchmark"));
 }
+
+#[test]
+fn performance_replay_rejects_invalid_remote_paths_and_mismatched_bundle() {
+    for (file, pointer, replacement, reason) in [
+        (
+            "bound-source.json",
+            "/bundle/tokenizer_dir",
+            "relative/bundle",
+            "POSIX worker path",
+        ),
+        (
+            "bound-source.json",
+            "/bundle/gguf",
+            "/missing-mac-worker/bundle/../model.gguf",
+            "POSIX worker path",
+        ),
+        (
+            "bound-source.json",
+            "/gguf_canonical",
+            "/missing-mac-worker/../blob",
+            "invalid bound source paths",
+        ),
+        (
+            "bound-source.json",
+            "/bundle/gguf",
+            "/different-bundle/model.gguf",
+            "invalid bound source paths",
+        ),
+        (
+            "binaries.json",
+            "/baseline/canonical",
+            "relative/baseline",
+            "POSIX worker path",
+        ),
+        (
+            "binaries.json",
+            "/candidate/canonical",
+            "/missing-mac-worker/../candidate",
+            "POSIX worker path",
+        ),
+        (
+            "binaries.json",
+            "/client/canonical",
+            "C:\\worker\\client.exe",
+            "POSIX worker path",
+        ),
+        (
+            "inputs.json",
+            "/report_dir",
+            "relative/reports",
+            "POSIX worker path",
+        ),
+        (
+            "inputs.json",
+            "/report_dir",
+            "/missing-mac-worker/../reports",
+            "POSIX worker path",
+        ),
+        (
+            "inputs.json",
+            "/report_dir",
+            "/missing-mac-worker\\reports",
+            "POSIX worker path",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let expected = replay_fixture(root.path());
+        let path = root.path().join(file);
+        let mut value: serde_json::Value = read_json(&path).unwrap();
+        *value.pointer_mut(pointer).unwrap() = json!(replacement);
+        write_json(&path, &value).unwrap();
+        let error = verify_evidence(&expected, root.path()).unwrap_err();
+        assert!(
+            error.contains(reason),
+            "{file}{pointer} = {replacement:?}: {error}"
+        );
+    }
+}
+
 #[test]
 fn performance_replay_rejects_changed_policy_source_command_and_missing_measurement() {
     for mutation in [
-        "policy", "source", "command", "missing", "summary", "capacity",
+        "policy",
+        "source",
+        "command",
+        "worker_argument_encoding",
+        "mixed_worker_argument_encoding",
+        "missing",
+        "summary",
+        "capacity",
     ] {
         let root = tempfile::tempdir().unwrap();
         let expected = replay_fixture(root.path());
@@ -434,6 +547,20 @@ fn performance_replay_rejects_changed_policy_source_command_and_missing_measurem
                 let path = root.path().join("candidate/commands.json");
                 let mut value: serde_json::Value = read_json(&path).unwrap();
                 value["server"]["args"][3] = json!("cpu");
+                write_json(&path, &value).unwrap();
+            }
+            "worker_argument_encoding" | "mixed_worker_argument_encoding" => {
+                let path = root.path().join("candidate/commands.json");
+                let mut value: serde_json::Value = read_json(&path).unwrap();
+                let args = value["client"]["args"].as_array_mut().unwrap();
+                for arg in args {
+                    let bytes: Vec<u8> = serde_json::from_value(arg["Unix"].clone()).unwrap();
+                    let text = String::from_utf8(bytes).unwrap();
+                    *arg = json!({"Windows": text.encode_utf16().collect::<Vec<_>>()});
+                    if mutation == "mixed_worker_argument_encoding" {
+                        break;
+                    }
+                }
                 write_json(&path, &value).unwrap();
             }
             "missing" => fs::remove_file(root.path().join("candidate/bench.json")).unwrap(),

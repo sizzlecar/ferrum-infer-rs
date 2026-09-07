@@ -5206,10 +5206,6 @@ fn build_object_cache_specs(
         .collect()
 }
 
-fn object_file_name(index: usize, translation_unit: &NativeOperatorSourceFileLock) -> String {
-    object_file_name_for_host(index, translation_unit, false)
-}
-
 fn object_file_name_for_host(
     index: usize,
     translation_unit: &NativeOperatorSourceFileLock,
@@ -5225,10 +5221,6 @@ fn object_file_name_for_host(
         &translation_unit.sha256[..8],
         if msvc { "obj" } else { "o" }
     )
-}
-
-fn nvcc_policy_flags(policy: &NativeOperatorNvccPolicy) -> Vec<String> {
-    nvcc_policy_flags_for_host(policy, false)
 }
 
 fn nvcc_policy_flags_for_host(policy: &NativeOperatorNvccPolicy, msvc: bool) -> Vec<String> {
@@ -5803,7 +5795,10 @@ mod tests {
             sha256: "a".repeat(64),
         };
 
-        assert!(object_file_name(99, &translation_unit) < object_file_name(100, &translation_unit));
+        assert!(
+            object_file_name_for_host(99, &translation_unit, false)
+                < object_file_name_for_host(100, &translation_unit, false)
+        );
     }
 
     #[test]
