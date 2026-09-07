@@ -51,7 +51,7 @@ use crate::qwen35_weights::{
 };
 
 use super::{
-    hf_metadata::parse_hf_model_semantic_metadata,
+    hf_metadata::{is_hf_template_source, parse_hf_model_semantic_metadata},
     weight_layout::{contiguous_or_reshaped_binding, dense_or_reshaped_layout},
     CausalLanguageModelDescriptor, PreparedProductionModel, ProductionModelSourceBundle,
     ProductionWeightArtifact,
@@ -393,7 +393,7 @@ impl Qwen35FamilyProvider {
             ));
         }
         if config.metadata.template.template.is_empty()
-            || config.metadata.template.source_file != "tokenizer_config.json"
+            || !is_hf_template_source(&config.metadata.template.source_file)
             || config.metadata.special_tokens.eos_token_ids.is_empty()
             || config.weights.is_empty()
         {
@@ -2765,7 +2765,12 @@ fn load_safetensors_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let metadata = parse_hf_model_semantic_metadata(&hf_config, &tokenizer_config_bytes)?;
+    let metadata = parse_hf_model_semantic_metadata(
+        &hf_config,
+        tokenizer_config_bytes,
+        sources.chat_template_jinja(),
+        sources.chat_template_json(),
+    )?;
 
     let inventory = Qwen35WeightInventory::from_names(archive.tensor_names());
     let plan = inventory.detect_prefix_and_resolve(&text)?;
@@ -2905,7 +2910,12 @@ fn load_gguf_family_config(
     let tokenizer_config_bytes = sources
         .tokenizer_config_json()
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
-    let metadata = parse_hf_model_semantic_metadata(&hf_config, tokenizer_config_bytes)?;
+    let metadata = parse_hf_model_semantic_metadata(
+        &hf_config,
+        tokenizer_config_bytes,
+        sources.chat_template_jinja(),
+        sources.chat_template_json(),
+    )?;
 
     let manifest = text.weight_manifest("model.language_model")?;
     let mut weights = Vec::new();
@@ -7012,7 +7022,8 @@ mod tests {
             "pad_token_id": 0
         }"#;
         Qwen35FamilyConfig {
-            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
+            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config, None, None)
+                .unwrap(),
             hf_config,
             vocab_size: 32,
             max_position_embeddings: 128,
@@ -7156,7 +7167,8 @@ mod tests {
             "pad_token_id": 0
         }"#;
         let mut config = Qwen35FamilyConfig {
-            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
+            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config, None, None)
+                .unwrap(),
             hf_config,
             vocab_size,
             max_position_embeddings,
@@ -7366,7 +7378,8 @@ mod tests {
             "pad_token_id": 0
         }"#;
         Qwen35FamilyConfig {
-            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config).unwrap(),
+            metadata: parse_hf_model_semantic_metadata(&hf_config, tokenizer_config, None, None)
+                .unwrap(),
             hf_config,
             vocab_size: 32,
             max_position_embeddings: 128,
@@ -7494,6 +7507,8 @@ mod tests {
                 "eos_token_id": 2,
                 "pad_token_id": 0
             }"#,
+            None,
+            None,
         )
         .unwrap();
         config.weight_format = FamilyWeightFormat::SafetensorsGptqMarlin;
@@ -8085,6 +8100,31 @@ mod tests {
             assert!(
                 !operation_ids.contains(&forbidden),
                 "GGUF dense program leaked F16 operation {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_family_accepts_selected_standalone_template_for_dense_and_moe_packages() {
+        for mut config in [test_config(), test_moe_gptq_config()] {
+            let template = b"{{ messages[0].content }}\nassistant:";
+            config.metadata = parse_hf_model_semantic_metadata(
+                &config.hf_config,
+                br#"{"chat_template":null,"eos_token_id":2}"#,
+                Some(template),
+                None,
+            )
+            .unwrap();
+            let raw = serde_json::to_value(&config).unwrap();
+            let prepared = TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+                .prepare(&raw)
+                .unwrap();
+            assert_eq!(prepared.metadata().template, config.metadata.template);
+            config.metadata.template.source_file = "unregistered.jinja".into();
+            assert!(
+                TypedFamilyRegistration::new(Qwen35FamilyProvider::new().unwrap())
+                    .prepare(&serde_json::to_value(&config).unwrap())
+                    .is_err()
             );
         }
     }

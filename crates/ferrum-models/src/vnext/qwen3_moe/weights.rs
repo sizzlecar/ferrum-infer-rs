@@ -1667,6 +1667,70 @@ mod tests {
     }
 
     #[test]
+    fn product_preparation_accepts_standalone_template_and_binds_immutable_source() {
+        use crate::vnext::{resolve_registered_model_from_sources, ProductionModelSourceBundle};
+        use ferrum_interfaces::vnext::ModelArtifactSourceRole;
+        use std::{fs, sync::Arc};
+        let semantic = fixture_semantics();
+        let (directory, _archive) = fixture_archive();
+        let config = serde_json::json!({
+            "architectures":["Qwen3MoeForCausalLM"],"model_type":"qwen3_moe",
+            "hidden_size":semantic.hidden_size,"num_hidden_layers":semantic.layer_count,
+            "num_attention_heads":semantic.attention_head_count,"num_key_value_heads":semantic.kv_head_count,
+            "head_dim":semantic.head_dim,"vocab_size":semantic.vocabulary_size,
+            "max_position_embeddings":semantic.maximum_sequence_tokens,
+            "num_experts":semantic.expert_count,"num_experts_per_tok":semantic.experts_per_token,
+            "moe_intermediate_size":semantic.expert_intermediate_size,"norm_topk_prob":true,
+            "rms_norm_eps":0.000001,"rope_theta":1000000,"tie_word_embeddings":false,
+            "hidden_act":"silu","torch_dtype":"float16","attention_bias":false,
+            "decoder_sparse_step":1,"mlp_only_layers":[],
+            "quantization_config":{"quant_method":"gptq","checkpoint_format":"gptq","bits":4,"group_size":128,"desc_act":false,"sym":true}
+        });
+        fs::write(
+            directory.path().join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        fs::write(directory.path().join("tokenizer.json"), b"{}").unwrap();
+        fs::write(
+            directory.path().join("tokenizer_config.json"),
+            br#"{"chat_template":null,"eos_token_id":2}"#,
+        )
+        .unwrap();
+        let template = b"{{ messages[0].content }}\nassistant:";
+        fs::write(directory.path().join("chat_template.jinja"), template).unwrap();
+        let sources = Arc::new(
+            ProductionModelSourceBundle::open_colocated_safetensors(directory.path()).unwrap(),
+        );
+        fs::write(
+            directory.path().join("chat_template.jinja"),
+            b"changed after opening",
+        )
+        .unwrap();
+        let registered = resolve_registered_model_from_sources(&sources)
+            .unwrap()
+            .into_required()
+            .unwrap();
+        let prepared = registered.prepare_from_sources(sources).unwrap();
+        let metadata = &prepared.family().metadata().template;
+        assert_eq!(metadata.template.as_bytes(), template);
+        assert_eq!(metadata.source_file, "chat_template.jinja");
+        assert_eq!(metadata.sha256, format!("{:x}", Sha256::digest(template)));
+        assert_eq!(
+            prepared.family().metadata().special_tokens.eos_token_ids,
+            BTreeSet::from([2])
+        );
+        let fingerprint = prepared
+            .sources()
+            .fingerprint(ModelArtifactSourceRole::Tokenizer, "chat_template.jinja")
+            .unwrap();
+        assert_eq!(fingerprint.sha256, metadata.sha256);
+        prepared
+            .product_source_identity("fixture", "fixture")
+            .unwrap();
+    }
+
+    #[test]
     fn routed_only_manifest_builds_one_stable_program_and_physical_schema() {
         let semantic = fixture_semantics();
         let (_directory, archive) = fixture_archive();

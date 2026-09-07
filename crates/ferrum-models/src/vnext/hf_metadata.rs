@@ -12,23 +12,67 @@ use sha2::{Digest, Sha256};
 pub(super) fn parse_hf_model_semantic_metadata(
     model_config: &Value,
     tokenizer_config_bytes: &[u8],
+    chat_template_jinja: Option<&[u8]>,
+    chat_template_json: Option<&[u8]>,
 ) -> Result<ModelSemanticMetadata, String> {
     let tokenizer_config: Value = serde_json::from_slice(tokenizer_config_bytes)
         .map_err(|error| format!("parse tokenizer tokenizer_config.json: {error}"))?;
-    let template = tokenizer_config
-        .get("chat_template")
-        .and_then(Value::as_str)
-        .filter(|template| !template.is_empty())
-        .ok_or_else(|| "tokenizer_config.json missing non-empty string chat_template".to_owned())?;
+    // Modern HF snapshots save a standalone template. Select it from the
+    // immutable tokenizer source, with the same precedence as the product
+    // renderer, and bind the digest to the file actually selected.
+    let (template, source_file, source_bytes) = if let Some(bytes) = chat_template_jinja {
+        let template = std::str::from_utf8(bytes)
+            .map_err(|error| format!("chat_template.jinja is not UTF-8: {error}"))?;
+        (template.to_owned(), "chat_template.jinja", bytes)
+    } else if let Some(bytes) = chat_template_json {
+        let value: Value = serde_json::from_slice(bytes)
+            .map_err(|error| format!("parse chat_template.json: {error}"))?;
+        let template = value
+            .as_str()
+            .or_else(|| template_value(&value))
+            .ok_or("chat_template.json missing chat_template")?;
+        (template.to_owned(), "chat_template.json", bytes)
+    } else {
+        let template = template_value(&tokenizer_config)
+            .ok_or("tokenizer_config.json missing non-empty chat_template and no standalone template supplied")?;
+        (
+            template.to_owned(),
+            "tokenizer_config.json",
+            tokenizer_config_bytes,
+        )
+    };
+    if template.trim().is_empty() {
+        return Err(format!("{source_file} chat template must be non-empty"));
+    }
     let special_tokens = parse_special_tokens(model_config, &tokenizer_config)?;
     Ok(ModelSemanticMetadata {
         template: TemplateMetadata {
-            template: template.to_owned(),
-            source_file: "tokenizer_config.json".to_owned(),
-            sha256: format!("{:x}", Sha256::digest(tokenizer_config_bytes)),
+            template,
+            source_file: source_file.to_owned(),
+            sha256: format!("{:x}", Sha256::digest(source_bytes)),
         },
         special_tokens,
     })
+}
+
+fn template_value(value: &Value) -> Option<&str> {
+    match value.get("chat_template")? {
+        Value::String(template) => Some(template),
+        Value::Array(items) => items
+            .iter()
+            .find(|item| item.get("name").and_then(Value::as_str) == Some("default"))
+            .or_else(|| items.first())
+            .and_then(|item| item.get("template").and_then(Value::as_str)),
+        Value::Object(object) => object.get("template").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+pub(super) fn is_hf_template_source(source: &str) -> bool {
+    matches!(
+        source,
+        "tokenizer_config.json" | "chat_template.jinja" | "chat_template.json"
+    )
 }
 
 pub(super) fn parse_hf_model_semantic_metadata_with_external_template(
@@ -231,7 +275,7 @@ mod tests {
             "pad_token_id": 0,
             "added_tokens_decoder": {"1": {"content": "<bos>"}}
         }"#;
-        let metadata = parse_hf_model_semantic_metadata(&model, tokenizer).unwrap();
+        let metadata = parse_hf_model_semantic_metadata(&model, tokenizer, None, None).unwrap();
         assert_eq!(metadata.special_tokens.bos_token_id, Some(1));
         assert_eq!(
             metadata.special_tokens.eos_token_ids,
@@ -249,13 +293,85 @@ mod tests {
             "eos_token_id": 2
         }"#;
         assert_eq!(
-            parse_hf_model_semantic_metadata(&model, tokenizer)
+            parse_hf_model_semantic_metadata(&model, tokenizer, None, None)
                 .unwrap()
                 .special_tokens
                 .eos_token_ids,
             BTreeSet::from([2])
         );
-        assert!(parse_hf_model_semantic_metadata(&model, br#"{"eos_token_id":2}"#).is_err());
+        assert!(
+            parse_hf_model_semantic_metadata(&model, br#"{"eos_token_id":2}"#, None, None).is_err()
+        );
+    }
+
+    #[test]
+    fn standalone_template_retains_token_semantics_and_selected_file_digest() {
+        let model = json!({"eos_token_id": 2});
+        for embedded in [Value::Null, json!("legacy template")] {
+            let tokenizer = serde_json::to_vec(&json!({
+                "chat_template": embedded,
+                "eos_token": "<end>",
+                "pad_token_id": 0,
+                "added_tokens_decoder": {"3":{"content":"<end>"}}
+            }))
+            .unwrap();
+            let jinja = b"{{ messages[0].content }}<end>\n";
+            let metadata = parse_hf_model_semantic_metadata(
+                &model,
+                &tokenizer,
+                Some(jinja),
+                Some(br#"{"chat_template":"older standalone"}"#),
+            )
+            .unwrap();
+            assert_eq!(metadata.template.template.as_bytes(), jinja);
+            assert_eq!(metadata.template.source_file, "chat_template.jinja");
+            assert_eq!(
+                metadata.template.sha256,
+                format!("{:x}", Sha256::digest(jinja))
+            );
+            assert_eq!(metadata.special_tokens.eos_token_ids, BTreeSet::from([3]));
+            assert_eq!(metadata.special_tokens.pad_token_id, Some(0));
+        }
+    }
+
+    #[test]
+    fn standalone_json_and_legacy_templates_share_default_selection() {
+        let tokenizer = br#"{"eos_token_id":2,"chat_template":"embedded"}"#;
+        for value in [
+            json!("selected"),
+            json!({"chat_template":"selected"}),
+            json!({"chat_template":[{"name":"tool_use","template":"tools"},{"name":"default","template":"selected"}]}),
+        ] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let metadata =
+                parse_hf_model_semantic_metadata(&json!({}), tokenizer, None, Some(&bytes))
+                    .unwrap();
+            assert_eq!(metadata.template.template, "selected");
+            assert_eq!(metadata.template.source_file, "chat_template.json");
+            assert_eq!(
+                metadata.template.sha256,
+                format!("{:x}", Sha256::digest(&bytes))
+            );
+        }
+        let embedded = br#"{"eos_token_id":2,"chat_template":[{"name":"tool_use","template":"tools"},{"name":"default","template":"selected"}]}"#;
+        let metadata = parse_hf_model_semantic_metadata(&json!({}), embedded, None, None).unwrap();
+        assert_eq!(metadata.template.template, "selected");
+        assert_eq!(metadata.template.source_file, "tokenizer_config.json");
+    }
+
+    #[test]
+    fn invalid_declared_sidecar_never_silently_uses_another_template() {
+        let tokenizer = br#"{"eos_token_id":2,"chat_template":"valid embedded"}"#;
+        for bytes in [b"".as_slice(), b" \n", &[0xff]] {
+            assert!(
+                parse_hf_model_semantic_metadata(&json!({}), tokenizer, Some(bytes), None).is_err()
+            );
+        }
+        for bytes in [b"{".as_slice(), br#"{"chat_template":null}"#, br#""  ""#] {
+            assert!(
+                parse_hf_model_semantic_metadata(&json!({}), tokenizer, None, Some(bytes)).is_err()
+            );
+        }
     }
 
     #[test]

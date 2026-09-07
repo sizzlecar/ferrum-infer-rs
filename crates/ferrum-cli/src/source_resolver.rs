@@ -2415,6 +2415,32 @@ mod tests {
     }
 
     #[test]
+    fn typed_standalone_template_retains_immutable_bytes_for_run_and_serve() {
+        let dir = temp_model_dir(
+            "typed-sidecar-template",
+            r#"{"architectures":["Qwen3MoeForCausalLM"],"model_type":"qwen3_moe"}"#,
+        );
+        std::fs::write(dir.join("model.safetensors"), b"fixture-weights").unwrap();
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"chat_template":null,"eos_token_id":2}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), "{{ messages[0].content }}").unwrap();
+        let bundle = ProductionModelSourceBundle::open_colocated_safetensors(&dir).unwrap();
+        std::fs::write(
+            dir.join("chat_template.jinja"),
+            "changed after source opened",
+        )
+        .unwrap();
+        let selected = load_product_chat_template_source(&bundle, "chat_template.jinja").unwrap();
+        assert_eq!(selected.template, "{{ messages[0].content }}");
+        assert!(selected.source.ends_with("chat_template.jinja"));
+        assert!(load_product_chat_template_source(&bundle, "tokenizer_config.json").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn typed_template_source_ignores_unselected_duplicate() {
         let dir = temp_model_dir(
             "typed-template-source",
