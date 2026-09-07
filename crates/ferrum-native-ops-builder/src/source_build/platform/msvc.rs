@@ -337,18 +337,76 @@ pub(crate) fn tool_version(path: &Path, environment: &BTreeMap<String, String>) 
 }
 
 fn version_from_output(command: &Command, output: &std::process::Output) -> Result<String> {
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() || text.trim().is_empty() {
-        return Err(NativeOperatorBuilderError::Invalid(format!(
+    version_text_from_probe(
+        command,
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    )
+    .ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
             "Windows tool version probe failed: {}",
             probe_output_diagnostic(command, output)
-        )));
+        ))
+    })
+}
+
+fn version_text_from_probe(
+    command: &Command,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<String> {
+    if exit_code != Some(0) && !recognized_lib_help(command, exit_code, stdout, stderr) {
+        return None;
     }
-    Ok(text.trim().chars().take(4000).collect())
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
+    );
+    (!text.trim().is_empty()).then(|| text.trim().chars().take(4000).collect())
+}
+
+fn recognized_lib_help(
+    command: &Command,
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> bool {
+    // The selected MSVC LIB reports /? help with exit 1100. This exception applies only
+    // to recognizable help, never to compilation or archive execution.
+    let mut arguments = command.get_args();
+    if exit_code != Some(1100)
+        || !basename(&command.get_program().to_string_lossy()).eq_ignore_ascii_case("lib.exe")
+        || arguments.next() != Some(std::ffi::OsStr::new("/?"))
+        || arguments.next().is_some()
+        || !stderr.iter().all(u8::is_ascii_whitespace)
+    {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    if text.contains("fatal error") || text.contains(": error ") {
+        return false;
+    }
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    let Some(version) = lines
+        .next()
+        .and_then(|line| line.strip_prefix("Microsoft (R) Library Manager Version "))
+    else {
+        return false;
+    };
+    version.contains('.')
+        && version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && lines.any(|line| line.eq_ignore_ascii_case("usage: LIB [options] [files]"))
+        && lines.any(|line| {
+            line.strip_prefix("/OUT:")
+                .is_some_and(|value| !value.is_empty())
+        })
 }
 
 #[cfg(test)]
@@ -394,6 +452,48 @@ mod tests {
         assert_eq!(
             bounded_probe_text("界".repeat(4001).as_bytes()),
             format!("{} [output truncated]", "界".repeat(4000))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires configured MSVC tools"]
+    fn configured_msvc_tool_version_probes() {
+        let compiler =
+            PathBuf::from(std::env::var_os("NVCC_CCBIN").expect("NVCC_CCBIN must select cl.exe"))
+                .canonicalize()
+                .expect("resolve selected cl.exe");
+        let archiver = PathBuf::from(
+            std::env::var_os("FERRUM_MSVC_LIB").expect("FERRUM_MSVC_LIB must select lib.exe"),
+        )
+        .canonicalize()
+        .expect("resolve selected lib.exe");
+        let recorded = capture_msvc_environment().expect("capture selected MSVC/SDK environment");
+        let environment = msvc_environment_for_package_tools(
+            [
+                compiler.to_str().expect("cl.exe path must be UTF-8"),
+                archiver.to_str().expect("lib.exe path must be UTF-8"),
+            ],
+            &recorded,
+        )
+        .expect("construct the production package environment");
+        let mut failures = Vec::new();
+        for path in [&compiler, &archiver] {
+            match tool_version(path, &environment) {
+                Ok(version) => {
+                    assert!(!version.is_empty());
+                    eprintln!("production MSVC version probe succeeded: canonical={path:?} version={version:?}");
+                }
+                Err(error) => {
+                    eprintln!("production MSVC version probe failed: {error}");
+                    failures.push(error.to_string());
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "selected MSVC tools must pass the production version probes: {}",
+            failures.join("; ")
         );
     }
 
