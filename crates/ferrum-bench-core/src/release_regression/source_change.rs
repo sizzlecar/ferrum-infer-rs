@@ -4,6 +4,8 @@ use syn::{Attribute, Item, Meta};
 
 mod ready;
 pub use ready::run_ready_capability_only;
+mod model_metadata;
+pub use model_metadata::model_template_wiring_only;
 
 fn test_configuration(attribute: &Attribute) -> bool {
     let Meta::List(list) = &attribute.meta else {

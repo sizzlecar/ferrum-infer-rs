@@ -3,7 +3,7 @@ use super::{git, resolve_revision};
 use ferrum_bench_core::release_regression::dependency_change::validation_dependency_paths;
 use ferrum_bench_core::release_regression::source_change::{
     bench_release_exports_only, homebrew_documentation_only, legacy_metal_submission_only,
-    run_ready_capability_only, rust_validation_only,
+    model_template_wiring_only, run_ready_capability_only, rust_validation_only,
 };
 use ferrum_bench_core::release_regression::{
     analyze_paths, coordinated_version_paths, ChangeArea, Impact,
@@ -47,12 +47,14 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
         ReleaseExports,
         LegacyMetalSubmission,
         ReadyCapability,
+        ModelTemplateWiring,
     }
     let mut rust_paths = Vec::new();
     let mut release_tool_paths = Vec::new();
     let mut installation_paths = Vec::new();
     let mut legacy_submission_paths = Vec::new();
     let mut ready_capability_paths = Vec::new();
+    let mut model_template_paths = Vec::new();
     let mut unresolved = Vec::new();
     for entry in &mut impact.paths {
         let readme = matches!(entry.path.as_str(), "README.md" | "README_zh.md");
@@ -85,6 +87,13 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
                 && legacy_metal_submission_only(&before, &after)?
             {
                 Ok(Some(ContentProof::LegacyMetalSubmission))
+            } else if matches!(
+                entry.path.as_str(),
+                "crates/ferrum-models/src/vnext/qwen35.rs"
+                    | "crates/ferrum-models/src/vnext/qwen3_moe/mod.rs"
+            ) && model_template_wiring_only(&before, &after)?
+            {
+                Ok(Some(ContentProof::ModelTemplateWiring))
             } else if entry.path == "crates/ferrum-cli/src/commands/run.rs" {
                 let template = String::from_utf8(git(
                     repo,
@@ -132,6 +141,15 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
                 entry.reason = "ready JSONL only appends the declared reasoning capability through a proven scalar observation and existing Option borrow; original fields, call positions/arguments and all other production AST remain unchanged; retain protocol and capability regression".into();
                 ready_capability_paths.push(entry.path.clone());
             }
+            Ok(Some(ContentProof::ModelTemplateWiring)) => {
+                entry.areas = vec![
+                    ChangeArea::Download,
+                    ChangeArea::Template,
+                    ChangeArea::Termination,
+                ];
+                entry.reason = "AST changes only wire immutable standalone template sources and validate their selected name; metadata inputs, model configuration, weights, logical programs and execution remain unchanged".into();
+                model_template_paths.push(entry.path.clone());
+            }
             Ok(None) => {}
             Err(reason) => unresolved.push(json!({"path": entry.path, "reason": reason})),
         }
@@ -144,7 +162,7 @@ fn refine_content(repo: &Path, base: &str, candidate: &str, impact: &mut Impact)
         .into_iter()
         .filter(|area| impact.paths.iter().any(|entry| entry.areas.contains(area)))
         .collect();
-    json!({"rust_validation_paths": rust_paths, "release_tool_export_paths": release_tool_paths, "homebrew_installation_paths": installation_paths, "legacy_metal_submission_paths": legacy_submission_paths, "ready_capability_paths": ready_capability_paths, "unresolved": unresolved})
+    json!({"rust_validation_paths": rust_paths, "release_tool_export_paths": release_tool_paths, "homebrew_installation_paths": installation_paths, "legacy_metal_submission_paths": legacy_submission_paths, "ready_capability_paths": ready_capability_paths, "model_template_paths": model_template_paths, "unresolved": unresolved})
 }
 
 pub(super) fn analyze(repo: &Path, base: &str, candidate: &str, paths: &[String]) -> Analysis {

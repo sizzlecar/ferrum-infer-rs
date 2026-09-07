@@ -2767,7 +2767,7 @@ fn load_safetensors_family_config(
         .ok_or_else(|| "tokenizer source missing tokenizer_config.json".to_owned())?;
     let metadata = parse_hf_model_semantic_metadata(
         &hf_config,
-        tokenizer_config_bytes,
+        &tokenizer_config_bytes,
         sources.chat_template_jinja(),
         sources.chat_template_json(),
     )?;
