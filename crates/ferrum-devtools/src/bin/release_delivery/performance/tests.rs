@@ -209,6 +209,14 @@ fn child_commands_bind_same_local_files_and_fixed_generation_workload() {
     let server = process::server_arguments(&input, &bundle, 1234);
     assert_eq!(server[1], "/fixed/model.gguf");
     assert!(server.iter().any(|w| w == "--runtime-memory-budget-bytes"));
+    for flag in [
+        "--kv-capacity",
+        "--max-model-len",
+        "--max-num-batched-tokens",
+    ] {
+        let capacity = server.windows(2).find(|w| w[0] == flag).unwrap();
+        assert_eq!(capacity[1], input.max_model_len.to_string().as_str());
+    }
 }
 
 #[tokio::test]
@@ -344,7 +352,11 @@ fn replay_fixture(directory: &Path) -> ExpectedPerformanceRun {
         write_json(&location.join("bench.json"), measurement).unwrap();
         write_json(&location.join("checks.json"),&json!({"source_before":expected.source,"source_after":expected.source,
             "server_sha256_before":sha,"server_sha256_after":sha,"client_sha256_before":input.client_sha256,"client_sha256_after":input.client_sha256})).unwrap();
-        write_json(&location.join("health.json"),&json!({"status":"healthy","version":version,"auto_config":{"hardware_capabilities":{"backend":"Metal"}}})).unwrap();
+        write_json(&location.join("health.json"),&json!({"status":"healthy","version":version,"auto_config":{
+            "hardware_capabilities":{"backend":"Metal"},"selected_kv_capacity":input.max_model_len,
+            "selected_max_model_len":input.max_model_len,"selected_max_sequences":1,
+            "selected_max_batched_tokens":input.max_model_len
+        }})).unwrap();
         write_json(&location.join("execution.json"),&json!({"server_pid":123,"client_exit_code":0,"client_cleanup_completed":true,
             "client_completed_successfully":true,"cleanup_completed":true,"error":null,"cleanup_error":null})).unwrap();
         write_json(&location.join("commands.json"),&json!({"port":1234,"server":{"program":path,"args":process::server_arguments(&input,&bundle,1234)},
@@ -388,10 +400,18 @@ fn performance_replay_uses_original_measurements_without_opening_remote_model_pa
 }
 #[test]
 fn performance_replay_rejects_changed_policy_source_command_and_missing_measurement() {
-    for mutation in ["policy", "source", "command", "missing", "summary"] {
+    for mutation in [
+        "policy", "source", "command", "missing", "summary", "capacity",
+    ] {
         let root = tempfile::tempdir().unwrap();
         let expected = replay_fixture(root.path());
         match mutation {
+            "capacity" => {
+                let path = root.path().join("candidate/health.json");
+                let mut value: serde_json::Value = read_json(&path).unwrap();
+                value["auto_config"]["selected_kv_capacity"] = json!(32);
+                write_json(&path, &value).unwrap();
+            }
             "summary" => {
                 let path = root.path().join("performance.json");
                 let mut value: serde_json::Value = read_json(&path).unwrap();

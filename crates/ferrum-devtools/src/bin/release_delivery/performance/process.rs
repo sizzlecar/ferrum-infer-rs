@@ -44,6 +44,8 @@ pub(super) fn server_arguments(
         port.to_string().into(),
         "--kv-dtype".into(),
         "fp16".into(),
+        "--kv-capacity".into(),
+        args.max_model_len.to_string().into(),
         "--max-model-len".into(),
         args.max_model_len.to_string().into(),
         "--max-num-seqs".into(),
@@ -104,7 +106,11 @@ pub(super) fn client_arguments(
         report.as_os_str().into(),
     ]
 }
-pub(super) fn health_identity(health: &Value, version: &str) -> Result<(), String> {
+pub(super) fn health_identity(
+    health: &Value,
+    version: &str,
+    max_model_len: u32,
+) -> Result<(), String> {
     if health["status"] != "healthy"
         || health["version"].as_str() != Some(version)
         || !matches!(
@@ -116,6 +122,22 @@ pub(super) fn health_identity(health: &Value, version: &str) -> Result<(), Strin
             "performance server health omitted/mismatched actual Metal backend or version".into(),
         );
     }
+    // The allocator's estimated capacity can exceed the executor's selected
+    // pool. Check the limits actually selected for this fixed workload before
+    // starting any timed requests, and again when replaying archived evidence.
+    for (field, expected) in [
+        ("selected_kv_capacity", max_model_len),
+        ("selected_max_model_len", max_model_len),
+        ("selected_max_sequences", 1),
+        ("selected_max_batched_tokens", max_model_len),
+    ] {
+        let observed = &health["auto_config"][field];
+        if expected == 0 || observed.as_u64() != Some(u64::from(expected)) {
+            return Err(format!(
+                "performance server actual capacity mismatch: {field} expected {expected}, observed {observed}"
+            ));
+        }
+    }
     Ok(())
 }
 #[cfg(unix)]
@@ -123,6 +145,7 @@ async fn ready(
     group: &mut super::super::local::ProcessGroup,
     port: u16,
     version: &str,
+    max_model_len: u32,
     phase: &Path,
     deadline: Instant,
     terminate: &mut tokio::signal::unix::Signal,
@@ -148,7 +171,7 @@ async fn ready(
                 if response.status().is_success() {
                     let health: Value = response.json().await.map_err(|e| e.to_string())?;
                     write_json(&phase.join("health.json"), &health)?;
-                    health_identity(&health, version)?;
+                    health_identity(&health, version, max_model_len)?;
                     return Ok(true);
                 }
             }
@@ -218,7 +241,7 @@ pub(super) async fn phase(
             .checked_add(Duration::from_secs(args.startup_timeout_secs))
             .ok_or("startup deadline overflow")?
             .min(deadline);
-        ready(&mut group, port, version, phase, startup, &mut terminate, &mut interrupt).await?;
+        ready(&mut group, port, version, args.max_model_len, phase, startup, &mut terminate, &mut interrupt).await?;
         let mut bench=clean_command(client,&bundle.tokenizer_dir);
         bench.args(&bench_args).stdin(Stdio::null())
             .stdout(fs::File::create(phase.join("client.stdout.log")).map_err(|e|e.to_string())?)
@@ -280,13 +303,37 @@ pub(super) async fn phase(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn health() -> Value {
+        json!({"status":"healthy","version":"0.8.7","auto_config":{
+            "hardware_capabilities":{"backend":"Metal"},
+            "selected_kv_capacity":1024,"selected_max_model_len":1024,
+            "selected_max_sequences":1,"selected_max_batched_tokens":1024,
+            "admission":{"kv_capacity_tokens":32768,"max_model_length":1024}
+        }})
+    }
     #[test]
     fn health_requires_real_backend_and_registered_version() {
-        let mut value = json!({"status":"healthy","version":"0.8.7","auto_config":{"hardware_capabilities":{"backend":"Metal"}}});
-        assert!(health_identity(&value, "0.8.7").is_ok());
+        let mut value = health();
+        assert!(health_identity(&value, "0.8.7", 1024).is_ok());
         value["auto_config"]["hardware_capabilities"]["backend"] = json!("Cpu");
-        assert!(health_identity(&value, "0.8.7").is_err());
+        assert!(health_identity(&value, "0.8.7", 1024).is_err());
         value["auto_config"]["hardware_capabilities"]["backend"] = json!("Metal");
-        assert!(health_identity(&value, "0.8.8").is_err());
+        assert!(health_identity(&value, "0.8.8", 1024).is_err());
+    }
+    #[test]
+    fn selected_capacity_must_match_workload_even_when_admission_estimate_is_larger() {
+        for field in [
+            "selected_kv_capacity",
+            "selected_max_model_len",
+            "selected_max_sequences",
+            "selected_max_batched_tokens",
+        ] {
+            for observed in [Value::Null, json!(0), json!(512), json!(4096)] {
+                let mut value = health();
+                value["auto_config"][field] = observed;
+                let error = health_identity(&value, "0.8.7", 1024).unwrap_err();
+                assert!(error.contains(field), "{error}");
+            }
+        }
     }
 }
