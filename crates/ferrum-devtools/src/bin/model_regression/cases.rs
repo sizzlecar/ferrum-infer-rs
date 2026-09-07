@@ -1,7 +1,10 @@
+#[path = "auto_tools_json.rs"]
+mod auto_tools_json;
 #[path = "boundaries.rs"]
 mod boundaries;
 #[path = "stop.rs"]
 mod stop;
+pub(super) use auto_tools_json::auto_tools_json;
 pub(super) use boundaries::{run_length, run_reasoning, serve_length, serve_reasoning};
 pub(super) use stop::{run_stop, serve_stop};
 
@@ -355,58 +358,6 @@ pub(super) async fn tools(server: &Server<'_>) -> Result<Value> {
         server.args.reasoning_alias_replay,
     )
     .map_err(anyhow::Error::msg)?;
-    Ok(evidence)
-}
-
-pub(super) async fn auto_tools_json(server: &Server<'_>) -> Result<Value> {
-    use ferrum_bench_core::release_regression::model_tool::{
-        auto_tools_json_controls, verify_auto_tools_json_case, AUTO_TOOLS_JSON_PROMPT,
-    };
-    let mut evidence = json!({});
-    for (mode, stream) in [("sync", false), ("stream", true)] {
-        let mut first = request(
-            server,
-            vec![json!({"role": "user", "content": AUTO_TOOLS_JSON_PROMPT})],
-        );
-        first
-            .as_object_mut()
-            .unwrap()
-            .extend(auto_tools_json_controls().as_object().unwrap().clone());
-        first["stream"] = json!(stream);
-        if stream {
-            first["stream_options"] = json!({"include_usage": true});
-        }
-        let called = chat(
-            server,
-            &format!("auto-tools-json-call-{mode}"),
-            first.clone(),
-            stream,
-        )
-        .await?;
-        let calculation = protocol::calc_call(&called, server.args.max_tokens)
-            .context("automatic calculator handoff")?;
-        // The sole executed operation is the validated local integer fixture.
-        // Replay the actual model message, including its reasoning and call ID.
-        let mut continuation = first.clone();
-        let messages = continuation["messages"].as_array_mut().unwrap();
-        messages.push(called.message.clone());
-        messages.push(json!({
-            "role": "tool", "tool_call_id": calculation.call["id"],
-            "content": json!({"result": calculation.result}).to_string(),
-        }));
-        let completed = chat(
-            server,
-            &format!("auto-tools-json-final-{mode}"),
-            continuation.clone(),
-            stream,
-        )
-        .await?;
-        evidence[mode] = json!({
-            "call_request": first, "call": observation(&called),
-            "continuation_request": continuation, "continuation": observation(&completed),
-        });
-    }
-    verify_auto_tools_json_case(&evidence, server.args.max_tokens).map_err(anyhow::Error::msg)?;
     Ok(evidence)
 }
 

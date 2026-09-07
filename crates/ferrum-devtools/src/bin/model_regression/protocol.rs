@@ -2,6 +2,10 @@ use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+#[path = "responses_protocol.rs"]
+mod responses;
+pub(super) use responses::{responses_stream, responses_sync, Responses};
+
 #[derive(Debug)]
 pub(super) struct Chat {
     pub message: Value,

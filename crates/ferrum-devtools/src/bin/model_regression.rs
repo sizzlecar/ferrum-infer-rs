@@ -47,6 +47,7 @@ struct Args {
     #[arg(long)]
     report_dir: PathBuf,
     /// Checks: basic, stop, structured, tools, auto-tools-json, reasoning, length.
+    /// auto-tools-json exercises Chat Completions and Responses, sync and SSE.
     #[arg(long, value_delimiter = ',', default_value = "basic")]
     checks: Vec<Check>,
     /// Forward the public flag to both entrypoints. Otherwise keep model defaults.
@@ -141,6 +142,26 @@ struct Report {
     failed: bool,
 }
 
+/// A failed multi-request case can still contain useful observed output. Keep
+/// it with the failure so later successful cases cannot hide the failing phase.
+#[derive(Debug)]
+struct CaseFailure {
+    evidence: Value,
+    error: anyhow::Error,
+}
+
+impl std::fmt::Display for CaseFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.error)
+    }
+}
+
+impl std::error::Error for CaseFailure {}
+
+fn case_failure(evidence: Value, error: anyhow::Error) -> anyhow::Error {
+    CaseFailure { evidence, error }.into()
+}
+
 impl Report {
     fn save(&self) -> Result<()> {
         write_json(&self.path, &self.document)
@@ -151,7 +172,12 @@ impl Report {
             Ok(evidence) => json!({"case": name, "status": "passed", "evidence": evidence}),
             Err(error) => {
                 self.failed = true;
-                json!({"case": name, "status": "failed", "error": format!("{error:#}")})
+                let mut failed =
+                    json!({"case": name, "status": "failed", "error": format!("{error:#}")});
+                if let Some(partial) = error.downcast_ref::<CaseFailure>() {
+                    failed["evidence"] = partial.evidence.clone();
+                }
+                failed
             }
         };
         eprintln!("{name}: {}", case["status"]);
@@ -273,6 +299,13 @@ async fn main() -> Result<()> {
         }),
         failed: false,
     };
+    if args.checks.contains(&Check::AutoToolsJson) {
+        // The existing sampling fields describe run/Chat. Responses has its
+        // own output-budget field and receives no seed parameter.
+        report.document["sampling"]["responses"] = json!({
+            "temperature": 0, "max_output_tokens": args.max_tokens, "seed_sent": false
+        });
+    }
     report.save()?;
     record(&mut report, "binary-version", async {
         let version = process::run(
@@ -401,7 +434,10 @@ mod report_tests {
             document: json!({"cases": [], "status": "running"}),
             failed: false,
         };
-        let wrong_answer = protocol::answer("43", "42").map(|()| json!({"answer": "43"}));
+        let partial = json!({"sync": {"answer": "42"}, "stream": {"answer": "43"}});
+        let wrong_answer = protocol::answer("43", "42")
+            .map(|()| partial.clone())
+            .map_err(|error| case_failure(partial.clone(), error));
         assert!(wrong_answer.is_err());
         report
             .record("serve-basic", Duration::ZERO, wrong_answer)
@@ -418,5 +454,6 @@ mod report_tests {
         assert_eq!(document["status"], "failed");
         assert_eq!(document["cases"][0]["status"], "failed");
         assert!(document["cases"][0]["error"].as_str().is_some());
+        assert_eq!(document["cases"][0]["evidence"], partial);
     }
 }

@@ -35,7 +35,37 @@ fn evidence(alias: bool) -> Value {
         "reasoning_alias_replayed": alias})
 }
 
-fn auto_json_evidence() -> Value {
+fn native_response(observation: &Value, id: &str) -> Value {
+    let mut output = Vec::new();
+    let message = &observation["message"];
+    if let Some(reasoning) = message["reasoning"]
+        .as_str()
+        .filter(|text| !text.is_empty())
+    {
+        output.push(
+            json!({"id": format!("{id}-reasoning"), "type": "reasoning", "status": "completed",
+            "summary": [], "content": [{"type": "reasoning_text", "text": reasoning}]}),
+        );
+    }
+    if let Some(content) = message["content"].as_str().filter(|text| !text.is_empty()) {
+        output.push(json!({"id": format!("{id}-message"), "type": "message", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": content, "annotations": []}]}));
+    }
+    for (index, call) in message["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        output.push(json!({"id": format!("{id}-item-{index}"), "type": "function_call", "status": "completed",
+            "call_id": call["id"], "name": call["function"]["name"], "arguments": call["function"]["arguments"]}));
+    }
+    json!({"id": id, "object": "response", "status": "completed", "output": output,
+        "usage": {"input_tokens": observation["usage"]["prompt_tokens"],
+            "output_tokens": observation["usage"]["completion_tokens"], "total_tokens": observation["usage"]["total_tokens"]}})
+}
+
+pub(crate) fn auto_json_evidence() -> Value {
     let mut evidence = json!({});
     for (mode, stream) in [("sync", false), ("stream", true)] {
         let call = called("(123)+(456)", &format!("{mode}-calculation"));
@@ -58,7 +88,234 @@ fn auto_json_evidence() -> Value {
                 "finish_reason": "stop", "usage": {"prompt_tokens": 40, "completion_tokens": 4, "total_tokens": 44}}
         });
     }
+    evidence["responses"] = json!({});
+    for (mode, stream) in [("sync", false), ("stream", true)] {
+        let call = called("456+123", &format!("responses-{mode}-calculation"));
+        let native = native_response(&call, &format!("resp-{mode}-call"));
+        let final_observation = evidence[mode]["continuation"].clone();
+        let final_native = native_response(&final_observation, &format!("resp-{mode}-final"));
+        let mut first = auto_tools_json_responses_controls();
+        first["input"] = json!([{"role": "user", "content": AUTO_TOOLS_JSON_PROMPT}]);
+        first["max_output_tokens"] = json!(128);
+        first["stream"] = json!(stream);
+        first["temperature"] = json!(0);
+        let mut replay = first.clone();
+        let input = replay["input"].as_array_mut().unwrap();
+        input.extend(native["output"].as_array().unwrap().iter().cloned());
+        input.push(json!({"type": "function_call_output", "call_id": call["message"]["tool_calls"][0]["id"],
+            "output": "{\"result\":579}"}));
+        evidence["responses"][mode] = json!({"call_request": first, "call": call, "call_response": native,
+            "continuation_request": replay, "continuation": final_observation, "continuation_response": final_native});
+    }
     evidence
+}
+
+#[test]
+fn auto_tools_json_requires_native_responses_and_unchanged_full_output_replay() {
+    let good = auto_json_evidence();
+    verify_auto_tools_json_case(&good, 128).unwrap();
+    let mut missing = good.clone();
+    missing.as_object_mut().unwrap().remove("responses");
+    assert!(verify_auto_tools_json_case(&missing, 128)
+        .unwrap_err()
+        .contains("responses.sync"));
+    for mode in ["sync", "stream"] {
+        for field in [
+            "call_response",
+            "continuation_response",
+            "call_request",
+            "continuation_request",
+        ] {
+            let mut wrong = good.clone();
+            wrong["responses"][mode]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                verify_auto_tools_json_case(&wrong, 128).is_err(),
+                "missing {mode}.{field}"
+            );
+        }
+        for (suffix, changed) in [
+            (
+                "/continuation_request/input/3/call_id",
+                json!("not-the-actual-call"),
+            ),
+            (
+                "/continuation_request/input/3/output",
+                json!("{\"result\":580}"),
+            ),
+            (
+                "/continuation_request/input/3/output",
+                json!("{\"result\":579,\"result\":579}"),
+            ),
+            ("/continuation_request/input/3/type", json!("message")),
+            (
+                "/continuation_request/input/1/content/0/text",
+                json!("invented reasoning"),
+            ),
+            (
+                "/continuation_request/input/2/arguments",
+                json!("{\"expression\":\"122+457\"}"),
+            ),
+            (
+                "/continuation_request/input/2/id",
+                json!("invented output-item identity"),
+            ),
+            (
+                "/call_response/output/1/call_id",
+                json!("changed-native-call"),
+            ),
+            ("/call_response/usage/input_tokens", json!(11)),
+            (
+                "/continuation_response/output/0/content/0/text",
+                json!("{\"answer\":580}"),
+            ),
+            ("/continuation_response/status", json!("incomplete")),
+            (
+                "/continuation_response/output/0/status",
+                json!("incomplete"),
+            ),
+        ] {
+            let mut wrong = good.clone();
+            let pointer = format!("/responses/{mode}{suffix}");
+            *wrong.pointer_mut(&pointer).unwrap() = changed;
+            assert!(
+                verify_auto_tools_json_case(&wrong, 128).is_err(),
+                "accepted {pointer}"
+            );
+        }
+        let mut reordered = good.clone();
+        reordered["responses"][mode]["continuation_request"]["input"]
+            .as_array_mut()
+            .unwrap()
+            .swap(1, 2);
+        assert!(verify_auto_tools_json_case(&reordered, 128).is_err());
+        let mut dropped = good.clone();
+        dropped["responses"][mode]["continuation_request"]["input"]
+            .as_array_mut()
+            .unwrap()
+            .remove(1);
+        assert!(verify_auto_tools_json_case(&dropped, 128).is_err());
+        let mut wrong_id = good.clone();
+        wrong_id["responses"][mode]["continuation_request"]["input"][3]["call_id"] =
+            good["responses"][mode]["call_response"]["output"][1]["id"].clone();
+        assert!(
+            verify_auto_tools_json_case(&wrong_id, 128).is_err(),
+            "output item id is not call_id"
+        );
+        let mut wrong_namespace = good.clone();
+        wrong_namespace["responses"][mode]["call_response"]["output"][1]["namespace"] =
+            json!("undeclared");
+        wrong_namespace["responses"][mode]["continuation_request"]["input"][2]["namespace"] =
+            json!("undeclared");
+        assert!(verify_auto_tools_json_case(&wrong_namespace, 128).is_err());
+        let mut summary = good.clone();
+        let changed = json!([{"type": "summary_text", "text": "unobserved reasoning"}]);
+        summary["responses"][mode]["call_response"]["output"][0]["summary"] = changed.clone();
+        summary["responses"][mode]["continuation_request"]["input"][1]["summary"] = changed;
+        assert!(verify_auto_tools_json_case(&summary, 128).is_err());
+    }
+}
+
+#[test]
+fn auto_tools_json_responses_rejects_weakened_controls_and_chat_only_fields() {
+    let good = auto_json_evidence();
+    for mode in ["sync", "stream"] {
+        for (field, value) in [
+            ("tool_choice", json!("none")),
+            ("tools", json!([])),
+            ("text", Value::Null),
+            ("temperature", json!(1)),
+            ("max_output_tokens", json!(127)),
+            ("stream", json!(mode != "stream")),
+        ] {
+            let mut wrong = good.clone();
+            wrong["responses"][mode]["continuation_request"][field] = value;
+            assert!(
+                verify_auto_tools_json_case(&wrong, 128).is_err(),
+                "changed replay {field}"
+            );
+        }
+        for choice in [
+            json!("none"),
+            json!("required"),
+            json!({"type":"function", "name":"calc"}),
+        ] {
+            let mut wrong = good.clone();
+            for turn in ["call_request", "continuation_request"] {
+                wrong["responses"][mode][turn]["tool_choice"] = choice.clone();
+            }
+            assert!(verify_auto_tools_json_case(&wrong, 128).is_err());
+        }
+        for field in [
+            "response_format",
+            "messages",
+            "stream_options",
+            "max_tokens",
+            "stop",
+            "seed",
+        ] {
+            let mut wrong = good.clone();
+            for turn in ["call_request", "continuation_request"] {
+                wrong["responses"][mode][turn][field] = Value::Null;
+            }
+            assert!(
+                verify_auto_tools_json_case(&wrong, 128).is_err(),
+                "accepted Chat-only {field}"
+            );
+        }
+        for (field, value) in [("temperature", json!(1)), ("seed", json!(7))] {
+            let mut wrong = good.clone();
+            for turn in ["call_request", "continuation_request"] {
+                wrong["responses"][mode][turn][field] = value.clone();
+            }
+            assert!(verify_auto_tools_json_case(&wrong, 128).is_err());
+        }
+        let mut weakened = good.clone();
+        for turn in ["call_request", "continuation_request"] {
+            weakened["responses"][mode][turn]["text"]["format"]["strict"] = json!(false);
+        }
+        assert!(verify_auto_tools_json_case(&weakened, 128).is_err());
+        let mut missing = good.clone();
+        missing["responses"].as_object_mut().unwrap().remove(mode);
+        assert!(verify_auto_tools_json_case(&missing, 128).is_err());
+    }
+}
+
+#[test]
+fn auto_tools_json_reports_each_failed_mode_and_preserves_repeated_call_failure() {
+    let mut repeated = auto_json_evidence();
+    for mode in ["sync", "stream"] {
+        repeated[mode]["continuation"] = repeated[mode]["call"].clone();
+        repeated["responses"][mode]["continuation"] = repeated["responses"][mode]["call"].clone();
+        repeated["responses"][mode]["continuation_response"] =
+            repeated["responses"][mode]["call_response"].clone();
+    }
+    let error = verify_auto_tools_json_case(&repeated, 128).unwrap_err();
+    for label in [
+        "chat.sync: final:",
+        "chat.stream: final:",
+        "responses.sync: final:",
+        "responses.stream: final:",
+    ] {
+        assert!(error.contains(label), "{error}");
+    }
+    assert!(error.contains("another tool call"));
+    repeated["sync"] = json!({"phase": "call_response", "error": "HTTP transport timed out", "call_request": auto_tools_json_controls()});
+    let error = verify_auto_tools_json_case(&repeated, 128).unwrap_err();
+    assert!(error.contains("chat.sync: call_response: HTTP transport timed out"));
+    assert!(error.contains("responses.stream: final:"));
+    for pointer in ["/sync/error", "/responses/stream/error"] {
+        for malformed in [json!({"message": "transport failed"}), json!(true)] {
+            let mut corrupted = auto_json_evidence();
+            let parent = pointer.strip_suffix("/error").unwrap();
+            corrupted.pointer_mut(parent).unwrap()["error"] = malformed;
+            assert!(verify_auto_tools_json_case(&corrupted, 128)
+                .unwrap_err()
+                .contains("invalid non-string error field"));
+        }
+    }
 }
 
 #[test]
