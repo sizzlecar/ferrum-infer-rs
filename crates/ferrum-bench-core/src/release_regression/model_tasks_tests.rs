@@ -66,6 +66,7 @@ impl ReportFixture {
                 ModelCheck::Tools => &["serve-tools"],
                 ModelCheck::Reasoning => &["run-reasoning", "serve-reasoning"],
                 ModelCheck::Length => &["run-length", "serve-length"],
+                ModelCheck::AutoToolsJson => &["serve-auto-tools-json"],
             };
             for name in entries {
                 let evidence = match *name {

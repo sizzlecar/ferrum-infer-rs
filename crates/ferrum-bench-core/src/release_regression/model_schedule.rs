@@ -230,6 +230,7 @@ pub fn model_task_schedule(plan: &Plan) -> ModelTaskSchedule {
                 ModelCheck::Tools => 3,
                 ModelCheck::Reasoning => 4,
                 ModelCheck::Length => 5,
+                ModelCheck::AutoToolsJson => 6,
             });
             run
         })

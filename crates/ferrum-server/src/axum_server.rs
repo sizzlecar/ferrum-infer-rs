@@ -5,9 +5,9 @@
 
 use crate::{
     chat_template::{
-        render_chat_prompt_with_model_template_options_and_compatibility,
-        render_chat_prompt_with_tools_and_model_template_compatibility, ChatTemplateOptions,
-        ModelChatTemplate, ModelReasoningProtocol, ReasoningEffort,
+        render_chat_prompt_with_model_template_options_and_compatibility_with_prefill,
+        render_chat_prompt_with_tools_and_model_template_compatibility_with_prefill,
+        ChatTemplateOptions, ModelChatTemplate, ModelReasoningProtocol, ReasoningEffort,
     },
     model_registry::{LoraAdapterModel, ServedModelKind, ServedModelRegistry},
     openai::*,
@@ -65,6 +65,7 @@ const DEFAULT_SAMPLING_TEMPERATURE: f32 = 0.0;
 const DEFAULT_SAMPLING_TOP_P: f32 = 1.0;
 const DEFAULT_COMPLETION_MAX_TOKENS: u32 = 4096;
 const INITIAL_FORBIDDEN_TOKEN_TEXTS_METADATA_KEY: &str = "ferrum_initial_forbidden_token_texts";
+const PROMPT_OPENED_REASONING_METADATA_KEY: &str = "ferrum_prompt_opened_reasoning";
 const DEFAULT_GUIDED_TOOL_ARGUMENT_STRING_MAX_LENGTH: u64 = 128;
 const MAX_CACHED_JSON_SCHEMA_VALIDATORS: usize = 64;
 const INITIAL_STRUCTURED_CALL_FORBIDDEN_TOKEN_TEXTS: &[&str] =
@@ -2476,8 +2477,7 @@ async fn handle_chat_completions_stream(
         || model_output_protocol == ModelOutputProtocol::HarmonyGptOss;
     // R1-distill-style templates open the think block inside the prompt;
     // the parser must know generation starts mid-think.
-    let started_in_think =
-        has_unclosed_model_reasoning_block(model_output_protocol, &inference_request.prompt);
+    let started_in_think = request_started_in_reasoning(&inference_request);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -2724,6 +2724,7 @@ async fn handle_chat_completions_stream(
                         if let Err(e) = validate_hard_structured_response(
                             &openai_request,
                             &parsed_final.content,
+                            structured_chat_response.as_ref(),
                         ) {
                             let error_event = openai_error_sse_event(
                                 stream_validation_error_message(e),
@@ -3021,8 +3022,7 @@ async fn handle_chat_completions_sync(
         });
     let model_output_protocol = inference_request.sampling_params.model_output_protocol;
     // R1-distill-style templates open the think block inside the prompt.
-    let started_in_think =
-        has_unclosed_model_reasoning_block(model_output_protocol, &inference_request.prompt);
+    let started_in_think = request_started_in_reasoning(&inference_request);
     let replay_request_id = inference_request.id.to_string();
     let profile_request_model = openai_request.model.clone();
     let profile_started_at = Instant::now();
@@ -3162,8 +3162,11 @@ async fn handle_chat_completions_sync(
                     Some("tool_choice"),
                 ));
             }
-            if let Err(error) = validate_hard_structured_response(&openai_request, &message.content)
-            {
+            if let Err(error) = validate_hard_structured_response(
+                &openai_request,
+                &message.content,
+                structured_chat_response.as_ref(),
+            ) {
                 if let Err(err) = write_chat_request_profile_event(
                     &state,
                     &replay_request_id,
@@ -3368,6 +3371,22 @@ fn convert_chat_request(
     convert_chat_request_with_template_model(request, &request.model, None)
 }
 
+fn request_started_in_reasoning(request: &InferenceRequest) -> bool {
+    request
+        .metadata
+        .get(PROMPT_OPENED_REASONING_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            // Requests constructed outside the chat converter retain their
+            // legacy parser behavior. Rendered chat requests carry the actual
+            // generation-suffix state, independent of user/schema text.
+            has_unclosed_model_reasoning_block(
+                request.sampling_params.model_output_protocol,
+                &request.prompt,
+            )
+        })
+}
+
 /// Convert OpenAI chat request to internal inference request.
 ///
 /// `template_model_id` is the loaded model id used for prompt-template family
@@ -3442,10 +3461,11 @@ fn convert_chat_request_with_template_model_and_default(
         request,
         output_contract,
         reasoning_enabled,
+        model_template,
         message_phases,
     );
-    let prompt = if tools.is_empty() && functions.is_empty() {
-        render_chat_prompt_with_model_template_options_and_compatibility(
+    let rendered_prompt = if tools.is_empty() && functions.is_empty() {
+        render_chat_prompt_with_model_template_options_and_compatibility_with_prefill(
             &render_messages,
             template_model_id,
             model_template,
@@ -3454,7 +3474,7 @@ fn convert_chat_request_with_template_model_and_default(
             Some(&render_message_phases),
         )?
     } else {
-        render_chat_prompt_with_tools_and_model_template_compatibility(
+        render_chat_prompt_with_tools_and_model_template_compatibility_with_prefill(
             &render_messages,
             template_model_id,
             model_template,
@@ -3467,11 +3487,17 @@ fn convert_chat_request_with_template_model_and_default(
             Some(&render_message_phases),
         )?
     };
+    let prompt = rendered_prompt.text;
+    let prompt_opened_thinking = rendered_prompt.reasoning_prefill;
     let tool_call_protocol = model_template
         .map(|template| template.tool_call_protocol)
         .unwrap_or_default();
     let api_chat = api_chat_request(request, effective_tool_choice, tool_call_protocol);
     let mut metadata = HashMap::new();
+    metadata.insert(
+        PROMPT_OPENED_REASONING_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(prompt_opened_thinking),
+    );
     metadata.insert(
         "openai_messages".to_string(),
         serde_json::to_value(&request.messages)?,
@@ -3506,7 +3532,6 @@ fn convert_chat_request_with_template_model_and_default(
             serde_json::json!(true),
         );
     }
-    let prompt_opened_thinking = has_unclosed_model_reasoning_block(model_output_protocol, &prompt);
     let reasoning_markers = model_reasoning_markers(model_output_protocol);
     if !prompt_opened_thinking {
         let mut forbidden = reasoning_markers
@@ -3707,15 +3732,19 @@ fn render_messages_with_response_format_instruction(
     request: &ChatCompletionsRequest,
     output_contract: EffectiveChatOutputContract,
     reasoning_enabled: bool,
+    model_template: Option<&ModelChatTemplate>,
     message_phases: Option<&[Option<AssistantMessagePhase>]>,
 ) -> (Vec<ChatMessage>, Vec<Option<AssistantMessagePhase>>) {
     let mut phases = message_phases
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| vec![None; request.messages.len()]);
     debug_assert_eq!(phases.len(), request.messages.len());
-    let Some(instruction) =
-        response_format_prompt_instruction(request, output_contract, reasoning_enabled)
-    else {
+    let Some(instruction) = response_format_prompt_instruction(
+        request,
+        output_contract,
+        reasoning_enabled,
+        model_template,
+    ) else {
         return (request.messages.clone(), phases);
     };
     let mut messages = request.messages.clone();
@@ -3752,12 +3781,37 @@ fn response_format_prompt_instruction(
     request: &ChatCompletionsRequest,
     output_contract: EffectiveChatOutputContract,
     reasoning_enabled: bool,
+    model_template: Option<&ModelChatTemplate>,
 ) -> Option<String> {
     if !output_contract.accepts_requested_response_format() {
         return None;
     }
+    let automatic_tools = request
+        .tools
+        .as_ref()
+        .is_some_and(|tools| !tools.is_empty())
+        && match request.tool_choice.as_ref() {
+            None => true,
+            Some(ToolChoice::Mode(mode)) => mode.eq_ignore_ascii_case("auto"),
+            _ => false,
+        }
+        && matches!(
+            output_contract,
+            EffectiveChatOutputContract::StrictJsonSchemaContent
+                | EffectiveChatOutputContract::JsonObjectContent
+        );
+    let tool_instruction = if model_template
+        .is_some_and(crate::chat_template::model_template_supports_tools)
+    {
+        "If a tool is needed, call it using the provided tool instructions and its argument schema."
+    } else {
+        "If a tool is needed, put a JSON object with the declared function name in the name field and its argument object in the arguments field inside <tool_call>...</tool_call>. This envelope distinguishes a tool call from a final JSON answer."
+    };
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
+            "json_object" if automatic_tools => Some(format!(
+                "{tool_instruction} The response_format applies only to the final answer: output a single valid JSON object, with no markdown fences or extra text."
+            )),
             "json_object" => Some(
                 "The response_format requires a single valid JSON object. Output only JSON, with no markdown fences, no explanation, no chain-of-thought, and no extra text."
                     .to_string(),
@@ -3765,7 +3819,11 @@ fn response_format_prompt_instruction(
             "json_schema" => {
                 let schema = format.json_schema.as_ref()?.schema.as_ref()?;
                 let schema_text = serde_json::to_string(schema).ok()?;
-                Some(if reasoning_enabled {
+                Some(if automatic_tools {
+                    format!(
+                        "{tool_instruction} Complete any enabled reasoning before the final answer. The response_format applies only to the final answer: output a single valid JSON value satisfying this JSON Schema, with no markdown fences or extra text. Schema: {schema_text}"
+                    )
+                } else if reasoning_enabled {
                     format!(
                         "The response_format requires a single valid JSON value satisfying this JSON Schema. Complete any enabled reasoning before the final answer. In the final answer, output only JSON, with no markdown fences, no explanation, and no extra text. Schema: {schema_text}"
                     )
@@ -4499,7 +4557,19 @@ fn strict_json_schema_string(
 fn validate_hard_structured_response(
     request: &ChatCompletionsRequest,
     content: &str,
+    validated_chat_response: Option<&ferrum_types::ApiChatResponse>,
 ) -> std::result::Result<(), ServerError> {
+    // Both terminal paths validate tool names, arguments and choice before
+    // reaching this point. The final-answer schema applies to the content
+    // branch; a tool call has its own independently validated argument schema.
+    if validated_chat_response.is_some_and(|response| !response.message.tool_calls.is_empty()) {
+        return Ok(());
+    }
+    // Validate the same content that the typed response will publish. A text
+    // fallback may interpret marker-like strings inside valid JSON as framing.
+    let content = validated_chat_response
+        .map(|response| response.message.content.as_str())
+        .unwrap_or(content);
     match EffectiveChatOutputContract::resolve(request) {
         EffectiveChatOutputContract::JsonObjectContent => {
             let value = serde_json::from_str::<serde_json::Value>(content).map_err(|error| {
@@ -5639,6 +5709,7 @@ fn finish_reason_to_string(reason: &FinishReason) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod auto_tools_json;
     mod engine_stop_contract;
     mod gemma_thought;
     mod harmony_stops;

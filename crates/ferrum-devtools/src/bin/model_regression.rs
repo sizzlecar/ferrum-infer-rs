@@ -46,6 +46,7 @@ struct Args {
     /// A new or empty directory; raw requests, responses and child logs stay here.
     #[arg(long)]
     report_dir: PathBuf,
+    /// Checks: basic, stop, structured, tools, auto-tools-json, reasoning, length.
     #[arg(long, value_delimiter = ',', default_value = "basic")]
     checks: Vec<Check>,
     /// Forward the public flag to both entrypoints. Otherwise keep model defaults.
@@ -341,6 +342,14 @@ async fn main() -> Result<()> {
                     Check::Tools => {
                         record(&mut report, "serve-tools", cases::tools(&server)).await?
                     }
+                    Check::AutoToolsJson => {
+                        record(
+                            &mut report,
+                            "serve-auto-tools-json",
+                            cases::auto_tools_json(&server),
+                        )
+                        .await?
+                    }
                 }
             }
         }
@@ -365,6 +374,25 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod report_tests {
     use super::*;
+    #[test]
+    fn automatic_tool_json_check_can_be_selected_explicitly() {
+        let args = Args::try_parse_from([
+            "model-regression",
+            "--ferrum-bin",
+            "fixture-ferrum",
+            "--model",
+            "fixture-model",
+            "--backend",
+            "cpu",
+            "--report-dir",
+            "fixture-report",
+            "--checks",
+            "auto-tools-json",
+        ])
+        .unwrap();
+        assert_eq!(args.checks, vec![Check::AutoToolsJson]);
+    }
+
     #[test]
     fn a_real_answer_oracle_failure_survives_successful_later_cases() {
         let directory = tempfile::tempdir().unwrap();

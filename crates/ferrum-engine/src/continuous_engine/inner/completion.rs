@@ -79,6 +79,20 @@ impl SequenceState {
         if stop_end == full.len() {
             return Ok(());
         }
+        if let Some(root_end) = processor
+            .complete_root_text_len_with_terminals(&self.generated_tokens, &self.stop_token_ids)?
+        {
+            // The composed grammar owns the entire wire result, including
+            // tool and native protocol terminators. A stop may trim trailing
+            // whitespace, but cannot cut a complete result inside a merged
+            // token merely because the untrimmed token was grammar-valid.
+            if stop_end < root_end {
+                return Err(FerrumError::model(
+                    "stop sequence truncated the structured output before its complete tool or final result",
+                ));
+            }
+            return Ok(());
+        }
         // The grammar already validated the generated value. A text stop must
         // not cut *inside* that value, even if the shorter prefix also parses
         // (for example, cutting the final digit from a schema-constrained 123).
@@ -160,6 +174,29 @@ impl SequenceState {
             ))),
             Err(error) => Some(error),
         }
+    }
+
+    fn classified_structured_api_response(
+        &self,
+        finish_reason: FinishReason,
+    ) -> Result<Option<ferrum_types::ApiResponse>> {
+        if !matches!(finish_reason, FinishReason::Stop | FinishReason::EOS) {
+            return Ok(None);
+        }
+        let Some(processor) = self.structured_output_processor.as_ref() else {
+            return Ok(None);
+        };
+        let Some((branch, payload)) = processor
+            .classified_result_with_terminals(&self.generated_tokens, &self.stop_token_ids)?
+        else {
+            return Ok(None);
+        };
+        ferrum_types::api_response_from_classified_generated_text(
+            &self.original_request,
+            &payload,
+            finish_reason,
+            branch,
+        )
     }
 }
 
@@ -600,6 +637,7 @@ impl EngineInner {
         finish_reason: FinishReason,
         mut explicit_terminal_error: Option<FerrumError>,
     ) -> Result<()> {
+        let mut classified_api_response = None;
         if explicit_terminal_error.is_none() {
             explicit_terminal_error = self.sequences.read().get(request_id).and_then(|seq| {
                 seq.structured_output_terminal_error(finish_reason)
@@ -607,6 +645,15 @@ impl EngineInner {
                         seq.validate_structured_stop_boundary(self.tokenizer.as_ref())
                             .err()
                     })
+                    .or_else(
+                        || match seq.classified_structured_api_response(finish_reason) {
+                            Ok(response) => {
+                                classified_api_response = response;
+                                None
+                            }
+                            Err(error) => Some(error),
+                        },
+                    )
             });
         }
         if explicit_terminal_error.is_none() && finish_reason != FinishReason::Error {
@@ -636,11 +683,13 @@ impl EngineInner {
                 let text = seq
                     .decoded_output_text(self.tokenizer.as_ref(), Some(finish_reason))
                     .unwrap_or_default();
-                let api_response = ferrum_types::api_response_from_generated_text(
-                    &seq.original_request,
-                    &text,
-                    finish_reason,
-                );
+                let api_response = classified_api_response.take().or_else(|| {
+                    ferrum_types::api_response_from_generated_text(
+                        &seq.original_request,
+                        &text,
+                        finish_reason,
+                    )
+                });
                 let prompt_token_count = seq.input_tokens.len();
                 let execution_evidence = seq.take_execution_evidence()?;
 

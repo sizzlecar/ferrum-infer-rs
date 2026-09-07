@@ -728,12 +728,20 @@ impl SequenceState {
         let structured_output_processor = shared_structured_factory
             .or(local_structured_factory.as_ref())
             .map(|factory| {
-                factory.create_processor(
+                factory.create_processor_with_chat_contract(
                     &request.sampling_params.response_format,
                     &request.sampling_params.structured_output_start,
                     request.sampling_params.max_tokens,
                     &stop_token_ids,
                     &stop_text_seqs,
+                    request
+                        .api_request
+                        .as_ref()
+                        .and_then(|request| match request {
+                            ferrum_types::ApiRequest::Chat(chat) => Some(chat),
+                            ferrum_types::ApiRequest::Completion(_) => None,
+                        }),
+                    request.sampling_params.model_output_protocol,
                 )
             })
             .transpose()?
@@ -1634,6 +1642,15 @@ impl SequenceState {
                 }
             }
         }
+        if let Some(processor) = &self.structured_output_processor {
+            match processor
+                .is_protocol_complete_with_terminals(&self.generated_tokens, &self.stop_token_ids)
+            {
+                Ok(true) => return Some(FinishReason::EOS),
+                Ok(false) => {}
+                Err(_) => return Some(FinishReason::Error),
+            }
+        }
         if let Some(last_token) = self.generated_tokens.last() {
             if self.model_eos_token_ids.contains(&last_token.get()) {
                 return Some(FinishReason::EOS);
@@ -1663,12 +1680,24 @@ impl SequenceState {
             Some(FinishReason::Stop | FinishReason::EOS) => {
                 self.sampling_params.model_output_protocol
                     == ferrum_types::ModelOutputProtocol::HarmonyGptOss
-                    && tokenizer.is_some_and(|tokenizer| {
+                    && (tokenizer.is_some_and(|tokenizer| {
                         ["<|call|>", "<|return|>"]
                             .into_iter()
                             .filter_map(|marker| tokenizer.token_id(marker))
                             .any(|terminal| terminal == token)
-                    })
+                    }) || (stop_reason == Some(FinishReason::EOS)
+                        && !self.stop_token_ids.contains(&token.get())
+                        && self
+                            .structured_output_processor
+                            .as_ref()
+                            .is_some_and(|processor| {
+                                processor
+                                    .is_protocol_complete_with_terminals(
+                                        &self.generated_tokens,
+                                        &self.stop_token_ids,
+                                    )
+                                    .unwrap_or(false)
+                            })))
             }
             _ => true,
         }
@@ -1707,8 +1736,41 @@ impl SequenceState {
             )?;
             required_structured_delimiter_token_id = constraint.required_delimiter_token_id;
             grammar_start_token_index = constraint.grammar_start_token_index;
+            if constraint.accepting
+                && processor
+                    .complete_root_text_len_with_terminals(
+                        &self.generated_tokens,
+                        &self.stop_token_ids,
+                    )?
+                    .is_some()
+            {
+                // A single token may contain both the reasoning delimiter and
+                // its complete result. The whole-root grammar has checked
+                // those bytes even when the token-sequence matcher cannot
+                // observe a separately encoded delimiter.
+                self.response_completion_state = ResponseCompletionState::Satisfied;
+                if let Some(mask) = &mut self.argmax_token_mask {
+                    mask.set_tokens_validity(&self.model_eos_token_ids, true);
+                }
+                if let Some(mask) = &mut self.initial_argmax_token_mask {
+                    mask.set_tokens_validity(&self.model_eos_token_ids, true);
+                }
+            }
             if !constraint.accepting {
-                mask_stop_token_logits(logits, &self.stop_token_ids);
+                // Native terminators belong to the grammar itself. The root
+                // becomes accepting only after this exact allowed token is
+                // consumed; other early stop IDs must remain masked.
+                if constraint.grammar_owned_terminal_token_id.is_some() {
+                    for &token_id in &self.stop_token_ids {
+                        if constraint.grammar_owned_terminal_token_id != Some(token_id) {
+                            if let Some(logit) = logits.get_mut(token_id as usize) {
+                                *logit = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                } else {
+                    mask_stop_token_logits(logits, &self.stop_token_ids);
+                }
             }
         }
         match (has_structured_output, grammar_start_token_index) {

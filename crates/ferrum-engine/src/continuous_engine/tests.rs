@@ -13510,3 +13510,5 @@ fn sample_masks_metadata_initial_token_text_only_before_first_generation() {
     assert_eq!(next.get(), 5);
     assert_eq!(next_logits[5], 100.0);
 }
+
+mod auto_tools_json;

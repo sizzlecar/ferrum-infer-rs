@@ -20,6 +20,7 @@ use llguidance::{
 use parking_lot::Mutex;
 use serde_json::json;
 
+mod auto_tools;
 mod harmony;
 #[cfg(test)]
 mod reasoning_envelope_tests;
@@ -93,7 +94,9 @@ pub struct StructuredOutputFactory {
     vocab_size: usize,
     defined_token_ids: Arc<[bool]>,
     json_token_classes: Arc<[StructuredOutputTokenClass]>,
+    wire_token_bytes: Arc<[Vec<u8>]>,
     grammar_templates: Mutex<HashMap<String, Matcher>>,
+    schema_validators: Mutex<HashMap<String, Arc<jsonschema::Validator>>>,
 }
 
 impl std::fmt::Debug for StructuredOutputFactory {
@@ -130,6 +133,13 @@ impl StructuredOutputFactory {
         }
 
         let special_ids = tokenizer_special_ids(tokenizer.as_ref());
+        let wire_token_bytes = (0..vocab_size)
+            .map(|idx| {
+                tokenizer
+                    .token_bytes(TokenId::new(idx as u32))
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
         let mut defined_token_ids = Vec::with_capacity(vocab_size);
         let mut json_token_classes = Vec::with_capacity(vocab_size);
         let token_bytes = (0..vocab_size)
@@ -200,8 +210,46 @@ impl StructuredOutputFactory {
             vocab_size,
             defined_token_ids: defined_token_ids.into(),
             json_token_classes: json_token_classes.into(),
+            wire_token_bytes: wire_token_bytes.into(),
             grammar_templates: Mutex::new(HashMap::new()),
+            schema_validators: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Compile one request's grammar while reusing the tokenizer trie.
+    pub fn create_processor_with_chat_contract(
+        &self,
+        response_format: &ResponseFormat,
+        start: &StructuredOutputStart,
+        max_output_tokens: usize,
+        stop_token_ids: &HashSet<u32>,
+        stop_text_sequences: &[String],
+        chat_request: Option<&ferrum_types::ApiChatRequest>,
+        output_protocol: ferrum_types::ModelOutputProtocol,
+    ) -> Result<Option<StructuredOutputProcessor>> {
+        if let Some(chat) = chat_request.filter(|chat| {
+            chat.automatic_tools_with_hard_response_format()
+                && !matches!(response_format, ResponseFormat::Text)
+        }) {
+            return auto_tools::compile(
+                self,
+                response_format,
+                start,
+                max_output_tokens,
+                stop_token_ids,
+                stop_text_sequences,
+                chat,
+                output_protocol,
+            )
+            .map(Some);
+        }
+        self.create_processor(
+            response_format,
+            start,
+            max_output_tokens,
+            stop_token_ids,
+            stop_text_sequences,
+        )
     }
 
     /// Compile one request's grammar while reusing the tokenizer trie.
@@ -351,6 +399,7 @@ impl StructuredOutputFactory {
                 trailing_identical_token_count: 0,
                 liveness_intervention_count: 0,
                 last_liveness_intervention_at: None,
+                composed: None,
             }),
             vocab_size: self.vocab_size,
             defined_token_ids: Arc::clone(&self.defined_token_ids),
@@ -476,6 +525,9 @@ pub struct StructuredOutputMaskOutcome {
     /// avoid rejecting an intentionally hidden special token during output
     /// quality filtering.
     pub required_delimiter_token_id: Option<u32>,
+    /// A native protocol terminal allowed by the complete grammar at this
+    /// step, even though consuming it is necessary for root acceptance.
+    pub grammar_owned_terminal_token_id: Option<u32>,
 }
 
 /// Terminal/debug snapshot that distinguishes activation failures from an
@@ -524,6 +576,7 @@ struct ProcessorState {
     trailing_identical_token_count: usize,
     liveness_intervention_count: usize,
     last_liveness_intervention_at: Option<usize>,
+    composed: Option<auto_tools::ComposedState>,
 }
 
 #[derive(Clone)]
@@ -574,6 +627,16 @@ impl StructuredOutputProcessor {
         hidden_control_token_ids: Option<&HashSet<u32>>,
     ) -> Result<StructuredOutputMaskOutcome> {
         let mut state = self.state.lock();
+        if state.composed.is_some() {
+            return auto_tools::mask(
+                self,
+                &mut state,
+                logits,
+                generated,
+                terminal_token_ids,
+                hidden_control_token_ids,
+            );
+        }
         advance_state(&mut state, generated, terminal_token_ids, self.budget)?;
         activate_forcing_if_due(&mut state, generated, self.budget);
         if let Activation::Harmony(boundary) = &state.activation {
@@ -587,6 +650,7 @@ impl StructuredOutputProcessor {
                     liveness_intervention: false,
                     grammar_start_token_index: None,
                     required_delimiter_token_id,
+                    grammar_owned_terminal_token_id: None,
                 });
             }
         }
@@ -630,6 +694,7 @@ impl StructuredOutputProcessor {
                 liveness_intervention: false,
                 grammar_start_token_index: None,
                 required_delimiter_token_id: Some(required_delimiter_token),
+                grammar_owned_terminal_token_id: None,
             });
         }
 
@@ -702,6 +767,7 @@ impl StructuredOutputProcessor {
             liveness_intervention,
             grammar_start_token_index: Some(grammar_start_token_index),
             required_delimiter_token_id: None,
+            grammar_owned_terminal_token_id: None,
         })
     }
 
@@ -754,6 +820,9 @@ impl StructuredOutputProcessor {
         terminal_token_ids: Option<&HashSet<u32>>,
     ) -> Result<StructuredOutputProgress> {
         let mut state = self.state.lock();
+        if state.composed.is_some() {
+            return auto_tools::progress(self, &mut state, generated, terminal_token_ids);
+        }
         advance_state(&mut state, generated, terminal_token_ids, self.budget)?;
         activate_forcing_if_due(&mut state, generated, self.budget);
         let (phase, delimiter_token_count, delimiter_prefix_token_count, accepting) =
@@ -865,10 +934,16 @@ impl StructuredOutputProcessor {
 
     pub fn reset(&self) -> Result<()> {
         let mut state = self.state.lock();
-        state
-            .matcher
-            .reset()
-            .map_err(|error| FerrumError::internal(format!("reset structured output: {error}")))?;
+        if let Some(composed) = &state.composed {
+            // llguidance rollback treats model EOS tokens as zero bytes.
+            // A composed native grammar consumes their actual marker bytes,
+            // so reset from the pristine grammar instead of rolling them back.
+            state.matcher = composed.fresh_matcher();
+        } else {
+            state.matcher.reset().map_err(|error| {
+                FerrumError::internal(format!("reset structured output: {error}"))
+            })?;
+        }
         state.activation = state.initial_activation.clone();
         state.consumed = 0;
         state.boundary_forced = false;
@@ -878,7 +953,76 @@ impl StructuredOutputProcessor {
         state.trailing_identical_token_count = 0;
         state.liveness_intervention_count = 0;
         state.last_liveness_intervention_at = None;
+        if let Some(composed) = &mut state.composed {
+            composed.reset();
+            state.grammar_start = composed.result_start();
+        }
         Ok(())
+    }
+
+    /// Native framing can end inside an ordinary merged token instead of a
+    /// model EOS ID. Only a complete native root authorizes this path.
+    pub fn is_protocol_complete_with_terminals(
+        &self,
+        generated: &[TokenId],
+        terminal_token_ids: &HashSet<u32>,
+    ) -> Result<bool> {
+        let mut state = self.state.lock();
+        if !state
+            .composed
+            .as_ref()
+            .is_some_and(|composed| composed.is_native())
+        {
+            return Ok(false);
+        }
+        auto_tools::advance(&mut state, generated, Some(terminal_token_ids))?;
+        state.matcher.is_accepting().map_err(|error| {
+            FerrumError::model(format!(
+                "structured-output acceptance check failed: {error}"
+            ))
+        })
+    }
+
+    /// Byte end of a complete composed wire result, excluding an external
+    /// model EOS. Text-stop handling can compare its cut position with this
+    /// boundary without parsing tool markup as a final JSON value.
+    pub fn complete_root_text_len_with_terminals(
+        &self,
+        generated: &[TokenId],
+        terminal_token_ids: &HashSet<u32>,
+    ) -> Result<Option<usize>> {
+        let mut state = self.state.lock();
+        if state.composed.is_none() {
+            return Ok(None);
+        }
+        auto_tools::advance(&mut state, generated, Some(terminal_token_ids))?;
+        let accepting = state.matcher.is_accepting().map_err(|error| {
+            FerrumError::model(format!(
+                "structured-output acceptance check failed: {error}"
+            ))
+        })?;
+        Ok(accepting.then(|| {
+            state
+                .composed
+                .as_ref()
+                .expect("composed processor")
+                .complete_text_len()
+        }))
+    }
+
+    /// Classify a complete non-native result with final-schema precedence.
+    /// The returned payload preserves bytes from tokens spanning the
+    /// reasoning/result boundary. Native protocols keep their own parser.
+    pub fn classified_result_with_terminals(
+        &self,
+        generated: &[TokenId],
+        terminal_token_ids: &HashSet<u32>,
+    ) -> Result<Option<(ferrum_types::StructuredOutputBranch, String)>> {
+        let mut state = self.state.lock();
+        if state.composed.is_none() {
+            return Ok(None);
+        }
+        auto_tools::classify(&mut state, generated, terminal_token_ids)
     }
 }
 

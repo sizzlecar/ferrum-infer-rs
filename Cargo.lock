@@ -1660,6 +1660,7 @@ dependencies = [
  "async-trait",
  "ferrum-interfaces",
  "ferrum-types",
+ "jsonschema",
  "llguidance",
  "once_cell",
  "parking_lot",
