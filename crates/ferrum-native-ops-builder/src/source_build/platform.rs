@@ -27,6 +27,35 @@ pub(crate) fn is_msvc_compiler(path: &str) -> bool {
     basename(path).eq_ignore_ascii_case("cl.exe")
 }
 
+pub(crate) fn nvcc_ccbin_argument(path: &str, msvc: bool) -> Result<String> {
+    if !msvc {
+        return Ok(path.to_string());
+    }
+    if !is_msvc_compiler(path) {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "MSVC NVCC -ccbin must select cl.exe".to_string(),
+        ));
+    }
+    // NVCC compares this spelling with the ordinary paths in its controlled
+    // PATH. Preserve the canonical identity separately and verify this alias
+    // against that physical file before executing a source build.
+    normalize_windows_path(path)
+}
+
+pub(crate) fn validate_nvcc_ccbin_identity(
+    compiler: &NativeOperatorToolFileIdentity,
+) -> Result<()> {
+    let argument = nvcc_ccbin_argument(&compiler.path, true)?;
+    let actual = tool_file_identity(Path::new(&argument))?;
+    if &actual != compiler {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "NVCC -ccbin invocation does not resolve to its recorded compiler identity: invocation={argument} recorded={}",
+            compiler.path
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_host_contract(
     abi: Option<&NativeOperatorHostAbi>,
     target: &str,

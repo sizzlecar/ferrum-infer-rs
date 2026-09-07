@@ -563,7 +563,7 @@ jobs:
           key: windows-msvc1938-cuda1241-${{ hashFiles('Cargo.lock', 'crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/cuda/**') }}
           restore-keys: |
             windows-msvc1938-cuda1241-
-      - name: Verify selected Windows tool version probes
+      - name: Verify selected Windows toolchain probes
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true

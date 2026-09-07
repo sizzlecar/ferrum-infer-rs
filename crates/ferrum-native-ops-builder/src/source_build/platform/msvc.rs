@@ -457,6 +457,13 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires configured CUDA Toolkit and MSVC tools"]
+    fn configured_nvcc_host_compile() {
+        crate::source_build::windows_tests::configured_nvcc_host_compile();
+    }
+
+    #[cfg(windows)]
+    #[test]
     #[ignore = "requires configured MSVC tools"]
     fn configured_msvc_tool_version_probes() {
         let compiler =

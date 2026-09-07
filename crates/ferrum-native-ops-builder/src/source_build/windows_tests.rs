@@ -44,7 +44,7 @@ fn toolchain() -> NativeOperatorSourceBuildToolchain {
                 manifest: evidence("toolchain/cuda-static-manifest.json"),
             },
             host_toolchain: NativeOperatorHostToolchainIdentity {
-                compiler: tool("C:/MSVC/bin/Hostx64/x64/cl.exe"),
+                compiler: tool(r"\\?\C:\MSVC\bin\Hostx64\x64\cl.exe"),
                 compiler_version: "MSVC 1938 full 193833130".to_string(),
                 target: platform::MSVC_TARGET.to_string(),
                 host_abi: Some(NativeOperatorHostAbi::for_target(platform::MSVC_TARGET).unwrap()),
@@ -58,9 +58,13 @@ fn toolchain() -> NativeOperatorSourceBuildToolchain {
 }
 
 fn plan(root: &Path) -> (NativeOperatorSourceBuildPlan, PathBuf) {
+    plan_with_source(root, "#include \"marlin.h\"\n")
+}
+
+fn plan_with_source(root: &Path, contents: &str) -> (NativeOperatorSourceBuildPlan, PathBuf) {
     let source = root.join("source");
     fs::create_dir_all(source.join("kernels")).unwrap();
-    fs::write(source.join("kernels/marlin.cu"), "#include \"marlin.h\"\n").unwrap();
+    fs::write(source.join("kernels/marlin.cu"), contents).unwrap();
     fs::write(source.join("kernels/marlin.h"), "void fixture();\n").unwrap();
     let definition = NativeOperatorSourceDefinition {
         schema_version: NATIVE_OPERATOR_SOURCE_DEFINITION_SCHEMA_VERSION,
@@ -228,7 +232,8 @@ fn receipt(
         &request.output_dir.join("logs"),
         Some(&toolchain),
         &environment,
-    );
+    )
+    .unwrap();
     let specs = build_object_cache_specs(
         plan,
         &architecture,
@@ -412,6 +417,194 @@ fn msvc_cache_identity_rejects_objects_from_nvcc_reinitialized_environments() {
     assert_ne!(signature, legacy_signature);
     receipt.commands[0].object_cache_key = Some(sha256_bytes(legacy_signature.as_bytes()));
     assert!(verify_source_build_receipt_against_plan_portable(&receipt, &path).is_err());
+}
+
+#[test]
+fn msvc_nvcc_ccbin_invocation_is_bound_by_receipt_and_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let (plan, path) = plan(root.path());
+    let receipt = receipt(&plan, &path);
+    verify_source_build_receipt_against_plan_portable(&receipt, &path).unwrap();
+    let identity = &receipt.toolchain.as_ref().unwrap().static_identity;
+    assert_eq!(
+        identity.host_toolchain.compiler.path,
+        r"\\?\C:\MSVC\bin\Hostx64\x64\cl.exe"
+    );
+    let argument = &receipt.commands[0].argv[7];
+    assert_eq!(argument, "C:/MSVC/bin/Hostx64/x64/cl.exe");
+    assert!(receipt.effective_environment["PATH"]
+        .split(';')
+        .any(|path| { Some(path) == platform::parent(argument) }));
+    let specs = build_object_cache_specs(
+        &plan,
+        &receipt.architecture_argument,
+        identity,
+        &receipt.effective_environment,
+    )
+    .unwrap();
+    let signature = specs[0].input_signature();
+    let value: serde_json::Value = serde_json::from_str(signature).unwrap();
+    assert_eq!(value["msvc_nvcc_ccbin"], *argument);
+    let legacy_signature = signature.replace(
+        &format!(
+            ",\"msvc_nvcc_ccbin\":{}",
+            serde_json::to_string(argument).unwrap()
+        ),
+        "",
+    );
+    assert_ne!(signature, legacy_signature);
+    let mut legacy_cache = receipt.clone();
+    legacy_cache.commands[0].object_cache_key = Some(sha256_bytes(legacy_signature.as_bytes()));
+    assert!(verify_source_build_receipt_against_plan_portable(&legacy_cache, &path).is_err());
+    for changed in [
+        identity.host_toolchain.compiler.path.as_str(),
+        "C:/Other/cl.exe",
+    ] {
+        let mut invalid = receipt.clone();
+        invalid.commands[0].argv[7] = changed.to_string();
+        assert!(verify_source_build_receipt_against_plan_portable(&invalid, &path).is_err());
+    }
+    let linux = "/usr/bin/../bin/g++";
+    assert_eq!(platform::nvcc_ccbin_argument(linux, false).unwrap(), linux);
+}
+
+#[cfg(windows)]
+#[test]
+fn msvc_nvcc_ccbin_projection_resolves_to_the_recorded_file() {
+    let directory = tempfile::Builder::new()
+        .prefix("nvcc host 中文 ")
+        .tempdir()
+        .unwrap();
+    let compiler = directory.path().join("cl.exe");
+    fs::write(&compiler, b"selected compiler identity").unwrap();
+    let identity = tool_file_identity(&compiler).unwrap();
+    assert!(identity.path.starts_with(r"\\?\"));
+    platform::validate_nvcc_ccbin_identity(&identity).unwrap();
+    let argument = platform::nvcc_ccbin_argument(&identity.path, true).unwrap();
+    assert!(!argument.starts_with(r"\\?\"));
+    assert_eq!(
+        Path::new(&argument).canonicalize().unwrap(),
+        Path::new(&identity.path)
+    );
+    fs::write(&compiler, b"changed compiler identity").unwrap();
+    assert!(platform::validate_nvcc_ccbin_identity(&identity).is_err());
+}
+
+#[cfg(windows)]
+pub(super) fn configured_nvcc_host_compile() {
+    let root = tempfile::Builder::new()
+        .prefix("ferrum nvcc host ")
+        .tempdir()
+        .unwrap();
+    let (plan, plan_path) = plan_with_source(root.path(),
+        "#include \"marlin.h\"\nextern \"C\" __global__ void ferrum_host_probe(int* values) { values[threadIdx.x] = 7; }\n");
+    let toolkit =
+        PathBuf::from(std::env::var_os("CUDA_PATH").expect("CUDA_PATH must select a Toolkit"));
+    let nvcc = tool_file_identity(&toolkit.join("bin/nvcc.exe")).unwrap();
+    let compiler = tool_file_identity(Path::new(
+        &std::env::var_os("NVCC_CCBIN").expect("NVCC_CCBIN must select cl.exe"),
+    ))
+    .unwrap();
+    let archiver = tool_file_identity(Path::new(
+        &std::env::var_os("FERRUM_MSVC_LIB").expect("FERRUM_MSVC_LIB must select lib.exe"),
+    ))
+    .unwrap();
+    platform::validate_nvcc_ccbin_identity(&compiler).unwrap();
+    let environment = platform::msvc_environment_for_tools(
+        [&nvcc.path, &compiler.path, &archiver.path],
+        &platform::capture_msvc_environment().unwrap(),
+    )
+    .unwrap();
+    let output = root.path().join("build");
+    for directory in ["objects", "logs", "depfiles"] {
+        fs::create_dir_all(output.join(directory)).unwrap();
+    }
+    let request = NativeOperatorSourceBuildRequest {
+        plan_path,
+        source_root: root.path().join("source").canonicalize().unwrap(),
+        output_dir: output,
+        compute_capability: "sm_89".to_string(),
+        builder_sha: "0".repeat(40),
+        nvcc_path: PathBuf::from(&nvcc.path),
+        ccbin_path: PathBuf::from(&compiler.path),
+        ar_path: PathBuf::from(&archiver.path),
+        cuda_toolkit_root: toolkit,
+        nvcc_threads: 1,
+        object_cache_dir: root.path().join("cache"),
+        plan_only: false,
+    };
+    // Use the production argv builder with selected canonical executable
+    // paths. This exercises PATH/-ccbin together, beyond a --version probe.
+    let commands = build_commands(
+        &request,
+        &plan,
+        &request.source_root,
+        &architecture_argument(plan.architecture, &request.compute_capability),
+        &request.output_dir.join("objects"),
+        &request.output_dir.join("logs"),
+        None,
+        &environment,
+    )
+    .unwrap();
+    let command = &commands[0];
+    let stdout = request.output_dir.join(&command.stdout_log);
+    let stderr = request.output_dir.join(&command.stderr_log);
+    write_command_stream(
+        &stdout,
+        "stdout",
+        &command.argv,
+        b"configured compile probe\n",
+    )
+    .unwrap();
+    write_command_stream(
+        &stderr,
+        "stderr",
+        &command.argv,
+        b"configured compile probe\n",
+    )
+    .unwrap();
+    let status = run_logged_command(
+        &command.argv,
+        &stdout,
+        &stderr,
+        &command.working_directory,
+        &environment,
+    )
+    .unwrap();
+    eprintln!(
+        "production NVCC host compile: argv={:?} status={status} stdout={} stderr={}",
+        command.argv,
+        fs::read_to_string(stdout)
+            .unwrap()
+            .chars()
+            .take(8000)
+            .collect::<String>(),
+        fs::read_to_string(stderr)
+            .unwrap()
+            .chars()
+            .take(8000)
+            .collect::<String>()
+    );
+    assert!(
+        status.success(),
+        "production NVCC host compile failed: {status}"
+    );
+    let object = Path::new(command.object_file.as_ref().unwrap());
+    let inspection =
+        ferrum_native_ops::inspect_msvc_object(&fs::read(object).unwrap(), platform::MSVC_TARGET)
+            .unwrap();
+    assert_eq!(inspection.identity.machine, 0x8664);
+    let depfile = request
+        .output_dir
+        .join(command.compiler_depfile.as_ref().unwrap());
+    let (target, dependencies) =
+        parse_make_depfile(&fs::read_to_string(&depfile).unwrap(), &depfile).unwrap();
+    assert!(platform::same_path(&target, &object.display().to_string()));
+    assert!(dependencies.iter().any(|dependency| {
+        platform::source_relative_path(dependency, &command.working_directory)
+            .is_ok_and(|relative| relative == plan.translation_units[0].path)
+    }));
+    platform::validate_nvcc_ccbin_identity(&compiler).unwrap();
 }
 
 #[test]

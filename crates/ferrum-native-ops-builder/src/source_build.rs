@@ -410,6 +410,8 @@ struct NativeOperatorBuildInputIdentity<'a> {
     toolchain: Option<&'a NativeOperatorSourceBuildStaticToolchain>,
     #[serde(skip_serializing_if = "Option::is_none")]
     msvc_environment_option: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_nvcc_ccbin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -428,6 +430,8 @@ struct NativeOperatorObjectInputIdentity<'a> {
     toolchain: &'a NativeOperatorSourceBuildStaticToolchain,
     #[serde(skip_serializing_if = "Option::is_none")]
     msvc_environment_option: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_nvcc_ccbin: Option<String>,
 }
 
 pub fn lock_native_operator_source_definition(
@@ -671,7 +675,7 @@ pub fn run_native_operator_source_build(
         &logs_dir,
         toolchain.as_ref(),
         &effective_environment,
-    );
+    )?;
     let initial_log = if request.plan_only {
         b"plan-only: command was not executed\n".as_slice()
     } else {
@@ -1690,7 +1694,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
             expected_object_file.clone(),
             expected_architecture.clone(),
             "-ccbin".to_string(),
-            static_identity.host_toolchain.compiler.path.clone(),
+            platform::nvcc_ccbin_argument(&static_identity.host_toolchain.compiler.path, msvc)?,
             if msvc { "-MD" } else { "-MMD" }.to_string(),
             "-MF".to_string(),
             expected_compiler_depfile.clone(),
@@ -3752,6 +3756,9 @@ fn resolve_static_toolchain(
         miss_probe: None,
     };
     validate_static_toolchain_identity("<source-build-preflight>", &toolchain.static_identity)?;
+    if platform::is_msvc(toolchain.static_identity.host_toolchain.host_abi.as_ref()) {
+        platform::validate_nvcc_ccbin_identity(&toolchain.static_identity.host_toolchain.compiler)?;
+    }
     Ok(toolchain)
 }
 
@@ -4782,6 +4789,9 @@ fn validate_host_toolchain_unchanged(
             "host toolchain files or driver configuration changed during source build".to_string(),
         ));
     }
+    if platform::is_msvc(identity.host_abi.as_ref()) {
+        platform::validate_nvcc_ccbin_identity(&identity.compiler)?;
+    }
     Ok(())
 }
 
@@ -5112,6 +5122,12 @@ fn build_inputs_sha256(
         msvc_environment_option: platform::nvcc_environment_option(toolchain.is_some_and(
             |toolchain| platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref()),
         )),
+        msvc_nvcc_ccbin: toolchain
+            .filter(|toolchain| platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref()))
+            .map(|toolchain| {
+                platform::nvcc_ccbin_argument(&toolchain.host_toolchain.compiler.path, true)
+            })
+            .transpose()?,
     };
     let bytes =
         serde_json::to_vec(&identity).map_err(|source| NativeOperatorBuilderError::Json {
@@ -5235,6 +5251,9 @@ fn build_object_cache_specs(
                 msvc_environment_option: platform::nvcc_environment_option(platform::is_msvc(
                     toolchain.host_toolchain.host_abi.as_ref(),
                 )),
+                msvc_nvcc_ccbin: platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref())
+                    .then(|| platform::nvcc_ccbin_argument(&toolchain.host_toolchain.compiler.path, true))
+                    .transpose()?,
             };
             let input_signature = serde_json::to_string(&identity).map_err(|source| {
                 NativeOperatorBuilderError::Json {
@@ -5312,7 +5331,7 @@ fn build_commands(
     logs_dir: &Path,
     toolchain: Option<&NativeOperatorSourceBuildToolchain>,
     _effective_environment: &BTreeMap<String, String>,
-) -> Vec<NativeOperatorSourceBuildCommand> {
+) -> Result<Vec<NativeOperatorSourceBuildCommand>> {
     let nvcc_path = toolchain
         .map(|toolchain| toolchain.static_identity.cuda_toolkit.nvcc.path.as_str())
         .unwrap_or_else(|| request.nvcc_path.to_str().unwrap_or("<non-utf8-nvcc>"));
@@ -5334,6 +5353,7 @@ fn build_commands(
             platform::is_msvc(toolchain.static_identity.host_toolchain.host_abi.as_ref())
         })
         .unwrap_or_else(|| platform::is_msvc_compiler(ccbin_path));
+    let ccbin_argument = platform::nvcc_ccbin_argument(ccbin_path, msvc)?;
     let mut commands = Vec::with_capacity(plan.translation_units.len() + 1);
     let mut object_paths = Vec::with_capacity(plan.translation_units.len());
     for (index, translation_unit) in plan.translation_units.iter().enumerate() {
@@ -5356,7 +5376,7 @@ fn build_commands(
             object_path.display().to_string(),
             architecture_argument.to_string(),
             "-ccbin".to_string(),
-            ccbin_path.to_string(),
+            ccbin_argument.clone(),
             if msvc { "-MD" } else { "-MMD" }.to_string(),
             "-MF".to_string(),
             compiler_depfile_path.display().to_string(),
@@ -5454,7 +5474,7 @@ fn build_commands(
         elapsed_ms: None,
         return_code: None,
     });
-    commands
+    Ok(commands)
 }
 
 fn run_logged_command(
