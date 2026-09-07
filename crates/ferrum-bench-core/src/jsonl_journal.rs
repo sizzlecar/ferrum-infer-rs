@@ -292,12 +292,13 @@ fn open_shared_inner(
         }
     }
 
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    let file = options.open(&path)?;
     if mode == JsonlJournalOpenMode::Truncate {
-        file.set_len(0)?;
+        // Windows append-only handles cannot truncate. Initialize with write
+        // access, then keep the actual writer append-only so external records
+        // added after initialization cannot be overwritten by a stale offset.
+        drop(File::create(&path)?);
     }
+    let file = OpenOptions::new().create(true).append(true).open(&path)?;
     let (sender, receiver) = sync_channel(config.queue_capacity);
     let failure = Arc::new(JournalFailure::new());
     let worker_failure = Arc::clone(&failure);
@@ -594,7 +595,9 @@ mod tests {
     #[test]
     fn truncate_journal_appends_after_an_external_startup_record() {
         let path = temp_path("external-startup-record");
+        std::fs::write(&path, "{\"source\":\"previous-run\"}\n").unwrap();
         let journal = JsonlJournal::create(path.clone()).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
         let mut startup_writer = OpenOptions::new().append(true).open(&path).unwrap();
         writeln!(startup_writer, r#"{{"source":"startup"}}"#).unwrap();
         startup_writer.flush().unwrap();
@@ -604,6 +607,9 @@ mod tests {
             .unwrap();
         journal.flush().unwrap();
 
+        // A later create call joins the live writer without truncating again.
+        let second_owner = JsonlJournal::<serde_json::Value>::create(path.clone()).unwrap();
+
         assert_eq!(
             read_values(&path),
             vec![
@@ -611,6 +617,7 @@ mod tests {
                 serde_json::json!({"source": "engine"}),
             ]
         );
+        drop(second_owner);
         drop(journal);
         let _ = std::fs::remove_file(path);
     }
