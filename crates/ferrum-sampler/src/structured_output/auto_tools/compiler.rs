@@ -46,9 +46,16 @@ impl Builder<'_> {
     }
 
     fn schema(&mut self, name: &str, schema: serde_json::Value) -> Result<String> {
+        let mut schema = compact_json_schema(schema)?;
+        // Both branches must permit ordinary JSON formatting. Restricting
+        // final JSON to compact separators can mask a model's intended answer
+        // while leaving a lower-scoring tool call available. Request budgets
+        // and the processor's liveness checks still bound generation; compiler
+        // options remain owned by Ferrum rather than request x-guidance.
+        JsonCompileOptions::default().apply_to(&mut schema);
         self.schemas.push(GrammarWithLexer {
             name: Some(name.to_string()),
-            json_schema: Some(compact_json_schema(schema)?),
+            json_schema: Some(schema),
             lark_grammar: None,
         });
         Ok(format!("@{name}"))
@@ -250,7 +257,7 @@ pub(super) fn build(
     ));
     builder
         .rules
-        .push("result: final_value | tool_result".into());
+        .push("result: ws (final_value | tool_result) ws".into());
 
     let mut headers = Vec::new();
     let mut following_headers = Vec::new();
@@ -301,14 +308,16 @@ pub(super) fn build(
             max_initial = max_initial.max(token_count(factory, &text)?);
             required_wire.push(text.clone());
             let wire = builder.wire(&text);
-            direct_results.push(format!("{wire} final_value {return_rule}"));
+            direct_results.push(format!("{wire} ws final_value ws {return_rule}"));
         }
         let final_follow = "<|start|>assistant<|channel|>final<|message|>";
         following_headers.push(Header::result(final_follow));
         required_wire.push(final_follow.to_string());
         max_following = token_count(factory, final_follow)?;
         let final_follow_wire = builder.wire(final_follow);
-        follow_results.push(format!("{final_follow_wire} final_value {return_rule}"));
+        follow_results.push(format!(
+            "{final_follow_wire} ws final_value ws {return_rule}"
+        ));
         for (name, arguments) in names.iter().zip(&argument_rules) {
             for constrain in ["", "<|constrain|>json"] {
                 for header in [
@@ -317,12 +326,12 @@ pub(super) fn build(
                     format!("<|start|>assistant to=functions.{name}<|channel|>commentary{constrain}<|message|>"),
                 ] {
                     let wire = builder.wire(&header);
-                    direct_results.push(format!("{wire} {arguments} {call_rule}"));
+                    direct_results.push(format!("{wire} ws {arguments} ws {call_rule}"));
                     headers.push(Header::result(&header));
                     max_initial = max_initial.max(token_count(factory, &header)?);
                     required_wire.push(header.clone());
                     if header.starts_with("<|start|>") {
-                        follow_results.push(format!("{wire} {arguments} {call_rule}"));
+                        follow_results.push(format!("{wire} ws {arguments} ws {call_rule}"));
                         following_headers.push(Header::result(&header));
                         max_following = max_following.max(token_count(factory, &header)?);
                     }

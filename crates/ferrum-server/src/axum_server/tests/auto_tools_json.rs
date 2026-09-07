@@ -778,9 +778,7 @@ fn bare_call(arguments_field: &str, reversed: bool, spaced: bool) -> String {
     let (name, arguments) = if spaced {
         (
             "\"name\" : \"weather\"".to_owned(),
-            // The argument subgrammar keeps its existing compact JSON
-            // policy; exercise whitespace in the named-call envelope only.
-            format!("\"{arguments_field}\" : {{\"city\":\"Paris\"}}"),
+            format!("\"{arguments_field}\" : {{\n  \"city\" : \"Paris\"\n}}"),
         )
     } else {
         (
@@ -817,11 +815,9 @@ async fn infer_json_script(
         .map(|piece| LogitStep::only(tokenizer.token_id(piece).unwrap()))
         .collect::<Vec<_>>();
     if let Some(alternative) = alternative {
-        assert_eq!(
-            emitted.len(),
-            1,
-            "competing logits are for one complete payload"
-        );
+        // Compete at the first token, including prefixes whose remainder is
+        // emitted by later steps. Choosing the wrong branch must fail rather
+        // than silently turn a valid final prefix into a tool call.
         steps[0] = LogitStep::candidates(vec![
             (tokenizer.token_id(INVALID).unwrap(), 100.0),
             (tokenizer.token_id(emitted[0]).unwrap(), 50.0),
@@ -1014,6 +1010,36 @@ async fn actual_sampler_keeps_think_tags_inside_final_json_strings() {
                 // validated at the HTTP boundary or the published branch.
                 assert!(result.calls.is_empty());
                 assert_eq!(result.content, payload);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn actual_sampler_keeps_pretty_json_tokens_available_alongside_tools() {
+    let packets = [
+        " {\n",
+        "  \"city\": \"Paris\",\n",
+        "  \"temperature\": 21\n",
+        "}",
+    ];
+    for protocol in [ToolProtocol::Json, ToolProtocol::FunctionParameterXml] {
+        for endpoint in [Endpoint::Chat, Endpoint::Responses] {
+            for stream in [false, true] {
+                let (result, _) = infer_json_script(
+                    protocol.template(),
+                    endpoint,
+                    stream,
+                    endpoint.request(weather_schema(), stream),
+                    &packets,
+                    Some(protocol.envelope()),
+                )
+                .await;
+                assert!(result.calls.is_empty());
+                assert_eq!(
+                    serde_json::from_str::<Value>(&result.content).unwrap(),
+                    json!({"city": "Paris", "temperature": 21})
+                );
             }
         }
     }

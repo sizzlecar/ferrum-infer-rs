@@ -802,3 +802,126 @@ fn final_json_strings_preserve_reasoning_tag_text_in_merged_and_split_tokens() {
         }
     }
 }
+
+#[test]
+fn pretty_final_json_remains_valid_one_token_at_a_time_with_auto_tools() {
+    let tokenizer = Arc::new(PacketTokenizer::new(&[]));
+    for protocol in [
+        ApiToolCallProtocol::Json,
+        ApiToolCallProtocol::FunctionParameterXml,
+    ] {
+        for after_reasoning in [false, true] {
+            let processor = processor(
+                Arc::clone(&tokenizer),
+                protocol,
+                ModelOutputProtocol::Text,
+                if after_reasoning {
+                    StructuredOutputStart::AfterDelimiter("</think>".into())
+                } else {
+                    StructuredOutputStart::Immediate
+                },
+                512,
+            );
+            let mut generated = Vec::new();
+            if after_reasoning {
+                append(
+                    &processor,
+                    &tokenizer,
+                    &mut generated,
+                    "The tool result is known.</think>",
+                );
+            }
+            // Each byte crosses the live grammar; newlines and indentation
+            // outside strings are valid JSON, independent of tool availability.
+            append(
+                &processor,
+                &tokenizer,
+                &mut generated,
+                "{\n  \"ok\": true\n}",
+            );
+            assert!(processor.is_accepting(&generated).unwrap());
+            let (branch, text) = processor
+                .classified_result_with_terminals(&generated, &tokenizer.terminals())
+                .unwrap()
+                .unwrap();
+            assert_eq!(branch, ferrum_types::StructuredOutputBranch::Final);
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                json!({"ok": true})
+            );
+        }
+    }
+}
+
+#[test]
+fn pretty_final_opener_outscores_a_tool_when_both_branches_are_valid() {
+    let invalid_final = "{\n  \"ok\": false\n}";
+    for opener in ["{\n", " {\n"] {
+        let tokenizer = Arc::new(PacketTokenizer::new(&[opener, invalid_final]));
+        for protocol in [
+            ApiToolCallProtocol::Json,
+            ApiToolCallProtocol::FunctionParameterXml,
+        ] {
+            for after_reasoning in [false, true] {
+                let processor = processor(
+                    Arc::clone(&tokenizer),
+                    protocol,
+                    ModelOutputProtocol::Text,
+                    if after_reasoning {
+                        StructuredOutputStart::AfterDelimiter("</think>".into())
+                    } else {
+                        StructuredOutputStart::Immediate
+                    },
+                    512,
+                );
+                let mut generated = Vec::new();
+                if after_reasoning {
+                    append(
+                        &processor,
+                        &tokenizer,
+                        &mut generated,
+                        "Now return the final JSON.</think>",
+                    );
+                }
+                let mut logits = vec![f32::NEG_INFINITY; tokenizer.vocab_size()];
+                logits[tokenizer.id(invalid_final) as usize] = 100.0;
+                logits[tokenizer.id(opener) as usize] = 50.0;
+                logits[tokenizer.id("<tool_call>") as usize] = 10.0;
+                processor
+                    .mask_logits_with_terminals(
+                        &mut logits,
+                        &generated,
+                        &tokenizer.terminals(),
+                        &HashSet::new(),
+                    )
+                    .unwrap();
+                assert!(
+                    !logits[tokenizer.id(invalid_final) as usize].is_finite(),
+                    "pretty output must still satisfy its schema"
+                );
+                assert!(
+                    logits[tokenizer.id("<tool_call>") as usize].is_finite(),
+                    "automatic tool branch must remain available"
+                );
+                let (selected, _) = logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                    .unwrap();
+                assert_eq!(selected as u32, tokenizer.id(opener),
+                    "valid pretty JSON token {opener:?} was masked in favor of a lower-scoring tool, protocol={protocol:?}, after_reasoning={after_reasoning}");
+                generated.push(TokenId::new(selected as u32));
+                append(&processor, &tokenizer, &mut generated, "  \"ok\": true\n}");
+                let (branch, text) = processor
+                    .classified_result_with_terminals(&generated, &tokenizer.terminals())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(branch, ferrum_types::StructuredOutputBranch::Final);
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                    json!({"ok": true})
+                );
+            }
+        }
+    }
+}
