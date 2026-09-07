@@ -150,6 +150,74 @@ mod tests {
     }
 
     #[test]
+    fn nvcc_mt_encodes_one_target_without_changing_native_header_paths() {
+        // NVCC writes -MT literally but escapes spaces in its header paths.
+        // This is the reduced shape of its actual Windows compiler output.
+        let dependencies = [
+            "kernels/marlin.cu",
+            "C:/Program Files/CUDA/bin/../include/cuda_runtime.h",
+            "C:/Program Files/Visual Studio/include/vcruntime.h",
+        ];
+        let rhs = "kernels/marlin.cu \\\r\n    C:/Program\\ Files/CUDA/bin/../include/cuda_runtime.h \\\r\n    C:/Program\\ Files/Visual\\ Studio/include/vcruntime.h\r\n";
+        for target in [
+            r"C:\build area\对象 #$.obj",
+            r"\\?\C:\build area\对象 #$.obj",
+        ] {
+            assert!(parse_make_depfile(&format!("{target} : {rhs}"), Path::new("raw.d")).is_err());
+            let encoded = platform::nvcc_dependency_target(target, true).unwrap();
+            let raw = format!("{encoded} : {rhs}");
+            let (parsed_target, parsed_dependencies) =
+                parse_make_depfile(&raw, Path::new("raw.d")).unwrap();
+            assert_eq!(parsed_target, target);
+            assert_eq!(parsed_dependencies, dependencies);
+            let portable_dependencies = vec![
+                "kernels/marlin.cu".to_string(),
+                "C:/Program Files/CUDA/include/cuda_runtime.h".to_string(),
+                "C:/Program Files/Visual Studio/include/vcruntime.h".to_string(),
+            ];
+            let portable = serialize_portable_depfile(target, &portable_dependencies).unwrap();
+            assert_eq!(
+                parse_portable_make_depfile(
+                    std::str::from_utf8(&portable).unwrap(),
+                    Path::new("portable.d")
+                )
+                .unwrap(),
+                (target.to_string(), portable_dependencies)
+            );
+        }
+    }
+
+    #[test]
+    fn nvcc_mt_preserves_native_unc_dependency_roots() {
+        let dependency = r"\\sdk\share\include\cuda.h";
+        for target in [
+            r"\\build\share area\unit #$.obj",
+            r"\\?\UNC\build\share area\unit #$.obj",
+            "//build/share area/unit #$.obj",
+        ] {
+            let encoded = platform::nvcc_dependency_target(target, true).unwrap();
+            let raw = format!("{encoded} : kernel.cu \\\r\n    {dependency}\r\n");
+            let parsed = parse_make_depfile(&raw, Path::new("native.d")).unwrap();
+            assert_eq!(
+                parsed,
+                (
+                    target.to_string(),
+                    vec!["kernel.cu".to_string(), dependency.to_string()]
+                )
+            );
+            let portable = serialize_portable_depfile(&parsed.0, &parsed.1).unwrap();
+            assert_eq!(
+                parse_portable_make_depfile(
+                    std::str::from_utf8(&portable).unwrap(),
+                    Path::new("portable.d")
+                )
+                .unwrap(),
+                parsed
+            );
+        }
+    }
+
+    #[test]
     fn windows_portable_depfile_round_trips_make_escaped_drive_and_slashes() {
         let target = r"C:\build space\a.obj";
         let dependencies = vec![

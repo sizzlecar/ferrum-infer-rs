@@ -414,6 +414,8 @@ struct NativeOperatorBuildInputIdentity<'a> {
     msvc_nvcc_ccbin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     msvc_nvcc_program: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_nvcc_dependency_target_encoding: Option<platform::NvccDependencyTargetEncoding>,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,6 +438,8 @@ struct NativeOperatorObjectInputIdentity<'a> {
     msvc_nvcc_ccbin: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     msvc_nvcc_program: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_nvcc_dependency_target_encoding: Option<platform::NvccDependencyTargetEncoding>,
 }
 
 pub fn lock_native_operator_source_definition(
@@ -1718,6 +1722,20 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         expected_argv.push("--threads".to_string());
         expected_argv.push(receipt.nvcc_threads.to_string());
         let mut actual_argv = command.argv.clone();
+        if msvc {
+            let object = command.object_file.as_deref().ok_or_else(|| {
+                NativeOperatorBuilderError::Invalid(
+                    "MSVC source command has no object target".to_string(),
+                )
+            })?;
+            let target = platform::nvcc_dependency_target(object, true)?;
+            if actual_argv.get(12) != Some(&target) {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "{} source-build -MT for {} differs from its exact encoded object path",
+                    receipt.operator, translation_unit.path
+                )));
+            }
+        }
         if let Some(output) = actual_argv.get_mut(4) {
             *output = platform::basename(output).to_string();
         }
@@ -2597,13 +2615,21 @@ fn validate_translation_unit_depfile(
             (identity, canonical_path)
         };
         validate_observed_dependency("<compiled-depfile>", &identity)?;
-        if !observed.insert(identity.clone()) {
+        if portable_paths
+            .get(&identity)
+            .is_some_and(|previous| previous != &portable_path)
+        {
             return Err(NativeOperatorBuilderError::Invalid(format!(
-                "compiler depfile contains a duplicate dependency identity: {:?}:{}",
+                "compiler depfile maps one dependency identity to conflicting portable paths: {:?}:{}",
                 identity.domain, identity.path
             )));
         }
-        portable_paths.insert(identity.clone(), portable_path.clone());
+        observed.insert(identity.clone());
+        portable_paths
+            .entry(identity.clone())
+            .or_insert_with(|| portable_path.clone());
+        // Preserve every compiler occurrence, including absolute/relative
+        // aliases, while the canonical dependency set remains unique.
         bindings.push(NativeOperatorDepfileDependencyBinding {
             producer_path: dependency,
             portable_path,
@@ -3163,6 +3189,8 @@ fn validate_depfile_bindings_basic(
         )));
     }
     let mut dependencies = BTreeSet::new();
+    let mut paths_by_identity = BTreeMap::new();
+    let mut identities_by_portable_path = BTreeMap::new();
     for binding in bindings {
         if binding.producer_path.is_empty()
             || binding.producer_path.len() > MAX_DEPFILE_WORD_BYTES
@@ -3195,11 +3223,29 @@ fn validate_depfile_bindings_basic(
                 )?;
             }
         }
-        if !dependencies.insert(binding.dependency.clone()) {
+        let identity_path = (binding.dependency.domain, binding.dependency.path.as_str());
+        let identity_value = (
+            binding.dependency.sha256.as_str(),
+            binding.portable_path.as_str(),
+        );
+        if paths_by_identity
+            .get(&identity_path)
+            .is_some_and(|previous| previous != &identity_value)
+            || identities_by_portable_path
+                .get(binding.portable_path.as_str())
+                .is_some_and(|previous| *previous != &binding.dependency)
+        {
             return Err(NativeOperatorBuilderError::Invalid(format!(
-                "{context} depfile bindings duplicate a typed dependency"
+                "{context} depfile bindings have conflicting dependency identities or portable paths"
             )));
         }
+        paths_by_identity
+            .entry(identity_path)
+            .or_insert(identity_value);
+        identities_by_portable_path
+            .entry(binding.portable_path.as_str())
+            .or_insert(&binding.dependency);
+        dependencies.insert(binding.dependency.clone());
     }
     Ok(dependencies.into_iter().collect())
 }
@@ -5144,6 +5190,11 @@ fn build_inputs_sha256(
             .filter(|toolchain| platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref()))
             .map(|toolchain| platform::nvcc_program(&toolchain.cuda_toolkit.nvcc.path, true))
             .transpose()?,
+        msvc_nvcc_dependency_target_encoding: platform::nvcc_dependency_target_encoding(
+            toolchain.is_some_and(|toolchain| {
+                platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref())
+            }),
+        ),
     };
     let bytes =
         serde_json::to_vec(&identity).map_err(|source| NativeOperatorBuilderError::Json {
@@ -5273,6 +5324,9 @@ fn build_object_cache_specs(
                 msvc_nvcc_program: platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref())
                     .then(|| platform::nvcc_program(&toolchain.cuda_toolkit.nvcc.path, true))
                     .transpose()?,
+                msvc_nvcc_dependency_target_encoding: platform::nvcc_dependency_target_encoding(
+                    platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref()),
+                ),
             };
             let input_signature = serde_json::to_string(&identity).map_err(|source| {
                 NativeOperatorBuilderError::Json {
@@ -5401,7 +5455,7 @@ fn build_commands(
             "-MF".to_string(),
             compiler_depfile_path.display().to_string(),
             "-MT".to_string(),
-            object_path.display().to_string(),
+            platform::nvcc_dependency_target(&object_path.display().to_string(), msvc)?,
         ];
         argv.extend(plan.include_dirs.iter().map(|path| format!("-I{path}")));
         argv.extend(plan.defines.iter().map(|define| format!("-D{define}")));

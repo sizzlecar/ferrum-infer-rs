@@ -23,6 +23,45 @@ pub(crate) fn nvcc_environment_option(msvc: bool) -> Option<&'static str> {
     msvc.then_some("--use-local-env")
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NvccDependencyTargetEncoding {
+    NativeWindowsMakeWord,
+}
+
+pub(crate) fn nvcc_dependency_target_encoding(msvc: bool) -> Option<NvccDependencyTargetEncoding> {
+    msvc.then_some(NvccDependencyTargetEncoding::NativeWindowsMakeWord)
+}
+
+pub(crate) fn nvcc_dependency_target(path: &str, msvc: bool) -> Result<String> {
+    if !msvc {
+        return Ok(path.to_string());
+    }
+    if !windows_path(path)
+        || path.len() > MAX_DEPFILE_WORD_BYTES
+        || path.chars().any(|character| {
+            matches!(character, '\0' | '\n' | '\r')
+                || (character.is_whitespace() && !matches!(character, ' ' | '\t'))
+        })
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "Windows NVCC dependency target must be an absolute, bounded single-line make word"
+                .to_string(),
+        ));
+    }
+    normalize_windows_path(path)?;
+    let mut target = String::with_capacity(path.len());
+    for character in path.chars() {
+        if matches!(character, ' ' | '\t' | '#' | '$') {
+            target.push('\\');
+        }
+        target.push(character);
+    }
+    // Retain native separators and drive colons: escaping those would make
+    // the raw depfile parser also unescape NVCC's native UNC dependencies.
+    Ok(target)
+}
+
 pub(crate) fn is_msvc_compiler(path: &str) -> bool {
     basename(path).eq_ignore_ascii_case("cl.exe")
 }

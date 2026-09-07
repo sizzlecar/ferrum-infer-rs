@@ -122,16 +122,34 @@ fn dependency_proof_publication_reopens_and_rejects_damaged_members() {
     let portable_depfile = output.join("dependency.d");
     let translation_unit = &plan.translation_units[0];
     let closure = &plan.dependency_closures[0];
-    let dependencies = std::iter::once(translation_unit.path.clone())
-        .chain(closure.headers.iter().map(|header| header.path.clone()))
-        .collect::<Vec<_>>();
+    let cuda_header = root.path().join("cuda/include/crt/host_defines.h");
+    fs::create_dir_all(cuda_header.parent().unwrap()).unwrap();
+    fs::write(&cuda_header, b"#define FIXTURE_HOST_DEFINES 1\n").unwrap();
+    let cuda_header = cuda_header.canonicalize().unwrap();
+    let cuda_dependency = NativeOperatorObservedDependency {
+        domain: NativeOperatorDependencyDomain::BackendToolchain,
+        path: "include/crt/host_defines.h".to_string(),
+        sha256: sha256_file(&cuda_header).unwrap(),
+    };
+    // NVCC reports the source both relatively and absolutely, and can repeat
+    // the exact same CUDA header. Preserve these occurrences as raw evidence.
+    let dependencies = vec![
+        translation_unit.path.clone(),
+        source.join(&translation_unit.path).display().to_string(),
+        closure.headers[0].path.clone(),
+        cuda_header.display().to_string(),
+        cuda_header.display().to_string(),
+    ];
     fs::write(
         &compiler_depfile,
         serialize_portable_depfile(&object.display().to_string(), &dependencies).unwrap(),
     )
     .unwrap();
     let toolchain_scope = NativeOperatorToolchainDependencyScope {
-        by_absolute_path: BTreeMap::new(),
+        by_absolute_path: BTreeMap::from([(
+            platform::comparison_path(&cuda_header.display().to_string()).unwrap(),
+            cuda_dependency.clone(),
+        )]),
     };
     let validated = validate_translation_unit_depfile(
         &compiler_depfile,
@@ -143,6 +161,105 @@ fn dependency_proof_publication_reopens_and_rejects_damaged_members() {
         &toolchain_scope,
     )
     .unwrap();
+    assert_eq!(
+        validated
+            .bindings
+            .iter()
+            .map(|binding| &binding.producer_path)
+            .collect::<Vec<_>>(),
+        dependencies.iter().collect::<Vec<_>>()
+    );
+    let mut expected = expected_source_dependencies(translation_unit, closure);
+    expected.insert(cuda_dependency);
+    assert_eq!(
+        validated.observed_dependencies,
+        expected.into_iter().collect::<Vec<_>>()
+    );
+    let validate_pair =
+        |raw: &str, portable: &str, bindings: &[NativeOperatorDepfileDependencyBinding]| {
+            validate_portable_depfile_pair(
+                raw,
+                &compiler_depfile,
+                portable,
+                &portable_depfile,
+                &object.display().to_string(),
+                &source.display().to_string(),
+                translation_unit,
+                closure,
+                bindings,
+                &toolchain_scope,
+            )
+        };
+    let original_raw = std::str::from_utf8(&validated.compiler_raw).unwrap();
+    let original_portable = std::str::from_utf8(&validated.portable_raw).unwrap();
+    for mutation in 0..3 {
+        let mut bindings = validated.bindings.clone();
+        match mutation {
+            0 => bindings[4].portable_path = root.path().join("other.h").display().to_string(),
+            1 => bindings[4].dependency.path = "include/crt/other.h".to_string(),
+            _ => bindings[4].dependency.sha256 = "0".repeat(64),
+        }
+        assert!(validate_depfile_bindings_basic("<conflicting-repeat>", &bindings).is_err());
+    }
+    // Consistently forged repeated identities still must satisfy the locked
+    // source closure or toolchain manifest, beyond the basic consistency check.
+    for domain in [
+        NativeOperatorDependencyDomain::Source,
+        NativeOperatorDependencyDomain::BackendToolchain,
+    ] {
+        let mut bindings = validated.bindings.clone();
+        for binding in &mut bindings {
+            if binding.dependency.domain == domain {
+                binding.dependency.sha256 = "0".repeat(64);
+            }
+        }
+        assert!(validate_depfile_bindings_basic("<consistent-forgery>", &bindings).is_ok());
+        assert!(validate_pair(original_raw, original_portable, &bindings).is_err());
+    }
+    let (_, mut portable_dependencies) =
+        parse_portable_make_depfile(original_portable, &portable_depfile).unwrap();
+    portable_dependencies.push(portable_dependencies[0].clone());
+    let duplicated_portable =
+        serialize_portable_depfile(&object.display().to_string(), &portable_dependencies).unwrap();
+    assert!(validate_pair(
+        original_raw,
+        std::str::from_utf8(&duplicated_portable).unwrap(),
+        &validated.bindings
+    )
+    .is_err());
+
+    let other_header = root.path().join("other-host-defines.h");
+    fs::copy(&cuda_header, &other_header).unwrap();
+    let other_header = other_header.canonicalize().unwrap();
+    let mut conflicting_scope = NativeOperatorToolchainDependencyScope {
+        by_absolute_path: toolchain_scope.by_absolute_path.clone(),
+    };
+    conflicting_scope.by_absolute_path.insert(
+        platform::comparison_path(&other_header.display().to_string()).unwrap(),
+        validated.bindings[4].dependency.clone(),
+    );
+    let mut conflicting_dependencies = dependencies.clone();
+    conflicting_dependencies[4] = other_header.display().to_string();
+    fs::write(
+        &compiler_depfile,
+        serialize_portable_depfile(&object.display().to_string(), &conflicting_dependencies)
+            .unwrap(),
+    )
+    .unwrap();
+    let error = validate_translation_unit_depfile(
+        &compiler_depfile,
+        &portable_depfile,
+        &object,
+        &source,
+        translation_unit,
+        closure,
+        &conflicting_scope,
+    )
+    .err()
+    .expect("conflicting physical aliases must be rejected");
+    assert!(error.to_string().contains("conflicting portable paths"));
+    fs::write(&compiler_depfile, &validated.compiler_raw).unwrap();
+
     publish_object_dependency_proof(
         &cache_entry,
         &cache_key,
@@ -179,6 +296,7 @@ fn dependency_proof_publication_reopens_and_rejects_damaged_members() {
     };
     let proof = restore().unwrap().expect("published proof is reusable");
     assert_eq!(proof.observed_dependencies, validated.observed_dependencies);
+    assert_eq!(proof.depfile_bindings, validated.bindings);
     assert_eq!(
         fs::read(&restored_compiler).unwrap(),
         validated.compiler_raw
@@ -187,6 +305,31 @@ fn dependency_proof_publication_reopens_and_rejects_damaged_members() {
         fs::read(&restored_portable).unwrap(),
         validated.portable_raw
     );
+
+    let proof_path = cache_entry.join("dependency-proof/proof.json");
+    let raw_path = cache_entry.join("dependency-proof/compiler-dependency.raw.d");
+    let original_proof = fs::read(&proof_path).unwrap();
+    for delete_occurrence in [false, true] {
+        let mut changed_dependencies = dependencies.clone();
+        if delete_occurrence {
+            changed_dependencies.pop();
+        } else {
+            changed_dependencies.swap(0, 1);
+        }
+        let changed_raw =
+            serialize_portable_depfile(&object.display().to_string(), &changed_dependencies)
+                .unwrap();
+        let mut forged_proof: NativeOperatorObjectDependencyProof =
+            serde_json::from_slice(&original_proof).unwrap();
+        forged_proof.compiler_depfile_sha256 = sha256_bytes(&changed_raw);
+        fs::write(&raw_path, changed_raw).unwrap();
+        write_json(&proof_path, &forged_proof).unwrap();
+        let error = restore().unwrap_err();
+        assert!(error.to_string().contains("ordered typed bindings"));
+        fs::write(&raw_path, &validated.compiler_raw).unwrap();
+        fs::write(&proof_path, &original_proof).unwrap();
+        assert!(restore().unwrap().is_some());
+    }
 
     for member in ["compiler-dependency.raw.d", "dependency.d", "proof.json"] {
         let path = cache_entry.join("dependency-proof").join(member);
@@ -210,7 +353,7 @@ fn receipt(
     let request = NativeOperatorSourceBuildRequest {
         plan_path: plan_path.to_path_buf(),
         source_root: PathBuf::from("C:/source"),
-        output_dir: PathBuf::from("C:/build"),
+        output_dir: PathBuf::from("C:/build path/#inputs$"),
         compute_capability: "sm_89".to_string(),
         builder_sha: "c".repeat(40),
         nvcc_path: PathBuf::from("C:/CUDA/bin/nvcc.exe"),
@@ -510,6 +653,7 @@ fn msvc_nvcc_program_is_bound_by_receipt_and_cache() {
         msvc_environment_option: Some("--use-local-env"),
         msvc_nvcc_ccbin: Some(receipt.commands[0].argv[7].clone()),
         msvc_nvcc_program: None,
+        msvc_nvcc_dependency_target_encoding: platform::nvcc_dependency_target_encoding(true),
     };
     let mut invalid = receipt.clone();
     invalid.inputs_sha256 = sha256_bytes(&serde_json::to_vec(&previous_inputs).unwrap());
@@ -548,6 +692,7 @@ fn unix_cache_inputs_omit_msvc_nvcc_program() {
         msvc_environment_option: None,
         msvc_nvcc_ccbin: None,
         msvc_nvcc_program: None,
+        msvc_nvcc_dependency_target_encoding: None,
     };
     let previous_bytes = format!(
         "{{\"plan_sha256\":\"plan\",\"source_package_sha256\":\"source\",\"builder_contract_version\":{},\"architecture_argument\":\"-arch=sm_89\",\"effective_environment\":{{}},\"toolchain\":null}}",
@@ -575,6 +720,115 @@ fn unix_cache_inputs_omit_msvc_nvcc_program() {
     let specs = build_object_cache_specs(&plan, "-arch=sm_89", &identity, &environment).unwrap();
     let signature: serde_json::Value = serde_json::from_str(specs[0].input_signature()).unwrap();
     assert!(signature.get("msvc_nvcc_program").is_none());
+    assert!(signature
+        .get("msvc_nvcc_dependency_target_encoding")
+        .is_none());
+    let unix = "/tmp/build path/object:name#$value.o";
+    assert_eq!(
+        platform::nvcc_dependency_target(unix, false)
+            .unwrap()
+            .as_bytes(),
+        unix.as_bytes()
+    );
+}
+
+#[test]
+fn msvc_dependency_target_encoding_is_bound_by_receipt_and_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let (plan, path) = plan(root.path());
+    let receipt = receipt(&plan, &path);
+    verify_source_build_receipt_against_plan_portable(&receipt, &path).unwrap();
+    let command = &receipt.commands[0];
+    let object = command.object_file.as_ref().unwrap();
+    let target = &command.argv[12];
+    assert_eq!(
+        target,
+        &object.replace("build path/#inputs$", r"build\ path/\#inputs\$")
+    );
+    assert_ne!(target, object);
+    for changed in [
+        object.clone(),
+        target.replace(r"build\ path", r"other\ path"),
+        target.replace(r"\ ", " "),
+        target.replace(r"\#", "#"),
+        target.replace(r"\$", "$"),
+        escape_make_word(object).unwrap(),
+    ] {
+        let mut invalid = receipt.clone();
+        invalid.commands[0].argv[12] = changed;
+        let error = verify_source_build_receipt_against_plan_portable(&invalid, &path).unwrap_err();
+        assert!(error.to_string().contains("exact encoded object path"));
+    }
+
+    let identity = &receipt.toolchain.as_ref().unwrap().static_identity;
+    let specs = build_object_cache_specs(
+        &plan,
+        &receipt.architecture_argument,
+        identity,
+        &receipt.effective_environment,
+    )
+    .unwrap();
+    let signature = specs[0].input_signature();
+    let value: serde_json::Value = serde_json::from_str(signature).unwrap();
+    assert_eq!(
+        value["msvc_nvcc_dependency_target_encoding"],
+        "native_windows_make_word"
+    );
+    let previous_signature = signature.replace(
+        ",\"msvc_nvcc_dependency_target_encoding\":\"native_windows_make_word\"",
+        "",
+    );
+    assert_ne!(signature, previous_signature);
+    let mut invalid = receipt.clone();
+    invalid.commands[0].object_cache_key = Some(sha256_bytes(previous_signature.as_bytes()));
+    assert!(verify_source_build_receipt_against_plan_portable(&invalid, &path).is_err());
+    let previous_inputs = NativeOperatorBuildInputIdentity {
+        plan_sha256: &receipt.plan_sha256,
+        source_package_sha256: &receipt.source_package.sha256,
+        builder_contract_version: NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION,
+        architecture_argument: &receipt.architecture_argument,
+        effective_environment: &receipt.effective_environment,
+        toolchain: Some(identity),
+        msvc_environment_option: Some("--use-local-env"),
+        msvc_nvcc_ccbin: Some(command.argv[7].clone()),
+        msvc_nvcc_program: Some(command.argv[0].clone()),
+        msvc_nvcc_dependency_target_encoding: None,
+    };
+    let mut invalid = receipt.clone();
+    invalid.inputs_sha256 = sha256_bytes(&serde_json::to_vec(&previous_inputs).unwrap());
+    assert!(verify_source_build_receipt_against_plan_portable(&invalid, &path).is_err());
+}
+
+#[test]
+fn msvc_dependency_target_preserves_native_paths_and_word_boundaries() {
+    assert_eq!(
+        platform::nvcc_dependency_target(r"C:\build path\#inputs$\a.obj", true).unwrap(),
+        r"C:\build\ path\\#inputs\$\a.obj"
+    );
+    assert_eq!(
+        platform::nvcc_dependency_target("C:\\build\tpath\\a.obj", true).unwrap(),
+        "C:\\build\\\tpath\\a.obj"
+    );
+    for invalid in [
+        "",
+        "relative.obj",
+        "/tmp/object.obj",
+        "C:object.obj",
+        "C:\\bad\nobject.obj",
+        "C:\\bad\robject.obj",
+        "C:\\bad\0object.obj",
+    ] {
+        assert!(
+            platform::nvcc_dependency_target(invalid, true).is_err(),
+            "{invalid:?}"
+        );
+    }
+    let max_word = format!("C:/{}", "a".repeat(MAX_DEPFILE_WORD_BYTES - 3));
+    assert_eq!(
+        platform::nvcc_dependency_target(&max_word, true).unwrap(),
+        max_word
+    );
+    assert!(platform::nvcc_dependency_target(&format!("{max_word}a"), true).is_err());
 }
 
 #[cfg(windows)]
