@@ -152,6 +152,12 @@ to `basic`; explicitly select the checks relevant to the release:
 - `structured`: server JSON/schema behavior and valid structured responses.
 - `tools`: server tool calls and a tool-result continuation.
 
+For a fixed Hugging Face snapshot, `ferrum run`, `ferrum serve`, `ferrum pull`,
+and the runner accept `OWNER/REPOSITORY@FULL_40_HEX_COMMIT` as the model.
+This selects the exact snapshot through Ferrum's downloader and cache; aliases,
+branches and tags cannot be used as pins. The runner verifies the actual
+repository, revision and file fingerprints reported by both product entrypoints.
+
 A stop probe derives an internal boundary from actual reasoning or final text.
 Baseline and replay keep the same prompt, mode and budget; checks require the
 exact nonempty prefix, no stop leakage and fewer generated tokens. If the default
