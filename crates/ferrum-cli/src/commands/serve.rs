@@ -3074,21 +3074,18 @@ mod tests {
 
     #[test]
     fn model_weight_bytes_from_path_sums_local_weight_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "ferrum-weight-bytes-test-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("unnamed")
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        let workspace = tempfile::Builder::new()
+            .prefix("ferrum-weight-bytes-test-")
+            .tempdir()
+            .expect("create temp model dir");
+        let dir = workspace.path();
         std::fs::write(dir.join("model-00001-of-00002.safetensors"), vec![0u8; 7])
             .expect("write safetensors shard");
         std::fs::write(dir.join("model-00002-of-00002.safetensors"), vec![0u8; 11])
             .expect("write safetensors shard");
         std::fs::write(dir.join("tokenizer.json"), vec![0u8; 101]).expect("write non-weight file");
 
-        let result = model_weight_bytes_from_path(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
+        let result = model_weight_bytes_from_path(dir);
 
         assert_eq!(result, Some(18));
     }

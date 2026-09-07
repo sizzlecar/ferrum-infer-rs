@@ -1809,6 +1809,7 @@ dependencies = [
  "syn 2.0.108",
  "thiserror 1.0.69",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

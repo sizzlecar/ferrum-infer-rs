@@ -1,0 +1,6 @@
+# Source bytes are embedded by include_str! contracts and provider fingerprints.
+*.rs text eol=lf
+
+# Preserve upstream chat-template bytes and exact rendered-prompt goldens.
+/crates/ferrum-server/tests/fixtures/chat_template/**/template.jinja text eol=lf
+/crates/ferrum-server/tests/fixtures/chat_template/**/golden_*.txt text eol=lf

@@ -60,6 +60,19 @@ fn run(cmd: &mut Command) -> Output {
     cmd.output().expect("failed to run ferrum command")
 }
 
+fn assert_serve_usage(cmd: &Command, stdout: &str) {
+    // Clap uses the invoked executable's filename, including .exe on Windows.
+    let binary_name = Path::new(cmd.get_program())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("ferrum executable has a UTF-8 filename");
+    let expected = format!("Usage: {binary_name} serve [OPTIONS] [MODEL]");
+    assert!(
+        stdout.lines().any(|line| line == expected),
+        "expected help usage line {expected:?}, got:\n{stdout}"
+    );
+}
+
 fn configure_temp_env(cmd: &mut Command, temp_root: &Path) {
     cmd.env("TMPDIR", temp_root);
     cmd.env("TMP", temp_root);
@@ -176,7 +189,7 @@ fn serve_accepts_positional_model_argument() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("Usage: ferrum serve [OPTIONS] [MODEL]"));
+    assert_serve_usage(&cmd, &stdout);
     assert!(
         !stderr.contains("unexpected argument"),
         "serve positional model should parse successfully"
@@ -200,7 +213,7 @@ fn serve_accepts_model_flag_argument() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stdout.contains("Usage: ferrum serve [OPTIONS] [MODEL]"));
+    assert_serve_usage(&cmd, &stdout);
     assert!(
         !stderr.contains("unexpected argument"),
         "serve --model should parse successfully"
