@@ -294,13 +294,15 @@ Correctness on a different GPU does not reproduce a README throughput number.
 
 Configure release latency limits in
 [`policy.limits`](../.github/release-performance.json) before starting a release.
-The shared Mac currently allows 20% TTFT and 10% time-per-output-token increases;
-set `ttft_max_relative_increase` back to `0.1` when using a stable dedicated host.
+The shared Mac temporarily allows 30% TTFT and 20% time-per-output-token
+increases; restore both limits to `0.1` when using a stable dedicated host.
 Each limit also bounds both ends of the baseline A/A 95% confidence interval.
 Candidate comparisons pass only when the upper confidence bound is within the
-configured increase; wider uncertainty remains inconclusive. The 20% TTFT budget
-does not exclude regressions between 10% and 20%. Correctness checks are unchanged,
-and changing this file does not reclassify evidence from an earlier release run.
+configured increase; wider uncertainty remains inconclusive. These relaxed limits
+permit regressions up to 30% TTFT and 20% time per output token; they do not establish
+performance within the original 10% limits. Correctness checks are unchanged.
+A changed policy applies to new measurements; earlier reports retain their original
+policy and conclusions and are not reclassified.
 
 For a manual release retry, `reuse_cuda_run_id` can name a completed main-branch
 release run. The workflow rechecks its original successful CUDA execution,
