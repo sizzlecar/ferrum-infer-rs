@@ -137,13 +137,34 @@ impl ReportFixture {
                         }
                         evidence
                     }
+                    "serve-auto-tools-json" => {
+                        let mut evidence = super::super::model_tool::auto_json_evidence();
+                        for api in ["chat", "responses"] {
+                            for mode in ["sync", "stream"] {
+                                let observed = if api == "responses" {
+                                    &mut evidence["responses"][mode]
+                                } else {
+                                    &mut evidence[mode]
+                                };
+                                let budget = if api == "responses" {
+                                    "max_output_tokens"
+                                } else {
+                                    "max_tokens"
+                                };
+                                for turn in ["call_request", "continuation_request"] {
+                                    observed[turn][budget] = json!(expected.max_tokens);
+                                }
+                            }
+                        }
+                        evidence
+                    }
                     _ => json!({}),
                 };
                 cases.push(json!({"case": name, "status": "passed", "evidence": evidence}));
             }
         }
         cases.push(json!({"case": "binary-unchanged", "status": "passed", "evidence": {"sha256": expected.binary_sha256}}));
-        Self {
+        let mut fixture = Self {
             value: json!({
                 "schema_version": 2, "status": "passed", "profile_id": expected.profile.id,
                 "target": expected.profile.target, "binary_sha256": expected.binary_sha256,
@@ -164,7 +185,13 @@ impl ReportFixture {
                 } else { "inherit" },
                 "cases": cases,
             }),
+        };
+        if expected.checks.contains(&ModelCheck::AutoToolsJson) {
+            fixture.value["sampling"]["responses"] = json!({
+                "temperature": 0, "max_output_tokens": expected.max_tokens, "seed_sent": false
+            });
         }
+        fixture
     }
 
     fn case_mut(&mut self, name: &str) -> &mut Value {
@@ -321,6 +348,7 @@ fn checks_have_strict_round_trip_names() {
         ModelCheck::Stop,
         ModelCheck::Structured,
         ModelCheck::Tools,
+        ModelCheck::AutoToolsJson,
         ModelCheck::Reasoning,
         ModelCheck::Length,
     ] {
@@ -345,6 +373,7 @@ fn selected_checks_are_reusable_and_do_not_impose_unselected_model_work() {
         vec![ModelCheck::Structured],
         vec![ModelCheck::Tools],
         vec![ModelCheck::Tools, ModelCheck::Basic],
+        vec![ModelCheck::AutoToolsJson],
     ] {
         let expected = task("selected", Backend::Metal, checks);
         let mut fixture = ReportFixture::passed(&expected);
@@ -753,6 +782,65 @@ fn tool_report_cannot_substitute_expression_result_or_actual_replay_messages() {
                 "accepted {mode} {pointer}"
             );
         }
+    }
+}
+
+#[test]
+fn automatic_tool_report_requires_both_apis_and_the_actual_responses_replay() {
+    let expected = task(
+        "automatic-tools",
+        Backend::Cuda,
+        vec![ModelCheck::AutoToolsJson],
+    );
+    let valid = ReportFixture::passed(&expected);
+    verify_model_report(&expected, &valid.value).unwrap();
+
+    let mut missing_sampling = ReportFixture::passed(&expected);
+    missing_sampling.value["sampling"]
+        .as_object_mut()
+        .unwrap()
+        .remove("responses");
+    assert!(verify_model_report(&expected, &missing_sampling.value).is_err());
+    for (field, value) in [
+        ("temperature", json!(1)),
+        ("max_output_tokens", json!(expected.max_tokens + 1)),
+        ("seed_sent", json!(true)),
+        ("seed_sent", Value::Null),
+    ] {
+        let mut wrong_sampling = ReportFixture::passed(&expected);
+        wrong_sampling.value["sampling"]["responses"][field] = value;
+        assert!(verify_model_report(&expected, &wrong_sampling.value).is_err());
+    }
+
+    for api in ["chat", "responses"] {
+        for mode in ["sync", "stream"] {
+            let mut missing = ReportFixture::passed(&expected);
+            let evidence = &mut missing.case_mut("serve-auto-tools-json")["evidence"];
+            let surface = if api == "responses" {
+                &mut evidence["responses"]
+            } else {
+                evidence
+            };
+            surface.as_object_mut().unwrap().remove(mode);
+            // A terminal passed report and three successful modes cannot
+            // substitute for the fourth required conversation.
+            assert!(verify_model_report(&expected, &missing.value).is_err());
+        }
+    }
+
+    for mode in ["sync", "stream"] {
+        let mut invented = ReportFixture::passed(&expected);
+        let input = invented.case_mut("serve-auto-tools-json")["evidence"]["responses"][mode]
+            ["continuation_request"]["input"]
+            .as_array_mut()
+            .unwrap();
+        input.last_mut().unwrap()["call_id"] = json!("another-call");
+        assert!(verify_model_report(&expected, &invented.value).is_err());
+
+        let mut failed = ReportFixture::passed(&expected);
+        failed.case_mut("serve-auto-tools-json")["evidence"]["responses"][mode]["error"] =
+            json!("the final response timed out");
+        assert!(verify_model_report(&expected, &failed.value).is_err());
     }
 }
 

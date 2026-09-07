@@ -10,6 +10,21 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ApiEndpoint {
+    ChatCompletions,
+    Responses,
+}
+
+impl ApiEndpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::Responses => "/v1/responses",
+        }
+    }
+}
+
 struct Process {
     child: Child,
     stdout: PathBuf,
@@ -242,13 +257,23 @@ impl<'a> Server<'a> {
     }
 
     pub async fn request(&self, name: &str, body: &Value) -> Result<String> {
+        self.request_to(name, body, ApiEndpoint::ChatCompletions)
+            .await
+    }
+
+    pub async fn request_to(
+        &self,
+        name: &str,
+        body: &Value,
+        endpoint: ApiEndpoint,
+    ) -> Result<String> {
         write_json(
             self.args.report_dir.join(format!("{name}.request.json")),
             body,
         )?;
         let mut response = self
             .client
-            .post(format!("{}/v1/chat/completions", self.url))
+            .post(format!("{}{}", self.url, endpoint.path()))
             .json(body)
             .send()
             .await?;
@@ -261,7 +286,7 @@ impl<'a> Server<'a> {
             .to_owned();
         write_json(
             self.args.report_dir.join(format!("{name}.http.json")),
-            &json!({"status": status.as_u16(), "content_type": content_type}),
+            &json!({"status": status.as_u16(), "content_type": content_type, "path": endpoint.path()}),
         )?;
         let mut raw = File::create(self.args.report_dir.join(format!("{name}.response.txt")))?;
         let mut bytes = Vec::new();

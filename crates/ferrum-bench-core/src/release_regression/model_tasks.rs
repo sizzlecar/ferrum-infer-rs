@@ -385,6 +385,16 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             && report["sampling"]["max_tokens"].as_u64() == Some(u64::from(expected.max_tokens)),
         "report sampling differs from the runner's controlled inputs",
     );
+    if expected.checks.contains(&ModelCheck::AutoToolsJson) {
+        let responses = &report["sampling"]["responses"];
+        require(
+            &mut errors,
+            responses["temperature"].as_f64() == Some(0.0)
+                && responses["max_output_tokens"].as_u64() == Some(u64::from(expected.max_tokens))
+                && responses["seed_sent"].as_bool() == Some(false),
+            "report Responses sampling differs from the actual request controls",
+        );
+    }
     if let Some(unexecuted) = report.get("unexecuted_serve_checks") {
         require(
             &mut errors,
