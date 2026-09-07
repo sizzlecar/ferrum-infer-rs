@@ -251,8 +251,48 @@ pub(crate) fn target(compiler: &Path) -> Result<String> {
     Ok(MSVC_TARGET.to_string())
 }
 
-fn tool_version_command(path: &Path) -> Result<Command> {
+fn controlled_probe_command(
+    path: &Path,
+    environment: &BTreeMap<String, String>,
+) -> Result<Command> {
+    let recorded = MSVC_ENVIRONMENT_KEYS
+        .iter()
+        .map(|key| {
+            environment
+                .get(*key)
+                .cloned()
+                .map(|value| ((*key).to_string(), value))
+                .ok_or_else(|| {
+                    NativeOperatorBuilderError::Invalid(format!(
+                        "Windows tool probe controlled environment is missing {key}"
+                    ))
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    validate_msvc_environment(&recorded)?;
+    if environment.len() != MSVC_ENVIRONMENT_KEYS.len() + 4
+        || environment.get("VSLANG").map(String::as_str) != Some("1033")
+        || environment.get("SOURCE_DATE_EPOCH").map(String::as_str) != Some("0")
+        || environment.get("TZ").map(String::as_str) != Some("UTC")
+        || environment.get("PATH").is_none_or(|paths| {
+            paths.is_empty()
+                || paths
+                    .split(';')
+                    .any(|path| normalize_windows_path(path).is_err())
+        })
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "Windows tool probe requires the complete controlled MSVC build environment"
+                .to_string(),
+        ));
+    }
     let mut command = Command::new(path);
+    command.env_clear().envs(environment);
+    Ok(command)
+}
+
+fn tool_version_command(path: &Path, environment: &BTreeMap<String, String>) -> Result<Command> {
+    let mut command = controlled_probe_command(path, environment)?;
     command.arg(
         if basename(&path.display().to_string()).eq_ignore_ascii_case("nvcc.exe") {
             "--version"
@@ -260,17 +300,6 @@ fn tool_version_command(path: &Path) -> Result<Command> {
             "/?"
         },
     );
-    command.env_clear().env("VSLANG", "1033");
-    for key in ["SystemRoot", "TEMP", "TMP"] {
-        let value = std::env::var(key).map_err(|_| {
-            NativeOperatorBuilderError::Invalid(format!(
-                "Windows tool probe is missing {key}: program={:?} args={:?} status=not_started stdout=\"\" stderr=\"\"",
-                command.get_program(),
-                command.get_args().collect::<Vec<_>>()
-            ))
-        })?;
-        command.env(key, value);
-    }
     Ok(command)
 }
 
@@ -296,14 +325,18 @@ fn probe_output_diagnostic(command: &Command, output: &std::process::Output) -> 
     )
 }
 
-pub(crate) fn tool_version(path: &Path) -> Result<String> {
-    let mut command = tool_version_command(path)?;
+pub(crate) fn tool_version(path: &Path, environment: &BTreeMap<String, String>) -> Result<String> {
+    let mut command = tool_version_command(path, environment)?;
     let output = command
         .output()
         .map_err(|source| NativeOperatorBuilderError::Io {
             path: path.to_path_buf(),
             source,
         })?;
+    version_from_output(&command, &output)
+}
+
+fn version_from_output(command: &Command, output: &std::process::Output) -> Result<String> {
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -312,11 +345,15 @@ pub(crate) fn tool_version(path: &Path) -> Result<String> {
     if !output.status.success() || text.trim().is_empty() {
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "Windows tool version probe failed: {}",
-            probe_output_diagnostic(&command, &output)
+            probe_output_diagnostic(command, output)
         )));
     }
     Ok(text.trim().chars().take(4000).collect())
 }
+
+#[cfg(test)]
+#[path = "msvc_probe_tests.rs"]
+mod probe_tests;
 
 #[cfg(test)]
 mod tests {
@@ -369,7 +406,26 @@ mod tests {
         let canonical_path = input_path
             .canonicalize()
             .unwrap_or_else(|error| panic!("resolve selected NVCC {:?}: {error}", input_path));
-        match tool_version(&canonical_path) {
+        let compiler =
+            PathBuf::from(std::env::var_os("NVCC_CCBIN").expect("NVCC_CCBIN must select cl.exe"))
+                .canonicalize()
+                .expect("resolve selected cl.exe");
+        let archiver = PathBuf::from(
+            std::env::var_os("FERRUM_MSVC_LIB").expect("FERRUM_MSVC_LIB must select lib.exe"),
+        )
+        .canonicalize()
+        .expect("resolve selected lib.exe");
+        let recorded = capture_msvc_environment().expect("capture selected MSVC/SDK environment");
+        let environment = msvc_environment_for_tools(
+            [
+                canonical_path.to_str().expect("NVCC path must be UTF-8"),
+                compiler.to_str().expect("cl.exe path must be UTF-8"),
+                archiver.to_str().expect("lib.exe path must be UTF-8"),
+            ],
+            &recorded,
+        )
+        .expect("construct the production source-build environment");
+        match tool_version(&canonical_path, &environment) {
             Ok(version) => {
                 assert!(!version.is_empty());
                 eprintln!(
@@ -388,7 +444,7 @@ mod tests {
                     for isolated in [false, true] {
                         let environment_label = if isolated { "production" } else { "inherited" };
                         let command = if isolated {
-                            tool_version_command(path)
+                            tool_version_command(path, &environment)
                         } else {
                             let mut command = Command::new(path);
                             command.arg("--version");

@@ -965,7 +965,11 @@ pub fn run_native_operator_source_build(
             .expect("actual source build has a resolved toolchain")
             .static_identity
             .clone();
-        let probe = match probe_source_toolchain(&static_identity, missed_translation_units) {
+        let probe = match probe_source_toolchain(
+            &static_identity,
+            &receipt.effective_environment,
+            missed_translation_units,
+        ) {
             Ok(probe) => probe,
             Err(error) => {
                 receipt.commands = commands.clone();
@@ -4597,13 +4601,22 @@ fn tool_file_identity(path: &Path) -> Result<NativeOperatorToolFileIdentity> {
 
 fn probe_source_toolchain(
     static_identity: &NativeOperatorSourceBuildStaticToolchain,
+    effective_environment: &BTreeMap<String, String>,
     missed_translation_units: Vec<String>,
 ) -> Result<NativeOperatorSourceBuildToolchainProbe> {
+    let msvc_environment = platform::is_msvc(static_identity.host_toolchain.host_abi.as_ref())
+        .then_some(effective_environment);
     Ok(NativeOperatorSourceBuildToolchainProbe {
-        nvcc_version: tool_version(Path::new(&static_identity.cuda_toolkit.nvcc.path))?,
+        nvcc_version: tool_version(
+            Path::new(&static_identity.cuda_toolkit.nvcc.path),
+            msvc_environment,
+        )?,
         host_compiler_version: static_identity.host_toolchain.compiler_version.clone(),
         host_target: static_identity.host_toolchain.target.clone(),
-        archiver_version: tool_version(Path::new(&static_identity.archiver.path))?,
+        archiver_version: tool_version(
+            Path::new(&static_identity.archiver.path),
+            msvc_environment,
+        )?,
         probed_for_misses: missed_translation_units,
     })
 }
@@ -5010,7 +5023,10 @@ fn read_u32(bytes: &[u8], endianness: NativeOperatorObjectEndianness) -> u32 {
     }
 }
 
-pub(crate) fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
+pub(crate) fn tool_identity(
+    path: &Path,
+    msvc_environment: Option<&BTreeMap<String, String>>,
+) -> Result<NativeOperatorToolIdentity> {
     require_file(path)?;
     let canonical = path
         .canonicalize()
@@ -5021,16 +5037,25 @@ pub(crate) fn tool_identity(path: &Path) -> Result<NativeOperatorToolIdentity> {
     Ok(NativeOperatorToolIdentity {
         path: canonical.display().to_string(),
         sha256: sha256_file(&canonical)?,
-        version: tool_version(&canonical)?,
+        version: tool_version(&canonical, msvc_environment)?,
     })
 }
 
-fn tool_version(path: &Path) -> Result<String> {
+fn tool_version(
+    path: &Path,
+    msvc_environment: Option<&BTreeMap<String, String>>,
+) -> Result<String> {
     if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
     {
-        return platform::msvc::tool_version(path);
+        let environment = msvc_environment.ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid(format!(
+                "Windows tool version probe requires the controlled build environment: {}",
+                path.display()
+            ))
+        })?;
+        return platform::msvc::tool_version(path, environment);
     }
     require_file(path)?;
     let canonical = path

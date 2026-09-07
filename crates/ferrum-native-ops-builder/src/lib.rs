@@ -362,15 +362,25 @@ pub fn package_native_operator(
     let source_host = source_host_toolchain(&source_build.receipt)?;
     let host_abi = source_host.host_abi.clone();
     let msvc = source_build::platform::is_msvc(host_abi.as_ref());
+    let probe_environment = package_probe_environment(&request.cc, &request.ar, source_host)?;
     let package_toolchain = NativeOperatorPackageToolchain {
-        descriptor_compiler: tool_identity(&request.cc)?,
+        descriptor_compiler: tool_identity(&request.cc, probe_environment.as_ref())?,
         descriptor_target: compiler_target(&request.cc)?,
-        archiver: tool_identity(&request.ar)?,
+        archiver: tool_identity(&request.ar, probe_environment.as_ref())?,
         host_abi: host_abi.clone(),
         environment: source_host.environment.clone(),
     };
     validate_package_host_link(&package_toolchain, &source_build.receipt)?;
     let package_environment = package_build_environment(&package_toolchain)?;
+    if probe_environment
+        .as_ref()
+        .is_some_and(|environment| environment != &package_environment)
+    {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "MSVC tool probe environment differs from the recorded package build environment"
+                .to_string(),
+        ));
+    }
 
     let (g03_catalog, g03_catalog_sha256): (NativeOperatorProviderCatalog, String) =
         read_json_with_sha256(&request.g03_catalog_path)?;
@@ -1698,6 +1708,41 @@ fn validate_recorded_tool_binary(
         )));
     }
     Ok(())
+}
+
+fn package_probe_environment(
+    compiler: &Path,
+    archiver: &Path,
+    source_host: &NativeOperatorHostToolchainIdentity,
+) -> Result<Option<BTreeMap<String, String>>> {
+    if !source_build::platform::is_msvc(source_host.host_abi.as_ref()) {
+        return Ok(None);
+    }
+    // Resolve the same selected tool paths used by tool_identity and the final
+    // package commands, before either version probe starts. The environment is
+    // rebuilt solely from the source receipt's validated MSVC/SDK selection.
+    let canonical_tools = [compiler, archiver]
+        .into_iter()
+        .map(|path| {
+            path.canonicalize()
+                .map_err(|source| NativeOperatorBuilderError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })
+                .and_then(|path| {
+                    path.into_os_string().into_string().map_err(|_| {
+                        NativeOperatorBuilderError::Invalid(
+                            "MSVC package tool path is not UTF-8".to_string(),
+                        )
+                    })
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    source_build::platform::msvc_environment_for_package_tools(
+        [&canonical_tools[0], &canonical_tools[1]],
+        &source_host.environment,
+    )
+    .map(Some)
 }
 
 fn package_build_environment(
