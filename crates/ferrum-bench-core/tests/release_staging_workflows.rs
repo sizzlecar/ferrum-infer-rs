@@ -2,7 +2,9 @@
 //! Permissions and secret access are checked structurally. The input guard is
 //! executed as committed, with dispatch inputs supplied only through its env.
 use serde_yaml::{Mapping, Value};
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+#[cfg(unix)]
+use std::{collections::BTreeMap, process::Command};
+use std::{fs, path::Path};
 
 fn key(name: &str) -> Value {
     Value::String(name.into())
@@ -254,6 +256,9 @@ fn inherited_and_explicit_publication_secrets_are_rejected() {
     }
 }
 
+// These staging guards run in Bash on the workflows' Linux/macOS jobs.
+// Structural permissions and secret-access checks above run on every platform.
+#[cfg(unix)]
 fn dispatch_inputs() -> BTreeMap<String, String> {
     [
         ("version", "12.34.56".into()),
@@ -267,6 +272,7 @@ fn dispatch_inputs() -> BTreeMap<String, String> {
     .collect()
 }
 
+#[cfg(unix)]
 fn add_environment(
     command: &mut Command,
     value: Option<&Value>,
@@ -301,6 +307,7 @@ fn add_environment(
     }
 }
 
+#[cfg(unix)]
 fn run_guards(
     workflow: &Value,
     inputs: &BTreeMap<String, String>,
@@ -345,12 +352,15 @@ fn run_guards(
         assert_eq!(
             output.status.success(),
             should_succeed,
-            "{label} {job_name:?}: {}",
+            "{label} {job_name:?}: status={:?}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn actual_input_guards_accept_formal_versions_and_reject_publication_or_bad_inputs() {
     for (name, workflow) in workflows() {

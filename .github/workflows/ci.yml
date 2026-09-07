@@ -552,7 +552,8 @@ jobs:
           "CUDA_PATH=$toolkit" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "CUDA_HOME=$toolkit" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "$toolkit\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
+        id: windows_cache
         with:
           path: |
             ~/.cargo/registry
@@ -567,7 +568,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cargo check --locked --workspace --all-targets
-          cargo test --locked --workspace --all-targets
+          cargo test --locked --workspace --all-targets --no-fail-fast
           cargo build --locked -p ferrum-native-ops-builder -p ferrum-devtools --bin ferrum-native-ops-builder --bin model_regression
       - name: Build the four native CUDA operators with MSVC
         run: |
@@ -584,8 +585,9 @@ jobs:
           curl.exe --fail --location --retry 3 --output $sourceArchive $sourceUrl
           if ((Get-FileHash $sourceArchive -Algorithm SHA256).Hash -ne $distribution.archive.sha256) { throw 'Native source archive hash mismatch' }
           tar.exe -xf $sourceArchive -C $source
-          # This pinned archive supplies only the canonical provider catalog.
-          # Its Linux machine code is never linked into the Windows binary.
+          # Preserve this historical provider catalog as versioned binding provenance.
+          # Windows packages separately pin their actual source plan and MSVC tools;
+          # runtime compatibility checks the live provider contracts. No Linux code is linked.
           $referenceArchive = Join-Path $work 'reference.tar.zst'
           curl.exe --fail --location --retry 3 --output $referenceArchive 'https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst'
           if ((Get-FileHash $referenceArchive -Algorithm SHA256).Hash -ne 'd4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e') { throw 'Reference archive hash mismatch' }
@@ -620,6 +622,16 @@ jobs:
           cargo build --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
           & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf 'target/debug/ferrum.exe'
           & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-ptx 'target/debug/ferrum.exe'
+      - name: Save Windows build caches
+        if: ${{ always() && steps.windows_cache.outputs.cache-primary-key != '' && steps.windows_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/ferrum-native-object-cache
+          key: ${{ steps.windows_cache.outputs.cache-primary-key }}
       - name: Preserve native build evidence and candidate executables
         if: always()
         uses: actions/upload-artifact@v4
