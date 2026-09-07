@@ -1003,6 +1003,420 @@ fn single_auto_tool_bare_arguments_json_becomes_structured_tool_call() {
     assert_eq!(call.function.arguments, r#"{"city":"深圳","unit":"c"}"#);
 }
 
+fn hard_auto_tool_request(protocol: ApiToolCallProtocol) -> InferenceRequest {
+    let mut request = chat_request_with_tool_protocol(None, protocol);
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.response_format = Some(ApiResponseFormat {
+        format_type: "json_schema".to_string(),
+        json_schema: Some(ApiJsonSchema {
+            name: Some("answer".to_string()),
+            schema: chat.tools[0].function.parameters.clone().unwrap(),
+            strict: Some(true),
+        }),
+    });
+    request
+}
+
+#[test]
+fn automatic_tools_hard_format_contract_respects_choice_and_format_semantics() {
+    let request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    let Some(ApiRequest::Chat(chat)) = request.api_request else {
+        panic!("expected chat request");
+    };
+    // Null and omission both deserialize to the typed default automatic choice.
+    for choice in [None, Some(json!(null)), Some(json!("auto"))] {
+        let mut wire = serde_json::to_value(&chat).unwrap();
+        if let Some(choice) = choice {
+            wire["tool_choice"] = choice;
+        } else {
+            wire.as_object_mut().unwrap().remove("tool_choice");
+        }
+        let parsed: ApiChatRequest = serde_json::from_value(wire).unwrap();
+        assert!(parsed.automatic_tools_with_hard_response_format());
+    }
+    for choice in [
+        ApiToolChoice::Mode("required".to_string()),
+        ApiToolChoice::Mode("none".to_string()),
+        ApiToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: ApiToolChoiceFunction {
+                name: "weather".to_string(),
+            },
+        },
+    ] {
+        let mut request = chat.clone();
+        request.tool_choice = Some(choice);
+        assert!(!request.automatic_tools_with_hard_response_format());
+    }
+    for strict in [None, Some(false)] {
+        let mut request = chat.clone();
+        request
+            .response_format
+            .as_mut()
+            .unwrap()
+            .json_schema
+            .as_mut()
+            .unwrap()
+            .strict = strict;
+        assert!(!request.automatic_tools_with_hard_response_format());
+    }
+    let mut request = chat.clone();
+    request.response_format = Some(ApiResponseFormat {
+        format_type: "json_object".to_string(),
+        json_schema: None,
+    });
+    assert!(request.automatic_tools_with_hard_response_format());
+    request.tools.clear();
+    assert!(!request.automatic_tools_with_hard_response_format());
+}
+
+#[test]
+fn strict_auto_final_json_cannot_be_inferred_as_a_tool_call() {
+    for protocol in [
+        ApiToolCallProtocol::Json,
+        ApiToolCallProtocol::FunctionParameterXml,
+    ] {
+        let mut request = hard_auto_tool_request(protocol);
+        for format in ["json_schema", "json_object"] {
+            let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+                panic!("expected chat request");
+            };
+            chat.response_format.as_mut().unwrap().format_type = format.to_string();
+            for value in [
+                json!({"city": "Paris", "unit": "c"}),
+                json!({"name": "weather", "arguments": {"city": "Paris", "unit": "c"}}),
+                json!({"tool_calls": [{"name": "weather", "arguments": {"city": "Paris", "unit": "c"}}]}),
+                json!({"answer": "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"}),
+                json!("<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>"),
+            ] {
+                assert!(api_response_after_stop(&request, &value.to_string()).is_none(), "{protocol:?}, {format}: {value}");
+            }
+        }
+    }
+}
+
+#[test]
+fn classified_final_is_an_explicit_chat_response_even_when_it_looks_like_a_call() {
+    let mut request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("expected chat request");
+    };
+    chat.response_format = Some(ApiResponseFormat {
+        format_type: "json_object".to_string(),
+        json_schema: None,
+    });
+    for text in [
+        " {\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}} \n",
+        r#"{"name":"weather","parameters":{"city":"Paris"}}"#,
+        r#"{"city":"Paris","unit":"c"}"#,
+        r#"{"answer":"<tool_call> is literal data"}"#,
+    ] {
+        let Some(ApiResponse::Chat(response)) = api_response_from_classified_generated_text(
+            &request,
+            text,
+            FinishReason::EOS,
+            StructuredOutputBranch::Final,
+        )
+        .unwrap() else {
+            panic!("a proven final must prevent downstream text reclassification");
+        };
+        assert_eq!(response.message.role, ApiMessageRole::Assistant);
+        assert_eq!(response.message.content, text);
+        assert!(response.message.tool_calls.is_empty());
+        assert!(response.message.function_call.is_none());
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+}
+
+#[test]
+fn classified_tool_accepts_named_json_without_weakening_unclassified_strict_parsing() {
+    let request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    for text in [
+        r#"{"name":"weather","arguments":{"city":"Paris","unit":"c"}}"#,
+        " \n{\"parameters\":{\"city\":\"Paris\",\"unit\":\"c\"},\"name\":\"weather\"}\t",
+    ] {
+        assert!(api_response_after_stop(&request, text).is_none());
+        for reason in [FinishReason::Stop, FinishReason::EOS] {
+            let Some(ApiResponse::Chat(response)) = api_response_from_classified_generated_text(
+                &request,
+                text,
+                reason,
+                StructuredOutputBranch::ToolCall,
+            )
+            .unwrap() else {
+                panic!("a proven named call must preserve the tool branch");
+            };
+            assert!(response.message.content.is_empty());
+            assert_eq!(response.message.tool_calls.len(), 1);
+            assert_eq!(response.message.tool_calls[0].function.name, "weather");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(
+                    &response.message.tool_calls[0].function.arguments
+                )
+                .unwrap(),
+                json!({"city":"Paris","unit":"c"})
+            );
+            assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        }
+    }
+}
+
+#[test]
+fn classified_tool_keeps_complete_registered_envelope_validation() {
+    for (protocol, text) in [
+        (
+            ApiToolCallProtocol::Json,
+            r#"<tool_call>{"name":"weather","arguments":{"city":"Paris","unit":"c"}}</tool_call>"#,
+        ),
+        (
+            ApiToolCallProtocol::FunctionParameterXml,
+            "<tool_call><function=weather><parameter=city>Paris</parameter><parameter=unit>c</parameter></function></tool_call>",
+        ),
+    ] {
+        let request = hard_auto_tool_request(protocol);
+        assert_eq!(
+            api_response_from_classified_generated_text(
+                &request,
+                text,
+                FinishReason::Stop,
+                StructuredOutputBranch::ToolCall,
+            )
+            .unwrap(),
+            api_response_after_stop(&request, text)
+        );
+        for malformed in [
+            text.strip_suffix("</tool_call>").unwrap().to_string(),
+            format!("{text} trailing"),
+            text.replacen("weather", "undeclared", 1),
+        ] {
+            assert!(api_response_from_classified_generated_text(
+                &request,
+                &malformed,
+                FinishReason::Stop,
+                StructuredOutputBranch::ToolCall,
+            )
+            .is_err(), "accepted {malformed:?}");
+        }
+    }
+}
+
+#[test]
+fn classified_tool_never_guesses_unnamed_arguments_or_searches_surrounding_text() {
+    let request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    for text in [
+        r#"{"city":"Paris","unit":"c"}"#,
+        r#"{"name":"weather"}"#,
+        r#"{"name":"undeclared","arguments":{"city":"Paris"}}"#,
+        r#"{"name":"weather","arguments":[],"parameters":{}}"#,
+        r#"{"name":"weather","arguments":[]}"#,
+        r#"{"name":"weather","arguments":"{\"city\":\"Paris\"}"}"#,
+        r#"prefix {"name":"weather","arguments":{"city":"Paris"}}"#,
+        r#"{"name":"weather","arguments":{"city":"Paris"}} trailing"#,
+        "```json\n{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\"}}\n```",
+        r#"{"name":"weather","arguments":{"city":"Paris"}"#,
+        r#"<tool_call>{"city":"Paris","unit":"c"}</tool_call>"#,
+        r#"<tool_call>{"name":"weather","arguments":[]}</tool_call>"#,
+        r#"<|tool_call>call:weather{city:<|"|>Paris<|"|>}<tool_call|>"#,
+        r#"[TOOL_CALLS]weather[ARGS]{"city":"Paris"}"#,
+    ] {
+        assert!(
+            api_response_from_classified_generated_text(
+                &request,
+                text,
+                FinishReason::Stop,
+                StructuredOutputBranch::ToolCall,
+            )
+            .is_err(),
+            "accepted {text:?}"
+        );
+    }
+    let xml_request = hard_auto_tool_request(ApiToolCallProtocol::FunctionParameterXml);
+    assert!(api_response_from_classified_generated_text(
+        &xml_request,
+        r#"{"name":"weather","arguments":{"city":"Paris"}}"#,
+        FinishReason::Stop,
+        StructuredOutputBranch::ToolCall,
+    )
+    .is_err());
+}
+
+#[test]
+fn classified_output_does_not_upgrade_truncation_or_bypass_request_contract() {
+    let request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    let text = r#"{"name":"weather","arguments":{"city":"Paris"}}"#;
+    for branch in [
+        StructuredOutputBranch::Final,
+        StructuredOutputBranch::ToolCall,
+    ] {
+        for reason in [
+            FinishReason::Length,
+            FinishReason::Cancelled,
+            FinishReason::Error,
+            FinishReason::ContentFilter,
+        ] {
+            assert!(
+                api_response_from_classified_generated_text(&request, text, reason, branch)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    let ordinary = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));
+    assert!(api_response_from_classified_generated_text(
+        &ordinary,
+        text,
+        FinishReason::Stop,
+        StructuredOutputBranch::ToolCall,
+    )
+    .is_err());
+    assert!(api_response_from_classified_generated_text(
+        &InferenceRequest::new("plain prompt", "plain"),
+        text,
+        FinishReason::Stop,
+        StructuredOutputBranch::Final,
+    )
+    .unwrap()
+    .is_none());
+}
+
+#[test]
+fn strict_auto_json_envelopes_allow_parallel_calls_with_distinct_ids() {
+    let request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    let text = concat!(
+        " <tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Paris\",\"unit\":\"c\"}}</tool_call>\n",
+        "<tool_call>{\"name\":\"weather\",\"arguments\":{\"city\":\"Berlin\",\"unit\":\"c\"}}</tool_call> "
+    );
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, text) else {
+        panic!("complete explicit envelopes must establish tool intent");
+    };
+    let calls = response.message.tool_calls;
+    assert_eq!(calls.len(), 2);
+    assert_ne!(calls[0].id, calls[1].id);
+    assert_eq!(calls[0].function.name, "weather");
+    assert_eq!(calls[1].function.name, "weather");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&calls[0].function.arguments).unwrap()["city"],
+        "Paris"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&calls[1].function.arguments).unwrap()["city"],
+        "Berlin"
+    );
+}
+
+#[test]
+fn strict_auto_json_argument_string_does_not_close_the_envelope() {
+    let request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    let arguments = json!({"city": "literal </tool_call> and <tool_call>", "unit": "c"});
+    let text = format!(
+        "<tool_call>{}</tool_call>",
+        json!({"name": "weather", "arguments": arguments})
+    );
+    let Some(ApiResponse::Chat(response)) = api_response_after_stop(&request, &text) else {
+        panic!("markers inside JSON strings are argument data");
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &response.message.tool_calls[0].function.arguments
+        )
+        .unwrap(),
+        arguments
+    );
+}
+
+#[test]
+fn strict_auto_requires_complete_envelopes_without_unframed_suffixes() {
+    for (protocol, valid) in [
+        (ApiToolCallProtocol::Json, r#"<tool_call>{"name":"weather","arguments":{"city":"Paris","unit":"c"}}</tool_call>"#),
+        (ApiToolCallProtocol::FunctionParameterXml, "<tool_call><function=weather><parameter=city>Paris</parameter><parameter=unit>c</parameter></function></tool_call>"),
+    ] {
+        let request = hard_auto_tool_request(protocol);
+        assert!(api_response_after_stop(&request, valid).is_some(), "{protocol:?}");
+        for text in [
+            valid.strip_suffix("</tool_call>").unwrap().to_string(),
+            format!("{valid}<tool_call>"),
+            format!("{valid}{{\"city\":\"Paris\"}}"),
+            format!("prefix {valid}"),
+            format!("\"{valid}"),
+            valid.replacen("weather", "undeclared", 1),
+        ] {
+            assert!(api_response_after_stop(&request, &text).is_none(), "{protocol:?}: {text}");
+        }
+        assert!(api_response_from_generated_text(&request, valid, FinishReason::Length).is_none());
+    }
+}
+
+#[test]
+fn strict_auto_xml_does_not_ignore_malformed_parameter_framing() {
+    let request = hard_auto_tool_request(ApiToolCallProtocol::FunctionParameterXml);
+    for parameters in [
+        "<parameter=city>Paris</parameter><parameter=unit>c</parameter>unframed",
+        "unframed<parameter=city>Paris</parameter><parameter=unit>c</parameter>",
+        "<parameter=city>Paris</parameter></parameter><parameter=unit>c</parameter>",
+        "<parameter=city>Paris</parameter><parameter=unit>c",
+    ] {
+        let text = format!("<tool_call><function=weather>{parameters}</function></tool_call>");
+        assert!(api_response_after_stop(&request, &text).is_none(), "{text}");
+    }
+}
+
+#[test]
+fn non_strict_and_forced_requests_keep_existing_argument_fallback() {
+    let mut request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    let text = r#"{"city":"Paris","unit":"c"}"#;
+    for choice in [
+        ApiToolChoice::Mode("required".to_string()),
+        ApiToolChoice::Function {
+            tool_type: "function".to_string(),
+            function: ApiToolChoiceFunction {
+                name: "weather".to_string(),
+            },
+        },
+    ] {
+        let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+            panic!("chat")
+        };
+        chat.tool_choice = Some(choice);
+        assert!(api_response_after_stop(&request, text).is_some());
+    }
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("chat")
+    };
+    chat.tool_choice = None;
+    chat.response_format
+        .as_mut()
+        .unwrap()
+        .json_schema
+        .as_mut()
+        .unwrap()
+        .strict = Some(false);
+    assert!(api_response_after_stop(&request, text).is_some());
+}
+
+#[test]
+fn strict_auto_json_enables_only_its_declared_control_markers() {
+    let mut request = hard_auto_tool_request(ApiToolCallProtocol::Json);
+    let Some(ApiRequest::Chat(chat)) = request.api_request.as_mut() else {
+        panic!("chat")
+    };
+    assert_eq!(
+        chat.generated_control_token_texts(),
+        &["<tool_call>", "</tool_call>"]
+    );
+    let envelope = chat.generated_response_envelope().unwrap();
+    assert_eq!(envelope.open_token_text, "<tool_call>");
+    assert_eq!(envelope.close_token_text, "</tool_call>");
+    chat.tool_choice = Some(ApiToolChoice::Mode("none".to_string()));
+    assert!(chat.generated_control_token_texts().is_empty());
+    assert!(chat.generated_response_envelope().is_none());
+    chat.tool_choice = None;
+    chat.response_format = None;
+    assert!(chat.generated_control_token_texts().is_empty());
+    assert!(chat.generated_response_envelope().is_none());
+}
+
 #[test]
 fn multi_auto_tool_bare_arguments_json_does_not_guess_tool() {
     let mut request = chat_request_with_tool(Some(ApiToolChoice::Mode("auto".to_string())));

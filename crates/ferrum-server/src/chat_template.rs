@@ -115,6 +115,23 @@ pub struct ChatTemplateOptions {
     pub now_override: Option<chrono::NaiveDateTime>,
 }
 
+/// The rendered prompt and whether its assistant generation suffix already
+/// opened the model's reasoning envelope.
+#[derive(Clone, Debug)]
+pub(crate) struct RenderedPrompt {
+    pub text: String,
+    pub reasoning_prefill: bool,
+}
+
+impl RenderedPrompt {
+    fn without_reasoning_prefill(text: String) -> Self {
+        Self {
+            text,
+            reasoning_prefill: false,
+        }
+    }
+}
+
 impl ChatTemplateOptions {
     pub fn default_for_template(_model_template: Option<&ModelChatTemplate>) -> Self {
         // Omission is a real third state: the model-owned template decides its
@@ -424,16 +441,73 @@ fn render_model_template(
     functions: Option<&[ChatFunction]>,
     function_call: Option<&FunctionCallChoice>,
 ) -> std::result::Result<String, minijinja::Error> {
-    let original = render_model_template_once(
+    render_model_template_with_prefill(
         messages,
         message_phases,
         model_template,
         options,
+        coalesce_interleaved_system_messages,
         tools,
         tool_choice,
         functions,
         function_call,
-    );
+        false,
+    )
+    .map(|rendered| rendered.text)
+}
+
+fn render_model_template_with_prefill(
+    messages: &[PromptMessage],
+    message_phases: &[Option<AssistantMessagePhase>],
+    model_template: &ModelChatTemplate,
+    options: &ChatTemplateOptions,
+    coalesce_interleaved_system_messages: bool,
+    tools: Option<&[ChatTool]>,
+    tool_choice: Option<&ToolChoice>,
+    functions: Option<&[ChatFunction]>,
+    function_call: Option<&FunctionCallChoice>,
+    inspect_prefill: bool,
+) -> std::result::Result<RenderedPrompt, minijinja::Error> {
+    let mut fixed_options = options.clone();
+    if inspect_prefill && fixed_options.now_override.is_none() {
+        fixed_options.now_override = Some(chrono::Local::now().naive_local());
+    }
+    let render = |messages: &[PromptMessage], phases: &[Option<AssistantMessagePhase>]| {
+        let text = render_model_template_once(
+            messages,
+            phases,
+            model_template,
+            &fixed_options,
+            tools,
+            tool_choice,
+            functions,
+            function_call,
+            true,
+        )?;
+        let reasoning_prefill = if inspect_prefill {
+            let baseline = render_model_template_once(
+                messages,
+                phases,
+                model_template,
+                &fixed_options,
+                tools,
+                tool_choice,
+                functions,
+                function_call,
+                false,
+            )
+            .ok();
+            reasoning_prefill_from_generation_suffix(model_template, &text, baseline.as_deref())
+        } else {
+            false
+        };
+        Ok(RenderedPrompt {
+            text,
+            reasoning_prefill,
+        })
+    };
+    let original: std::result::Result<RenderedPrompt, minijinja::Error> =
+        render(messages, message_phases);
     if original.is_ok()
         || !coalesce_interleaved_system_messages
         || !has_nonleading_system_message(messages)
@@ -450,19 +524,31 @@ fn render_model_template(
     // single leading system message while preserving system and conversation
     // order within their respective streams.
     let (adapted_messages, adapted_phases) = coalesce_system_messages(messages, message_phases);
-    match render_model_template_once(
-        &adapted_messages,
-        &adapted_phases,
-        model_template,
-        options,
-        tools,
-        tool_choice,
-        functions,
-        function_call,
-    ) {
+    match render(&adapted_messages, &adapted_phases) {
         Ok(prompt) => Ok(prompt),
         Err(_) => original,
     }
+}
+
+fn reasoning_prefill_from_generation_suffix(
+    template: &ModelChatTemplate,
+    prompt: &str,
+    without_generation_prompt: Option<&str>,
+) -> bool {
+    let Some((opening, _)) = model_reasoning_markers(template.output_protocol) else {
+        return false;
+    };
+    if let Some(suffix) = without_generation_prompt
+        .and_then(|baseline| prompt.strip_prefix(baseline))
+        .filter(|suffix| !suffix.is_empty())
+    {
+        return has_unclosed_model_reasoning_block(template.output_protocol, suffix);
+    }
+    // Some model templates ignore add_generation_prompt or change earlier
+    // rendering when it is disabled. Keep the narrow, declared prefill case;
+    // historical message/schema tags never justify scanning the whole prompt.
+    template.reasoning_protocol == ModelReasoningProtocol::PromptOpened
+        && prompt.trim_end().ends_with(opening.trim_end())
 }
 
 fn is_system_message_position_error(error: &minijinja::Error) -> bool {
@@ -524,6 +610,7 @@ fn render_model_template_once(
     tool_choice: Option<&ToolChoice>,
     functions: Option<&[ChatFunction]>,
     function_call: Option<&FunctionCallChoice>,
+    add_generation_prompt: bool,
 ) -> std::result::Result<String, minijinja::Error> {
     let mut env = Environment::new();
     // HF chat templates are written for Jinja2 and freely use Python string
@@ -611,7 +698,7 @@ fn render_model_template_once(
     let tmpl = env.get_template("chat")?;
     tmpl.render(ModelTemplateContext {
         messages: template_messages,
-        add_generation_prompt: true,
+        add_generation_prompt,
         bos_token: model_template.bos_token.as_deref().unwrap_or(""),
         eos_token: model_template.eos_token.as_deref().unwrap_or(""),
         enable_thinking: options.enable_thinking,
@@ -850,6 +937,54 @@ pub(crate) fn render_chat_prompt_with_model_template_options_and_compatibility(
     )
 }
 
+pub(crate) fn render_chat_prompt_with_model_template_options_and_compatibility_with_prefill(
+    messages: &[ChatMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+    coalesce_interleaved_system_messages: bool,
+    message_phases: Option<&[Option<AssistantMessagePhase>]>,
+) -> ferrum_types::Result<RenderedPrompt> {
+    let prompt_messages = messages
+        .iter()
+        .map(PromptMessage::from_chat_message)
+        .collect::<Vec<_>>();
+    if let Some(template) = model_template {
+        return validate_rendered_prompt(
+            template,
+            render_model_template_with_prefill(
+                &prompt_messages,
+                message_phases.unwrap_or(&[]),
+                template,
+                options,
+                coalesce_interleaved_system_messages,
+                None,
+                None,
+                None,
+                None,
+                true,
+            ),
+        );
+    }
+    Ok(RenderedPrompt::without_reasoning_prefill(
+        render_fallback_prompt(&prompt_messages, model_id, None),
+    ))
+}
+
+fn validate_rendered_prompt(
+    template: &ModelChatTemplate,
+    rendered: std::result::Result<RenderedPrompt, minijinja::Error>,
+) -> ferrum_types::Result<RenderedPrompt> {
+    match rendered {
+        Ok(prompt) if !prompt.text.trim().is_empty() => Ok(prompt),
+        Ok(_) => Err(chat_template_render_error(
+            template,
+            "template rendered an empty prompt",
+        )),
+        Err(error) => Err(chat_template_evaluation_error(template, error)),
+    }
+}
+
 fn render_fallback_prompt(
     messages: &[PromptMessage],
     model_id: &str,
@@ -963,30 +1098,83 @@ pub(crate) fn render_chat_prompt_with_tools_and_model_template_compatibility(
     coalesce_interleaved_system_messages: bool,
     message_phases: Option<&[Option<AssistantMessagePhase>]>,
 ) -> ferrum_types::Result<String> {
+    render_chat_prompt_with_tools_and_model_template_prefill_mode(
+        messages,
+        model_id,
+        model_template,
+        options,
+        tools,
+        tool_choice,
+        functions,
+        function_call,
+        coalesce_interleaved_system_messages,
+        message_phases,
+        false,
+    )
+    .map(|prompt| prompt.text)
+}
+
+pub(crate) fn render_chat_prompt_with_tools_and_model_template_compatibility_with_prefill(
+    messages: &[ChatMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+    tools: &[ChatTool],
+    tool_choice: Option<&ToolChoice>,
+    functions: &[ChatFunction],
+    function_call: Option<&FunctionCallChoice>,
+    coalesce_interleaved_system_messages: bool,
+    message_phases: Option<&[Option<AssistantMessagePhase>]>,
+) -> ferrum_types::Result<RenderedPrompt> {
+    render_chat_prompt_with_tools_and_model_template_prefill_mode(
+        messages,
+        model_id,
+        model_template,
+        options,
+        tools,
+        tool_choice,
+        functions,
+        function_call,
+        coalesce_interleaved_system_messages,
+        message_phases,
+        true,
+    )
+}
+
+fn render_chat_prompt_with_tools_and_model_template_prefill_mode(
+    messages: &[ChatMessage],
+    model_id: &str,
+    model_template: Option<&ModelChatTemplate>,
+    options: &ChatTemplateOptions,
+    tools: &[ChatTool],
+    tool_choice: Option<&ToolChoice>,
+    functions: &[ChatFunction],
+    function_call: Option<&FunctionCallChoice>,
+    coalesce_interleaved_system_messages: bool,
+    message_phases: Option<&[Option<AssistantMessagePhase>]>,
+    inspect_prefill: bool,
+) -> ferrum_types::Result<RenderedPrompt> {
     if let Some(model_template) = model_template {
         if model_template_supports_tools(model_template) {
             let prompt_messages = messages
                 .iter()
                 .map(PromptMessage::from_chat_message)
                 .collect::<Vec<_>>();
-            return match render_model_template(
-                &prompt_messages,
-                message_phases.unwrap_or(&[]),
+            return validate_rendered_prompt(
                 model_template,
-                options,
-                coalesce_interleaved_system_messages,
-                (!tools.is_empty()).then_some(tools),
-                tool_choice,
-                (!functions.is_empty()).then_some(functions),
-                function_call,
-            ) {
-                Ok(prompt) if !prompt.trim().is_empty() => Ok(prompt),
-                Ok(_) => Err(chat_template_render_error(
+                render_model_template_with_prefill(
+                    &prompt_messages,
+                    message_phases.unwrap_or(&[]),
                     model_template,
-                    "template rendered an empty prompt",
-                )),
-                Err(e) => Err(chat_template_evaluation_error(model_template, e)),
-            };
+                    options,
+                    coalesce_interleaved_system_messages,
+                    (!tools.is_empty()).then_some(tools),
+                    tool_choice,
+                    (!functions.is_empty()).then_some(functions),
+                    function_call,
+                    inspect_prefill,
+                ),
+            );
         }
 
         // The model ships a chat template with no `tools` support (e.g. the
@@ -1008,33 +1196,32 @@ pub(crate) fn render_chat_prompt_with_tools_and_model_template_compatibility(
             prompt_phases.extend_from_slice(phases);
             prompt_phases
         });
-        return match render_model_template(
-            &prompt_messages,
-            prompt_phases.as_deref().unwrap_or(&[]),
+        return validate_rendered_prompt(
             model_template,
-            options,
-            coalesce_interleaved_system_messages,
-            None,
-            None,
-            None,
-            None,
-        ) {
-            Ok(prompt) if !prompt.trim().is_empty() => Ok(prompt),
-            Ok(_) => Err(chat_template_render_error(
+            render_model_template_with_prefill(
+                &prompt_messages,
+                prompt_phases.as_deref().unwrap_or(&[]),
                 model_template,
-                "template rendered an empty prompt",
-            )),
-            Err(e) => Err(chat_template_evaluation_error(model_template, e)),
-        };
+                options,
+                coalesce_interleaved_system_messages,
+                None,
+                None,
+                None,
+                None,
+                inspect_prefill,
+            ),
+        );
     }
 
-    Ok(render_chat_prompt_with_tools(
-        messages,
-        model_id,
-        tools,
-        tool_choice,
-        functions,
-        function_call,
+    Ok(RenderedPrompt::without_reasoning_prefill(
+        render_chat_prompt_with_tools(
+            messages,
+            model_id,
+            tools,
+            tool_choice,
+            functions,
+            function_call,
+        ),
     ))
 }
 
@@ -1042,7 +1229,7 @@ pub(crate) fn render_chat_prompt_with_tools_and_model_template_compatibility(
 /// identifier (substring matching alone would not distinguish a template
 /// that only handles `message.tool_calls` history from one that renders
 /// tool definitions).
-fn model_template_supports_tools(template: &ModelChatTemplate) -> bool {
+pub(crate) fn model_template_supports_tools(template: &ModelChatTemplate) -> bool {
     let src = template.template.as_bytes();
     let needle = b"tools";
     let mut start = 0;
@@ -1991,5 +2178,181 @@ mod tests {
             ModelReasoningProtocol::Unknown
         );
         assert!(!invalid.reasoning_enabled(Some(true)));
+    }
+
+    fn prefill_render(
+        template: &ModelChatTemplate,
+        enable_thinking: Option<bool>,
+    ) -> RenderedPrompt {
+        render_chat_prompt_with_model_template_options_and_compatibility_with_prefill(
+            &[
+                msg(MessageRole::System, "Schema: {\"const\":\"<think>Paris\"}"),
+                msg(MessageRole::User, "valid user data ending in <think>"),
+            ],
+            "unused-model-name",
+            Some(template),
+            &ChatTemplateOptions {
+                enable_thinking,
+                ..Default::default()
+            },
+            true,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn generation_prefill_ignores_message_tags_and_respects_actual_thinking_switch() {
+        let plain = ModelChatTemplate::new(
+            "{% for message in messages %}{{ message.content }}{% endfor %}",
+            "plain",
+        );
+        assert_eq!(plain.reasoning_protocol, ModelReasoningProtocol::None);
+        assert!(!prefill_render(&plain, None).reasoning_prefill);
+        for (source, capability, enabled_prefill) in [
+            (
+                include_str!(
+                    "../tests/fixtures/chat_template/Qwen__Qwen3.5-35B-A3B/template.jinja"
+                ),
+                ModelReasoningProtocol::PromptOpened,
+                true,
+            ),
+            (
+                include_str!("../tests/fixtures/chat_template/Qwen__Qwen3-0.6B/template.jinja"),
+                ModelReasoningProtocol::ModelGenerated,
+                false,
+            ),
+        ] {
+            let template = ModelChatTemplate::new(source, "actual-template");
+            assert_eq!(template.reasoning_protocol, capability);
+            assert_eq!(
+                prefill_render(&template, Some(true)).reasoning_prefill,
+                enabled_prefill
+            );
+            assert!(!prefill_render(&template, Some(false)).reasoning_prefill);
+        }
+        let ignores_switch = ModelChatTemplate::new(
+            "{% for message in messages %}{{ message.content }}{% endfor %}<assistant><think>\n",
+            "fixed-opener",
+        );
+        assert!(
+            prefill_render(&ignores_switch, Some(false)).reasoning_prefill,
+            "the rendered model prefix still needs its closer when a template ignores the switch"
+        );
+    }
+
+    #[test]
+    fn generation_prefill_accepts_unknown_template_only_with_suffix_evidence() {
+        let template = ModelChatTemplate::new(
+            "{% if 'valid' not in messages[-1].content %}{{ raise_exception('needs actual request') }}{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}{% if add_generation_prompt %}<assistant><think>\n{% endif %}", "conditional");
+        assert_eq!(template.reasoning_protocol, ModelReasoningProtocol::Unknown);
+        assert!(prefill_render(&template, None).reasoning_prefill);
+        for protocol in [
+            ModelReasoningProtocol::None,
+            ModelReasoningProtocol::Unknown,
+            ModelReasoningProtocol::ModelGenerated,
+            ModelReasoningProtocol::PromptOpened,
+        ] {
+            let mut declared = template.clone();
+            declared.reasoning_protocol = protocol;
+            for baseline in [
+                None,
+                Some("unrelated baseline"),
+                Some("<assistant><think>\n"),
+            ] {
+                assert_eq!(
+                    reasoning_prefill_from_generation_suffix(
+                        &declared,
+                        "<assistant><think>\n",
+                        baseline
+                    ),
+                    protocol == ModelReasoningProtocol::PromptOpened
+                );
+                assert!(!reasoning_prefill_from_generation_suffix(
+                    &declared,
+                    "user mentions <think> then assistant starts here",
+                    baseline
+                ));
+            }
+        }
+        let baseline_error = ModelChatTemplate::new(
+            "{% if not add_generation_prompt %}{{ raise_exception('generation required') }}{% endif %}{% for message in messages %}{{ message.content }}{% endfor %}<assistant><think>\n", "baseline-error");
+        assert!(
+            prefill_render(&baseline_error, None).reasoning_prefill,
+            "a diagnostic baseline failure must not reject a valid prompt"
+        );
+    }
+
+    #[test]
+    fn generation_prefill_uses_successful_coalesced_tool_render_and_preserves_prompt() {
+        let source = "{% for message in messages %}{% if message.role == 'system' and not loop.first %}{{ raise_exception('System message must be first') }}{% endif %}{{ message.content }}{% endfor %}{% if tools %}{{ tools | tojson }}{% endif %}{% if add_generation_prompt %}<assistant><think>\n{% endif %}";
+        let messages = [
+            msg(MessageRole::User, "Hi"),
+            msg(MessageRole::System, "schema <think>"),
+            msg(MessageRole::User, "Again"),
+        ];
+        for source in [
+            source.to_string(),
+            source.replace("{% if tools %}{{ tools | tojson }}{% endif %}", ""),
+        ] {
+            let template = ModelChatTemplate::new(source, "coalescing");
+            let options = ChatTemplateOptions::default();
+            let tools = [tool("weather")];
+            let rendered =
+                render_chat_prompt_with_tools_and_model_template_compatibility_with_prefill(
+                    &messages,
+                    "unused",
+                    Some(&template),
+                    &options,
+                    &tools,
+                    None,
+                    &[],
+                    None,
+                    true,
+                    None,
+                )
+                .unwrap();
+            let legacy = render_chat_prompt_with_tools_and_model_template_compatibility(
+                &messages,
+                "unused",
+                Some(&template),
+                &options,
+                &tools,
+                None,
+                &[],
+                None,
+                true,
+                None,
+            )
+            .unwrap();
+            assert_eq!(rendered.text, legacy);
+            assert!(rendered.reasoning_prefill);
+            assert!(
+                render_chat_prompt_with_tools_and_model_template_compatibility_with_prefill(
+                    &messages,
+                    "unused",
+                    Some(&template),
+                    &options,
+                    &tools,
+                    None,
+                    &[],
+                    None,
+                    false,
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn generation_prefill_uses_declared_native_reasoning_markers() {
+        let mut template = ModelChatTemplate::new(
+            "{% for message in messages %}{{ message.content }}{% endfor %}{% if add_generation_prompt %}<|turn>model\n<|channel>thought\n{% if enable_thinking is defined and enable_thinking is false %}<channel|>{% endif %}{% endif %}", "gemma");
+        template.set_output_protocol(ModelOutputProtocol::GemmaThought);
+        assert!(prefill_render(&template, Some(true)).reasoning_prefill);
+        assert!(!prefill_render(&template, Some(false)).reasoning_prefill);
+        template.set_output_protocol(ModelOutputProtocol::HarmonyGptOss);
+        assert!(!prefill_render(&template, Some(true)).reasoning_prefill);
     }
 }

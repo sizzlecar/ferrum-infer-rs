@@ -24,6 +24,7 @@ pub enum ModelCheck {
     Stop,
     Structured,
     Tools,
+    AutoToolsJson,
     Reasoning,
     Length,
 }
@@ -35,6 +36,7 @@ impl fmt::Display for ModelCheck {
             Self::Stop => "stop",
             Self::Structured => "structured",
             Self::Tools => "tools",
+            Self::AutoToolsJson => "auto-tools-json",
             Self::Reasoning => "reasoning",
             Self::Length => "length",
         })
@@ -50,6 +52,7 @@ impl FromStr for ModelCheck {
             "stop" => Ok(Self::Stop),
             "structured" => Ok(Self::Structured),
             "tools" => Ok(Self::Tools),
+            "auto-tools-json" => Ok(Self::AutoToolsJson),
             "reasoning" => Ok(Self::Reasoning),
             "length" => Ok(Self::Length),
             _ => Err(format!("unknown model check {value:?}")),
@@ -64,6 +67,7 @@ impl ModelCheck {
             Self::Stop => &["run-stop", "serve-stop"],
             Self::Structured => &["serve-structured"],
             Self::Tools => &["serve-tools"],
+            Self::AutoToolsJson => &["serve-auto-tools-json"],
             Self::Reasoning => &["run-reasoning", "serve-reasoning"],
             Self::Length => &["run-length", "serve-length"],
         }
@@ -649,6 +653,13 @@ pub fn verify_model_report(expected: &ExpectedModelRun, report: &Value) -> Resul
             expected.reasoning_alias_replay,
         ) {
             errors.push(format!("serve-tools: {error}"));
+        }
+    }
+    if let Some(case) = recorded.get("serve-auto-tools-json") {
+        if let Err(error) =
+            super::model_tool::verify_auto_tools_json_case(&case["evidence"], expected.max_tokens)
+        {
+            errors.push(format!("serve-auto-tools-json: {error}"));
         }
     }
     finish(errors)

@@ -244,6 +244,111 @@ pub fn verify_tool_case(
     Ok(())
 }
 
+pub const AUTO_TOOLS_JSON_PROMPT: &str = "Use the calc tool to evaluate 123+456. After receiving its result, return only a JSON object with that integer result in the answer field.";
+
+/// Public wire controls for the optional real-model automatic-tool probe.
+pub fn auto_tools_json_controls() -> Value {
+    serde_json::json!({
+        "tools": [{"type": "function", "function": {
+            "name": "calc", "description": "Evaluate an arithmetic expression.",
+            "parameters": {"type": "object", "properties": {"expression": {"type": "string"}},
+                "required": ["expression"], "additionalProperties": false}
+        }}],
+        "tool_choice": "auto",
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "ArithmeticAnswer", "strict": true,
+            "schema": {"type": "object", "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"], "additionalProperties": false}
+        }}
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StructuredCalcAnswer {
+    answer: u64,
+}
+
+/// Recheck the two actual requests, caller-owned history, and independently
+/// calculated answer. A forced call or a schema-free continuation is not this probe.
+pub fn verify_auto_tools_json_case(evidence: &Value, max_tokens: u32) -> Result<(), String> {
+    for (mode, stream) in [("sync", false), ("stream", true)] {
+        let evidence = &evidence[mode];
+        let first = &evidence["call_request"];
+        let replay = &evidence["continuation_request"];
+        if !first.is_object() || !replay.is_object() {
+            return Err(format!("{mode}: missing actual request objects"));
+        }
+        for (field, expected) in auto_tools_json_controls().as_object().unwrap() {
+            if first[field] != *expected {
+                return Err(format!("{mode}: request does not exercise the declared automatic tools and strict final schema"));
+            }
+        }
+        if first["stream"].as_bool() != Some(stream)
+            || first["max_tokens"].as_u64() != Some(u64::from(max_tokens))
+            || (stream && first["stream_options"]["include_usage"] != true)
+        {
+            return Err(format!(
+                "{mode}: request differs from its wire mode or token budget"
+            ));
+        }
+        let mut replay_controls = replay.clone();
+        replay_controls["messages"] = first["messages"].clone();
+        if replay_controls != *first {
+            return Err(format!(
+                "{mode}: tool-result replay changed or lost original request controls"
+            ));
+        }
+        let user = serde_json::json!({"role": "user", "content": AUTO_TOOLS_JSON_PROMPT});
+        if first["messages"] != serde_json::json!([user.clone()]) {
+            return Err(format!(
+                "{mode}: request did not ask for the calculator fixture"
+            ));
+        }
+        let called = &evidence["call"];
+        let calculated = verify_calc_call(called, max_tokens)?;
+        let history = replay["messages"]
+            .as_array()
+            .ok_or("missing replay history")?;
+        if history.len() != 3 || history[0] != user || history[1] != called["message"] {
+            return Err(format!("{mode}: replay did not preserve the actual assistant call and original user message"));
+        }
+        let result_message = &history[2];
+        if result_message["role"] != "tool"
+            || result_message["tool_call_id"] != calculated.call["id"]
+        {
+            return Err(format!("{mode}: tool result references a different call"));
+        }
+        let result_text = result_message["content"]
+            .as_str()
+            .ok_or("missing tool result JSON")?;
+        let result_value: Value = serde_json::from_str(result_text).map_err(|e| e.to_string())?;
+        let result: ToolResult = serde_json::from_str(result_text).map_err(|e| e.to_string())?;
+        if !result_value.is_object() || result.result != calculated.result {
+            return Err(format!(
+                "{mode}: tool result differs from the parsed calculation"
+            ));
+        }
+        let completed = &evidence["continuation"];
+        verify_usage(completed, max_tokens)?;
+        let (content, _, _) = boundary_observation(completed)?;
+        let value: Value =
+            serde_json::from_str(content).map_err(|e| format!("invalid final JSON: {e}"))?;
+        let answer: StructuredCalcAnswer =
+            serde_json::from_str(content).map_err(|e| format!("final schema violation: {e}"))?;
+        if completed["finish_reason"] != "stop"
+            || !completed["message"]["function_call"].is_null()
+            || !value.is_object()
+            || answer.answer != calculated.result
+        {
+            return Err(format!(
+                "{mode}: final JSON did not naturally complete with the computed answer"
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "model_tool_tests.rs"]
 mod tests;

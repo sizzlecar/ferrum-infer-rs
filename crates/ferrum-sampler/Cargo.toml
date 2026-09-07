@@ -33,6 +33,7 @@ tracing = { workspace = true }
 # Utils
 once_cell = { workspace = true }
 llguidance = { workspace = true }
+jsonschema = { workspace = true }
 
 # Serialization
 serde = { workspace = true, features = ["derive"] }

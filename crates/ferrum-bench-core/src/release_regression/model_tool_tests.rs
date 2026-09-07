@@ -35,6 +35,134 @@ fn evidence(alias: bool) -> Value {
         "reasoning_alias_replayed": alias})
 }
 
+fn auto_json_evidence() -> Value {
+    let mut evidence = json!({});
+    for (mode, stream) in [("sync", false), ("stream", true)] {
+        let call = called("(123)+(456)", &format!("{mode}-calculation"));
+        let mut first = auto_tools_json_controls();
+        first["messages"] = json!([{"role": "user", "content": AUTO_TOOLS_JSON_PROMPT}]);
+        first["max_tokens"] = json!(128);
+        first["stream"] = json!(stream);
+        first["temperature"] = json!(0);
+        if stream {
+            first["stream_options"] = json!({"include_usage": true});
+        }
+        let mut replay = first.clone();
+        replay["messages"].as_array_mut().unwrap().extend([
+            call["message"].clone(),
+            json!({"role": "tool", "tool_call_id": call["message"]["tool_calls"][0]["id"], "content": "{\"result\":579}"}),
+        ]);
+        evidence[mode] = json!({
+            "call_request": first, "call": call, "continuation_request": replay,
+            "continuation": {"message": {"role": "assistant", "content": "{\"answer\":579}", "reasoning": null},
+                "finish_reason": "stop", "usage": {"prompt_tokens": 40, "completion_tokens": 4, "total_tokens": 44}}
+        });
+    }
+    evidence
+}
+
+#[test]
+fn auto_tools_json_checks_real_calculation_schema_and_caller_owned_history() {
+    let good = auto_json_evidence();
+    verify_auto_tools_json_case(&good, 128).unwrap();
+    for mode in ["sync", "stream"] {
+        for (suffix, value) in [
+            (
+                "/call/message/tool_calls/0/function/arguments",
+                json!("{\"expression\":\"122+457\"}"),
+            ),
+            ("/continuation/message/content", json!("{\"answer\":580}")),
+            (
+                "/continuation/message/content",
+                json!("{\"answer\":\"579\"}"),
+            ),
+            (
+                "/continuation/message/content",
+                json!("{\"answer\":579,\"extra\":true}"),
+            ),
+            (
+                "/continuation/message/content",
+                json!("{\"answer\":579,\"answer\":579}"),
+            ),
+            ("/continuation/message/content", json!("[579]")),
+            ("/continuation/finish_reason", json!("length")),
+            (
+                "/continuation_request/messages/1/content",
+                json!("invented assistant text"),
+            ),
+            (
+                "/continuation_request/messages/2/tool_call_id",
+                json!("another-call"),
+            ),
+            (
+                "/continuation_request/messages/2/content",
+                json!("{\"result\":580}"),
+            ),
+        ] {
+            let mut wrong = good.clone();
+            let pointer = format!("/{mode}{suffix}");
+            *wrong.pointer_mut(&pointer).unwrap() = value;
+            assert!(
+                verify_auto_tools_json_case(&wrong, 128).is_err(),
+                "accepted {pointer}"
+            );
+        }
+    }
+}
+
+#[test]
+fn auto_tools_json_rejects_forced_calls_or_weakened_replay_controls() {
+    let good = auto_json_evidence();
+    for mode in ["sync", "stream"] {
+        for choice in [
+            json!("required"),
+            json!("none"),
+            json!({"type": "function", "function": {"name": "calc"}}),
+        ] {
+            let mut wrong = good.clone();
+            wrong[mode]["call_request"]["tool_choice"] = choice.clone();
+            wrong[mode]["continuation_request"]["tool_choice"] = choice;
+            assert!(verify_auto_tools_json_case(&wrong, 128).is_err());
+        }
+        let mut dropped_schema = good.clone();
+        for turn in ["call_request", "continuation_request"] {
+            dropped_schema[mode][turn]
+                .as_object_mut()
+                .unwrap()
+                .remove("response_format");
+        }
+        assert!(verify_auto_tools_json_case(&dropped_schema, 128).is_err());
+        for (field, changed) in [
+            ("tool_choice", json!("none")),
+            ("tools", json!([])),
+            ("response_format", Value::Null),
+            ("temperature", json!(1)),
+        ] {
+            let mut wrong = good.clone();
+            wrong[mode]["continuation_request"][field] = changed;
+            assert!(
+                verify_auto_tools_json_case(&wrong, 128).is_err(),
+                "lost {field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn auto_tools_json_requires_both_observed_wire_modes_and_request_budgets() {
+    let good = auto_json_evidence();
+    for mode in ["sync", "stream"] {
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().remove(mode);
+        assert!(verify_auto_tools_json_case(&missing, 128).is_err());
+        let mut wrong_mode = good.clone();
+        wrong_mode[mode]["call_request"]["stream"] = json!(mode != "stream");
+        wrong_mode[mode]["continuation_request"]["stream"] = json!(mode != "stream");
+        assert!(verify_auto_tools_json_case(&wrong_mode, 128).is_err());
+    }
+    assert!(verify_auto_tools_json_case(&good, 127).is_err());
+}
+
 #[test]
 fn integer_addition_accepts_balanced_parentheses_without_joining_separate_numbers() {
     for expression in [

@@ -1,8 +1,7 @@
 //! Strict terminal-output parsing for the GPT-OSS Harmony wire protocol.
 //!
-//! This intentionally supports only Ferrum's first product slice: a direct
-//! final answer, one analysis message followed by a final answer, or one
-//! analysis message followed by a function call on the commentary channel.
+//! This intentionally supports a final answer or a function call on the
+//! commentary channel, optionally preceded by one analysis message.
 
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +37,7 @@ pub struct ParsedHarmonyResponse {
 /// Accepted shapes are deliberately narrow:
 ///
 /// - `final<|return|>`
+/// - `commentary to=functions.NAME ... <|call|>`
 /// - `analysis<|end|> -> final<|return|>`
 /// - `analysis<|end|> -> commentary to=functions.NAME ... <|call|>`
 ///
@@ -140,24 +140,29 @@ fn parse_harmony_response_internal(
                     })
                 }
                 HarmonyChannel::Commentary => {
-                    let tool_call = parse_tool_call(&second)?;
-                    require_terminal(&second, HarmonyTerminal::Call)?;
-                    require_no_trailing_output(&second)?;
-                    Ok(ParsedHarmonyResponse {
-                        reasoning_content: Some(first.payload.to_string()),
-                        content: String::new(),
-                        tool_call: Some(tool_call),
-                    })
+                    parse_terminal_tool_call(&second, Some(first.payload))
                 }
                 HarmonyChannel::Analysis => Err(invalid_harmony(
                     "only one analysis message is supported before the terminal response",
                 )),
             }
         }
-        HarmonyChannel::Commentary => Err(invalid_harmony(
-            "a commentary tool call must follow one complete analysis message",
-        )),
+        HarmonyChannel::Commentary => parse_terminal_tool_call(&first, None),
     }
+}
+
+fn parse_terminal_tool_call(
+    message: &ParsedMessage<'_>,
+    reasoning_content: Option<&str>,
+) -> Result<ParsedHarmonyResponse> {
+    let tool_call = parse_tool_call(message)?;
+    require_terminal(message, HarmonyTerminal::Call)?;
+    require_no_trailing_output(message)?;
+    Ok(ParsedHarmonyResponse {
+        reasoning_content: reasoning_content.map(str::to_string),
+        content: String::new(),
+        tool_call: Some(tool_call),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -660,17 +665,102 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_or_non_object_tool_json() {
-        for arguments in ["{", "[]", "null", "\"Paris\""] {
-            let output = format!(
-                "<|channel|>analysis<|message|>Need weather.<|end|>\
-                 <|start|>assistant<|channel|>commentary to=functions.weather<|constrain|>json\
-                 <|message|>{arguments}<|call|>"
-            );
+    fn parses_direct_function_tool_call_with_optional_prefix_and_content_type() {
+        for header in [
+            "<|channel|>commentary to=functions.weather",
+            "<|start|>assistant<|channel|>commentary to=functions.weather",
+            "<|start|>assistant to=functions.weather<|channel|>commentary",
+        ] {
+            for content_type in ["", "<|constrain|>json"] {
+                let output =
+                    format!("{header}{content_type}<|message|> {{\"city\": \"Paris\"}} \n<|call|>");
+                let expected = ParsedHarmonyResponse {
+                    reasoning_content: None,
+                    content: String::new(),
+                    tool_call: Some(HarmonyToolCall {
+                        name: "weather".to_string(),
+                        arguments_json: "{\"city\": \"Paris\"}".to_string(),
+                    }),
+                };
+                assert_eq!(parse_harmony_response(&output).unwrap(), expected);
+                for finish_reason in [FinishReason::Stop, FinishReason::Length, FinishReason::EOS] {
+                    assert_eq!(
+                        parse_harmony_response_for_finish_reason(&output, Some(finish_reason))
+                            .unwrap(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_direct_tool_calls_with_invalid_recipient_or_content_type() {
+        for header in [
+            "<|channel|>commentary",
+            "<|channel|>commentary to=",
+            "<|channel|>commentary to=functions.",
+            "<|channel|>commentary to=browser.search",
+            "<|channel|>commentary to=python",
+            "<|start|>assistant to=functions.weather<|channel|>commentary to=functions.weather",
+            "<|channel|>commentary to=functions.weather<|constrain|>text",
+        ] {
+            let output = format!("{header}<|message|>{{}}<|call|>");
             assert!(
                 parse_harmony_response(&output).is_err(),
-                "accepted {arguments:?}"
+                "accepted {output:?}"
             );
+            assert!(
+                parse_length_truncated_harmony_response(&output).is_err(),
+                "accepted {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_tool_calls_require_complete_call_terminal_even_when_truncated() {
+        for suffix in [
+            "",
+            "<|message|>{\"city\":",
+            "<|message|>{\"city\":\"Paris\"}",
+            "<|message|>{}<|cal",
+            "<|message|>{}<|end|>",
+            "<|message|>{}<|return|>",
+            "<|message|>{}<|call|><|call|>",
+            "<|message|>{}<|call|>garbage",
+            "<|message|>{}<|call|><|start|>assistant<|channel|>final<|message|>done<|return|>",
+        ] {
+            let output =
+                format!("<|channel|>commentary to=functions.weather<|constrain|>json{suffix}");
+            assert!(
+                parse_harmony_response(&output).is_err(),
+                "accepted {output:?}"
+            );
+            for finish_reason in [FinishReason::Stop, FinishReason::Length, FinishReason::EOS] {
+                assert!(
+                    parse_harmony_response_for_finish_reason(&output, Some(finish_reason)).is_err(),
+                    "accepted {output:?} for {finish_reason:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_or_non_object_tool_json() {
+        for arguments in ["{", "[]", "null", "\"Paris\""] {
+            for prefix in [
+                "",
+                "<|channel|>analysis<|message|>Need weather.<|end|><|start|>assistant",
+            ] {
+                let output = format!(
+                    "{prefix}<|channel|>commentary to=functions.weather<|constrain|>json\
+                     <|message|>{arguments}<|call|>"
+                );
+                assert!(
+                    parse_harmony_response(&output).is_err(),
+                    "accepted {output:?}"
+                );
+            }
         }
     }
 

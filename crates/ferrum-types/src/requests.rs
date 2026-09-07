@@ -323,11 +323,32 @@ impl ApiToolCallProtocol {
 }
 
 impl ApiChatRequest {
+    /// Automatic tool calls and hard final JSON are alternative output branches.
+    /// A final object must never acquire tool-call semantics merely because its
+    /// fields happen to match a function's argument schema.
+    pub fn automatic_tools_with_hard_response_format(&self) -> bool {
+        !self.tools.is_empty()
+            && self.tool_choice.as_ref().is_none_or(|choice| {
+                matches!(choice, ApiToolChoice::Mode(mode) if mode.eq_ignore_ascii_case("auto"))
+            })
+            && self.response_format.as_ref().is_some_and(|format| {
+                format.format_type == "json_object"
+                    || (format.format_type == "json_schema"
+                        && format
+                            .json_schema
+                            .as_ref()
+                            .is_some_and(|schema| schema.strict == Some(true)))
+            })
+    }
+
     /// Protocol controls are generatable only when this request can emit a
     /// modern tool call. `tool_choice: none` must not widen token sampling.
     pub fn generated_control_token_texts(&self) -> &'static [&'static str] {
         if self.tools.is_empty() || api_tool_choice_is_none(self) {
             return &[];
+        }
+        if self.automatic_tools_with_hard_response_format() {
+            return &["<tool_call>", "</tool_call>"];
         }
         self.tool_call_protocol.generated_control_token_texts()
     }
@@ -336,6 +357,13 @@ impl ApiChatRequest {
     pub fn generated_response_envelope(&self) -> Option<ResponseCompletionEnvelope> {
         if self.tools.is_empty() || api_tool_choice_is_none(self) {
             return None;
+        }
+        if self.automatic_tools_with_hard_response_format() {
+            return Some(ResponseCompletionEnvelope {
+                open_token_text: "<tool_call>".to_string(),
+                close_token_text: "</tool_call>".to_string(),
+                max_envelopes: MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE,
+            });
         }
         self.tool_call_protocol.generated_response_envelope()
     }
@@ -414,6 +442,108 @@ pub fn api_response_from_generated_text(
     chat_api_response_from_generated_text(chat_request, text, finish_reason).map(ApiResponse::Chat)
 }
 
+/// Branch established by the structured-output grammar for a complete result.
+/// When both the final and tool languages accept the same bytes, the grammar
+/// owner must select `Final` before invoking the classified response helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredOutputBranch {
+    Final,
+    ToolCall,
+}
+
+/// Preserve an authoritative grammar decision through product response shaping.
+///
+/// `text` is the complete result payload, excluding reasoning and its headers.
+/// This function does not validate the final schema or infer branch ownership
+/// from JSON fields. Only a caller that established full grammar acceptance
+/// and final precedence may supply `branch`.
+///
+/// A final answer deliberately returns `Some`, even when its fields resemble a
+/// call, so downstream text fallbacks cannot reinterpret it. Classified calls
+/// accept complete registered envelopes or a named JSON object with explicit
+/// arguments; they never infer the sole tool from an unnamed argument object.
+pub fn api_response_from_classified_generated_text(
+    request: &InferenceRequest,
+    text: &str,
+    finish_reason: FinishReason,
+    branch: StructuredOutputBranch,
+) -> crate::Result<Option<ApiResponse>> {
+    let Some(ApiRequest::Chat(chat_request)) = request.api_request.as_ref() else {
+        return Ok(None);
+    };
+    if !matches!(finish_reason, FinishReason::Stop | FinishReason::EOS) {
+        return Ok(None);
+    }
+    if !chat_request.automatic_tools_with_hard_response_format() {
+        return Err(crate::FerrumError::invalid_request(
+            "classified structured output requires automatic tools with a hard response format",
+        ));
+    }
+
+    let (content, tool_calls, wire_finish_reason) = match branch {
+        StructuredOutputBranch::Final => (text.to_string(), Vec::new(), "stop"),
+        StructuredOutputBranch::ToolCall => {
+            let calls = parse_explicit_tool_call_envelopes(text, chat_request)
+                .or_else(|| parse_classified_named_json_call(text, chat_request))
+                .filter(|calls| {
+                    calls.iter().all(|call| {
+                        serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                            .is_ok_and(|arguments| arguments.is_object())
+                    })
+                })
+                .ok_or_else(|| {
+                    crate::FerrumError::invalid_format(
+                        "classified tool output is not a complete declared function call",
+                    )
+                })?;
+            (String::new(), calls, "tool_calls")
+        }
+    };
+    Ok(Some(ApiResponse::Chat(ApiChatResponse {
+        message: ApiChatMessage {
+            role: ApiMessageRole::Assistant,
+            content,
+            name: None,
+            tool_calls,
+            tool_call_id: None,
+            function_call: None,
+        },
+        finish_reason: Some(wire_finish_reason.to_string()),
+    })))
+}
+
+fn parse_classified_named_json_call(
+    text: &str,
+    chat_request: &ApiChatRequest,
+) -> Option<Vec<ApiToolCall>> {
+    if chat_request.tool_call_protocol != ApiToolCallProtocol::Json {
+        return None;
+    }
+    // Consume the whole JSON value, without searching surrounding prose,
+    // fences, native control markers, or a reasoning section for a call.
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let name = value.get("name")?.as_str()?;
+    if !api_tool_name_allowed(chat_request, name) {
+        return None;
+    }
+    let arguments = match (value.get("arguments"), value.get("parameters")) {
+        (Some(arguments), None) | (None, Some(arguments)) => arguments,
+        _ => return None,
+    };
+    if !arguments.is_object() {
+        return None;
+    }
+    let call = ApiToolCall {
+        id: "call_0".to_string(),
+        tool_type: "function".to_string(),
+        function: ApiFunctionCall {
+            name: name.to_string(),
+            arguments: serde_json::to_string(arguments).ok()?,
+        },
+    };
+    validate_parsed_tool_calls(vec![call])
+}
+
 pub fn chat_api_may_emit_tool_or_function_call(chat_request: &ApiChatRequest) -> bool {
     (!chat_request.tools.is_empty() && !api_tool_choice_is_none(chat_request))
         || (!chat_request.legacy_functions.is_empty()
@@ -485,13 +615,25 @@ fn parse_tool_calls_from_generated_text(
     text: &str,
     chat_request: &ApiChatRequest,
 ) -> Option<Vec<ApiToolCall>> {
+    if chat_request.automatic_tools_with_hard_response_format() {
+        return parse_explicit_tool_call_envelopes(text, chat_request);
+    }
     if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
-        if let Some(calls) = parse_function_parameter_xml_tool_calls(text, chat_request) {
+        if let Some(calls) = parse_function_parameter_xml_tool_calls(text, chat_request, false) {
             return validate_parsed_tool_calls(calls);
         }
     }
 
     let value = parse_json_value_from_generated_text(text)?;
+    parse_json_tool_call_value(&value, chat_request, 0, true)
+}
+
+fn parse_json_tool_call_value(
+    value: &serde_json::Value,
+    chat_request: &ApiChatRequest,
+    index_offset: usize,
+    allow_unwrapped_arguments: bool,
+) -> Option<Vec<ApiToolCall>> {
     if let Some(calls) = value.get("tool_calls").and_then(|value| value.as_array()) {
         if calls.len() > MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
             return None;
@@ -499,20 +641,80 @@ fn parse_tool_calls_from_generated_text(
         let parsed = calls
             .iter()
             .enumerate()
-            .map(|(index, value)| parse_tool_call_value(value, index, chat_request))
+            .map(|(index, value)| parse_tool_call_value(value, index_offset + index, chat_request))
             .collect::<Option<Vec<_>>>()?;
         return validate_parsed_tool_calls(parsed);
     }
     if let Some(tool_call) = value.get("tool_call") {
-        return parse_tool_call_value(tool_call, 0, chat_request)
+        return parse_tool_call_value(tool_call, index_offset, chat_request)
             .and_then(|call| validate_parsed_tool_calls(vec![call]));
     }
-    if let Some(tool_call) = parse_wrapped_tool_call_value(&value, 0, chat_request) {
+    if let Some(tool_call) = parse_wrapped_tool_call_value(value, index_offset, chat_request) {
         return validate_parsed_tool_calls(vec![tool_call]);
     }
-    parse_tool_call_value(&value, 0, chat_request)
-        .or_else(|| parse_forced_tool_arguments_value(&value, 0, chat_request))
+    parse_tool_call_value(value, index_offset, chat_request)
+        .or_else(|| {
+            allow_unwrapped_arguments
+                .then(|| parse_forced_tool_arguments_value(value, index_offset, chat_request))
+                .flatten()
+        })
         .and_then(|call| validate_parsed_tool_calls(vec![call]))
+}
+
+/// Only explicit, fully consumed protocol envelopes establish a tool branch.
+/// Do not search arbitrary text for tags: they may be literal final JSON data.
+fn parse_explicit_tool_call_envelopes(
+    text: &str,
+    chat_request: &ApiChatRequest,
+) -> Option<Vec<ApiToolCall>> {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut remaining = text.trim();
+    let mut calls = Vec::new();
+    while !remaining.is_empty() {
+        if calls.len() >= MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
+            return None;
+        }
+        let payload = remaining.strip_prefix(OPEN)?.trim_start();
+        let parsed = match chat_request.tool_call_protocol {
+            ApiToolCallProtocol::Json => {
+                // The closing marker can legitimately occur inside a JSON
+                // argument string; consume JSON before interpreting framing.
+                let mut values =
+                    serde_json::Deserializer::from_str(payload).into_iter::<serde_json::Value>();
+                let value = values.next()?.ok()?;
+                remaining = payload[values.byte_offset()..]
+                    .trim_start()
+                    .strip_prefix(CLOSE)?
+                    .trim_start();
+                parse_json_tool_call_value(&value, chat_request, calls.len(), false)?
+            }
+            ApiToolCallProtocol::FunctionParameterXml => {
+                let end = remaining.find(CLOSE)? + CLOSE.len();
+                let envelope = &remaining[..end];
+                remaining = remaining[end..].trim_start();
+                let mut parsed =
+                    parse_function_parameter_xml_tool_calls(envelope, chat_request, true)?;
+                for (index, call) in parsed.iter_mut().enumerate() {
+                    call.id = format!("call_{}", calls.len() + index);
+                }
+                parsed
+            }
+        };
+        if calls.len() + parsed.len() > MAX_PARALLEL_TOOL_CALLS_PER_RESPONSE {
+            return None;
+        }
+        for call in parsed {
+            if calls
+                .iter()
+                .any(|previous: &ApiToolCall| previous.id == call.id)
+            {
+                return None;
+            }
+            calls.push(call);
+        }
+    }
+    validate_parsed_tool_calls(calls)
 }
 
 fn validate_parsed_tool_calls(calls: Vec<ApiToolCall>) -> Option<Vec<ApiToolCall>> {
@@ -533,6 +735,7 @@ fn validate_parsed_tool_calls(calls: Vec<ApiToolCall>) -> Option<Vec<ApiToolCall
 fn parse_function_parameter_xml_tool_calls(
     text: &str,
     chat_request: &ApiChatRequest,
+    require_complete_parameters: bool,
 ) -> Option<Vec<ApiToolCall>> {
     const TOOL_START: &str = "<tool_call>";
     const TOOL_END: &str = "</tool_call>";
@@ -581,6 +784,7 @@ fn parse_function_parameter_xml_tool_calls(
         let arguments = parse_function_parameter_xml_arguments(
             &function[name_end + 1..arguments_end],
             parameter_schema,
+            require_complete_parameters,
         )?;
         let arguments = serde_json::to_string(&arguments).ok()?;
         calls.push(ApiToolCall {
@@ -599,6 +803,7 @@ fn parse_function_parameter_xml_tool_calls(
 fn parse_function_parameter_xml_arguments(
     text: &str,
     parameter_schema: Option<&serde_json::Value>,
+    require_complete_parameters: bool,
 ) -> Option<serde_json::Map<String, serde_json::Value>> {
     const PARAMETER_START: &str = "<parameter=";
     const PARAMETER_END: &str = "</parameter>";
@@ -607,6 +812,9 @@ fn parse_function_parameter_xml_arguments(
     let mut schema_probe = parameter_schema.map(XmlParameterSchemaProbe::new);
     let mut remaining = text;
     while let Some(parameter_start) = remaining.find(PARAMETER_START) {
+        if require_complete_parameters && !remaining[..parameter_start].trim().is_empty() {
+            return None;
+        }
         remaining = &remaining[parameter_start + PARAMETER_START.len()..];
         let Some(name_end) = remaining.find('>') else {
             return None;
@@ -627,6 +835,9 @@ fn parse_function_parameter_xml_arguments(
         );
         arguments.insert(name.to_string(), value);
         remaining = &remaining[value_end + PARAMETER_END.len()..];
+    }
+    if require_complete_parameters && !remaining.trim().is_empty() {
+        return None;
     }
     Some(arguments)
 }

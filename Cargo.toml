@@ -67,7 +67,7 @@ uuid = { version = "1.6", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 parking_lot = "0.12"
 once_cell = "1.19"
-llguidance = { version = "1.7.6", default-features = false, features = ["ahash", "referencing"] }
+llguidance = { version = "1.7.6", default-features = false, features = ["ahash", "referencing", "lark"] }
 jsonschema = { version = "0.48.1", default-features = false }
 
 # Metrics
