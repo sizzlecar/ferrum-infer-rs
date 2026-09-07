@@ -585,6 +585,147 @@ pub(super) fn configured_nvcc_host_compile() {
             .take(8000)
             .collect::<String>()
     );
+    if !status.success() {
+        for relative in ["include/cuda_runtime.h", "bin/nvcc.profile"] {
+            let path = request.cuda_toolkit_root.join(relative);
+            eprintln!(
+                "NVCC compile diagnostic input: path={} exists={} identity={:?}",
+                path.display(),
+                path.exists(),
+                tool_file_identity(&path)
+            );
+        }
+        let bounded_log = |path: &Path| {
+            let mut bytes = Vec::new();
+            match fs::File::open(path).and_then(|file| file.take(12001).read_to_end(&mut bytes)) {
+                Ok(_) => {
+                    let truncated = bytes.len() > 12000;
+                    bytes.truncate(12000);
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&bytes),
+                        if truncated { "\n[truncated]" } else { "" }
+                    )
+                }
+                Err(error) => format!("cannot read {}: {error}", path.display()),
+            }
+        };
+        let run_diagnostic = |name: &str, argv: &[String]| {
+            let stdout = request.output_dir.join(format!("logs/{name}.stdout.log"));
+            let stderr = request.output_dir.join(format!("logs/{name}.stderr.log"));
+            let result = (|| {
+                write_command_stream(&stdout, "stdout", argv, b"compile failure diagnostic\n")?;
+                write_command_stream(&stderr, "stderr", argv, b"compile failure diagnostic\n")?;
+                run_logged_command(
+                    argv,
+                    &stdout,
+                    &stderr,
+                    &command.working_directory,
+                    &environment,
+                )
+            })();
+            eprintln!(
+                "NVCC compile diagnostic {name}: argv={argv:?} result={result:?} stdout={} stderr={}",
+                bounded_log(&stdout),
+                bounded_log(&stderr)
+            );
+            result
+        };
+        let diagnosis = (|| -> Result<()> {
+            let ordinary = platform::normalize_windows_path(&nvcc.path)?;
+            let ordinary_identity = tool_file_identity(Path::new(&ordinary))?;
+            if ordinary_identity != nvcc {
+                return Err(NativeOperatorBuilderError::Invalid(format!(
+                    "ordinary NVCC path has a different physical identity: {ordinary_identity:?} != {nvcc:?}"
+                )));
+            }
+            eprintln!("NVCC compile diagnostic verified ordinary={ordinary:?} identity={nvcc:?}");
+            for (name, program) in [
+                ("canonical-dryrun", &nvcc.path),
+                ("ordinary-dryrun", &ordinary),
+            ] {
+                let mut argv = command.argv.clone();
+                argv[0] = program.clone();
+                argv.push("--dryrun".to_string());
+                // A failed dryrun remains diagnostic; still collect the next comparison.
+                let _ = run_diagnostic(name, &argv);
+            }
+            let object = Path::new(command.object_file.as_ref().unwrap());
+            let depfile = request
+                .output_dir
+                .join(command.compiler_depfile.as_ref().unwrap());
+            for path in [object, depfile.as_path()] {
+                if !path.starts_with(&request.output_dir)
+                    || !request.output_dir.starts_with(root.path())
+                {
+                    return Err(NativeOperatorBuilderError::Invalid(format!(
+                        "diagnostic output is outside the probe TempDir: {}",
+                        path.display()
+                    )));
+                }
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(source) => {
+                        return Err(NativeOperatorBuilderError::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        });
+                    }
+                }
+            }
+            let mut argv = command.argv.clone();
+            argv[0] = ordinary;
+            let comparison = run_diagnostic("ordinary-compile", &argv)?;
+            if comparison.success() {
+                let object_identity = tool_file_identity(object)?;
+                let inspection = ferrum_native_ops::inspect_msvc_object(
+                    &fs::read(object).map_err(|source| NativeOperatorBuilderError::Io {
+                        path: object.to_path_buf(),
+                        source,
+                    })?,
+                    platform::MSVC_TARGET,
+                )
+                .map_err(NativeOperatorBuilderError::Invalid)?;
+                let depfile_identity = tool_file_identity(&depfile)?;
+                let contents = fs::read_to_string(&depfile).map_err(|source| {
+                    NativeOperatorBuilderError::Io {
+                        path: depfile.clone(),
+                        source,
+                    }
+                })?;
+                let (target, dependencies) = parse_make_depfile(&contents, &depfile)?;
+                let target_matches = platform::same_path(&target, &object.display().to_string());
+                let source_matches = dependencies.iter().any(|dependency| {
+                    platform::source_relative_path(dependency, &command.working_directory)
+                        .is_ok_and(|relative| relative == plan.translation_units[0].path)
+                });
+                eprintln!(
+                    "ordinary NVCC compile evidence: object={object_identity:?} COFF={:?} depfile={depfile_identity:?} target={target:?} dependencies={} target_matches={target_matches} source_matches={source_matches}",
+                    inspection.identity,
+                    dependencies.len()
+                );
+                if inspection.identity.machine != 0x8664 || !target_matches || !source_matches {
+                    return Err(NativeOperatorBuilderError::Invalid(
+                        "ordinary NVCC compile did not produce the expected AMD64 object and source-bound depfile".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        eprintln!("NVCC compile failure diagnosis: {diagnosis:?}");
+        // Check both spellings again even when a diagnostic command or inspection failed.
+        for path in [
+            Ok(nvcc.path.clone()),
+            platform::normalize_windows_path(&nvcc.path),
+        ] {
+            let identity = path.and_then(|path| tool_file_identity(Path::new(&path)));
+            let unchanged = identity.as_ref().is_ok_and(|identity| identity == &nvcc);
+            eprintln!(
+                "NVCC compile diagnostic final identity: unchanged={unchanged} identity={identity:?}"
+            );
+        }
+    }
     assert!(
         status.success(),
         "production NVCC host compile failed: {status}"
