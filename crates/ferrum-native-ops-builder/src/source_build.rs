@@ -408,6 +408,8 @@ struct NativeOperatorBuildInputIdentity<'a> {
     architecture_argument: &'a str,
     effective_environment: &'a BTreeMap<String, String>,
     toolchain: Option<&'a NativeOperatorSourceBuildStaticToolchain>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_environment_option: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -424,6 +426,8 @@ struct NativeOperatorObjectInputIdentity<'a> {
     builder_contract_version: u32,
     effective_environment: &'a BTreeMap<String, String>,
     toolchain: &'a NativeOperatorSourceBuildStaticToolchain,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_environment_option: Option<&'static str>,
 }
 
 pub fn lock_native_operator_source_definition(
@@ -5069,6 +5073,9 @@ fn build_inputs_sha256(
         architecture_argument,
         effective_environment,
         toolchain,
+        msvc_environment_option: platform::nvcc_environment_option(toolchain.is_some_and(
+            |toolchain| platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref()),
+        )),
     };
     let bytes =
         serde_json::to_vec(&identity).map_err(|source| NativeOperatorBuilderError::Json {
@@ -5189,6 +5196,9 @@ fn build_object_cache_specs(
                 builder_contract_version: NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION,
                 effective_environment,
                 toolchain,
+                msvc_environment_option: platform::nvcc_environment_option(platform::is_msvc(
+                    toolchain.host_toolchain.host_abi.as_ref(),
+                )),
             };
             let input_signature = serde_json::to_string(&identity).map_err(|source| {
                 NativeOperatorBuilderError::Json {
@@ -5244,6 +5254,8 @@ fn nvcc_policy_flags_for_host(policy: &NativeOperatorNvccPolicy, msvc: bool) -> 
         flags.push("--expt-extended-lambda".to_string());
     }
     if msvc {
+        // Do not let nvcc replace the SDK/search paths bound by the receipt.
+        flags.extend(platform::nvcc_environment_option(msvc).map(str::to_string));
         flags.extend(["-Xcompiler".to_string(), "/MD,/EHsc,/bigobj".to_string()]);
     }
     if policy.host_position_independent_code && !msvc {

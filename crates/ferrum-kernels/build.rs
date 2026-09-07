@@ -1356,6 +1356,7 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
     let nvcc = resolve_program(&HostTools::current().nvcc(cuda_root.as_deref()));
     let compute_cap = detect_cuda_compute_cap();
     let ccbin = env::var("NVCC_CCBIN").ok();
+    let environment_option = HostTools::current().nvcc_environment_option();
     let mut flags = vec![
         format!("nvcc={}", nvcc.display()),
         format!("arch=sm_{compute_cap}"),
@@ -1365,6 +1366,7 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
         "-O3".to_string(),
         "--use_fast_math".to_string(),
     ];
+    flags.extend(environment_option.map(str::to_string));
     if let Some(cuda_include) = &cuda_include {
         flags.push(format!("-I{}", cuda_include.display()));
     }
@@ -1440,6 +1442,7 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     .arg("-std=c++17")
                     .arg("-O3")
                     .arg("--use_fast_math");
+                command.args(environment_option);
                 if let Some(cuda_include) = &cuda_include {
                     command.arg(format!("-I{}", cuda_include.display()));
                 }

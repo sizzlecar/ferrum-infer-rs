@@ -1,7 +1,13 @@
 //! Child ownership and CLI adaptation; benchmark requests remain in bench-serve.
-use super::{remaining, source::Bundle, write_json, PerformanceArgs};
-use serde_json::{json, Value};
-use std::{ffi::OsString, fs, net::TcpListener, path::Path, process::Stdio, time::Duration};
+#[cfg(unix)]
+use super::{remaining, write_json};
+use super::{source::Bundle, PerformanceArgs};
+#[cfg(any(unix, test))]
+use serde_json::json;
+use serde_json::Value;
+use std::{ffi::OsString, path::Path};
+#[cfg(unix)]
+use std::{fs, net::TcpListener, process::Stdio, time::Duration};
 use tokio::{process::Command, time::Instant};
 
 pub(super) fn clean_command(binary: &Path, cwd: &Path) -> Command {

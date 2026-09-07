@@ -19,6 +19,10 @@ pub(crate) fn is_msvc(abi: Option<&NativeOperatorHostAbi>) -> bool {
     abi.is_some_and(|abi| abi.compiler_flavor == NativeOperatorCompilerFlavor::Msvc)
 }
 
+pub(crate) fn nvcc_environment_option(msvc: bool) -> Option<&'static str> {
+    msvc.then_some("--use-local-env")
+}
+
 pub(crate) fn is_msvc_compiler(path: &str) -> bool {
     basename(path).eq_ignore_ascii_case("cl.exe")
 }

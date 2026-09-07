@@ -239,6 +239,7 @@ fn msvc_receipt_replays_native_commands_without_the_build_machine() {
     assert!(compile.object_file.as_ref().unwrap().ends_with(".obj"));
     assert!(compile.argv.iter().any(|arg| arg == "-MD"));
     assert!(compile.argv.iter().any(|arg| arg == "/MD,/EHsc,/bigobj"));
+    assert!(compile.argv.iter().any(|arg| arg == "--use-local-env"));
     assert!(!compile
         .argv
         .iter()
@@ -247,7 +248,7 @@ fn msvc_receipt_replays_native_commands_without_the_build_machine() {
         receipt.commands.last().unwrap().argv[3],
         platform::basename(compile.object_file.as_ref().unwrap())
     );
-    for mutation in 0..5 {
+    for mutation in 0..6 {
         let mut invalid = receipt.clone();
         match mutation {
             0 => invalid.commands[0]
@@ -273,19 +274,47 @@ fn msvc_receipt_replays_native_commands_without_the_build_machine() {
             3 => {
                 invalid.commands.last_mut().unwrap().argv[3] = "C:/other/member.obj".to_string();
             }
-            _ => {
+            4 => {
                 invalid.commands[0]
                     .object_identity
                     .as_mut()
                     .unwrap()
                     .machine = 0x14c;
             }
+            _ => invalid.commands[0]
+                .argv
+                .retain(|arg| arg != "--use-local-env"),
         }
         assert!(
             verify_source_build_receipt_against_plan_portable(&invalid, &path).is_err(),
             "mutation {mutation}"
         );
     }
+}
+
+#[test]
+fn msvc_cache_identity_rejects_objects_from_nvcc_reinitialized_environments() {
+    let root = tempfile::tempdir().unwrap();
+    let (plan, path) = plan(root.path());
+    let mut receipt = receipt(&plan, &path);
+    let specs = build_object_cache_specs(
+        &plan,
+        &architecture_argument(plan.architecture, "sm_89"),
+        &receipt.toolchain.as_ref().unwrap().static_identity,
+        &receipt.effective_environment,
+    )
+    .unwrap();
+    let signature = specs[0].input_signature();
+    let value: serde_json::Value = serde_json::from_str(signature).unwrap();
+    assert_eq!(value["msvc_environment_option"], "--use-local-env");
+    // This field is appended and omitted for legacy Unix identities. Removing
+    // it reconstructs the previous Windows signature with every other input
+    // unchanged, including the compiler/SDK and declared INCLUDE order.
+    let legacy_signature =
+        signature.replace(",\"msvc_environment_option\":\"--use-local-env\"", "");
+    assert_ne!(signature, legacy_signature);
+    receipt.commands[0].object_cache_key = Some(sha256_bytes(legacy_signature.as_bytes()));
+    assert!(verify_source_build_receipt_against_plan_portable(&receipt, &path).is_err());
 }
 
 #[test]

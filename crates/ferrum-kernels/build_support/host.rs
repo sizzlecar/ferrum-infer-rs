@@ -48,6 +48,10 @@ impl HostTools {
         }
     }
 
+    pub fn nvcc_environment_option(self) -> Option<&'static str> {
+        (self == Self::WindowsMsvc).then_some("--use-local-env")
+    }
+
     pub fn executable_candidates(self, program: &Path) -> Vec<PathBuf> {
         let mut candidates = vec![program.to_path_buf()];
         if self == Self::WindowsMsvc && program.extension().is_none() {
@@ -71,6 +75,11 @@ mod tests {
 
     #[test]
     fn cuda_tools_keep_paths_with_spaces_as_one_path() {
+        assert_eq!(
+            HostTools::WindowsMsvc.nvcc_environment_option(),
+            Some("--use-local-env")
+        );
+        assert_eq!(HostTools::Unix.nvcc_environment_option(), None);
         let root = Path::new("toolchains/CUDA Toolkit");
         assert_eq!(
             HostTools::WindowsMsvc.nvcc(Some(root)),
