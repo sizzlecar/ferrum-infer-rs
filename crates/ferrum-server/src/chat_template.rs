@@ -10,11 +10,9 @@ use minijinja::Environment;
 use serde::ser::SerializeStruct;
 use serde::Serialize;
 use serde_json::Value;
-use std::fmt;
-use std::str::FromStr;
 
 // Keep the existing server import path compatible with the shared capability type.
-pub use ferrum_types::ModelReasoningProtocol;
+pub use ferrum_types::{ModelReasoningProtocol, ReasoningEffort, ReasoningEffortSupport};
 
 /// Model-provided chat template, usually from GGUF or Hugging Face metadata.
 #[derive(Clone, Debug)]
@@ -27,6 +25,8 @@ pub struct ModelChatTemplate {
     pub output_protocol: ModelOutputProtocol,
     pub reasoning_protocol: ModelReasoningProtocol,
     pub reasoning_default_enabled: bool,
+    /// Declared by the model implementation, independently of output parsing.
+    pub reasoning_effort_support: ReasoningEffortSupport,
 }
 
 impl ModelChatTemplate {
@@ -41,6 +41,7 @@ impl ModelChatTemplate {
             eos_token: None,
             reasoning_protocol: ModelReasoningProtocol::None,
             reasoning_default_enabled: false,
+            reasoning_effort_support: ReasoningEffortSupport::Unknown,
         };
         let (reasoning_protocol, reasoning_default_enabled) =
             detect_model_reasoning_protocol(&model_template);
@@ -72,6 +73,23 @@ impl ModelChatTemplate {
         self.reasoning_protocol = reasoning_protocol;
         self.reasoning_default_enabled = reasoning_default_enabled;
     }
+
+    pub fn validate_reasoning_effort(&self, effort: ReasoningEffort) -> ferrum_types::Result<()> {
+        if self.reasoning_effort_support.supports(effort) == Some(false) {
+            let supported = self
+                .reasoning_effort_support
+                .declared_efforts()
+                .expect("unsupported effort requires a declaration")
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(FerrumError::invalid_request(format!(
+                "reasoning_effort '{effort}' is not supported by this model; declared supported values: {supported}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 fn tool_call_protocol_for_template(template: &str) -> ApiToolCallProtocol {
@@ -82,51 +100,6 @@ fn tool_call_protocol_for_template(template: &str) -> ApiToolCallProtocol {
         ApiToolCallProtocol::FunctionParameterXml
     } else {
         ApiToolCallProtocol::Json
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Minimal,
-    Low,
-    Medium,
-    High,
-    XHigh,
-}
-
-impl ReasoningEffort {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Minimal => "minimal",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::XHigh => "xhigh",
-        }
-    }
-}
-
-impl fmt::Display for ReasoningEffort {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for ReasoningEffort {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "minimal" => Ok(Self::Minimal),
-            "low" => Ok(Self::Low),
-            "medium" => Ok(Self::Medium),
-            "high" => Ok(Self::High),
-            "xhigh" => Ok(Self::XHigh),
-            _ => Err(format!(
-                "unsupported reasoning effort {value:?}; expected minimal, low, medium, high, or xhigh"
-            )),
-        }
     }
 }
 
@@ -338,7 +311,7 @@ fn render_prompt_messages_with_options_and_compatibility(
                 model_template,
                 "template rendered an empty prompt",
             )),
-            Err(e) => Err(chat_template_render_error(model_template, e)),
+            Err(e) => Err(chat_template_evaluation_error(model_template, e)),
         };
     }
     Ok(render_fallback_prompt(messages, model_id, None))
@@ -354,6 +327,35 @@ fn chat_template_render_error(
          fix the model's chat template or serve the model without one.",
         template.source
     ))
+}
+
+#[derive(Debug)]
+struct TemplateRequestRejection(String);
+
+impl std::fmt::Display for TemplateRequestRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemplateRequestRejection {}
+
+fn chat_template_evaluation_error(
+    template: &ModelChatTemplate,
+    error: minijinja::Error,
+) -> FerrumError {
+    // A model-authored input check is distinct from a broken template. Use its
+    // typed source, not error text or a broad InvalidOperation classification.
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = cause {
+        if current.is::<TemplateRequestRejection>() {
+            return FerrumError::invalid_request(format!(
+                "chat template rejected the request: {error}"
+            ));
+        }
+        cause = current.source();
+    }
+    chat_template_render_error(template, error)
 }
 
 #[derive(Serialize)]
@@ -575,10 +577,10 @@ fn render_model_template_once(
     env.add_function(
         "raise_exception",
         |message: String| -> std::result::Result<String, minijinja::Error> {
-            Err(minijinja::Error::new(
-                minijinja::ErrorKind::InvalidOperation,
-                message,
-            ))
+            Err(
+                minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, message.clone())
+                    .with_source(TemplateRequestRejection(message)),
+            )
         },
     );
     // transformers exposes `strftime_now(format)` = `datetime.now().strftime`
@@ -983,7 +985,7 @@ pub(crate) fn render_chat_prompt_with_tools_and_model_template_compatibility(
                     model_template,
                     "template rendered an empty prompt",
                 )),
-                Err(e) => Err(chat_template_render_error(model_template, e)),
+                Err(e) => Err(chat_template_evaluation_error(model_template, e)),
             };
         }
 
@@ -1022,7 +1024,7 @@ pub(crate) fn render_chat_prompt_with_tools_and_model_template_compatibility(
                 model_template,
                 "template rendered an empty prompt",
             )),
-            Err(e) => Err(chat_template_render_error(model_template, e)),
+            Err(e) => Err(chat_template_evaluation_error(model_template, e)),
         };
     }
 

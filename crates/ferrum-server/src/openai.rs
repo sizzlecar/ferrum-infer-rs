@@ -98,6 +98,11 @@ pub struct ChatCompletionsRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<OpenAiResponseFormat>,
 
+    /// Standard reasoning control. Omission/null retains model and server
+    /// defaults; explicit `none` requests disabled reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ferrum_types::ReasoningEffort>,
+
     /// OpenAI tool definitions. Function tools are parsed, carried through
     /// structured request data, and can shape model-emitted tool-call JSON.
     /// Tool execution itself stays caller-owned.

@@ -849,6 +849,7 @@ pub fn load_prepared_product_chat_template(
         ));
     }
     selected.set_output_protocol(prepared.descriptor().output_protocol());
+    selected.reasoning_effort_support = prepared.descriptor().reasoning_effort_support().clone();
     Ok(selected)
 }
 

@@ -50,7 +50,9 @@ support matrix and are hidden from the default CLI help.
 | `stop` | Supported | Accepts a string or string array. Both streaming and non-streaming text end before the first matched stop, including matches across tokens or inside a token. Streaming holds possible stop prefixes and releases unmatched text when generation ends. Empty stop strings are ignored. |
 | `stream` | Supported | Emits OpenAI-shaped SSE chunks followed by `[DONE]`. |
 | `stream_options.include_usage` | Supported with `stream=true` | Emits a final usage chunk with `choices: []`; `stream_options` without streaming is rejected. |
-| `chat_template_kwargs.enable_thinking` | Supported when the model template reads it | Boolean vLLM-compatible chat-template variable. Ferrum forwards it to the model-provided template. `ferrum serve --enable-thinking` or `--disable-thinking` sets the default for omitted requests; the request value wins. Templates that do not use `enable_thinking` are unaffected; non-boolean values return HTTP 400. |
+| `reasoning_effort` | Supported according to model capabilities | Standard reasoning control, shared with Responses `reasoning.effort`; see the behavior below. |
+| `chat_template_kwargs.enable_thinking` | Supported when the model template reads it | Boolean vLLM-compatible chat-template variable. Ferrum forwards it to the model-provided template. `ferrum serve --enable-thinking` or `--disable-thinking` sets the default for omitted requests; explicit request controls win. Templates that do not use `enable_thinking` are unaffected; null acts as omission, and other non-boolean values return HTTP 400. |
+| `chat_template_kwargs.reasoning_effort` | Supported extension | Passes a recognized effort string to the model template. Used alone, this legacy extension does not derive an `enable_thinking` value or override its server default. |
 | `n` | Restricted | Only `n=1` is supported; other values return HTTP 400 with `param=n`. |
 | `logit_bias` | Rejected | Non-empty maps return HTTP 400 with `param=logit_bias`. |
 | `logprobs` | Rejected | Returns HTTP 400 with `param=logprobs`. |
@@ -61,6 +63,22 @@ support matrix and are hidden from the default CLI help.
 | `tool_choice=required` | Supported | Requires at least one function tool. Ferrum steers generation toward the first declared tool's argument schema and returns OpenAI-shaped `tool_calls`. If no valid tool call can be parsed, non-streaming requests return HTTP 400 with `param=tool_choice`; streaming requests emit an OpenAI-shaped SSE error and `[DONE]` without first leaking invalid content. |
 | legacy `functions` / `function_call=auto/none` | Supported | Parsed for SDK compatibility and carried through structured request data. Assistant `function_call` responses serialize in the legacy OpenAI shape, including non-streaming responses and streaming deltas when engine output emits matching function-call JSON. |
 | specific legacy `function_call` | Supported | Named function-call selectors validate against declared legacy functions and constrain generated function-call JSON parsing to the selected function. Undeclared function names return HTTP 400 with `param=function_call`. |
+
+Chat `reasoning_effort` and Responses `reasoning.effort` accept `none`, `minimal`,
+`low`, `medium`, `high`, `xhigh`, and `max`. Omission or null preserves the server
+and template defaults. An explicit `none` passes both `reasoning_effort="none"`
+and `enable_thinking=false` to the template; other explicit values pass the
+requested effort and `enable_thinking=true`, overriding the server default.
+Conflicting standard and extension controls return HTTP 400.
+
+Accepted values depend on the loaded model. Ferrum rejects a standard effort
+outside a model's declared support set before inference; for example, GPT-OSS
+declares `low`, `medium`, and `high`. If support is unknown, Ferrum forwards the
+controls and preserves the model template's behavior. Templates may reject a
+value with HTTP 400. A template that only consumes the thinking switch gets
+on/off control, without a guarantee of distinct computation budgets for each
+positive effort. Templates that consume neither variable remain unchanged.
+Legacy-only template kwargs retain their existing direct template semantics.
 
 Both Chat Completions and Responses first render system and developer messages
 in their original positions. If a model-owned template explicitly rejects a

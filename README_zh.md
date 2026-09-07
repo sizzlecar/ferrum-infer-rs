@@ -83,7 +83,9 @@ curl http://localhost:8000/v1/chat/completions \
 输入与请求的输出预算之和。
 
 快速开始默认使用 `--disable-thinking`，让首次回答简短直接。删除该参数即可恢复模型模板默认的
-推理行为；HTTP 请求也可以通过 `chat_template_kwargs.enable_thinking` 覆盖服务端默认值。
+推理行为；HTTP 请求也可以通过 `chat_template_kwargs.enable_thinking`、Chat 的
+`reasoning_effort` 或 Responses 的 `reasoning.effort` 覆盖服务端默认值。
+模型支持范围及兼容行为见 [API 说明](docs/openai-api-compatibility.md#chat-fields)。
 
 `ferrum doctor <MODEL>` 会解析模型来源并打印下一条 `run`、`serve` 命令，
 不会下载模型或启动推理引擎。
