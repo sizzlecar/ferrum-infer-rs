@@ -230,9 +230,10 @@ jobs:
         run: cargo test --locked --workspace --doc
 
       # ── CLI E2E ───────────────────────────────────────
-      - name: "Test: CLI build + smoke test"
+      # Integration tests already build the real CLI with workspace test features.
+      # Release staging separately builds and checks the product feature set.
+      - name: "Test: CLI help (CPU build)"
         run: |
-          cargo build --locked -p ferrum-cli --bin ferrum
           # Verify help works
           ./target/debug/ferrum --help
           ./target/debug/ferrum tts --help
@@ -265,17 +266,13 @@ jobs:
       - name: Compile with Metal (all targets)
         run: cargo check --locked --workspace --all-targets --features metal
 
-      # Reuse the dev profile built by tests. Release assets are built by the
-      # release workflows and undergo their own installation/runtime checks.
-      - name: Build CLI (Metal, dev)
-        run: cargo build --locked -p ferrum-cli --bin ferrum --features metal
-
       - name: Workspace tests (all targets, Metal feature)
         run: cargo test --locked --workspace --all-targets --features metal
 
       - name: Documentation tests (Metal feature)
         run: cargo test --locked --workspace --doc --features metal
 
+      # Reuse the real CLI built for integration tests, as in the CPU job.
       - name: "Test: CLI help (Metal build)"
         run: |
           ./target/debug/ferrum --help
