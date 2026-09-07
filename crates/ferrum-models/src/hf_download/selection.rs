@@ -1,10 +1,9 @@
 use super::HfFileInfo;
+use crate::source::cached_weights::{parse_safetensors_index, SAFETENSORS_SINGLE};
 use ferrum_types::{FerrumError, Result};
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-pub(super) const SAFETENSORS_INDEX: &str = "model.safetensors.index.json";
-const SAFETENSORS_SINGLE: &str = "model.safetensors";
+pub(super) use crate::source::cached_weights::SAFETENSORS_INDEX;
 
 /// Existing loaders prefer the canonical single file over a sharded index.
 pub(super) fn authoritative_index(files: &[HfFileInfo]) -> Option<&HfFileInfo> {
@@ -53,58 +52,28 @@ pub(super) fn selected_files<'a>(
         .collect())
 }
 
-#[derive(Deserialize)]
-struct SafeTensorsIndex {
-    weight_map: BTreeMap<String, String>,
-}
-
 fn indexed_shards(files: &[HfFileInfo], bytes: &[u8]) -> Result<BTreeSet<String>> {
-    let index: SafeTensorsIndex = serde_json::from_slice(bytes)
-        .map_err(|error| FerrumError::model(format!("Invalid {SAFETENSORS_INDEX}: {error}")))?;
-    if index.weight_map.is_empty() {
-        return Err(FerrumError::model(format!(
-            "Invalid {SAFETENSORS_INDEX}: weight_map must not be empty"
-        )));
-    }
-
+    let shards = parse_safetensors_index(bytes)?;
     let available: BTreeSet<&str> = files
         .iter()
         .filter(|file| is_file(file))
         .map(|file| file.path.as_str())
         .collect();
-    let mut shards = BTreeSet::new();
-    for path in index.weight_map.into_values() {
-        if !valid_shard_path(&path) {
-            return Err(FerrumError::model(format!(
-                "Invalid shard path {path:?} in {SAFETENSORS_INDEX}: expected a portable relative .safetensors path without URL metacharacters"
-            )));
-        }
+    for path in &shards {
         if !available.contains(path.as_str()) {
             return Err(FerrumError::model(format!(
                 "Shard {path:?} referenced by {SAFETENSORS_INDEX} is absent from the repository file inventory"
             )));
         }
-        shards.insert(path);
     }
     Ok(shards)
-}
-
-fn valid_shard_path(path: &str) -> bool {
-    !path.is_empty()
-        && path.ends_with(".safetensors")
-        && !path
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '\\' | '%' | '?' | '#' | ':'))
-        && path
-            .split('/')
-            .all(|component| !matches!(component, "" | "." | ".."))
 }
 
 fn is_file(file: &HfFileInfo) -> bool {
     file.file_type.as_deref() != Some("directory")
 }
 
-fn is_weight_path(path: &str) -> bool {
+pub(super) fn is_weight_path(path: &str) -> bool {
     [".safetensors", ".pt", ".bin", ".onnx"]
         .iter()
         .any(|extension| path.ends_with(extension))

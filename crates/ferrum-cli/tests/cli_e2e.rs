@@ -86,6 +86,8 @@ fn create_cached_model(hf_home: &Path, model_id: &str, complete: bool, blob_size
     write_file(&blobs_dir.join("blob.bin"), &vec![7u8; blob_size]);
     if complete {
         write_file(&snapshot_dir.join("model.safetensors"), b"stub");
+        write_file(&snapshot_dir.join("config.json"), b"{}");
+        write_file(&snapshot_dir.join("tokenizer.json"), b"{}");
     } else {
         write_file(&snapshot_dir.join("tokenizer.json"), b"{}");
     }

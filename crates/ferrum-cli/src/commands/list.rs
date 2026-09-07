@@ -130,39 +130,9 @@ fn get_model_info(model_dir: &PathBuf) -> Option<ModelInfo> {
 
 /// Check if model has actual weight files (not just tokenizer)
 fn check_model_complete(snapshots_dir: &PathBuf) -> bool {
-    if !snapshots_dir.exists() {
-        return false;
-    }
-
-    // Check each snapshot directory
-    if let Ok(entries) = fs::read_dir(snapshots_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                // A snapshot may contain a single file, sharded weights plus
-                // an index, or a curated GGUF filename.
-                let has_weights = fs::read_dir(&path)
-                    .is_ok_and(|files| files.flatten().any(|file| is_weight_file(&file.path())));
-                if has_weights {
-                    return true;
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn is_weight_file(path: &std::path::Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".safetensors")
-        || lower.ends_with(".safetensors.index.json")
-        || lower.ends_with(".gguf")
-        || (lower.starts_with("pytorch_model")
-            && (lower.ends_with(".bin") || lower.ends_with(".bin.index.json")))
+    snapshots_dir
+        .parent()
+        .is_some_and(crate::source_resolver::cache::model_cache_ready)
 }
 
 fn get_dir_size(path: &PathBuf) -> u64 {
