@@ -68,6 +68,18 @@ pub fn contract_groups() -> Vec<ContractGroup> {
     let tiny = |name: &str| integration("ferrum-engine", "tiny_stack", name);
     let scheduler = |name: &str| lib("ferrum-scheduler", &format!("vnext::tests::{name}"));
     let kv = |name: &str| lib("ferrum-kv", &format!("managers::paged::tests::{name}"));
+    let weight_source = |name: &str| {
+        lib(
+            "ferrum-quantization",
+            &format!("gptq_marlin_source::tests::{name}"),
+        )
+    };
+    let weight_manifest = |name: &str| {
+        lib(
+            "ferrum-models",
+            &format!("vnext::qwen3_moe::weights::tests::{name}"),
+        )
+    };
     let all = vec![
         Entrypoint::Run,
         Entrypoint::ServeSync,
@@ -105,7 +117,26 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         // Supported preemption discards physical KV and replays the preserved
         // token history. Pair its scheduler transition with real CPU KV/logit
         // equivalence; this does not certify GPU swapping or persistence.
-        ("kv-resume", KvResume, all, vec![engine("plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progress_victim"), engine("cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer")]),
+        ("kv-resume", KvResume, all.clone(), vec![engine("plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progress_victim"), engine("cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer")]),
+        // Source transformations run on the host before either product entrypoint
+        // uploads weights. These assertions cover decoded bytes, source recipes,
+        // manifests and stable logical programs; they do not certify GPU operators.
+        ("weight-materialization", WeightMaterialization, all, vec![
+            weight_source("dense_symmetric_gptq_preserves_rows_groups_signs_and_source_identity"),
+            weight_source("dense_gptq_rejects_invalid_source_recipes_and_dimensions"),
+            weight_source("dense_gptq_rejects_bad_payloads_before_materialization"),
+            weight_source("repacks_valid_symmetric_gptq_components_once_at_source_boundary"),
+            weight_source("symmetric_qzeros_convention_does_not_change_marlin_payload"),
+            weight_source("aggregate_gate_up_fuses_raw_columns_before_marlin_repack"),
+            weight_source("aggregate_experts_without_projection_axis_repack_independently"),
+            weight_manifest("dense_and_gptq_routers_share_the_program_and_physical_layout"),
+            weight_manifest("router_inventory_rejects_ambiguous_incomplete_and_wrong_shape_sources"),
+            weight_manifest("router_source_alignment_does_not_require_marlin_output_tiles"),
+            weight_manifest("product_preparation_materializes_gptq_router_from_standalone_template_checkpoint"),
+            weight_manifest("gguf_native_schema_keeps_the_gptq_logical_program_and_stacked_experts"),
+            weight_manifest("gguf_manifest_rejects_same_element_wrong_shape_and_extra_tensor"),
+            weight_manifest("routed_only_manifest_builds_one_stable_program_and_physical_schema"),
+        ]),
     ];
     specifications
         .into_iter()

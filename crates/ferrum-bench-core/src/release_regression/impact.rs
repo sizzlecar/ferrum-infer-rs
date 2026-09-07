@@ -238,6 +238,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         return Some((vec![Download, Architecture],
             "typed model semantics and GPTQ configuration feed source compatibility, model programs and capacity; physical weight transforms and device operators are separate modules"));
     }
+    if (component == "ferrum-quantization" && relative == "src/gptq_marlin_source.rs")
+        || (component == "ferrum-models" && relative == "src/vnext/qwen3_moe/weights.rs")
+    {
+        return Some((vec![WeightMaterialization],
+            "reviewed checkpoint decoding, source manifests and physical weight layouts; retain CPU numerical/boundary contracts and exact-target model load/forward, while device operators and architecture programs remain separate contributors"));
+    }
     if component == "ferrum-models" && relative == "src/vnext/hf_metadata.rs" {
         return Some((vec![Download, Template, Termination],
             "Hugging Face chat-template selection and special-token metadata; actual model configuration, weight layouts and operators live in separate modules"));
@@ -423,6 +429,38 @@ fn valid_relative_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_weight_sources_do_not_hide_program_or_device_changes() {
+        let sources = [
+            "crates/ferrum-quantization/src/gptq_marlin_source.rs",
+            "crates/ferrum-models/src/vnext/qwen3_moe/weights.rs",
+        ];
+        for source in sources {
+            assert_eq!(
+                analyze_paths([source]).areas,
+                [ChangeArea::WeightMaterialization]
+            );
+        }
+        for other in [
+            "crates/ferrum-quantization/src/gptq.rs",
+            "crates/ferrum-quantization/src/new_source.rs",
+            "crates/ferrum-models/src/vnext/qwen3_moe/program.rs",
+            "crates/ferrum-models/src/vnext/another/weights.rs",
+            "crates/ferrum-kernels/src/backend/cuda/quantization.rs",
+        ] {
+            let independent = analyze_paths([other]);
+            let mixed = analyze_paths([sources[0], sources[1], other]);
+            assert!(mixed.areas.contains(&ChangeArea::WeightMaterialization));
+            for area in independent.areas {
+                assert!(mixed.areas.contains(&area), "{other} lost {area:?}");
+            }
+            assert!(mixed.areas.contains(&ChangeArea::Kernel), "{other}");
+        }
+        let unknown = analyze_paths([sources[0], "unreviewed-runtime/weights.rs"]);
+        assert_eq!(unknown.unknown_paths, ["unreviewed-runtime/weights.rs"]);
+        assert_eq!(unknown.areas, ChangeArea::ALL);
+    }
 
     #[test]
     fn isolated_engine_tests_and_packaging_do_not_erase_parent_execution_changes() {
@@ -841,9 +879,15 @@ mod tests {
             analyze_paths([config]).areas,
             [ChangeArea::Download, ChangeArea::Architecture]
         );
+        let weights = analyze_paths([
+            config,
+            "crates/ferrum-models/src/vnext/qwen3_moe/weights.rs",
+        ]);
+        assert!(weights.areas.contains(&ChangeArea::WeightMaterialization));
+        assert!(weights.areas.contains(&ChangeArea::Architecture));
         assert!(analyze_paths([
             config,
-            "crates/ferrum-models/src/vnext/qwen3_moe/weights.rs"
+            "crates/ferrum-models/src/vnext/qwen3_moe/program.rs"
         ])
         .areas
         .contains(&ChangeArea::Kernel));
