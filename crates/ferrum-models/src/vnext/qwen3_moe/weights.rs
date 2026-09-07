@@ -11,6 +11,7 @@ use ferrum_quantization::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 use super::config::{Qwen3MoeGptqConfig, Qwen3MoeSemanticConfig};
 use super::invalid_config;
@@ -42,6 +43,8 @@ const STRUCTURE_FINGERPRINT_VERSION: u8 = 1;
 pub(super) enum Qwen3MoeWeightManifest {
     SafetensorsGptqMarlin {
         quantization: Qwen3MoeGptqConfig,
+        #[serde(default)]
+        quantized_router_layers: BTreeSet<u32>,
         tensor_count: u64,
         structure_fingerprint: String,
     },
@@ -72,13 +75,38 @@ impl Qwen3MoeWeightManifest {
         quantization: &Qwen3MoeGptqConfig,
     ) -> Result<Self, String> {
         semantic.validate_gptq(quantization)?;
-        let manifest = expected_manifest(semantic, quantization)
-            .map_err(|error| format!("build weight contract: {error}"))?;
+        let mut quantized_router_layers = BTreeSet::new();
+        for layer in 0..semantic.layer_count {
+            let stem = format!("model.layers.{layer}.mlp.gate");
+            let dense = archive.contains(&format!("{stem}.weight"));
+            let packed = ["qweight", "qzeros", "scales", "g_idx"]
+                .map(|suffix| archive.contains(&format!("{stem}.{suffix}")));
+            if packed.iter().any(|present| *present) {
+                if dense || !packed.iter().all(|present| *present) {
+                    return Err(format!(
+                        "router {stem} must have exactly one complete dense or GPTQ representation"
+                    ));
+                }
+                quantized_router_layers
+                    .insert(u32::try_from(layer).map_err(|_| "router layer index exceeds u32")?);
+            } else if !dense {
+                return Err(format!("missing dense or GPTQ router {stem}"));
+            }
+        }
+        let manifest =
+            expected_manifest_for_routers(semantic, quantization, &quantized_router_layers)
+                .map_err(|error| format!("build weight contract: {error}"))?;
         let Qwen3MoeWeightManifest::SafetensorsGptqMarlin { tensor_count, .. } = &manifest else {
             unreachable!("GPTQ manifest constructor returned a GGUF manifest")
         };
-        validate_archive(archive, semantic, quantization, *tensor_count)
-            .map_err(|error| error.to_string())?;
+        validate_archive(
+            archive,
+            semantic,
+            quantization,
+            &quantized_router_layers,
+            *tensor_count,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(manifest)
     }
 
@@ -117,11 +145,16 @@ impl Qwen3MoeWeightManifest {
 
     pub(super) fn validate(&self, semantic: &Qwen3MoeSemanticConfig) -> Result<(), VNextError> {
         match self {
-            Self::SafetensorsGptqMarlin { quantization, .. } => {
+            Self::SafetensorsGptqMarlin {
+                quantization,
+                quantized_router_layers,
+                ..
+            } => {
                 semantic
                     .validate_gptq(quantization)
                     .map_err(|reason| invalid_config("semantic", reason))?;
-                let expected = expected_manifest(semantic, quantization)?;
+                let expected =
+                    expected_manifest_for_routers(semantic, quantization, quantized_router_layers)?;
                 if self != &expected {
                     return Err(invalid_config(
                         "weights",
@@ -144,7 +177,12 @@ impl Qwen3MoeWeightManifest {
         semantic: &Qwen3MoeSemanticConfig,
     ) -> Result<WeightSchema, VNextError> {
         self.validate(semantic)?;
-        let Self::SafetensorsGptqMarlin { quantization, .. } = self else {
+        let Self::SafetensorsGptqMarlin {
+            quantization,
+            quantized_router_layers,
+            ..
+        } = self
+        else {
             let Self::GgufNative { tensors } = self else {
                 unreachable!()
             };
@@ -212,11 +250,6 @@ impl Qwen3MoeWeightManifest {
                     format!("{prefix}.self_attn.k_norm.weight"),
                     vec![semantic.head_dim],
                 ),
-                (
-                    ROUTER_ROLE,
-                    format!("{prefix}.mlp.gate.weight"),
-                    vec![semantic.expert_count, hidden],
-                ),
             ] {
                 append_dense(
                     layer_weight_id(layer_index, role)?,
@@ -227,6 +260,35 @@ impl Qwen3MoeWeightManifest {
                     &mut tensors,
                 );
             }
+            let router_id = layer_component_id(layer_index, ROUTER_ROLE)?;
+            let router_stem = format!("{prefix}.mlp.gate");
+            components.push(WeightComponentSpec {
+                id: router_id.clone(),
+                role: WeightComponentRole::Values,
+                external_names: if quantized_router_layers.contains(&layer_index) {
+                    // The GPTQ source adapter materializes this explicit recipe
+                    // into the same row-major F16 router used by the program.
+                    ["qweight", "qzeros", "g_idx", "scales"]
+                        .map(|suffix| format!("{router_stem}.{suffix}"))
+                        .to_vec()
+                } else {
+                    vec![format!("{router_stem}.weight")]
+                },
+                dimensions: vec![semantic.expert_count, hidden],
+                encoding: WeightEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+                required: true,
+            });
+            tensors.push(WeightTensorSpec {
+                id: layer_weight_id(layer_index, ROUTER_ROLE)?,
+                dimensions: vec![semantic.expert_count, hidden],
+                logical_element_type: ElementType::F16,
+                physical_layout: PhysicalWeightLayout::Dense {
+                    component_id: router_id,
+                },
+                required: true,
+            });
             for (role, stem, dimensions) in [
                 (
                     Q_PROJ_ROLE,
@@ -1088,6 +1150,7 @@ fn validate_archive(
     archive: &SafetensorsArchive,
     semantic: &Qwen3MoeSemanticConfig,
     quantization: &Qwen3MoeGptqConfig,
+    quantized_router_layers: &BTreeSet<u32>,
     expected_count: u64,
 ) -> Result<(), VNextError> {
     if u64::try_from(archive.tensor_count()).ok() != Some(expected_count) {
@@ -1099,8 +1162,11 @@ fn validate_archive(
             ),
         ));
     }
-    let observed =
-        visit_expected_tensors(semantic, quantization, |name, element_type, dimensions| {
+    let observed = visit_expected_tensors(
+        semantic,
+        quantization,
+        quantized_router_layers,
+        |name, element_type, dimensions| {
             let tensor = archive
                 .tensor(&name)
                 .map_err(|error| invalid_config("weights", error.to_string()))?;
@@ -1115,7 +1181,8 @@ fn validate_archive(
                 ));
             }
             Ok(())
-        })?;
+        },
+    )?;
     if observed != expected_count {
         return Err(invalid_config(
             "weights",
@@ -1125,19 +1192,42 @@ fn validate_archive(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn expected_manifest(
     semantic: &Qwen3MoeSemanticConfig,
     quantization: &Qwen3MoeGptqConfig,
 ) -> Result<Qwen3MoeWeightManifest, VNextError> {
+    expected_manifest_for_routers(semantic, quantization, &BTreeSet::new())
+}
+
+fn expected_manifest_for_routers(
+    semantic: &Qwen3MoeSemanticConfig,
+    quantization: &Qwen3MoeGptqConfig,
+    quantized_router_layers: &BTreeSet<u32>,
+) -> Result<Qwen3MoeWeightManifest, VNextError> {
+    if quantized_router_layers
+        .iter()
+        .any(|layer| u64::from(*layer) >= semantic.layer_count)
+    {
+        return Err(invalid_config(
+            "weights",
+            "quantized router layer exceeds layer count",
+        ));
+    }
     let mut hasher = Sha256::new();
     hasher.update([STRUCTURE_FINGERPRINT_VERSION]);
-    let tensor_count =
-        visit_expected_tensors(semantic, quantization, |name, element_type, dimensions| {
+    let tensor_count = visit_expected_tensors(
+        semantic,
+        quantization,
+        quantized_router_layers,
+        |name, element_type, dimensions| {
             hash_header(&mut hasher, &name, element_type, &dimensions);
             Ok(())
-        })?;
+        },
+    )?;
     Ok(Qwen3MoeWeightManifest::SafetensorsGptqMarlin {
         quantization: quantization.clone(),
+        quantized_router_layers: quantized_router_layers.clone(),
         tensor_count,
         structure_fingerprint: format!("{:x}", hasher.finalize()),
     })
@@ -1146,6 +1236,7 @@ pub(super) fn expected_manifest(
 fn visit_expected_tensors(
     semantic: &Qwen3MoeSemanticConfig,
     quantization: &Qwen3MoeGptqConfig,
+    quantized_router_layers: &BTreeSet<u32>,
     mut visitor: impl FnMut(String, ElementType, Vec<u64>) -> Result<(), VNextError>,
 ) -> Result<u64, VNextError> {
     let hidden = semantic.hidden_size;
@@ -1195,12 +1286,29 @@ fn visit_expected_tensors(
                 format!("{prefix}.self_attn.k_norm.weight"),
                 vec![semantic.head_dim],
             ),
-            (
-                format!("{prefix}.mlp.gate.weight"),
-                vec![semantic.expert_count, hidden],
-            ),
         ] {
             emit(&mut visitor, &mut count, name, ElementType::F16, dimensions)?;
+        }
+        if u32::try_from(layer_index)
+            .ok()
+            .is_some_and(|layer| quantized_router_layers.contains(&layer))
+        {
+            emit_gptq_sources(
+                &mut visitor,
+                &mut count,
+                format!("{prefix}.mlp.gate"),
+                semantic.expert_count,
+                hidden,
+                quantization,
+            )?;
+        } else {
+            emit(
+                &mut visitor,
+                &mut count,
+                format!("{prefix}.mlp.gate.weight"),
+                ElementType::F16,
+                vec![semantic.expert_count, hidden],
+            )?;
         }
         for (stem, n, k) in [
             (format!("{prefix}.self_attn.q_proj"), query, hidden),
@@ -1254,7 +1362,32 @@ fn emit_gptq(
     quantization: &Qwen3MoeGptqConfig,
 ) -> Result<(), VNextError> {
     validate_logical_gptq_matrix(n, k, quantization)?;
+    emit_gptq_sources(visitor, count, stem, n, k, quantization)
+}
+
+fn emit_gptq_sources(
+    visitor: &mut impl FnMut(String, ElementType, Vec<u64>) -> Result<(), VNextError>,
+    count: &mut u64,
+    stem: String,
+    n: u64,
+    k: u64,
+    quantization: &Qwen3MoeGptqConfig,
+) -> Result<(), VNextError> {
     let group_size = u64::from(quantization.group_size);
+    // Routers are materialized as dense F16, so their source tensors need
+    // GPTQ packing/group alignment without Marlin's output tile alignment.
+    if n == 0
+        || k == 0
+        || group_size == 0
+        || !n.is_multiple_of(8)
+        || !k.is_multiple_of(8)
+        || !k.is_multiple_of(group_size)
+    {
+        return Err(invalid_config(
+            "weights",
+            format!("GPTQ source matrix [{n}, {k}] is not packing/group aligned"),
+        ));
+    }
     for (suffix, element_type, dimensions) in [
         ("qweight", ElementType::I32, vec![k / 8, n]),
         ("scales", ElementType::F16, vec![k / group_size, n]),
@@ -1395,7 +1528,14 @@ mod tests {
     }
 
     fn fixture_archive() -> (tempfile::TempDir, SafetensorsArchive) {
-        let semantic = fixture_semantics();
+        fixture_archive_for(&fixture_semantics(), &BTreeSet::new(), |_| {})
+    }
+
+    fn fixture_archive_for(
+        semantic: &Qwen3MoeSemanticConfig,
+        quantized_routers: &BTreeSet<u32>,
+        mutate: impl FnOnce(&mut BTreeMap<String, TensorView<'static>>),
+    ) -> (tempfile::TempDir, SafetensorsArchive) {
         let hidden = semantic.hidden_size as usize;
         let query = semantic.query_features().unwrap() as usize;
         let kv = semantic.kv_features().unwrap() as usize;
@@ -1413,61 +1553,75 @@ mod tests {
             "lm_head.weight",
             vec![semantic.vocabulary_size as usize, hidden],
         );
-        for name in [
-            "model.layers.0.input_layernorm.weight",
-            "model.layers.0.post_attention_layernorm.weight",
-        ] {
-            insert_dense(&mut views, name, vec![hidden]);
+        for layer in 0..semantic.layer_count {
+            let layer_prefix = format!("model.layers.{layer}");
+            for name in [
+                format!("{layer_prefix}.input_layernorm.weight"),
+                format!("{layer_prefix}.post_attention_layernorm.weight"),
+            ] {
+                insert_dense(&mut views, name, vec![hidden]);
+            }
+            for name in [
+                format!("{layer_prefix}.self_attn.q_norm.weight"),
+                format!("{layer_prefix}.self_attn.k_norm.weight"),
+            ] {
+                insert_dense(&mut views, name, vec![semantic.head_dim as usize]);
+            }
+            if quantized_routers.contains(&(layer as u32)) {
+                insert_gptq(
+                    &mut views,
+                    &format!("{layer_prefix}.mlp.gate"),
+                    semantic.expert_count as usize,
+                    hidden,
+                    group_size,
+                );
+            } else {
+                insert_dense(
+                    &mut views,
+                    format!("{layer_prefix}.mlp.gate.weight"),
+                    vec![semantic.expert_count as usize, hidden],
+                );
+            }
+            for (role, n, k) in [
+                ("q_proj", query, hidden),
+                ("k_proj", kv, hidden),
+                ("v_proj", kv, hidden),
+                ("o_proj", hidden, query),
+            ] {
+                insert_gptq(
+                    &mut views,
+                    &format!("{layer_prefix}.self_attn.{role}"),
+                    n,
+                    k,
+                    group_size,
+                );
+            }
+            for expert_index in 0..semantic.expert_count {
+                let prefix = format!("{layer_prefix}.mlp.experts.{expert_index}");
+                insert_gptq(
+                    &mut views,
+                    &format!("{prefix}.gate_proj"),
+                    intermediate,
+                    hidden,
+                    group_size,
+                );
+                insert_gptq(
+                    &mut views,
+                    &format!("{prefix}.up_proj"),
+                    intermediate,
+                    hidden,
+                    group_size,
+                );
+                insert_gptq(
+                    &mut views,
+                    &format!("{prefix}.down_proj"),
+                    hidden,
+                    intermediate,
+                    group_size,
+                );
+            }
         }
-        for name in [
-            "model.layers.0.self_attn.q_norm.weight",
-            "model.layers.0.self_attn.k_norm.weight",
-        ] {
-            insert_dense(&mut views, name, vec![semantic.head_dim as usize]);
-        }
-        insert_dense(
-            &mut views,
-            "model.layers.0.mlp.gate.weight",
-            vec![semantic.expert_count as usize, hidden],
-        );
-        for (role, n, k) in [
-            ("q_proj", query, hidden),
-            ("k_proj", kv, hidden),
-            ("v_proj", kv, hidden),
-            ("o_proj", hidden, query),
-        ] {
-            insert_gptq(
-                &mut views,
-                &format!("model.layers.0.self_attn.{role}"),
-                n,
-                k,
-                group_size,
-            );
-        }
-        for expert_index in 0..semantic.expert_count {
-            let prefix = format!("model.layers.0.mlp.experts.{expert_index}");
-            insert_gptq(
-                &mut views,
-                &format!("{prefix}.gate_proj"),
-                intermediate,
-                hidden,
-                group_size,
-            );
-            insert_gptq(
-                &mut views,
-                &format!("{prefix}.up_proj"),
-                intermediate,
-                hidden,
-                group_size,
-            );
-            insert_gptq(
-                &mut views,
-                &format!("{prefix}.down_proj"),
-                hidden,
-                intermediate,
-                group_size,
-            );
-        }
+        mutate(&mut views);
         let directory = tempfile::tempdir().unwrap();
         serialize_to_file(
             views,
@@ -1668,11 +1822,149 @@ mod tests {
 
     #[test]
     fn product_preparation_accepts_standalone_template_and_binds_immutable_source() {
+        assert_product_preparation(false);
+    }
+
+    #[test]
+    fn product_preparation_materializes_gptq_router_from_standalone_template_checkpoint() {
+        assert_product_preparation(true);
+    }
+
+    #[test]
+    fn router_source_alignment_does_not_require_marlin_output_tiles() {
+        let quantization = fixture_quantization();
+        let mut headers = Vec::new();
+        let mut count = 0;
+        emit_gptq_sources(
+            &mut |name, dtype, shape| {
+                headers.push((name, dtype, shape));
+                Ok(())
+            },
+            &mut count,
+            "router".into(),
+            8,
+            256,
+            &quantization,
+        )
+        .unwrap();
+        assert_eq!(
+            headers,
+            vec![
+                ("router.qweight".into(), ElementType::I32, vec![32, 8]),
+                ("router.scales".into(), ElementType::F16, vec![2, 8]),
+                ("router.qzeros".into(), ElementType::I32, vec![2, 1]),
+                ("router.g_idx".into(), ElementType::I32, vec![256]),
+            ]
+        );
+        // Other GPTQ matrices still use the native Marlin path.
+        assert!(emit_gptq(
+            &mut |_, _, _| Ok(()),
+            &mut 0,
+            "projection".into(),
+            8,
+            256,
+            &quantization,
+        )
+        .is_err());
+        for (n, k) in [(0, 256), (7, 256), (8, 0), (8, 255), (8, 264)] {
+            assert!(emit_gptq_sources(
+                &mut |_, _, _| Ok(()),
+                &mut 0,
+                "router".into(),
+                n,
+                k,
+                &quantization,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn dense_and_gptq_routers_share_the_program_and_physical_layout() {
+        let mut semantic = fixture_semantics();
+        semantic.layer_count = 2;
+        semantic.expert_count = 16;
+        let quantization = fixture_quantization();
+        let dense = expected_manifest(&semantic, &quantization).unwrap();
+        let (_directory, archive) = fixture_archive_for(&semantic, &BTreeSet::from([1]), |_| {});
+        let mixed = Qwen3MoeWeightManifest::load(&archive, &semantic, &quantization).unwrap();
+        let dense_schema = dense.weight_schema(&semantic).unwrap();
+        let mixed_schema = mixed.weight_schema(&semantic).unwrap();
+        let family_id = ModelFamilyId::new(super::super::FAMILY_ID).unwrap();
+        mixed_schema.validate(&family_id).unwrap();
+        assert_eq!(dense_schema.tensors, mixed_schema.tensors);
+        assert_eq!(
+            super::super::program::build_semantic_program(&family_id, &semantic, &dense).unwrap(),
+            super::super::program::build_semantic_program(&family_id, &semantic, &mixed).unwrap()
+        );
+        for (dense, mixed) in dense_schema.components.iter().zip(&mixed_schema.components) {
+            if dense.id != layer_component_id(1, ROUTER_ROLE).unwrap() {
+                assert_eq!(dense, mixed);
+            }
+        }
+        let Qwen3MoeWeightManifest::SafetensorsGptqMarlin {
+            quantized_router_layers,
+            ..
+        } = &mixed
+        else {
+            unreachable!()
+        };
+        assert_eq!(quantized_router_layers, &BTreeSet::from([1]));
+        let encoded = serde_json::to_value(&mixed).unwrap();
+        let decoded: Qwen3MoeWeightManifest = serde_json::from_value(encoded.clone()).unwrap();
+        decoded.validate(&semantic).unwrap();
+        for changed in [
+            serde_json::json!([]),
+            serde_json::json!([0]),
+            serde_json::json!([2]),
+        ] {
+            let mut tampered = encoded.clone();
+            tampered["quantized_router_layers"] = changed;
+            let decoded: Qwen3MoeWeightManifest = serde_json::from_value(tampered).unwrap();
+            assert!(decoded.validate(&semantic).is_err());
+        }
+    }
+
+    #[test]
+    fn router_inventory_rejects_ambiguous_incomplete_and_wrong_shape_sources() {
+        let mut semantic = fixture_semantics();
+        semantic.expert_count = 16;
+        for case in 0..4 {
+            let (_directory, archive) =
+                fixture_archive_for(&semantic, &BTreeSet::from([0]), |views| match case {
+                    0 => insert_dense(views, "model.layers.0.mlp.gate.weight", vec![16, 256]),
+                    1 => {
+                        views.remove("model.layers.0.mlp.gate.g_idx");
+                    }
+                    2 => {
+                        views.insert(
+                            "model.layers.0.mlp.gate.qweight".into(),
+                            TensorView::new(Dtype::I32, vec![16, 32], leak_bytes(vec![0; 2048]))
+                                .unwrap(),
+                        );
+                    }
+                    3 => insert_dense(views, "unexpected.weight", vec![1]),
+                    _ => unreachable!(),
+                });
+            assert!(
+                Qwen3MoeWeightManifest::load(&archive, &semantic, &fixture_quantization()).is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    fn assert_product_preparation(quantized_router: bool) {
         use crate::vnext::{resolve_registered_model_from_sources, ProductionModelSourceBundle};
         use ferrum_interfaces::vnext::ModelArtifactSourceRole;
         use std::{fs, sync::Arc};
-        let semantic = fixture_semantics();
-        let (directory, _archive) = fixture_archive();
+        let mut semantic = fixture_semantics();
+        let routers = if quantized_router {
+            semantic.expert_count = 8;
+            BTreeSet::from([0])
+        } else {
+            BTreeSet::new()
+        };
+        let (directory, _archive) = fixture_archive_for(&semantic, &routers, |_| {});
         let config = serde_json::json!({
             "architectures":["Qwen3MoeForCausalLM"],"model_type":"qwen3_moe",
             "hidden_size":semantic.hidden_size,"num_hidden_layers":semantic.layer_count,
@@ -1712,6 +2004,26 @@ mod tests {
             .into_required()
             .unwrap();
         let prepared = registered.prepare_from_sources(sources).unwrap();
+        let router_id = layer_component_id(0, ROUTER_ROLE).unwrap();
+        let router = prepared
+            .family()
+            .weight_schema()
+            .components
+            .iter()
+            .find(|component| component.id == router_id)
+            .unwrap();
+        let payload = prepared.weights().component(router).unwrap();
+        assert_eq!(
+            payload.dimensions(),
+            [semantic.expert_count, semantic.hidden_size]
+        );
+        let expected = f16::from_f32(if quantized_router { -8.0 } else { 0.0 })
+            .to_bits()
+            .to_le_bytes();
+        assert!(payload
+            .bytes()
+            .chunks_exact(2)
+            .all(|value| value == expected));
         let metadata = &prepared.family().metadata().template;
         assert_eq!(metadata.template.as_bytes(), template);
         assert_eq!(metadata.source_file, "chat_template.jinja");

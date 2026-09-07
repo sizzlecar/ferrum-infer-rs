@@ -77,6 +77,147 @@ fn obligation_owners(plan: &Plan, obligation: usize) -> Vec<&str> {
 }
 
 #[test]
+fn weight_materialization_binds_cpu_contracts_and_loads_every_declared_target() {
+    let targets = vec![
+        text_target("gguf-q4_k_m", Backend::Metal),
+        text_target("gptq-int4", Backend::Cuda),
+        text_target("bf16", Backend::Cuda),
+    ];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| profile(&format!("weight-{index}"), target.clone()))
+            .collect(),
+    );
+    request.impact = super::super::analyze_paths([
+        "crates/ferrum-quantization/src/gptq_marlin_source.rs",
+        "crates/ferrum-models/src/vnext/qwen3_moe/weights.rs",
+    ]);
+    request.checks = super::super::contracts::contract_check_descriptors();
+    request
+        .checks
+        .extend(super::super::model_schedule::model_check_descriptors());
+    let result = plan(&request).unwrap();
+    let materialization = result
+        .obligations
+        .iter()
+        .position(|obligation| {
+            obligation.behavior == Behavior::WeightMaterialization
+                && obligation.layer == EvidenceLayer::Contract
+                && obligation.scope == ObligationScope::Global
+        })
+        .unwrap();
+    assert_eq!(
+        result.obligations[materialization].checkers,
+        ["cpu-contract.weight-materialization"]
+    );
+    assert!(!result.gaps.contains(&Gap::UnassignedCheck {
+        obligation: materialization
+    }));
+    for target in &targets {
+        for behavior in [Behavior::ModelLoad, Behavior::ModelForward] {
+            let index = result
+                .obligations
+                .iter()
+                .position(|obligation| {
+                    obligation.behavior == behavior
+                        && obligation.layer == EvidenceLayer::ModelRuntime
+                        && obligation.scope
+                            == ObligationScope::Target {
+                                target: target.clone(),
+                            }
+                })
+                .unwrap();
+            assert_eq!(obligation_owners(&result, index).len(), 1);
+            assert!(!result.obligations[index].checkers.is_empty());
+            assert!(!result
+                .gaps
+                .contains(&Gap::UnassignedCheck { obligation: index }));
+        }
+    }
+    assert!(!result.obligations.iter().any(|obligation| matches!(
+        obligation.behavior,
+        Behavior::KernelNumerics
+            | Behavior::KernelBoundaries
+            | Behavior::ArchitectureState
+            | Behavior::Performance
+    )));
+    // A registration is still required: model forward cannot substitute for
+    // source numerics merely because the same profile was selected.
+    request
+        .checks
+        .retain(|check| check.behavior != Behavior::WeightMaterialization);
+    let unbound = plan(&request).unwrap();
+    let index = unbound
+        .obligations
+        .iter()
+        .position(|obligation| obligation.behavior == Behavior::WeightMaterialization)
+        .unwrap();
+    assert!(unbound
+        .gaps
+        .contains(&Gap::UnassignedCheck { obligation: index }));
+}
+
+#[test]
+fn weight_source_classification_preserves_quick_start_and_other_performance_reach() {
+    let mut legacy = text_target("gguf-q4_k_m", Backend::Metal);
+    legacy.execution_path = "legacy-model-executor".into();
+    let cuda = text_target("gptq-int4", Backend::Cuda);
+    let mut request = input(
+        Stage::Release,
+        vec![legacy.clone(), cuda.clone()],
+        vec![profile("quick-metal", legacy), profile("quick-cuda", cuda)],
+    );
+    request.quick_start_profile_ids = vec!["quick-metal".into(), "quick-cuda".into()];
+    request.impact =
+        super::super::analyze_paths(["crates/ferrum-kernels/src/backend/metal/mod.rs"]);
+    mark_submission_proof(&mut request.impact);
+    let baseline = plan(&request).unwrap();
+    let weight_impact =
+        super::super::analyze_paths(["crates/ferrum-models/src/vnext/qwen3_moe/weights.rs"]);
+    request.impact.areas.extend(weight_impact.areas);
+    request.impact.paths.extend(weight_impact.paths);
+    let changed = plan(&request).unwrap();
+    for prior in &baseline.obligations {
+        assert!(
+            changed.obligations.iter().any(|current| {
+                current.behavior == prior.behavior
+                    && current.layer == prior.layer
+                    && current.scope == prior.scope
+                    && current.entrypoints == prior.entrypoints
+            }),
+            "lost baseline obligation {prior:?}"
+        );
+    }
+    for id in &request.quick_start_profile_ids {
+        assert!(selected_ids(&changed).contains(&id.as_str()));
+    }
+    assert!(changed
+        .obligations
+        .iter()
+        .any(|obligation| obligation.behavior == Behavior::Performance));
+    assert!(changed
+        .obligations
+        .iter()
+        .any(|obligation| obligation.behavior == Behavior::WeightMaterialization));
+
+    // An actual device implementation contributor still requires device
+    // numerical and performance evidence, independently of source decoding.
+    let other = super::super::analyze_paths(["crates/ferrum-kernels/src/backend/cuda/quant.rs"]);
+    request.impact.areas.extend(other.areas);
+    request.impact.paths.extend(other.paths);
+    let kernel = plan(&request).unwrap();
+    assert!(kernel.obligations.iter().any(|obligation| {
+        obligation.behavior == Behavior::KernelNumerics
+            && obligation.layer == EvidenceLayer::BackendNumerics
+            && matches!(&obligation.scope, ObligationScope::Target { target } if target.backend == Backend::Cuda)
+    }));
+}
+
+#[test]
 fn release_keeps_every_quick_start_and_samples_architecture_with_protocol() {
     let text = text_target("bf16", Backend::Metal);
     let alternate = text_target("int4", Backend::Metal);

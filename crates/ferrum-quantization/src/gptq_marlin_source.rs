@@ -43,6 +43,99 @@ impl GptqMarlinSafetensorsSource {
         &self.archive
     }
 
+    /// Materialize a small symmetric GPTQ matrix as row-major F16. The schema
+    /// explicitly names all four sources in qweight, qzeros, g_idx, scales
+    /// order; ordinary dense tensors and native Marlin matrices keep their
+    /// existing paths. This happens only during static resource initialization.
+    fn dense_gptq<'source>(
+        &'source self,
+        component: &WeightComponentSpec,
+    ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
+        let [qweight_name, qzeros_name, g_idx_name, scales_name] =
+            component.external_names.as_slice()
+        else {
+            return Err(invalid_component(
+                component,
+                "dense GPTQ requires four ordered sources",
+            ));
+        };
+        let stem = qweight_name.strip_suffix(".qweight").unwrap_or_default();
+        if stem.is_empty()
+            || qzeros_name != &format!("{stem}.qzeros")
+            || g_idx_name != &format!("{stem}.g_idx")
+            || scales_name != &format!("{stem}.scales")
+        {
+            return Err(invalid_component(component, "dense GPTQ sources must share one stem and be ordered qweight, qzeros, g_idx, scales"));
+        }
+        let qweight = self.tensor(component, qweight_name)?;
+        let qzeros = self.tensor(component, qzeros_name)?;
+        let g_idx = self.tensor(component, g_idx_name)?;
+        let scales = self.tensor(component, scales_name)?;
+        let [n, k] = component.dimensions.as_slice() else {
+            return Err(invalid_component(
+                component,
+                "dense GPTQ output must be a matrix [N, K]",
+            ));
+        };
+        let n = usize::try_from(*n)
+            .map_err(|_| invalid_component(component, "dense GPTQ N overflows"))?;
+        let k = usize::try_from(*k)
+            .map_err(|_| invalid_component(component, "dense GPTQ K overflows"))?;
+        let (group_count, scale_n) = validate_scale_shape(component, &scales)?;
+        if n == 0
+            || k == 0
+            || !n.is_multiple_of(8)
+            || !k.is_multiple_of(8)
+            || group_count == 0
+            || !k.is_multiple_of(group_count)
+            || scale_n != n
+            || qweight.dtype() != Dtype::I32
+            || qweight.shape() != [k as u64 / 8, n as u64]
+            || scales.dtype() != Dtype::F16
+        {
+            return Err(invalid_component(
+                component,
+                "dense GPTQ source shape/dtype differs from its F16 matrix contract",
+            ));
+        }
+        let group_size = k / group_count;
+        validate_symmetric_qzeros_shape(component, &qzeros, k, n, group_size)?;
+        validate_canonical_g_idx(component, &g_idx, k, group_size)?;
+        let packed = decode_i32(qweight.bytes(), component, "qweight")?;
+        let scales_values = decode_f16(scales.bytes(), component)?;
+        let byte_count = usize::try_from(component.physical_bytes()?)
+            .map_err(|_| invalid_component(component, "dense GPTQ byte count overflows"))?;
+        let mut bytes = Vec::with_capacity(byte_count);
+        for output in 0..n {
+            for input in 0..k {
+                let word = packed[(input / 8) * n + output] as u32;
+                let code = ((word >> ((input % 8) * 4)) & 15) as i32;
+                // The adapter's symmetric INT4 contract uses the same uint4b8
+                // bias as Marlin, independently of historical qzeros encoding.
+                let value =
+                    (code - 8) as f32 * scales_values[(input / group_size) * n + output].to_f32();
+                let value = f16::from_f32(value);
+                if !value.is_finite() {
+                    return Err(invalid_component(
+                        component,
+                        "dense GPTQ produced a non-finite F16 weight",
+                    ));
+                }
+                bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+            }
+        }
+        WeightComponentPayload::from_ordered_sources(
+            component,
+            component.external_names.clone(),
+            [&qweight, &qzeros, &g_idx, &scales]
+                .map(|tensor| tensor.source_file().to_owned())
+                .to_vec(),
+            component.dimensions.clone(),
+            ElementType::F16,
+            bytes,
+        )
+    }
+
     fn packed_values<'source>(
         &'source self,
         component: &WeightComponentSpec,
@@ -246,6 +339,18 @@ impl WeightComponentSource for GptqMarlinSafetensorsSource {
         component: &WeightComponentSpec,
     ) -> std::result::Result<WeightComponentPayload<'source>, VNextError> {
         match (&component.role, &component.encoding) {
+            (
+                WeightComponentRole::Values,
+                WeightEncoding::Dense {
+                    element_type: ElementType::F16,
+                },
+            ) if component
+                .external_names
+                .first()
+                .is_some_and(|name| name.ends_with(".qweight")) =>
+            {
+                self.dense_gptq(component)
+            }
             (WeightComponentRole::PackedValues, WeightEncoding::Quantized(quantization)) => {
                 self.packed_values(component, quantization)
             }
@@ -754,6 +859,171 @@ mod tests {
             packing: QuantizationPacking::Tiled,
             scale_type: ElementType::F16,
             zero_point_type: None,
+        }
+    }
+
+    type OwnedTensor = (Dtype, Vec<usize>, Vec<u8>);
+
+    fn dense_fixture(
+        qzeros_word: u32,
+        mutate: impl FnOnce(&mut BTreeMap<String, OwnedTensor>),
+    ) -> tempfile::TempDir {
+        let (n, k, group_size) = (8_usize, 256_usize, 128_usize);
+        let mut words = vec![0_u32; k / 8 * n];
+        for input in 0..k {
+            for output in 0..n {
+                words[input / 8 * n + output] |=
+                    (((input + 3 * output) % 16) as u32) << (4 * (input % 8));
+            }
+        }
+        let mut tensors = BTreeMap::from([
+            (
+                "layer.proj.qweight".to_owned(),
+                (
+                    Dtype::I32,
+                    vec![k / 8, n],
+                    words.into_iter().flat_map(u32::to_le_bytes).collect(),
+                ),
+            ),
+            (
+                "layer.proj.qzeros".to_owned(),
+                (
+                    Dtype::I32,
+                    vec![k / group_size, n / 8],
+                    (0..k / group_size * n / 8)
+                        .flat_map(|_| qzeros_word.to_le_bytes())
+                        .collect(),
+                ),
+            ),
+            (
+                "layer.proj.g_idx".to_owned(),
+                (
+                    Dtype::I32,
+                    vec![k],
+                    (0..k)
+                        .flat_map(|input| ((input / group_size) as i32).to_le_bytes())
+                        .collect(),
+                ),
+            ),
+            (
+                "layer.proj.scales".to_owned(),
+                (
+                    Dtype::F16,
+                    vec![k / group_size, n],
+                    (0..k / group_size)
+                        .flat_map(|group| {
+                            (0..n).flat_map(move |output| {
+                                f16::from_f32((1 + group * 2 + output) as f32 * 0.25)
+                                    .to_bits()
+                                    .to_le_bytes()
+                            })
+                        })
+                        .collect(),
+                ),
+            ),
+        ]);
+        mutate(&mut tensors);
+        let directory = tempdir().unwrap();
+        let views = tensors
+            .iter()
+            .map(|(name, (dtype, shape, bytes))| {
+                (name, TensorView::new(*dtype, shape.clone(), bytes).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        serialize_to_file(views, &None, &directory.path().join("model.safetensors")).unwrap();
+        directory
+    }
+
+    fn dense_component() -> WeightComponentSpec {
+        WeightComponentSpec {
+            id: WeightId::new("component.layer.proj.values").unwrap(),
+            role: WeightComponentRole::Values,
+            external_names: ["qweight", "qzeros", "g_idx", "scales"]
+                .map(|suffix| format!("layer.proj.{suffix}"))
+                .to_vec(),
+            dimensions: vec![8, 256],
+            encoding: WeightEncoding::Dense {
+                element_type: ElementType::F16,
+            },
+            required: true,
+        }
+    }
+
+    #[test]
+    fn dense_symmetric_gptq_preserves_rows_groups_signs_and_source_identity() {
+        let component = dense_component();
+        for qzeros in [0x7777_7777, 0x8888_8888] {
+            let directory = dense_fixture(qzeros, |_| {});
+            let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
+            let payload = source.component(&component).unwrap();
+            assert_eq!(payload.dimensions(), [8, 256]);
+            assert_eq!(payload.external_names(), component.external_names);
+            let values = decode_f16(payload.bytes(), &component).unwrap();
+            for output in 0..8 {
+                for input in 0..256 {
+                    let code = ((input + 3 * output) % 16) as i32;
+                    let scale = (1 + (input / 128) * 2 + output) as f32 * 0.25;
+                    assert_eq!(
+                        values[output * 256 + input].to_f32(),
+                        (code - 8) as f32 * scale
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dense_gptq_rejects_invalid_source_recipes_and_dimensions() {
+        let directory = dense_fixture(0x7777_7777, |_| {});
+        let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
+        let component = dense_component();
+        let mut invalid = vec![];
+        let mut wrong_order = component.clone();
+        wrong_order.external_names.swap(1, 2);
+        invalid.push(wrong_order);
+        let mut wrong_stem = component.clone();
+        wrong_stem.external_names[3] = "other.scales".into();
+        invalid.push(wrong_stem);
+        let mut missing = component.clone();
+        missing.external_names.pop();
+        invalid.push(missing);
+        for dimensions in [
+            vec![256, 8],
+            vec![4, 512],
+            vec![0, 256],
+            vec![8, 128],
+            vec![2, 4, 256],
+            vec![8, u64::MAX],
+        ] {
+            let mut wrong_shape = component.clone();
+            wrong_shape.dimensions = dimensions;
+            invalid.push(wrong_shape);
+        }
+        for invalid in invalid {
+            assert!(source.component(&invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn dense_gptq_rejects_bad_payloads_before_materialization() {
+        for case in 0..7 {
+            let directory = dense_fixture(0x7777_7777, |tensors| match case {
+                0 => tensors.get_mut("layer.proj.g_idx").unwrap().2[..4]
+                    .copy_from_slice(&1_i32.to_le_bytes()),
+                1 => tensors.get_mut("layer.proj.scales").unwrap().0 = Dtype::BF16,
+                2 => tensors.get_mut("layer.proj.scales").unwrap().1 = vec![1, 16],
+                3 => tensors.get_mut("layer.proj.qzeros").unwrap().0 = Dtype::F32,
+                4 => {
+                    tensors.remove("layer.proj.g_idx");
+                }
+                5 => tensors.get_mut("layer.proj.scales").unwrap().2[..2]
+                    .copy_from_slice(&f16::NAN.to_bits().to_le_bytes()),
+                6 => tensors.get_mut("layer.proj.scales").unwrap().2[..2]
+                    .copy_from_slice(&f16::MAX.to_bits().to_le_bytes()),
+                _ => unreachable!(),
+            });
+            let source = GptqMarlinSafetensorsSource::open(directory.path()).unwrap();
+            assert!(source.component(&dense_component()).is_err(), "case {case}");
         }
     }
 

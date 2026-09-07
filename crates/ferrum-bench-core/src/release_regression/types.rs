@@ -13,6 +13,9 @@ pub enum ChangeArea {
     Kv,
     /// Proven submission/completion lifecycle changes without operator changes.
     BackendSubmission,
+    /// Checkpoint decoding, physical layout construction and source validation
+    /// before model execution; does not imply device operator changes.
+    WeightMaterialization,
     Kernel,
     Architecture,
     Build,
@@ -20,7 +23,7 @@ pub enum ChangeArea {
     Validation,
 }
 impl ChangeArea {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Download,
         Self::Template,
         Self::Termination,
@@ -29,6 +32,7 @@ impl ChangeArea {
         Self::Scheduler,
         Self::Kv,
         Self::BackendSubmission,
+        Self::WeightMaterialization,
         Self::Kernel,
         Self::Architecture,
         Self::Build,
@@ -178,6 +182,9 @@ pub enum Behavior {
     /// history after physical KV release; does not imply KV swapping support.
     KvResume,
     SubmissionCompletion,
+    /// Host-side numerical decoding, source closure and physical weight layout
+    /// boundaries. Model execution and device arithmetic require other evidence.
+    WeightMaterialization,
     KernelNumerics,
     KernelBoundaries,
     ModelLoad,

@@ -336,6 +336,10 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
             &[ModelLoad, ModelForward],
         ),
         BackendSubmission => (&[], &[ModelLoad, ModelForward]),
+        ChangeArea::WeightMaterialization => (
+            &[Behavior::WeightMaterialization],
+            &[ModelLoad, ModelForward],
+        ),
         Kernel => (&[KernelBoundaries], &[ModelForward]),
         Architecture => (
             &[ModelLoad, ArchitectureState],
@@ -358,7 +362,12 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
         &reason,
     );
     let scopes = match area {
-        Kernel | BackendSubmission | Architecture | Scheduler | Kv => targets
+        Kernel
+        | BackendSubmission
+        | ChangeArea::WeightMaterialization
+        | Architecture
+        | Scheduler
+        | Kv => targets
             .iter()
             .cloned()
             .map(|target| ObligationScope::Target { target })
