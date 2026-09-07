@@ -56,6 +56,33 @@ pub(crate) fn validate_nvcc_ccbin_identity(
     Ok(())
 }
 
+pub(crate) fn nvcc_program(path: &str, msvc: bool) -> Result<String> {
+    if !msvc {
+        return Ok(path.to_string());
+    }
+    if !basename(path).eq_ignore_ascii_case("nvcc.exe") {
+        return Err(NativeOperatorBuilderError::Invalid(
+            "MSVC CUDA compilation must select nvcc.exe".to_string(),
+        ));
+    }
+    // NVCC locates nvcc.profile relative to argv[0]. Its Windows profile
+    // discovery does not support the verbatim spelling returned by canonicalize.
+    // Keep this projection separate from the recorded physical file identity.
+    normalize_windows_path(path)
+}
+
+pub(crate) fn validate_nvcc_program_identity(nvcc: &NativeOperatorToolFileIdentity) -> Result<()> {
+    let program = nvcc_program(&nvcc.path, true)?;
+    let actual = tool_file_identity(Path::new(&program))?;
+    if &actual != nvcc {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "NVCC invocation does not resolve to its recorded executable identity: invocation={program} recorded={}",
+            nvcc.path
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_host_contract(
     abi: Option<&NativeOperatorHostAbi>,
     target: &str,

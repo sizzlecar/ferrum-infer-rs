@@ -1353,7 +1353,27 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
             cuda_include.display()
         );
     }
-    let nvcc = resolve_program(&HostTools::current().nvcc(cuda_root.as_deref()));
+    let host_tools = HostTools::current();
+    let selected_nvcc = resolve_program(&host_tools.nvcc(cuda_root.as_deref()));
+    let nvcc = host_tools
+        .nvcc_invocation(&selected_nvcc)
+        .unwrap_or_else(|error| panic!("[core-ptx] invalid NVCC invocation: {error}"));
+    let invocation_identity = || {
+        (host_tools == HostTools::WindowsMsvc).then(|| {
+            let actual = nvcc.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "[core-ptx] cannot resolve NVCC invocation {}: {error}",
+                    nvcc.display()
+                )
+            });
+            assert_eq!(
+                actual, selected_nvcc,
+                "[core-ptx] NVCC invocation must select the recorded compiler"
+            );
+            sha256_file_fingerprint(&actual)
+        })
+    };
+    let selected_nvcc_identity = invocation_identity();
     let compute_cap = detect_cuda_compute_cap();
     let ccbin = env::var("NVCC_CCBIN").ok();
     let environment_option = HostTools::current().nvcc_environment_option();
@@ -1428,6 +1448,11 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     reason,
                     &signature,
                 );
+                assert_eq!(
+                    invocation_identity(),
+                    selected_nvcc_identity,
+                    "[core-ptx] NVCC changed before compilation"
+                );
                 let mut command = std::process::Command::new(&nvcc);
                 command
                     .arg(format!("--gpu-architecture=sm_{compute_cap}"))
@@ -1465,6 +1490,11 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
+                assert_eq!(
+                    invocation_identity(),
+                    selected_nvcc_identity,
+                    "[core-ptx] NVCC changed during compilation"
+                );
                 write_core_ptx_stamp(out_dir, kernel, &signature);
                 publish_cuda_build_artifact(
                     native_build_cache,

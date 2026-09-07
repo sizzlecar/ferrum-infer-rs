@@ -40,7 +40,7 @@ fn toolchain() -> NativeOperatorSourceBuildToolchain {
                 canonical_root: "C:/CUDA".to_string(),
                 invocation_root: "C:/CUDA".to_string(),
                 release_version: "12.4.0".to_string(),
-                nvcc: tool("C:/CUDA/bin/nvcc.exe"),
+                nvcc: tool(r"\\?\C:\CUDA\bin\nvcc.exe"),
                 manifest: evidence("toolchain/cuda-static-manifest.json"),
             },
             host_toolchain: NativeOperatorHostToolchainIdentity {
@@ -468,6 +468,134 @@ fn msvc_nvcc_ccbin_invocation_is_bound_by_receipt_and_cache() {
     assert_eq!(platform::nvcc_ccbin_argument(linux, false).unwrap(), linux);
 }
 
+#[test]
+fn msvc_nvcc_program_is_bound_by_receipt_and_cache() {
+    let root = tempfile::tempdir().unwrap();
+    let (plan, path) = plan(root.path());
+    let receipt = receipt(&plan, &path);
+    verify_source_build_receipt_against_plan_portable(&receipt, &path).unwrap();
+    let identity = &receipt.toolchain.as_ref().unwrap().static_identity;
+    assert_eq!(identity.cuda_toolkit.nvcc.path, r"\\?\C:\CUDA\bin\nvcc.exe");
+    let program = &receipt.commands[0].argv[0];
+    assert_eq!(program, "C:/CUDA/bin/nvcc.exe");
+    let specs = build_object_cache_specs(
+        &plan,
+        &receipt.architecture_argument,
+        identity,
+        &receipt.effective_environment,
+    )
+    .unwrap();
+    let signature = specs[0].input_signature();
+    let value: serde_json::Value = serde_json::from_str(signature).unwrap();
+    assert_eq!(value["msvc_nvcc_program"], *program);
+    let legacy_signature = signature.replace(
+        &format!(
+            ",\"msvc_nvcc_program\":{}",
+            serde_json::to_string(program).unwrap()
+        ),
+        "",
+    );
+    assert_ne!(signature, legacy_signature);
+    let mut invalid = receipt.clone();
+    invalid.commands[0].object_cache_key = Some(sha256_bytes(legacy_signature.as_bytes()));
+    assert!(verify_source_build_receipt_against_plan_portable(&invalid, &path).is_err());
+
+    let previous_inputs = NativeOperatorBuildInputIdentity {
+        plan_sha256: &receipt.plan_sha256,
+        source_package_sha256: &receipt.source_package.sha256,
+        builder_contract_version: NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION,
+        architecture_argument: &receipt.architecture_argument,
+        effective_environment: &receipt.effective_environment,
+        toolchain: Some(identity),
+        msvc_environment_option: Some("--use-local-env"),
+        msvc_nvcc_ccbin: Some(receipt.commands[0].argv[7].clone()),
+        msvc_nvcc_program: None,
+    };
+    let mut invalid = receipt.clone();
+    invalid.inputs_sha256 = sha256_bytes(&serde_json::to_vec(&previous_inputs).unwrap());
+    assert!(verify_source_build_receipt_against_plan_portable(&invalid, &path).is_err());
+    for changed in [
+        identity.cuda_toolkit.nvcc.path.as_str(),
+        "C:/Other/nvcc.exe",
+        "C:/CUDA/bin/cl.exe",
+    ] {
+        let mut invalid = receipt.clone();
+        invalid.commands[0].argv[0] = changed.to_string();
+        assert!(verify_source_build_receipt_against_plan_portable(&invalid, &path).is_err());
+    }
+    assert!(platform::nvcc_program("C:/CUDA/bin/cl.exe", true).is_err());
+    assert!(platform::nvcc_program("nvcc.exe", true).is_err());
+    assert_eq!(
+        platform::nvcc_program(r"\\?\UNC\server\CUDA Tools\bin\nvcc.exe", true).unwrap(),
+        "//server/CUDA Tools/bin/nvcc.exe"
+    );
+    let unix = "/opt/cuda/../cuda/bin/nvcc";
+    assert_eq!(platform::nvcc_program(unix, false).unwrap(), unix);
+}
+
+#[test]
+fn unix_cache_inputs_omit_msvc_nvcc_program() {
+    let root = tempfile::tempdir().unwrap();
+    let (plan, path) = plan(root.path());
+    let environment = BTreeMap::new();
+    let previous_inputs = NativeOperatorBuildInputIdentity {
+        plan_sha256: "plan",
+        source_package_sha256: "source",
+        builder_contract_version: NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION,
+        architecture_argument: "-arch=sm_89",
+        effective_environment: &environment,
+        toolchain: None,
+        msvc_environment_option: None,
+        msvc_nvcc_ccbin: None,
+        msvc_nvcc_program: None,
+    };
+    let previous_bytes = format!(
+        "{{\"plan_sha256\":\"plan\",\"source_package_sha256\":\"source\",\"builder_contract_version\":{},\"architecture_argument\":\"-arch=sm_89\",\"effective_environment\":{{}},\"toolchain\":null}}",
+        NATIVE_OPERATOR_SOURCE_OBJECT_BUILD_CONTRACT_VERSION
+    );
+    assert_eq!(
+        serde_json::to_string(&previous_inputs).unwrap(),
+        previous_bytes
+    );
+    assert_eq!(
+        build_inputs_sha256("plan", "source", "-arch=sm_89", &environment, None, &path).unwrap(),
+        sha256_bytes(previous_bytes.as_bytes())
+    );
+    let mut identity = toolchain().static_identity;
+    identity.cuda_toolkit.canonical_root = "/opt/cuda".to_string();
+    identity.cuda_toolkit.invocation_root = "/opt/cuda".to_string();
+    identity.cuda_toolkit.nvcc.path = "/opt/cuda/bin/nvcc".to_string();
+    identity.host_toolchain.compiler.path = "/usr/bin/g++".to_string();
+    identity.host_toolchain.compiler_version = "g++ 12".to_string();
+    identity.host_toolchain.target = "x86_64-linux-gnu".to_string();
+    identity.host_toolchain.host_abi = None;
+    identity.host_toolchain.environment.clear();
+    identity.archiver.path = "/usr/bin/ar".to_string();
+    validate_static_toolchain_identity(&plan.operator, &identity).unwrap();
+    let specs = build_object_cache_specs(&plan, "-arch=sm_89", &identity, &environment).unwrap();
+    let signature: serde_json::Value = serde_json::from_str(specs[0].input_signature()).unwrap();
+    assert!(signature.get("msvc_nvcc_program").is_none());
+}
+
+#[cfg(windows)]
+#[test]
+fn msvc_nvcc_program_projection_resolves_to_the_recorded_file() {
+    let directory = tempfile::Builder::new()
+        .prefix("nvcc 中文 tools ")
+        .tempdir()
+        .unwrap();
+    let nvcc = directory.path().join("nvcc.exe");
+    fs::write(&nvcc, b"selected NVCC identity").unwrap();
+    let identity = tool_file_identity(&nvcc).unwrap();
+    assert!(identity.path.starts_with(r"\\?\"));
+    platform::validate_nvcc_program_identity(&identity).unwrap();
+    let program = platform::nvcc_program(&identity.path, true).unwrap();
+    assert!(!program.starts_with(r"\\?\"));
+    assert_eq!(tool_file_identity(Path::new(&program)).unwrap(), identity);
+    fs::write(&nvcc, b"changed NVCC identity").unwrap();
+    assert!(platform::validate_nvcc_program_identity(&identity).is_err());
+}
+
 #[cfg(windows)]
 #[test]
 fn msvc_nvcc_ccbin_projection_resolves_to_the_recorded_file() {
@@ -510,6 +638,7 @@ pub(super) fn configured_nvcc_host_compile() {
     ))
     .unwrap();
     platform::validate_nvcc_ccbin_identity(&compiler).unwrap();
+    platform::validate_nvcc_program_identity(&nvcc).unwrap();
     let environment = platform::msvc_environment_for_tools(
         [&nvcc.path, &compiler.path, &archiver.path],
         &platform::capture_msvc_environment().unwrap(),
@@ -533,8 +662,8 @@ pub(super) fn configured_nvcc_host_compile() {
         object_cache_dir: root.path().join("cache"),
         plan_only: false,
     };
-    // Use the production argv builder with selected canonical executable
-    // paths. This exercises PATH/-ccbin together, beyond a --version probe.
+    // Use the production argv builder from canonical identities. This exercises
+    // the actual NVCC program and PATH/-ccbin together, beyond --version probes.
     let commands = build_commands(
         &request,
         &plan,
@@ -571,6 +700,7 @@ pub(super) fn configured_nvcc_host_compile() {
         &environment,
     )
     .unwrap();
+    platform::validate_nvcc_program_identity(&nvcc).unwrap();
     eprintln!(
         "production NVCC host compile: argv={:?} status={status} stdout={} stderr={}",
         command.argv,
@@ -694,6 +824,11 @@ pub(super) fn configured_nvcc_host_compile() {
                         source,
                     }
                 })?;
+                eprintln!(
+                    "ordinary NVCC compile raw evidence: object={object_identity:?} COFF={:?} depfile={depfile_identity:?} contents={:?}",
+                    inspection.identity,
+                    contents.chars().take(16000).collect::<String>()
+                );
                 let (target, dependencies) = parse_make_depfile(&contents, &depfile)?;
                 let target_matches = platform::same_path(&target, &object.display().to_string());
                 let source_matches = dependencies.iter().any(|dependency| {
@@ -738,14 +873,22 @@ pub(super) fn configured_nvcc_host_compile() {
     let depfile = request
         .output_dir
         .join(command.compiler_depfile.as_ref().unwrap());
-    let (target, dependencies) =
-        parse_make_depfile(&fs::read_to_string(&depfile).unwrap(), &depfile).unwrap();
+    let contents = fs::read_to_string(&depfile).unwrap();
+    eprintln!(
+        "production NVCC compile raw evidence: object={:?} COFF={:?} depfile={:?} contents={:?}",
+        tool_file_identity(object),
+        inspection.identity,
+        tool_file_identity(&depfile),
+        contents.chars().take(16000).collect::<String>()
+    );
+    let (target, dependencies) = parse_make_depfile(&contents, &depfile).unwrap();
     assert!(platform::same_path(&target, &object.display().to_string()));
     assert!(dependencies.iter().any(|dependency| {
         platform::source_relative_path(dependency, &command.working_directory)
             .is_ok_and(|relative| relative == plan.translation_units[0].path)
     }));
     platform::validate_nvcc_ccbin_identity(&compiler).unwrap();
+    platform::validate_nvcc_program_identity(&nvcc).unwrap();
 }
 
 #[test]

@@ -412,6 +412,8 @@ struct NativeOperatorBuildInputIdentity<'a> {
     msvc_environment_option: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     msvc_nvcc_ccbin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_nvcc_program: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -432,6 +434,8 @@ struct NativeOperatorObjectInputIdentity<'a> {
     msvc_environment_option: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     msvc_nvcc_ccbin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    msvc_nvcc_program: Option<String>,
 }
 
 pub fn lock_native_operator_source_definition(
@@ -1295,6 +1299,13 @@ pub fn run_native_operator_source_build(
             &receipt.effective_environment,
         )
         .and_then(|()| validate_tool_file_unchanged(&static_identity.cuda_toolkit.nvcc))
+        .and_then(|()| {
+            if platform::is_msvc(static_identity.host_toolchain.host_abi.as_ref()) {
+                platform::validate_nvcc_program_identity(&static_identity.cuda_toolkit.nvcc)
+            } else {
+                Ok(())
+            }
+        })
         .and_then(|()| validate_cuda_toolkit_unchanged(&static_identity.cuda_toolkit))
         {
             return reject_source_build(
@@ -1687,7 +1698,7 @@ pub(crate) fn verify_source_build_receipt_against_plan_portable(
         let expected_depfile = format!("{index:08}-{stem}.d");
         let expected_compiler_depfile = format!("{index:08}-{stem}.compiler.raw.d");
         let mut expected_argv = vec![
-            static_identity.cuda_toolkit.nvcc.path.clone(),
+            platform::nvcc_program(&static_identity.cuda_toolkit.nvcc.path, msvc)?,
             "-c".to_string(),
             translation_unit.path.clone(),
             "-o".to_string(),
@@ -3758,6 +3769,7 @@ fn resolve_static_toolchain(
     validate_static_toolchain_identity("<source-build-preflight>", &toolchain.static_identity)?;
     if platform::is_msvc(toolchain.static_identity.host_toolchain.host_abi.as_ref()) {
         platform::validate_nvcc_ccbin_identity(&toolchain.static_identity.host_toolchain.compiler)?;
+        platform::validate_nvcc_program_identity(&toolchain.static_identity.cuda_toolkit.nvcc)?;
     }
     Ok(toolchain)
 }
@@ -5128,6 +5140,10 @@ fn build_inputs_sha256(
                 platform::nvcc_ccbin_argument(&toolchain.host_toolchain.compiler.path, true)
             })
             .transpose()?,
+        msvc_nvcc_program: toolchain
+            .filter(|toolchain| platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref()))
+            .map(|toolchain| platform::nvcc_program(&toolchain.cuda_toolkit.nvcc.path, true))
+            .transpose()?,
     };
     let bytes =
         serde_json::to_vec(&identity).map_err(|source| NativeOperatorBuilderError::Json {
@@ -5254,6 +5270,9 @@ fn build_object_cache_specs(
                 msvc_nvcc_ccbin: platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref())
                     .then(|| platform::nvcc_ccbin_argument(&toolchain.host_toolchain.compiler.path, true))
                     .transpose()?,
+                msvc_nvcc_program: platform::is_msvc(toolchain.host_toolchain.host_abi.as_ref())
+                    .then(|| platform::nvcc_program(&toolchain.cuda_toolkit.nvcc.path, true))
+                    .transpose()?,
             };
             let input_signature = serde_json::to_string(&identity).map_err(|source| {
                 NativeOperatorBuilderError::Json {
@@ -5354,6 +5373,7 @@ fn build_commands(
         })
         .unwrap_or_else(|| platform::is_msvc_compiler(ccbin_path));
     let ccbin_argument = platform::nvcc_ccbin_argument(ccbin_path, msvc)?;
+    let nvcc_program = platform::nvcc_program(nvcc_path, msvc)?;
     let mut commands = Vec::with_capacity(plan.translation_units.len() + 1);
     let mut object_paths = Vec::with_capacity(plan.translation_units.len());
     for (index, translation_unit) in plan.translation_units.iter().enumerate() {
@@ -5369,7 +5389,7 @@ fn build_commands(
         let compiler_depfile_path = request.output_dir.join(&compiler_depfile_relative);
         object_paths.push(object_path.clone());
         let mut argv = vec![
-            nvcc_path.to_string(),
+            nvcc_program.clone(),
             "-c".to_string(),
             translation_unit.path.clone(),
             "-o".to_string(),
