@@ -15,22 +15,14 @@
 
 ## 快速开始
 
-安装 Ferrum：
-
-选择与你的平台对应的安装命令，会自动添加 tap。Homebrew 6 检查互斥安装时还需要信任
-两条[公式定义](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)，请先查看定义再运行
-信任命令；旧版 Homebrew 可跳过该命令。详见 [Homebrew 信任说明](https://docs.brew.sh/Tap-Trust)。
+在 macOS Apple Silicon 或 Linux x86_64 上安装 Ferrum 最新正式版：
 
 ```bash
-# Homebrew 6：信任已查看的两条公式定义
-brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
-
-# macOS Apple Silicon
-brew install sizzlecar/ferrum/ferrum
-
-# Linux x86_64，NVIDIA CUDA sm89
-brew install sizzlecar/ferrum/ferrum-cuda
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 ```
+
+安装脚本会校验发布包，并将 `~/.local/bin` 加入 shell 的 PATH；完成后打开新终端。
+也可以使用 [Homebrew 或手动安装](#安装)。
 
 下载权重前先检查安装的二进制：
 
@@ -137,7 +129,27 @@ Ferrum 支持：
 
 ## 安装
 
-Homebrew（公式信任说明见[快速开始](#快速开始)）：
+一键安装在 Apple Silicon 上选择 Metal。在 Linux 上，兼容的 sm89 显卡能够加载驱动、
+CUDA 12.4 与 NCCL 运行库时选择 CUDA，否则选择 CPU。也可以明确要求后端或指定版本：
+
+```bash
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
+```
+
+使用脚本安装后，重新执行原安装命令即可升级。脚本保留已有版本目录，将入口切换到
+校验后的新版二进制。正在运行的会话继续使用原版本，新启动的会话使用新版本；已有服务
+可在需要更新时自行重启。模型和配置会保留。
+
+如果希望当前终端立即使用 Ferrum，可执行：
+
+```bash
+. "$HOME/.local/share/ferrum/installer/env"
+```
+
+通过 Homebrew 安装的用户使用 `brew upgrade` 升级对应公式。Homebrew 6 检查互斥安装时需要
+信任两条[公式定义](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)，请先查看定义再运行
+信任命令；旧版 Homebrew 可跳过。详见 [Homebrew 信任说明](https://docs.brew.sh/Tap-Trust)。
 
 ```bash
 # Homebrew 6：信任已查看的两条公式定义
