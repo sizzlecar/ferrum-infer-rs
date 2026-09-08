@@ -391,6 +391,10 @@ pub(super) fn runner_command(
         task.profile.id.clone(),
         "--report-dir".into(),
         report.into(),
+        // First run includes cold source downloads. Keep its child limit within
+        // the explicit whole-task budget instead of the runner's shorter default.
+        "--run-timeout-secs".into(),
+        timeout_secs.to_string(),
         "--checks".into(),
         task.checks
             .iter()
