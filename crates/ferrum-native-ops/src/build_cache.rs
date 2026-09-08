@@ -9,6 +9,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -717,7 +719,28 @@ fn atomic_write_json(
 
 struct EntryLock {
     file: File,
+    #[cfg(not(windows))]
     path: PathBuf,
+}
+
+#[cfg(windows)]
+fn open_windows_lock_file(path: &Path) -> io::Result<File> {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "native cache lock must be a regular file, not a reparse point",
+        ));
+    }
+    Ok(file)
 }
 
 impl EntryLock {
@@ -765,7 +788,41 @@ impl EntryLock {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    fn acquire(entry: &Path) -> Result<Self, NativeBuildArtifactCacheError> {
+        let path = entry.join("publish.lock");
+        let started = Instant::now();
+        loop {
+            match open_windows_lock_file(&path) {
+                Ok(file) => {
+                    let mut guard = Self { file };
+                    guard
+                        .file
+                        .set_len(0)
+                        .and_then(|_| {
+                            writeln!(guard.file, "pid={}", std::process::id())?;
+                            guard.file.sync_all()
+                        })
+                        .map_err(|source| NativeBuildArtifactCacheError::LockCreate {
+                            path: path.clone(),
+                            source,
+                        })?;
+                    return Ok(guard);
+                }
+                Err(source) if source.raw_os_error() == Some(32) => {
+                    if started.elapsed() >= ENTRY_LOCK_WAIT {
+                        return Err(NativeBuildArtifactCacheError::LockTimeout(path));
+                    }
+                    thread::sleep(ENTRY_LOCK_POLL);
+                }
+                Err(source) => {
+                    return Err(NativeBuildArtifactCacheError::LockCreate { path, source });
+                }
+            }
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn acquire(entry: &Path) -> Result<Self, NativeBuildArtifactCacheError> {
         let path = entry.join("publish.lock");
         let started = Instant::now();
@@ -810,7 +867,9 @@ impl Drop for EntryLock {
                 );
             }
         }
-        #[cfg(not(unix))]
+        // On Windows, closing `file` releases the exclusive sharing mode.
+        // Keep the pathname so a crashed publisher leaves no stale ownership.
+        #[cfg(not(any(unix, windows)))]
         if let Err(source) = fs::remove_file(&self.path) {
             if source.kind() != io::ErrorKind::NotFound {
                 eprintln!(
@@ -1046,7 +1105,7 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn stale_lock_files_do_not_poison_the_cache() {
         let temp = TestDir::new("stale-lock");
@@ -1061,5 +1120,86 @@ mod tests {
         let receipt = cache.publish(&spec, &source).unwrap();
 
         assert_eq!(receipt.artifact_sha256, sha256_file(&source).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "subprocess fixture invoked only by windows_lock_recovers_after_process_exit"]
+    fn windows_lock_exit_without_drop_child() {
+        let entry = std::env::var_os("FERRUM_NATIVE_CACHE_LOCK_TEST_ENTRY")
+            .expect("parent test must supply its isolated lock directory");
+        let _guard = EntryLock::acquire(Path::new(&entry)).unwrap();
+        // Exit closes OS handles without running EntryLock::drop.
+        std::process::exit(0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_recovers_after_process_exit() {
+        let temp = TestDir::new("lock-process-exit");
+        let path = temp.0.join("publish.lock");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "build_cache::tests::windows_lock_exit_without_drop_child",
+                "--ignored",
+            ])
+            .env("FERRUM_NATIVE_CACHE_LOCK_TEST_ENTRY", &temp.0)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(path.is_file(), "the exited child must leave its lock file");
+
+        let guard = EntryLock::acquire(&temp.0).unwrap();
+        assert_eq!(
+            open_windows_lock_file(&path).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        drop(guard);
+        assert!(
+            path.is_file(),
+            "ownership must not depend on deleting the file"
+        );
+        drop(EntryLock::acquire(&temp.0).unwrap());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("pid={}\n", std::process::id())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_respects_legacy_live_handles() {
+        let temp = TestDir::new("lock-legacy-handle");
+        let path = temp.0.join("publish.lock");
+        let mut legacy = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        legacy
+            .write_all(b"pid=stale-legacy-marker-with-extra-bytes\n")
+            .unwrap();
+        assert_eq!(
+            open_windows_lock_file(&path).unwrap_err().raw_os_error(),
+            Some(32)
+        );
+        drop(legacy);
+        drop(EntryLock::acquire(&temp.0).unwrap());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            format!("pid={}\n", std::process::id())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_rejects_a_directory_without_contention_retry() {
+        let temp = TestDir::new("lock-directory");
+        fs::create_dir(temp.0.join("publish.lock")).unwrap();
+        assert!(matches!(
+            EntryLock::acquire(&temp.0),
+            Err(NativeBuildArtifactCacheError::LockCreate { .. })
+        ));
     }
 }
