@@ -568,13 +568,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked -p ferrum-native-ops-builder --lib source_build::platform::msvc::tests::configured_ -- --ignored --nocapture
-      - name: Check and test the native Windows workspace
+      - name: Build the Windows native operator builder
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo check --locked --workspace --all-targets
-          cargo test --locked --workspace --all-targets --no-fail-fast
-          cargo build --locked -p ferrum-native-ops-builder -p ferrum-devtools --bin ferrum-native-ops-builder --bin model_regression
+          cargo build --locked -p ferrum-native-ops-builder --bin ferrum-native-ops-builder
       - name: Build the four native CUDA operators with MSVC
         run: |
           $ErrorActionPreference = 'Stop'
@@ -604,21 +602,43 @@ jobs:
           $builder = Join-Path $env:GITHUB_WORKSPACE 'target/debug/ferrum-native-ops-builder.exe'
           $builderSha = git rev-parse HEAD
           $receiptArgs = @()
+          $failedOperators = @()
           foreach ($operator in @('marlin', 'vllm-marlin', 'vllm-moe-marlin', 'vllm-paged-attention-v2')) {
             $build = Join-Path $work "build/$operator"
             $package = Join-Path $set "packages/$operator"
             $plan = Join-Path $work "$operator.plan.json"
             $spec = Join-Path $work "$operator.package.json"
-            & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $source --out $plan
-            & $builder source-build --plan $plan --source-root $source --out $build --compute-capability sm_89 --builder-sha $builderSha --nvcc "$env:CUDA_PATH/bin/nvcc.exe" --cuda-toolkit-root $env:CUDA_PATH --ccbin $env:NVCC_CCBIN --ar $env:FERRUM_MSVC_LIB --nvcc-threads 4 --object-cache "$env:USERPROFILE/ferrum-native-object-cache"
-            & $builder materialize-package-spec --definition "native-operators/cuda/package-definitions/$operator.json" --g03-catalog $catalog --out $spec
-            & $builder package --spec $spec --source-root $source --license-root $env:GITHUB_WORKSPACE --source-build-receipt "$build/source-build.receipt.json" --source-build-plan $plan --g03-catalog $catalog --abi-contract 'native-operators/abi/ferrum-native-abi-v2.json' --cc $env:CC --ar $env:FERRUM_MSVC_LIB --out $package
-            $receipt = Join-Path $package 'package.receipt.json'
-            $receiptArgs += @('--receipt', $receipt, '--receipt-sha256', (Get-FileHash $receipt -Algorithm SHA256).Hash.ToLowerInvariant())
+            $stage = 'lock-source'
+            try {
+              & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $source --out $plan
+              $stage = 'source-build'
+              & $builder source-build --plan $plan --source-root $source --out $build --compute-capability sm_89 --builder-sha $builderSha --nvcc "$env:CUDA_PATH/bin/nvcc.exe" --cuda-toolkit-root $env:CUDA_PATH --ccbin $env:NVCC_CCBIN --ar $env:FERRUM_MSVC_LIB --nvcc-threads 4 --object-cache "$env:USERPROFILE/ferrum-native-object-cache"
+              $stage = 'materialize-package-spec'
+              & $builder materialize-package-spec --definition "native-operators/cuda/package-definitions/$operator.json" --g03-catalog $catalog --out $spec
+              $stage = 'package'
+              & $builder package --spec $spec --source-root $source --license-root $env:GITHUB_WORKSPACE --source-build-receipt "$build/source-build.receipt.json" --source-build-plan $plan --g03-catalog $catalog --abi-contract 'native-operators/abi/ferrum-native-abi-v2.json' --cc $env:CC --ar $env:FERRUM_MSVC_LIB --out $package
+              $stage = 'package receipt'
+              $receipt = Join-Path $package 'package.receipt.json'
+              $receiptArgs += @('--receipt', $receipt, '--receipt-sha256', (Get-FileHash $receipt -Algorithm SHA256).Hash.ToLowerInvariant())
+            } catch {
+              $failedOperators += "$operator ($stage)"
+              Write-Warning ("Native operator {0} failed during {1}: {2}" -f $operator, $stage, $_.Exception.Message)
+              Write-Host $_.InvocationInfo.PositionMessage
+            }
+          }
+          if ($failedOperators.Count -gt 0) {
+            throw ("Native CUDA operator builds failed: {0}" -f ($failedOperators -join ', '))
           }
           $lock = Join-Path $set 'native-operator-set.lock.json'
           & $builder assemble-set @receiptArgs --g03-catalog-sha256 $referenceLock.g03_catalog_sha256 --compute-capability sm_89 --out $lock
           "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Check and test the native Windows workspace
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo check --locked --workspace --all-targets
+          cargo test --locked --workspace --all-targets --no-fail-fast
+          cargo build --locked -p ferrum-native-ops-builder -p ferrum-devtools --bin ferrum-native-ops-builder --bin model_regression
       - name: Compile and link the full Windows CUDA CLI
         run: |
           $ErrorActionPreference = 'Stop'
@@ -627,16 +647,6 @@ jobs:
           cargo build --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
           & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf 'target/debug/ferrum.exe'
           & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-ptx 'target/debug/ferrum.exe'
-      - name: Save Windows build caches
-        if: ${{ always() && steps.windows_cache.outputs.cache-primary-key != '' && steps.windows_cache.outputs.cache-hit != 'true' }}
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            ~/ferrum-native-object-cache
-          key: ${{ steps.windows_cache.outputs.cache-primary-key }}
       - name: Preserve native build evidence and candidate executables
         if: always()
         uses: actions/upload-artifact@v4
@@ -649,6 +659,16 @@ jobs:
             target/debug/model_regression.exe
           if-no-files-found: warn
           retention-days: 7
+      - name: Save Windows build caches
+        if: ${{ always() && steps.windows_cache.outputs.cache-primary-key != '' && steps.windows_cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/ferrum-native-object-cache
+          key: ${{ steps.windows_cache.outputs.cache-primary-key }}
 
   required:
     name: CI required
