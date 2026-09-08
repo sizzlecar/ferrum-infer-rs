@@ -81,7 +81,9 @@ fn classify(input: &[u8]) -> Scope {
     }
 }
 
-fn aggregate(prepare: &str, scope: &str, jobs: [&str; 4]) -> Result<(), String> {
+const REQUIRED_JOBS: [&str; 5] = ["CPU", "Metal", "CUDA", "GPU runtime", "Windows native"];
+
+fn aggregate(prepare: &str, scope: &str, jobs: [&str; REQUIRED_JOBS.len()]) -> Result<(), String> {
     if Outcome::parse(prepare)? != Outcome::Success {
         return Err(format!("prepare must succeed, got {prepare:?}"));
     }
@@ -89,10 +91,7 @@ fn aggregate(prepare: &str, scope: &str, jobs: [&str; 4]) -> Result<(), String> 
         Scope::Docs => Outcome::Skipped,
         Scope::Code => Outcome::Success,
     };
-    for (name, value) in ["CPU", "Metal", "CUDA", "GPU runtime"]
-        .into_iter()
-        .zip(jobs)
-    {
+    for (name, value) in REQUIRED_JOBS.into_iter().zip(jobs) {
         let actual = Outcome::parse(value).map_err(|error| format!("{name}: {error}"))?;
         if actual != expected {
             return Err(format!(
@@ -111,11 +110,11 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{}", classify(&input).as_str());
             Ok(())
         }
-        [command, prepare, scope, cpu, metal, cuda, gpu] if command == "aggregate" => {
-            eprintln!("prepare={prepare:?}, scope={scope:?}, CPU={cpu:?}, Metal={metal:?}, CUDA={cuda:?}, GPU runtime={gpu:?}");
-            aggregate(prepare, scope, [cpu, metal, cuda, gpu])
+        [command, prepare, scope, cpu, metal, cuda, gpu, windows] if command == "aggregate" => {
+            eprintln!("prepare={prepare:?}, scope={scope:?}, CPU={cpu:?}, Metal={metal:?}, CUDA={cuda:?}, GPU runtime={gpu:?}, Windows native={windows:?}");
+            aggregate(prepare, scope, [cpu, metal, cuda, gpu, windows])
         }
-        _ => Err("usage: policy classify < changed-paths.z; policy aggregate PREPARE SCOPE CPU METAL CUDA GPU".to_owned()),
+        _ => Err("usage: policy classify < changed-paths.z; policy aggregate PREPARE SCOPE CPU METAL CUDA GPU WINDOWS".to_owned()),
     }
 }
 
@@ -186,14 +185,14 @@ mod tests {
 
     #[test]
     fn accepts_successful_code_and_expected_documentation_skips() {
-        assert!(aggregate("success", "code", ["success"; 4]).is_ok());
-        assert!(aggregate("success", "docs", ["skipped"; 4]).is_ok());
+        assert!(aggregate("success", "code", ["success"; REQUIRED_JOBS.len()]).is_ok());
+        assert!(aggregate("success", "docs", ["skipped"; REQUIRED_JOBS.len()]).is_ok());
     }
 
     #[test]
     fn every_required_job_must_have_its_expected_result() {
         for (scope, expected) in [("code", "success"), ("docs", "skipped")] {
-            for index in 0..4 {
+            for index in 0..REQUIRED_JOBS.len() {
                 for wrong in [
                     "success",
                     "skipped",
@@ -206,7 +205,7 @@ mod tests {
                     if wrong == expected {
                         continue;
                     }
-                    let mut jobs = [expected; 4];
+                    let mut jobs = [expected; REQUIRED_JOBS.len()];
                     jobs[index] = wrong;
                     assert!(
                         aggregate("success", scope, jobs).is_err(),
@@ -220,12 +219,12 @@ mod tests {
     #[test]
     fn failed_prepare_and_unknown_scope_cannot_be_hidden_by_skipped_jobs() {
         for prepare in ["failure", "cancelled", "skipped", "neutral", "", "unknown"] {
-            assert!(aggregate(prepare, "docs", ["skipped"; 4]).is_err());
-            assert!(aggregate(prepare, "code", ["success"; 4]).is_err());
+            assert!(aggregate(prepare, "docs", ["skipped"; REQUIRED_JOBS.len()]).is_err());
+            assert!(aggregate(prepare, "code", ["success"; REQUIRED_JOBS.len()]).is_err());
         }
         for scope in ["", "unknown", "docs\n"] {
-            assert!(aggregate("success", scope, ["success"; 4]).is_err());
-            assert!(aggregate("success", scope, ["skipped"; 4]).is_err());
+            assert!(aggregate("success", scope, ["success"; REQUIRED_JOBS.len()]).is_err());
+            assert!(aggregate("success", scope, ["skipped"; REQUIRED_JOBS.len()]).is_err());
         }
     }
 }

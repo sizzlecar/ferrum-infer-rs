@@ -4,9 +4,11 @@
 //! runner that vLLM uses. The heavy Python/Torch extension dependencies stay
 //! outside Ferrum's normal link path: setting `FERRUM_FA2_DIRECT_FFI_SHIM`
 //! to a small C ABI `.so` enables the path, and this module resolves it with
-//! `dlopen`.
+//! `dlopen` on Unix. This diagnostic shim is unavailable on other platforms.
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+#[cfg(unix)]
+use std::ffi::CString;
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
@@ -46,6 +48,7 @@ unsafe impl Sync for Fa2Shim {}
 
 static FA2_SHIM: std::sync::OnceLock<Result<Fa2Shim>> = std::sync::OnceLock::new();
 
+#[cfg(unix)]
 #[link(name = "dl")]
 extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
@@ -53,9 +56,12 @@ extern "C" {
     fn dlerror() -> *const c_char;
 }
 
+#[cfg(unix)]
 const RTLD_NOW: c_int = 2;
+#[cfg(unix)]
 const RTLD_LOCAL: c_int = 0;
 
+#[cfg(unix)]
 fn dl_error_string() -> String {
     unsafe {
         let err = dlerror();
@@ -67,12 +73,14 @@ fn dl_error_string() -> String {
     }
 }
 
+#[cfg(unix)]
 fn fa2_direct_ffi_shim_path_from_env() -> Option<String> {
     std::env::vars()
         .find(|(name, _)| name == "FERRUM_FA2_DIRECT_FFI_SHIM")
         .map(|(_, value)| value)
 }
 
+#[cfg(unix)]
 fn load_fa2_shim() -> Result<Fa2Shim> {
     let path = fa2_direct_ffi_shim_path_from_env().ok_or_else(|| {
         FerrumError::unsupported(
@@ -105,6 +113,13 @@ fn load_fa2_shim() -> Result<Fa2Shim> {
         _handle: handle,
         paged_varlen,
     })
+}
+
+#[cfg(not(unix))]
+fn load_fa2_shim() -> Result<Fa2Shim> {
+    Err(FerrumError::unsupported(
+        "FA2 direct FFI diagnostic shims require Unix",
+    ))
 }
 
 fn fa2_shim() -> Result<&'static Fa2Shim> {

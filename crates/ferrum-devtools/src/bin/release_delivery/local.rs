@@ -7,13 +7,14 @@ use ferrum_bench_core::release_regression::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::process::Stdio;
 use std::{
     collections::BTreeSet,
     ffi::OsString,
     fs,
     io::Read,
     path::{Path, PathBuf},
-    process::Stdio,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::process::Command;

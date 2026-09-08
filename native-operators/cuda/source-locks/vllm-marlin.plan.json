@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.vllm_marlin",
   "source_package": {
     "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
-    "sha256": "b5d8d16c1c08c3b8b68bdae8066a649043d1eff1ca74905bfbd035e1d30dafda"
+    "revision": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
+    "sha256": "90e5bd3db1d7f465cdf49ee4824b1b13f99e384d3439ecc07ed1e3489842ee33"
   },
   "upstream_sources": [
     {
@@ -114,7 +114,7 @@
     },
     {
       "path": "vllm_marlin/kernel_selector.h",
-      "sha256": "e6519b39ab932372629296e5e13efa5a79d5735bc8a4dc23b7ca97619d3df425"
+      "sha256": "130eac057e1f861ed87329f79be057978f403584e0961205dd41243b6485c48a"
     },
     {
       "path": "vllm_marlin/marlin.cuh",
@@ -122,7 +122,7 @@
     },
     {
       "path": "vllm_marlin/marlin_dtypes.cuh",
-      "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+      "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
     },
     {
       "path": "vllm_marlin/marlin_mma.h",
@@ -130,7 +130,7 @@
     },
     {
       "path": "vllm_marlin/marlin_template.h",
-      "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+      "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
     },
     {
       "path": "vllm_marlin/scalar_type.hpp",
@@ -165,7 +165,7 @@
         },
         {
           "path": "vllm_marlin/kernel_selector.h",
-          "sha256": "e6519b39ab932372629296e5e13efa5a79d5735bc8a4dc23b7ca97619d3df425"
+          "sha256": "130eac057e1f861ed87329f79be057978f403584e0961205dd41243b6485c48a"
         },
         {
           "path": "vllm_marlin/marlin.cuh",
@@ -173,7 +173,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -184,7 +184,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "625d73faa04f270228ef7945639f82263b5c17066590ed0165aea9f717ad312e"
+      "closure_sha256": "c4a87314f096d4edd13bd3e5de5651f4c19b98dec61abeec92da43c87f122d79"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu",
@@ -203,7 +203,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -211,7 +211,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -222,7 +222,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "2ae8ab9fbee8be734c301cf22cc83f694459a11ac1f0d7d001d3b22b2968e83d"
+      "closure_sha256": "14cedbc06f65420bc0fdbe913d94ad24f3dd9d52d074a6d3a2dea3daee8dc8e6"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu",
@@ -241,7 +241,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -249,7 +249,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -260,7 +260,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "7ff7b44da86e21dbc4deae753aa90d8e0470c721b91d2bef171334a7da2d5ae2"
+      "closure_sha256": "fcd1456e704622f8150e5d529281f93c78a37af50c95133bd05ada07888e72a7"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u4_bfloat16.cu",
@@ -279,7 +279,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -287,7 +287,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -298,7 +298,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "9e6cae277046614882ab8ac75b712c5f9a890dc15ea9dd84a28f6bc4feaf8c77"
+      "closure_sha256": "ba3dc8c4ece1f21a3b4437e4e9169f44323fe0c2bf2e28b3038f973509525834"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu",
@@ -317,7 +317,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -325,7 +325,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -336,7 +336,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "56ca3d8323df33a4076e13919f54d338d67fbeaa5d683367f71bf3de55a307fc"
+      "closure_sha256": "7e4749bb041b4e1f82f88c517044f3e96e19682b0644208a639e573e0f456457"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_bfloat16_u8b128_bfloat16.cu",
@@ -355,7 +355,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -363,7 +363,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -374,7 +374,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "83131d46e948339f82181bb52028ad5f3c13ea91d165eec1743e12292c49ccfe"
+      "closure_sha256": "739106b419f4667c6d7718e0c485b953c4fcacc8c7576021f0049037d5aeb8c3"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_float16_fe2m1f_float16.cu",
@@ -393,7 +393,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -401,7 +401,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -412,7 +412,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "88d67039f71fe07044ad65ed7a951de0ac94f57d1c985354b804304a040d43a2"
+      "closure_sha256": "4f3f0bae50746dbef82cf06dc40f514546a8ccd41224f52d842597489c3c124f"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_float16_fe4m3fn_float16.cu",
@@ -431,7 +431,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -439,7 +439,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -450,7 +450,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "b7b37207c8d021e7e95b7e33af7706cbc8d468e3190390311d572147002b6f4d"
+      "closure_sha256": "e24ab9a1d03e6af6319ca87d11d5cdc20675fdb2ce70a027b0f3651e63c2444d"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_float16_u4_float16.cu",
@@ -469,7 +469,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -477,7 +477,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -488,7 +488,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "c953260aeda8751d935c0161cb0da6495f95ac17f519bf66ef89dabe9da3ed91"
+      "closure_sha256": "f9d93865852e3f5ec431d41d6f1434f2c2bd4b056d03492677ee9b945af89286"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_float16_u4b8_float16.cu",
@@ -507,7 +507,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -515,7 +515,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -526,7 +526,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "d6ae218c2d5c2e9e8b83baed14056ae828a0724e4f2372573ef8270d102863cb"
+      "closure_sha256": "a02b9b4032efe41cd5481156e3508d47ee1d2350b10df9b7aa86904dc9e8cbc9"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_float16_u8b128_float16.cu",
@@ -545,7 +545,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -553,7 +553,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -564,7 +564,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "e93eeda24a0854bc3d593c25d1ab62c4ff75060d79efa58b3320b1e454bb0abc"
+      "closure_sha256": "c0c6eefd7c3c45bac57d363d4b8bcdf850aa2ca86a061ad1895499413a31520f"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_s8_u4_bfloat16.cu",
@@ -583,7 +583,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -591,7 +591,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -602,7 +602,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "25925da3e9e2d96757c3a7a5a674abc9ec6de4e08534ee61eed7b69d39706951"
+      "closure_sha256": "c08bfade56f07b8e97db214282594c2fa78f12bc2e4334b86e8749b110662921"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_s8_u4_float16.cu",
@@ -621,7 +621,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -629,7 +629,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -640,7 +640,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "a959b07c3377601f53ca21c43e10b30f7537eb8c0fb964bb0cdfcf4dde871631"
+      "closure_sha256": "8861a31165f261f5781db004f99c0e5073bb4ff439656c8b310e10c75ffb4a2e"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_s8_u4b8_bfloat16.cu",
@@ -659,7 +659,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -667,7 +667,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -678,7 +678,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "70ab084566151598a4488ed9198ff9b39bde47acb6c77338ca7330c3a0545809"
+      "closure_sha256": "da8ddac1f2e699a3d44947bb0a12d64dfa185ecc1a986cfa7b6466d0f125706a"
     },
     {
       "translation_unit": "vllm_marlin/sm80_kernel_s8_u4b8_float16.cu",
@@ -697,7 +697,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -705,7 +705,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -716,7 +716,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "357b525a4db8dbe660e664d7e2b5c4e5d3f1f1fc77b04695588b5a2d7389a5e2"
+      "closure_sha256": "f9f31c48f8364ba2219fbcb7b8d0481a54c8dfa52f212ee70849bbd1f9da0b16"
     },
     {
       "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_fe2m1f_bfloat16.cu",
@@ -735,7 +735,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -743,7 +743,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -754,7 +754,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "cd5d71ed14af7780c3505dedef6265db7f292d89e5e8568f073018bdf89b7166"
+      "closure_sha256": "41d4a694893082850148a7e821e51e3704b4a1f177772422215a622e1354d9ef"
     },
     {
       "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4_bfloat16.cu",
@@ -773,7 +773,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -781,7 +781,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -792,7 +792,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "ec9e10b120d483f991f7105800960542263d344290f49e5b11f5e822b8a8949a"
+      "closure_sha256": "6dc4cfa5314096a086282348f1ba10b1f119b9e41ad124b486f3db68970a8576"
     },
     {
       "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4_float16.cu",
@@ -811,7 +811,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -819,7 +819,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -830,7 +830,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "fc8cbc36f50c9fc5252fd1683ae1e65bc2360ebfd78a4a45ffeec178372266c2"
+      "closure_sha256": "4d5131fbcfc182208655f65abafd793f4c458c7323f8422599263f92f130d3da"
     },
     {
       "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_bfloat16.cu",
@@ -849,7 +849,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -857,7 +857,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -868,7 +868,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "3da1ef31031d3da47aec020552d187d70ec2ec480a35606596c00c80ecf99988"
+      "closure_sha256": "c6b78504dd12c7ed3442e236b96f3a5b963db7a4ca9bd24a5863e0a834fa0666"
     },
     {
       "translation_unit": "vllm_marlin/sm89_kernel_fe4m3fn_u4b8_float16.cu",
@@ -887,7 +887,7 @@
         },
         {
           "path": "vllm_marlin/marlin_dtypes.cuh",
-          "sha256": "98161328ad75930ffa0e13abb97288634d4a544327ff5abf9dce6963336fc415"
+          "sha256": "e30760800939e0d3ba8a52eaf608119b56c8fa721990a1f45ce50d69e1602244"
         },
         {
           "path": "vllm_marlin/marlin_mma.h",
@@ -895,7 +895,7 @@
         },
         {
           "path": "vllm_marlin/marlin_template.h",
-          "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17"
+          "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a"
         },
         {
           "path": "vllm_marlin/scalar_type.hpp",
@@ -906,7 +906,7 @@
           "sha256": "75279f685dbe549a4b35f779f0414aafbb7ca46421b6f74748a8857ce55fcd30"
         }
       ],
-      "closure_sha256": "1b666bfe8778fd04d4a2da916a5dfd729921b64621cc25c6cd8e72100fbdffcd"
+      "closure_sha256": "307575c0ba37e9c72a0bbbc5b87d07c80ce426ecb086db2ca1291ea3c18293ba"
     }
   ],
   "include_dirs": [

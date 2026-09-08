@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.vllm_moe_marlin",
   "source_package": {
     "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.885762babdde73807bdacfe1348890a170e1a002be7c7f5ad1fd66df7e90190e",
-    "sha256": "0873493ca299a9f1ae42004c8c275280799ca3b027b775537e101731e59cc179"
+    "revision": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
+    "sha256": "77a909a3a9b6000000c8243a7c4c8e631cca4406f6f79aff06b43fb5cd695c07"
   },
   "upstream_sources": [
     {
@@ -20,21 +20,21 @@
     },
     {
       "path": "kernels/vllm_marlin_moe/ops.cu",
-      "sha256": "fd78f759a69623a5c2d10b1e8edb4004d6724d4534f61758f7c10b372b607cd6"
+      "sha256": "64cc641c31962b288d1bd70188aeea3c33dd334dd9cd7fb14d41b5a2fe7eeebc"
     }
   ],
   "headers": [
     {
       "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
-      "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+      "sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c"
     },
     {
       "path": "kernels/vllm_marlin_moe/kernel.h",
-      "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+      "sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364"
     },
     {
       "path": "kernels/vllm_marlin_moe/marlin_template.h",
-      "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+      "sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700"
     },
     {
       "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
@@ -59,15 +59,15 @@
       "headers": [
         {
           "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
-          "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+          "sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c"
         },
         {
           "path": "kernels/vllm_marlin_moe/kernel.h",
-          "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+          "sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364"
         },
         {
           "path": "kernels/vllm_marlin_moe/marlin_template.h",
-          "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+          "sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700"
         },
         {
           "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
@@ -86,22 +86,22 @@
           "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
         }
       ],
-      "closure_sha256": "3f1605ddca3e6e3a33715d79b83aa3e20991990cebcc6ef4326b67793edc6249"
+      "closure_sha256": "6b7b0ccdd863cec7d948453dbcd27fef262e36ed01a2615fe9997708b04d067d"
     },
     {
       "translation_unit": "kernels/vllm_marlin_moe/ops.cu",
       "headers": [
         {
           "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
-          "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+          "sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c"
         },
         {
           "path": "kernels/vllm_marlin_moe/kernel.h",
-          "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+          "sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364"
         },
         {
           "path": "kernels/vllm_marlin_moe/marlin_template.h",
-          "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+          "sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700"
         },
         {
           "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
@@ -120,7 +120,7 @@
           "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
         }
       ],
-      "closure_sha256": "5213e577268b99a6162d8f3b7b9deb9b0bd54a552b3237a70b779549febbe6a2"
+      "closure_sha256": "8f8e5b4dcfb8f779aed0a0affef98bcc5f938586c852ac4539233c186d316915"
     }
   ],
   "include_dirs": [

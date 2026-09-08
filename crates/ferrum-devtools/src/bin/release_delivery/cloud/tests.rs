@@ -311,6 +311,10 @@ async fn cloud_subprocess_failure_and_timeout_are_errors_and_timeout_reaps_child
             assert!(error.contains("timed out"));
             let pid =
                 fs::read_to_string(&pid_file).expect("child entered Rust fixture before timeout");
+            assert!(
+                pid.trim().parse::<u32>().is_ok_and(|value| value > 0),
+                "child fixture omitted a valid process ID"
+            );
             #[cfg(unix)]
             {
                 let status = std::process::Command::new("kill")

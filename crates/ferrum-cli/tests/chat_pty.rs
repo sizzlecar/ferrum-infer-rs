@@ -11,6 +11,8 @@
 //!     cargo test --release -p ferrum-cli --features metal --test chat_pty \
 //!       -- --ignored --test-threads=1
 
+#![cfg(unix)]
+
 use rexpect::session::spawn_command;
 use std::path::PathBuf;
 use std::process::Command;

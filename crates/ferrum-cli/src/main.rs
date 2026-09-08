@@ -11,7 +11,7 @@
 use clap::{Parser, Subcommand};
 use colored::*;
 use ferrum_cli::{commands::*, config::CliConfig, utils::setup_logging};
-use std::process;
+use std::{future::Future, pin::Pin, process};
 
 #[derive(Parser)]
 #[command(name = "ferrum")]
@@ -103,17 +103,30 @@ async fn main() {
         }
     };
 
-    // Execute command
-    let result = match cli.command {
-        Commands::Run(cmd) => run::execute(cmd, config).await,
-        Commands::Bench(cmd) => bench::execute(cmd, config).await,
-        Commands::BenchServe(cmd) => bench_serve::execute(cmd, config).await,
-        Commands::ReplayBundle(cmd) => replay_bundle::execute(cmd, config).await,
-        Commands::VnextDeterminism(cmd) => vnext_determinism::execute(cmd).await,
-        Commands::Embed(cmd) => embed::execute(cmd, config).await,
-        Commands::Transcribe(cmd) => transcribe::execute(cmd, config).await,
-        Commands::Tts(cmd) => tts::execute(cmd, config).await,
-        Commands::Serve(cmd) => {
+    if let Err(e) = command_future(cli.command, config, config_loaded).await {
+        eprintln!("{} {}", "Error:".red().bold(), e);
+        process::exit(1);
+    }
+}
+
+// Construct command futures outside main's poll frame. In unoptimized builds,
+// keeping every command inline adds large construction temporaries to the same
+// stack as model initialization, exceeding Windows' default main-thread stack.
+fn command_future(
+    command: Commands,
+    config: CliConfig,
+    config_loaded: bool,
+) -> Pin<Box<dyn Future<Output = ferrum_types::Result<()>>>> {
+    match command {
+        Commands::Run(cmd) => Box::pin(run::execute(cmd, config)),
+        Commands::Bench(cmd) => Box::pin(bench::execute(cmd, config)),
+        Commands::BenchServe(cmd) => Box::pin(bench_serve::execute(cmd, config)),
+        Commands::ReplayBundle(cmd) => Box::pin(replay_bundle::execute(cmd, config)),
+        Commands::VnextDeterminism(cmd) => Box::pin(vnext_determinism::execute(cmd)),
+        Commands::Embed(cmd) => Box::pin(embed::execute(cmd, config)),
+        Commands::Transcribe(cmd) => Box::pin(transcribe::execute(cmd, config)),
+        Commands::Tts(cmd) => Box::pin(tts::execute(cmd, config)),
+        Commands::Serve(cmd) => Box::pin(async move {
             let compatibility = if config_loaded {
                 ferrum_cli::config::load_interleaved_system_coalescing("ferrum.toml").await
             } else {
@@ -123,15 +136,10 @@ async fn main() {
                 Ok(configured) => serve::execute_cli(cmd, config, configured).await,
                 Err(error) => Err(error),
             }
-        }
-        Commands::Stop(cmd) => stop::execute(cmd).await,
-        Commands::Pull(cmd) => pull::execute(cmd, config).await,
-        Commands::List(cmd) => list::execute(cmd, config).await,
-        Commands::Doctor(cmd) => doctor::execute(cmd, config).await,
-    };
-
-    if let Err(e) = result {
-        eprintln!("{} {}", "Error:".red().bold(), e);
-        process::exit(1);
+        }),
+        Commands::Stop(cmd) => Box::pin(stop::execute(cmd)),
+        Commands::Pull(cmd) => Box::pin(pull::execute(cmd, config)),
+        Commands::List(cmd) => Box::pin(list::execute(cmd, config)),
+        Commands::Doctor(cmd) => Box::pin(doctor::execute(cmd, config)),
     }
 }

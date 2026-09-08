@@ -1,5 +1,6 @@
 [package]
 name = "ferrum-cli"
+default-run = "ferrum"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -10,6 +11,10 @@ readme = "../../README.md"
 [[bin]]
 name = "ferrum"
 path = "src/main.rs"
+
+[[bin]]
+name = "ferrum-launcher"
+path = "src/bin/ferrum-launcher.rs"
 
 [dependencies]
 # Core dependencies
@@ -83,10 +88,15 @@ libc = "0.2"
 [dev-dependencies]
 axum = "0.7"
 rstest = "0.23"
-rexpect = "0.6"
 async-openai = { version = "0.27", default-features = false, features = ["rustls"] }
 safetensors = { workspace = true }
 tempfile = "3.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+rexpect = "0.6"
 
 [features]
 default = []

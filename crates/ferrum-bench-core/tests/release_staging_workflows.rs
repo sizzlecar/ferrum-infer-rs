@@ -2,7 +2,9 @@
 //! Permissions and secret access are checked structurally. The input guard is
 //! executed as committed, with dispatch inputs supplied only through its env.
 use serde_yaml::{Mapping, Value};
-use std::{collections::BTreeMap, fs, path::Path, process::Command};
+#[cfg(any(unix, windows))]
+use std::{collections::BTreeMap, process::Command};
+use std::{fs, path::Path};
 
 fn key(name: &str) -> Value {
     Value::String(name.into())
@@ -254,6 +256,9 @@ fn inherited_and_explicit_publication_secrets_are_rejected() {
     }
 }
 
+// Execute only guards whose shell family is native to this test host. The
+// structural permissions and secret-access checks above still cover every job.
+#[cfg(any(unix, windows))]
 fn dispatch_inputs() -> BTreeMap<String, String> {
     [
         ("version", "12.34.56".into()),
@@ -261,12 +266,79 @@ fn dispatch_inputs() -> BTreeMap<String, String> {
         ("release_candidate_tag", "v12.34.56-rc.2".into()),
         ("staging_label", "formal-12.34.56_rc.2".into()),
         ("publish_release", "false".into()),
+        ("windows_launcher_url", String::new()),
+        ("windows_launcher_sha256", String::new()),
     ]
     .into_iter()
     .map(|(name, value)| (name.into(), value))
     .collect()
 }
 
+fn guard_shell<'a>(workflow: &'a Value, job: &'a Value, step: &'a Value) -> &'a str {
+    step.get("shell")
+        .or_else(|| job.get("defaults")?.get("run")?.get("shell"))
+        .or_else(|| workflow.get("defaults")?.get("run")?.get("shell"))
+        .and_then(Value::as_str)
+        .expect("staging guards must declare a shell")
+}
+
+#[cfg(any(unix, windows))]
+fn guard_consumes_input(workflow: &Value, job: &Value, step: &Value, input: &str) -> bool {
+    let script = step["run"].as_str().expect("guard script");
+    let expression = format!("${{{{ inputs.{input} }}}}");
+    [workflow, job, step].into_iter().any(|scope| {
+        scope
+            .get("env")
+            .and_then(Value::as_mapping)
+            .is_some_and(|env| {
+                env.iter().any(|(name, value)| {
+                    let name = name.as_str().expect("environment key");
+                    value.as_str() == Some(expression.as_str())
+                        && [
+                            format!("${name}"),
+                            format!("${{{name}}}"),
+                            format!("$env:{name}"),
+                        ]
+                        .iter()
+                        .any(|reference| script.contains(reference))
+                })
+            })
+    })
+}
+
+#[cfg(windows)]
+fn windows_guard_shell() -> std::path::PathBuf {
+    // Hosted runners have pwsh. A developer Windows installation may only have
+    // inbox PowerShell 5.1; these environment-only guards use its common syntax.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for path in std::env::split_paths(&paths) {
+            let program = path.join("pwsh.exe");
+            if program.is_file() {
+                return program;
+            }
+        }
+    }
+    let program =
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"))
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    assert!(
+        program.is_file(),
+        "Windows needs an installed PowerShell to test its guards"
+    );
+    program
+}
+
+#[test]
+fn staging_guard_shell_uses_step_then_job_then_workflow_default() {
+    let workflow: Value = serde_yaml::from_str("defaults:\n  run:\n    shell: bash").unwrap();
+    let job: Value = serde_yaml::from_str("defaults:\n  run:\n    shell: pwsh").unwrap();
+    let step: Value = serde_yaml::from_str("shell: powershell").unwrap();
+    assert_eq!(guard_shell(&workflow, &job, &step), "powershell");
+    assert_eq!(guard_shell(&workflow, &job, &Value::Null), "pwsh");
+    assert_eq!(guard_shell(&workflow, &Value::Null, &Value::Null), "bash");
+}
+
+#[cfg(any(unix, windows))]
 fn add_environment(
     command: &mut Command,
     value: Option<&Value>,
@@ -301,13 +373,16 @@ fn add_environment(
     }
 }
 
+#[cfg(any(unix, windows))]
 fn run_guards(
     workflow: &Value,
     inputs: &BTreeMap<String, String>,
     should_succeed: bool,
     label: &str,
-) {
+    tested_input: Option<&str>,
+) -> usize {
     let temporary = tempfile::tempdir().unwrap();
+    let mut executed = 0;
     for (job_name, job) in workflow["jobs"].as_mapping().unwrap() {
         // Validation must precede checkout, tool installation and build actions.
         let first = job["steps"]
@@ -318,20 +393,56 @@ fn run_guards(
         let script = first["run"]
             .as_str()
             .expect("first staging step must execute the input guard");
-        let mut command = Command::new("bash");
-        command
-            .args([
-                "--noprofile",
-                "--norc",
-                "-e",
-                "-o",
-                "pipefail",
-                "-c",
-                script,
-            ])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .current_dir(temporary.path());
+        let shell = guard_shell(workflow, job, first);
+        assert!(
+            matches!(shell, "bash" | "pwsh" | "powershell"),
+            "unsupported guard shell: {shell}"
+        );
+        if (cfg!(unix) && shell != "bash") || (cfg!(windows) && shell == "bash") {
+            continue;
+        }
+        if tested_input.is_some_and(|input| !guard_consumes_input(workflow, job, first, input)) {
+            continue;
+        }
+        #[cfg(unix)]
+        let mut command = {
+            let mut command = Command::new("bash");
+            command
+                .args([
+                    "--noprofile",
+                    "--norc",
+                    "-e",
+                    "-o",
+                    "pipefail",
+                    "-c",
+                    script,
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin");
+            command
+        };
+        #[cfg(windows)]
+        let mut command = {
+            let program = windows_guard_shell();
+            let mut command = Command::new(&program);
+            command
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    script,
+                ])
+                .env_clear();
+            for name in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+            eprintln!("guard {job_name:?}: executing {}", program.display());
+            command
+        };
+        command.current_dir(temporary.path());
         add_environment(&mut command, workflow.get("env"), inputs);
         add_environment(&mut command, job.get("env"), inputs);
         add_environment(&mut command, first.get("env"), inputs);
@@ -345,20 +456,26 @@ fn run_guards(
         assert_eq!(
             output.status.success(),
             should_succeed,
-            "{label} {job_name:?}: {}",
+            "{label} {job_name:?}: status={:?}; stdout={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        executed += 1;
     }
+    executed
 }
 
+#[cfg(any(unix, windows))]
 #[test]
 fn actual_input_guards_accept_formal_versions_and_reject_publication_or_bad_inputs() {
+    let mut executed = 0;
     for (name, workflow) in workflows() {
         let inputs = dispatch_inputs();
-        run_guards(&workflow, &inputs, true, &name);
+        executed += run_guards(&workflow, &inputs, true, &name, None);
         let mut sha256 = inputs.clone();
         sha256.insert("release_candidate_sha".into(), "b".repeat(64));
-        run_guards(&workflow, &sha256, true, &name);
+        run_guards(&workflow, &sha256, true, &name, None);
         for (field, invalid) in [
             ("publish_release", "true"),
             ("publish_release", ""),
@@ -376,6 +493,7 @@ fn actual_input_guards_accept_formal_versions_and_reject_publication_or_bad_inpu
                 &invalid_inputs,
                 false,
                 &format!("{name}: {field}={invalid}"),
+                Some(field),
             );
         }
         for field in inputs.keys() {
@@ -389,7 +507,33 @@ fn actual_input_guards_accept_formal_versions_and_reject_publication_or_bad_inpu
                 &injected,
                 false,
                 &format!("{name}: {field} injection"),
+                Some(field),
+            );
+        }
+        let mut pinned = inputs.clone();
+        pinned.insert("windows_launcher_url".into(), "https://github.com/sizzlecar/ferrum-infer-rs/releases/download/v12.34.55/ferrum-windows-launcher-v1.exe".into());
+        pinned.insert("windows_launcher_sha256".into(), "b".repeat(64));
+        run_guards(
+            &workflow,
+            &pinned,
+            true,
+            &name,
+            Some("windows_launcher_url"),
+        );
+        for field in ["windows_launcher_url", "windows_launcher_sha256"] {
+            let mut incomplete = pinned.clone();
+            incomplete.insert(field.into(), String::new());
+            run_guards(
+                &workflow,
+                &incomplete,
+                false,
+                &format!("{name}: missing {field}"),
+                Some(field),
             );
         }
     }
+    assert!(
+        executed > 0,
+        "no staging input guard was executed on this host"
+    );
 }

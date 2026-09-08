@@ -80,7 +80,7 @@ fn current_resident_bytes() -> Option<u64> {
     resident_pages.checked_mul(page_size as u64)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn current_resident_bytes() -> Option<u64> {
     None
 }
@@ -106,11 +106,12 @@ fn high_water_bytes() -> Option<u64> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn high_water_bytes() -> Option<u64> {
     None
 }
 
+#[cfg(not(windows))]
 pub fn sample_process_memory() -> Option<ProcessMemorySample> {
     let high_water = high_water_bytes()?;
     let current = current_resident_bytes().unwrap_or(high_water);
@@ -118,6 +119,34 @@ pub fn sample_process_memory() -> Option<ProcessMemorySample> {
         current_bytes: current,
         high_water_bytes: high_water.max(current),
         source: process_memory_source(),
+    })
+}
+
+#[cfg(windows)]
+pub fn sample_process_memory() -> Option<ProcessMemorySample> {
+    use windows_sys::Win32::System::{
+        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        Threading::GetCurrentProcess,
+    };
+
+    let mut counters = PROCESS_MEMORY_COUNTERS {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: the current-process pseudo-handle remains valid without being closed;
+    // counters points to a writable structure with the declared size.
+    let succeeded =
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    if succeeded == 0 {
+        return None;
+    }
+
+    // Working-set counters are resident bytes, distinct from page-file commit charge.
+    let current_bytes = counters.WorkingSetSize as u64;
+    Some(ProcessMemorySample {
+        current_bytes,
+        high_water_bytes: (counters.PeakWorkingSetSize as u64).max(current_bytes),
+        source: "windows_process_memory_counters",
     })
 }
 
@@ -131,7 +160,7 @@ fn process_memory_source() -> &'static str {
     "getrusage_maxrss"
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn process_memory_source() -> &'static str {
     "unsupported"
 }
@@ -161,15 +190,17 @@ mod tests {
         snapshot.validate().unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
-    fn process_memory_sampler_returns_non_zero_on_unix() {
-        let sample = ProcessMemorySampler.sample();
-        assert!(sample
-            .as_ref()
-            .is_some_and(|sample| sample.current_bytes > 0));
-        assert!(sample
-            .as_ref()
-            .is_some_and(|sample| sample.high_water_bytes > 0));
+    fn process_memory_sampler_returns_valid_resident_bytes() {
+        let sample = ProcessMemorySampler
+            .sample()
+            .expect("supported platform samples current-process memory");
+        assert!(sample.current_bytes > 0);
+        assert!(sample.high_water_bytes >= sample.current_bytes);
+        ProcessMemoryObservation::from_sample(sample)
+            .to_snapshot("process", None)
+            .validate()
+            .unwrap();
     }
 }

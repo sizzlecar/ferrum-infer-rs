@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use ferrum_types::{
     is_sha256_digest, NativeOperatorBackend, NativeOperatorBinding, NativeOperatorContractVersion,
-    NativeOperatorLinkage, FERRUM_NATIVE_OPERATOR_ABI_VERSION,
+    NativeOperatorHostAbi, NativeOperatorLinkage, FERRUM_NATIVE_OPERATOR_ABI_VERSION,
     NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,8 @@ pub struct NativeOperatorArtifactLock {
     pub operation_bindings: Vec<NativeOperatorBinding>,
     #[serde(default)]
     pub system_libraries: Vec<NativeOperatorSystemLibrary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_abi: Option<NativeOperatorHostAbi>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -87,6 +89,7 @@ pub enum NativeOperatorSystemLibrary {
     Cublas,
     CublasLt,
     StdCxx,
+    MsvcRuntime,
 }
 
 #[derive(Debug, Error)]
@@ -170,7 +173,22 @@ impl NativeOperatorArtifactSetLock {
         lock_path: impl AsRef<Path>,
         compute_capability: Option<&str>,
     ) -> Result<ResolvedNativeOperatorArtifactSet, NativeOperatorArtifactSetError> {
-        let lock_path = lock_path.as_ref();
+        Self::load_and_resolve_impl(lock_path.as_ref(), compute_capability, None)
+    }
+
+    pub fn load_and_resolve_for_target(
+        lock_path: impl AsRef<Path>,
+        compute_capability: Option<&str>,
+        target: &str,
+    ) -> Result<ResolvedNativeOperatorArtifactSet, NativeOperatorArtifactSetError> {
+        Self::load_and_resolve_impl(lock_path.as_ref(), compute_capability, Some(target))
+    }
+
+    fn load_and_resolve_impl(
+        lock_path: &Path,
+        compute_capability: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<ResolvedNativeOperatorArtifactSet, NativeOperatorArtifactSetError> {
         if !lock_path.is_file() {
             return Err(NativeOperatorArtifactSetError::LockMissing(
                 lock_path.to_path_buf(),
@@ -188,7 +206,7 @@ impl NativeOperatorArtifactSetLock {
                 source,
             }
         })?;
-        lock.resolve(lock_path, compute_capability)
+        lock.resolve_impl(lock_path, compute_capability, target)
     }
 
     pub fn resolve(
@@ -196,8 +214,29 @@ impl NativeOperatorArtifactSetLock {
         lock_path: impl AsRef<Path>,
         compute_capability: Option<&str>,
     ) -> Result<ResolvedNativeOperatorArtifactSet, NativeOperatorArtifactSetError> {
+        self.resolve_impl(lock_path.as_ref(), compute_capability, None)
+    }
+
+    pub fn resolve_for_target(
+        &self,
+        lock_path: impl AsRef<Path>,
+        compute_capability: Option<&str>,
+        target: &str,
+    ) -> Result<ResolvedNativeOperatorArtifactSet, NativeOperatorArtifactSetError> {
+        self.resolve_impl(lock_path.as_ref(), compute_capability, Some(target))
+    }
+
+    fn resolve_impl(
+        &self,
+        lock_path: &Path,
+        compute_capability: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<ResolvedNativeOperatorArtifactSet, NativeOperatorArtifactSetError> {
         self.validate()?;
-        let lock_path = lock_path.as_ref();
+        let expected_host = target
+            .map(NativeOperatorHostAbi::for_target)
+            .transpose()
+            .map_err(NativeOperatorArtifactSetError::LockInvalid)?;
         let root = lock_path.parent().unwrap_or_else(|| Path::new("."));
         let canonical_root =
             fs::canonicalize(root).map_err(|source| NativeOperatorArtifactSetError::LockRead {
@@ -312,12 +351,21 @@ impl NativeOperatorArtifactSetLock {
             if let Some(compute_capability) = compute_capability {
                 request = request.with_compute_capability(compute_capability);
             }
+            if let Some(host_abi) = &expected_host {
+                request = request.with_host_abi(host_abi.clone());
+            }
             let resolved = NativeOperatorResolver.resolve(&request).map_err(|source| {
                 NativeOperatorArtifactSetError::ArtifactResolve {
                     operator: artifact_lock.operator.clone(),
                     source,
                 }
             })?;
+            if artifact_lock.host_abi != resolved.manifest.host_abi {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
+                    "{}.host_abi differs between lock and manifest",
+                    artifact_lock.operator
+                )));
+            }
             if resolved.manifest.schema_version != NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION {
                 return Err(NativeOperatorArtifactSetError::LockInvalid(format!(
                     "{} uses legacy manifest schema {}; artifact sets require schema {}",
@@ -345,12 +393,24 @@ impl NativeOperatorArtifactSetLock {
                 &resolved.artifact_sha256,
             )?;
 
-            let link_name =
+            let link_name = if let Some(host_abi) = &resolved.manifest.host_abi {
+                native_artifact_link_name_for_target(
+                    &resolved.artifact_path,
+                    resolved.manifest.linkage,
+                    &host_abi.target,
+                )
+            } else {
                 native_artifact_link_name(&resolved.artifact_path, resolved.manifest.linkage)
-                    .map_err(NativeOperatorArtifactSetError::LockInvalid)?;
-            if let Some(first) =
-                link_names.insert(link_name.clone(), artifact_lock.operator.clone())
-            {
+            }
+            .map_err(NativeOperatorArtifactSetError::LockInvalid)?;
+            let collision_key = if resolved.manifest.host_abi.as_ref().is_some_and(|host| {
+                host.compiler_flavor == ferrum_types::NativeOperatorCompilerFlavor::Msvc
+            }) {
+                link_name.to_ascii_lowercase()
+            } else {
+                link_name.clone()
+            };
+            if let Some(first) = link_names.insert(collision_key, artifact_lock.operator.clone()) {
                 return Err(NativeOperatorArtifactSetError::LinkNameCollision {
                     link_name,
                     first,
@@ -586,6 +646,36 @@ impl NativeOperatorArtifactSetLock {
             }
             validate_relative_path(&artifact.manifest_path)?;
             validate_relative_path(&artifact.artifact_path)?;
+            if let Some(host_abi) = &artifact.host_abi {
+                host_abi
+                    .validate()
+                    .map_err(NativeOperatorArtifactSetError::LockInvalid)?;
+                if host_abi.compiler_flavor == ferrum_types::NativeOperatorCompilerFlavor::Msvc {
+                    if artifact
+                        .system_libraries
+                        .contains(&NativeOperatorSystemLibrary::StdCxx)
+                        || !artifact
+                            .system_libraries
+                            .contains(&NativeOperatorSystemLibrary::MsvcRuntime)
+                    {
+                        return Err(NativeOperatorArtifactSetError::LockInvalid("MSVC operators require msvc_runtime and cannot declare the GNU stdc++ runtime".into()));
+                    }
+                } else if artifact
+                    .system_libraries
+                    .contains(&NativeOperatorSystemLibrary::MsvcRuntime)
+                {
+                    return Err(NativeOperatorArtifactSetError::LockInvalid(
+                        "MSVC runtime requires a matching MSVC host ABI".into(),
+                    ));
+                }
+            } else if artifact
+                .system_libraries
+                .contains(&NativeOperatorSystemLibrary::MsvcRuntime)
+            {
+                return Err(NativeOperatorArtifactSetError::LockInvalid(
+                    "MSVC runtime requires a declared MSVC host ABI".into(),
+                ));
+            }
         }
         if operation_binding_count == 0 {
             return Err(NativeOperatorArtifactSetError::LockInvalid(
@@ -594,6 +684,46 @@ impl NativeOperatorArtifactSetLock {
         }
         Ok(())
     }
+}
+
+pub fn native_artifact_link_name_for_target(
+    path: &Path,
+    linkage: NativeOperatorLinkage,
+    target: &str,
+) -> Result<String, String> {
+    let host = NativeOperatorHostAbi::for_target(target)?;
+    if host.compiler_flavor != ferrum_types::NativeOperatorCompilerFlavor::Msvc {
+        return native_artifact_link_name(path, linkage);
+    }
+    if linkage != NativeOperatorLinkage::Static
+        || !path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("lib"))
+    {
+        return Err(format!(
+            "MSVC native artifact must be a static .lib: {}",
+            path.display()
+        ));
+    }
+    let name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "MSVC artifact has no UTF-8 library name: {}",
+                path.display()
+            )
+        })?;
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Err("MSVC native library name contains unsupported linker characters".into());
+    }
+    // Unlike Unix libfoo.a, MSVC libfoo.lib is linked as libfoo, not foo.
+    Ok(name.to_owned())
 }
 
 pub fn native_artifact_link_name(
@@ -789,6 +919,24 @@ mod tests {
         provider_id: &str,
         extra_strong_symbol: Option<&str>,
     ) -> NativeOperatorArtifactLock {
+        write_artifact_for_target(
+            root,
+            operator,
+            operation_id,
+            provider_id,
+            extra_strong_symbol,
+            cfg!(windows).then_some("x86_64-pc-windows-msvc"),
+        )
+    }
+
+    fn write_artifact_for_target(
+        root: &Path,
+        operator: &str,
+        operation_id: &str,
+        provider_id: &str,
+        extra_strong_symbol: Option<&str>,
+        target: Option<&str>,
+    ) -> NativeOperatorArtifactLock {
         let dir = root.join(operator);
         fs::create_dir_all(&dir).unwrap();
         let descriptor = format!("ferrum_native_{operator}_descriptor_v2");
@@ -802,23 +950,37 @@ mod tests {
         }
         let source_path = dir.join("operator.c");
         let object_path = dir.join("operator.o");
-        let artifact_path = dir.join(format!("libferrum_native_{operator}.a"));
+        let artifact_name = if target.is_some() {
+            format!("ferrum_native_{operator}.lib")
+        } else {
+            format!("libferrum_native_{operator}.a")
+        };
+        let artifact_path = dir.join(&artifact_name);
         fs::write(&source_path, source).unwrap();
-        assert!(Command::new("cc")
-            .args(["-c"])
-            .arg(&source_path)
-            .arg("-o")
-            .arg(&object_path)
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("ar")
-            .arg("rcs")
-            .arg(&artifact_path)
-            .arg(&object_path)
-            .status()
-            .unwrap()
-            .success());
+        if target.is_some() {
+            let mut exports = vec![descriptor.as_str(), execute.as_str()];
+            if let Some(symbol) = extra_strong_symbol {
+                exports.push(symbol);
+            }
+            fs::write(&artifact_path, crate::coff::tests::native_library(&exports)).unwrap();
+        } else {
+            assert!(Command::new("cc")
+                .args(["-c"])
+                .arg(&source_path)
+                .arg("-o")
+                .arg(&object_path)
+                .status()
+                .unwrap()
+                .success());
+            assert!(Command::new("ar")
+                .arg("rcs")
+                .arg(&artifact_path)
+                .arg(&object_path)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let host_abi = target.map(|target| NativeOperatorHostAbi::for_target(target).unwrap());
 
         let binary_sha256 = digest_bytes(&fs::read(&artifact_path).unwrap());
         let source_package_sha256 = digest(if operator == "alpha" { 'a' } else { 'b' });
@@ -858,6 +1020,7 @@ mod tests {
             inputs_sha256: inputs_sha256.clone(),
             binary_sha256: binary_sha256.clone(),
             linkage: NativeOperatorLinkage::Static,
+            host_abi: host_abi.clone(),
             g03_catalog_sha256: Some(g03_catalog_sha256.clone()),
             abi_contract_sha256: Some(abi_contract_sha256.clone()),
             descriptor_export: Some(descriptor.clone()),
@@ -903,11 +1066,12 @@ mod tests {
             size_bytes: fs::metadata(path).unwrap().len(),
         };
         NativeOperatorArtifactLock {
+            host_abi,
             operator: operator.to_string(),
             backend: NativeOperatorBackend::Cuda,
             manifest_path: format!("{operator}/native_operator_manifest.json"),
             manifest: evidence(&manifest_path),
-            artifact_path: format!("{operator}/libferrum_native_{operator}.a"),
+            artifact_path: format!("{operator}/{artifact_name}"),
             operator_abi_version: "1".to_string(),
             ferrum_native_abi_version: FERRUM_NATIVE_OPERATOR_ABI_VERSION.to_string(),
             source_package_sha256,
@@ -930,7 +1094,11 @@ mod tests {
             operation_bindings,
             system_libraries: vec![
                 NativeOperatorSystemLibrary::CudaRuntime,
-                NativeOperatorSystemLibrary::StdCxx,
+                if target.is_some() {
+                    NativeOperatorSystemLibrary::MsvcRuntime
+                } else {
+                    NativeOperatorSystemLibrary::StdCxx
+                },
             ],
         }
     }
@@ -982,6 +1150,133 @@ mod tests {
         assert_eq!(resolved.artifacts.len(), 2);
         assert_eq!(resolved.artifacts[0].resolved.manifest.operator, "alpha");
         assert_eq!(resolved.artifacts[1].resolved.manifest.operator, "beta");
+    }
+
+    #[test]
+    fn resolves_msvc_set_only_for_matching_host_and_runtime() {
+        let dir = temp_dir("msvc-set");
+        let target = "x86_64-pc-windows-msvc";
+        let artifact = write_artifact_for_target(
+            dir.path(),
+            "alpha",
+            "operation.alpha",
+            "provider.cuda.alpha",
+            None,
+            Some(target),
+        );
+        let mut lock = NativeOperatorArtifactSetLock {
+            schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
+            g03_catalog_sha256: artifact.g03_catalog.sha256.clone(),
+            artifacts: vec![artifact],
+        };
+        let path = dir.path().join("native-operators.lock.json");
+        lock.resolve_for_target(&path, Some("sm_89"), target)
+            .unwrap();
+        assert!(lock
+            .resolve_for_target(&path, Some("sm_89"), "x86_64-unknown-linux-gnu")
+            .is_err());
+        let host = lock.artifacts[0].host_abi.take();
+        assert!(lock
+            .resolve_for_target(&path, Some("sm_89"), target)
+            .is_err());
+        lock.artifacts[0].host_abi = host;
+        lock.artifacts[0].system_libraries = vec![
+            NativeOperatorSystemLibrary::CudaRuntime,
+            NativeOperatorSystemLibrary::StdCxx,
+        ];
+        assert!(lock
+            .resolve_for_target(&path, Some("sm_89"), target)
+            .is_err());
+    }
+
+    #[test]
+    fn msvc_link_names_preserve_lib_prefix_and_reject_unix_or_invalid_targets() {
+        let target = "x86_64-pc-windows-msvc";
+        assert_eq!(
+            native_artifact_link_name_for_target(
+                Path::new("libnative.lib"),
+                NativeOperatorLinkage::Static,
+                target
+            )
+            .unwrap(),
+            "libnative"
+        );
+        assert_eq!(
+            native_artifact_link_name_for_target(
+                Path::new("native.LIB"),
+                NativeOperatorLinkage::Static,
+                target
+            )
+            .unwrap(),
+            "native"
+        );
+        assert!(native_artifact_link_name_for_target(
+            Path::new("libnative.a"),
+            NativeOperatorLinkage::Static,
+            target
+        )
+        .is_err());
+        assert!(native_artifact_link_name_for_target(
+            Path::new("native.lib"),
+            NativeOperatorLinkage::Static,
+            "x86_64-pc-windows-gnu"
+        )
+        .is_err());
+        assert!(native_artifact_link_name_for_target(
+            Path::new("native.lib"),
+            NativeOperatorLinkage::Static,
+            "x86_64-unknown-linux-gnu"
+        )
+        .is_err());
+        assert_eq!(
+            native_artifact_link_name_for_target(
+                Path::new("libnative.a"),
+                NativeOperatorLinkage::Static,
+                "x86_64-unknown-linux-gnu"
+            )
+            .unwrap(),
+            "native"
+        );
+    }
+
+    #[test]
+    fn msvc_set_rejects_case_insensitive_link_name_collision() {
+        let dir = temp_dir("msvc-link-name-collision");
+        let target = "x86_64-pc-windows-msvc";
+        let mut artifacts = Vec::new();
+        for (operator, library) in [("alpha", "native.lib"), ("beta", "NATIVE.lib")] {
+            let mut artifact = write_artifact_for_target(
+                dir.path(),
+                operator,
+                &format!("operation.{operator}"),
+                &format!("provider.cuda.{operator}"),
+                None,
+                Some(target),
+            );
+            let path = format!("{operator}/{library}");
+            fs::rename(
+                dir.path().join(&artifact.artifact_path),
+                dir.path().join(&path),
+            )
+            .unwrap();
+            artifact.artifact_path = path;
+            artifacts.push(artifact);
+        }
+        let lock = NativeOperatorArtifactSetLock {
+            schema_version: NATIVE_OPERATOR_ARTIFACT_SET_SCHEMA_VERSION,
+            g03_catalog_sha256: artifacts[0].g03_catalog.sha256.clone(),
+            artifacts,
+        };
+        let error = lock
+            .resolve_for_target(dir.path().join("lock.json"), Some("sm_89"), target)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NativeOperatorArtifactSetError::LinkNameCollision { .. }
+            ),
+            "{error}"
+        );
     }
 
     #[test]

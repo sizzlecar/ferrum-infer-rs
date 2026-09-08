@@ -12,10 +12,11 @@ use ferrum_kernels::native_ops::{
 use ferrum_native_ops::{NativeOperatorArtifactFormat, NativeOperatorResolveError};
 use ferrum_types::{
     CompiledNativeOperatorIdentity, NativeOperatorBackend, NativeOperatorBinding,
-    NativeOperatorBuildSummary, NativeOperatorContractVersion, NativeOperatorLinkage,
-    NativeOperatorManifest, NativeOperatorProviderCatalog, NativeOperatorProviderCatalogRow,
-    NativeOperatorSourcePackage, FERRUM_NATIVE_OPERATOR_ABI_VERSION,
-    NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION, NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
+    NativeOperatorBuildSummary, NativeOperatorContractVersion, NativeOperatorHostAbi,
+    NativeOperatorLinkage, NativeOperatorManifest, NativeOperatorProviderCatalog,
+    NativeOperatorProviderCatalogRow, NativeOperatorSourcePackage,
+    FERRUM_NATIVE_OPERATOR_ABI_VERSION, NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
+    NATIVE_OPERATOR_PROVIDER_CATALOG_SCHEMA_VERSION,
 };
 use sha2::{Digest, Sha256};
 
@@ -117,6 +118,40 @@ fn write_static_archive(root: &Path, include_descriptor: bool) -> PathBuf {
             .push_str("const char *ferrum_native_fa2_descriptor_v2(void) { return \"fa2\"; }\n");
     }
     std::fs::write(&source, source_text).unwrap();
+    if cfg!(windows) {
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cl.exe".into());
+        let compiler_output = Command::new(compiler)
+            .current_dir(root)
+            .args([
+                "/nologo",
+                "/std:c11",
+                "/MD",
+                "/c",
+                "native_op.c",
+                "/Fonative_op.obj",
+            ])
+            .output()
+            .expect("compile native operator fixture with MSVC");
+        assert!(
+            compiler_output.status.success(),
+            "MSVC fixture compilation failed: {}{}",
+            String::from_utf8_lossy(&compiler_output.stdout),
+            String::from_utf8_lossy(&compiler_output.stderr)
+        );
+        let archiver = std::env::var_os("FERRUM_MSVC_LIB").unwrap_or_else(|| "lib.exe".into());
+        let archiver_output = Command::new(archiver)
+            .current_dir(root)
+            .args(["/nologo", "/OUT:ferrum_native_fa2.lib", "native_op.obj"])
+            .output()
+            .expect("archive native operator fixture with MSVC");
+        assert!(
+            archiver_output.status.success(),
+            "MSVC fixture archiving failed: {}{}",
+            String::from_utf8_lossy(&archiver_output.stdout),
+            String::from_utf8_lossy(&archiver_output.stderr)
+        );
+        return root.join("ferrum_native_fa2.lib");
+    }
     let object = root.join("native_op.o");
     let archive = root.join("libferrum_native_fa2.a");
     let cc_status = Command::new("cc")
@@ -144,6 +179,8 @@ fn write_manifest(
     inputs_sha256: String,
 ) {
     let manifest = NativeOperatorManifest {
+        host_abi: cfg!(windows)
+            .then(|| NativeOperatorHostAbi::for_target("x86_64-pc-windows-msvc").unwrap()),
         schema_version: NATIVE_OPERATOR_MANIFEST_SCHEMA_VERSION,
         operator: FA2_NATIVE_OPERATOR.to_string(),
         operator_abi_version: "1".to_string(),
@@ -180,7 +217,7 @@ fn write_manifest(
             builder_sha: digest('7'),
             elapsed_ms: 1,
             nvcc_version: Some("12.4".to_string()),
-            host_compiler: "cc".to_string(),
+            host_compiler: if cfg!(windows) { "cl.exe" } else { "cc" }.to_string(),
         },
     };
     std::fs::write(path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
@@ -406,10 +443,15 @@ fn resolves_cuda_fa2_native_operator_with_pinned_hashes_and_exports() {
         selection.artifact_format,
         NativeOperatorArtifactFormat::StaticArchive
     );
+    let expected_member = if cfg!(windows) {
+        "native_op.obj"
+    } else {
+        "native_op.o"
+    };
     assert!(selection
         .archive_members
         .iter()
-        .any(|member| member == "native_op.o"));
+        .any(|member| member == expected_member));
     assert_eq!(
         selection.required_exports,
         vec![

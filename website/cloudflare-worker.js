@@ -1,4 +1,5 @@
 import shellInstaller from "../scripts/install.sh";
+import powerShellInstaller from "../scripts/install.ps1";
 
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
@@ -134,9 +135,9 @@ const pages = {
     quickTitle: "From install to first answer",
     quickLead: "Install with one command, then run locally or connect an OpenAI-compatible client.",
     installTitle: "Install",
-    installNote: "Run the command for your system. The installer verifies release checksums and adds Ferrum to your PATH. Open a new terminal afterward.",
+    installNote: "Run the command for your system. The installer verifies release checksums and adds Ferrum to your PATH. On macOS and Linux, open a new terminal afterward; PowerShell is ready immediately.",
     upgradeNote: "Upgrade by running the same install command again. Existing sessions keep their current version; new launches use the update.",
-    runtimeNote: 'Linux CUDA requires an NVIDIA sm89 GPU, a compatible driver, and CUDA 12.4/NCCL runtimes. Automatic installation falls back to CPU if CUDA cannot start.',
+    runtimeNote: 'Linux CUDA requires an NVIDIA sm89 GPU, a compatible driver, and CUDA 12.4/NCCL runtimes. Automatic installation falls back to CPU if CUDA cannot start. Windows supports one sm89 GPU (compute capability 8.9) and includes CUDA and VC runtimes; install an <a href="https://www.nvidia.com/Download/index.aspx">NVIDIA driver</a> (551.78 or newer) separately.',
     homebrewTitle: "Homebrew alternative (macOS / Linux)",
     homebrewNote: 'Homebrew 6 needs both <a href="https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula">formula definitions</a> trusted for its conflict check. Review them before running the trust command; older Homebrew versions can skip it. <a href="https://docs.brew.sh/Tap-Trust">Homebrew trust details</a>.',
     firstRunTitle: "First run",
@@ -151,7 +152,7 @@ const pages = {
     faqTitle: "Frequently asked questions",
     faq: [
       ["What is Ferrum?", "Ferrum is an open-source Rust workspace and command-line product for running and serving language models locally on supported Metal and CUDA hardware."],
-      ["Does Ferrum require Python?", "No Python runtime is required. Linux CUDA uses the host's NVIDIA driver, CUDA 12.4 and NCCL runtimes."],
+      ["Does Ferrum require Python?", "No Python runtime is required. Linux CUDA uses the host's NVIDIA driver, CUDA 12.4 and NCCL runtimes. The Windows installer includes CUDA and VC runtimes; its NVIDIA system driver is installed separately."],
       ["Which models are in the formal release scope?", "Ferrum v0.8 formally covers Qwen3.5 4B and 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense. Other model work may appear as development evidence before entering the support matrix."],
       ["Can existing OpenAI clients connect to Ferrum?", "Ferrum implements OpenAI-compatible Chat Completions and stateless Responses surfaces. Check the compatibility document for the exact request contract."],
       ["Is Ferrum a hosted AI service?", "No. Ferrum is inference software that runs on hardware you control. Model licenses and data-handling choices remain yours."],
@@ -192,9 +193,9 @@ const pages = {
     quickTitle: "从安装到第一次回答",
     quickLead: "一行命令安装，随后在本地运行模型，或接入 OpenAI 兼容客户端。",
     installTitle: "安装",
-    installNote: "执行对应系统的一行命令。安装脚本会校验发布包并自动加入 PATH。安装完成后打开新终端。",
+    installNote: "执行对应系统的一行命令。安装脚本会校验发布包并自动加入 PATH。macOS 和 Linux 完成后打开新终端；PowerShell 安装后即可使用。",
     upgradeNote: "再次执行同一安装命令即可升级。已有会话继续使用原版本，新启动的会话使用更新后的版本。",
-    runtimeNote: 'Linux CUDA 需要 NVIDIA sm89 显卡、兼容驱动及 CUDA 12.4/NCCL 运行库；自动安装在 CUDA 无法启动时回退到 CPU。',
+    runtimeNote: 'Linux CUDA 需要 NVIDIA sm89 显卡、兼容驱动及 CUDA 12.4/NCCL 运行库；自动安装在 CUDA 无法启动时回退到 CPU。Windows 支持单张 sm89 显卡（计算能力 8.9），安装包内含 CUDA 与 VC 运行库；需另行安装 551.78 或更新的 <a href="https://www.nvidia.com/Download/index.aspx">NVIDIA 驱动</a>。',
     homebrewTitle: "Homebrew 备选安装（macOS / Linux）",
     homebrewNote: 'Homebrew 6 的冲突检查需要信任两个 <a href="https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula">formula 定义</a>。请先查看定义，再执行 trust 命令；旧版 Homebrew 可以跳过这一步。<a href="https://docs.brew.sh/Tap-Trust">Homebrew 信任机制说明</a>。',
     firstRunTitle: "首次运行",
@@ -209,7 +210,7 @@ const pages = {
     faqTitle: "常见问题",
     faq: [
       ["Ferrum 是什么？", "Ferrum 是一个开源 Rust workspace 与命令行产品，用于在受支持的 Metal 和 CUDA 硬件上本地运行并提供语言模型服务。"],
-      ["Ferrum 需要 Python 吗？", "不需要 Python runtime。Linux CUDA 使用主机的 NVIDIA 驱动、CUDA 12.4 与 NCCL 运行库。"],
+      ["Ferrum 需要 Python 吗？", "不需要 Python runtime。Linux CUDA 使用主机的 NVIDIA 驱动、CUDA 12.4 与 NCCL 运行库。Windows 安装包内含 CUDA 与 VC 运行库，NVIDIA 系统驱动需单独安装。"],
       ["哪些模型属于正式发布范围？", "Ferrum v0.8 正式覆盖 Qwen3.5 4B 与 35B-A3B、Qwen3 30B-A3B 和 Llama 3.1 8B dense。其他模型可能先以开发证据出现，完成发布级门禁后才进入支持矩阵。"],
       ["现有 OpenAI client 能连接 Ferrum 吗？", "Ferrum 实现 OpenAI 兼容的 Chat Completions 与无状态 Responses 接口；精确请求契约请查看兼容性文档。"],
       ["Ferrum 是托管 AI 服务吗？", "不是。Ferrum 是运行在你控制的硬件上的推理软件；模型许可与数据处理方式仍由你决定。"],
@@ -239,7 +240,7 @@ function render(page) {
     "@type": "SoftwareApplication",
     name: "Ferrum",
     applicationCategory: "DeveloperApplication",
-    operatingSystem: "macOS, Linux",
+    operatingSystem: "macOS, Linux, Windows",
     description: page.description,
     url: canonical,
     codeRepository: REPOSITORY,
@@ -300,7 +301,10 @@ function render(page) {
 <span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span>
 
 <span class="comment"># Linux x86_64 · Terminal</span>
-<span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span></pre></div>
+<span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span>
+
+<span class="comment"># Windows x64 · NVIDIA CUDA sm89 · PowerShell</span>
+<span class="command">irm https://ferrum.pandaailabs.com/install.ps1 | iex</span></pre></div>
       <p class="note">${page.runtimeNote}</p>
       <p class="note">${page.upgradeNote}</p>
       <details><summary>${page.homebrewTitle}</summary><p>${page.homebrewNote}</p><pre><span class="comment"># Homebrew 6</span>
@@ -318,7 +322,11 @@ ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 
 <span class="comment"># Linux CUDA</span>
 ferrum doctor qwen3.5:4b
-ferrum run qwen3.5:4b --disable-thinking</pre></div>
+ferrum run qwen3.5:4b --disable-thinking
+
+<span class="comment"># Windows CUDA · 6 GB VRAM</span>
+ferrum doctor Qwen/Qwen3.5-2B
+ferrum run Qwen/Qwen3.5-2B --kv-capacity 2048 --max-model-len 2048 --max-num-seqs 1 --max-tokens 512</pre></div>
     </div></section>
     <section><div class="wrap split">
       <div><div class="section-head"><h2>${page.platformTitle}</h2><p>${page.platformLead}</p></div><a class="button" href="${REPOSITORY}/blob/main/docs/openai-api-compatibility.md">OpenAI API contract</a></div>
@@ -363,6 +371,9 @@ export default {
     const { pathname } = new URL(request.url);
     if (pathname === "/install.sh") {
       return installerResponse(request, shellInstaller);
+    }
+    if (pathname === "/install.ps1") {
+      return installerResponse(request, powerShellInstaller);
     }
     if (pathname === "/robots.txt") {
       return response(`User-agent: *\nAllow: /\nSitemap: ${SITE_ORIGIN}/sitemap.xml\n`, "text/plain");

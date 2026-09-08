@@ -7,8 +7,8 @@ use std::process::Command;
 
 use ferrum_types::{
     resolve_native_operator_manifest, NativeOperatorBackend, NativeOperatorBinding,
-    NativeOperatorLinkage, NativeOperatorManifest, NativeOperatorRequirement,
-    DEFAULT_NATIVE_OPERATOR_ABI_VERSION,
+    NativeOperatorCompilerFlavor, NativeOperatorHostAbi, NativeOperatorLinkage,
+    NativeOperatorManifest, NativeOperatorRequirement, DEFAULT_NATIVE_OPERATOR_ABI_VERSION,
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -68,6 +68,10 @@ pub enum NativeOperatorResolveError {
     },
     #[error("native operator artifact missing required exports in {path}: {missing:?}")]
     ArtifactMissingExports { path: PathBuf, missing: Vec<String> },
+    #[error("native operator host ABI mismatch: {0}")]
+    HostAbiMismatch(String),
+    #[error("invalid native operator COFF library {path}: {reason}")]
+    InvalidCoffLibrary { path: PathBuf, reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +88,7 @@ pub struct NativeOperatorResolveRequest {
     pub descriptor_export: Option<String>,
     pub required_exports: Vec<String>,
     pub operation_bindings: Option<Vec<NativeOperatorBinding>>,
+    pub host_abi: Option<NativeOperatorHostAbi>,
 }
 
 impl NativeOperatorResolveRequest {
@@ -106,11 +111,17 @@ impl NativeOperatorResolveRequest {
             descriptor_export: None,
             required_exports: Vec::new(),
             operation_bindings: None,
+            host_abi: None,
         }
     }
 
     pub fn with_compute_capability(mut self, compute_capability: impl Into<String>) -> Self {
         self.compute_capability = Some(compute_capability.into());
+        self
+    }
+
+    pub fn with_host_abi(mut self, host_abi: NativeOperatorHostAbi) -> Self {
+        self.host_abi = Some(host_abi);
         self
     }
 
@@ -207,6 +218,23 @@ impl NativeOperatorResolver {
         }
 
         let manifest = load_manifest(&request.manifest_path)?;
+        let default_host = if cfg!(target_os = "windows") {
+            let target = if cfg!(all(target_arch = "x86_64", target_env = "msvc")) {
+                "x86_64-pc-windows-msvc"
+            } else {
+                return Err(NativeOperatorResolveError::HostAbiMismatch(
+                    "unsupported Windows native operator host".into(),
+                ));
+            };
+            Some(
+                NativeOperatorHostAbi::for_target(target)
+                    .map_err(NativeOperatorResolveError::HostAbiMismatch)?,
+            )
+        } else {
+            None
+        };
+        let expected_host = request.host_abi.as_ref().or(default_host.as_ref());
+        validate_host_abi(manifest.host_abi.as_ref(), expected_host)?;
         if manifest.operator != request.operator {
             return Err(NativeOperatorResolveError::OperatorMismatch {
                 expected: request.operator.clone(),
@@ -261,8 +289,18 @@ impl NativeOperatorResolver {
                 actual: artifact_sha256,
             });
         }
-        let binary_validation =
-            validate_binary_artifact(&request.artifact_path, manifest.linkage, &manifest.exports)?;
+        let binary_validation = if expected_host
+            .is_some_and(|host| host.compiler_flavor == NativeOperatorCompilerFlavor::Msvc)
+        {
+            validate_msvc_artifact(
+                &request.artifact_path,
+                manifest.linkage,
+                &manifest.exports,
+                &expected_host.expect("checked MSVC host").target,
+            )?
+        } else {
+            validate_binary_artifact(&request.artifact_path, manifest.linkage, &manifest.exports)?
+        };
         Ok(ResolvedNativeOperator {
             manifest,
             manifest_path: request.manifest_path.clone(),
@@ -271,6 +309,92 @@ impl NativeOperatorResolver {
             binary_validation,
         })
     }
+}
+
+fn validate_host_abi(
+    actual: Option<&NativeOperatorHostAbi>,
+    expected: Option<&NativeOperatorHostAbi>,
+) -> Result<()> {
+    if let Some(expected) = expected {
+        expected
+            .validate()
+            .map_err(NativeOperatorResolveError::HostAbiMismatch)?;
+        if let Some(actual) = actual {
+            if actual != expected {
+                return Err(NativeOperatorResolveError::HostAbiMismatch(format!(
+                    "expected {expected:?}, got {actual:?}"
+                )));
+            }
+        } else if expected.compiler_flavor == NativeOperatorCompilerFlavor::Msvc {
+            return Err(NativeOperatorResolveError::HostAbiMismatch(
+                "MSVC library has no declared target/CRT contract".into(),
+            ));
+        }
+    } else if actual.is_some_and(|host| host.compiler_flavor == NativeOperatorCompilerFlavor::Msvc)
+    {
+        return Err(NativeOperatorResolveError::HostAbiMismatch(
+            "MSVC library requires an explicit matching product target".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_msvc_artifact(
+    path: &Path,
+    linkage: NativeOperatorLinkage,
+    exports: &[String],
+    target: &str,
+) -> Result<NativeOperatorBinaryValidation> {
+    if linkage != NativeOperatorLinkage::Static
+        || !path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("lib"))
+    {
+        return Err(NativeOperatorResolveError::ArtifactSuffixMismatch {
+            path: path.to_path_buf(),
+            linkage,
+        });
+    }
+    let bytes = fs::read(path).map_err(|source| NativeOperatorResolveError::ArtifactRead {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let archive = crate::inspect_msvc_archive(&bytes, target).map_err(|reason| {
+        NativeOperatorResolveError::InvalidCoffLibrary {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    let missing = exports
+        .iter()
+        .filter(|symbol| !archive.defined_symbols.contains(symbol))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(NativeOperatorResolveError::ArtifactMissingExports {
+            path: path.to_path_buf(),
+            missing,
+        });
+    }
+    archive.require_unique_exports(exports).map_err(|reason| {
+        NativeOperatorResolveError::InvalidCoffLibrary {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    Ok(NativeOperatorBinaryValidation {
+        format: NativeOperatorArtifactFormat::StaticArchive,
+        archive_members: archive
+            .members
+            .into_iter()
+            .map(|member| member.name)
+            .collect(),
+        defined_symbols: archive.defined_symbols,
+        strong_defined_symbols: archive.strong_defined_symbols,
+        required_exports: exports.to_vec(),
+        matched_exports: exports.to_vec(),
+    })
 }
 
 fn file_sha256(path: &Path) -> Result<String> {
@@ -516,6 +640,8 @@ mod tests {
             inputs_sha256: digest('b'),
             binary_sha256,
             linkage: NativeOperatorLinkage::Static,
+            host_abi: cfg!(windows)
+                .then(|| NativeOperatorHostAbi::for_target("x86_64-pc-windows-msvc").unwrap()),
             g03_catalog_sha256: Some(digest('c')),
             abi_contract_sha256: Some(digest('d')),
             descriptor_export: Some("ferrum_native_dummy_descriptor_v2".to_string()),
@@ -547,6 +673,15 @@ mod tests {
     }
 
     fn write_static_archive(dir: &Path, include_descriptor: bool) -> PathBuf {
+        if cfg!(windows) {
+            let mut exports = vec!["ferrum_native_dummy_execute_v1"];
+            if include_descriptor {
+                exports.push("ferrum_native_dummy_descriptor_v2");
+            }
+            let archive = dir.join("ferrum_native_dummy.lib");
+            fs::write(&archive, crate::coff::tests::native_library(&exports)).unwrap();
+            return archive;
+        }
         let source = dir.join("native_op.c");
         let mut source_text =
             String::from("int ferrum_native_dummy_execute_v1(void) { return 0; }\n");
@@ -711,7 +846,11 @@ mod tests {
     #[test]
     fn rejects_text_file_even_when_hash_matches() {
         let dir = temp_dir("text-artifact");
-        let artifact = dir.path().join("libferrum_native_dummy.a");
+        let artifact = dir.path().join(if cfg!(windows) {
+            "ferrum_native_dummy.lib"
+        } else {
+            "libferrum_native_dummy.a"
+        });
         let bytes = b"not an archive";
         fs::write(&artifact, bytes).unwrap();
         let manifest = dir.path().join("native_operator_manifest.json");
@@ -727,7 +866,11 @@ mod tests {
             .resolve(&request(&manifest, &artifact))
             .unwrap_err();
         assert!(
-            matches!(err, NativeOperatorResolveError::ArtifactToolFailed { .. }),
+            matches!(
+                err,
+                NativeOperatorResolveError::ArtifactToolFailed { .. }
+                    | NativeOperatorResolveError::InvalidCoffLibrary { .. }
+            ),
             "{err:?}"
         );
     }
@@ -777,5 +920,53 @@ mod tests {
             matches!(err, NativeOperatorResolveError::ManifestInvalid(_)),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn msvc_library_requires_real_coff_and_exact_product_host_contract() {
+        let dir = temp_dir("msvc-resolver");
+        let path = dir.path().join("native.lib");
+        let exports = required_exports();
+        let bytes = crate::coff::tests::native_library(
+            &exports.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        fs::write(&path, &bytes).unwrap();
+        let manifest_path = dir.path().join("manifest.json");
+        write_manifest(
+            &manifest_path,
+            digest_bytes(&bytes),
+            FERRUM_NATIVE_ABI_VERSION,
+            vec!["sm_89".into()],
+            exports,
+        );
+        let mut manifest: NativeOperatorManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let host = NativeOperatorHostAbi::for_target("x86_64-pc-windows-msvc").unwrap();
+        manifest.host_abi = Some(host.clone());
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let request = request(&manifest_path, &path).with_host_abi(host.clone());
+        NativeOperatorResolver.resolve(&request).unwrap();
+        let wrong = request
+            .clone()
+            .with_host_abi(NativeOperatorHostAbi::for_target("x86_64-unknown-linux-gnu").unwrap());
+        assert!(matches!(
+            NativeOperatorResolver.resolve(&wrong),
+            Err(NativeOperatorResolveError::HostAbiMismatch(_))
+        ));
+        manifest.host_abi = None;
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(matches!(
+            NativeOperatorResolver.resolve(&request),
+            Err(NativeOperatorResolveError::HostAbiMismatch(_))
+        ));
+        manifest.host_abi = Some(host);
+        let fake = b"!<arch>\nnot a COFF implementation";
+        manifest.binary_sha256 = digest_bytes(fake);
+        fs::write(&path, fake).unwrap();
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(matches!(
+            NativeOperatorResolver.resolve(&request),
+            Err(NativeOperatorResolveError::InvalidCoffLibrary { .. })
+        ));
     }
 }

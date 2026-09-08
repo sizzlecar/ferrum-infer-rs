@@ -73,6 +73,7 @@ pub mod fused_add_rms_norm;
 pub mod fused_silu_mul;
 pub mod gpu_paged_kv;
 pub mod marlin;
+#[cfg(not(target_os = "windows"))]
 pub mod nccl_comm;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod residual_add;
@@ -80,7 +81,7 @@ pub mod residual_add;
 pub mod rms_norm;
 #[cfg(feature = "candle-cuda-compat")]
 pub mod rope;
-#[cfg(feature = "candle-cuda-compat")]
+#[cfg(all(feature = "candle-cuda-compat", not(target_os = "windows")))]
 pub mod tp_decode;
 pub mod vnext_ops;
 mod vnext_replay;

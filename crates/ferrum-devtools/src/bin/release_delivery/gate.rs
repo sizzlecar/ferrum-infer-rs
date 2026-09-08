@@ -31,6 +31,9 @@ use tokio::process::Command;
 #[path = "ci_evidence.rs"]
 mod ci_evidence;
 
+#[path = "windows_assets.rs"]
+pub(super) mod windows_assets;
+
 #[derive(Debug, Args)]
 pub struct GateArgs {
     #[arg(long)]
@@ -46,6 +49,9 @@ pub struct GateArgs {
     /// Explicit staged metadata paths; remote installation paths are not local inputs.
     #[arg(long, required = true)]
     pub abi: Vec<PathBuf>,
+    /// Windows assets from this release's successful staging job, kept outside Unix ABI inputs.
+    #[arg(long)]
+    pub windows_staged: PathBuf,
     #[arg(long)]
     pub version: String,
     #[arg(long)]
@@ -107,6 +113,14 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     // The candidate's reachable base can be older than today's main releases.
     // Reject a historical downgrade before any public channel can be mutated.
     verify_public_version(&args.repo, &args.version).await?;
+    let windows = windows_assets::verify(
+        &args.windows_staged,
+        &args.version,
+        &candidate,
+        args.ci_run_id,
+        &text(&document["provenance"], "release_base_tag")?,
+        &args.repo,
+    )?;
     let mut distributions = BTreeMap::new();
     let mut names = BTreeSet::new();
     for path in &args.abi {
@@ -152,7 +166,7 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     let contracts: ContractReport = read(&args.contracts)?;
     verify_contract_report(&contract_groups(), &contracts)
         .map_err(|issues| format!("CPU contract evidence: {}", issues.join("; ")))?;
-    verify_ci(&args.repo, args.ci_run_id, &candidate).await?;
+    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempt).await?;
     let ci_evidence = ci_evidence::load(
         &args.repo,
         args.ci_run_id,
@@ -165,15 +179,21 @@ pub async fn verify(args: GateArgs) -> Result<AcceptedRelease, String> {
     .await?;
     verify_obligations_with(&plan, &ci_evidence)?;
     // A rerun that began while artifacts were inspected must not reuse old Quality.
-    verify_ci(&args.repo, args.ci_run_id, &candidate).await?;
+    verify_ci(&args.repo, args.ci_run_id, &candidate, windows.attempt).await?;
     let notes = fs::read_to_string(&args.notes).map_err(|e| format!("release notes: {e}"))?;
     if notes.trim().is_empty() {
         return Err("release notes are empty".into());
     }
-    let assets = distributions
+    let mut assets: Vec<_> = distributions
         .into_values()
         .flat_map(|distribution| distribution.assets)
         .collect();
+    for asset in windows.assets {
+        if !names.insert(asset.name.clone()) {
+            return Err("duplicate declared release asset".into());
+        }
+        assets.push(asset);
+    }
     Ok(AcceptedRelease {
         version: args.version,
         candidate_sha: candidate,
@@ -732,23 +752,30 @@ async fn public_version_at(
     Ok(())
 }
 
-async fn verify_ci(repo: &str, run_id: u64, candidate: &str) -> Result<(), String> {
+async fn verify_ci(
+    repo: &str,
+    run_id: u64,
+    candidate: &str,
+    windows_attempt: u64,
+) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .user_agent("ferrum-release-delivery")
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|_| "cannot construct CI client")?;
     let token = std::env::var("GITHUB_TOKEN").ok();
-    ci_at(
+    ci_at_with_windows(
         &client,
         "https://api.github.com",
         repo,
         run_id,
         candidate,
         token.as_deref(),
+        Some(windows_attempt),
     )
     .await
 }
+#[cfg(test)]
 async fn ci_at(
     client: &reqwest::Client,
     base: &str,
@@ -756,6 +783,17 @@ async fn ci_at(
     run_id: u64,
     candidate: &str,
     token: Option<&str>,
+) -> Result<(), String> {
+    ci_at_with_windows(client, base, repo, run_id, candidate, token, None).await
+}
+async fn ci_at_with_windows(
+    client: &reqwest::Client,
+    base: &str,
+    repo: &str,
+    run_id: u64,
+    candidate: &str,
+    token: Option<&str>,
+    windows_attempt: Option<u64>,
 ) -> Result<(), String> {
     if run_id == 0 {
         return Err("CI run id must be explicit and nonzero".into());
@@ -814,6 +852,7 @@ async fn ci_at(
     // https://docs.github.com/en/rest/actions/workflow-jobs#list-jobs-for-a-workflow-run
     let mut page = 1;
     let mut occurrences = BTreeMap::new();
+    let mut windows_occurrences = BTreeMap::new();
     let mut ids = BTreeSet::new();
     let mut total = None;
     loop {
@@ -834,7 +873,9 @@ async fn ci_at(
             if !ids.insert(id) {
                 return Err("CI response repeats a job across pages".into());
             }
-            if job["name"] != "Quality / CI required" {
+            let windows_job = job["name"] == "stage-cuda / Stage Windows x86_64 CUDA sm89";
+            if job["name"] != "Quality / CI required" && !(windows_attempt.is_some() && windows_job)
+            {
                 continue;
             }
             let job_attempt = job["run_attempt"]
@@ -845,7 +886,12 @@ async fn ci_at(
             {
                 return Err("Quality job belongs to another run or candidate".into());
             }
-            if occurrences.insert(job_attempt, job.clone()).is_some() {
+            let selected = if windows_job {
+                &mut windows_occurrences
+            } else {
+                &mut occurrences
+            };
+            if selected.insert(job_attempt, job.clone()).is_some() {
                 return Err("Quality job is ambiguous within one execution attempt".into());
             }
         }
@@ -856,6 +902,16 @@ async fn ci_at(
     }
     if total != Some(ids.len() as u64) {
         return Err("CI returned an incomplete job inventory".into());
+    }
+    if let Some(expected) = windows_attempt {
+        let (attempt, job) = windows_occurrences
+            .last_key_value()
+            .ok_or("Windows release staging job is missing")?;
+        if *attempt != expected || job["status"] != "completed" || job["conclusion"] != "success" {
+            return Err(
+                "latest Windows staging did not succeed for the accepted artifact attempt".into(),
+            );
+        }
     }
     let (job_attempt, required) = occurrences
         .last_key_value()

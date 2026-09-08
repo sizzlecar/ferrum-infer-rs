@@ -369,6 +369,15 @@ async fn ci_fixture(
     status: u16,
     expect_jobs: bool,
 ) -> Result<(), String> {
+    ci_fixture_with_windows(run, jobs, status, expect_jobs, None).await
+}
+async fn ci_fixture_with_windows(
+    run: Value,
+    jobs: Vec<Value>,
+    status: u16,
+    expect_jobs: bool,
+    windows_attempt: Option<u64>,
+) -> Result<(), String> {
     use tokio::{
         io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
         net::TcpListener,
@@ -419,12 +428,67 @@ async fn ci_fixture(
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
-    let result = ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None).await;
+    let result = match windows_attempt {
+        Some(attempt) => {
+            ci_at_with_windows(
+                &client,
+                &url,
+                "owner/repo",
+                17,
+                &"a".repeat(40),
+                None,
+                Some(attempt),
+            )
+            .await
+        }
+        None => ci_at(&client, &url, "owner/repo", 17, &"a".repeat(40), None).await,
+    };
     tokio::time::timeout(Duration::from_secs(3), worker)
         .await
         .expect("CI fixture did not finish expected requests")
         .unwrap();
     result
+}
+
+#[tokio::test]
+async fn windows_assets_require_the_latest_successful_staging_attempt() {
+    let mut windows = ci_job();
+    windows["id"] = json!(23);
+    windows["name"] = json!("stage-cuda / Stage Windows x86_64 CUDA sm89");
+    ci_fixture_with_windows(
+        ci_run(),
+        vec![ci_job(), windows.clone()],
+        200,
+        true,
+        Some(2),
+    )
+    .await
+    .unwrap();
+    // A publication-only retry may reuse this exact, still-latest staging job.
+    let mut retry = ci_run();
+    retry["run_attempt"] = json!(3);
+    ci_fixture_with_windows(retry, vec![ci_job(), windows.clone()], 200, true, Some(2))
+        .await
+        .unwrap();
+    for changed in [json!("failure"), json!("cancelled")] {
+        let mut failure = windows.clone();
+        failure["conclusion"] = changed;
+        assert!(
+            ci_fixture_with_windows(ci_run(), vec![ci_job(), failure], 200, true, Some(2))
+                .await
+                .is_err()
+        );
+    }
+    assert!(
+        ci_fixture_with_windows(ci_run(), vec![ci_job(), windows], 200, true, Some(1))
+            .await
+            .is_err()
+    );
+    assert!(
+        ci_fixture_with_windows(ci_run(), vec![ci_job()], 200, true, Some(2))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
