@@ -126,6 +126,25 @@ pub fn contract_groups() -> Vec<ContractGroup> {
         // token history. Pair its scheduler transition with real CPU KV/logit
         // equivalence; this does not certify GPU swapping or persistence.
         ("kv-resume", KvResume, all.clone(), vec![engine("plan_runtime_batch_decode_capacity_deferral_recomputes_a_blocked_progress_victim"), engine("cpu_kv_recompute_matches_uninterrupted_logits_and_preserves_peer")]),
+        // Real files and production adapters, with typed/stub execution input.
+        // These cover sink lifecycle, identity/HTTP correlation and error
+        // propagation; they are not real-model or accelerator profile evidence.
+        // The sampler exercises the host running this harness. A Unix result
+        // never certifies the separately cfg(windows) K32 implementation.
+        ("observability", Observability, all.clone(), vec![
+            lib("ferrum-bench-core", "jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record"),
+            lib("ferrum-bench-core", "jsonl_journal::tests::last_handle_drop_closes_and_flushes"),
+            lib("ferrum-bench-core", "jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events"),
+            lib("ferrum-bench-core", "jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush"),
+            lib("ferrum-types", "process_memory::tests::process_memory_sampler_returns_valid_resident_bytes"),
+            lib("ferrum-cli", "observability_product::tests::actual_run_observability_writes_prompt_token_ids"),
+            lib("ferrum-cli", "observability_product::tests::actual_run_failure_observability_writes_diagnostics_bundle"),
+            engine("vnext_profile_preserves_the_complete_canonical_execution_identity"),
+            server("route_chat_profile_events_preserve_benchmark_correlation"),
+            server("route_chat_sync_success_writes_product_profile_event"),
+            server("route_chat_stream_success_writes_product_profile_event"),
+            server("route_chat_stream_generation_failure_writes_replay_diagnostics"),
+        ]),
         // Source transformations run on the host before either product entrypoint
         // uploads weights. These assertions cover decoded bytes, source recipes,
         // manifests and stable logical programs; they do not certify GPU operators.

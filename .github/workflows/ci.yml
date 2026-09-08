@@ -479,7 +479,7 @@ jobs:
           retention-days: 14
 
   windows:
-    name: Windows (MSVC and CUDA compile)
+    name: Windows (MSVC contracts)
     needs: prepare
     if: needs.prepare.outputs.scope == 'code'
     runs-on: windows-2022
@@ -487,9 +487,6 @@ jobs:
     defaults:
       run:
         shell: pwsh
-    env:
-      CUDA_COMPUTE_CAP: '89'
-      CUDA_WINDOWS_VERSION: '12.4'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -498,6 +495,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.91.0
         with:
           targets: x86_64-pc-windows-msvc
+          components: rust-src
       - name: Select a supported MSVC toolset and Windows SDK
         run: |
           $ErrorActionPreference = 'Stop'
@@ -516,7 +514,7 @@ jobs:
           }
           $tools = Get-ChildItem "$vs\VC\Tools\MSVC" -Directory | Where-Object Name -Like '14.38.*' |
             Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $tools) { throw 'CUDA 12.4 requires the selected MSVC 19.38 compiler' }
+          if (-not $tools) { throw 'The selected MSVC 19.38 compiler was not found' }
           $vcvars = "$vs\VC\Auxiliary\Build\vcvarsall.bat"
           $selected = & cmd.exe /d /s /c "call `"$vcvars`" amd64 10.0.22621.0 -vcvars_ver=14.38 >nul && set"
           foreach ($line in $selected) {
@@ -527,31 +525,7 @@ jobs:
           $compilerBin = Join-Path $tools.FullName 'bin\Hostx64\x64'
           "CC=$compilerBin\cl.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "CXX=$compilerBin\cl.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "NVCC_CCBIN=$compilerBin\cl.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "FERRUM_MSVC_LIB=$compilerBin\lib.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$compilerBin\link.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "FERRUM_VS_ROOT=$vs" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Install CUDA compilation and runtime components
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          $installer = Join-Path $env:RUNNER_TEMP 'cuda_12.4.1_windows.exe'
-          curl.exe --fail --location --retry 3 --output $installer 'https://developer.download.nvidia.com/compute/cuda/12.4.1/local_installers/cuda_12.4.1_551.78_windows.exe'
-          $signature = Get-AuthenticodeSignature $installer
-          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'NVIDIA') {
-            throw 'CUDA installer does not have a valid NVIDIA signature'
-          }
-          Get-FileHash $installer -Algorithm SHA256 | Format-List
-          $process = Start-Process $installer -Wait -PassThru -ArgumentList @(
-            '-s', '-n', 'nvcc_12.4', 'cudart_12.4', 'cublas_12.4', 'cublas_dev_12.4',
-            'nvrtc_12.4', 'nvrtc_dev_12.4', 'cuobjdump_12.4')
-          if ($process.ExitCode -notin @(0, 3010)) { throw "CUDA installation failed: $($process.ExitCode)" }
-          Remove-Item $installer
-          $toolkit = "$env:ProgramFiles\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
-          & "$toolkit\bin\nvcc.exe" --version
-          "CUDA_PATH=$toolkit" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "CUDA_HOME=$toolkit" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          "$toolkit\bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
       - uses: actions/cache/restore@v4
         id: windows_cache
         with:
@@ -559,100 +533,38 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            ~/ferrum-native-object-cache
-          key: windows-msvc1938-cuda1241-${{ hashFiles('Cargo.lock', 'crates/ferrum-native-ops-builder/**', 'crates/ferrum-native-ops/**', 'native-operators/cuda/**') }}
+          key: windows-msvc1938-workspace-nodebug-v1-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            windows-msvc1938-cuda1241-
-      - name: Verify selected Windows toolchain probes
+            windows-msvc1938-workspace-nodebug-v1-
+      # Compile the complete MSVC workspace; execute Windows process,
+      # distribution and OS-file contracts here. Shared inference runs above.
+      # release-cuda.yml owns native CUDA operators, full linkage and packaging.
+      - name: Check the MSVC workspace
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo test --locked -p ferrum-native-ops-builder --lib source_build::platform::msvc::tests::configured_ -- --ignored --nocapture
-      - name: Build the Windows native operator builder
+          cargo check --locked --workspace --all-targets
+      - name: Test Windows launcher and PowerShell bootstrap contracts
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --locked -p ferrum-native-ops-builder --bin ferrum-native-ops-builder
-      - name: Build the four native CUDA operators with MSVC
+          cargo test --locked -p ferrum-cli --test windows_launcher
+          cargo test --locked -p ferrum-devtools --test windows_bootstrap
+      - name: Test portable and Windows release asset contracts
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          $work = Join-Path $env:RUNNER_TEMP 'ferrum-windows-native'
-          $source = Join-Path $work 'source'
-          $reference = Join-Path $work 'reference'
-          $set = Join-Path $work 'operator-set'
-          New-Item -ItemType Directory -Force $source, $reference, $set | Out-Null
-          $distribution = Get-Content 'native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json' -Raw | ConvertFrom-Json
-          $sourceArchive = Join-Path $work $distribution.archive.file_name
-          $sourceUrl = 'https://github.com/{0}/releases/download/{1}/{2}' -f $distribution.distribution.repository, $distribution.distribution.tag, $distribution.distribution.asset_name
-          curl.exe --fail --location --retry 3 --output $sourceArchive $sourceUrl
-          if ((Get-FileHash $sourceArchive -Algorithm SHA256).Hash -ne $distribution.archive.sha256) { throw 'Native source archive hash mismatch' }
-          tar.exe -xf $sourceArchive -C $source
-          # Preserve this historical provider catalog as versioned binding provenance.
-          # Windows packages separately pin their actual source plan and MSVC tools;
-          # runtime compatibility checks the live provider contracts. No Linux code is linked.
-          $referenceArchive = Join-Path $work 'reference.tar.zst'
-          curl.exe --fail --location --retry 3 --output $referenceArchive 'https://github.com/sizzlecar/ferrum-infer-rs/releases/download/ferrum-native-cuda12.4-sm89-v6/native-operator-set-cuda12.4-sm89-v6.tar.zst'
-          if ((Get-FileHash $referenceArchive -Algorithm SHA256).Hash -ne 'd4cdfe8818ed2071dbf8e2fcd3f12263a96f1cb32b542a2b161c99c9fc81584e') { throw 'Reference archive hash mismatch' }
-          tar.exe -xf $referenceArchive -C $reference
-          $referenceLockPath = Join-Path $reference 'inputs/native-operator-set.lock.json'
-          $referenceLock = Get-Content $referenceLockPath -Raw | ConvertFrom-Json
-          $catalog = Join-Path (Split-Path $referenceLockPath) $referenceLock.artifacts[0].g03_catalog.path
-          if ((Get-FileHash $catalog -Algorithm SHA256).Hash -ne $referenceLock.g03_catalog_sha256) { throw 'Canonical provider catalog hash mismatch' }
-          $builder = Join-Path $env:GITHUB_WORKSPACE 'target/debug/ferrum-native-ops-builder.exe'
-          $builderSha = git rev-parse HEAD
-          $receiptArgs = @()
-          $failedOperators = @()
-          foreach ($operator in @('marlin', 'vllm-marlin', 'vllm-moe-marlin', 'vllm-paged-attention-v2')) {
-            $build = Join-Path $work "build/$operator"
-            $package = Join-Path $set "packages/$operator"
-            $plan = Join-Path $work "$operator.plan.json"
-            $spec = Join-Path $work "$operator.package.json"
-            $stage = 'lock-source'
-            try {
-              & $builder lock-source --definition "native-operators/cuda/source-definitions/$operator.json" --source-root $source --out $plan
-              $stage = 'source-build'
-              & $builder source-build --plan $plan --source-root $source --out $build --compute-capability sm_89 --builder-sha $builderSha --nvcc "$env:CUDA_PATH/bin/nvcc.exe" --cuda-toolkit-root $env:CUDA_PATH --ccbin $env:NVCC_CCBIN --ar $env:FERRUM_MSVC_LIB --nvcc-threads 4 --object-cache "$env:USERPROFILE/ferrum-native-object-cache"
-              $stage = 'materialize-package-spec'
-              & $builder materialize-package-spec --definition "native-operators/cuda/package-definitions/$operator.json" --g03-catalog $catalog --out $spec
-              $stage = 'package'
-              & $builder package --spec $spec --source-root $source --license-root $env:GITHUB_WORKSPACE --source-build-receipt "$build/source-build.receipt.json" --source-build-plan $plan --g03-catalog $catalog --abi-contract 'native-operators/abi/ferrum-native-abi-v2.json' --cc $env:CC --ar $env:FERRUM_MSVC_LIB --out $package
-              $stage = 'package receipt'
-              $receipt = Join-Path $package 'package.receipt.json'
-              $receiptArgs += @('--receipt', $receipt, '--receipt-sha256', (Get-FileHash $receipt -Algorithm SHA256).Hash.ToLowerInvariant())
-            } catch {
-              $failedOperators += "$operator ($stage)"
-              Write-Warning ("Native operator {0} failed during {1}: {2}" -f $operator, $stage, $_.Exception.Message)
-              Write-Host $_.InvocationInfo.PositionMessage
-            }
-          }
-          if ($failedOperators.Count -gt 0) {
-            throw ("Native CUDA operator builds failed: {0}" -f ($failedOperators -join ', '))
-          }
-          $lock = Join-Path $set 'native-operator-set.lock.json'
-          & $builder assemble-set @receiptArgs --g03-catalog-sha256 $referenceLock.g03_catalog_sha256 --compute-capability sm_89 --out $lock
-          "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      # Keep this lane focused on Windows native toolchain and CUDA linkage.
-      # Shared workspace correctness is covered above; installer/model lifecycle
-      # acceptance is run on the native GPU development host before publication.
-      - name: Compile and link the full Windows CUDA CLI
+          cargo test --locked -p ferrum-devtools --bin release_delivery portable::tests::
+          cargo test --locked -p ferrum-devtools --bin release_delivery gate::tests::windows_assets_require_the_latest_successful_staging_attempt -- --exact
+      - name: Test Windows memory sampling and journal file semantics
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo build --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
-          & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf 'target/debug/ferrum.exe'
-          & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-ptx 'target/debug/ferrum.exe'
-      - name: Preserve native build evidence and candidate executables
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-native-msvc-sm89
-          path: |
-            ${{ runner.temp }}/ferrum-windows-native/build
-            ${{ runner.temp }}/ferrum-windows-native/operator-set
-            target/debug/ferrum.exe
-          if-no-files-found: warn
-          retention-days: 7
+          cargo test --locked -p ferrum-types --lib process_memory::tests::process_memory_sampler_returns_valid_resident_bytes -- --exact
+          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::truncate_journal_appends_after_an_external_startup_record -- --exact
+          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::last_handle_drop_closes_and_flushes -- --exact
+          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::explicit_close_drains_joins_and_rejects_new_events -- --exact
+          cargo test --locked -p ferrum-bench-core --lib jsonl_journal::tests::serialization_failure_is_latched_and_returned_by_flush -- --exact
       - name: Save Windows build caches
         if: ${{ always() && steps.windows_cache.outputs.cache-primary-key != '' && steps.windows_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
@@ -661,7 +573,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            ~/ferrum-native-object-cache
           key: ${{ steps.windows_cache.outputs.cache-primary-key }}
 
   required:

@@ -1128,6 +1128,101 @@ fn shared_work_prefers_a_fully_bound_selected_representative_without_combining_t
 }
 
 #[test]
+fn observability_contract_requires_real_registered_assertions_without_model_sampling() {
+    let targets = vec![
+        text_target("bf16", Backend::Metal),
+        text_target("bf16", Backend::Cuda),
+    ];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .into_iter()
+            .map(|target| profile(&format!("{:?}", target.backend), target))
+            .collect(),
+    );
+    request.impact.areas = vec![ChangeArea::ObservabilityContract];
+    request.checks = super::super::contracts::contract_check_descriptors();
+    let result = plan(&request).unwrap();
+    let (index, obligation) = result
+        .obligations
+        .iter()
+        .enumerate()
+        .find(|(_, obligation)| obligation.behavior == Behavior::Observability)
+        .unwrap();
+    assert_eq!(obligation.layer, EvidenceLayer::Contract);
+    assert_eq!(obligation.scope, ObligationScope::Global);
+    assert_eq!(obligation.entrypoints, ENTRYPOINTS);
+    assert_eq!(obligation.checkers, ["cpu-contract.observability"]);
+    assert!(!result
+        .gaps
+        .contains(&Gap::UnassignedCheck { obligation: index }));
+    assert!(result.selected.is_empty());
+    assert!(!result.obligations.iter().any(requires_model));
+
+    request
+        .checks
+        .retain(|check| check.behavior != Behavior::Observability);
+    let missing = plan(&request).unwrap();
+    let index = missing
+        .obligations
+        .iter()
+        .position(|obligation| obligation.behavior == Behavior::Observability)
+        .unwrap();
+    assert!(missing
+        .gaps
+        .contains(&Gap::UnassignedCheck { obligation: index }));
+}
+
+#[test]
+fn contract_only_observability_cannot_erase_runtime_or_accept_basic_as_profile_evidence() {
+    let targets = vec![
+        text_target("bf16", Backend::Metal),
+        text_target("bf16", Backend::Cuda),
+    ];
+    let mut request = input(
+        Stage::PullRequest,
+        targets.clone(),
+        targets
+            .iter()
+            .map(|target| profile(&format!("{:?}", target.backend), target.clone()))
+            .collect(),
+    );
+    request.impact.areas = vec![ChangeArea::ObservabilityContract, ChangeArea::Observability];
+    request.checks = super::super::contracts::contract_check_descriptors();
+    // Existing model checks include Basic, but do not inspect profile sinks.
+    request
+        .checks
+        .extend(super::super::model_schedule::model_check_descriptors());
+    let result = plan(&request).unwrap();
+    for target in targets {
+        let (index, obligation) = result
+            .obligations
+            .iter()
+            .enumerate()
+            .find(|(_, obligation)| {
+                obligation.behavior == Behavior::Observability
+                    && obligation.layer == EvidenceLayer::ModelRuntime
+                    && obligation.scope
+                        == ObligationScope::Backend {
+                            backend: target.backend,
+                        }
+            })
+            .unwrap();
+        assert!(obligation.checkers.is_empty());
+        assert!(result
+            .gaps
+            .contains(&Gap::UnassignedCheck { obligation: index }));
+    }
+    request.impact.areas.push(ChangeArea::Kernel);
+    let mixed = plan(&request).unwrap();
+    assert!(mixed.obligations.iter().any(|obligation| {
+        obligation.behavior == Behavior::KernelNumerics
+            && obligation.layer == EvidenceLayer::BackendNumerics
+    }));
+}
+
+#[test]
 fn observability_requires_metadata_and_sink_checks_without_full_compute_expansion() {
     let metal = text_target("bf16", Backend::Metal);
     let cuda = text_target("bf16", Backend::Cuda);

@@ -347,12 +347,13 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
         ),
         Build => (&[], &[ModelLoad]),
         ChangeArea::Observability => (&[Behavior::Observability], &[Behavior::Observability]),
+        ObservabilityContract => (&[Behavior::Observability], &[]),
         Validation => (&[], &[]),
     };
-    let reason = if area == ChangeArea::Observability {
-        "shared request metadata and instrumentation: contract checks cover propagation, sink completion and errors; runtime uses one representative per backend, not all operators/layouts".into()
-    } else {
-        format!("affected component: {area:?}")
+    let reason = match area {
+        ChangeArea::Observability => "shared request metadata and instrumentation: contract checks cover propagation, sink completion and errors; runtime uses one representative per backend, not all operators/layouts".into(),
+        ObservabilityContract => "proven sink/metadata-adapter/process-accounting scope: real contract assertions cover propagation, file lifecycle and errors; no changed model-side event acquisition is claimed".into(),
+        _ => format!("affected component: {area:?}"),
     };
     add_for_scopes(
         plan,
@@ -375,7 +376,7 @@ fn area_obligations(plan: &mut Plan, area: ChangeArea, targets: &[ExecutionTarge
         Template | Termination | Structured | Tools => protocols(targets),
         Download => architectures(targets),
         Build | ChangeArea::Observability => backends(targets),
-        Validation => Vec::new(),
+        ObservabilityContract | Validation => Vec::new(),
     };
     add_for_scopes(plan, runtime, ModelRuntime, &scopes, &reason);
     if area == BackendSubmission {

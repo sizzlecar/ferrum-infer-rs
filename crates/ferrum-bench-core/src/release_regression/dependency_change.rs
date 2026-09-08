@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use toml_edit::{DocumentMut, Item, TableLike, Value};
 
+mod product;
+pub use product::{product_dependency_paths, ProductDependencyRefinement};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DependencyRefinement {
     pub paths: Vec<String>,

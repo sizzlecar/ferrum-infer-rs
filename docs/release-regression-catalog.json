@@ -259,5 +259,21 @@
       "execution_path": "production-plan-runtime"
     }
   ],
-  "checks": []
+  "checks": [],
+  "readme_reviews": [
+    {
+      "path": "README.md",
+      "before_sha256": "54d8c1c4b8e8005479d03fb633255f39cddde5be954386ed2113b081bc172d3f",
+      "after_sha256": "3825b8e9eecf85874a6c96d9638aab84b6c311ed0d5f92e01b1ac973398216e2",
+      "areas": ["build", "template", "termination", "structured", "tools"],
+      "rationale": "Reviewed distribution, PATH and live upgrade instructions, Windows hardware and capacity examples, and existing reasoning/tool JSON API scope against implementation and native validation. Retain distribution and protocol checks; this review does not certify execution or performance."
+    },
+    {
+      "path": "README_zh.md",
+      "before_sha256": "7204b7d801d7c310698f065bd16a6ad2e05cd566b1f6624caa86eabcb37b0438",
+      "after_sha256": "c552fbb42649c022158bdffe60345dcc34b6978e3fc798e056deb100da1a225e",
+      "areas": ["build", "template", "termination", "structured", "tools"],
+      "rationale": "Reviewed Chinese distribution, PATH and live upgrade instructions, Windows hardware and capacity examples, and existing reasoning/tool JSON API scope against implementation and native validation. Retain distribution and protocol checks; this review does not certify execution or performance."
+    }
+  ]
 }
