@@ -515,7 +515,7 @@ fn sha256_file(path: &Path) -> Result<String, NativeBuildArtifactCacheError> {
         source,
     })?;
     let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count =
             file.read(&mut buffer)
@@ -612,7 +612,7 @@ fn stage_verified_copy(
         })?;
     let mut copied_digest = Sha256::new();
     let mut size_bytes = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = input.read(&mut buffer).map_err(|source_error| {
             NativeBuildArtifactCacheError::Read {
@@ -854,6 +854,58 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn publish_and_restore_fit_a_windows_sized_stack() {
+        // MSVC executables can run with a 1 MiB main stack. The cache must
+        // stream larger artifacts without putting its I/O buffers there.
+        thread::Builder::new()
+            .name("native-cache-small-stack".to_string())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let temp = TestDir::new("small-stack");
+                let cache_root = temp.0.join("cache");
+                let cache = NativeBuildArtifactCache::new(&cache_root).unwrap();
+                let source = temp.0.join("unit.obj");
+                let mut bytes = (0..2 * 1024 * 1024 + 37)
+                    .map(|index| (index % 251) as u8)
+                    .collect::<Vec<_>>();
+                fs::write(&source, &bytes).unwrap();
+                let expected_sha256 = format!("{:x}", Sha256::digest(&bytes));
+                let spec = NativeBuildArtifactSpec::new(
+                    "object.small-stack",
+                    "unit.obj",
+                    "source=small-stack-fixture",
+                )
+                .unwrap();
+
+                let published = cache.publish(&spec, &source).unwrap();
+                assert_eq!(published.artifact_sha256, expected_sha256);
+                assert_eq!(published.artifact_size_bytes, bytes.len() as u64);
+                drop(cache);
+
+                let reopened = NativeBuildArtifactCache::new(&cache_root).unwrap();
+                let destination = temp.0.join("out/unit.obj");
+                assert_eq!(
+                    reopened.restore(&spec, &destination).unwrap(),
+                    NativeBuildArtifactLookup::Hit(published.clone())
+                );
+                assert_eq!(fs::read(&destination).unwrap(), bytes);
+
+                let middle = bytes.len() / 2;
+                bytes[middle] ^= 1;
+                fs::write(&published.artifact_path, &bytes).unwrap();
+                fs::write(&destination, b"existing output").unwrap();
+                assert!(matches!(
+                    reopened.restore(&spec, &destination),
+                    Err(NativeBuildArtifactCacheError::ArtifactSha256Mismatch { .. })
+                ));
+                assert_eq!(fs::read(&destination).unwrap(), b"existing output");
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
