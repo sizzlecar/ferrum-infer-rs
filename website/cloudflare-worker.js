@@ -1,3 +1,5 @@
+import shellInstaller from "../scripts/install.sh";
+
 const SITE_ORIGIN = "https://ferrum.pandaailabs.com";
 const REPOSITORY = "https://github.com/sizzlecar/ferrum-infer-rs";
 
@@ -130,7 +132,14 @@ const pages = {
       ["Release-gated", "Both ferrum run and ferrum serve are validated against documented release flows before promotion."],
     ],
     quickTitle: "From install to first answer",
-    quickLead: "The first run downloads model weights. Ferrum prints download progress; the Metal model below is about 2.55 GiB and the CUDA repository is about 8.7 GiB.",
+    quickLead: "Install with one command, then run locally or connect an OpenAI-compatible client.",
+    installTitle: "Install",
+    installNote: "Run the command for your system. The installer verifies release checksums and adds Ferrum to your PATH. Open a new terminal afterward.",
+    upgradeNote: "Upgrade by running the same install command again. Existing sessions keep their current version; new launches use the update.",
+    runtimeNote: 'Linux CUDA requires an NVIDIA sm89 GPU, a compatible driver, and CUDA 12.4/NCCL runtimes. Automatic installation falls back to CPU if CUDA cannot start.',
+    homebrewTitle: "Homebrew alternative (macOS / Linux)",
+    homebrewNote: 'Homebrew 6 needs both <a href="https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula">formula definitions</a> trusted for its conflict check. Review them before running the trust command; older Homebrew versions can skip it. <a href="https://docs.brew.sh/Tap-Trust">Homebrew trust details</a>.',
+    firstRunTitle: "First run",
     note: "The quick start disables verbose reasoning for a short first response. Remove --disable-thinking when you want the model template's default reasoning behavior.",
     platformTitle: "Built for local and private serving",
     platformLead: "Use the interactive CLI while exploring, then serve the same model behind a familiar HTTP contract.",
@@ -142,7 +151,7 @@ const pages = {
     faqTitle: "Frequently asked questions",
     faq: [
       ["What is Ferrum?", "Ferrum is an open-source Rust workspace and command-line product for running and serving language models locally on supported Metal and CUDA hardware."],
-      ["Does Ferrum require Python?", "No Python runtime is required for the official prebuilt Metal and CUDA binaries. The CUDA host still needs compatible NVIDIA driver, CUDA runtime, and NCCL runtime libraries."],
+      ["Does Ferrum require Python?", "No Python runtime is required. Linux CUDA uses the host's NVIDIA driver, CUDA 12.4 and NCCL runtimes."],
       ["Which models are in the formal release scope?", "Ferrum v0.8 formally covers Qwen3.5 4B and 35B-A3B, Qwen3 30B-A3B, and Llama 3.1 8B dense. Other model work may appear as development evidence before entering the support matrix."],
       ["Can existing OpenAI clients connect to Ferrum?", "Ferrum implements OpenAI-compatible Chat Completions and stateless Responses surfaces. Check the compatibility document for the exact request contract."],
       ["Is Ferrum a hosted AI service?", "No. Ferrum is inference software that runs on hardware you control. Model licenses and data-handling choices remain yours."],
@@ -181,7 +190,14 @@ const pages = {
       ["发布门禁", "正式提升版本前，ferrum run 与 ferrum serve 都会按公开文档流程完成回归。"],
     ],
     quickTitle: "从安装到第一次回答",
-    quickLead: "首次运行需要下载模型权重。Ferrum 会输出下载进度；下面的 Metal 模型约为 2.55 GiB，CUDA 仓库约为 8.7 GiB。",
+    quickLead: "一行命令安装，随后在本地运行模型，或接入 OpenAI 兼容客户端。",
+    installTitle: "安装",
+    installNote: "执行对应系统的一行命令。安装脚本会校验发布包并自动加入 PATH。安装完成后打开新终端。",
+    upgradeNote: "再次执行同一安装命令即可升级。已有会话继续使用原版本，新启动的会话使用更新后的版本。",
+    runtimeNote: 'Linux CUDA 需要 NVIDIA sm89 显卡、兼容驱动及 CUDA 12.4/NCCL 运行库；自动安装在 CUDA 无法启动时回退到 CPU。',
+    homebrewTitle: "Homebrew 备选安装（macOS / Linux）",
+    homebrewNote: 'Homebrew 6 的冲突检查需要信任两个 <a href="https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula">formula 定义</a>。请先查看定义，再执行 trust 命令；旧版 Homebrew 可以跳过这一步。<a href="https://docs.brew.sh/Tap-Trust">Homebrew 信任机制说明</a>。',
+    firstRunTitle: "首次运行",
     note: "快速开始通过 --disable-thinking 缩短第一次回答。需要模型模板默认推理行为时，删除这个参数即可。",
     platformTitle: "为本地与私有服务而构建",
     platformLead: "探索阶段使用交互式 CLI，随后通过熟悉的 HTTP 契约提供同一个模型。",
@@ -193,7 +209,7 @@ const pages = {
     faqTitle: "常见问题",
     faq: [
       ["Ferrum 是什么？", "Ferrum 是一个开源 Rust workspace 与命令行产品，用于在受支持的 Metal 和 CUDA 硬件上本地运行并提供语言模型服务。"],
-      ["Ferrum 需要 Python 吗？", "官方预编译 Metal 与 CUDA 二进制无需 Python runtime。CUDA 主机仍需兼容的 NVIDIA driver、CUDA runtime 与 NCCL runtime。"],
+      ["Ferrum 需要 Python 吗？", "不需要 Python runtime。Linux CUDA 使用主机的 NVIDIA 驱动、CUDA 12.4 与 NCCL 运行库。"],
       ["哪些模型属于正式发布范围？", "Ferrum v0.8 正式覆盖 Qwen3.5 4B 与 35B-A3B、Qwen3 30B-A3B 和 Llama 3.1 8B dense。其他模型可能先以开发证据出现，完成发布级门禁后才进入支持矩阵。"],
       ["现有 OpenAI client 能连接 Ferrum 吗？", "Ferrum 实现 OpenAI 兼容的 Chat Completions 与无状态 Responses 接口；精确请求契约请查看兼容性文档。"],
       ["Ferrum 是托管 AI 服务吗？", "不是。Ferrum 是运行在你控制的硬件上的推理软件；模型许可与数据处理方式仍由你决定。"],
@@ -279,18 +295,30 @@ function render(page) {
     </div></section>
     <section id="quick-start"><div class="wrap">
       <div class="section-head"><h2>${page.quickTitle}</h2><p>${page.quickLead}</p></div>
-      <div class="code-shell"><div class="code-top"><span>Terminal</span><span class="dots"><i></i><i></i><i></i></span></div><pre><span class="comment"># macOS Apple Silicon</span>
-<span class="command">brew tap sizzlecar/ferrum
-brew install ferrum</span>
+      <p class="note">${page.installNote}</p>
+      <div class="code-shell"><div class="code-top"><span>${page.installTitle}</span><span class="dots"><i></i><i></i><i></i></span></div><pre><span class="comment"># macOS Apple Silicon · Terminal</span>
+<span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span>
+
+<span class="comment"># Linux x86_64 · Terminal</span>
+<span class="command">curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh</span></pre></div>
+      <p class="note">${page.runtimeNote}</p>
+      <p class="note">${page.upgradeNote}</p>
+      <details><summary>${page.homebrewTitle}</summary><p>${page.homebrewNote}</p><pre><span class="comment"># Homebrew 6</span>
+<span class="command">brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda</span>
+
+<span class="comment"># macOS Apple Silicon</span>
+<span class="command">brew install sizzlecar/ferrum/ferrum</span>
+
+<span class="comment"># Linux x86_64 · NVIDIA CUDA sm89</span>
+<span class="command">brew install sizzlecar/ferrum/ferrum-cuda</span></pre></details>
+      <p class="note">${page.note}</p>
+      <div class="code-shell"><div class="code-top"><span>${page.firstRunTitle}</span><span class="dots"><i></i><i></i><i></i></span></div><pre><span class="comment"># macOS Metal</span>
 ferrum doctor qwen3.5:4b-q4_k_m
 ferrum run qwen3.5:4b-q4_k_m --disable-thinking
 
-<span class="comment"># Linux x86_64 · NVIDIA CUDA sm89</span>
-<span class="command">brew tap sizzlecar/ferrum
-brew install ferrum-cuda</span>
+<span class="comment"># Linux CUDA</span>
 ferrum doctor qwen3.5:4b
 ferrum run qwen3.5:4b --disable-thinking</pre></div>
-      <p class="note">${page.note}</p>
     </div></section>
     <section><div class="wrap split">
       <div><div class="section-head"><h2>${page.platformTitle}</h2><p>${page.platformLead}</p></div><a class="button" href="${REPOSITORY}/blob/main/docs/openai-api-compatibility.md">OpenAI API contract</a></div>
@@ -318,9 +346,24 @@ function response(body, contentType, status = 200) {
   });
 }
 
+function installerResponse(request, source) {
+  const allowed = request.method === "GET" || request.method === "HEAD";
+  const result = response(
+    allowed ? (request.method === "HEAD" ? null : source) : "Method Not Allowed\n",
+    "text/plain",
+    allowed ? 200 : 405,
+  );
+  result.headers.set("cache-control", "no-cache");
+  if (!allowed) result.headers.set("allow", "GET, HEAD");
+  return result;
+}
+
 export default {
   async fetch(request) {
     const { pathname } = new URL(request.url);
+    if (pathname === "/install.sh") {
+      return installerResponse(request, shellInstaller);
+    }
     if (pathname === "/robots.txt") {
       return response(`User-agent: *\nAllow: /\nSitemap: ${SITE_ORIGIN}/sitemap.xml\n`, "text/plain");
     }

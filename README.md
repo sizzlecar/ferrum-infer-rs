@@ -15,23 +15,15 @@
 
 ## Quick Start
 
-Install Ferrum:
-
-Choose the install command for your platform; it automatically adds the tap.
-Homebrew 6 also needs both [formula definitions](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)
-trusted for its conflict check. Review them before running the trust command;
-older Homebrew versions can skip it. See [Homebrew's trust documentation](https://docs.brew.sh/Tap-Trust).
+Install the latest stable Ferrum on macOS Apple Silicon or Linux x86_64:
 
 ```bash
-# Homebrew 6: trust the reviewed formula definitions
-brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
-
-# macOS Apple Silicon
-brew install sizzlecar/ferrum/ferrum
-
-# Linux x86_64, NVIDIA CUDA sm89
-brew install sizzlecar/ferrum/ferrum-cuda
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 ```
+
+The installer verifies release checksums and adds `~/.local/bin` to your shell's
+PATH. Open a new terminal afterward. [Homebrew and manual installation](#installation)
+are also available.
 
 Inspect the installed binary before downloading weights:
 
@@ -145,7 +137,31 @@ and session caching.
 
 ## Installation
 
-Homebrew (see the formula trust explanation in [Quick Start](#quick-start)):
+The one-line installer selects Metal on Apple Silicon. On Linux it selects CUDA
+for compatible sm89 GPUs when the driver, CUDA 12.4 and NCCL runtimes can load,
+and otherwise selects CPU. You can require a backend or install a specific version:
+
+```bash
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
+```
+
+To upgrade an installation made with the script, rerun the original install
+command. It keeps existing version directories and switches the entry point to
+the verified new binary. Running sessions continue using their current version;
+new launches use the new version. Restart an existing server when you want it to
+use the update. Models and configuration are preserved.
+
+For immediate PATH setup in the current terminal:
+
+```bash
+. "$HOME/.local/share/ferrum/installer/env"
+```
+
+For Homebrew installations, use `brew upgrade` for the installed formula.
+Homebrew 6 needs both [formula definitions](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)
+trusted for its conflict check. Review them before running the trust command;
+older Homebrew versions can skip it. See [Homebrew's trust documentation](https://docs.brew.sh/Tap-Trust).
 
 ```bash
 # Homebrew 6: trust the reviewed formula definitions
