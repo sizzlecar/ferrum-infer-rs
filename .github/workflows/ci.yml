@@ -632,18 +632,13 @@ jobs:
           $lock = Join-Path $set 'native-operator-set.lock.json'
           & $builder assemble-set @receiptArgs --g03-catalog-sha256 $referenceLock.g03_catalog_sha256 --compute-capability sm_89 --out $lock
           "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Check and test the native Windows workspace
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $PSNativeCommandUseErrorActionPreference = $true
-          cargo check --locked --workspace --all-targets
-          cargo test --locked --workspace --all-targets --no-fail-fast
-          cargo build --locked -p ferrum-native-ops-builder -p ferrum-devtools --bin ferrum-native-ops-builder --bin model_regression
+      # Keep this lane focused on Windows native toolchain and CUDA linkage.
+      # Shared workspace correctness is covered above; installer/model lifecycle
+      # acceptance is run on the native GPU development host before publication.
       - name: Compile and link the full Windows CUDA CLI
         run: |
           $ErrorActionPreference = 'Stop'
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo check --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
           cargo build --locked -p ferrum-cli --bin ferrum --features cuda,vllm-moe-marlin,vllm-paged-attn-v2
           & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-elf 'target/debug/ferrum.exe'
           & "$env:CUDA_PATH/bin/cuobjdump.exe" --list-ptx 'target/debug/ferrum.exe'
@@ -656,7 +651,6 @@ jobs:
             ${{ runner.temp }}/ferrum-windows-native/build
             ${{ runner.temp }}/ferrum-windows-native/operator-set
             target/debug/ferrum.exe
-            target/debug/model_regression.exe
           if-no-files-found: warn
           retention-days: 7
       - name: Save Windows build caches

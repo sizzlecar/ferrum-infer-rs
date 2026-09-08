@@ -39,6 +39,8 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       rc_tag: ${{ steps.plan.outputs.rc_tag }}
       baseline_tag: ${{ steps.plan.outputs.baseline_tag }}
+      windows_launcher_url: ${{ steps.launcher.outputs.url }}
+      windows_launcher_sha256: ${{ steps.launcher.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,6 +109,30 @@ jobs:
             -f "tag_name=v$version" -f "target_commitish=$GITHUB_SHA" -f "previous_tag_name=$base" \
             --jq .body > "$RUNNER_TEMP/release-notes.md"
           printf 'active=true\nversion=%s\nrc_tag=%s\nbaseline_tag=%s\n' "$version" "$rc_tag" "$base" >> "$GITHUB_OUTPUT"
+      - name: Reuse the immutable stable launcher from the formal baseline
+        if: steps.plan.outputs.active == 'true'
+        id: launcher
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_GITHUB_TOKEN }}
+          BASELINE_TAG: ${{ steps.plan.outputs.baseline_tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$BASELINE_TAG" > "$RUNNER_TEMP/baseline-release.json"
+          jq -e --arg tag "$BASELINE_TAG" '.tag_name == $tag and .draft == false and .prerelease == false' "$RUNNER_TEMP/baseline-release.json"
+          release_id=$(jq -er '.id' "$RUNNER_TEMP/baseline-release.json")
+          # The embedded assets array can be truncated; inspect every public asset.
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" | jq 'add' > "$RUNNER_TEMP/baseline-assets.json"
+          count=$(jq '[.[] | select(.name == "ferrum-windows-launcher-v1.exe")] | length' "$RUNNER_TEMP/baseline-assets.json")
+          if [ "$count" = 0 ]; then
+            # A formal baseline without Windows assets is the first issuance only.
+            jq -e '[.[] | select(.name | test("windows"; "i"))] | length == 0' "$RUNNER_TEMP/baseline-assets.json"
+            printf 'url=\nsha256=\n' >> "$GITHUB_OUTPUT"
+          else
+            test "$count" = 1
+            expected="https://github.com/$GITHUB_REPOSITORY/releases/download/$BASELINE_TAG/ferrum-windows-launcher-v1.exe"
+            jq -e --arg url "$expected" '.[] | select(.name == "ferrum-windows-launcher-v1.exe") | .browser_download_url == $url and (.digest | test("^sha256:[0-9a-f]{64}$"))' "$RUNNER_TEMP/baseline-assets.json"
+            sha=$(jq -er '.[] | select(.name == "ferrum-windows-launcher-v1.exe") | .digest | sub("^sha256:"; "")' "$RUNNER_TEMP/baseline-assets.json")
+            printf 'url=%s\nsha256=%s\n' "$expected" "$sha" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -148,6 +174,8 @@ jobs:
       release_candidate_tag: ${{ needs.prepare.outputs.rc_tag }}
       staging_label: run-${{ github.run_id }}-${{ github.run_attempt }}
       publish_release: false
+      windows_launcher_url: ${{ needs.prepare.outputs.windows_launcher_url }}
+      windows_launcher_sha256: ${{ needs.prepare.outputs.windows_launcher_sha256 }}
 
   tasks:
     needs: [prepare, quality, stage, stage-cuda]
@@ -519,6 +547,11 @@ jobs:
           path: ${{ runner.temp }}/staged
       - uses: actions/download-artifact@v4
         with:
+          artifact-ids: ${{ needs.stage-cuda.outputs.windows_asset_id }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/staged-windows
+      - uses: actions/download-artifact@v4
+        with:
           pattern: release-*-evidence
           path: ${{ runner.temp }}/evidence
       - uses: actions/download-artifact@v4
@@ -554,6 +587,7 @@ jobs:
           gate_args=(--plan "$RUNNER_TEMP/plan/release-plan.json" --tasks "$RUNNER_TEMP/tasks/tasks.json"
             --contracts "$RUNNER_TEMP/contracts/contract-checks.json" --version "$VERSION"
             --workspace "$GITHUB_WORKSPACE" --notes "$RUNNER_TEMP/plan/release-notes.md"
+            --windows-staged "$RUNNER_TEMP/staged-windows"
             --repo "$GITHUB_REPOSITORY" --ci-run-id "$GITHUB_RUN_ID")
           for abi in "$RUNNER_TEMP/staged/"*.abi.json; do gate_args+=(--abi "$abi"); done
           for install in "$RUNNER_TEMP/installation/"*.json; do gate_args+=(--installation "$install"); done

@@ -184,17 +184,30 @@ async fn extract(archive: &Path, binary: &Path, expected_sha: &str) -> Result<()
     Ok(())
 }
 pub(super) async fn probe(binary: &Path, arguments: &[&str]) -> Result<Observation, String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(30),
-        Command::new(binary)
-            .args(arguments)
-            .stdin(Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("startup probe {arguments:?} timed out"))?
-    .map_err(|e| e.to_string())?;
+    probe_with_environment(binary, arguments, None, None).await
+}
+
+pub(super) async fn probe_with_environment(
+    binary: &Path,
+    arguments: &[&str],
+    environment: Option<&std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>>,
+    working_directory: Option<&Path>,
+) -> Result<Observation, String> {
+    let mut command = Command::new(binary);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    if let Some(environment) = environment {
+        command.env_clear().envs(environment);
+    }
+    if let Some(directory) = working_directory {
+        command.current_dir(directory);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| format!("startup probe {arguments:?} timed out"))?
+        .map_err(|e| e.to_string())?;
     Ok(Observation {
         arguments: arguments.iter().map(|s| (*s).into()).collect(),
         exit_code: output.status.code(),

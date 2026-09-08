@@ -12,6 +12,8 @@ mod installation;
 mod local;
 #[path = "release_delivery/performance.rs"]
 mod performance;
+#[path = "release_delivery/portable.rs"]
+mod portable;
 #[path = "release_delivery/public_install.rs"]
 mod public_install;
 #[path = "release_delivery/publish.rs"]
@@ -41,6 +43,8 @@ struct Args {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Package or inspect a Windows CUDA portable ZIP; no publication gate.
+    Portable(portable::PortableArgs),
     Inspect(installation::InspectArgs),
     Installed(public_install::InstalledArgs),
     Gate {
@@ -64,6 +68,7 @@ enum Action {
 }
 async fn run(action: Action) -> Result<(), String> {
     match action {
+        Action::Portable(args) => portable::execute(args).await,
         Action::Installed(args) => public_install::verify(args).await,
         Action::Gate { inputs, output } => {
             let accepted = gate::verify(inputs).await?;

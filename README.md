@@ -15,23 +15,25 @@
 
 ## Quick Start
 
-Install Ferrum:
-
-Choose the install command for your platform; it automatically adds the tap.
-Homebrew 6 also needs both [formula definitions](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)
-trusted for its conflict check. Review them before running the trust command;
-older Homebrew versions can skip it. See [Homebrew's trust documentation](https://docs.brew.sh/Tap-Trust).
+Install the latest stable Ferrum on macOS Apple Silicon or Linux x86_64:
 
 ```bash
-# Homebrew 6: trust the reviewed formula definitions
-brew trust --formula sizzlecar/ferrum/ferrum sizzlecar/ferrum/ferrum-cuda
-
-# macOS Apple Silicon
-brew install sizzlecar/ferrum/ferrum
-
-# Linux x86_64, NVIDIA CUDA sm89
-brew install sizzlecar/ferrum/ferrum-cuda
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh
 ```
+
+The installer verifies release checksums and adds `~/.local/bin` to your shell's
+PATH. Open a new terminal afterward. [Homebrew and manual installation](#installation)
+are also available.
+
+Windows x64 with an NVIDIA sm89 GPU is supported starting with **0.8.9**.
+Install from PowerShell:
+
+```powershell
+irm https://ferrum.pandaailabs.com/install.ps1 | iex
+```
+
+The script verifies the setup checksum, installs for the current user, and adds
+Ferrum to PATH, including the current PowerShell session.
 
 Inspect the installed binary before downloading weights:
 
@@ -64,10 +66,34 @@ ferrum doctor qwen3.5:4b
 ferrum run qwen3.5:4b --disable-thinking
 ```
 
+### Windows NVIDIA CUDA (0.8.9+)
+
+For a 6GB RTX 4050, use the 2B model with a 2048-token context and one active
+sequence. The first run downloads the model; these commands preserve its default
+thinking behavior and allow up to 512 generated tokens:
+
+```powershell
+ferrum doctor Qwen/Qwen3.5-2B
+ferrum run Qwen/Qwen3.5-2B --backend cuda --max-model-len 2048 --max-num-seqs 1 --max-tokens 512
+```
+
+To serve it, run:
+
+```powershell
+ferrum serve --model Qwen/Qwen3.5-2B --served-model-name ferrum --backend cuda --max-model-len 2048 --max-num-seqs 1 --port 8000
+```
+
+Then send a request from another PowerShell terminal:
+
+```powershell
+$body = @{ model = 'ferrum'; messages = @(@{ role = 'user'; content = 'Reply with a short hello.' }); max_tokens = 512 } | ConvertTo-Json -Depth 4
+Invoke-RestMethod http://localhost:8000/v1/chat/completions -Method Post -ContentType 'application/json' -Body $body
+```
+
 Ferrum does not silently select a model. `run` requires MODEL, and `serve`
 requires either `--model` or an intentional `default_model` in `ferrum.toml`.
 
-Serve the same model through an OpenAI-compatible API:
+On macOS and Linux, serve the same model through an OpenAI-compatible API:
 
 ```bash
 # macOS Metal
@@ -85,7 +111,7 @@ A working request returns HTTP 200 with a non-empty assistant response. Ferrum
 uses the model's context limit unless `--max-model-len` is set explicitly; any
 explicit limit must fit the rendered input plus the requested output budget.
 
-The Quick Start uses `--disable-thinking` so the first response is short and
+The macOS and Linux examples use `--disable-thinking` so the first response is short and
 direct. Omit the flag to preserve the model template's default reasoning
 behavior; an HTTP request can override the server default with
 `chat_template_kwargs.enable_thinking`, Chat `reasoning_effort`, or Responses
@@ -145,7 +171,46 @@ and session caching.
 
 ## Installation
 
-Homebrew (see the formula trust explanation in [Quick Start](#quick-start)):
+Windows **0.8.9 and later** can also be installed by downloading
+`ferrum-<version>-windows-x86_64-cuda-sm89-setup.exe` and its `.sha256` file from
+[Releases](https://github.com/sizzlecar/ferrum-infer-rs/releases), verifying the
+checksum, and running setup. It installs under `%LOCALAPPDATA%\Programs\Ferrum`
+and adds the current-user PATH; open a new terminal after a manual setup install.
+The package includes CUDA and VC runtimes. It requires a compatible NVIDIA sm89
+GPU and driver (551.78 or later); it does not install the system driver or include
+models. CUDA Toolkit, Rust, and build tools are not needed. Ferrum remains a
+command-line application with `run` and `serve`, without a GUI or background service.
+
+To upgrade Windows, rerun the same PowerShell install command or the newer setup.
+Existing sessions keep running their original version; new launches use the
+updated version. Models, configuration, and existing version directories are
+preserved. Restart an existing server when you want it to use the update.
+
+The macOS/Linux one-line installer selects Metal on Apple Silicon. On Linux it selects CUDA
+for compatible sm89 GPUs when the driver, CUDA 12.4 and NCCL runtimes can load,
+and otherwise selects CPU. You can require a backend or install a specific version:
+
+```bash
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --backend cuda
+curl -fsSL https://ferrum.pandaailabs.com/install.sh | sh -s -- --version 0.8.8
+```
+
+To upgrade an installation made with the script, rerun the original install
+command. It keeps existing version directories and switches the entry point to
+the verified new binary. Running sessions continue using their current version;
+new launches use the new version. Restart an existing server when you want it to
+use the update. Models and configuration are preserved.
+
+For immediate PATH setup in the current terminal:
+
+```bash
+. "$HOME/.local/share/ferrum/installer/env"
+```
+
+For Homebrew installations, use `brew upgrade` for the installed formula.
+Homebrew 6 needs both [formula definitions](https://github.com/sizzlecar/homebrew-ferrum/tree/main/Formula)
+trusted for its conflict check. Review them before running the trust command;
+older Homebrew versions can skip it. See [Homebrew's trust documentation](https://docs.brew.sh/Tap-Trust).
 
 ```bash
 # Homebrew 6: trust the reviewed formula definitions
@@ -183,7 +248,7 @@ Install the latest Metal build from crates.io:
 cargo install ferrum-cli --locked --features metal
 ```
 
-The official prebuilt CUDA asset targets `sm89`. CUDA installation requires a
+The official prebuilt Linux CUDA asset targets `sm89`. Linux CUDA installation requires a
 compatible NVIDIA driver, CUDA runtime, and NCCL runtime on the target host.
 CUDA source builds also require Ferrum's matching native-operator set, so use
 the prebuilt CUDA tarball or Homebrew formula for the supported install path.
