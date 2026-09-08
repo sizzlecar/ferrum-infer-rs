@@ -127,6 +127,12 @@ fn cloud_runner_arguments_preserve_expected_semantics_and_quote_shell_data() {
     assert_eq!(after("--stop-prompt"), Some(task.stop_prompt.as_str()));
     assert_eq!(after("--checks"), Some("basic,stop,tools"));
     assert_eq!(after("--max-tokens"), Some("512"));
+    // Cold loading shares the whole task's existing limit; request and server
+    // startup limits keep their independent defaults and are not inflated.
+    assert_eq!(after("--run-timeout-secs"), Some("1800"));
+    assert_eq!(words[3], "1800s");
+    assert_eq!(after("--startup-timeout-secs"), None);
+    assert_eq!(after("--request-timeout-secs"), None);
     assert_eq!(after("--context-tokens"), None);
     assert_eq!(after("--max-num-seqs"), None);
     for flag in [
