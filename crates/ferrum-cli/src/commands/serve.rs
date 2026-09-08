@@ -2163,7 +2163,7 @@ fn compiled_kernel_features() -> CompiledKernelFeatures {
         cuda_graph: cfg!(feature = "cuda"),
         greedy_argmax: cfg!(feature = "cuda") || cfg!(feature = "metal"),
         fa2_source: false,
-        fa2_direct_ffi: cfg!(feature = "cuda"),
+        fa2_direct_ffi: cfg!(all(unix, feature = "cuda")),
         fa2_native_operator_artifact: fa2_native.is_some() || has_v2_fa2,
         fa2_native_operator_artifact_metadata: fa2_native.map(|artifact| {
             CompiledNativeOperatorArtifact {

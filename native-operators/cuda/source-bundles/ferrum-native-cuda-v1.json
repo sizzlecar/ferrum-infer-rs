@@ -1,18 +1,18 @@
 {
   "archive": {
-    "file_name": "ferrum-native-cuda-sources-a8.tar.gz",
+    "file_name": "ferrum-native-cuda-sources-a9.tar.gz",
     "format": "tar.gz",
-    "sha256": "7e85c08657e1b6785abfabb9728bf5a5c9f63cc68df7a5a4c665cf6f647eb930",
-    "size_bytes": 123201
+    "sha256": "3bf31ad487a48c4493869296ee40ecb0acfcd5b4c66ca26bd1953ab60fce31a6",
+    "size_bytes": 119557
   },
-  "bundle_id": "ferrum-native-cuda-v1+sha256.ce176cb717a2d9faad8c45d387c8a336866d30ac26212893d8a665f207ef56ab",
+  "bundle_id": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
   "distribution": {
-    "asset_name": "ferrum-native-cuda-sources-a8.tar.gz",
+    "asset_name": "ferrum-native-cuda-sources-a9.tar.gz",
     "kind": "github-release-asset",
     "repository": "sizzlecar/ferrum-infer-rs",
-    "tag": "ferrum-native-cuda-sources-a8"
+    "tag": "ferrum-native-cuda-sources-a9"
   },
-  "member_set_sha256": "ce176cb717a2d9faad8c45d387c8a336866d30ac26212893d8a665f207ef56ab",
+  "member_set_sha256": "b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
   "members": [
     {
       "path": "kernels/marlin_cuda_kernel.cu",
@@ -31,8 +31,8 @@
     },
     {
       "path": "kernels/vllm_attn/attention_kernels.cuh",
-      "sha256": "2981b1b970e94e7f617d11df20f6b484a54f6774bd8a31e63556f68c2c8a509a",
-      "size_bytes": 29949
+      "sha256": "4a961f33700f62a2250157dd41f8db66e5a31c00c0076d82eca02eb16640c97e",
+      "size_bytes": 30169
     },
     {
       "path": "kernels/vllm_attn/attention_utils.cuh",
@@ -81,13 +81,13 @@
     },
     {
       "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
-      "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f",
-      "size_bytes": 14162
+      "sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c",
+      "size_bytes": 14180
     },
     {
       "path": "kernels/vllm_marlin_moe/kernel.h",
-      "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67",
-      "size_bytes": 2561
+      "sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364",
+      "size_bytes": 2589
     },
     {
       "path": "kernels/vllm_marlin_moe/kernel_instantiations.cu",
@@ -96,8 +96,8 @@
     },
     {
       "path": "kernels/vllm_marlin_moe/marlin_template.h",
-      "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19",
-      "size_bytes": 78563
+      "sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700",
+      "size_bytes": 78619
     },
     {
       "path": "kernels/vllm_marlin_moe/ops.cu",
@@ -171,8 +171,8 @@
     },
     {
       "path": "vllm_marlin/marlin_template.h",
-      "sha256": "42445fefe782c30686a1fe1e03da35001ee151b334614aa089cd7106d8d5cc17",
-      "size_bytes": 81758
+      "sha256": "c87b3198d9bcbdfe990fe9b4aa179ba123b0ec6a4aa166789867a987043a095a",
+      "size_bytes": 81814
     },
     {
       "path": "vllm_marlin/scalar_type.hpp",

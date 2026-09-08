@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.vllm_moe_marlin",
   "source_package": {
     "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.ce176cb717a2d9faad8c45d387c8a336866d30ac26212893d8a665f207ef56ab",
-    "sha256": "fd71013feedc81abd7295f371878aafd2b2f0aebced777a2a7162c73e96e4603"
+    "revision": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
+    "sha256": "77a909a3a9b6000000c8243a7c4c8e631cca4406f6f79aff06b43fb5cd695c07"
   },
   "upstream_sources": [
     {
@@ -26,15 +26,15 @@
   "headers": [
     {
       "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
-      "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+      "sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c"
     },
     {
       "path": "kernels/vllm_marlin_moe/kernel.h",
-      "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+      "sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364"
     },
     {
       "path": "kernels/vllm_marlin_moe/marlin_template.h",
-      "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+      "sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700"
     },
     {
       "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
@@ -59,15 +59,15 @@
       "headers": [
         {
           "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
-          "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+          "sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c"
         },
         {
           "path": "kernels/vllm_marlin_moe/kernel.h",
-          "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+          "sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364"
         },
         {
           "path": "kernels/vllm_marlin_moe/marlin_template.h",
-          "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+          "sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700"
         },
         {
           "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
@@ -86,22 +86,22 @@
           "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
         }
       ],
-      "closure_sha256": "3f1605ddca3e6e3a33715d79b83aa3e20991990cebcc6ef4326b67793edc6249"
+      "closure_sha256": "6b7b0ccdd863cec7d948453dbcd27fef262e36ed01a2615fe9997708b04d067d"
     },
     {
       "translation_unit": "kernels/vllm_marlin_moe/ops.cu",
       "headers": [
         {
           "path": "kernels/vllm_marlin_moe/core/scalar_type.hpp",
-          "sha256": "bda15fbc215b862dd8a0e5bb97a7b19b0edad1376af973082394a0e69c8fea8f"
+          "sha256": "981808135cbe1456fa8f9dd476af5a70ee8bcfb9b4fbd50b5ed22b8f456de52c"
         },
         {
           "path": "kernels/vllm_marlin_moe/kernel.h",
-          "sha256": "daf2a906200adfab7bc7e18d58075292b8e940e81c6e7af604850e40ae539c67"
+          "sha256": "a022529facc9ebcb64a00ab57e11de34c223e887a3b13bc4788e55c4efb3d364"
         },
         {
           "path": "kernels/vllm_marlin_moe/marlin_template.h",
-          "sha256": "50aff0a25504305eaa042c27b3ca840c9b396d3e4d345d78ef0a171086f9ed19"
+          "sha256": "2a68bab99c31dcf0759a7e89c067f8bf199a2917a9d422a91c752e945c49c700"
         },
         {
           "path": "kernels/vllm_marlin_moe/quantization/gptq_marlin/dequant.h",
@@ -120,7 +120,7 @@
           "sha256": "6798f312dde391a9a02a685e47c96b716647b8a405200b87d5e68af7b402af50"
         }
       ],
-      "closure_sha256": "8bf3a416aab46f2b3d9800f2c1a15844fcd31679e3a9a55747e211c8944f4028"
+      "closure_sha256": "8f8e5b4dcfb8f779aed0a0affef98bcc5f938586c852ac4539233c186d316915"
     }
   ],
   "include_dirs": [

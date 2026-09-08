@@ -3,8 +3,8 @@
   "operator": "ferrum.cuda.vllm_paged_attention_v2",
   "source_package": {
     "kind": "ferrum-native-source-bundle",
-    "revision": "ferrum-native-cuda-v1+sha256.ce176cb717a2d9faad8c45d387c8a336866d30ac26212893d8a665f207ef56ab",
-    "sha256": "c8c7e5a8063162c2959e29122f1a88ccb14ac7789e8447199d14608d5dfac428"
+    "revision": "ferrum-native-cuda-v1+sha256.b5a82f9db0907a965594d0405a7fea065ff670dbe618832a4f0a1c64b186fed1",
+    "sha256": "de439dd07a2c34efc0a9f7c74b67291d347d28cdf2dd342084c031cfd93ec253"
   },
   "upstream_sources": [
     {
@@ -30,7 +30,7 @@
     },
     {
       "path": "kernels/vllm_attn/attention_kernels.cuh",
-      "sha256": "2981b1b970e94e7f617d11df20f6b484a54f6774bd8a31e63556f68c2c8a509a"
+      "sha256": "4a961f33700f62a2250157dd41f8db66e5a31c00c0076d82eca02eb16640c97e"
     },
     {
       "path": "kernels/vllm_attn/attention_utils.cuh",
@@ -79,7 +79,7 @@
         },
         {
           "path": "kernels/vllm_attn/attention_kernels.cuh",
-          "sha256": "2981b1b970e94e7f617d11df20f6b484a54f6774bd8a31e63556f68c2c8a509a"
+          "sha256": "4a961f33700f62a2250157dd41f8db66e5a31c00c0076d82eca02eb16640c97e"
         },
         {
           "path": "kernels/vllm_attn/attention_utils.cuh",
@@ -114,7 +114,7 @@
           "sha256": "cb3bb3d40f972dd2649d42536c26c767f68dfb5c09ba9d4856299a888af12f17"
         }
       ],
-      "closure_sha256": "7cf8a97de5f029b5c9a84aeaa05a6bd9c02aedccfd60fd6bc86a4e197fff9526"
+      "closure_sha256": "c69b65bb947965044559c731174eb1a233381fc028121fdb21e1deaf24c8d469"
     }
   ],
   "include_dirs": [

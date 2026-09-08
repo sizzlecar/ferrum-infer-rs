@@ -92,7 +92,9 @@ dirs = "5.0"
 futures = "0.3"
 
 hf-hub = "0.4.1"
-tokenizers = { version = "0.21", features = ["onig"] }
+# Keep inference features; the optional C++ vocabulary trainer forces a static
+# MSVC CRT that conflicts with the native CUDA operators' dynamic CRT.
+tokenizers = { version = "0.21", default-features = false, features = ["onig", "progressbar"] }
 safetensors = "0.4"
 
 # Random - 使用与candle-vllm相同的版本
