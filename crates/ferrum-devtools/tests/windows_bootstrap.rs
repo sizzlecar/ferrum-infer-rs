@@ -18,7 +18,15 @@ fn powershell(body: &str, environment: &[(&str, &str)]) -> std::process::Output 
     let program = Path::new(&std::env::var_os("SystemRoot").unwrap())
         .join("System32/WindowsPowerShell/v1.0/powershell.exe");
     Command::new(program)
-        .args(["-NoProfile", "-NonInteractive", "-Command"])
+        // Load the repository's unsigned script only in this test process,
+        // independently of the invoking shell's execution policy.
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+        ])
         .arg(format!(
             "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); . {}; {body}",
             quote(script.to_str().unwrap())
