@@ -4,8 +4,25 @@ use syn::{Attribute, Item, Meta};
 
 mod ready;
 pub use ready::run_ready_capability_only;
+mod command_future;
+pub use command_future::boxed_command_dispatch_only;
+mod cli_capability;
+pub use cli_capability::{cli_run_reasoning_mask_only, cli_serve_host_capability_only};
+mod cuda_host;
+pub use cuda_host::{cuda_diagnostic_loader_only, cuda_optional_exports_only};
+mod core_build;
+pub use core_build::core_cuda_build_host_only;
+mod observability_host;
+pub use observability_host::{journal_initialization_only, windows_process_memory_only};
+mod protocol_observability;
+pub use protocol_observability::{protocol_observability_unchanged, ProtocolObservabilityKind};
 mod model_metadata;
 pub use model_metadata::{gptq_format_validation_only, model_template_wiring_only};
+mod reasoning_metadata;
+pub use reasoning_metadata::{
+    reasoning_controls_exports_only, reasoning_descriptor_metadata_only,
+    reasoning_effort_declaration_only,
+};
 
 fn test_configuration(attribute: &Attribute) -> bool {
     let Meta::List(list) = &attribute.meta else {

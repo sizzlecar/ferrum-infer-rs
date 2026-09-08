@@ -1,5 +1,9 @@
 //! Generate a reviewable regression plan from a complete Git diff and product catalog.
 //! Planning does not execute checks or authorize a release.
+#[path = "regression_plan/native_artifacts.rs"]
+mod native_artifacts;
+#[path = "regression_plan/readme.rs"]
+mod readme;
 #[path = "regression_plan/scope.rs"]
 mod scope;
 
@@ -232,11 +236,26 @@ fn run(args: Args) -> Result<(), String> {
         None
     };
     let paths = changed_paths_between(&args.repo, &base, &candidate)?;
-    let analysis = scope::analyze(&args.repo, &base, &candidate, &paths);
+    let mut analysis = scope::analyze(&args.repo, &base, &candidate, &paths);
     let catalog_bytes = fs::read(&args.catalog)
         .map_err(|error| format!("read {}: {error}", args.catalog.display()))?;
-    let catalog = serde_json::from_slice(&catalog_bytes)
+    let mut catalog = serde_json::from_slice(&catalog_bytes)
         .map_err(|error| format!("read product catalog JSON: {error}"))?;
+    let reviews = readme::take_reviews(&mut catalog)?;
+    let readme_reviews = readme::apply_reviews(&mut analysis.impact, &reviews, |path| {
+        Ok((
+            git(&args.repo, &["cat-file", "blob", &format!("{base}:{path}")])?,
+            git(
+                &args.repo,
+                &["cat-file", "blob", &format!("{candidate}:{path}")],
+            )?,
+        ))
+    })?;
+    let native_artifact_refinement = if args.stage == "release" {
+        native_artifacts::refine(&args.repo, &base, &candidate, &mut analysis.impact)
+    } else {
+        json!({"applied": false, "reason": "artifact host projection only applies to formal release plans"})
+    };
     let input = plan_input(catalog, &args.stage, analysis.impact)?;
     let plan = plan(&input)?;
     let document = json!({
@@ -246,7 +265,10 @@ fn run(args: Args) -> Result<(), String> {
             "catalog_sha256": format!("{:x}", Sha256::digest(&catalog_bytes)),
             "release_base_tag": release_base_tag, "version_refinement": analysis.version_refinement,
             "dependency_refinement": analysis.dependency_refinement,
-            "content_refinement": analysis.content_refinement},
+            "content_refinement": analysis.content_refinement,
+            "native_artifact_refinement": native_artifact_refinement,
+            "readme_reviews_applied": readme_reviews.applied,
+            "readme_reviews_unmatched": readme_reviews.unmatched},
         "model_tasks": model_task_schedule(&plan),
         "performance_tasks": performance_task_schedule(&plan),
         "plan": plan,
@@ -771,6 +793,109 @@ ferrum-engine = { path = "crates/ferrum-engine", version = "1.2.3" }
         let analysis = scope::analyze(&repo.0, &base, &candidate, &paths);
         assert_eq!(analysis.dependency_refinement["applied"], false);
         assert_eq!(analysis.impact.areas, ChangeArea::ALL);
+    }
+
+    #[test]
+    fn readme_review_uses_immutable_git_content_and_rejects_a_later_claim() {
+        use ferrum_bench_core::release_regression::{Backend, ExecutionTarget, ModelProfile};
+        use ferrum_types::{ModelOutputProtocol, ModelReasoningProtocol};
+        let repo = GitFixture::new();
+        let before = "# Product\nInstall the package.\n";
+        let after = "# Product\nInstall the package and use its API.\n";
+        fs::write(repo.0.join("README.md"), before).unwrap();
+        let base = repo.commit();
+        fs::write(repo.0.join("README.md"), after).unwrap();
+        let candidate = repo.commit();
+        let review = readme::ReadmeReview {
+            path: "README.md".into(),
+            before_sha256: format!("{:x}", Sha256::digest(before.as_bytes())),
+            after_sha256: format!("{:x}", Sha256::digest(after.as_bytes())),
+            areas: vec![ferrum_bench_core::release_regression::ChangeArea::Build],
+            rationale: "Reviewed the installation description.".into(),
+        };
+        let profile = ModelProfile {
+            id: "quick-start".into(),
+            model: "fixture".into(),
+            target: ExecutionTarget {
+                architecture: "dense".into(),
+                protocol: ModelOutputProtocol::Text,
+                precision: "f32".into(),
+                backend: Backend::Cpu,
+                execution_path: "production-plan-runtime".into(),
+            },
+            available: true,
+            estimate: None,
+            reasoning_protocol: ModelReasoningProtocol::None,
+        };
+        let targets =
+            [Backend::Cpu, Backend::Metal, Backend::Cuda].map(|backend| ExecutionTarget {
+                backend,
+                ..profile.target.clone()
+            });
+        let catalog = repo.0.join("catalog.json");
+        fs::write(
+            &catalog,
+            serde_json::to_vec(&json!({
+                "profiles": [profile], "quick_start_profile_ids": ["quick-start"], "required_targets": targets,
+                "readme_reviews": [review]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // Worktree edits cannot replace the candidate's reviewed blob.
+        fs::write(
+            repo.0.join("README.md"),
+            "Supports an unreviewed new model.",
+        )
+        .unwrap();
+        let output = repo.0.join("plan.json");
+        run(Args {
+            catalog: catalog.clone(),
+            base: base.clone(),
+            candidate,
+            stage: "pull_request".into(),
+            repo: repo.0.clone(),
+            output: Some(output.clone()),
+            summary: None,
+        })
+        .unwrap();
+        let document: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(
+            document["provenance"]["readme_reviews_applied"],
+            json!([review])
+        );
+        assert_eq!(
+            document["plan"]["impact"]["product_contract_changed"],
+            false
+        );
+        assert!(
+            !document["plan"]["gaps"].as_array().unwrap().is_empty(),
+            "documentation review does not supply missing execution coverage"
+        );
+        // Once the changed claim is committed, the previous review is stale.
+        fs::remove_file(&output).unwrap();
+        let later = repo.commit();
+        run(Args {
+            catalog,
+            base,
+            candidate: later,
+            stage: "pull_request".into(),
+            repo: repo.0.clone(),
+            output: Some(output.clone()),
+            summary: None,
+        })
+        .unwrap();
+        let later: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(later["plan"]["impact"]["product_contract_changed"], true);
+        assert_eq!(later["provenance"]["readme_reviews_applied"], json!([]));
+        assert_eq!(
+            later["provenance"]["readme_reviews_unmatched"][0]["path"],
+            "README.md"
+        );
+        assert!(later["plan"]["gaps"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"kind":"product_contract_review"})));
     }
 
     #[test]

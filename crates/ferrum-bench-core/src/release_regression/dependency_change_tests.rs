@@ -1,6 +1,6 @@
 use super::*;
 
-fn fixture() -> BTreeMap<String, String> {
+pub(super) fn fixture() -> BTreeMap<String, String> {
     [
         ("Cargo.toml", r#"[workspace]
 members = ["crates/ferrum-bench-core", "crates/app"]

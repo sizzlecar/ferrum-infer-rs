@@ -1,5 +1,5 @@
 //! Conservative component mapping for a complete PR or release diff.
-//! Only the declared backend module boundaries narrow accelerator reach. Shared
+//! Declared backend modules and native build inputs narrow accelerator reach. Shared
 //! and unfamiliar paths retain component-wide scope; model identity is not inferred.
 use super::types::{Backend, ChangeArea, Impact, PathImpact};
 use std::collections::BTreeSet;
@@ -62,13 +62,16 @@ where
     result
 }
 
-/// These are the actual isolated modules declared by backend/mod.rs. None means
-/// shared or unreviewed reach, never that no backend is affected. Keep this proof
+/// Isolated modules declared by backend/mod.rs and CUDA native build inputs.
+/// None means shared or unreviewed reach, never that no backend is affected. Keep this proof
 /// attached to each contributing path; an unrelated Metal path cannot narrow a
 /// shared protocol, dependency or model-program change in the same diff.
 pub(super) fn path_backend(path: &str) -> Option<Backend> {
     if !valid_relative_path(path) {
         return None;
+    }
+    if cuda_build_descriptor(path) {
+        return Some(Backend::Cuda);
     }
     let relative = path.strip_prefix("crates/ferrum-kernels/src/backend/")?;
     if relative == "cpu.rs" {
@@ -83,6 +86,33 @@ pub(super) fn path_backend(path: &str) -> Option<Backend> {
         }
     }
     None
+}
+
+fn cuda_build_descriptor(path: &str) -> bool {
+    let Some(relative) = path.strip_prefix("native-operators/cuda/") else {
+        return false;
+    };
+    let Some((directory, filename)) = relative.split_once('/') else {
+        return false;
+    };
+    let suffix = match directory {
+        "source-bundles" | "source-definitions" | "package-definitions" => ".json",
+        "source-locks" => ".plan.json",
+        _ => return false,
+    };
+    !filename.contains('/')
+        && filename
+            .strip_suffix(suffix)
+            .is_some_and(|stem| !stem.is_empty())
+}
+
+fn cargo_integration_target(relative: &str) -> bool {
+    relative.strip_prefix("tests/").is_some_and(|name| {
+        !name.contains('/')
+            && name
+                .strip_suffix(".rs")
+                .is_some_and(|stem| !stem.is_empty())
+    })
 }
 
 fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
@@ -129,6 +159,22 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
             "source packaging inputs; retain build and installation checks",
         ));
     }
+    if matches!(
+        path,
+        ".gitattributes"
+            | "scripts/install.sh"
+            | "scripts/install.ps1"
+            | "packaging/windows/ferrum.iss"
+            | "website/cloudflare-worker.js"
+            | "website/wrangler.jsonc"
+    ) {
+        return Some((vec![Build, Validation],
+            "source checkout and distribution entrypoints: retain build, installation, upgrade and publication contracts; inference executes in the separately built product"));
+    }
+    if cuda_build_descriptor(path) {
+        return Some((vec![Build, Kernel],
+            "declared CUDA native source/package manifests and locked compiler inputs: retain artifact/ABI validation and CUDA operator coverage; model architecture is a separate source owner"));
+    }
     if path.starts_with(".github/workflows/")
         || path.starts_with(".github/ci/")
         || matches!(
@@ -152,6 +198,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     let rest = path.strip_prefix("crates/")?;
     let (component, relative) = rest.split_once('/')?;
     if component == "ferrum-devtools" {
+        if cargo_integration_target(relative)
+            || relative == "tests/fixtures/unix_bootstrap_program.rs"
+        {
+            return Some((vec![Validation],
+                "independent Cargo integration target or the Rust child executable compiled by unix_bootstrap; production imports retain their own source impact"));
+        }
         if relative == "Cargo.toml" || (relative.starts_with("src/") && relative.ends_with(".rs")) {
             return Some((vec![Build, Validation],
                 "private development-tool crate; manifest changes require complete snapshot validation of publish=false and dependency isolation"));
@@ -159,6 +211,10 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
         // Build hooks, assets and additional configuration are not inferred from
         // this private crate's name. Its reviewed Rust source boundary is explicit.
         return None;
+    }
+    if component == "ferrum-kernels" && matches!(relative, "build.rs" | "build_support/host.rs") {
+        return Some((vec![Build, Kernel],
+            "native build producer can alter device compiler flags as well as host tools and linkage; require a content proof before narrowing numerical scope"));
     }
     if matches!(relative, "Cargo.toml" | "build.rs") {
         // A crate dependency or build hook can change behavior beyond its own source.
@@ -169,7 +225,12 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     }
     // continuous_engine.rs declares this exact module under cfg(test). A
     // changed production parent/import still contributes its own full reach.
-    if component == "ferrum-engine" && relative == "src/continuous_engine/tests.rs" {
+    if component == "ferrum-engine"
+        && matches!(
+            relative,
+            "src/continuous_engine/tests.rs" | "src/continuous_engine/tests/auto_tools_json.rs"
+        )
+    {
         return Some((
             vec![Validation],
             "engine unit-test module declared only under cfg(test)",
@@ -179,18 +240,80 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     // Keep nested fixtures/helpers and unknown crates conservative: their use
     // cannot be established from a directory name alone. A production import
     // added alongside a test still contributes its own production source diff.
-    if known_component(component)
-        && relative.strip_prefix("tests/").is_some_and(|name| {
-            !name.contains('/')
-                && name
-                    .strip_suffix(".rs")
-                    .is_some_and(|stem| !stem.is_empty())
-        })
-    {
+    if known_component(component) && cargo_integration_target(relative) {
         return Some((
             vec![Validation],
             "known crate's top-level Cargo integration-test target",
         ));
+    }
+    if (component == "ferrum-native-ops" && relative == "src/coff_tests.rs")
+        || (component == "ferrum-native-ops-builder"
+            && matches!(
+                relative,
+                "src/package_platform/tests.rs"
+                    | "src/source_build/windows_tests.rs"
+                    | "src/source_build/platform/msvc_probe_tests.rs"
+            ))
+    {
+        return Some((vec![Validation],
+            "declared native artifact and compiler-probe unit-test modules; production build and operator inputs retain their independent impact"));
+    }
+    if (component == "ferrum-native-ops"
+        && matches!(
+            relative,
+            "src/lib.rs"
+                | "src/abi.rs"
+                | "src/artifact_set.rs"
+                | "src/build_cache.rs"
+                | "src/build_unit.rs"
+                | "src/coff.rs"
+                | "src/manifest.rs"
+                | "src/registry.rs"
+                | "src/resolver.rs"
+        ))
+        || (component == "ferrum-native-ops-builder"
+            && matches!(
+                relative,
+                "src/lib.rs"
+                    | "src/main.rs"
+                    | "src/package_platform.rs"
+                    | "src/source_build/depfile.rs"
+                    | "src/source_build/platform.rs"
+                    | "src/source_build/platform/msvc.rs"
+            ))
+        || (component == "ferrum-types" && relative == "src/native_operator.rs")
+    {
+        return Some((vec![Build],
+            "reviewed host compiler, artifact cache, archive, ABI and provider-admission contracts; operator implementations and their locked source inputs remain separate contributors"));
+    }
+    if component == "ferrum-native-ops-builder" && relative == "src/source_build.rs" {
+        return Some((vec![Build, Kernel],
+            "source build policy includes device mathematics flags; actual artifact consumption can narrow release host reach, but path identity alone cannot discard numerical scope"));
+    }
+    if (component == "ferrum-engine"
+        && matches!(
+            relative,
+            "src/continuous_engine/inner/completion.rs" | "src/continuous_engine/sequence.rs"
+        ))
+        || (component == "ferrum-types" && relative == "src/requests.rs")
+    {
+        return Some((vec![Template, Termination, Structured, Tools, Scheduler, Kv, Observability],
+            "request protocols, token sampling and completion, scheduler/KV ownership and execution evidence; device operators and model programs are implemented by separate consumers"));
+    }
+    if component == "ferrum-types" && relative == "src/process_memory.rs" {
+        return Some((vec![Observability],
+            "process resident-memory sampling and observation serialization; no model state or numerical execution"));
+    }
+    if component == "ferrum-cli"
+        && matches!(
+            relative,
+            "src/bin/ferrum-launcher.rs"
+                | "src/bin/launcher/current.rs"
+                | "src/bin/launcher/windows.rs"
+        )
+    {
+        return Some((vec![Build, Validation],
+            "independent Windows launcher binary and its declared modules own version selection, child lifecycle and stdio; the launched inference binary remains a separate source target"));
     }
     // These modules are only connected to the independent staged-binary test
     // executable; do not infer the same for other CLI examples or nested helpers.
@@ -251,16 +374,31 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     if component == "ferrum-models"
         && matches!(
             relative,
-            "src/hf_download.rs" | "src/hf_download/selection.rs"
+            "src/source.rs"
+                | "src/hf_download.rs"
+                | "src/hf_download/selection.rs"
+                | "src/hf_download/metadata_inventory.rs"
+                | "src/source/cached_weights.rs"
         )
     {
         return Some((
             vec![Download],
-            "Hub transfer, immutable source selection, shard closure and cache publication",
+            "Hub transfer, immutable source selection, metadata inventory, shard closure and cache publication; tensor decoding and model programs are separate consumers",
         ));
+    }
+    if component == "ferrum-cli"
+        && matches!(
+            relative,
+            "src/source_resolver/cache.rs" | "src/commands/list.rs"
+        )
+    {
+        return Some((vec![Download],
+            "shared source-cache selection and completeness, including explicit metadata overrides; no tensor loading, numerical conversion or device-state implementation"));
     }
     if (component == "ferrum-models" && relative == "src/hf_download/download_tests.rs")
         || (component == "ferrum-cli" && relative == "tests/download_jsonl/hub.rs")
+        || (component == "ferrum-cli" && relative == "tests/cache_recovery/model.rs")
+        || (component == "ferrum-cli" && relative == "src/source_resolver/cache/tests.rs")
     {
         return Some((
             vec![Validation],
@@ -270,7 +408,10 @@ fn classify(path: &str) -> Option<(Vec<ChangeArea>, &'static str)> {
     if component == "ferrum-types"
         && matches!(
             relative,
-            "src/reasoning.rs" | "src/reasoning/gemma.rs" | "src/harmony.rs"
+            "src/reasoning.rs"
+                | "src/reasoning/gemma.rs"
+                | "src/harmony.rs"
+                | "src/reasoning_controls.rs"
         )
     {
         return Some((vec![Template, Termination, Structured, Tools],
@@ -399,6 +540,9 @@ fn classify_bench_core(relative: &str) -> Option<(Vec<ChangeArea>, &'static str)
             | "examples/model_gate/tests.rs"
             | "examples/regression_plan.rs"
             | "examples/regression_plan/scope.rs"
+            | "examples/regression_plan/native_artifacts.rs"
+            | "examples/regression_plan/readme.rs"
+            | "examples/regression_plan/readme_tests.rs"
             | "examples/release_candidate.rs"
             | "examples/contract_checks.rs"
             | "examples/release_delivery.rs"
@@ -429,6 +573,236 @@ fn valid_relative_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installation_targets_keep_distribution_checks_without_hiding_inference_changes() {
+        let paths = [
+            ".gitattributes",
+            "scripts/install.sh",
+            "scripts/install.ps1",
+            "packaging/windows/ferrum.iss",
+            "website/cloudflare-worker.js",
+            "website/wrangler.jsonc",
+            "crates/ferrum-cli/src/bin/ferrum-launcher.rs",
+            "crates/ferrum-cli/src/bin/launcher/current.rs",
+            "crates/ferrum-cli/src/bin/launcher/windows.rs",
+        ];
+        for path in paths {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, [ChangeArea::Build, ChangeArea::Validation]);
+            assert!(impact.unknown_paths.is_empty(), "{path}");
+        }
+        let mixed = analyze_paths(
+            paths
+                .into_iter()
+                .chain(["crates/ferrum-kernels/src/backend/metal/fused_rms_norm.rs"]),
+        );
+        assert!(mixed.areas.contains(&ChangeArea::Build));
+        assert!(mixed.areas.contains(&ChangeArea::Kernel));
+        assert!(mixed.areas.contains(&ChangeArea::Validation));
+        for unreviewed in [
+            "scripts/inference.sh",
+            "website/inference.js",
+            "packaging/windows/unknown.ps1",
+            "crates/ferrum-cli/src/bin/launcher/unknown.rs",
+            "crates/ferrum-cli/src/commands/run.rs",
+        ] {
+            assert_eq!(analyze_paths([unreviewed]).areas, ALL_AREAS, "{unreviewed}");
+        }
+    }
+
+    #[test]
+    fn native_cuda_descriptors_retain_cuda_kernel_coverage_and_unknown_sources_expand() {
+        let descriptors = [
+            "native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json",
+            "native-operators/cuda/source-definitions/marlin.json",
+            "native-operators/cuda/package-definitions/vllm-paged-attention-v2.json",
+            "native-operators/cuda/source-locks/vllm-moe-marlin.plan.json",
+        ];
+        for path in descriptors {
+            assert_eq!(path_backend(path), Some(Backend::Cuda));
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, [ChangeArea::Kernel, ChangeArea::Build]);
+            assert!(impact.unknown_paths.is_empty());
+        }
+        let metal = "crates/ferrum-kernels/src/backend/metal/fused_rms_norm.rs";
+        let mixed = analyze_paths(descriptors.into_iter().chain([metal]));
+        assert!(mixed
+            .paths
+            .iter()
+            .any(|p| path_backend(&p.path) == Some(Backend::Metal)));
+        assert!(mixed
+            .paths
+            .iter()
+            .any(|p| path_backend(&p.path) == Some(Backend::Cuda)));
+        for unreviewed in [
+            "native-operators/cuda/kernels/marlin.cu",
+            "native-operators/cuda/source-definitions/dispatch.cu",
+            "native-operators/cuda/source-definitions/nested/config.json",
+            "native-operators/cuda/source-locks/not-a-plan.json",
+            "native-operators/cuda/source-definitions/.json",
+            "native-operators/metal/source-definitions/operator.json",
+            "native-operators/cuda/source-definitions/../kernel.json",
+        ] {
+            let impact = analyze_paths([descriptors[0], unreviewed]);
+            assert_eq!(path_backend(unreviewed), None);
+            assert_eq!(impact.areas, ALL_AREAS, "{unreviewed}");
+            assert_eq!(impact.unknown_paths, [unreviewed]);
+        }
+    }
+
+    #[test]
+    fn private_integration_targets_and_declared_fixtures_do_not_reclassify_unknown_helpers() {
+        for path in [
+            "crates/ferrum-devtools/tests/unix_bootstrap.rs",
+            "crates/ferrum-devtools/tests/windows_bootstrap.rs",
+            "crates/ferrum-devtools/tests/fixtures/unix_bootstrap_program.rs",
+            "crates/ferrum-cli/src/source_resolver/cache/tests.rs",
+        ] {
+            let impact = analyze_paths([path]);
+            assert_eq!(impact.areas, [ChangeArea::Validation]);
+            assert!(impact.unknown_paths.is_empty());
+        }
+        for path in [
+            "crates/ferrum-devtools/tests/fixtures/unknown.rs",
+            "crates/ferrum-devtools/tests/.rs",
+            "crates/ferrum-devtools/tests/config.json",
+            "crates/ferrum-cli/src/source_resolver/cache/new_helper.rs",
+        ] {
+            assert_eq!(analyze_paths([path]).areas, ALL_AREAS, "{path}");
+        }
+        let mixed = analyze_paths([
+            "crates/ferrum-devtools/tests/windows_bootstrap.rs",
+            "crates/ferrum-kernels/src/backend/cuda/marlin.rs",
+        ]);
+        assert!(mixed.areas.contains(&ChangeArea::Validation));
+        assert!(mixed.areas.contains(&ChangeArea::Kernel));
+    }
+
+    #[test]
+    fn request_lifecycle_mapping_retains_resources_and_evidence_with_native_operator_changes() {
+        let lifecycle = [
+            "crates/ferrum-engine/src/continuous_engine/inner/completion.rs",
+            "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+            "crates/ferrum-types/src/requests.rs",
+        ];
+        let expected = [
+            ChangeArea::Template,
+            ChangeArea::Termination,
+            ChangeArea::Structured,
+            ChangeArea::Tools,
+            ChangeArea::Scheduler,
+            ChangeArea::Kv,
+            ChangeArea::Observability,
+        ];
+        for path in lifecycle {
+            assert_eq!(analyze_paths([path]).areas, expected, "{path}");
+            assert_eq!(path_backend(path), None);
+        }
+        let bundle = "native-operators/cuda/source-bundles/ferrum-native-cuda-v1.json";
+        let mixed = analyze_paths(lifecycle.into_iter().chain([bundle]));
+        for area in expected {
+            assert!(mixed.areas.contains(&area), "lost {area:?}");
+        }
+        assert!(mixed.areas.contains(&ChangeArea::Kernel));
+        assert!(mixed.areas.contains(&ChangeArea::Build));
+        let native = mixed.paths.iter().find(|p| p.path == bundle).unwrap();
+        assert_eq!(native.areas, [ChangeArea::Build, ChangeArea::Kernel]);
+        assert_eq!(path_backend(&native.path), Some(Backend::Cuda));
+        for protocol in mixed.paths.iter().filter(|p| p.path != bundle) {
+            assert_eq!(protocol.areas, expected);
+            assert_eq!(path_backend(&protocol.path), None);
+        }
+        assert_eq!(
+            analyze_paths(["crates/ferrum-types/src/process_memory.rs"]).areas,
+            [ChangeArea::Observability]
+        );
+        for unreviewed in [
+            "crates/ferrum-types/src/lib.rs",
+            "crates/ferrum-models/src/lib.rs",
+            "crates/ferrum-engine/src/continuous_engine/inner/new_runtime.rs",
+        ] {
+            let combined = analyze_paths([lifecycle[0], unreviewed]);
+            assert!(combined.areas.contains(&ChangeArea::Kernel), "{unreviewed}");
+            assert!(
+                combined.areas.contains(&ChangeArea::Architecture),
+                "{unreviewed}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_host_contracts_retain_build_checks_without_hiding_runtime_or_source_changes() {
+        let host = [
+            "crates/ferrum-types/src/native_operator.rs",
+            "crates/ferrum-native-ops/src/lib.rs",
+            "crates/ferrum-native-ops/src/abi.rs",
+            "crates/ferrum-native-ops/src/artifact_set.rs",
+            "crates/ferrum-native-ops/src/build_cache.rs",
+            "crates/ferrum-native-ops/src/build_unit.rs",
+            "crates/ferrum-native-ops/src/coff.rs",
+            "crates/ferrum-native-ops/src/manifest.rs",
+            "crates/ferrum-native-ops/src/registry.rs",
+            "crates/ferrum-native-ops/src/resolver.rs",
+            "crates/ferrum-native-ops-builder/src/lib.rs",
+            "crates/ferrum-native-ops-builder/src/main.rs",
+            "crates/ferrum-native-ops-builder/src/package_platform.rs",
+            "crates/ferrum-native-ops-builder/src/source_build/depfile.rs",
+            "crates/ferrum-native-ops-builder/src/source_build/platform.rs",
+            "crates/ferrum-native-ops-builder/src/source_build/platform/msvc.rs",
+        ];
+        for path in host {
+            assert_eq!(analyze_paths([path]).areas, [ChangeArea::Build], "{path}");
+        }
+        for device_policy in [
+            "crates/ferrum-native-ops-builder/src/source_build.rs",
+            "crates/ferrum-kernels/build.rs",
+            "crates/ferrum-kernels/build_support/host.rs",
+        ] {
+            let impact = analyze_paths([device_policy]);
+            assert!(impact.areas.contains(&ChangeArea::Build));
+            assert!(
+                impact.areas.contains(&ChangeArea::Kernel),
+                "{device_policy}"
+            );
+            assert!(!impact.areas.contains(&ChangeArea::Architecture));
+        }
+        for fixture in [
+            "crates/ferrum-native-ops/src/coff_tests.rs",
+            "crates/ferrum-native-ops-builder/src/package_platform/tests.rs",
+            "crates/ferrum-native-ops-builder/src/source_build/windows_tests.rs",
+            "crates/ferrum-native-ops-builder/src/source_build/platform/msvc_probe_tests.rs",
+        ] {
+            assert_eq!(analyze_paths([fixture]).areas, [ChangeArea::Validation]);
+        }
+        let source = "native-operators/cuda/source-definitions/marlin.json";
+        assert_eq!(
+            analyze_paths(host.into_iter().chain([source])).areas,
+            [ChangeArea::Kernel, ChangeArea::Build]
+        );
+        for runtime in [
+            "crates/ferrum-native-ops/src/new_runtime.rs",
+            "crates/ferrum-native-ops-builder/src/new_runtime.rs",
+            "crates/ferrum-kernels/src/native_ops.rs",
+            "crates/ferrum-models/src/vnext/qwen35.rs",
+        ] {
+            let combined = analyze_paths([host[0], runtime]);
+            assert!(combined.areas.contains(&ChangeArea::Build));
+            assert!(combined.areas.contains(&ChangeArea::Kernel), "{runtime}");
+            assert!(
+                combined.areas.contains(&ChangeArea::Architecture),
+                "{runtime}"
+            );
+        }
+        // Manifest/build-hook changes can introduce dependencies beyond these
+        // declared source modules and still require the separate content proof.
+        for build in [
+            "crates/ferrum-native-ops/Cargo.toml",
+            "crates/ferrum-native-ops-builder/build.rs",
+        ] {
+            assert_eq!(analyze_paths([build]).areas, ALL_AREAS);
+        }
+    }
 
     #[test]
     fn reviewed_weight_sources_do_not_hide_program_or_device_changes() {
@@ -469,7 +843,7 @@ mod tests {
         assert_eq!(analyze_paths([".gitignore"]).areas, [ChangeArea::Build]);
         for parent in [
             "crates/ferrum-engine/src/continuous_engine.rs",
-            "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+            "crates/ferrum-engine/src/continuous_engine/new_runtime.rs",
             "crates/ferrum-engine/src/continuous_engine/tests/unreviewed.rs",
         ] {
             assert!(analyze_paths([tests, ".gitignore", parent])
@@ -482,7 +856,7 @@ mod tests {
     fn shared_contracts_and_engine_expand_interacting_behaviors() {
         for path in [
             "crates/ferrum-types/src/sampling.rs",
-            "crates/ferrum-engine/src/continuous_engine/sequence.rs",
+            "crates/ferrum-engine/src/continuous_engine.rs",
         ] {
             let impact = analyze_paths([path]);
             for area in [
@@ -590,7 +964,7 @@ mod tests {
     fn backend_and_build_changes_cannot_become_protocol_only_plans() {
         for path in [
             "crates/ferrum-kernels/src/cuda/ops.rs",
-            "crates/ferrum-native-ops/src/lib.rs",
+            "crates/ferrum-native-ops/src/new_runtime.rs",
             "Cargo.lock",
         ] {
             let impact = analyze_paths([path]);
@@ -646,6 +1020,9 @@ mod tests {
             "crates/ferrum-bench-core/examples/release_delivery/cloud.rs",
             "crates/ferrum-bench-core/examples/contract_checks.rs",
             "crates/ferrum-bench-core/examples/regression_plan.rs",
+            "crates/ferrum-bench-core/examples/regression_plan/native_artifacts.rs",
+            "crates/ferrum-bench-core/examples/regression_plan/readme.rs",
+            "crates/ferrum-bench-core/examples/regression_plan/readme_tests.rs",
             "crates/ferrum-bench-core/examples/release_candidate/workspace.rs",
             "crates/ferrum-bench-core/src/stats.rs",
         ] {
@@ -660,6 +1037,10 @@ mod tests {
         assert!(combined.areas.contains(&ChangeArea::Observability));
         assert!(combined.areas.contains(&ChangeArea::Validation));
         assert!(!combined.areas.contains(&ChangeArea::Kernel));
+        let unreviewed =
+            analyze_paths(["crates/ferrum-bench-core/examples/regression_plan/unreviewed.rs"]);
+        assert_eq!(unreviewed.areas, ALL_AREAS);
+        assert_eq!(unreviewed.unknown_paths.len(), 1);
     }
 
     #[test]
@@ -764,6 +1145,7 @@ mod tests {
             "ferrum-models",
             "ferrum-kernels",
             "ferrum-bench-core",
+            "ferrum-devtools",
         ] {
             let test = format!("crates/{component}/tests/a_new_boundary.rs");
             assert_eq!(
@@ -797,8 +1179,12 @@ mod tests {
     #[test]
     fn source_transfer_and_protocol_parsers_keep_their_actual_shared_responsibilities() {
         for path in [
+            "crates/ferrum-models/src/source.rs",
             "crates/ferrum-models/src/hf_download.rs",
             "crates/ferrum-models/src/hf_download/selection.rs",
+            "crates/ferrum-models/src/hf_download/metadata_inventory.rs",
+            "crates/ferrum-models/src/source/cached_weights.rs",
+            "crates/ferrum-cli/src/source_resolver/cache.rs",
         ] {
             assert_eq!(analyze_paths([path]).areas, [ChangeArea::Download]);
         }
@@ -839,6 +1225,7 @@ mod tests {
             "crates/ferrum-types/src/reasoning.rs",
             "crates/ferrum-types/src/reasoning/gemma.rs",
             "crates/ferrum-types/src/harmony.rs",
+            "crates/ferrum-types/src/reasoning_controls.rs",
         ] {
             assert_eq!(
                 analyze_paths([path]).areas,

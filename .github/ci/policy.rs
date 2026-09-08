@@ -81,7 +81,13 @@ fn classify(input: &[u8]) -> Scope {
     }
 }
 
-const REQUIRED_JOBS: [&str; 5] = ["CPU", "Metal", "CUDA", "GPU runtime", "Windows native"];
+const REQUIRED_JOBS: [&str; 5] = [
+    "CPU",
+    "Metal",
+    "CUDA",
+    "GPU runtime",
+    "Windows MSVC contracts",
+];
 
 fn aggregate(prepare: &str, scope: &str, jobs: [&str; REQUIRED_JOBS.len()]) -> Result<(), String> {
     if Outcome::parse(prepare)? != Outcome::Success {
@@ -111,7 +117,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [command, prepare, scope, cpu, metal, cuda, gpu, windows] if command == "aggregate" => {
-            eprintln!("prepare={prepare:?}, scope={scope:?}, CPU={cpu:?}, Metal={metal:?}, CUDA={cuda:?}, GPU runtime={gpu:?}, Windows native={windows:?}");
+            eprintln!("prepare={prepare:?}, scope={scope:?}, CPU={cpu:?}, Metal={metal:?}, CUDA={cuda:?}, GPU runtime={gpu:?}, Windows MSVC contracts={windows:?}");
             aggregate(prepare, scope, [cpu, metal, cuda, gpu, windows])
         }
         _ => Err("usage: policy classify < changed-paths.z; policy aggregate PREPARE SCOPE CPU METAL CUDA GPU WINDOWS".to_owned()),

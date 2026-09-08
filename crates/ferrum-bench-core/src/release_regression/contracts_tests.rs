@@ -227,24 +227,26 @@ fn descriptors_preserve_actual_entrypoints_and_leave_unimplemented_groups_unboun
 }
 
 #[test]
-fn weight_materialization_requires_executed_assertions_not_a_passed_summary() {
-    let required = contract_groups()
-        .into_iter()
-        .find(|group| group.behavior == Behavior::WeightMaterialization)
-        .expect("weight materialization has real registered source contracts");
-    let directory = tempfile::tempdir().unwrap();
-    let mut report = run_contract_checks(
-        &[],
-        std::slice::from_ref(&required),
-        &options(directory.path()),
-    )
-    .unwrap();
-    assert_eq!(report.status, ContractStatus::Failed);
-    report.status = ContractStatus::Passed;
-    report.groups[0].status = ContractStatus::Passed;
-    assert!(verify_contract_report(std::slice::from_ref(&required), &report).is_err());
-    report.groups[0].tests.clear();
-    assert!(verify_contract_report(std::slice::from_ref(&required), &report).is_err());
-    report.groups.clear();
-    assert!(verify_contract_report(&[required], &report).is_err());
+fn materialization_and_observability_require_executed_assertions_not_a_passed_summary() {
+    for behavior in [Behavior::WeightMaterialization, Behavior::Observability] {
+        let required = contract_groups()
+            .into_iter()
+            .find(|group| group.behavior == behavior)
+            .expect("behavior has real registered production contracts");
+        let directory = tempfile::tempdir().unwrap();
+        let mut report = run_contract_checks(
+            &[],
+            std::slice::from_ref(&required),
+            &options(directory.path()),
+        )
+        .unwrap();
+        assert_eq!(report.status, ContractStatus::Failed);
+        report.status = ContractStatus::Passed;
+        report.groups[0].status = ContractStatus::Passed;
+        assert!(verify_contract_report(std::slice::from_ref(&required), &report).is_err());
+        report.groups[0].tests.clear();
+        assert!(verify_contract_report(std::slice::from_ref(&required), &report).is_err());
+        report.groups.clear();
+        assert!(verify_contract_report(&[required], &report).is_err());
+    }
 }

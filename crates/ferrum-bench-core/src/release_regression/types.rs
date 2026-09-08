@@ -20,10 +20,14 @@ pub enum ChangeArea {
     Architecture,
     Build,
     Observability,
+    /// Proven sink, metadata-adapter or process-accounting changes that do not
+    /// alter model-side event acquisition. Unknown instrumentation keeps the
+    /// broader Observability area and its real-model obligations.
+    ObservabilityContract,
     Validation,
 }
 impl ChangeArea {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Download,
         Self::Template,
         Self::Termination,
@@ -37,6 +41,7 @@ impl ChangeArea {
         Self::Architecture,
         Self::Build,
         Self::Observability,
+        Self::ObservabilityContract,
         Self::Validation,
     ];
 }
