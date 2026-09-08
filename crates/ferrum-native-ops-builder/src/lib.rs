@@ -1300,6 +1300,14 @@ fn copy_source_build_inputs(
             .path
             .clone(),
     ];
+    if source_build::platform::is_msvc(toolchain.static_identity.host_toolchain.host_abi.as_ref()) {
+        let archive = receipt.archive_file.as_ref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid("MSVC receipt has no source archive".into())
+        })?;
+        // Portable MSVC verification reopens the original archive, before the
+        // package adds its descriptor to the separately published library.
+        inputs.push(archive.clone());
+    }
     inputs.extend(
         receipt
             .commands
@@ -2734,55 +2742,7 @@ fn validate_package_semantic_links(
             receipt.operator
         )));
     }
-    let toolchain = source_build.toolchain.as_ref().ok_or_else(|| {
-        NativeOperatorBuilderError::Invalid(format!(
-            "{} source-build receipt is missing toolchain provenance",
-            receipt.operator
-        ))
-    })?;
-    let mut expected_source_input_paths = vec![
-        format!(
-            "provenance/{}",
-            toolchain.static_identity.cuda_toolkit.manifest.path
-        ),
-        format!(
-            "provenance/{}",
-            toolchain.static_identity.host_toolchain.manifest.path
-        ),
-    ];
-    expected_source_input_paths.extend(
-        source_build
-            .commands
-            .iter()
-            .filter(|command| {
-                matches!(
-                    command.dependency_validation,
-                    Some(
-                        NativeOperatorDependencyValidation::Depfile
-                            | NativeOperatorDependencyValidation::CacheProof
-                    )
-                )
-            })
-            .flat_map(|command| {
-                [command.compiler_depfile.as_ref(), command.depfile.as_ref()]
-                    .into_iter()
-                    .flatten()
-            })
-            .map(|relative| format!("provenance/{relative}")),
-    );
-    expected_source_input_paths.sort();
-    expected_source_input_paths.dedup();
-    let actual_source_input_paths = receipt
-        .source_build_inputs
-        .iter()
-        .map(|evidence| evidence.path.clone())
-        .collect::<Vec<_>>();
-    if actual_source_input_paths != expected_source_input_paths {
-        return Err(NativeOperatorBuilderError::Invalid(format!(
-            "{} packaged source-build inputs do not exactly match toolkit/depfile evidence",
-            receipt.operator
-        )));
-    }
+    validate_source_build_input_paths(source_build, &receipt.source_build_inputs)?;
 
     if receipt.source_archive_sha256 != source_build.archive_sha256.as_deref().unwrap_or_default() {
         return Err(NativeOperatorBuilderError::Invalid(format!(
@@ -2853,6 +2813,67 @@ fn validate_package_semantic_links(
         return Err(NativeOperatorBuilderError::Invalid(format!(
             "{} manifest is not the exact semantic projection of its package and source evidence",
             receipt.operator
+        )));
+    }
+    Ok(())
+}
+
+fn validate_source_build_input_paths(
+    source_build: &NativeOperatorSourceBuildReceipt,
+    inputs: &[NativeOperatorEvidenceFile],
+) -> Result<()> {
+    let toolchain = source_build.toolchain.as_ref().ok_or_else(|| {
+        NativeOperatorBuilderError::Invalid(format!(
+            "{} source-build receipt is missing toolchain provenance",
+            source_build.operator
+        ))
+    })?;
+    let mut expected = vec![
+        format!(
+            "provenance/{}",
+            toolchain.static_identity.cuda_toolkit.manifest.path
+        ),
+        format!(
+            "provenance/{}",
+            toolchain.static_identity.host_toolchain.manifest.path
+        ),
+    ];
+    if source_build::platform::is_msvc(toolchain.static_identity.host_toolchain.host_abi.as_ref()) {
+        let archive = source_build.archive_file.as_ref().ok_or_else(|| {
+            NativeOperatorBuilderError::Invalid("MSVC receipt has no source archive".into())
+        })?;
+        expected.push(format!("provenance/{archive}"));
+    }
+    expected.extend(
+        source_build
+            .commands
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command.dependency_validation,
+                    Some(
+                        NativeOperatorDependencyValidation::Depfile
+                            | NativeOperatorDependencyValidation::CacheProof
+                    )
+                )
+            })
+            .flat_map(|command| {
+                [command.compiler_depfile.as_ref(), command.depfile.as_ref()]
+                    .into_iter()
+                    .flatten()
+            })
+            .map(|relative| format!("provenance/{relative}")),
+    );
+    expected.sort();
+    expected.dedup();
+    let actual = inputs
+        .iter()
+        .map(|evidence| &evidence.path)
+        .collect::<Vec<_>>();
+    if actual != expected.iter().collect::<Vec<_>>() {
+        return Err(NativeOperatorBuilderError::Invalid(format!(
+            "{} packaged source-build inputs do not exactly match toolkit/depfile/archive evidence",
+            source_build.operator
         )));
     }
     Ok(())
@@ -3634,6 +3655,16 @@ mod tests {
         assert!(is_sha256_digest(&receipt.source_build_receipt.sha256));
         assert!(is_sha256_digest(&receipt.source_build_plan.sha256));
         assert_eq!(receipt.source_build_inputs.len(), 4);
+        let source_build: NativeOperatorSourceBuildReceipt =
+            read_json(&output_dir.join(&receipt.source_build_receipt.path)).unwrap();
+        let source_archive_path = format!(
+            "provenance/{}",
+            source_build.archive_file.as_deref().unwrap()
+        );
+        assert!(!receipt
+            .source_build_inputs
+            .iter()
+            .any(|evidence| evidence.path == source_archive_path));
         assert!(receipt
             .source_build_inputs
             .iter()

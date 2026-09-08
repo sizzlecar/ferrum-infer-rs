@@ -1176,3 +1176,122 @@ fn msvc_environment_rejects_untracked_flags_and_mixed_tool_installations() {
     invalid.insert("INCLUDE".to_string(), "relative/include".to_string());
     assert!(platform::msvc_environment_for_package_tools(tools, &invalid).is_err());
 }
+
+#[test]
+fn packaged_msvc_source_inputs_survive_relocation_and_reject_missing_or_changed_archive() {
+    let root = tempfile::tempdir().unwrap();
+    let (plan, plan_path) = plan(root.path());
+    let mut source_receipt = receipt(&plan, &plan_path);
+    let build = root.path().join("build");
+    let package = root.path().join("package");
+    let receipt_path = build.join("source-build.receipt.json");
+    let static_identity = &source_receipt.toolchain.as_ref().unwrap().static_identity;
+    let mut input_paths = std::collections::BTreeSet::from([
+        static_identity.cuda_toolkit.manifest.path.clone(),
+        static_identity.host_toolchain.manifest.path.clone(),
+    ]);
+    for command in &source_receipt.commands {
+        input_paths.extend(command.compiler_depfile.iter().cloned());
+        input_paths.extend(command.depfile.iter().cloned());
+    }
+    let archive_relative = source_receipt.archive_file.clone().unwrap();
+    input_paths.insert(archive_relative.clone());
+    // These opaque bytes exercise copying and evidence identities, not JSON,
+    // depfile or COFF parsing. Those contracts have separate parser tests.
+    let inputs = input_paths
+        .into_iter()
+        .map(|relative| {
+            let bytes = format!("opaque source-build input: {relative}\n").into_bytes();
+            let path = build.join(&relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &bytes).unwrap();
+            (format!("provenance/{relative}"), bytes)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let archive_path = format!("provenance/{archive_relative}");
+    let archive_bytes = &inputs[&archive_path];
+    source_receipt.archive_sha256 = Some(sha256_bytes(archive_bytes));
+    write_json(&receipt_path, &source_receipt).unwrap();
+
+    let evidence =
+        crate::copy_source_build_inputs(&receipt_path, &source_receipt, &package).unwrap();
+    assert_eq!(
+        evidence.iter().map(|item| &item.path).collect::<Vec<_>>(),
+        inputs.keys().collect::<Vec<_>>()
+    );
+    for item in &evidence {
+        assert_eq!(
+            fs::read(package.join(&item.path)).unwrap(),
+            inputs[&item.path]
+        );
+        assert_eq!(item.sha256, sha256_bytes(&inputs[&item.path]));
+        assert_eq!(item.size_bytes, inputs[&item.path].len() as u64);
+    }
+    let archive_evidence = evidence
+        .iter()
+        .find(|item| item.path == archive_path)
+        .unwrap();
+    assert_eq!(
+        Some(&archive_evidence.sha256),
+        source_receipt.archive_sha256.as_ref()
+    );
+    crate::validate_source_build_input_paths(&source_receipt, &evidence).unwrap();
+    let mut omitted = evidence.clone();
+    omitted.retain(|item| item.path != archive_path);
+    assert!(crate::validate_source_build_input_paths(&source_receipt, &omitted).is_err());
+    let mut renamed = evidence.clone();
+    renamed
+        .iter_mut()
+        .find(|item| item.path == archive_path)
+        .unwrap()
+        .path = "provenance/renamed.lib".to_string();
+    renamed.sort_by(|left, right| left.path.cmp(&right.path));
+    assert!(crate::validate_source_build_input_paths(&source_receipt, &renamed).is_err());
+    let mut extra = evidence.clone();
+    let mut extra_item = archive_evidence.clone();
+    extra_item.path = "provenance/extra.lib".to_string();
+    extra.push(extra_item);
+    extra.sort_by(|left, right| left.path.cmp(&right.path));
+    assert!(crate::validate_source_build_input_paths(&source_receipt, &extra).is_err());
+
+    // Only the evidence selection is under test: legacy Linux receipts have no
+    // host_abi field and must retain their previous toolkit/depfile input list.
+    let mut linux_receipt = source_receipt.clone();
+    linux_receipt
+        .toolchain
+        .as_mut()
+        .unwrap()
+        .static_identity
+        .host_toolchain
+        .host_abi = None;
+    let linux_evidence = crate::copy_source_build_inputs(
+        &receipt_path,
+        &linux_receipt,
+        &root.path().join("linux-package"),
+    )
+    .unwrap();
+    assert_eq!(linux_evidence, omitted);
+    crate::validate_source_build_input_paths(&linux_receipt, &linux_evidence).unwrap();
+
+    fs::remove_dir_all(&build).unwrap();
+    let relocated = root.path().join("relocated package");
+    fs::rename(&package, &relocated).unwrap();
+    let relocated = relocated.canonicalize().unwrap();
+    for item in &evidence {
+        assert_eq!(
+            crate::resolve_package_evidence(&relocated, &relocated, item).unwrap(),
+            *item
+        );
+    }
+    let relocated_archive = relocated.join(&archive_path);
+    fs::remove_file(&relocated_archive).unwrap();
+    assert!(crate::resolve_package_evidence(&relocated, &relocated, archive_evidence).is_err());
+    let mut changed = archive_bytes.clone();
+    changed[0] ^= 1;
+    fs::write(&relocated_archive, &changed).unwrap();
+    assert_eq!(
+        fs::metadata(&relocated_archive).unwrap().len(),
+        archive_evidence.size_bytes
+    );
+    assert!(crate::resolve_package_evidence(&relocated, &relocated, archive_evidence).is_err());
+}
