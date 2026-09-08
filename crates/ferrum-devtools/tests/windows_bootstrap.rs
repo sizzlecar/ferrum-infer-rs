@@ -32,6 +32,9 @@ fn powershell(body: &str, environment: &[(&str, &str)]) -> std::process::Output 
             quote(script.to_str().unwrap())
         ))
         .envs(environment.iter().copied())
+        // Let Windows PowerShell build its own module paths. A PowerShell 7
+        // parent passes incompatible modules through intermediate Rust processes.
+        .env_remove("PSModulePath")
         .output()
         .unwrap()
 }
