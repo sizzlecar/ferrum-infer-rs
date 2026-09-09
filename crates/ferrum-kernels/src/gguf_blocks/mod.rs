@@ -9,6 +9,7 @@ use half::f16;
 
 mod iq3s_grid;
 pub(crate) use iq3s_grid::IQ3_S_GRID;
+mod block_decode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufBlockFormat {
@@ -109,9 +110,7 @@ impl GgufBlockFormat {
             .chunks_exact(self.block_bytes())
             .zip(output.chunks_exact_mut(self.block_values()))
         {
-            for (index, value) in destination.iter_mut().enumerate() {
-                *value = self.decode_value(block, index);
-            }
+            self.decode_block(block, destination);
         }
         Ok(())
     }

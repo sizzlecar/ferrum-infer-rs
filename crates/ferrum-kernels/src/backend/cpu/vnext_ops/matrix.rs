@@ -42,7 +42,7 @@ impl CpuMatrixFormat {
 }
 
 /// A checked borrowed matrix; native blocks remain compressed for the entire
-/// model lifetime. Each dot product decodes individual values in its registers.
+/// model lifetime. Each dot product uses at most one decoded block on its stack.
 pub(super) struct CpuMatrix<'a> {
     bytes: &'a [u8],
     format: CpuMatrixFormat,
@@ -87,6 +87,34 @@ impl<'a> CpuMatrix<'a> {
         }
     }
 
+    fn dot(&self, weight: &[u8], input: &[u8], input_type: CpuFloat) -> f32 {
+        let mut sum = 0.0_f32;
+        match self.format {
+            CpuMatrixFormat::Dense(dtype) => {
+                for column in 0..self.columns {
+                    sum += input_type.read(input, column) * dtype.read(weight, column);
+                }
+            }
+            CpuMatrixFormat::Native(format) => {
+                // A fixed-size local tile, independent of model dimensions;
+                // no persistent or full-matrix dequantization allocation.
+                let mut decoded = [0.0_f32; 256];
+                let decoded = &mut decoded[..format.block_values()];
+                let inputs_per_block = format.block_values() * input_type.bytes();
+                for (block, input) in weight
+                    .chunks_exact(format.block_bytes())
+                    .zip(input.chunks_exact(inputs_per_block))
+                {
+                    format.decode_block(block, decoded);
+                    for (column, &value) in decoded.iter().enumerate() {
+                        sum += input_type.read(input, column) * value;
+                    }
+                }
+            }
+        }
+        sum
+    }
+
     /// Accumulation stays F32 for both declared activation profiles. Work is
     /// parallelized between independent output elements; scheduling cannot
     /// change a dot product's reduction order.
@@ -127,10 +155,7 @@ impl<'a> CpuMatrix<'a> {
                 let input = &input[input_start..input_start + input_row_bytes];
                 let weight =
                     &self.bytes[weight_row * self.row_bytes..(weight_row + 1) * self.row_bytes];
-                let mut sum = 0.0_f32;
-                for column in 0..self.columns {
-                    sum += input_type.read(input, column) * self.value(weight, column);
-                }
+                let sum = self.dot(weight, input, input_type);
                 output_type.write(destination, 0, sum);
             });
         Ok(())

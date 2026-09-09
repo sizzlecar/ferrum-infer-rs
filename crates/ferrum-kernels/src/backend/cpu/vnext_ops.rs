@@ -20,3 +20,6 @@ pub use composition::CpuVNextComposition;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod matrix_bench;
