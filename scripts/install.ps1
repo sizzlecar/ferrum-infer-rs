@@ -95,6 +95,20 @@ function Assert-FerrumHardware {
     if ([version]$match.Groups[1].Value -lt [version]'551.78') { throw 'Update the NVIDIA driver to 551.78 or later: https://www.nvidia.com/drivers/ . CUDA Toolkit is not required.' }
 }
 
+function Get-FerrumWindowsArchitecture {
+    # Windows PowerShell 5.1 can run on .NET Framework versions that do not
+    # expose RuntimeInformation.OSArchitecture. Read the machine environment,
+    # not the process environment (which describes x86 under WOW64).
+    $nativeArchitecture = [Environment]::GetEnvironmentVariable('PROCESSOR_ARCHITECTURE', 'Machine')
+    switch ($nativeArchitecture) {
+        'AMD64' { return 'X64' }
+        'x86' { return 'X86' }
+        'ARM64' { return 'Arm64' }
+        'ARM' { return 'Arm' }
+        default { throw ('Cannot determine a supported native Windows architecture: '+$nativeArchitecture+'. This installer requires Windows x64.') }
+    }
+}
+
 function Add-FerrumProcessPath {
     param([Parameter(Mandatory=$true)][string]$Directory)
     if (-not [IO.Directory]::Exists($Directory) -or $Directory.Contains(';')) { throw 'Installed Ferrum directory is not a usable PATH entry.' }
@@ -140,7 +154,7 @@ function Install-FerrumSetup {
 function Install-FerrumRelease {
     param([string]$RequestedVersion = '')
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'This installer requires Windows.' }
-    $architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    $architecture = Get-FerrumWindowsArchitecture
     if ($architecture -cne 'X64') { throw 'This installer supports native Windows x64 only.' }
     $candidates = @((Join-Path ([Environment]::GetFolderPath('System')) 'nvidia-smi.exe'), (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NVIDIA Corporation\NVSMI\nvidia-smi.exe'))
     $smi = @($candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1)

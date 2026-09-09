@@ -11,12 +11,21 @@ fn quote(value: &str) -> String {
 }
 
 fn powershell(body: &str, environment: &[(&str, &str)]) -> std::process::Output {
+    powershell_in("System32", body, environment)
+}
+
+fn powershell_in(
+    system_directory: &str,
+    body: &str,
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/install.ps1")
         .canonicalize()
         .unwrap();
     let program = Path::new(&std::env::var_os("SystemRoot").unwrap())
-        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        .join(system_directory)
+        .join("WindowsPowerShell/v1.0/powershell.exe");
     Command::new(program)
         // Load the repository's unsigned script only in this test process,
         // independently of the invoking shell's execution policy.
@@ -37,6 +46,74 @@ fn powershell(body: &str, environment: &[(&str, &str)]) -> std::process::Output 
         .env_remove("PSModulePath")
         .output()
         .unwrap()
+}
+
+#[test]
+fn bootstrap_detects_native_architecture_in_windows_powershell_and_wow64() {
+    // An independent OS query is the oracle; process bitness is deliberately
+    // different in SysWOW64. Do not assume the CI host's CPU architecture.
+    let body = r#"
+        $cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Architecture -Unique)
+        [ordered]@{architecture=(Get-FerrumWindowsArchitecture); cpu=$cpu; process_bits=([IntPtr]::Size*8)} | ConvertTo-Json -Compress
+    "#;
+    let output = powershell(body, &[]);
+    require_success(&output);
+    let native: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let expected = match native["cpu"].as_array().unwrap().as_slice() {
+        [value] => match value.as_u64().unwrap() {
+            0 => "X86",
+            5 => "Arm",
+            9 => "X64",
+            12 => "Arm64",
+            other => panic!("unsupported processor architecture {other}"),
+        },
+        other => panic!("inconsistent processor architectures {other:?}"),
+    };
+    assert_eq!(native["architecture"], expected);
+
+    // Parent-process environment overrides must not change native detection.
+    let overridden = powershell(
+        "Get-FerrumWindowsArchitecture",
+        &[
+            ("PROCESSOR_ARCHITECTURE", "unknown"),
+            ("PROCESSOR_ARCHITEW6432", "unknown"),
+        ],
+    );
+    require_success(&overridden);
+    assert_eq!(
+        String::from_utf8(overridden.stdout).unwrap().trim(),
+        expected
+    );
+
+    if expected == "X64" {
+        let output = powershell_in("SysWOW64", body, &[]);
+        require_success(&output);
+        let wow64: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(wow64["process_bits"], 32);
+        assert_eq!(wow64["architecture"], native["architecture"]);
+    }
+}
+
+#[test]
+fn bootstrap_startup_reaches_gpu_probe_after_real_architecture_detection() {
+    // Exercise the install entrypoint, stopping at the first hardware probe.
+    // The only replaced boundaries are driver-file lookup and process launch;
+    // no network request or installer execution is needed for this regression.
+    let output = powershell(
+        r#"
+        $architecture = Get-FerrumWindowsArchitecture
+        function Test-Path { param($LiteralPath, $PathType); return $true }
+        function Invoke-FerrumProcess { param($Program, $Arguments); throw 'fixture: reached GPU probe' }
+        try { Install-FerrumRelease; throw 'startup did not stop at hardware detection' }
+        catch {
+            $expected = if ($architecture -eq 'X64') { 'fixture: reached GPU probe' } else { 'This installer supports native Windows x64 only.' }
+            if ($_.Exception.Message -cne $expected) { throw }
+            $architecture
+        }
+        "#,
+        &[],
+    );
+    require_success(&output);
 }
 
 fn require_success(output: &std::process::Output) {
