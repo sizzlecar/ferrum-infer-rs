@@ -13,6 +13,8 @@ __device__ __forceinline__ float native_half(const byte* b, unsigned offset) {
 
 __device__ __forceinline__ float native_block_value(const byte* b, unsigned i, unsigned format) {
     switch (format) {
+        case 1:
+            return native_half(b, 2 * i);
         case 11: {
             const unsigned group = i / 16;
             const unsigned lo = (b[96 + group % 8] >> (4 * (group / 8))) & 15;

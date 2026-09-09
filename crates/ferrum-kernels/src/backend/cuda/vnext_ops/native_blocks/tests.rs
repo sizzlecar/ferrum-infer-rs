@@ -212,3 +212,89 @@ fn native_block_embeddings_preserve_f16_and_f32_activations_on_cuda() {
     embedding::<f16>(&stream, &kernels.embedding_f16);
     embedding::<f32>(&stream, &kernels.embedding_f32);
 }
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn native_matrix_launcher_preserves_mixed_dense_and_block_partitions() {
+    use ferrum_interfaces::vnext::ElementType;
+    mixed_matrix::<f16>(ElementType::F16);
+    mixed_matrix::<f32>(ElementType::F32);
+}
+
+fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
+    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use ferrum_interfaces::vnext::WeightId;
+    use weights::{MatrixFormat, MatrixPart};
+    let context = CudaContext::new(0).expect("native matrix conformance requires CUDA");
+    let kernels = CudaNativeBlockKernels::load(&context).unwrap();
+    let stream = context.default_stream();
+    let columns = 512_usize;
+    let rows = 3_usize;
+    let outputs = 3_usize;
+    let stride = 2 * outputs + 2;
+    let (blocks, decoded) = matrix(GgufBlockFormat::Iq4Xs, outputs, 2);
+    let dense = (0..outputs * columns)
+        .map(|i| f16::from_f32(((i * 7 % 41) as f32 - 20.0) / 512.0))
+        .collect::<Vec<_>>();
+    let input = (0..rows * columns)
+        .map(|i| T::from_f32(((i * 13 % 29) as f32 - 14.0) / 256.0))
+        .collect::<Vec<_>>();
+    let x = stream.clone_htod(&input).unwrap();
+    let q = stream.clone_htod(&blocks).unwrap();
+    let d = stream.clone_htod(&dense).unwrap();
+    let canary = T::from_f32(-12345.0);
+    let mut output = stream.clone_htod(&vec![canary; rows * stride]).unwrap();
+    let (xp, _x_guard) = x.device_ptr(&stream);
+    let (qp, _q_guard) = q.device_ptr(&stream);
+    let (dp, _d_guard) = d.device_ptr(&stream);
+    let (yp, y_guard) = output.device_ptr_mut(&stream);
+    for (format, pointer, offset) in [
+        (MatrixFormat::Block(GgufBlockFormat::Iq4Xs), qp, 1),
+        (MatrixFormat::DenseF16, dp, 1 + outputs as u32),
+    ] {
+        let part = MatrixPart {
+            component_id: WeightId::new("component.matrix").unwrap(),
+            format,
+            rows: outputs as u32,
+            columns: columns as u32,
+            output_offset: offset,
+        };
+        kernels
+            .linear(
+                &stream,
+                xp,
+                pointer,
+                yp,
+                &part,
+                rows as u32,
+                stride as u32,
+                activation,
+            )
+            .unwrap();
+    }
+    drop(y_guard);
+    let actual = stream.clone_dtoh(&output).unwrap();
+    for row in 0..rows {
+        assert_eq!(actual[row * stride].as_f32(), canary.as_f32());
+        assert_eq!(actual[row * stride + stride - 1].as_f32(), canary.as_f32());
+        for col in 0..2 * outputs {
+            let products = (0..columns).map(|k| {
+                let weight = if col < outputs {
+                    decoded[col * columns + k]
+                } else {
+                    dense[(col - outputs) * columns + k].to_f32()
+                };
+                f64::from(input[row * columns + k].as_f32()) * f64::from(weight)
+            });
+            let sum = products.clone().sum::<f64>();
+            let bound = (columns as f64 * f32::EPSILON as f64 + T::ROUNDING)
+                * products.map(f64::abs).sum::<f64>()
+                + 1e-6;
+            let value = actual[row * stride + col + 1].as_f32();
+            assert!(
+                value.is_finite() && (f64::from(value) - sum).abs() <= bound,
+                "row {row} col {col}: actual {value}, F64 {sum}, bound {bound}"
+            );
+        }
+    }
+}

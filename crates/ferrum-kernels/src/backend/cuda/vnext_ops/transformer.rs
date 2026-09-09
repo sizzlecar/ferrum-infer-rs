@@ -83,6 +83,7 @@ mod moe_routed;
 mod moe_weights;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe_workspace;
+mod native_linear;
 
 pub(super) use attention::CudaGatedDeltaRecurrentAttentionProvider;
 pub(super) use causal_attention::CudaCausalPagedAttentionProvider;
@@ -261,24 +262,37 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
 
 pub(super) struct CudaDenseLinearProvider {
     descriptor: OperationProviderDescriptor,
+    native: super::native_blocks::CudaNativeBlockKernels,
 }
 
 impl CudaDenseLinearProvider {
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
         let contract = dense_linear_contract().map_err(contract_error)?;
-        let descriptor = provider_descriptor(
+        let descriptor = provider_descriptor_with_formats(
             runtime,
             &contract,
             DENSE_LINEAR_PROVIDER_ID,
             DENSE_LINEAR_F16_CAPABILITY_ID,
             DENSE_LINEAR_ESTIMATOR_ID,
             contiguous_bindings(2),
+            BTreeSet::from([
+                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
+            ]),
+            native_linear::quantization_formats().map_err(contract_error)?,
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/native_linear.rs").as_bytes(),
+                include_str!("native_blocks.rs").as_bytes(),
+                include_str!("native_blocks/weights.rs").as_bytes(),
+                crate::ptx::VNEXT_GGUF.as_bytes(),
                 DENSE_LINEAR_PROVIDER_ID.as_bytes(),
             ]),
         )?;
-        Ok(Self { descriptor })
+        Ok(Self {
+            descriptor,
+            native: super::native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
+        })
     }
 }
 
@@ -308,12 +322,33 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseLinearProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_dense_linear(
-            self.descriptor.provider_implementation_fingerprint(),
-            invocation,
-        )
-        .map(EncodedDeviceOperation::compute)
-        .map_err(|message| provider_failure(identity, "cuda.dense_linear.encode", message))
+        let native = invocation.participants().iter().any(|participant| {
+            participant.bindings().iter().any(|binding| {
+                binding.role() == ResolvedValueRole::Input
+                    && binding.ordinal() == 1
+                    && binding.weight().is_some_and(|weight| {
+                        !matches!(
+                            weight.physical_layout(),
+                            ferrum_interfaces::vnext::PhysicalWeightLayout::Dense { .. }
+                        )
+                    })
+            })
+        });
+        let encoded = if native {
+            native_linear::encode(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.native,
+                invocation,
+            )
+        } else {
+            encode_dense_linear(
+                self.descriptor.provider_implementation_fingerprint(),
+                invocation,
+            )
+        };
+        encoded
+            .map(EncodedDeviceOperation::compute)
+            .map_err(|message| provider_failure(identity, "cuda.dense_linear.encode", message))
     }
 }
 
@@ -1124,6 +1159,7 @@ pub(super) fn provider_descriptor(
         estimator_id,
         bindings,
         BTreeSet::from([WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?]),
+        BTreeSet::new(),
         provider_fingerprint,
     )
 }
@@ -1145,6 +1181,7 @@ fn weightless_provider_descriptor(
         estimator_id,
         bindings,
         BTreeSet::new(),
+        BTreeSet::new(),
         provider_fingerprint,
     )
 }
@@ -1158,6 +1195,7 @@ fn provider_descriptor_with_formats(
     estimator_id: &str,
     bindings: Vec<ProviderStorageBindingRequirement>,
     accepted_weight_formats: BTreeSet<WeightFormatId>,
+    accepted_quantization_formats: BTreeSet<QuantizationFormatId>,
     provider_fingerprint: String,
 ) -> Result<OperationProviderDescriptor, CudaDeviceRuntimeError> {
     let capability = CapabilityId::new(capability_id).map_err(contract_error)?;
@@ -1184,7 +1222,7 @@ fn provider_descriptor_with_formats(
         runtime.descriptor().id.clone(),
         BTreeSet::from([capability]),
         accepted_weight_formats,
-        BTreeSet::new(),
+        accepted_quantization_formats,
         bindings,
         estimator_id,
         ContractVersion::new(1, 0),

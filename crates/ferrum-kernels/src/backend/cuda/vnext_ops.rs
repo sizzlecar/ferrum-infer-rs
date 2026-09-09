@@ -88,6 +88,9 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_replay.rs").as_bytes(),
         include_str!("vnext_ops.rs").as_bytes(),
         include_str!("vnext_ops/transformer.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
+        include_str!("vnext_ops/native_blocks.rs").as_bytes(),
+        include_str!("vnext_ops/native_blocks/weights.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
         include_str!("vnext_ops/transformer/gpt_oss_attention.rs").as_bytes(),
@@ -100,6 +103,7 @@ pub fn cuda_vnext_runtime_config(
         crate::ptx::LINEAR_ATTENTION.as_bytes(),
         crate::ptx::GATED_DELTA_RULE.as_bytes(),
         crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
+        crate::ptx::VNEXT_GGUF.as_bytes(),
         crate::ptx::GPT_OSS_ATTENTION.as_bytes(),
     ];
     #[cfg(feature = "vllm-moe-marlin")]
