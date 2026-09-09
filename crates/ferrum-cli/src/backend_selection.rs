@@ -15,9 +15,10 @@ pub(crate) fn select_device(backend: &str) -> Result<Device> {
             .map(|_| ())
             .map_err(|error| error.to_string()),
         #[cfg(feature = "cuda")]
-        Device::CUDA(index) => candle_core::Device::new_cuda(*index)
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
+        Device::CUDA(index) => {
+            ferrum_kernels::backend::cuda::vnext_runtime::CudaDeviceRuntime::probe_device(*index)
+                .map_err(|error| error.to_string())
+        }
         _ => Err("accelerator support is absent from this binary".to_owned()),
     })
 }
@@ -70,6 +71,16 @@ fn unsupported_backend(requested: &str) -> FerrumError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires an actual CUDA device"]
+    fn native_cuda_device_selection_initializes_the_product_driver() {
+        assert_eq!(select_device("cuda").unwrap(), Device::CUDA(0));
+        #[cfg(not(feature = "metal"))]
+        assert_eq!(select_device("auto").unwrap(), Device::CUDA(0));
+        assert_eq!(select_device("cpu").unwrap(), Device::CPU);
+    }
 
     #[test]
     fn automatic_selection_requires_a_working_device_and_can_use_cpu() {
