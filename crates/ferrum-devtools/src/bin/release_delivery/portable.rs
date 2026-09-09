@@ -125,19 +125,25 @@ pub(super) fn verify_staged(
     candidate: &str,
 ) -> Result<StagedPortable, String> {
     let receipt: Receipt = read(receipt_path)?;
-    if receipt.archive_name != "ferrum-windows-x86_64-cuda-sm89.zip"
+    let expected_archive = match receipt.manifest.backend {
+        Backend::Cpu => "ferrum-windows-x86_64-cpu.zip",
+        Backend::Cuda => "ferrum-windows-x86_64-cuda-sm89.zip",
+        _ => return Err("Windows portable backend is unsupported".into()),
+    };
+    if receipt.archive_name != expected_archive
         || receipt.manifest.build.version != version
         || receipt.manifest.build.source_commit != candidate
-        || receipt.manifest.cuda_compute_capability != "89"
-        || ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]
-            .iter()
-            .any(|required| {
-                !receipt
-                    .manifest
-                    .cargo_features
+        || (receipt.manifest.backend == Backend::Cuda
+            && (receipt.manifest.cuda_compute_capability != "89"
+                || ["cuda", "vllm-moe-marlin", "vllm-paged-attn-v2"]
                     .iter()
-                    .any(|f| f == required)
-            })
+                    .any(|required| {
+                        !receipt
+                            .manifest
+                            .cargo_features
+                            .iter()
+                            .any(|f| f == required)
+                    })))
     {
         return Err("Windows portable identity differs from the formal candidate".into());
     }
@@ -285,20 +291,34 @@ fn validate(manifest: &Manifest) -> Result<(), String> {
         );
     }
     if manifest.schema_version != 1
-        || manifest.backend != Backend::Cuda
+        || !matches!(manifest.backend, Backend::Cpu | Backend::Cuda)
         || manifest.target_triple != TARGET
     {
-        return Err("portable payload requires CUDA and x86_64-pc-windows-msvc identity".into());
+        return Err(
+            "portable payload requires CPU or CUDA and x86_64-pc-windows-msvc identity".into(),
+        );
     }
-    if manifest.cuda_compute_capability.is_empty()
-        || !manifest
-            .cuda_compute_capability
-            .bytes()
-            .all(|b| b.is_ascii_digit())
-        || !manifest.cargo_features.iter().any(|f| f == "cuda")
-        || manifest.cargo_features.iter().any(|f| f == "metal")
+    if manifest.backend == Backend::Cuda
+        && (manifest.cuda_compute_capability.is_empty()
+            || !manifest
+                .cuda_compute_capability
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+            || !manifest.cargo_features.iter().any(|f| f == "cuda")
+            || manifest.cargo_features.iter().any(|f| f == "metal"))
     {
         return Err("portable CUDA build declaration is incomplete or inconsistent".into());
+    }
+    if manifest.backend == Backend::Cpu
+        && (!manifest.cuda_compute_capability.is_empty()
+            || manifest
+                .cargo_features
+                .iter()
+                .any(|f| f == "cuda" || f == "metal" || f.starts_with("vllm-")))
+    {
+        return Err(
+            "portable CPU build must not enable GPU features or declare CUDA capability".into(),
+        );
     }
     let mut features = BTreeSet::new();
     if manifest.cargo_features.iter().any(|f| {
@@ -373,10 +393,16 @@ fn validate(manifest: &Manifest) -> Result<(), String> {
             _ => 0,
         });
     }
-    if binary_count != 1 || !roles.contains(&1) || !roles.contains(&2) {
+    if binary_count != 1 || !roles.contains(&2) {
+        return Err("portable payload requires one ferrum.exe and its MSVC runtime files".into());
+    }
+    if manifest.backend == Backend::Cuda && !roles.contains(&1) {
         return Err(
             "portable CUDA payload requires one ferrum.exe, CUDA and MSVC runtime files".into(),
         );
+    }
+    if manifest.backend == Backend::Cpu && roles.contains(&1) {
+        return Err("portable CPU payload must not contain CUDA runtime files".into());
     }
     Ok(())
 }

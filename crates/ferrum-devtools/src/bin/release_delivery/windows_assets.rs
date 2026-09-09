@@ -1,10 +1,10 @@
 //! Windows build/packaging evidence adds assets to the existing publisher.
 //! Driverless staging remains byte-only; model and upgrade QA are separate.
 use super::super::{installation, portable, AcceptedAsset};
+use ferrum_bench_core::release_candidate::staging::Backend;
 use serde::Deserialize;
 use std::{collections::BTreeSet, fs, path::Path};
 
-const ARCHIVE: &str = "ferrum-windows-x86_64-cuda-sm89.zip";
 const LAUNCHER: &str = "ferrum-windows-launcher-v1.exe";
 
 #[derive(Deserialize)]
@@ -62,8 +62,62 @@ pub(in super::super) fn verify(
     baseline_tag: &str,
     repo: &str,
 ) -> Result<VerifiedWindows, String> {
+    let mut cuda = verify_one(
+        directory,
+        Backend::Cuda,
+        version,
+        candidate,
+        run,
+        baseline_tag,
+        repo,
+    )?;
+    let cpu = verify_one(
+        &directory.join("cpu"),
+        Backend::Cpu,
+        version,
+        candidate,
+        run,
+        baseline_tag,
+        repo,
+    )?;
+    if cpu.attempt != cuda.attempt {
+        return Err("Windows CPU and CUDA staging attempts differ".into());
+    }
+    for asset in cpu.assets {
+        if let Some(existing) = cuda
+            .assets
+            .iter()
+            .find(|existing| existing.name == asset.name)
+        {
+            if existing.sha256 != asset.sha256 {
+                return Err(
+                    "Windows CPU and CUDA packages must share the stable launcher bytes".into(),
+                );
+            }
+        } else {
+            cuda.assets.push(asset);
+        }
+    }
+    Ok(cuda)
+}
+
+pub(in super::super) fn verify_one(
+    directory: &Path,
+    backend: Backend,
+    version: &str,
+    candidate: &str,
+    run: u64,
+    baseline_tag: &str,
+    repo: &str,
+) -> Result<VerifiedWindows, String> {
+    let suffix = match backend {
+        Backend::Cpu => "cpu",
+        Backend::Cuda => "cuda-sm89",
+        Backend::Metal => return Err("Windows does not distribute Metal".into()),
+    };
+    let archive = format!("ferrum-windows-x86_64-{suffix}.zip");
     let stage: Staging = super::read(&directory.join("windows-staging.json"))?;
-    let setup = format!("ferrum-{version}-windows-x86_64-cuda-sm89-setup.exe");
+    let setup = format!("ferrum-{version}-windows-x86_64-{suffix}-setup.exe");
     let candidate_prefix = format!("v{version}-rc.");
     if stage.schema_version != 1
         || stage.version != version
@@ -78,21 +132,24 @@ pub(in super::super) fn verify(
             .is_none_or(|n| {
                 n.is_empty() || n.starts_with('0') || !n.bytes().all(|b| b.is_ascii_digit())
             })
-        || stage.archive.name != ARCHIVE
+        || stage.archive.name != archive
         || stage.setup.name != setup
         || stage.launcher.name != LAUNCHER
     {
         return Err("Windows staging receipt differs from this formal candidate/run".into());
     }
-    let receipt_path = directory.join(format!("{ARCHIVE}.receipt.json"));
+    let receipt_path = directory.join(format!("{archive}.receipt.json"));
     let receipt_hash = installation::sha256(&receipt_path)?;
     let portable = portable::verify_staged(
-        &directory.join(ARCHIVE),
+        &directory.join(&archive),
         &receipt_path,
         &directory.join("portable.staging-inspection.json"),
         version,
         candidate,
     )?;
+    if backend == Backend::Cpu && !portable.startup_executed {
+        return Err("Windows CPU assets require executed startup checks on a Windows host".into());
+    }
     if stage.archive.sha256 != portable.archive_sha256
         || stage.archive.size_bytes != portable.archive_size_bytes
         || stage.binary_sha256 != portable.binary_sha256
@@ -187,14 +244,14 @@ pub(in super::super) fn verify(
     }
     assets.push(AcceptedAsset {
         path: receipt_path,
-        name: format!("{ARCHIVE}.receipt.json"),
+        name: format!("{archive}.receipt.json"),
         sha256: receipt_hash,
     });
     let mut names = BTreeSet::new();
     if assets.iter().any(|asset| !names.insert(&asset.name)) {
         return Err("duplicate Windows public asset".into());
     }
-    println!("Verified Windows staged bytes; CUDA startup {}. Model/upgrade QA is not asserted by this asset gate.", if portable.startup_executed { "passed" } else { "deferred (no driver on staging host)" });
+    println!("Verified Windows {suffix} staged bytes; startup {}. Model/upgrade QA is not asserted by this asset gate.", if portable.startup_executed { "passed" } else { "deferred (no driver on staging host)" });
     Ok(VerifiedWindows {
         assets,
         attempt: stage.workflow_run_attempt,

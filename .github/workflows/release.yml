@@ -242,7 +242,7 @@ jobs:
       asset_id: ${{ steps.asset_id.outputs.artifact-id }}
       runner_id: ${{ steps.runner_id.outputs.artifact-id }}
       controller_id: ${{ steps.controller_id.outputs.artifact-id }}
-    name: Stage macOS aarch64 Metal
+    name: Stage macOS aarch64 CPU and Metal
     runs-on: macos-14
     timeout-minutes: 90
     steps:
@@ -308,6 +308,40 @@ jobs:
             --staging-label "$STAGING_LABEL" \
             --workflow-run-id "$GITHUB_RUN_ID" \
             --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Build, package and execute the macOS CPU program
+        run: |
+          cargo build --release --locked -p ferrum-cli --bin ferrum
+          strip target/release/ferrum
+          file target/release/ferrum > ferrum-macos-aarch64-cpu.dependencies.txt
+          otool -L target/release/ferrum >> ferrum-macos-aarch64-cpu.dependencies.txt
+          mkdir -p dist-cpu
+          cp target/release/ferrum dist-cpu/ferrum
+          cat LICENSE crates/ferrum-kernels/src/gguf_blocks/LICENSE.ggml > dist-cpu/LICENSE
+          cp README.md dist-cpu/README.md
+          asset=ferrum-macos-aarch64-cpu.tar.gz
+          tar -C dist-cpu -czf "$asset" ferrum LICENSE README.md
+          ./target/release/examples/release_candidate manifest \
+            --version "$VERSION" \
+            --candidate-sha "$RC_SHA" --candidate-tag "$RC_TAG" \
+            --staging-label "$STAGING_LABEL" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --backend cpu --target-triple aarch64-apple-darwin \
+            --asset "$asset" --binary dist-cpu/ferrum \
+            --dependencies ferrum-macos-aarch64-cpu.dependencies.txt
+          ./target/release/release_delivery inspect --abi "$asset.abi.json" \
+            --version "$VERSION" --candidate-sha "$RC_SHA" \
+            --extract-dir "$RUNNER_TEMP/macos-cpu-startup" \
+            --output "$RUNNER_TEMP/installation-macos-cpu.json"
+
+      - name: Upload macOS CPU installation evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: installation-macos-cpu
+          if-no-files-found: error
+          retention-days: 14
+          path: ${{ runner.temp }}/installation-macos-cpu.json
 
       - name: Build release Metal binary once
         run: cargo build --release --locked -p ferrum-cli --bin ferrum --features metal
@@ -385,7 +419,7 @@ jobs:
             model-regression-macos-aarch64.tar.gz.sha256
             model-regression-macos-aarch64.binary.sha256
 
-      - name: Upload staged Metal asset
+      - name: Upload staged macOS CPU and Metal assets
         id: asset_id
         uses: actions/upload-artifact@v4
         with:
@@ -400,3 +434,10 @@ jobs:
             ferrum-macos-aarch64.tar.gz.dependency.json
             ferrum-macos-aarch64.tar.gz.abi.json
             ferrum-macos-aarch64.dependencies.txt
+            ferrum-macos-aarch64-cpu.tar.gz
+            ferrum-macos-aarch64-cpu.tar.gz.sha256
+            ferrum-macos-aarch64-cpu.tar.gz.binary.sha256
+            ferrum-macos-aarch64-cpu.tar.gz.version.json
+            ferrum-macos-aarch64-cpu.tar.gz.dependency.json
+            ferrum-macos-aarch64-cpu.tar.gz.abi.json
+            ferrum-macos-aarch64-cpu.dependencies.txt

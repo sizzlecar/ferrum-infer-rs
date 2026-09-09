@@ -27,6 +27,7 @@ cleanup() {
 prepare() {
     asset="ferrum-$platform"
     [ "$backend" != cuda ] || asset="$asset-cuda-sm89"
+    if [ "$platform" = macos-aarch64 ] && [ "$backend" = cpu ]; then asset="$asset-cpu"; fi
     asset="$asset.tar.gz"
     note "Downloading Ferrum $version ($backend, $platform)..."
     download "$release_base/v$version/$asset" "$work/$asset"
@@ -123,11 +124,21 @@ main() {
     case "$os/$arch" in
         Darwin/arm64|Darwin/aarch64)
             platform=macos-aarch64
-            case "$backend" in auto|metal) backend=metal;; *) die 'The macOS release is Apple Silicon with Metal';; esac;;
+            metal_supported=no
+            if [ "$backend" != cpu ] && command -v system_profiler >/dev/null 2>&1; then
+                if displays=$(system_profiler SPDisplaysDataType -json 2>/dev/null); then
+                    if printf '%s\n' "$displays" | grep -Eq '"spdisplays_(mtlgpufamilysupport|metal)"[[:space:]]*:[[:space:]]*"spdisplays_(metal[0-9]+|supported)"'; then metal_supported=yes; fi
+                fi
+            fi
+            case "$backend" in
+                auto) if [ "$metal_supported" = yes ]; then backend=metal; else backend=cpu; note 'No supported Metal GPU was detected; selecting the CPU package.'; fi;;
+                metal) [ "$metal_supported" = yes ] || die 'Metal requires a supported GPU reported by macOS';;
+                cpu) ;; *) die 'CUDA is unavailable on Apple Silicon macOS';;
+            esac;;
         Linux/x86_64|Linux/amd64)
             platform=linux-x86_64
             gpu_supported=no
-            if command -v nvidia-smi >/dev/null 2>&1; then
+            if [ "$backend" != cpu ] && command -v nvidia-smi >/dev/null 2>&1; then
                 if caps=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null); then
                     if printf '%s\n' "$caps" | awk 'BEGIN{n=0} {gsub(/[[:space:]]/,""); if($0!="8.9") exit 1; n++} END{if(n==0) exit 1}'; then gpu_supported=yes; fi
                 fi
@@ -186,8 +197,8 @@ main() {
     work=$(mktemp -d "$root/download.XXXXXXXX")
     prepare
     if [ "$runtime_ok" != yes ]; then
-        if [ "$requested" = auto ] && [ "$backend" = cuda ]; then
-            note 'CUDA binary could not start with installed runtimes; selecting CPU. CUDA 12.4/NCCL/driver are not bundled.'
+        if [ "$requested" = auto ] && [ "$backend" != cpu ]; then
+            note "$backend binary could not start with installed runtimes; selecting CPU."
             backend=cpu; prepare
         fi
         [ "$runtime_ok" = yes ] || die 'The release binary cannot start on this host; no installed binary was replaced'

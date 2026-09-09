@@ -144,7 +144,7 @@ fn validate_target(backend: &str, target: &str) -> Result<(), String> {
         return Err("invalid installation target triple".into());
     }
     match (backend, parts.as_slice()) {
-        ("cpu" | "cuda", [_, _, "linux", _]) | ("metal", [_, "apple", "darwin"]) => Ok(()),
+        ("cpu" | "cuda", [_, _, "linux", _]) | ("cpu" | "metal", [_, "apple", "darwin"]) => Ok(()),
         _ => Err("installation backend does not agree with its staged target platform".into()),
     }
 }

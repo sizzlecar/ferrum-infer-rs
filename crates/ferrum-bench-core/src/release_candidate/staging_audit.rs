@@ -25,10 +25,10 @@ impl Format {
         }
         match (backend, parts.as_slice()) {
             (Backend::Cpu | Backend::Cuda, [_, _, "linux", _]) => Ok(Self::Ldd),
-            (Backend::Metal, [_, "apple", "darwin"]) => Ok(Self::Otool),
-            (Backend::Cpu | Backend::Cuda, _) => {
-                Err("CPU and CUDA staging assets require a Linux target and ldd audit".into())
-            }
+            (Backend::Cpu | Backend::Metal, [_, "apple", "darwin"]) => Ok(Self::Otool),
+            (Backend::Cpu | Backend::Cuda, _) => Err(
+                "CPU staging requires Linux or Apple Darwin; CUDA requires a Linux target".into(),
+            ),
             (Backend::Metal, _) => {
                 Err("Metal staging assets require an Apple Darwin target and otool audit".into())
             }
@@ -152,6 +152,21 @@ pub(super) fn inspect(text: &str, backend: Backend, format: Format) -> Result<Au
             return Err(format!(
                 "forbidden Python/Torch/vLLM dynamic runtime dependency: {name}"
             ));
+        }
+        if backend == Backend::Cpu {
+            let gpu_library = |path: &str| {
+                let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+                ["libcuda", "libcublas", "libnccl", "libcudnn"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                    || matches!(
+                        name.as_str(),
+                        "metal" | "metalperformanceshaders" | "metalperformanceshadersgraph"
+                    )
+            };
+            if gpu_library(&name) || resolved.as_deref().is_some_and(gpu_library) {
+                return Err(format!("CPU package depends on a GPU runtime: {name}"));
+            }
         }
         if resolved.is_none() {
             if backend != Backend::Cuda || name != "libcuda.so.1" {

@@ -64,10 +64,11 @@ fn invoke_powershell_in(
 }
 
 #[test]
-fn downloaded_bootstrap_pipeline_executes_native_detection_and_rejects_missing_driver() {
+fn downloaded_bootstrap_pipeline_selects_cpu_without_driver_tools() {
     // Serve unmodified candidate bytes and execute the README's IRM/IEX pipeline.
-    // Only the external driver-file lookup is replaced. This proves startup and
-    // no-driver rejection, not a complete installation from the public website.
+    // Replace driver-file lookup and release metadata at the network boundary.
+    // Missing CPU assets stop before setup execution; this is a startup/selection
+    // regression, not a complete installation from the public website.
     let script =
         fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1")).unwrap();
     let server = Server::new(BTreeMap::from([("/install.ps1".into(), script)]));
@@ -75,10 +76,16 @@ fn downloaded_bootstrap_pipeline_executes_native_detection_and_rejects_missing_d
         r#"
         $cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Architecture -Unique)
         function Test-Path {{ param($LiteralPath, $PathType); return $false }}
+        function Invoke-RestMethod {{
+            param($Uri, $Headers)
+            if ($Uri -eq {url}) {{ return Microsoft.PowerShell.Utility\Invoke-RestMethod -Uri $Uri }}
+            if ($Uri -ne 'https://api.github.com/repos/sizzlecar/ferrum-infer-rs/releases/latest') {{ throw 'unexpected release endpoint' }}
+            return [pscustomobject]@{{tag_name='v2.3.4'; draft=$false; prerelease=$false; assets=@()}}
+        }}
         $failure = $null
         try {{ irm {url} | iex }}
         catch {{ $failure = [ordered]@{{message=$_.Exception.Message; error_id=$_.FullyQualifiedErrorId; cpu=$cpu; process_bits=([IntPtr]::Size*8)}} }}
-        if ($null -eq $failure) {{ throw 'installer unexpectedly succeeded without driver tools' }}
+        if ($null -eq $failure) {{ throw 'installer unexpectedly accepted missing release assets' }}
         $failure | ConvertTo-Json -Compress
         "#,
         url = quote(&format!("{}/install.ps1", server.url)),
@@ -95,11 +102,12 @@ fn downloaded_bootstrap_pipeline_executes_native_detection_and_rejects_missing_d
         }
         let output = invoke_powershell_in(directory, &body, &[]);
         require_success(&output);
-        let observed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let observed: Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
         let message = observed["message"].as_str().unwrap();
         if observed["cpu"] == json!([9]) {
             assert!(
-                message.contains("NVIDIA driver tools were not found"),
+                message.contains("ferrum-2.3.4-windows-x86_64-cpu-setup.exe"),
                 "{observed}"
             );
         } else {
@@ -267,6 +275,33 @@ fn bootstrap_detects_native_architecture_in_windows_powershell_and_wow64() {
 }
 
 #[test]
+fn gpu_probe_directories_resolve_native_executables_from_both_powershells() {
+    // Use an OS executable present even on driverless hosts to prove that the
+    // GPU tool's directory resolves to native bytes, including under WOW64.
+    let body = r#"
+        $candidates = @(Get-FerrumNvidiaSmiCandidates)
+        $nativeCommand = Join-Path ([IO.Path]::GetDirectoryName($candidates[0])) 'cmd.exe'
+        [ordered]@{
+            candidates=$candidates
+            command_sha256=(Get-FileHash -LiteralPath $nativeCommand -Algorithm SHA256).Hash
+            is64_os=[Environment]::Is64BitOperatingSystem
+            process_bits=([IntPtr]::Size*8)
+        } | ConvertTo-Json -Compress
+    "#;
+    let native_output = powershell(body, &[]);
+    require_success(&native_output);
+    let native: Value = serde_json::from_slice(&native_output.stdout).unwrap();
+    if native["is64_os"] == true {
+        let wow64_output = powershell_in("SysWOW64", body, &[]);
+        require_success(&wow64_output);
+        let wow64: Value = serde_json::from_slice(&wow64_output.stdout).unwrap();
+        assert_eq!(wow64["process_bits"], 32);
+        assert_eq!(wow64["command_sha256"], native["command_sha256"]);
+        assert_eq!(wow64["candidates"][1], native["candidates"][1]);
+    }
+}
+
+#[test]
 fn bootstrap_startup_reaches_gpu_probe_after_real_architecture_detection() {
     // Exercise the install entrypoint, stopping at the first hardware probe.
     // The only replaced boundaries are driver-file lookup and process launch;
@@ -276,7 +311,7 @@ fn bootstrap_startup_reaches_gpu_probe_after_real_architecture_detection() {
         $architecture = Get-FerrumWindowsArchitecture
         function Test-Path { param($LiteralPath, $PathType); return $true }
         function Invoke-FerrumProcess { param($Program, $Arguments); throw 'fixture: reached GPU probe' }
-        try { Install-FerrumRelease; throw 'startup did not stop at hardware detection' }
+        try { Install-FerrumRelease -RequestedBackend cuda; throw 'startup did not stop at hardware detection' }
         catch {
             $expected = if ($architecture -eq 'X64') { 'fixture: reached GPU probe' } else { 'This installer supports native Windows x64 only.' }
             if ($_.Exception.Message -cne $expected) { throw }
@@ -433,6 +468,77 @@ fn bootstrap_hardware_contract_rejects_other_architectures_or_old_drivers() {
         .status
         .success());
     }
+}
+
+#[test]
+fn bootstrap_backend_selection_falls_back_only_for_automatic_requests() {
+    for (requested, csv, probe_error, expected) in [
+        ("auto", "8.9, 560.94", "", "cuda"),
+        ("auto", "", "driver tools absent", "cpu"),
+        ("auto", "8.6, 560.94", "", "cpu"),
+        ("auto", "8.9, 528.33", "", "cpu"),
+        ("auto", "invalid", "", "cpu"),
+        ("cpu", "8.9, 560.94", "", "cpu"),
+        ("cpu", "", "driver tools absent", "cpu"),
+    ] {
+        let result = powershell(&format!(
+            "Resolve-FerrumBackend -RequestedBackend {} -Architecture X64 -GpuCsv {} -ProbeError {}",
+            quote(requested), quote(csv), quote(probe_error)
+        ), &[]);
+        require_success(&result);
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).lines().last(),
+            Some(expected)
+        );
+    }
+    for csv in ["", "8.6, 560.94", "8.9, 528.33", "invalid"] {
+        assert!(!powershell(
+            &format!(
+                "Resolve-FerrumBackend -RequestedBackend cuda -Architecture X64 -GpuCsv {}",
+                quote(csv)
+            ),
+            &[]
+        )
+        .status
+        .success());
+    }
+    assert!(!powershell(
+        "Resolve-FerrumBackend -RequestedBackend cpu -Architecture Arm64",
+        &[]
+    )
+    .status
+    .success());
+}
+
+#[test]
+fn bootstrap_selects_cpu_assets_from_the_requested_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let fixture = temp.path().join("cpu-release.json");
+    let mut cpu_release = release();
+    for asset in cpu_release["assets"].as_array_mut().unwrap() {
+        for key in ["name", "browser_download_url"] {
+            asset[key] = asset[key]
+                .as_str()
+                .unwrap()
+                .replace("cuda-sm89", "cpu")
+                .into();
+        }
+    }
+    fs::write(&fixture, serde_json::to_vec(&cpu_release).unwrap()).unwrap();
+    let result = powershell(&format!(
+        "Select-FerrumRelease -Release (Get-Content -Raw -LiteralPath {} | ConvertFrom-Json) -RequestedVersion '2.3.4' -SelectedBackend cpu | ConvertTo-Json -Depth 5",
+        quote(fixture.to_str().unwrap())
+    ), &[]);
+    require_success(&result);
+    let selected: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        selected["setup"]["name"],
+        "ferrum-2.3.4-windows-x86_64-cpu-setup.exe"
+    );
+    assert_eq!(
+        selected["checksum"]["name"],
+        "ferrum-2.3.4-windows-x86_64-cpu-setup.exe.sha256"
+    );
 }
 
 #[test]

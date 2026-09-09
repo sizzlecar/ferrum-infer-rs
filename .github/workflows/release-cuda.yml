@@ -447,6 +447,16 @@ jobs:
           $lock = Join-Path $set 'native-operator-set.lock.json'
           & $builder assemble-set @receiptArgs --g03-catalog-sha256 $referenceLock.g03_catalog_sha256 --compute-capability sm_89 --out $lock
           "FERRUM_NATIVE_OPERATOR_SET_LOCK=$lock" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build and preserve the CPU-only Windows executable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          Remove-Item Env:FERRUM_NATIVE_OPERATOR_SET_LOCK -ErrorAction SilentlyContinue
+          cargo build --release --locked -p ferrum-cli --bin ferrum
+          $cpu = Join-Path $env:RUNNER_TEMP 'windows-cpu-inputs'
+          New-Item -ItemType Directory $cpu | Out-Null
+          Copy-Item 'target/release/ferrum.exe' (Join-Path $cpu 'ferrum.exe')
+
       - name: Build release metadata and portable packaging tools
         run: |
           $ErrorActionPreference = 'Stop'
@@ -636,6 +646,60 @@ jobs:
             $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "$hash  $($file.Name)" | Set-Content ($file.FullName + '.sha256') -Encoding ascii
           }
+      - name: Package and execute the Windows CPU installer payload
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          $assets = Join-Path $env:RUNNER_TEMP 'windows-assets/cpu'
+          New-Item -ItemType Directory $assets | Out-Null
+          $binary = Join-Path $env:RUNNER_TEMP 'windows-cpu-inputs/ferrum.exe'
+          $spec = Get-Content (Join-Path $env:RUNNER_TEMP 'windows-runtime-inputs/portable-spec.json') -Raw | ConvertFrom-Json -AsHashtable
+          $spec.manifest.backend = 'cpu'
+          $spec.manifest.cuda_compute_capability = ''
+          $spec.manifest.cargo_features = @()
+          $spec.manifest.files = @($spec.manifest.files | Where-Object { $_.role -ne 'cuda_runtime' -and $_.path -ne 'licenses/CUDA.txt' })
+          $binaryFile = $spec.manifest.files | Where-Object path -EQ 'ferrum.exe'
+          $binaryFile.sha256 = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          $binaryFile.size_bytes = (Get-Item $binary).Length
+          $spec.sources['ferrum.exe'] = $binary
+          foreach ($name in @($spec.sources.Keys)) {
+            if ($name -notin $spec.manifest.files.path) { $spec.sources.Remove($name) }
+          }
+          $specPath = Join-Path $env:RUNNER_TEMP 'windows-cpu-inputs/portable-spec.json'
+          $spec | ConvertTo-Json -Depth 20 | Set-Content $specPath -Encoding utf8NoBOM
+          $archive = Join-Path $assets 'ferrum-windows-x86_64-cpu.zip'
+          & './target/release/release_delivery.exe' portable pack --spec $specPath --archive $archive --receipt "$archive.receipt.json"
+          $payload = Join-Path $env:RUNNER_TEMP 'windows-cpu-payload'
+          & './target/release/release_delivery.exe' portable inspect --archive $archive --receipt "$archive.receipt.json" --extract-dir $payload --output (Join-Path $assets 'portable.staging-inspection.json')
+          $dumpbin = Join-Path (Split-Path $env:CC) 'dumpbin.exe'
+          foreach ($entry in $spec.sources.GetEnumerator()) {
+            if ($entry.Key -eq 'ferrum.exe' -or $entry.Key.EndsWith('.dll')) {
+              $imports = & $dumpbin /nologo /headers /imports $entry.Value | Out-String
+              $imports | Set-Content (Join-Path $assets ($entry.Key + '.pe.txt')) -Encoding utf8NoBOM
+              if ($imports -match '(?im)^\s*(nvcuda|cudart[^\s]*|cublas[^\s]*|nvrtc[^\s]*|cudnn[^\s]*)\.dll\s*$') { throw "CPU payload imports an NVIDIA runtime: $($entry.Key)" }
+            }
+          }
+          Copy-Item $env:WINDOWS_LAUNCHER_PATH (Join-Path $assets 'ferrum-windows-launcher-v1.exe')
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'windows-assets/launcher-origin.json') (Join-Path $assets 'launcher-origin.json')
+          & $env:ISCC '/DBackend=cpu' "/DPayloadDir=$payload" "/DLauncherPath=$env:WINDOWS_LAUNCHER_PATH" "/DAppVersion=$env:VERSION" "/O$assets" 'packaging/windows/ferrum.iss' | Tee-Object -FilePath (Join-Path $assets 'iscc-build.log')
+          if ($LASTEXITCODE -ne 0) { throw "CPU ISCC compilation failed: $LASTEXITCODE" }
+          $provenance = [ordered]@{
+            schema_version = 1; version = $env:VERSION; candidate_sha = $env:RC_SHA; candidate_tag = $env:RC_TAG
+            staging_label = $env:STAGING_LABEL; workflow_run_id = [uint64]$env:GITHUB_RUN_ID; workflow_run_attempt = [uint64]$env:GITHUB_RUN_ATTEMPT
+            scope = 'staged_bytes_and_startup'
+            binary_sha256 = $binaryFile.sha256
+            manifest_sha256 = (Get-FileHash (Join-Path $payload 'ferrum-portable.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+            launcher_sha256 = (Get-FileHash $env:WINDOWS_LAUNCHER_PATH -Algorithm SHA256).Hash.ToLowerInvariant()
+            iscc_sha256 = (Get-FileHash $env:ISCC -Algorithm SHA256).Hash.ToLowerInvariant()
+          }
+          foreach ($entry in @(@('archive', 'ferrum-windows-x86_64-cpu.zip'), @('setup', "ferrum-$env:VERSION-windows-x86_64-cpu-setup.exe"), @('launcher', 'ferrum-windows-launcher-v1.exe'))) {
+            $file = Get-Item -LiteralPath (Join-Path $assets $entry[1])
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $provenance[$entry[0]] = @{ name = $file.Name; size_bytes = $file.Length; sha256 = $hash }
+            "$hash  $($file.Name)" | Set-Content ($file.FullName + '.sha256') -Encoding ascii
+          }
+          $provenance | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $assets 'windows-staging.json') -Encoding utf8NoBOM
+
       - name: Upload Windows staged release assets
         id: windows_assets
         uses: actions/upload-artifact@v4
