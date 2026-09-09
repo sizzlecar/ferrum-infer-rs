@@ -19,8 +19,10 @@ use std::sync::{Arc, OnceLock};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
+mod gguf;
 mod metadata_inventory;
 mod selection;
+pub use gguf::validate_gguf_filename;
 
 pub use metadata_inventory::{
     inspect_cached_metadata_inventory, inspect_cached_metadata_selection,
@@ -167,6 +169,7 @@ impl HfDownloader {
         revision: Option<&str>,
         gguf_filename: &str,
     ) -> Result<PathBuf> {
+        validate_gguf_filename(gguf_filename)?;
         let revision = revision.unwrap_or("main");
         let model_cache_name = format!("models--{}", model_id.replace('/', "--"));
         let model_dir = self.cache_dir.join("hub").join(&model_cache_name);
@@ -177,61 +180,39 @@ impl HfDownloader {
         fs::create_dir_all(&blobs_dir).await?;
         fs::create_dir_all(&refs_dir).await?;
 
-        let files = self.list_files(model_id, revision).await?;
-        let gguf_lower = gguf_filename.to_ascii_lowercase();
-        let files_to_download: Vec<_> = files
-            .iter()
-            .filter(|file| {
-                file.file_type.as_deref() != Some("directory")
-                    && file.path.to_ascii_lowercase() == gguf_lower
-            })
-            .collect();
-        if !files_to_download
-            .iter()
-            .any(|f| f.path.eq_ignore_ascii_case(gguf_filename))
-        {
-            return Err(FerrumError::model(format!(
-                "GGUF file '{}' not found in repo '{}'",
-                gguf_filename, model_id
-            )));
-        }
-
         let commit_sha = self.get_commit_sha(model_id, revision).await?;
+        if commit_sha.len() != 40 || !commit_sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(FerrumError::model(
+                "HuggingFace returned an invalid commit SHA",
+            ));
+        }
+        let files = self.list_files(model_id, &commit_sha).await?;
+        let file = gguf::selected_file(&files, gguf_filename)?;
         let snapshot_dir = snapshots_dir.join(&commit_sha);
         fs::create_dir_all(&snapshot_dir).await?;
 
-        let total_size: u64 = files_to_download.iter().filter_map(|f| f.size).sum();
+        let total_size = file.size.unwrap_or(0);
         eprintln!(
             "📦 Downloading {} files ({:.2} GB)",
-            files_to_download.len(),
+            1,
             total_size as f64 / 1_073_741_824.0
         );
 
-        for f in &files_to_download {
-            self.download_file_concurrent(
-                model_id,
-                revision,
-                &f.path,
-                f.size.unwrap_or(0),
-                &blobs_dir,
-                &snapshot_dir,
-                None,
-            )
-            .await?;
-        }
+        self.download_file_concurrent(
+            model_id,
+            &commit_sha,
+            &file.path,
+            total_size,
+            &blobs_dir,
+            &snapshot_dir,
+            None,
+        )
+        .await?;
 
         let ref_file = refs_dir.join(revision);
         fs::write(&ref_file, &commit_sha).await?;
 
-        // Locate the GGUF case-insensitively, since the API may return a
-        // capitalisation that differs from the alias key.
-        let actual_filename = files_to_download
-            .iter()
-            .find(|f| f.path.eq_ignore_ascii_case(gguf_filename))
-            .map(|f| f.path.clone())
-            .unwrap_or_else(|| gguf_filename.to_string());
-
-        let gguf_path = snapshot_dir.join(&actual_filename);
+        let gguf_path = snapshot_dir.join(&file.path);
         Ok(gguf_path)
     }
 
@@ -375,6 +356,7 @@ impl HfDownloader {
             DownloadLayout::Repository => selection::repository_files(&files),
             DownloadLayout::RootSafetensors => selection::selected_files(&files, index.as_deref())?,
         };
+        gguf::require_weight_selection(&files, &files_to_download)?;
         if files_to_download.is_empty() {
             return Err(FerrumError::model("No model files found in repository"));
         }

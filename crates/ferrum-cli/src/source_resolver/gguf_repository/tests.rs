@@ -10,7 +10,7 @@ pub(crate) fn write_metadata_fixture(path: &Path, architecture: &str, metadata: 
 }
 
 /// Header-only IQ4_XS artifact. Source composition does not execute its weights.
-fn write_iq_fixture(path: &Path, metadata: &[(&str, &Value)]) {
+pub(crate) fn write_iq_fixture(path: &Path, metadata: &[(&str, &Value)]) {
     write_metadata_fixture(path, "qwen35", metadata);
     let mut bytes = std::fs::read(path).unwrap();
     let mut reader = Cursor::new(&bytes);
@@ -148,6 +148,7 @@ async fn iq_repository_uses_declared_source_for_default_pinned_and_tokenizer_ove
         DownloadPolicy::NoDownload,
         None,
         &ProductSourceArgs {
+            gguf_file: None,
             semantic_source: None,
             tokenizer_source: Some(tokenizer.clone()),
         },

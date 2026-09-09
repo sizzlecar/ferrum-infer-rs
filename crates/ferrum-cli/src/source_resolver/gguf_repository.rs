@@ -3,6 +3,8 @@
 use super::*;
 use ferrum_quantization::gguf::GgufModelMetadata;
 
+pub(super) mod selection;
+
 #[cfg(test)]
 pub(super) mod tests;
 

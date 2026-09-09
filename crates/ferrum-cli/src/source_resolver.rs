@@ -66,6 +66,11 @@ use crate::gpu_mem_autosize::{apply_auto_size_with_profile, AutoSizeProfile};
 /// The physical weight source remains the positional MODEL argument.
 #[derive(Args, Debug, Clone, Default)]
 pub struct ProductSourceArgs {
+    /// Exact repository-relative GGUF filename. MODEL must be owner/repository,
+    /// optionally pinned with @<40-hex-commit>.
+    #[arg(long, value_name = "FILE")]
+    pub gguf_file: Option<String>,
+
     /// Directory containing the semantic `config.json` used to build the
     /// typed model family. When set, it is also the tokenizer source unless
     /// `--tokenizer-source` is supplied.
@@ -1633,6 +1638,18 @@ pub async fn resolve_model_source_with_product_sources(
     autosize: Option<(AutoSizeProfile, f32)>,
     source_args: &ProductSourceArgs,
 ) -> Result<Resolved> {
+    if let Some(filename) = &source_args.gguf_file {
+        let resolved = gguf_repository::selection::resolve(
+            model,
+            filename,
+            cache_dir,
+            download,
+            autosize,
+            source_args,
+        )
+        .await?;
+        return apply_explicit_product_sources(resolved, source_args);
+    }
     let mut resolved = resolve_model_source_internal(
         model,
         cache_dir,
@@ -1856,6 +1873,7 @@ mod tests {
             }"#,
         );
         let args = ProductSourceArgs {
+            gguf_file: None,
             semantic_source: Some(semantic.clone()),
             tokenizer_source: None,
         };
@@ -1964,6 +1982,7 @@ mod tests {
         )
         .unwrap();
         let args = ProductSourceArgs {
+            gguf_file: None,
             semantic_source: Some(semantic.clone()),
             tokenizer_source: None,
         };
@@ -2504,6 +2523,7 @@ mod tests {
             DownloadPolicy::NoDownload,
             None,
             &ProductSourceArgs {
+                gguf_file: None,
                 semantic_source: None,
                 tokenizer_source: Some(tokenizer.clone()),
             },

@@ -261,6 +261,7 @@ async fn explicit_tokenizer_with_gguf_preserves_colocated_semantics() {
             DownloadPolicy::NoDownload,
             None,
             &ProductSourceArgs {
+                gguf_file: None,
                 semantic_source: None,
                 tokenizer_source: Some(tokenizer.clone()),
             },
@@ -442,6 +443,7 @@ async fn explicit_tokenizer_allows_cached_weights_without_colocated_tokenizer() 
         DownloadPolicy::NoDownload,
         None,
         &ProductSourceArgs {
+            gguf_file: None,
             semantic_source: None,
             tokenizer_source: Some(tokenizer.clone()),
         },
@@ -478,6 +480,7 @@ async fn tokenizer_override_preserves_the_pinned_repository_for_unchanged_roles(
         DownloadPolicy::NoDownload,
         None,
         &ProductSourceArgs {
+            gguf_file: None,
             semantic_source: None,
             tokenizer_source: Some(tokenizer.clone()),
         },
@@ -522,6 +525,7 @@ async fn explicit_semantics_allow_cached_weights_without_colocated_metadata() {
         DownloadPolicy::NoDownload,
         None,
         &ProductSourceArgs {
+            gguf_file: None,
             semantic_source: Some(semantic.clone()),
             tokenizer_source: None,
         },

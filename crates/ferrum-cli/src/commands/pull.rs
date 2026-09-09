@@ -9,6 +9,9 @@ use ferrum_types::Result;
 pub struct PullCommand {
     /// Model to download (for example `qwen3.5:4b-q4_k_m` on Metal or `qwen3.5:4b` on CUDA)
     pub model: String,
+    /// Exact repository-relative GGUF filename; MODEL may include @<40-hex-commit>.
+    #[arg(long, value_name = "FILE")]
+    pub gguf_file: Option<String>,
 }
 
 pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
@@ -20,14 +23,28 @@ pub async fn execute(cmd: PullCommand, config: CliConfig) -> Result<()> {
     );
     println!("{}", format!("Cache: {}", cache_dir.display()).dimmed());
 
-    match crate::source_resolver::resolve_model_source(
-        &cmd.model,
-        &cache_dir,
-        crate::source_resolver::DownloadPolicy::AutoDownload,
-        None,
-    )
-    .await
-    {
+    let result = if let Some(filename) = cmd.gguf_file {
+        crate::source_resolver::resolve_model_source_with_product_sources(
+            &cmd.model,
+            &cache_dir,
+            crate::source_resolver::DownloadPolicy::AutoDownload,
+            None,
+            &crate::source_resolver::ProductSourceArgs {
+                gguf_file: Some(filename),
+                ..Default::default()
+            },
+        )
+        .await
+    } else {
+        crate::source_resolver::resolve_model_source(
+            &cmd.model,
+            &cache_dir,
+            crate::source_resolver::DownloadPolicy::AutoDownload,
+            None,
+        )
+        .await
+    };
+    match result {
         Ok(resolved) => {
             println!();
             println!("{} Model ready at:", "✓".green().bold());
