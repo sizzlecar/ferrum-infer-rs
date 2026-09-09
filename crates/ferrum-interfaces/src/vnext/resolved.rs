@@ -8,6 +8,8 @@ use std::fmt;
 use std::io::{self, Write};
 
 use super::model::PreparedModelFamilyWire;
+use super::numerical_resolution::NumericalProfileResolutionWire;
+use super::NumericalProfileResolution;
 use super::{
     AdmissionFitPolicy, CapabilityCatalog, CompletionRetentionSpec, ContractVersion,
     DeviceDescriptor, DynamicStorageProfile, ExecutablePlanView, ExecutionDeterminismRequirement,
@@ -1622,6 +1624,7 @@ pub enum ResolutionField {
     Config,
     ExternalMetadata,
     Family,
+    NumericalExecution,
     WeightSchema,
     WeightFormat,
     Tokenizer,
@@ -1661,6 +1664,7 @@ impl ResolutionField {
             Self::Config => "config",
             Self::ExternalMetadata => "external_metadata",
             Self::Family => "family",
+            Self::NumericalExecution => "numerical_execution",
             Self::WeightSchema => "weight_schema",
             Self::WeightFormat => "weight_format",
             Self::Tokenizer => "tokenizer",
@@ -1735,7 +1739,7 @@ impl ResolutionField {
             Field::Engine => {
                 matches!(source, Source::RuntimePreset | Source::CapabilityResolution)
             }
-            Field::ExecutionPlan => matches!(source, Source::Planner),
+            Field::ExecutionPlan | Field::NumericalExecution => matches!(source, Source::Planner),
             Field::Sampling | Field::StructuredOutput => matches!(
                 source,
                 Source::UserInput
@@ -2612,6 +2616,7 @@ pub struct ResolvedModelPlanInputs {
     pub config: ModelConfigFingerprint,
     pub external_metadata_id: super::ExternalModelMetadataId,
     pub prepared_family: PreparedModelFamily,
+    pub numerical_execution: NumericalProfileResolution,
     pub tokenizer: TokenizerDescriptor,
     pub device: DeviceDescriptor,
     pub capabilities: CapabilityCatalog,
@@ -2631,6 +2636,7 @@ pub struct ResolvedModelPlanParts {
     pub config: ModelConfigFingerprint,
     pub external_metadata_id: super::ExternalModelMetadataId,
     pub prepared_family: PreparedModelFamily,
+    pub numerical_execution: NumericalProfileResolution,
     pub tokenizer: TokenizerDescriptor,
     pub device: DeviceDescriptor,
     pub capabilities: CapabilityCatalog,
@@ -2664,6 +2670,7 @@ pub struct ResolvedPlanValidationContext<'a> {
     device: &'a DeviceDescriptor,
     capabilities: &'a CapabilityCatalog,
     runtime: &'a ResolvedRuntimePolicy,
+    numerical_execution: NumericalProfileResolution,
     completion_retention: CompletionRetentionSpec,
 }
 
@@ -2675,6 +2682,7 @@ impl<'a> ResolvedPlanValidationContext<'a> {
         device: &'a DeviceDescriptor,
         capabilities: &'a CapabilityCatalog,
         runtime: &'a ResolvedRuntimePolicy,
+        numerical_execution: &NumericalProfileResolution,
     ) -> Self {
         Self {
             registry,
@@ -2683,6 +2691,7 @@ impl<'a> ResolvedPlanValidationContext<'a> {
             device,
             capabilities,
             runtime,
+            numerical_execution: numerical_execution.clone(),
             completion_retention: CompletionRetentionSpec::default(),
         }
     }
@@ -2725,6 +2734,10 @@ impl<'a> ResolvedPlanValidationContext<'a> {
         self.runtime
     }
 
+    pub fn numerical_execution(&self) -> &NumericalProfileResolution {
+        &self.numerical_execution
+    }
+
     pub fn completion_retention(&self) -> &CompletionRetentionSpec {
         &self.completion_retention
     }
@@ -2733,6 +2746,7 @@ impl<'a> ResolvedPlanValidationContext<'a> {
 /// The single validated, data-only result consumed by a product entrypoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResolvedModelPlan {
+    wire_version: u32,
     parts: ResolvedModelPlanParts,
     fingerprint: ResolutionFingerprint,
 }
@@ -2760,6 +2774,7 @@ pub struct UnvalidatedResolvedModelPlanParts {
     config: ModelConfigFingerprint,
     external_metadata_id: super::ExternalModelMetadataId,
     prepared_family: PreparedModelFamilyWire,
+    numerical_execution: NumericalProfileResolutionWire,
     tokenizer: TokenizerDescriptor,
     device: DeviceDescriptor,
     capabilities: CapabilityCatalog,
@@ -2780,6 +2795,7 @@ pub struct UnvalidatedResolvedModelPlan {
 
 #[derive(Serialize)]
 struct ResolvedModelPlanWire {
+    wire_version: u32,
     parts: UnvalidatedResolvedModelPlanParts,
     fingerprint: ResolutionFingerprint,
 }
@@ -2787,6 +2803,7 @@ struct ResolvedModelPlanWire {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ResolvedModelPlanWireFields {
+    wire_version: u32,
     parts: UnvalidatedResolvedModelPlanParts,
     fingerprint: ResolutionFingerprint,
 }
@@ -2797,6 +2814,11 @@ impl<'de> Deserialize<'de> for ResolvedModelPlanWire {
         D: Deserializer<'de>,
     {
         let raw = serde_json::Value::deserialize(deserializer)?;
+        if raw.get("wire_version").and_then(serde_json::Value::as_u64) != Some(2) {
+            return Err(serde::de::Error::custom(
+                "resolved model plan requires wire version 2 with explicit numerical resolution; resolve the model again",
+            ));
+        }
         let fields =
             ResolvedModelPlanWireFields::deserialize(&raw).map_err(serde::de::Error::custom)?;
         let canonical = serde_json::to_value(&fields).map_err(serde::de::Error::custom)?;
@@ -2806,6 +2828,7 @@ impl<'de> Deserialize<'de> for ResolvedModelPlanWire {
             ));
         }
         Ok(Self {
+            wire_version: fields.wire_version,
             parts: fields.parts,
             fingerprint: fields.fingerprint,
         })
@@ -2833,6 +2856,7 @@ impl UnvalidatedResolvedModelPlan {
             config,
             external_metadata_id,
             prepared_family,
+            numerical_execution,
             tokenizer,
             device,
             capabilities,
@@ -2845,6 +2869,16 @@ impl UnvalidatedResolvedModelPlan {
             decisions,
         } = self.parts;
         let verified_source_artifacts = context.verify_source_artifacts()?;
+        if !context
+            .numerical_execution()
+            .matches_wire(&numerical_execution)
+        {
+            return Err(invalid_plan(
+                "validation_context.numerical_execution",
+                "serialized numerical request or selection differs from external trusted resolution",
+            ));
+        }
+        let numerical_execution = context.numerical_execution().clone();
         let source_artifacts =
             Self::revalidate_source_artifacts(source_artifacts, &verified_source_artifacts)?;
         let prepared_family =
@@ -2886,6 +2920,7 @@ impl UnvalidatedResolvedModelPlan {
                 config,
                 external_metadata_id,
                 prepared_family,
+                numerical_execution,
                 tokenizer,
                 device: context.device().clone(),
                 capabilities: context.capabilities().clone(),
@@ -2990,6 +3025,7 @@ impl ResolvedModelPlan {
             config,
             external_metadata_id,
             prepared_family,
+            numerical_execution,
             tokenizer,
             device,
             capabilities,
@@ -3007,6 +3043,7 @@ impl ResolvedModelPlan {
             config,
             external_metadata_id,
             prepared_family,
+            numerical_execution,
             tokenizer,
             device,
             capabilities,
@@ -3030,7 +3067,11 @@ impl ResolvedModelPlan {
             &parts,
             "serialize resolved model plan",
         )?)?;
-        Ok(Self { parts, fingerprint })
+        Ok(Self {
+            wire_version: 2,
+            parts,
+            fingerprint,
+        })
     }
 
     fn validate_external_inputs(
@@ -3059,8 +3100,9 @@ impl ResolvedModelPlan {
                 ),
             ));
         }
-        let externally_prepared =
-            family_registration.prepare(inputs.prepared_family.canonical_config())?;
+        let definition = family_registration.define(inputs.prepared_family.canonical_config())?;
+        let externally_prepared = family_registration
+            .prepare(&definition, &inputs.prepared_family.numerical_profile().id)?;
         if externally_prepared != inputs.prepared_family {
             return Err(invalid_plan(
                 "validation_context.model_registry",
@@ -3076,6 +3118,19 @@ impl ResolvedModelPlan {
                 "device, capability catalog, or runtime policy differs from external trusted inputs",
             ));
         }
+        if &inputs.numerical_execution != context.numerical_execution() {
+            return Err(invalid_plan(
+                "validation_context.numerical_execution",
+                "numerical request or selection differs from external trusted resolution",
+            ));
+        }
+        inputs.numerical_execution.validate_for(
+            &definition,
+            &inputs.prepared_family,
+            context.capabilities(),
+            context.runtime(),
+            &inputs.execution_plan,
+        )?;
         Ok(())
     }
 
@@ -3674,7 +3729,8 @@ impl ResolvedModelPlan {
             | ResolutionField::ExecutionPlan
             | ResolutionField::Sampling
             | ResolutionField::Stop
-            | ResolutionField::StructuredOutput => true,
+            | ResolutionField::StructuredOutput
+            | ResolutionField::NumericalExecution => true,
         }
     }
 
@@ -3805,6 +3861,11 @@ impl ResolvedModelPlan {
             ResolutionField::Family,
             parts.prepared_family.family_id(),
             "serialize model family decision"
+        );
+        insert_value!(
+            ResolutionField::NumericalExecution,
+            &parts.numerical_execution,
+            "serialize numerical execution decision"
         );
         insert_value!(
             ResolutionField::WeightSchema,

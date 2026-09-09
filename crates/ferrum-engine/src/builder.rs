@@ -14,7 +14,7 @@ use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, RecurrentStateManager, Sampler, SchedulerInterface as Scheduler,
     TensorFactory, Tokenizer,
 };
-use ferrum_models::vnext::{PreparedProductionModel, ProductionModelSourceBundle};
+use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{EngineConfig, FerrumError, Result};
 use std::sync::Arc;
 use tracing::{debug, info};
@@ -35,7 +35,7 @@ pub struct EngineBuilder {
     model_sources: Option<Arc<ProductionModelSourceBundle>>,
     /// Immutable typed model package prepared once by the product composition
     /// root and reused by startup policy and executor construction.
-    prepared_model: Option<Arc<PreparedProductionModel>>,
+    defined_model: Option<Arc<DefinedProductionModel>>,
     /// Override: custom tokenizer name
     tokenizer_name: Option<String>,
     /// Override: custom sampler name
@@ -72,7 +72,7 @@ impl EngineBuilder {
             registry,
             config,
             model_sources: None,
-            prepared_model: None,
+            defined_model: None,
             tokenizer_name: None,
             sampler_name: None,
             scheduler_name: None,
@@ -89,13 +89,13 @@ impl EngineBuilder {
 
     pub fn with_model_sources(mut self, sources: Arc<ProductionModelSourceBundle>) -> Self {
         self.model_sources = Some(sources);
-        self.prepared_model = None;
+        self.defined_model = None;
         self
     }
 
-    pub fn with_prepared_model(mut self, prepared: Arc<PreparedProductionModel>) -> Self {
+    pub fn with_defined_model(mut self, prepared: Arc<DefinedProductionModel>) -> Self {
         self.model_sources = Some(Arc::clone(prepared.sources()));
-        self.prepared_model = Some(prepared);
+        self.defined_model = Some(prepared);
         self
     }
 
@@ -253,7 +253,7 @@ impl EngineBuilder {
         let component_config = ComponentConfig::from_engine_config_and_product_model(
             &self.config,
             self.model_sources.clone(),
-            self.prepared_model.clone(),
+            self.defined_model.clone(),
         );
         validate_layer_split_plan(&component_config)?;
         let typed_model_path = component_config.get_string_option("model_path");
@@ -587,12 +587,12 @@ pub async fn create_product_engine(
 
 /// Create a product engine from the exact typed model package already used by
 /// startup capability and resource-policy resolution.
-pub async fn create_prepared_product_engine(
+pub async fn create_defined_product_engine(
     config: EngineConfig,
-    prepared: Arc<PreparedProductionModel>,
+    prepared: Arc<DefinedProductionModel>,
 ) -> Result<Box<dyn LlmInferenceEngine + Send + Sync>> {
     EngineBuilder::new(config)
-        .with_prepared_model(prepared)
+        .with_defined_model(prepared)
         .build()
         .await
 }

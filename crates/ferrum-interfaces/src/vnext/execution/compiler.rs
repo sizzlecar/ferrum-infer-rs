@@ -222,6 +222,9 @@ impl ProgramPlanCompiler {
     ) -> Result<ProgramPlanCompilation, VNextError> {
         validate_compile_options(family, options)?;
         let value_tensors = infer_value_tensors(family, catalog, options)?;
+        family
+            .numerical_profile()
+            .validate_inferred_boundaries(&value_tensors)?;
         let family_fingerprint = family.fingerprint()?;
         let execution_weight_fingerprint = execution_weights.plan().fingerprint()?;
         let execution_weight_schema = execution_weights.plan().schema();

@@ -176,8 +176,6 @@ fn native_catalog_packaging_input_cannot_bypass_product_validation() {
         .split("\n    fn ")
         .next()
         .expect("product create must have a bounded body");
-    assert!(create.contains("family: &PreparedModelFamily"));
-    assert!(create.contains("Some(family)"));
     assert!(create.contains("composition.validate_compiled_native_operators()?"));
     assert!(!composition.contains("pub fn create_for_family("));
 

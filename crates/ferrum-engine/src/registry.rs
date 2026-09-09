@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use ferrum_interfaces::{
     KvCacheManager, ModelExecutor, Sampler, SchedulerInterface as Scheduler, Tokenizer,
 };
-use ferrum_models::vnext::{PreparedProductionModel, ProductionModelSourceBundle};
+use ferrum_models::vnext::{DefinedProductionModel, ProductionModelSourceBundle};
 use ferrum_types::{Device, EngineConfig, FerrumError, Result, RuntimeKnobs};
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ pub struct ComponentConfig {
     pub model_sources: Option<Arc<ProductionModelSourceBundle>>,
     /// Prepared typed model derived from `model_sources`, when the composition
     /// root has already resolved a migrated family.
-    pub prepared_model: Option<Arc<PreparedProductionModel>>,
+    pub defined_model: Option<Arc<DefinedProductionModel>>,
 }
 
 impl ComponentConfig {
@@ -70,14 +70,14 @@ impl ComponentConfig {
     pub fn from_engine_config_and_product_model(
         config: &EngineConfig,
         model_sources: Option<Arc<ProductionModelSourceBundle>>,
-        prepared_model: Option<Arc<PreparedProductionModel>>,
+        defined_model: Option<Arc<DefinedProductionModel>>,
     ) -> Self {
         Self {
             engine_config: config.clone(),
             device: config.backend.device.clone(),
             component_options: config.backend.backend_options.clone(),
             model_sources,
-            prepared_model,
+            defined_model,
         }
     }
 
@@ -1159,7 +1159,7 @@ fn create_registered_vnext_executor(
     config: &ComponentConfig,
     model_path: &std::path::Path,
     sources: Option<Arc<ProductionModelSourceBundle>>,
-    prepared_model: Option<Arc<PreparedProductionModel>>,
+    defined_model: Option<Arc<DefinedProductionModel>>,
     registration: ferrum_models::vnext::RegisteredProductionModel,
 ) -> Result<Arc<dyn ModelExecutor + Send + Sync>> {
     use ferrum_models::vnext::ProductionExecutionKind;
@@ -1170,28 +1170,28 @@ fn create_registered_vnext_executor(
         registration.external_metadata_id(),
     )?;
 
-    let _prepared_model_reused = prepared_model.is_some();
-    if let (Some(prepared), Some(sources)) = (prepared_model.as_ref(), sources.as_ref()) {
+    let _defined_model_reused = defined_model.is_some();
+    if let (Some(prepared), Some(sources)) = (defined_model.as_ref(), sources.as_ref()) {
         if !Arc::ptr_eq(prepared.sources(), sources) {
             return Err(FerrumError::model(
                 "prepared product model and component sources do not share one source lease",
             ));
         }
     }
-    let prepared = match prepared_model {
+    let prepared = match defined_model {
         Some(prepared) => {
-            if prepared.family().external_metadata_id() != registration.external_metadata_id() {
+            if prepared.definition().external_metadata_id() != registration.external_metadata_id() {
                 return Err(FerrumError::model(format!(
                     "prepared product metadata {} differs from registered metadata {}",
-                    prepared.family().external_metadata_id(),
+                    prepared.definition().external_metadata_id(),
                     registration.external_metadata_id()
                 )));
             }
             prepared
         }
         None => Arc::new(match sources {
-            Some(sources) => registration.prepare_from_sources(sources)?,
-            None => registration.prepare(model_path)?,
+            Some(sources) => registration.define_from_sources(sources)?,
+            None => registration.define(model_path)?,
         }),
     };
 
@@ -1199,26 +1199,17 @@ fn create_registered_vnext_executor(
         (ProductionExecutionKind::CausalLanguage, Device::CUDA(ordinal)) => {
             #[cfg(feature = "cuda")]
             {
-                let model_info = prepared.model_info(
-                    config.engine_config.model.model_id.clone(),
-                    config.device.clone(),
-                );
-                let family = prepared.family();
+                let family = prepared.definition();
                 let family_fingerprint = family
-                    .fingerprint()
-                    .map_err(|error| FerrumError::model(error.to_string()))?;
-                let program_fingerprint = family
-                    .program()
                     .fingerprint()
                     .map_err(|error| FerrumError::model(error.to_string()))?;
                 info!(
                     external_metadata_id = %registration.external_metadata_id(),
                     family_id = %family.family_id(),
                     family_fingerprint,
-                    program_fingerprint,
-                    prepared_model_reused = _prepared_model_reused,
+                    defined_model_reused = _defined_model_reused,
                     backend = "cuda",
-                    "Building registered model from a typed vNext execution plan"
+                    "Resolving a defined model against the actual vNext runtime"
                 );
                 let device_id = ferrum_interfaces::vnext::DeviceId::new(format!(
                     "device.cuda.{ordinal}"
@@ -1229,7 +1220,6 @@ fn create_registered_vnext_executor(
                         *ordinal,
                         device_id,
                         config.engine_config.runtime.attention_execution_policy,
-                        family,
                     )
                     .map_err(|error| {
                         FerrumError::device(format!("create vNext CUDA runtime: {error}"))
@@ -1238,18 +1228,16 @@ fn create_registered_vnext_executor(
                     runtime,
                     operation_registry,
                     weight_materializers,
-                    weight_materializer_selection,
                     catalog,
                 ) = composition.into_parts();
                 let executor = crate::product_composition::create_vnext_executor(
                     &config.engine_config,
                     prepared.as_ref(),
-                    model_info,
                     runtime,
                     operation_registry,
                     weight_materializers,
-                    weight_materializer_selection,
                     catalog,
+                    ferrum_kernels::backend::cuda::vnext_ops::cuda_weight_materializer_selection,
                 )?;
                 info!(
                     resolved_plan_fingerprint = executor
@@ -1270,26 +1258,17 @@ fn create_registered_vnext_executor(
         }
         #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
         (ProductionExecutionKind::CausalLanguage, Device::Metal) => {
-            let model_info = prepared.model_info(
-                config.engine_config.model.model_id.clone(),
-                config.device.clone(),
-            );
-            let family = prepared.family();
+            let family = prepared.definition();
             let family_fingerprint = family
-                .fingerprint()
-                .map_err(|error| FerrumError::model(error.to_string()))?;
-            let program_fingerprint = family
-                .program()
                 .fingerprint()
                 .map_err(|error| FerrumError::model(error.to_string()))?;
             info!(
                 external_metadata_id = %registration.external_metadata_id(),
                 family_id = %family.family_id(),
                 family_fingerprint,
-                program_fingerprint,
-                prepared_model_reused = _prepared_model_reused,
+                defined_model_reused = _defined_model_reused,
                 backend = "metal",
-                "Building registered model from a typed vNext execution plan"
+                "Resolving a defined model against the actual vNext runtime"
             );
             let device_id = ferrum_interfaces::vnext::DeviceId::new("device.metal.0")
                 .map_err(|error| FerrumError::device(error.to_string()))?;
@@ -1314,12 +1293,11 @@ fn create_registered_vnext_executor(
             let executor = crate::product_composition::create_vnext_executor(
                 &config.engine_config,
                 prepared.as_ref(),
-                model_info,
                 runtime,
                 operation_registry,
                 weight_materializers,
-                weight_materializer_selection,
                 catalog,
+                |_| Ok(weight_materializer_selection.clone()),
             )?;
             info!(
                 resolved_plan_fingerprint = executor
@@ -1358,7 +1336,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             .vnext_checkpoint_capture
             .is_some();
         let model_sources = config.model_sources.clone();
-        let prepared_model = config.prepared_model.clone();
+        let defined_model = config.defined_model.clone();
         let model_path = model_sources
             .as_ref()
             .map(|sources| sources.weights().path().display().to_string())
@@ -1415,7 +1393,7 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
                         config,
                         std::path::Path::new(&model_path),
                         model_sources,
-                        prepared_model,
+                        defined_model,
                         registration,
                     );
                 }
@@ -1438,6 +1416,14 @@ impl ComponentFactory<Arc<dyn ModelExecutor + Send + Sync>> for LlmExecutorFacto
             return Err(FerrumError::unsupported(
                 "vNext checkpoint capture requires a registered vNext model package",
             ));
+        }
+
+        if let ferrum_types::NumericalExecutionPolicy::Require(profile) =
+            &config.engine_config.numerical_execution
+        {
+            return Err(FerrumError::unsupported(format!(
+                "numerical profile {profile} requires a registered vNext model package"
+            )));
         }
 
         if let WeightFormat::Gguf { ref path } = weight_fmt {
@@ -2213,7 +2199,7 @@ mod tests {
             device: Device::CPU,
             component_options: options,
             model_sources: None,
-            prepared_model: None,
+            defined_model: None,
         };
 
         assert_eq!(

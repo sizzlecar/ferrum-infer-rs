@@ -19,12 +19,17 @@ use ferrum_types::{
 };
 use serde_json::Value;
 
+mod definition;
 pub mod gemma4;
 pub mod gpt_oss;
 mod hf_metadata;
+pub use definition::DefinedProductionModel;
+mod numerical;
 pub mod qwen35;
 pub mod qwen3_moe;
 pub mod source;
+#[cfg(test)]
+mod test_support;
 mod weight_layout;
 
 pub use source::{
@@ -32,8 +37,8 @@ pub use source::{
     ProductionWeightArtifact,
 };
 
-type PrepareModel =
-    fn(Arc<ProductionModelSourceBundle>) -> ferrum_types::Result<PreparedProductionModel>;
+type DefineModel =
+    fn(Arc<ProductionModelSourceBundle>) -> ferrum_types::Result<DefinedProductionModel>;
 type ValidateSemanticConfig = fn(&ExternalModelMetadataId, &[u8]) -> ferrum_types::Result<()>;
 type CreateFamilyRegistration = fn() -> ferrum_types::Result<Box<dyn ModelFamilyRegistration>>;
 
@@ -42,7 +47,7 @@ struct ModelLoaderRegistration {
     gguf_architectures: &'static [&'static str],
     execution_kind: ProductionExecutionKind,
     validate_semantic_config: ValidateSemanticConfig,
-    prepare: PrepareModel,
+    define: DefineModel,
     create_family_registration: CreateFamilyRegistration,
 }
 
@@ -52,7 +57,7 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
         gguf_architectures: &[],
         execution_kind: ProductionExecutionKind::CausalLanguage,
         validate_semantic_config: gemma4::validate_semantic_config,
-        prepare: gemma4::prepare_from_sources,
+        define: gemma4::define_from_sources,
         create_family_registration: gemma4::family_registration,
     },
     ModelLoaderRegistration {
@@ -60,7 +65,7 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
         gguf_architectures: &[],
         execution_kind: ProductionExecutionKind::CausalLanguage,
         validate_semantic_config: gpt_oss::validate_semantic_config,
-        prepare: gpt_oss::prepare_from_sources,
+        define: gpt_oss::define_from_sources,
         create_family_registration: gpt_oss::family_registration,
     },
     ModelLoaderRegistration {
@@ -71,7 +76,7 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
         gguf_architectures: &["qwen35", "qwen35moe"],
         execution_kind: ProductionExecutionKind::CausalLanguage,
         validate_semantic_config: qwen35::validate_semantic_config,
-        prepare: qwen35::prepare_from_sources,
+        define: qwen35::define_from_sources,
         create_family_registration: qwen35_family_registration,
     },
     ModelLoaderRegistration {
@@ -79,7 +84,7 @@ const MODEL_LOADERS: &[ModelLoaderRegistration] = &[
         gguf_architectures: &["qwen3moe"],
         execution_kind: ProductionExecutionKind::CausalLanguage,
         validate_semantic_config: qwen3_moe::validate_semantic_config,
-        prepare: qwen3_moe::prepare_from_sources,
+        define: qwen3_moe::define_from_sources,
         create_family_registration: qwen3_moe::family_registration,
     },
 ];
@@ -212,6 +217,7 @@ pub struct CausalLanguageModelDescriptor {
     execution_dtype: DataType,
     output_protocol: ModelOutputProtocol,
     reasoning_effort_support: ReasoningEffortSupport,
+    moe: Option<MoeCapabilities>,
 }
 
 impl CausalLanguageModelDescriptor {
@@ -291,12 +297,44 @@ impl CausalLanguageModelDescriptor {
             execution_dtype,
             output_protocol: ModelOutputProtocol::Text,
             reasoning_effort_support: ReasoningEffortSupport::Unknown,
+            moe: None,
         })
     }
 
     pub fn with_output_protocol(mut self, output_protocol: ModelOutputProtocol) -> Self {
         self.output_protocol = output_protocol;
         self
+    }
+
+    pub(super) fn with_moe(
+        mut self,
+        experts: u64,
+        active: u64,
+        intermediate: u64,
+    ) -> ferrum_types::Result<Self> {
+        let positive = |name, value| {
+            usize::try_from(value)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    ferrum_types::FerrumError::model(format!(
+                        "{name} must be positive and fit usize"
+                    ))
+                })
+        };
+        let num_experts = positive("num_experts", experts)?;
+        let experts_per_token = positive("experts_per_token", active)?;
+        if experts_per_token > num_experts {
+            return Err(ferrum_types::FerrumError::model(
+                "experts_per_token exceeds num_experts",
+            ));
+        }
+        self.moe = Some(MoeCapabilities {
+            num_experts,
+            experts_per_token,
+            moe_intermediate_size: Some(positive("moe_intermediate_size", intermediate)?),
+        });
+        Ok(self)
     }
 
     pub fn with_reasoning_effort_support(mut self, support: ReasoningEffortSupport) -> Self {
@@ -378,16 +416,35 @@ impl std::fmt::Debug for PreparedProductionModel {
 impl PreparedProductionModel {
     pub(super) fn new(
         family: PreparedModelFamily,
-        weights: impl WeightComponentSource + 'static,
-        descriptor: CausalLanguageModelDescriptor,
+        weights: Arc<dyn WeightComponentSource>,
+        mut descriptor: CausalLanguageModelDescriptor,
         sources: Arc<ProductionModelSourceBundle>,
-    ) -> Self {
-        Self {
+    ) -> ferrum_types::Result<Self> {
+        descriptor.execution_dtype = match family
+            .numerical_profile()
+            .activation_type()
+            .map_err(|error| ferrum_types::FerrumError::model(error.to_string()))?
+        {
+            ElementType::F16 => DataType::FP16,
+            ElementType::Bf16 => DataType::BF16,
+            ElementType::F32 => DataType::FP32,
+            _ => {
+                return Err(ferrum_types::FerrumError::model(
+                    "invalid primary activation dtype",
+                ))
+            }
+        };
+        if moe_capabilities_from_program(&family)? != descriptor.moe {
+            return Err(ferrum_types::FerrumError::model(
+                "prepared program MoE capabilities differ from typed definition",
+            ));
+        }
+        Ok(Self {
             family,
-            weights: Arc::new(weights),
+            weights,
             descriptor,
             sources,
-        }
+        })
     }
 
     pub fn family(&self) -> &PreparedModelFamily {
@@ -641,7 +698,7 @@ impl RegisteredProductionModel {
         (self.registration.validate_semantic_config)(&self.external_metadata_id, raw)
     }
 
-    pub fn prepare(&self, model_dir: &Path) -> ferrum_types::Result<PreparedProductionModel> {
+    pub fn define(&self, model_dir: &Path) -> ferrum_types::Result<DefinedProductionModel> {
         let original = OriginalModelSource {
             kind: ModelSourceKind::LocalDirectory,
             location: model_dir.display().to_string(),
@@ -658,30 +715,30 @@ impl RegisteredProductionModel {
             },
             |raw| self.validate_semantic_config(raw),
         )?);
-        self.prepare_from_sources(sources)
+        self.define_from_sources(sources)
     }
 
-    pub fn prepare_from_sources(
+    pub fn define_from_sources(
         &self,
         sources: Arc<ProductionModelSourceBundle>,
-    ) -> ferrum_types::Result<PreparedProductionModel> {
+    ) -> ferrum_types::Result<DefinedProductionModel> {
         self.validate_semantic_config(sources.config_json())?;
-        let prepared = (self.registration.prepare)(sources)?;
-        if prepared.family().external_metadata_id() != &self.external_metadata_id {
+        let defined = (self.registration.define)(sources)?;
+        if defined.definition().external_metadata_id() != &self.external_metadata_id {
             return Err(ferrum_types::FerrumError::model(format!(
                 "registered model loader returned metadata identity {} for resolved identity {}",
-                prepared.family().external_metadata_id(),
+                defined.definition().external_metadata_id(),
                 self.external_metadata_id
             )));
         }
-        if prepared.execution_kind() != self.registration.execution_kind {
+        if defined.execution_kind() != self.registration.execution_kind {
             return Err(ferrum_types::FerrumError::model(format!(
                 "registered model loader returned execution kind {:?} for registered kind {:?}",
-                prepared.execution_kind(),
+                defined.execution_kind(),
                 self.registration.execution_kind
             )));
         }
-        Ok(prepared)
+        Ok(defined)
     }
 }
 
@@ -1123,7 +1180,7 @@ mod tests {
             r#"{"architectures":["DifferentForConditionalGeneration"]}"#,
         )
         .unwrap();
-        let error = match registration.prepare(directory.path()) {
+        let error = match registration.define(directory.path()) {
             Ok(_) => panic!("changed metadata unexpectedly prepared"),
             Err(error) => error.to_string(),
         };

@@ -23,8 +23,9 @@ pub use llm_executor::LlmExecutor;
 pub use stub_executor::StubModelExecutor;
 pub use tts_executor::TtsModelExecutor;
 pub use vnext_executor::{
-    VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
-    VNextDeterminismParticipantSpec, VNextDeterminismPhase, VNextDeterminismWorkspacePoison,
-    VNextExecutorConfig, VNextModelExecutor, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
+    VNextCompiledModel, VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec,
+    VNextDeterminismInitialState, VNextDeterminismParticipantSpec, VNextDeterminismPhase,
+    VNextDeterminismWorkspacePoison, VNextExecutorConfig, VNextModelExecutor,
+    VNextRuntimeComposition, MAX_VNEXT_DETERMINISM_PARTICIPANTS,
 };
 pub use whisper_executor::WhisperModelExecutor;

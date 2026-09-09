@@ -182,6 +182,10 @@ pub struct RuntimeKnobs {
 /// Engine configuration
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EngineConfig {
+    /// Numerical policy is resolved against family contracts and the actual
+    /// runtime catalog before any model weight allocation.
+    #[serde(default)]
+    pub numerical_execution: crate::NumericalExecutionPolicy,
     pub model: EngineModelConfig,
     pub scheduler: SchedulerConfig,
     pub sampling: SamplingConfig,

@@ -1,6 +1,9 @@
 #![allow(dead_code, unused_imports)]
 
 use ferrum_interfaces::vnext::*;
+#[path = "../vnext_numerical_fixture/mod.rs"]
+mod numerical_fixture;
+pub(crate) use numerical_fixture::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -161,7 +164,23 @@ impl ModelFamilyProvider for TestFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        fixture_f32_profiles(
+            self.family_id(),
+            &["value.output"],
+            &["operation.main"],
+            vec![fixture_byte_state(config.width)],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         ModelProgram::new(
             self.family_id().clone(),
             vec![id("value.input")],
@@ -587,7 +606,7 @@ pub(crate) fn try_execution_plan_with_policy_and_runtime_fingerprint(
     runtime_implementation_fingerprint: String,
 ) -> Result<ExecutionPlan, VNextError> {
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap();
     let catalog = catalog_with_runtime_fingerprint(runtime_implementation_fingerprint);
     let registry = operation_registry(&catalog);
