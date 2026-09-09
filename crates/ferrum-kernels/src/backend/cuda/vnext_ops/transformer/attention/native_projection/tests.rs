@@ -1,4 +1,4 @@
-use super::super::recurrent_tests::Guarded;
+use super::super::super::test_support::Guarded;
 use super::*;
 use crate::gguf_blocks::{fixtures::oracle_blocks, GgufBlockFormat};
 use cudarc::driver::CudaContext;
