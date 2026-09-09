@@ -6,6 +6,8 @@ use half::f16;
 use super::{AttnConfig, Backend};
 use ferrum_types::{FerrumError, Result};
 
+pub mod vnext_runtime;
+
 // ── Q4_K_M block layout ────────────────────────────────────────────────
 //
 // Mirrors GGML / candle's `BlockQ4K`. Used by `load_q4_k` to dequant raw
