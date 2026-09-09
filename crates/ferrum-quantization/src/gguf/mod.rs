@@ -34,7 +34,7 @@ pub mod native;
 pub mod source;
 
 pub use file::GgufFile;
-pub use inventory::{GgufInventory, GgufTensorInventory};
+pub use inventory::{GgufInventory, GgufModelMetadata, GgufTensorInventory};
 pub use linear::{linear_from_qtensor, GgufLinear};
 pub use loader::GgufLoader;
 pub use names::{ferrum_to_gguf, ferrum_to_gguf_with_arch, gate_up_split_parts, qkv_split_parts};

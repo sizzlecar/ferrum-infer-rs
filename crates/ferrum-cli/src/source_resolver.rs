@@ -1160,13 +1160,13 @@ fn open_colocated_product_sources(
         .map(Some)
 }
 
-fn direct_gguf_requires_typed_product_sources(path: &Path) -> bool {
-    ferrum_quantization::gguf::GgufFile::open(path)
-        .ok()
-        .and_then(|gguf| gguf.architecture().ok().map(str::to_owned))
-        .is_some_and(|architecture| {
-            ferrum_models::vnext::gguf_architecture_requires_typed_product_sources(&architecture)
-        })
+fn direct_gguf_requires_typed_product_sources(path: &Path) -> Result<bool> {
+    let metadata = gguf_repository::read_metadata(path)?;
+    Ok(
+        ferrum_models::vnext::gguf_architecture_requires_typed_product_sources(
+            &metadata.architecture,
+        ),
+    )
 }
 
 /// Should the resolver attempt to download from HF if the model isn't
@@ -1440,14 +1440,14 @@ async fn resolve_model_source_internal(
             from_cache: false,
         };
         let original_source = ModelSource::Local(model.to_owned());
-        let model_sources = if defer_colocated_product_sources {
+        let model_sources = if defer_repository_product_sources {
             None
         } else {
             open_colocated_product_sources(&source, &original_source)?
         };
-        if !defer_colocated_product_sources
+        if !defer_repository_product_sources
             && model_sources.is_none()
-            && direct_gguf_requires_typed_product_sources(&source.local_path)
+            && direct_gguf_requires_typed_product_sources(&source.local_path)?
         {
             return Err(FerrumError::unsupported(format!(
                 "GGUF architecture in '{}' has migrated to the typed vNext product runtime; use a curated GGUF alias or place config.json and tokenizer.json beside the file",
@@ -1533,7 +1533,7 @@ async fn resolve_model_source_internal(
             let colocated = open_colocated_product_sources(&source, &original_source)?;
             if source.format == ModelFormat::GGUF
                 && colocated.is_none()
-                && direct_gguf_requires_typed_product_sources(&source.local_path)
+                && direct_gguf_requires_typed_product_sources(&source.local_path)?
             {
                 let (sources, metadata_from_cache) = gguf_repository::resolve_metadata(
                     model,
@@ -1784,7 +1784,7 @@ mod tests {
         dir
     }
 
-    fn qwen35_semantic_config(moe: bool) -> String {
+    pub(super) fn qwen35_semantic_config(moe: bool) -> String {
         let mut text = serde_json::json!({
             "model_type": if moe { "qwen3_5_moe_text" } else { "qwen3_5_text" },
             "hidden_size": 16,
@@ -2229,7 +2229,7 @@ mod tests {
         std::fs::create_dir_all(&local).unwrap();
         std::fs::write(local.join("model.safetensors"), b"fixture").unwrap();
         let gguf = root.path().join("weights@main.gguf");
-        std::fs::write(&gguf, []).unwrap();
+        gguf_repository::tests::write_metadata_fixture(&gguf, "qwen3", &[]);
         for path in [&local, &gguf] {
             let resolved = resolve_model_source(
                 path.to_str().unwrap(),
@@ -2335,7 +2335,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let gguf = dir.join("legacy-model.gguf");
-        std::fs::write(&gguf, []).unwrap();
+        gguf_repository::tests::write_metadata_fixture(&gguf, "qwen3", &[]);
 
         let resolved = resolve_model_source(
             gguf.to_str().unwrap(),
@@ -2365,7 +2365,7 @@ mod tests {
         std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
         std::fs::write(repo_dir.join("refs/main"), revision).unwrap();
         let gguf = snapshot.join(&filename);
-        std::fs::write(&gguf, b"fixture-gguf").unwrap();
+        gguf_repository::tests::write_metadata_fixture(&gguf, "qwen3", &[]);
 
         let metadata_repo = tokenizer_sibling_repo(&repo).unwrap();
         let metadata_repo_dir = cache

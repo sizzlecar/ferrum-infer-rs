@@ -1,6 +1,77 @@
 //! Compose a selected GGUF repository file with its independent metadata.
 
 use super::*;
+use ferrum_quantization::gguf::GgufModelMetadata;
+
+#[cfg(test)]
+pub(super) mod tests;
+
+pub(super) fn read_metadata(path: &Path) -> Result<GgufModelMetadata> {
+    let mut file = std::fs::File::open(path)?;
+    GgufModelMetadata::read(&mut file).map_err(|error| {
+        FerrumError::model(format!(
+            "cannot read GGUF metadata '{}': {error}",
+            path.display()
+        ))
+    })
+}
+
+fn declared_metadata_repository(metadata: &GgufModelMetadata) -> Result<Option<String>> {
+    // Conversion provenance names the immediate source; a single parent is a
+    // fallback when that declaration is absent. Never pick one parent of a merge.
+    let url = if let Some(url) = &metadata.source_repository_url {
+        Some(url)
+    } else {
+        if metadata.base_model_count.is_some_and(|count| count > 1) {
+            return Err(FerrumError::model(
+                "GGUF declares multiple base models; provide --semantic-source DIR",
+            ));
+        }
+        metadata.base_model_repository_urls.get(&0)
+    };
+    url.map(|url| huggingface_repository_url(url)).transpose()
+}
+
+fn huggingface_repository_url(value: &str) -> Result<String> {
+    let invalid = || {
+        FerrumError::model(
+        "GGUF semantic/tokenizer provenance must name an HTTPS Hugging Face model repository; provide --semantic-source DIR",
+    )
+    };
+    let url = reqwest::Url::parse(value).map_err(|_| invalid())?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("huggingface.co")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    let repo = url
+        .path()
+        .strip_prefix('/')
+        .ok_or_else(invalid)?
+        .trim_end_matches('/');
+    let valid = |part: &str| {
+        !part.is_empty()
+            && !part.starts_with(['.', '-'])
+            && !part.ends_with(['.', '-'])
+            && !part.contains("..")
+            && !part.contains("--")
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    };
+    if !repo
+        .split_once('/')
+        .is_some_and(|(owner, name)| valid(owner) && valid(name))
+    {
+        return Err(invalid());
+    }
+    Ok(repo.to_owned())
+}
 
 pub(super) async fn resolve_metadata(
     requested_model: &str,
@@ -26,7 +97,8 @@ pub(super) async fn resolve_metadata(
         }
     }
     let repo = &weights_original.location;
-    let metadata_repo = tokenizer_sibling_repo(repo).ok_or_else(|| {
+    let metadata_repo = declared_metadata_repository(&read_metadata(local_path)?)?
+        .or_else(|| tokenizer_sibling_repo(repo)).ok_or_else(|| {
         FerrumError::model(format!(
             "GGUF repository '{repo}' has no semantic/tokenizer source; provide --semantic-source DIR"
         ))

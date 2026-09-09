@@ -145,7 +145,7 @@ async fn cached_legacy_gguf_does_not_require_an_invented_metadata_repository() {
     let cache = CacheFixture::new();
     let snapshot = cache.snapshot(CURRENT);
     let file = snapshot.path.join("model.gguf");
-    fs::write(&file, b"legacy GGUF source fixture").unwrap();
+    crate::source_resolver::gguf_repository::tests::write_metadata_fixture(&file, "qwen3", &[]);
     cache.select(CURRENT);
     let product = resolve_model_source_with_product_sources(
         REPO,
@@ -246,7 +246,7 @@ async fn explicit_tokenizer_with_gguf_preserves_colocated_semantics() {
     let snapshot = cache.snapshot(CURRENT);
     write_semantic(&snapshot.path);
     let file = snapshot.path.join("model.gguf");
-    fs::write(&file, b"GGUF source fixture").unwrap();
+    crate::source_resolver::gguf_repository::tests::write_metadata_fixture(&file, "qwen35", &[]);
     cache.select(CURRENT);
     let tokenizer = cache.root().join("external-tokenizer");
     write_tokenizer(&tokenizer);
