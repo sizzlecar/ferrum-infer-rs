@@ -228,11 +228,10 @@ fn flatten(
         }
         return Ok(());
     }
-    let (id, is_block) = match layout {
-        PhysicalWeightLayout::Dense { component_id } => (component_id, false),
+    let (id, is_block, storage) = match layout {
+        PhysicalWeightLayout::Dense { component_id } => (component_id, false, None),
         PhysicalWeightLayout::Stored { component } => {
-            exact_storage(&component.storage)?;
-            (&component.component_id, false)
+            (&component.component_id, false, Some(&component.storage))
         }
         PhysicalWeightLayout::BlockQuantized {
             blocks,
@@ -241,8 +240,7 @@ fn flatten(
         } if *block_axis as usize == shape.len() - 1
             && *block_padding == PhysicalWeightPadding::Exact =>
         {
-            exact_storage(&blocks.storage)?;
-            (&blocks.component_id, true)
+            (&blocks.component_id, true, Some(&blocks.storage))
         }
         _ => return Err("CUDA native matrix physical layout has no installed kernel".into()),
     };
@@ -267,6 +265,13 @@ fn flatten(
         }
         _ => return Err("CUDA native matrix component encoding differs from its layout".into()),
     };
+    if let Some(storage) = storage {
+        // Explicit strides describe the semantic component shape, which may be
+        // a reshape of the raw file dimensions. Quantized strides count blocks.
+        let mut storage_shape = shape.to_vec();
+        *storage_shape.last_mut().unwrap() = physical_columns;
+        exact_storage(storage, &storage_shape)?;
+    }
     if component.physical_dimensions().last() != Some(&physical_columns)
         || product(component.physical_dimensions())?
             != rows
@@ -285,16 +290,27 @@ fn flatten(
     Ok(())
 }
 
-fn exact_storage(storage: &PhysicalStorageLayout) -> Result<(), String> {
-    if matches!(
-        storage,
+fn exact_storage(storage: &PhysicalStorageLayout, shape: &[u64]) -> Result<(), String> {
+    match storage {
         PhysicalStorageLayout::Contiguous {
-            padding: PhysicalWeightPadding::Exact
+            padding: PhysicalWeightPadding::Exact,
+        } => Ok(()),
+        PhysicalStorageLayout::Strided {
+            strides_in_elements,
+            padding: PhysicalWeightPadding::Exact,
+        } if strides_in_elements.len() == shape.len() => {
+            let mut expected = 1_u64;
+            for (&extent, &stride) in shape.iter().zip(strides_in_elements).rev() {
+                if extent == 0 || (extent > 1 && stride != expected) {
+                    return Err("CUDA native matrix strides do not describe contiguous rows".into());
+                }
+                expected = expected
+                    .checked_mul(extent)
+                    .ok_or("CUDA native matrix storage strides overflow")?;
+            }
+            Ok(())
         }
-    ) {
-        Ok(())
-    } else {
-        Err("CUDA native matrix requires exact contiguous component storage".into())
+        _ => Err("CUDA native matrix requires exact contiguous component storage".into()),
     }
 }
 
