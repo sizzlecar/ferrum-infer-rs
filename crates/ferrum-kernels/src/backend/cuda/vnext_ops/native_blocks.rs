@@ -10,10 +10,15 @@ use cudarc::{
 
 pub(super) mod weights;
 
+// Must match the bounded row tile instantiated by vnext_gguf_linear_tiled_*.
+const LINEAR_ROW_TILE: u32 = 8;
+
 #[derive(Clone)]
 pub(super) struct CudaNativeBlockKernels {
     pub linear_f16: CudaFunction,
     pub linear_f32: CudaFunction,
+    linear_tiled_f16: CudaFunction,
+    linear_tiled_f32: CudaFunction,
     pub embedding_f16: CudaFunction,
     pub embedding_f32: CudaFunction,
     #[cfg(test)]
@@ -33,6 +38,8 @@ impl CudaNativeBlockKernels {
         Ok(Self {
             linear_f16: load("vnext_gguf_linear_f16")?,
             linear_f32: load("vnext_gguf_linear_f32")?,
+            linear_tiled_f16: load("vnext_gguf_linear_tiled_f16")?,
+            linear_tiled_f32: load("vnext_gguf_linear_tiled_f32")?,
             embedding_f16: load("vnext_gguf_embedding_f16")?,
             embedding_f32: load("vnext_gguf_embedding_f32")?,
             #[cfg(test)]
@@ -98,9 +105,12 @@ impl CudaNativeBlockKernels {
                 "CUDA native linear launch extent is invalid",
             ));
         }
-        let kernel = match activation {
-            ElementType::F16 => &self.linear_f16,
-            ElementType::F32 => &self.linear_f32,
+        let row_tile = if rows > 1 { LINEAR_ROW_TILE } else { 1 };
+        let kernel = match (activation, row_tile > 1) {
+            (ElementType::F16, false) => &self.linear_f16,
+            (ElementType::F32, false) => &self.linear_f32,
+            (ElementType::F16, true) => &self.linear_tiled_f16,
+            (ElementType::F32, true) => &self.linear_tiled_f32,
             _ => {
                 return Err(CudaDeviceRuntimeError::contract(
                     "CUDA native linear activation dtype is unsupported",
@@ -124,10 +134,11 @@ impl CudaNativeBlockKernels {
             launch.arg(parameter);
         }
         // SAFETY: The provider retains exact row-complete matrix and activation
-        // regions. One complete warp writes each guarded output column.
+        // regions. One complete warp writes each guarded output column for
+        // every row in its tile; the final partial tile guards all row accesses.
         unsafe {
             launch.launch(LaunchConfig {
-                grid_dim: (part.rows.div_ceil(4), rows, 1),
+                grid_dim: (part.rows.div_ceil(4), rows.div_ceil(row_tile), 1),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             })
