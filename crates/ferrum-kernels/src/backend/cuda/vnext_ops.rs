@@ -51,6 +51,7 @@ use super::vnext_runtime::{
     CudaDeviceRuntimeConfig, CudaDeviceRuntimeError,
 };
 
+mod native_blocks;
 mod transformer;
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";

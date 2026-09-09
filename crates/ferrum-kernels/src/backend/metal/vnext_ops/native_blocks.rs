@@ -10,6 +10,7 @@ pub(super) const FINGERPRINT_SOURCE: &str = concat!(
     include_str!("native_blocks.rs"),
     include_str!("native_blocks.metal"),
     include_str!("../../../gguf_blocks/iq3s_grid.rs"),
+    include_str!("../../../gguf_blocks/iq4nl_values.rs"),
     include_str!("../../../gguf_blocks/mod.rs"),
 );
 

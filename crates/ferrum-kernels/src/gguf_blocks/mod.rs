@@ -9,6 +9,8 @@ use half::f16;
 
 mod iq3s_grid;
 pub(crate) use iq3s_grid::IQ3_S_GRID;
+mod iq4nl_values;
+pub(crate) use iq4nl_values::IQ4_NL_VALUES;
 mod block_decode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,10 +188,6 @@ impl GgufBlockFormat {
         }
     }
 }
-
-pub(crate) const IQ4_NL_VALUES: [i8; 16] = [
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-];
 
 fn half_at(bytes: &[u8], offset: usize) -> f32 {
     f16::from_bits(u16::from_le_bytes([bytes[offset], bytes[offset + 1]])).to_f32()
