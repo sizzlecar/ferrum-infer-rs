@@ -216,7 +216,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
     Ok(capabilities)
 }
 
-fn cuda_weight_materializer_selection(
+pub fn cuda_weight_materializer_selection(
     family: &PreparedModelFamily,
 ) -> Result<WeightMaterializerSelection, VNextError> {
     let block_fp8_weight_format = WeightFormatId::new(BLOCK_FP8_SAFETENSORS_FORMAT_ID)?;
@@ -420,7 +420,6 @@ pub struct CudaVNextComposition {
     runtime: Arc<CudaDeviceRuntime>,
     registry: OperationRuntimeRegistry<CudaDeviceRuntime>,
     weight_materializers: WeightMaterializerRegistry,
-    weight_materializer_selection: WeightMaterializerSelection,
     catalog: CapabilityCatalog,
 }
 
@@ -429,15 +428,7 @@ impl CudaVNextComposition {
         ordinal: usize,
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
-        family: Option<&PreparedModelFamily>,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let weight_materializer_selection = match family {
-            Some(family) => cuda_weight_materializer_selection(family).map_err(contract_error)?,
-            None => WeightMaterializerSelection::exact(
-                WeightMaterializerId::new(IDENTITY_WEIGHT_MATERIALIZER_ID)
-                    .map_err(contract_error)?,
-            ),
-        };
         let config = cuda_vnext_runtime_config(ordinal, device_id, requested_attention_policy)
             .map_err(contract_error)?;
         let runtime = Arc::new(CudaDeviceRuntime::new(config)?);
@@ -486,7 +477,6 @@ impl CudaVNextComposition {
             runtime,
             registry,
             weight_materializers,
-            weight_materializer_selection,
             catalog,
         })
     }
@@ -495,10 +485,8 @@ impl CudaVNextComposition {
         ordinal: usize,
         device_id: DeviceId,
         requested_attention_policy: AttentionExecutionPolicy,
-        family: &PreparedModelFamily,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let composition =
-            Self::prepare(ordinal, device_id, requested_attention_policy, Some(family))?;
+        let composition = Self::prepare(ordinal, device_id, requested_attention_policy)?;
         composition.validate_compiled_native_operators()?;
         Ok(composition)
     }
@@ -533,14 +521,12 @@ impl CudaVNextComposition {
         Arc<CudaDeviceRuntime>,
         OperationRuntimeRegistry<CudaDeviceRuntime>,
         WeightMaterializerRegistry,
-        WeightMaterializerSelection,
         CapabilityCatalog,
     ) {
         (
             self.runtime,
             self.registry,
             self.weight_materializers,
-            self.weight_materializer_selection,
             self.catalog,
         )
     }
@@ -588,21 +574,21 @@ pub fn cuda_validated_native_operator_catalog_input(
     requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition =
-        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy, None)?;
+        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy)?;
     composition.validate_compiled_native_operators()?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }
 
 /// Capture the exact provider identities needed to package a new native
 /// artifact set. Product composition uses [`CudaVNextComposition::create`]
-/// with a typed model family and cannot bypass compiled-artifact validation.
+/// before family/profile selection and cannot bypass compiled-artifact validation.
 pub fn cuda_native_operator_catalog_input(
     ordinal: usize,
     device_id: DeviceId,
     requested_attention_policy: AttentionExecutionPolicy,
 ) -> Result<CudaNativeOperatorCatalogInput, CudaDeviceRuntimeError> {
     let composition =
-        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy, None)?;
+        CudaVNextComposition::prepare(ordinal, device_id, requested_attention_policy)?;
     cuda_native_operator_catalog_input_from_composition(composition)
 }
 

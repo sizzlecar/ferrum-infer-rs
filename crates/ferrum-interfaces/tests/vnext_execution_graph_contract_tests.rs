@@ -334,8 +334,8 @@ fn graph_plan_fixture(
     alias_policy: AliasPolicy,
     alias_storage: GraphAliasStorage,
 ) -> Result<GraphPlanFixture, VNextError> {
-    let family =
-        TypedFamilyRegistration::new(GraphFamily).prepare(&json!({"scenario": scenario}))?;
+    let family = TypedFamilyRegistration::new(GraphFamily)
+        .prepare_fixture(&json!({"scenario": scenario}))?;
     let catalog = graph_catalog(alias_policy.clone());
     let policy = policy(16 * 1024);
     let planning = TestPlanningRegistry::new(&catalog, 64, 32, EstimateBehavior::Correct);

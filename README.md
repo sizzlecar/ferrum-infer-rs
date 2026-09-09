@@ -261,6 +261,9 @@ the prebuilt CUDA tarball or Homebrew formula for the supported install path.
 - Product surface: `ferrum-cli`, `ferrum-server`, `ferrum-tokenizer`
 - Validation: `ferrum-bench-core`, `ferrum-testkit`
 
+Development notes: [numerical execution profiles (中文)](docs/numerical-execution.zh.md).
+The new CLI option is not available in v0.8.9 release assets.
+
 ## License
 
 MIT

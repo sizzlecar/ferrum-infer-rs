@@ -336,7 +336,7 @@ fn reusable_execution_workspace_is_core_derived_plan_data() {
 }
 
 #[test]
-fn legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable() {
+fn legacy_reusable_memory_plan_wire_round_trips_without_program_policy() {
     let registry = TestRegistry::new();
     let family = registry.prepare();
     let catalog = catalog();
@@ -402,9 +402,19 @@ fn legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable() {
     assert!(value["payload"]["memory"]["reusable_execution"]
         .get("program_policy")
         .is_none());
+    // Numerical profile identity now participates in the prepared family and
+    // whole-plan hash. The legacy reusable-memory wire contract is unchanged.
+    let reusable_wire = &value["payload"]["memory"]["reusable_execution"];
+    let restored_reusable: ReusableExecutionMemoryPlan =
+        serde_json::from_value(reusable_wire.clone()).unwrap();
+    assert_eq!(&restored_reusable, reusable);
     assert_eq!(
-        plan.plan_hash().as_str(),
-        "3dabd1b3a27d89d720b95a7e4035f94faf19f92eccc159218af0aafab9dd91a7"
+        serde_json::to_value(restored_reusable).unwrap(),
+        *reusable_wire
+    );
+    assert_eq!(
+        plan.payload().prepared_family_fingerprint(),
+        family.fingerprint().unwrap()
     );
     let restored =
         ExecutionPlan::from_json_validated(&wire, &family, &catalog, &policy, node_resolutions)
@@ -422,7 +432,7 @@ fn legacy_reusable_memory_plan_wire_and_plan_hash_remain_stable() {
 #[test]
 fn minimum_runnable_sums_lifetime_minima_and_sequential_invocation_peak() {
     let registration = TypedFamilyRegistration::new(SequentialScratchFamily);
-    let family = registration.prepare(&json!({"width": 4})).unwrap();
+    let family = registration.prepare_fixture(&json!({"width": 4})).unwrap();
     let catalog = catalog();
     let policy = policy(4096);
     let descriptor = catalog.providers_for(&id("operation.main")).unwrap()[0].clone();

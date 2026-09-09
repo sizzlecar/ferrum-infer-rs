@@ -138,7 +138,23 @@ impl ModelFamilyProvider for TestFamily {
         })
     }
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(
+        &self,
+        _config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError> {
+        fixture_f32_profiles(
+            self.family_id(),
+            &["value.middle", "value.output"],
+            &["operation.main"],
+            vec![],
+        )
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError> {
         let mut inputs = vec![id("value.input")];
         if config.no_static {
             inputs.push(id("value.weight"));
@@ -398,7 +414,7 @@ pub(crate) fn execution_plan_with_mode(
     no_static: bool,
 ) -> ExecutionPlan {
     let family = TypedFamilyRegistration::new(TestFamily)
-        .prepare(&json!({"width": 4, "no_static": no_static}))
+        .prepare_fixture(&json!({"width": 4, "no_static": no_static}))
         .unwrap();
     let catalog = catalog();
     let policy = policy();

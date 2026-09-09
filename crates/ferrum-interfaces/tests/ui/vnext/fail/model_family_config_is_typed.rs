@@ -45,7 +45,11 @@ impl ModelFamilyProvider for Family {
         unimplemented!()
     }
 
-    fn semantic_program(&self, _config: &Config) -> Result<ModelProgram, VNextError> {
+    fn numerical_profiles(&self, _config: &Config) -> Result<FamilyNumericalProfiles, VNextError> {
+        unimplemented!()
+    }
+
+    fn semantic_program(&self, _config: &Config, _profile: &NumericalExecutionProfile) -> Result<ModelProgram, VNextError> {
         unimplemented!()
     }
 

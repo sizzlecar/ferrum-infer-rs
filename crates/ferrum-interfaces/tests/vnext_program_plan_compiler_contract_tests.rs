@@ -4,7 +4,7 @@ use vnext_core_contract::*;
 
 fn prepared_with_weight_schema(schema: WeightSchema) -> PreparedModelFamily {
     TypedFamilyRegistration::new(FixedSchemaFamily { schema })
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap()
 }
 

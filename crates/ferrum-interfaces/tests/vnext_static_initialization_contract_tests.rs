@@ -750,7 +750,7 @@ fn derived_component_test_plan() -> (
     );
     let family = TestModelRegistry::new()
         .registration
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap();
     let runtime_policy = policy();
     let materializer_id = id("weight-materializer.test.derived-components");
@@ -802,7 +802,7 @@ fn static_transform_test_plan(
     );
     let family = TestModelRegistry::new()
         .registration
-        .prepare(&json!({"width": 4}))
+        .prepare_fixture(&json!({"width": 4}))
         .unwrap();
     let mut options = ProgramPlanCompileOptions::new(BTreeMap::from([(
         id("value.input"),

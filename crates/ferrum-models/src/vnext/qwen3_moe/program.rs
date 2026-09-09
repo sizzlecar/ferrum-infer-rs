@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
-    AttributeId, CanonicalRational, ContractVersion, ElementType, ModelFamilyId, ModelProgram,
-    NodeId, OperationId, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
-    ProgramValueId, ResolvedTensorLayout, SemanticValue, StateCapacityDemand, StateId,
-    StateInitialization, StateLifetime, StateSpec, VNextError, WeightReference,
-    CAUSAL_PAGED_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID,
-    ROUTED_SWIGLU_MOE_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
+    AttributeId, CanonicalRational, ContractVersion, ElementType, FamilyNumericalProfiles,
+    ModelFamilyId, ModelProgram, NodeId, NumericalExecutionProfile, OperationId, ProgramBlock,
+    ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
+    SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
+    VNextError, WeightReference, CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+    LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+    RESIDUAL_ADD_OPERATION_ID, RMS_NORM_OPERATION_ID, ROUTED_SWIGLU_MOE_OPERATION_ID,
+    TOKEN_EMBEDDING_OPERATION_ID,
 };
 
 use super::config::Qwen3MoeSemanticConfig;
@@ -18,11 +19,44 @@ use super::weights::{
     POST_ATTENTION_NORM_ROLE, Q_NORM_ROLE, Q_PROJ_ROLE, ROUTED_DOWN_ROLE, ROUTED_GATE_UP_ROLE,
     ROUTER_ROLE, V_PROJ_ROLE,
 };
+use crate::vnext::numerical::{kv_state, F16LanguageProfile};
+
+pub(super) fn numerical_profiles(
+    family: &ModelFamilyId,
+    semantic: &Qwen3MoeSemanticConfig,
+) -> Result<FamilyNumericalProfiles, VNextError> {
+    let mut profile = F16LanguageProfile::new(family, super::NUMERICAL_PROFILE_ID)?;
+    for (operation, major, multiply, accumulate) in [
+        (TOKEN_EMBEDDING_OPERATION_ID, 1, false, false),
+        (CAUSAL_PAGED_ATTENTION_OPERATION_ID, 2, true, true),
+        (RMS_NORM_OPERATION_ID, 1, true, true),
+        (ROUTED_SWIGLU_MOE_OPERATION_ID, 1, true, true),
+        (RESIDUAL_ADD_OPERATION_ID, 1, false, true),
+        (LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, 1, true, true),
+        (LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, 3, true, false),
+    ] {
+        profile.operation(operation, major, multiply, accumulate)?;
+    }
+    for layer in 0..semantic.layer_count {
+        profile.layer(
+            layer,
+            &["attention", "post_attention_norm", "moe", "output"],
+            kv_state(
+                layer,
+                semantic.kv_head_count,
+                semantic.head_dim,
+                semantic.maximum_sequence_tokens,
+            )?,
+        )?;
+    }
+    profile.finish()
+}
 
 pub(super) fn build_semantic_program(
     family_id: &ModelFamilyId,
     semantic: &Qwen3MoeSemanticConfig,
     manifest: &Qwen3MoeWeightManifest,
+    profile: &NumericalExecutionProfile,
 ) -> Result<ModelProgram, VNextError> {
     let schema = manifest.weight_schema(semantic)?;
     let mut weight_refs = Vec::with_capacity(schema.tensors.len());
@@ -47,7 +81,7 @@ pub(super) fn build_semantic_program(
             .saturating_mul(4)
             .saturating_add(4),
     );
-    let mut states = Vec::with_capacity(usize::try_from(semantic.layer_count).unwrap_or_default());
+    let states = profile.states.clone();
 
     let input_tokens = value_id("value.input.token_ids")?;
     let mut hidden = value_id("value.hidden.embedding")?;
@@ -72,22 +106,6 @@ pub(super) fn build_semantic_program(
             .map_err(|_| invalid_config("semantic.layer_count", "layer index exceeds u32"))?;
         let attention_output = value_id(format!("value.layer.{layer_index}.attention"))?;
         let kv_value = value_id(format!("value.state.layer.{layer_index}.kv"))?;
-        let kv_dimensions = vec![2, semantic.kv_head_count, semantic.head_dim];
-        let kv_bytes_per_token = kv_dimensions
-            .iter()
-            .try_fold(2_u64, |bytes, extent| bytes.checked_mul(*extent))
-            .ok_or_else(|| invalid_config("states.kv", "KV bytes per token overflow"))?;
-        states.push(StateSpec {
-            id: state_id(format!("state.layer.{layer_index}.kv"))?,
-            value_id: kv_value.clone(),
-            tensor: tensor_spec(kv_dimensions, ElementType::F16),
-            lifetime: StateLifetime::Sequence,
-            capacity_demand: StateCapacityDemand::TokenScaled {
-                bytes_per_token: kv_bytes_per_token,
-                maximum_tokens: semantic.maximum_sequence_tokens,
-            },
-            initialization: StateInitialization::None,
-        });
         nodes.push(ProgramNode {
             id: node_id(format!("node.layer.{layer_index}.attention"))?,
             operation_id: operation_id(CAUSAL_PAGED_ATTENTION_OPERATION_ID)?,

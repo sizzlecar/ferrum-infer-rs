@@ -5,6 +5,9 @@
 )]
 
 pub(crate) use ferrum_interfaces::vnext::*;
+#[path = "../vnext_numerical_fixture/mod.rs"]
+mod numerical_fixture;
+pub(crate) use numerical_fixture::*;
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use serde_json::{json, Value};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};

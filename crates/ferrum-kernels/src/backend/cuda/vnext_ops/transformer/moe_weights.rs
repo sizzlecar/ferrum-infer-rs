@@ -1776,34 +1776,39 @@ mod tests {
     #[test]
     fn rejects_another_quantization_format() {
         let mut schema = valid_schema();
+        validate(&schema).expect("unmodified GPTQ-Marlin contract must be valid");
         let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
             unreachable!();
         };
         spec.format_id = QuantizationFormatId::new("quantization.test.other").unwrap();
-        let error = validate(&schema).unwrap_err();
-        assert!(error.contains("not symmetric tiled"), "{error}");
+        assert!(
+            validate(&schema).is_err(),
+            "a foreign quantization format must not satisfy the GPTQ-Marlin contract"
+        );
     }
 
     #[test]
     fn rejects_non_marlin_packing_or_non_f16_scales() {
-        let mut schema = valid_schema();
-        let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
-            unreachable!();
-        };
-        spec.packing = QuantizationPacking::Linear;
-        let error = validate(&schema).unwrap_err();
-        assert!(error.contains("not symmetric tiled"), "{error}");
-
-        let mut schema = valid_schema();
-        let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
-            unreachable!();
-        };
-        spec.scale_type = ElementType::Bf16;
-        schema.components[1].encoding = WeightEncoding::Dense {
-            element_type: ElementType::Bf16,
-        };
-        let error = validate(&schema).unwrap_err();
-        assert!(error.contains("not symmetric tiled"), "{error}");
+        let baseline = valid_schema();
+        validate(&baseline).expect("unmodified GPTQ-Marlin contract must be valid");
+        for (packing, scale_type) in [
+            (QuantizationPacking::Linear, ElementType::F16),
+            (QuantizationPacking::Tiled, ElementType::Bf16),
+        ] {
+            let mut schema = baseline.clone();
+            let WeightEncoding::Quantized(spec) = &mut schema.components[0].encoding else {
+                unreachable!();
+            };
+            spec.packing = packing;
+            spec.scale_type = scale_type;
+            schema.components[1].encoding = WeightEncoding::Dense {
+                element_type: scale_type,
+            };
+            assert!(
+                validate(&schema).is_err(),
+                "accepted incompatible packing {packing:?} and scales {scale_type:?}"
+            );
+        }
     }
 
     #[test]

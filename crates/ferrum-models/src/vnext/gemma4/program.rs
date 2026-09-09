@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
 use ferrum_interfaces::vnext::{
-    AttributeId, CanonicalRational, ContractVersion, ElementType, ModelFamilyId, ModelProgram,
-    NodeId, OperationId, ProgramBlock, ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec,
-    ProgramValueId, ResolvedTensorLayout, SemanticValue, StateCapacityDemand, StateId,
-    StateInitialization, StateLifetime, StateSpec, VNextError, WeightReference,
-    CONSTANT_SCALE_OPERATION_ID, DENSE_GEGLU_TANH_OPERATION_ID,
+    AttributeId, CanonicalRational, ContractVersion, ElementType, FamilyNumericalProfiles,
+    ModelFamilyId, ModelProgram, NodeId, NumericalExecutionProfile, OperationId, ProgramBlock,
+    ProgramNode, ProgramNodeWorkSpec, ProgramTensorSpec, ProgramValueId, ResolvedTensorLayout,
+    SemanticValue, StateCapacityDemand, StateId, StateInitialization, StateLifetime, StateSpec,
+    VNextError, WeightReference, CONSTANT_SCALE_OPERATION_ID, DENSE_GEGLU_TANH_OPERATION_ID,
     HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_OPERATION_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
     LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, LOGIT_SOFTCAP_OPERATION_ID, RESIDUAL_ADD_OPERATION_ID,
     RMS_NORM_OPERATION_ID, TOKEN_EMBEDDING_OPERATION_ID,
@@ -19,11 +19,61 @@ use super::weights::{
     O_PROJ_ROLE, POST_ATTENTION_NORM_ROLE, POST_FEEDFORWARD_NORM_ROLE, PRE_FEEDFORWARD_NORM_ROLE,
     Q_NORM_ROLE, Q_PROJ_ROLE, UP_PROJ_ROLE, V_PROJ_ROLE,
 };
+use crate::vnext::numerical::{kv_state, F16LanguageProfile};
+
+pub(super) fn numerical_profiles(
+    family: &ModelFamilyId,
+    semantic: &Gemma4SemanticConfig,
+) -> Result<FamilyNumericalProfiles, VNextError> {
+    let mut profile = F16LanguageProfile::new(family, super::NUMERICAL_PROFILE_ID)?;
+    profile.boundary("value.hidden.embedding.unscaled")?;
+    profile.boundary("value.output.logits.uncapped")?;
+    for (operation, major, multiply, accumulate) in [
+        (TOKEN_EMBEDDING_OPERATION_ID, 1, false, false),
+        (CONSTANT_SCALE_OPERATION_ID, 1, true, false),
+        (
+            HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_OPERATION_ID,
+            1,
+            true,
+            true,
+        ),
+        (RMS_NORM_OPERATION_ID, 1, true, true),
+        (DENSE_GEGLU_TANH_OPERATION_ID, 1, true, true),
+        (RESIDUAL_ADD_OPERATION_ID, 1, false, true),
+        (LAST_TOKEN_DENSE_LINEAR_OPERATION_ID, 1, true, true),
+        (LOGIT_SOFTCAP_OPERATION_ID, 1, true, false),
+        (LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, 3, true, false),
+    ] {
+        profile.operation(operation, major, multiply, accumulate)?;
+    }
+    for (index, layer_type) in semantic.layer_types.iter().copied().enumerate() {
+        let layer = index as u64;
+        profile.layer(
+            layer,
+            &[
+                "attention",
+                "pre_feedforward",
+                "feedforward",
+                "post_feedforward",
+                "output.unscaled",
+                "output",
+            ],
+            kv_state(
+                layer,
+                semantic.kv_head_count(layer_type),
+                semantic.head_dim(layer_type),
+                semantic.maximum_sequence_tokens,
+            )?,
+        )?;
+    }
+    profile.finish()
+}
 
 pub(super) fn build_semantic_program(
     family_id: &ModelFamilyId,
     semantic: &Gemma4SemanticConfig,
     manifest: &Gemma4WeightManifest,
+    profile: &NumericalExecutionProfile,
 ) -> Result<ModelProgram, VNextError> {
     let schema = manifest.weight_schema(semantic)?;
     let mut weight_refs = Vec::with_capacity(schema.tensors.len());
@@ -38,7 +88,7 @@ pub(super) fn build_semantic_program(
 
     let layer_count = usize::try_from(semantic.layer_count).unwrap_or_default();
     let mut nodes = Vec::with_capacity(layer_count.saturating_mul(6).saturating_add(6));
-    let mut states = Vec::with_capacity(layer_count);
+    let states = profile.states.clone();
 
     let input_tokens = value_id("value.input.token_ids")?;
     let unscaled_embedding = value_id("value.hidden.embedding.unscaled")?;
@@ -88,22 +138,6 @@ pub(super) fn build_semantic_program(
             .kv_features(layer_type)
             .map_err(|reason| invalid_config("semantic.kv_features", reason))?;
         let kv_value = value_id(format!("value.state.layer.{layer_index}.kv"))?;
-        let kv_dimensions = vec![2, kv_heads, head_dim];
-        let kv_bytes_per_token = kv_dimensions
-            .iter()
-            .try_fold(2_u64, |bytes, extent| bytes.checked_mul(*extent))
-            .ok_or_else(|| invalid_config("states.kv", "KV bytes per token overflow"))?;
-        states.push(StateSpec {
-            id: state_id(format!("state.layer.{layer_index}.kv"))?,
-            value_id: kv_value.clone(),
-            tensor: tensor_spec(kv_dimensions, ElementType::F16),
-            lifetime: StateLifetime::Sequence,
-            capacity_demand: StateCapacityDemand::TokenScaled {
-                bytes_per_token: kv_bytes_per_token,
-                maximum_tokens: semantic.maximum_sequence_tokens,
-            },
-            initialization: StateInitialization::None,
-        });
 
         let attention_output = value_id(format!("value.layer.{layer_index}.attention"))?;
         let value_projection_role = if layer_type == Gemma4LayerType::FullAttention {

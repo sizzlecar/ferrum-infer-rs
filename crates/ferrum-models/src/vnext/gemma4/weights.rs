@@ -900,6 +900,12 @@ mod tests {
             &ModelFamilyId::new(super::super::FAMILY_ID).unwrap(),
             &semantic,
             &manifest,
+            &super::super::program::numerical_profiles(
+                &ModelFamilyId::new(super::super::FAMILY_ID).unwrap(),
+                &semantic,
+            )
+            .unwrap()
+            .profiles()[0],
         )
         .unwrap();
         let nodes = &program.blocks()[0].nodes;

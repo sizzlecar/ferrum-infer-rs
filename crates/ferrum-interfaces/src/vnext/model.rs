@@ -2,17 +2,19 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use super::{
     checked_elements, physical_component_ids, validate_physical_layout_budget, AttributeId,
     AxisWeightComponent, BlockQuantizationSpec, CanonicalRational, CompositeWeightPart,
-    ContractVersion, ElementType, ExternalModelMetadataId, ModelFamilyId, NodeId, OperationId,
-    PhysicalStorageLayout, PhysicalWeightComponentBinding, PhysicalWeightLayout,
-    PhysicalWeightPadding, ProgramValueId, QuantizationGrouping, QuantizationPacking,
-    QuantizationSpec, ResolvedTensorLayout, ResolvedWeightBinding, ResolvedWeightComponentLayout,
-    ResolvedWeightLogicalValidation, SemanticValue, StateId, StateInitialization, TokenizerId,
-    VNextError, WeightComponentRole, WeightEncoding, WeightFormatId, WeightId, WeightLayoutId,
-    MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH, MAX_PHYSICAL_WEIGHT_LAYOUT_NODES,
+    ContractVersion, ElementType, ExternalModelMetadataId, FamilyNumericalProfiles, ModelFamilyId,
+    NodeId, NumericalExecutionProfile, NumericalProfileId, OperationId, PhysicalStorageLayout,
+    PhysicalWeightComponentBinding, PhysicalWeightLayout, PhysicalWeightPadding, ProgramValueId,
+    QuantizationGrouping, QuantizationPacking, QuantizationSpec, ResolvedTensorLayout,
+    ResolvedWeightBinding, ResolvedWeightComponentLayout, ResolvedWeightLogicalValidation,
+    SemanticValue, StateId, StateInitialization, TokenizerId, VNextError, WeightComponentRole,
+    WeightEncoding, WeightFormatId, WeightId, WeightLayoutId, MAX_PHYSICAL_WEIGHT_LAYOUT_DEPTH,
+    MAX_PHYSICAL_WEIGHT_LAYOUT_NODES,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1950,7 +1952,7 @@ pub struct ModelSemanticMetadata {
 }
 
 /// Compile-time model family provider with a typed, validated configuration.
-pub trait ModelFamilyProvider: Send + Sync {
+pub trait ModelFamilyProvider: Send + Sync + 'static {
     type Config: Clone + Send + Sync + Serialize + DeserializeOwned + 'static;
 
     fn family_id(&self) -> &ModelFamilyId;
@@ -1976,21 +1978,117 @@ pub trait ModelFamilyProvider: Send + Sync {
 
     fn weight_schema(&self, config: &Self::Config) -> Result<WeightSchema, VNextError>;
 
-    fn semantic_program(&self, config: &Self::Config) -> Result<ModelProgram, VNextError>;
+    fn numerical_profiles(
+        &self,
+        config: &Self::Config,
+    ) -> Result<FamilyNumericalProfiles, VNextError>;
+
+    /// Specialization may change logical decoding dtype, never the source's
+    /// physical components, layouts, dimensions or tensor identities.
+    fn specialize_weight_schema(
+        &self,
+        _config: &Self::Config,
+        source: &WeightSchema,
+        _profile: &NumericalExecutionProfile,
+    ) -> Result<WeightSchema, VNextError> {
+        Ok(source.clone())
+    }
+
+    fn semantic_program(
+        &self,
+        config: &Self::Config,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<ModelProgram, VNextError>;
 
     fn semantic_metadata(&self, config: &Self::Config)
         -> Result<ModelSemanticMetadata, VNextError>;
 }
 
+/// Trusted source/semantic definition with no executable program. The typed
+/// configuration is retained privately so preparation does not parse or
+/// serialize it a second time, and cannot accept caller-constructed typed data.
+#[derive(Clone)]
+pub struct ModelFamilyDefinition {
+    parts: ModelFamilyDefinitionParts,
+    provider_authority: Arc<()>,
+    preparation: Arc<dyn DefinedFamilyPreparation>,
+}
+
+/// The generic implementation retains its configuration's concrete Rust type.
+/// Only the preparation operation crosses the heterogeneous catalog boundary.
+trait DefinedFamilyPreparation: Send + Sync {
+    fn prepare(
+        &self,
+        definition: &ModelFamilyDefinition,
+        profile: &NumericalExecutionProfile,
+    ) -> Result<PreparedModelFamily, VNextError>;
+}
+
+struct TypedDefinedFamily<P: ModelFamilyProvider> {
+    provider: Arc<P>,
+    config: P::Config,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ModelFamilyDefinitionParts {
+    family_id: ModelFamilyId,
+    external_metadata_id: ExternalModelMetadataId,
+    canonical_config: serde_json::Value,
+    weight_schema: WeightSchema,
+    metadata: ModelSemanticMetadata,
+    numerical_profiles: FamilyNumericalProfiles,
+}
+
+impl std::fmt::Debug for ModelFamilyDefinition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ModelFamilyDefinition")
+            .field("parts", &self.parts)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ModelFamilyDefinition {
+    pub fn family_id(&self) -> &ModelFamilyId {
+        &self.parts.family_id
+    }
+    pub fn external_metadata_id(&self) -> &ExternalModelMetadataId {
+        &self.parts.external_metadata_id
+    }
+    pub fn canonical_config(&self) -> &serde_json::Value {
+        &self.parts.canonical_config
+    }
+    pub fn weight_schema(&self) -> &WeightSchema {
+        &self.parts.weight_schema
+    }
+    pub fn metadata(&self) -> &ModelSemanticMetadata {
+        &self.parts.metadata
+    }
+    pub fn numerical_profiles(&self) -> &FamilyNumericalProfiles {
+        &self.parts.numerical_profiles
+    }
+
+    pub fn fingerprint(&self) -> Result<String, VNextError> {
+        let bytes = serde_json::to_vec(&self.parts).map_err(|error| VNextError::Serialization {
+            context: "serialize model family definition",
+            message: error.to_string(),
+        })?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 /// Maximum raw JSON bytes accepted before decoding a prepared family package.
 pub const MAX_PREPARED_MODEL_FAMILY_WIRE_BYTES: usize = 16 * 1024 * 1024;
+pub const PREPARED_MODEL_FAMILY_WIRE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreparedModelFamily {
+    wire_version: u32,
     family_id: ModelFamilyId,
     external_metadata_id: ExternalModelMetadataId,
     canonical_config: serde_json::Value,
     config_fingerprint: String,
+    numerical_profile: NumericalExecutionProfile,
     weight_schema: WeightSchema,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
@@ -2000,10 +2098,12 @@ pub struct PreparedModelFamily {
 /// Rehydration must resolve the typed provider again and reproduce every field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UnvalidatedPreparedModelFamily {
+    wire_version: u32,
     family_id: ModelFamilyId,
     external_metadata_id: ExternalModelMetadataId,
     canonical_config: serde_json::Value,
     config_fingerprint: String,
+    numerical_profile: NumericalExecutionProfile,
     weight_schema: WeightSchema,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
@@ -2014,10 +2114,12 @@ pub struct UnvalidatedPreparedModelFamily {
 /// package through a byte-bounded decoder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PreparedModelFamilyWire {
+    wire_version: u32,
     family_id: ModelFamilyId,
     external_metadata_id: ExternalModelMetadataId,
     canonical_config: serde_json::Value,
     config_fingerprint: String,
+    numerical_profile: NumericalExecutionProfile,
     weight_schema: WeightSchema,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
@@ -2026,10 +2128,12 @@ pub(crate) struct PreparedModelFamilyWire {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedModelFamilyWireFields {
+    wire_version: u32,
     family_id: ModelFamilyId,
     external_metadata_id: ExternalModelMetadataId,
     canonical_config: serde_json::Value,
     config_fingerprint: String,
+    numerical_profile: NumericalExecutionProfile,
     weight_schema: WeightSchema,
     program: ModelProgram,
     metadata: ModelSemanticMetadata,
@@ -2049,11 +2153,18 @@ impl<'de> Deserialize<'de> for PreparedModelFamilyWire {
                 "prepared model family wire contains unknown or non-canonical nested fields",
             ));
         }
+        if fields.wire_version != PREPARED_MODEL_FAMILY_WIRE_VERSION {
+            return Err(serde::de::Error::custom(
+                "incompatible prepared-family wire version; resolve the model again",
+            ));
+        }
         Ok(Self {
+            wire_version: fields.wire_version,
             family_id: fields.family_id,
             external_metadata_id: fields.external_metadata_id,
             canonical_config: fields.canonical_config,
             config_fingerprint: fields.config_fingerprint,
+            numerical_profile: fields.numerical_profile,
             weight_schema: fields.weight_schema,
             program: fields.program,
             metadata: fields.metadata,
@@ -2064,10 +2175,12 @@ impl<'de> Deserialize<'de> for PreparedModelFamilyWire {
 impl From<PreparedModelFamilyWire> for UnvalidatedPreparedModelFamily {
     fn from(wire: PreparedModelFamilyWire) -> Self {
         Self {
+            wire_version: wire.wire_version,
             family_id: wire.family_id,
             external_metadata_id: wire.external_metadata_id,
             canonical_config: wire.canonical_config,
             config_fingerprint: wire.config_fingerprint,
+            numerical_profile: wire.numerical_profile,
             weight_schema: wire.weight_schema,
             program: wire.program,
             metadata: wire.metadata,
@@ -2097,8 +2210,11 @@ impl UnvalidatedPreparedModelFamily {
                     .to_owned(),
             });
         }
-        let rebuilt = registration.prepare(&self.canonical_config)?;
-        let exact_match = rebuilt.family_id == self.family_id
+        let rebuilt = registration
+            .prepare_with_profile(&self.canonical_config, &self.numerical_profile.id)?;
+        let exact_match = rebuilt.wire_version == self.wire_version
+            && rebuilt.numerical_profile == self.numerical_profile
+            && rebuilt.family_id == self.family_id
             && rebuilt.external_metadata_id == self.external_metadata_id
             && rebuilt.canonical_config == self.canonical_config
             && rebuilt.config_fingerprint == self.config_fingerprint
@@ -2123,6 +2239,7 @@ impl PreparedModelFamily {
         external_metadata_id: ExternalModelMetadataId,
         canonical_config: serde_json::Value,
         mut weight_schema: WeightSchema,
+        mut numerical_profile: NumericalExecutionProfile,
         program: ModelProgram,
         metadata: ModelSemanticMetadata,
     ) -> Result<Self, VNextError> {
@@ -2152,12 +2269,16 @@ impl PreparedModelFamily {
             });
         }
         weight_schema.validate_program_references(&family_id, &program)?;
+        numerical_profile.normalize();
+        numerical_profile.validate_program(&program)?;
         Self::validate_metadata(&family_id, &metadata)?;
         Ok(Self {
+            wire_version: PREPARED_MODEL_FAMILY_WIRE_VERSION,
             family_id,
             external_metadata_id,
             canonical_config,
             config_fingerprint,
+            numerical_profile,
             weight_schema,
             program,
             metadata,
@@ -2208,6 +2329,10 @@ impl PreparedModelFamily {
 
     pub fn weight_schema(&self) -> &WeightSchema {
         &self.weight_schema
+    }
+
+    pub fn numerical_profile(&self) -> &NumericalExecutionProfile {
+        &self.numerical_profile
     }
 
     pub fn program(&self) -> &ModelProgram {
@@ -2343,16 +2468,34 @@ pub trait ModelFamilyRegistration: Send + Sync {
 
     fn external_metadata_ids(&self) -> BTreeSet<ExternalModelMetadataId>;
 
-    fn prepare(&self, raw_config: &serde_json::Value) -> Result<PreparedModelFamily, VNextError>;
+    fn define(&self, raw_config: &serde_json::Value) -> Result<ModelFamilyDefinition, VNextError>;
+
+    fn prepare(
+        &self,
+        definition: &ModelFamilyDefinition,
+        profile: &NumericalProfileId,
+    ) -> Result<PreparedModelFamily, VNextError>;
+
+    fn prepare_with_profile(
+        &self,
+        raw_config: &serde_json::Value,
+        profile: &NumericalProfileId,
+    ) -> Result<PreparedModelFamily, VNextError> {
+        self.prepare(&self.define(raw_config)?, profile)
+    }
 }
 
 pub struct TypedFamilyRegistration<P> {
-    provider: P,
+    provider: Arc<P>,
+    authority: Arc<()>,
 }
 
 impl<P> TypedFamilyRegistration<P> {
     pub fn new(provider: P) -> Self {
-        Self { provider }
+        Self {
+            provider: Arc::new(provider),
+            authority: Arc::new(()),
+        }
     }
 }
 
@@ -2365,7 +2508,7 @@ impl<P: ModelFamilyProvider> ModelFamilyRegistration for TypedFamilyRegistration
         self.provider.external_metadata_ids()
     }
 
-    fn prepare(&self, raw_config: &serde_json::Value) -> Result<PreparedModelFamily, VNextError> {
+    fn define(&self, raw_config: &serde_json::Value) -> Result<ModelFamilyDefinition, VNextError> {
         let external_metadata_ids = self.provider.external_metadata_ids();
         if external_metadata_ids.is_empty() {
             return Err(VNextError::InvalidModelConfig {
@@ -2395,16 +2538,100 @@ impl<P: ModelFamilyProvider> ModelFamilyRegistration for TypedFamilyRegistration
             }
         })?);
         validate_raw_config_consumed(self.provider.family_id(), raw_config, &typed_config)?;
-        let weight_schema = self.provider.weight_schema(&config)?;
-        let program = self.provider.semantic_program(&config)?;
+        let mut weight_schema = self.provider.weight_schema(&config)?;
+        weight_schema.validate(self.provider.family_id())?;
+        weight_schema.normalize();
         let metadata = self.provider.semantic_metadata(&config)?;
+        PreparedModelFamily::validate_metadata(self.provider.family_id(), &metadata)?;
+        let numerical_profiles = self.provider.numerical_profiles(&config)?;
+        if numerical_profiles
+            .profiles()
+            .iter()
+            .any(|profile| &profile.family_id != self.provider.family_id())
+        {
+            return Err(VNextError::InvalidModelConfig {
+                family_id: self.provider.family_id().to_string(),
+                field: "numerical_profiles".to_owned(),
+                reason: "profile catalog belongs to another model family".to_owned(),
+            });
+        }
+        Ok(ModelFamilyDefinition {
+            parts: ModelFamilyDefinitionParts {
+                family_id: self.provider.family_id().clone(),
+                external_metadata_id,
+                canonical_config: typed_config,
+                weight_schema,
+                metadata,
+                numerical_profiles,
+            },
+            provider_authority: self.authority.clone(),
+            preparation: Arc::new(TypedDefinedFamily {
+                provider: self.provider.clone(),
+                config,
+            }),
+        })
+    }
+
+    fn prepare(
+        &self,
+        definition: &ModelFamilyDefinition,
+        profile: &NumericalProfileId,
+    ) -> Result<PreparedModelFamily, VNextError> {
+        let incompatible = || VNextError::InvalidModelConfig {
+            family_id: self.provider.family_id().to_string(),
+            field: "definition".to_owned(),
+            reason: "definition was produced by another family/provider".to_owned(),
+        };
+        if !Arc::ptr_eq(&definition.provider_authority, &self.authority)
+            || definition.family_id() != self.provider.family_id()
+        {
+            return Err(incompatible());
+        }
+        let selected = definition.numerical_profiles().resolve(profile)?;
+        definition.preparation.prepare(definition, selected)
+    }
+}
+
+impl<P: ModelFamilyProvider> DefinedFamilyPreparation for TypedDefinedFamily<P> {
+    fn prepare(
+        &self,
+        definition: &ModelFamilyDefinition,
+        selected: &NumericalExecutionProfile,
+    ) -> Result<PreparedModelFamily, VNextError> {
+        let weight_schema = self.provider.specialize_weight_schema(
+            &self.config,
+            definition.weight_schema(),
+            selected,
+        )?;
+        let mut physical_identity = weight_schema.clone();
+        physical_identity.normalize();
+        for tensor in &mut physical_identity.tensors {
+            let source = definition
+                .weight_schema()
+                .tensor(&tensor.id)
+                .ok_or_else(|| VNextError::InvalidModelConfig {
+                    family_id: self.provider.family_id().to_string(),
+                    field: "numerical_profile.weight_schema".to_owned(),
+                    reason: "numerical specialization introduced a source tensor".to_owned(),
+                })?;
+            tensor.logical_element_type = source.logical_element_type;
+        }
+        if &physical_identity != definition.weight_schema() {
+            return Err(VNextError::InvalidModelConfig {
+                family_id: self.provider.family_id().to_string(),
+                field: "numerical_profile.weight_schema".to_owned(),
+                reason: "numerical specialization changed source physical identity".to_owned(),
+            });
+        }
+        let program = self.provider.semantic_program(&self.config, selected)?;
         PreparedModelFamily::from_canonical_config(
             self.provider.family_id().clone(),
-            external_metadata_id,
-            typed_config,
+            definition.external_metadata_id().clone(),
+            definition.canonical_config().clone(),
             weight_schema,
+            selected.clone(),
             program,
-            metadata,
+            definition.metadata().clone(),
         )
     }
 }

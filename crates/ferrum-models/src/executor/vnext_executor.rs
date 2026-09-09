@@ -56,7 +56,9 @@ use super::{
     vnext_timing::{log_static_initialization_receipt, AtomicDurationMetrics, StartupPhaseTimer},
 };
 
+mod composition;
 mod determinism;
+pub use composition::{VNextCompiledModel, VNextRuntimeComposition};
 mod request;
 pub use determinism::{
     VNextDeterminismExecutionMode, VNextDeterminismExecutionSpec, VNextDeterminismInitialState,
@@ -4622,82 +4624,44 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
             &ProgramPlanCompilation,
         ) -> Result<ResolvedModelPlan>,
     {
-        let executor_startup = StartupPhaseTimer::start("executor_composition_total");
+        let composition =
+            VNextRuntimeComposition::new(runtime, registry, weight_materializers, catalog);
+        composition
+            .compile_model(
+                prepared,
+                info,
+                engine_config,
+                config,
+                weight_materializer_selection,
+            )?
+            .initialize(resolve_plan)
+    }
+
+    fn from_compiled_model<F>(compiled: VNextCompiledModel<'_, R>, resolve_plan: F) -> Result<Self>
+    where
+        F: FnOnce(
+            &PreparedProductionModel,
+            &ResolvedRuntimePolicy,
+            &CapabilityCatalog,
+            &ProgramPlanCompilation,
+        ) -> Result<ResolvedModelPlan>,
+    {
+        let VNextCompiledModel {
+            composition,
+            prepared,
+            info,
+            config,
+            compilation,
+            language_io,
+            checkpoint_selection,
+            repetition_capacity,
+            executor_startup,
+        } = compiled;
+        let runtime = Arc::clone(&composition.runtime);
+        let registry = &composition.registry;
+        let catalog = composition.catalog.clone();
         let attention_head_dimension = prepared.descriptor().attention_head_dimension();
-        let checkpoint_selection = VNextCheckpointSelection::from_config(
-            engine_config.runtime.vnext_checkpoint_capture.as_ref(),
-        )?;
         let family = prepared.family();
-        let language_io = Self::resolve_language_io_ids(family.program())?;
-        let input_capacity = u64::try_from(config.maximum_model_tokens)
-            .map_err(|_| FerrumError::config("vNext model length exceeds u64"))?;
-        let vocabulary_size = u64::try_from(info.vocab_size)
-            .map_err(|_| FerrumError::config("vNext vocabulary exceeds u64"))?;
-        let repetition_capacity = input_capacity.min(vocabulary_size);
-        let mut compile_options = ProgramPlanCompileOptions::new(BTreeMap::from([
-            (
-                language_io.token_input.clone(),
-                ProgramTensorSpec {
-                    dimensions: vec![input_capacity],
-                    element_type: ElementType::U32,
-                    layout: ResolvedTensorLayout::Contiguous,
-                },
-            ),
-            (
-                language_io.token_mask_input.clone(),
-                ProgramTensorSpec {
-                    dimensions: vec![vocabulary_size],
-                    element_type: ElementType::U8,
-                    layout: ResolvedTensorLayout::Contiguous,
-                },
-            ),
-            (
-                language_io.repetition_token_ids_input.clone(),
-                ProgramTensorSpec {
-                    dimensions: vec![repetition_capacity],
-                    element_type: ElementType::U32,
-                    layout: ResolvedTensorLayout::Contiguous,
-                },
-            ),
-            (
-                language_io.repetition_offsets_input.clone(),
-                ProgramTensorSpec {
-                    dimensions: vec![2],
-                    element_type: ElementType::U32,
-                    layout: ResolvedTensorLayout::Contiguous,
-                },
-            ),
-            (
-                language_io.repetition_penalty_input.clone(),
-                ProgramTensorSpec {
-                    dimensions: vec![1],
-                    element_type: ElementType::F32,
-                    layout: ResolvedTensorLayout::Contiguous,
-                },
-            ),
-        ]))
-        .map_err(|error| FerrumError::model(format!("vNext compile input: {error}")))?;
-        config
-            .plan_observation
-            .apply(family, &mut compile_options)?;
-        if let Some(selection) = &checkpoint_selection {
-            selection.retain_in(&mut compile_options);
-        }
-        compile_options.require_weight_materializer_selection(weight_materializer_selection);
-        let compile_phase = StartupPhaseTimer::start("plan_compile");
-        let compilation = ProgramPlanCompiler::compile_with_weight_materializers(
-            family,
-            &catalog,
-            &config.runtime_policy,
-            &registry.planning(),
-            &weight_materializers,
-            &compile_options,
-        )
-        .map_err(|error| FerrumError::model(format!("vNext plan compile: {error}")))?;
-        config
-            .plan_observation
-            .validate_compilation(family, &compilation)?;
-        compile_phase.finish();
         let resolve_bind_phase = StartupPhaseTimer::start("plan_resolve_and_bind");
         let resolved_plan = resolve_plan(prepared, &config.runtime_policy, &catalog, &compilation)?;
         if resolved_plan.execution_plan() != compilation.executable().execution_plan() {
