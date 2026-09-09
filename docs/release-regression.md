@@ -109,6 +109,35 @@ sm89 and require compatible NVIDIA, CUDA and NCCL runtimes. Start paid hardware
 when the candidate and test inputs are ready. Export evidence before releasing
 temporary instances; retain paid storage only when its reuse justifies the cost.
 
+## GGUF source inventory
+
+Before choosing a quantized model sample, inspect every tensor in the exact
+artifact. The Rust inventory tool reports sorted external names, logical shapes,
+quantization block sizes, byte ranges, mixed dtypes, and split metadata:
+
+```sh
+cargo run --locked -p ferrum-quantization --example gguf_inventory -- /path/to/model.gguf
+```
+
+A downloaded prefix containing the complete GGUF header can be inspected without
+downloading the weights. Supply the full artifact length from its pinned source:
+
+```sh
+cargo run --locked -p ferrum-quantization --example gguf_inventory -- \
+  /path/to/model.header.gguf --file-size 5680522464
+```
+
+The example length is illustrative; use the actual selected artifact's length.
+The tool rejects incomplete row blocks, overlapping or out-of-bounds tensor
+ranges, and inconsistent split metadata. Its JSON distinguishes a caller-declared
+length from a local file length and records that payload bytes were not verified
+or materialized. It can inventory IQ3_S, IQ4_XS and IQ4_NL descriptors even though the
+existing Candle runtime reader does not recognize those encodings.
+An inventory proves neither the downloaded payload's hash nor model/backend
+support. Record source revision and SHA-256 separately, inspect every shard when
+present, and map external tensor names to the prepared family's actual roles.
+Keep inventories and downloaded prefixes outside the repository.
+
 ## Mandatory Quick Start
 
 The currently advertised paths are:
