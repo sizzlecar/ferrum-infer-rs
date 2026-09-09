@@ -14,9 +14,11 @@ read_checksum() {
     awk -v name="$2" 'NR == 1 && NF == 2 && $2 == name && length($1) == 64 && $1 !~ /[^0-9a-f]/ {hash=$1} END {if(NR != 1 || hash == "") exit 1; print hash}' "$1"
 }
 download() {
-    curl --fail --silent --show-error --location --retry 2 --connect-timeout 20 \
+    note "Downloading ${1##*/}..."
+    curl --fail --show-error --progress-bar --location --retry 2 --connect-timeout 20 \
         --max-time 600 --proto "$protocols" --proto-redir '=https' "$1" -o "$2" \
         || die "Download failed: $1"
+    note "Downloaded ${1##*/}."
 }
 cleanup() {
     if [ -n "$work" ]; then rm -rf "$work"; fi
@@ -30,6 +32,7 @@ prepare() {
     download "$release_base/v$version/$asset" "$work/$asset"
     download "$release_base/v$version/$asset.sha256" "$work/asset.sha256"
     download "$release_base/v$version/$asset.binary.sha256" "$work/binary.sha256"
+    note 'Verifying the downloaded release...'
     asset_hash=$(read_checksum "$work/asset.sha256" "$asset") || die 'Invalid archive checksum file'
     [ "$(checksum "$work/$asset")" = "$asset_hash" ] || die 'Archive SHA-256 mismatch'
     binary_hash=$(read_checksum "$work/binary.sha256" ferrum) || die 'Invalid binary checksum file'
@@ -109,6 +112,7 @@ main() {
     esac
     if [ "$version" = latest ]; then
         [ "$release_base" = https://github.com/sizzlecar/ferrum-infer-rs/releases/download ] || die 'An explicit mirror requires --version'
+        note 'Looking up the latest Ferrum release...'
         latest=$(curl --fail --silent --show-error --location --head --connect-timeout 20 --max-time 60 \
             --proto '=https' --proto-redir '=https' --output /dev/null --write-out '%{url_effective}' \
             https://github.com/sizzlecar/ferrum-infer-rs/releases/latest) || die 'Cannot resolve latest release'
