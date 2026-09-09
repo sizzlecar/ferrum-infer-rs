@@ -72,22 +72,34 @@ __device__ __forceinline__ float native_block_value(const byte* b, unsigned i, u
     return NAN;
 }
 
-template<typename T>
+template<typename T, unsigned RowTile>
 __device__ void native_linear(const T* x, const byte* w, T* y,
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset,
     unsigned format, unsigned block_values, unsigned block_bytes) {
-    const unsigned row = blockIdx.y;
+    const unsigned row = blockIdx.y * RowTile;
     const unsigned lane = threadIdx.x % 32;
     const unsigned column = blockIdx.x * 4 + threadIdx.x / 32;
     if (row >= rows || column >= outputs) return;
     const size_t row_bytes = size_t(inputs / block_values) * block_bytes;
-    float sum = 0.0f;
+    // Reuse each decoded weight across a bounded set of activation rows.
+    // Each row retains the original lane-strided FP32 sum and warp reduction;
+    // neither expanded weights nor a lower-precision accumulation is needed.
+    float sums[RowTile] = {};
     for (unsigned i = lane; i < inputs; i += 32) {
         const byte* block = w + size_t(column) * row_bytes + size_t(i / block_values) * block_bytes;
-        sum += float(x[size_t(row) * inputs + i]) * native_block_value(block, i % block_values, format);
+        const float weight = native_block_value(block, i % block_values, format);
+        #pragma unroll
+        for (unsigned r = 0; r < RowTile; ++r) {
+            if (row + r < rows) sums[r] += float(x[size_t(row + r) * inputs + i]) * weight;
+        }
     }
-    for (unsigned step = 16; step != 0; step /= 2) sum += __shfl_down_sync(0xffffffff, sum, step);
-    if (lane == 0) y[size_t(row) * stride + offset + column] = T(sum);
+    #pragma unroll
+    for (unsigned r = 0; r < RowTile; ++r) {
+        for (unsigned step = 16; step != 0; step /= 2)
+            sums[r] += __shfl_down_sync(0xffffffff, sums[r], step);
+        if (lane == 0 && row + r < rows)
+            y[size_t(row + r) * stride + offset + column] = T(sums[r]);
+    }
 }
 
 template<typename T>
@@ -103,14 +115,16 @@ __device__ void native_embedding(const unsigned* tokens, const byte* w, T* y,
     y[index] = T(native_block_value(w + block * block_bytes, col % block_values, format));
 }
 
-#define NATIVE_LINEAR(T, suffix) \
+#define NATIVE_LINEAR(T, suffix, tile) \
 extern "C" __global__ void vnext_gguf_linear_##suffix(const T* x, const byte* w, T* y, \
     unsigned rows, unsigned inputs, unsigned outputs, unsigned stride, unsigned offset, \
     unsigned format, unsigned values, unsigned bytes) { \
-    native_linear(x, w, y, rows, inputs, outputs, stride, offset, format, values, bytes); \
+    native_linear<T, tile>(x, w, y, rows, inputs, outputs, stride, offset, format, values, bytes); \
 }
-NATIVE_LINEAR(half, f16)
-NATIVE_LINEAR(float, f32)
+NATIVE_LINEAR(half, f16, 1)
+NATIVE_LINEAR(float, f32, 1)
+NATIVE_LINEAR(half, tiled_f16, 8)
+NATIVE_LINEAR(float, tiled_f32, 8)
 
 #define NATIVE_EMBEDDING(T, suffix) \
 extern "C" __global__ void vnext_gguf_embedding_##suffix(const unsigned* tokens, const byte* w, T* y, \

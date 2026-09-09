@@ -82,9 +82,14 @@ fn matrix(format: GgufBlockFormat, rows: usize, blocks_per_row: usize) -> (Vec<u
     (bytes, decoded)
 }
 
-fn linear<T: Scalar>(stream: &Arc<CudaStream>, kernel: &CudaFunction) {
+fn linear<T: Scalar>(
+    stream: &Arc<CudaStream>,
+    kernel: &CudaFunction,
+    row_tile: u32,
+) -> Vec<Vec<u32>> {
+    let mut observations = Vec::new();
     for format in FORMATS {
-        for rows in [1_usize, 3] {
+        for rows in [1_usize, 3, 8, 11] {
             let inputs = 3 * format.block_values();
             let outputs = 7_usize;
             let stride = outputs + 5;
@@ -96,7 +101,7 @@ fn linear<T: Scalar>(stream: &Arc<CudaStream>, kernel: &CudaFunction) {
             let input_gpu = stream.clone_htod(&input).unwrap();
             let weight_gpu = stream.clone_htod(&bytes).unwrap();
             let canary = T::from_f32(-12345.0);
-            let mut output = stream.clone_htod(&vec![canary; rows * stride]).unwrap();
+            let mut output = stream.clone_htod(&vec![canary; rows * stride + 8]).unwrap();
             let params = [
                 rows as u32,
                 inputs as u32,
@@ -116,13 +121,20 @@ fn linear<T: Scalar>(stream: &Arc<CudaStream>, kernel: &CudaFunction) {
             // rows, and the output column interval lies inside every stride.
             unsafe {
                 launch.launch(LaunchConfig {
-                    grid_dim: ((outputs as u32).div_ceil(4), rows as u32, 1),
+                    grid_dim: (
+                        (outputs as u32).div_ceil(4),
+                        (rows as u32).div_ceil(row_tile),
+                        1,
+                    ),
                     block_dim: (128, 1, 1),
                     shared_mem_bytes: 0,
                 })
             }
             .unwrap();
             let actual = stream.clone_dtoh(&output).unwrap();
+            for value in &actual[rows * stride..] {
+                assert_eq!(value.as_f32().to_bits(), canary.as_f32().to_bits());
+            }
             for row in 0..rows {
                 for column in 0..stride {
                     let actual = actual[row * stride + column].as_f32();
@@ -143,8 +155,15 @@ fn linear<T: Scalar>(stream: &Arc<CudaStream>, kernel: &CudaFunction) {
                         "{format:?} {rows}x{inputs}x{outputs} row {row} col {column}: {actual}, F64 {sum}, bound {bound}");
                 }
             }
+            observations.push(
+                actual
+                    .iter()
+                    .map(|value| value.as_f32().to_bits())
+                    .collect(),
+            );
         }
     }
+    observations
 }
 
 fn embedding<T: Scalar>(stream: &Arc<CudaStream>, kernel: &CudaFunction) {
@@ -199,8 +218,16 @@ fn native_block_linears_preserve_f16_and_f32_activations_on_cuda() {
     let context = CudaContext::new(0).expect("native block conformance requires CUDA");
     let kernels = CudaNativeBlockKernels::load(&context).unwrap();
     let stream = context.default_stream();
-    linear::<f16>(&stream, &kernels.linear_f16);
-    linear::<f32>(&stream, &kernels.linear_f32);
+    // Both paths first satisfy the independent decoded-byte/F64 oracle. Tiling
+    // must additionally preserve the existing per-row accumulation bits.
+    assert_eq!(
+        linear::<f16>(&stream, &kernels.linear_f16, 1),
+        linear::<f16>(&stream, &kernels.linear_tiled_f16, LINEAR_ROW_TILE)
+    );
+    assert_eq!(
+        linear::<f32>(&stream, &kernels.linear_f32, 1),
+        linear::<f32>(&stream, &kernels.linear_tiled_f32, LINEAR_ROW_TILE)
+    );
 }
 
 #[test]
@@ -222,6 +249,12 @@ fn native_matrix_launcher_preserves_mixed_dense_and_block_partitions() {
 }
 
 fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
+    for rows in [1, 3, 8, 11] {
+        mixed_matrix_rows::<T>(activation, rows);
+    }
+}
+
+fn mixed_matrix_rows<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType, rows: usize) {
     use cudarc::driver::{DevicePtr, DevicePtrMut};
     use ferrum_interfaces::vnext::WeightId;
     use weights::{MatrixFormat, MatrixPart};
@@ -229,7 +262,6 @@ fn mixed_matrix<T: Scalar>(activation: ferrum_interfaces::vnext::ElementType) {
     let kernels = CudaNativeBlockKernels::load(&context).unwrap();
     let stream = context.default_stream();
     let columns = 512_usize;
-    let rows = 3_usize;
     let outputs = 3_usize;
     let stride = 2 * outputs + 2;
     let (blocks, decoded) = matrix(GgufBlockFormat::Iq4Xs, outputs, 2);
