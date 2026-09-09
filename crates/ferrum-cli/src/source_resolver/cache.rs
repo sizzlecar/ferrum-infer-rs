@@ -1,6 +1,8 @@
 //! Cache selection and completeness for product model sources.
 
-use ferrum_models::source::{inspect_cached_weights, CachedWeights, ResolvedModelSource};
+use ferrum_models::source::{
+    inspect_cached_weights, CachedWeights, ModelFormat, ResolvedModelSource,
+};
 use ferrum_types::{FerrumError, Result};
 use std::path::{Path, PathBuf};
 
@@ -41,12 +43,30 @@ pub(super) fn inspect_snapshot(
     requested_model: &str,
     requirements: CacheRequirements,
 ) -> Result<CachedModel> {
-    let format = match inspect_cached_weights(path)? {
-        CachedWeights::Ready(format) => format,
-        CachedWeights::Absent => return Ok(CachedModel::Missing(None)),
+    let (format, local_path) = match inspect_cached_weights(path)? {
+        CachedWeights::Ready(format) => (format, path.to_owned()),
+        CachedWeights::Absent => {
+            match cached_gguf_files(path)?.as_slice() {
+                [] => return Ok(CachedModel::Missing(None)),
+                [file] => (ModelFormat::GGUF, file.clone()),
+                files => {
+                    return Err(FerrumError::model(format!(
+                    "GGUF repository has multiple cached files; select an explicit .gguf path:\n{}",
+                    files.iter().map(|file| format!("  {}", file.display())).collect::<Vec<_>>().join("\n")
+                )));
+                }
+            }
+        }
         CachedWeights::Incomplete { reason } => return Ok(CachedModel::Missing(Some(reason))),
     };
-    for filename in requirements.metadata() {
+    // GGUF weights can use independent semantic/tokenizer sources. Product
+    // composition resolves those roles after selecting the physical file.
+    let required_metadata = if format == ModelFormat::GGUF {
+        &[][..]
+    } else {
+        requirements.metadata()
+    };
+    for filename in required_metadata {
         let file = path.join(filename);
         match std::fs::metadata(&file) {
             Ok(metadata) if metadata.is_file() && metadata.len() > 0 => {}
@@ -82,10 +102,34 @@ pub(super) fn inspect_snapshot(
     }
     Ok(CachedModel::Ready(ResolvedModelSource {
         original: requested_model.to_owned(),
-        local_path: path.to_owned(),
+        local_path,
         format,
         from_cache: true,
     }))
+}
+
+fn cached_gguf_files(snapshot: &Path) -> Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(snapshot) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+            && matches!(
+                inspect_cached_weights(&path)?,
+                CachedWeights::Ready(ModelFormat::GGUF)
+            )
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 /// A present main ref selects one revision, even when that revision needs
@@ -159,24 +203,13 @@ pub(super) fn inspect_cached_model(
 pub(crate) fn model_cache_ready(model_dir: &Path) -> bool {
     snapshot_candidates(model_dir).is_ok_and(|snapshots| {
         snapshots.into_iter().any(|path| {
-            if matches!(
-                inspect_snapshot(&path, "cached model", CacheRequirements::Repository),
-                Ok(CachedModel::Ready(_))
-            ) && has_tokenizer_assets(&path)
-                && nonempty_file(&path.join("config.json"))
-            {
-                return true;
+            match inspect_snapshot(&path, "cached model", CacheRequirements::Repository) {
+                Ok(CachedModel::Ready(source)) if source.format == ModelFormat::GGUF => true,
+                Ok(CachedModel::Ready(_)) => {
+                    has_tokenizer_assets(&path) && nonempty_file(&path.join("config.json"))
+                }
+                _ => false,
             }
-            std::fs::read_dir(&path).is_ok_and(|files| {
-                files.flatten().any(|file| {
-                    matches!(
-                        inspect_cached_weights(&file.path()),
-                        Ok(CachedWeights::Ready(
-                            ferrum_models::source::ModelFormat::GGUF
-                        ))
-                    )
-                })
-            })
         })
     })
 }

@@ -4,8 +4,9 @@ use crate::config::CliConfig;
 use clap::Args;
 use colored::*;
 use ferrum_types::Result;
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Args)]
 pub struct ListCommand {}
@@ -91,18 +92,29 @@ struct ModelInfo {
     is_complete: bool,
 }
 
-fn get_model_info(model_dir: &PathBuf) -> Option<ModelInfo> {
+fn get_model_info(model_dir: &Path) -> Option<ModelInfo> {
     // Parse name from directory: models--Org--ModelName -> Org/ModelName
     let dir_name = model_dir.file_name()?.to_string_lossy().to_string();
-    let name = dir_name.strip_prefix("models--")?.replace("--", "/");
+    let encoded = dir_name.strip_prefix("models--")?;
+    let parts: Vec<_> = encoded.split("--").collect();
+    if !(1..=2).contains(&parts.len())
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || part.starts_with(['.', '-'])
+                || part.ends_with(['.', '-'])
+                || part.contains("..")
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
+    {
+        return None;
+    }
+    let name = parts.join("/");
 
-    // Get size of blobs
-    let blobs_dir = model_dir.join("blobs");
-    let size = if blobs_dir.exists() {
-        get_dir_size(&blobs_dir)
-    } else {
-        0
-    };
+    // HF may store bytes directly in snapshots or through links into blobs.
+    // Count each target once across both layouts, including partial downloads.
+    let size = cache_size(model_dir);
 
     // Check if model files exist (complete model)
     let snapshots_dir = model_dir.join("snapshots");
@@ -135,17 +147,31 @@ fn check_model_complete(snapshots_dir: &PathBuf) -> bool {
         .is_some_and(crate::source_resolver::cache::model_cache_ready)
 }
 
-fn get_dir_size(path: &PathBuf) -> u64 {
-    let mut size = 0;
-    if let Ok(entries) = fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Ok(metadata) = fs::metadata(&path) {
-                    size += metadata.len();
+fn cache_size(model_dir: &Path) -> u64 {
+    let mut size = 0u64;
+    let mut seen = HashSet::new();
+    let mut directories = vec![model_dir.join("blobs"), model_dir.join("snapshots")];
+    while let Some(directory) = directories.pop() {
+        if directory.is_symlink() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = fs::metadata(&path) else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    if !path.is_symlink() {
+                        directories.push(path);
+                    }
+                } else if metadata.is_file() {
+                    if let Ok(canonical) = path.canonicalize() {
+                        if seen.insert(canonical) {
+                            size = size.saturating_add(metadata.len());
+                        }
+                    }
                 }
-            } else if path.is_dir() {
-                size += get_dir_size(&path);
             }
         }
     }
@@ -179,6 +205,56 @@ fn get_hf_cache_dir(config: &CliConfig) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_size_includes_direct_snapshot_files_and_skips_malformed_names() {
+        let cache = tempfile::tempdir().unwrap();
+        let model = cache.path().join("models--fixture--model");
+        fs::create_dir_all(model.join("snapshots/revision")).unwrap();
+        fs::write(model.join("snapshots/revision/model.gguf"), b"weights").unwrap();
+        let info = get_model_info(&model).unwrap();
+        assert_eq!(info.name, "fixture/model");
+        assert_eq!(info.size, 7);
+        assert!(info.is_complete);
+        for name in [
+            "models--qwen3:4b",
+            "models--owner--repo--snapshot",
+            "models--..",
+            "models--",
+        ] {
+            assert!(get_model_info(&cache.path().join(name)).is_none());
+        }
+        assert_eq!(
+            get_model_info(&cache.path().join("models--gpt2"))
+                .unwrap()
+                .name,
+            "gpt2"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_links_share_blob_size_without_following_directory_cycles() {
+        use std::os::unix::fs::symlink;
+        let cache = tempfile::tempdir().unwrap();
+        let model = cache.path();
+        fs::create_dir_all(model.join("blobs")).unwrap();
+        fs::create_dir_all(model.join("snapshots/revision")).unwrap();
+        fs::write(model.join("blobs/hash"), b"weights").unwrap();
+        symlink(
+            "../../blobs/hash",
+            model.join("snapshots/revision/model.gguf"),
+        )
+        .unwrap();
+        symlink(
+            "../../blobs/hash",
+            model.join("snapshots/revision/another.gguf"),
+        )
+        .unwrap();
+        symlink("../..", model.join("snapshots/revision/cycle")).unwrap();
+        symlink("missing", model.join("snapshots/revision/missing.gguf")).unwrap();
+        assert_eq!(cache_size(model), 7);
+    }
 
     fn temporary_snapshot(name: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
