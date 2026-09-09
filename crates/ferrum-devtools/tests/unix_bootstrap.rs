@@ -248,7 +248,16 @@ fn actual_download_install_repeat_and_upgrade_preserve_profiles_and_models() {
     .unwrap();
     fs::create_dir(host.path().join("models")).unwrap();
     fs::write(host.path().join("models/weights"), b"keep model bytes").unwrap();
-    success(&first.run(host.path(), &server, "1.2.3", "Darwin", "auto", None, false));
+    let output = first.run(host.path(), &server, "1.2.3", "Darwin", "auto", None, false);
+    success(&output);
+    // Feedback must remain visible when the installer is captured by a pipe or
+    // CI job, and identify each payload/checksum rather than only the release.
+    let log = String::from_utf8_lossy(&output.stderr);
+    for suffix in ["", ".sha256", ".binary.sha256"] {
+        let name = format!("ferrum-macos-aarch64.tar.gz{suffix}");
+        assert!(log.contains(&format!("Downloading {name}...")), "{log}");
+        assert!(log.contains(&format!("Downloaded {name}.")), "{log}");
+    }
     let first_link = fs::read_link(host.path().join(".local/bin/ferrum")).unwrap();
     let mut session = VersionSession::start(&host.path().join(".local/bin/ferrum"));
     let original_pid = session.child.id();

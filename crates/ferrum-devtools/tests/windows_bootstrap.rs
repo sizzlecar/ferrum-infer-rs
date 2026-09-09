@@ -129,6 +129,98 @@ fn downloaded_bootstrap_pipeline_reports_http_failure() {
 }
 
 #[test]
+fn download_stream_preserves_bytes_and_reports_progress_before_completion() {
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let server = Server::new(BTreeMap::from([("/setup.exe".into(), payload.clone())]));
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("download 中文.exe");
+    let receipt = temp.path().join("progress.json");
+    let body = format!(
+        r#"
+        $events = [Collections.Generic.List[object]]::new()
+        function Write-Progress {{
+            param($Id, $Activity, $Status, $PercentComplete, [switch]$Completed)
+            $events.Add([ordered]@{{percent=$PercentComplete; completed=$Completed.IsPresent}})
+        }}
+        Invoke-FerrumDownload -Uri {url} -Destination {destination} -ExpectedSize {size}
+        [IO.File]::WriteAllText({receipt}, (ConvertTo-Json -InputObject @($events.ToArray()) -Compress))
+        "#,
+        url = quote(&format!("{}/setup.exe", server.url)),
+        destination = quote(destination.to_str().unwrap()),
+        size = payload.len(),
+        receipt = quote(receipt.to_str().unwrap()),
+    );
+    let output = powershell(&body, &[]);
+    require_success(&output);
+    assert_eq!(fs::read(destination).unwrap(), payload);
+    let events: Vec<Value> = serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+    assert_eq!(events.first().unwrap()["percent"], 0);
+    assert!(events.iter().any(|event| event["percent"]
+        .as_u64()
+        .is_some_and(|percent| percent > 0 && percent < 100)));
+    assert!(events.iter().any(|event| event["percent"] == 100));
+    assert_eq!(events.last().unwrap()["completed"], true);
+    let log = String::from_utf8_lossy(&output.stdout);
+    assert!(log.contains("Downloading download 中文.exe"), "{log}");
+    assert!(
+        log.contains("Downloaded download 中文.exe (2097152 bytes)"),
+        "{log}"
+    );
+}
+
+#[test]
+fn download_http_and_size_failures_do_not_leave_an_installable_payload() {
+    let server = Server::responses(BTreeMap::from([
+        ("/setup.exe".into(), b"payload".to_vec().into()),
+        (
+            "/truncated.exe".into(),
+            http_fixture::Response {
+                body: b"partial".to_vec(),
+                declared_length: Some(128),
+            },
+        ),
+        (
+            "/too-large.exe".into(),
+            http_fixture::Response {
+                body: b"larger than expected".to_vec(),
+                declared_length: None,
+            },
+        ),
+    ]));
+    let temp = tempfile::tempdir().unwrap();
+    let destination = temp.path().join("setup.exe");
+    for (path, size) in [
+        ("/missing.exe", 7),
+        ("/setup.exe", 8),
+        ("/truncated.exe", 128),
+        ("/too-large.exe", 7),
+    ] {
+        let output = powershell(
+            &format!(
+                "Invoke-FerrumDownload -Uri {} -Destination {} -ExpectedSize {size}",
+                quote(&format!("{}{path}", server.url)),
+                quote(destination.to_str().unwrap()),
+            ),
+            &[],
+        );
+        assert!(!output.status.success());
+        assert!(!destination.exists());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("Downloaded setup.exe"));
+    }
+    fs::write(&destination, b"existing user file").unwrap();
+    let output = powershell(
+        &format!(
+            "Invoke-FerrumDownload -Uri {} -Destination {} -ExpectedSize 7",
+            quote(&format!("{}/setup.exe", server.url)),
+            quote(destination.to_str().unwrap()),
+        ),
+        &[],
+    );
+    assert!(!output.status.success());
+    assert_eq!(fs::read(destination).unwrap(), b"existing user file");
+}
+
+#[test]
 fn bootstrap_detects_native_architecture_in_windows_powershell_and_wow64() {
     // An independent OS query is the oracle; process bitness is deliberately
     // different in SysWOW64. Do not assume the CI host's CPU architecture.

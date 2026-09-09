@@ -16,8 +16,31 @@ pub struct Server {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
+
+pub struct Response {
+    pub body: Vec<u8>,
+    pub declared_length: Option<usize>,
+}
+impl From<Vec<u8>> for Response {
+    fn from(body: Vec<u8>) -> Self {
+        Self {
+            declared_length: Some(body.len()),
+            body,
+        }
+    }
+}
+
 impl Server {
     pub fn new(assets: BTreeMap<String, Vec<u8>>) -> Self {
+        Self::responses(
+            assets
+                .into_iter()
+                .map(|(path, body)| (path, body.into()))
+                .collect(),
+        )
+    }
+
+    pub fn responses(assets: BTreeMap<String, Response>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -44,13 +67,17 @@ impl Server {
                         }
                         let text = String::from_utf8_lossy(&request);
                         let path = text.split_whitespace().nth(1).unwrap();
-                        let (status, body) = assets
+                        let (status, body, length) = assets
                             .get(path)
-                            .map(|b| ("200 OK", b.as_slice()))
-                            .unwrap_or(("404 Not Found", b"not found"));
+                            .map(|response| {
+                                ("200 OK", response.body.as_slice(), response.declared_length)
+                            })
+                            .unwrap_or(("404 Not Found", b"not found", Some(9)));
+                        let length = length
+                            .map(|n| format!("Content-Length: {n}\r\n"))
+                            .unwrap_or_default();
                         let head = format!(
-                            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                            body.len()
+                            "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n{length}Connection: close\r\n\r\n"
                         );
                         stream.write_all(head.as_bytes()).unwrap();
                         stream.write_all(body).unwrap();
