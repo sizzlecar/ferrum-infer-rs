@@ -952,6 +952,7 @@ mod tests {
             ttft_ms: 1.0,
             e2e_ms: 2.0,
             input_tokens: 8,
+            server_input_tokens: None,
             output_tokens: usage_tokens,
             output_token_count_source: OutputTokenCountSource::Usage,
             itl_evidence: RequestItlEvidence::sse(

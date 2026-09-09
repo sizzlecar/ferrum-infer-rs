@@ -142,6 +142,10 @@ fn validate_report(report: &BenchReport, workload: &Workload) -> Result<(), Stri
         .actual_input_tokens_per_request
         .as_ref()
         .ok_or("missing per-request input lengths")?;
+    let server_inputs = report
+        .server_input_tokens_per_request
+        .as_ref()
+        .ok_or("missing per-request server prompt usage")?;
     let outputs = report
         .output_tokens_per_request
         .as_ref()
@@ -150,7 +154,11 @@ fn validate_report(report: &BenchReport, workload: &Workload) -> Result<(), Stri
         .itl_evidence_per_request
         .as_ref()
         .ok_or("missing per-request usage observations")?;
-    if inputs.len() != repeats || outputs.len() != repeats || evidence.len() != repeats {
+    if inputs.len() != repeats
+        || server_inputs.len() != repeats
+        || outputs.len() != repeats
+        || evidence.len() != repeats
+    {
         return Err("token observation repeat count mismatch".into());
     }
     let expected_output = u64::from(workload.output_tokens) * u64::from(workload.measured_requests);
@@ -181,6 +189,7 @@ fn validate_report(report: &BenchReport, workload: &Workload) -> Result<(), Stri
             ));
         }
         if inputs[index].len() != requests
+            || server_inputs[index].len() != requests
             || outputs[index].len() != requests
             || evidence[index].len() != requests
             || inputs[index].iter().any(|n| {
@@ -189,6 +198,14 @@ fn validate_report(report: &BenchReport, workload: &Workload) -> Result<(), Stri
                         .is_none_or(|total| total > workload.max_model_len)
             })
             || outputs[index].iter().any(|n| *n != workload.output_tokens)
+            || server_inputs[index].iter().any(|n| {
+                n.is_none_or(|tokens| {
+                    tokens == 0
+                        || tokens
+                            .checked_add(workload.output_tokens)
+                            .is_none_or(|total| total > workload.max_model_len)
+                })
+            })
             || evidence[index].iter().any(|e| {
                 e.source != ferrum_bench_core::ItlEvidenceSource::SseDeltaEvents
                     || e.usage_output_tokens != Some(workload.output_tokens)
@@ -199,10 +216,18 @@ fn validate_report(report: &BenchReport, workload: &Workload) -> Result<(), Stri
                 "missing, invalid or budget-mismatched per-request token observations".into(),
             );
         }
-        // Client input arrays describe re-tokenized prompt text; server usage
-        // totals include the chat template and therefore need not equal them.
-        if repeat.actual_input_tokens < inputs[index].iter().map(|n| u64::from(*n)).sum::<u64>() {
-            return Err("server input usage is below the supplied prompt lengths".into());
+        // Keep supplied content and the server's rendered prompt distinct.
+        if repeat.actual_input_tokens != inputs[index].iter().map(|n| u64::from(*n)).sum::<u64>()
+            || repeat.server_input_tokens
+                != Some(
+                    server_inputs[index]
+                        .iter()
+                        .flatten()
+                        .map(|n| u64::from(*n))
+                        .sum::<u64>(),
+                )
+        {
+            return Err("input totals differ from the provided or server-observed lengths".into());
         }
         for (actual, expected) in [
             (
@@ -375,6 +400,7 @@ fn validate_pair(first: &BenchReport, second: &BenchReport) -> Result<(), String
         || serde_json::to_value(&second.env.runtime_config).map_err(|e| e.to_string())?
             != serde_json::to_value(&first.env.runtime_config).map_err(|e| e.to_string())?
         || second.actual_input_tokens_per_request != first.actual_input_tokens_per_request
+        || second.server_input_tokens_per_request != first.server_input_tokens_per_request
         || second
             .repeat_metrics
             .iter()
@@ -495,7 +521,8 @@ mod tests {
                         success: true,
                         ttft_ms: 10.0 * factor,
                         e2e_ms: 24.0 * factor,
-                        input_tokens: w.input_tokens + 4,
+                        input_tokens: w.input_tokens,
+                        server_input_tokens: Some(w.input_tokens + 4),
                         output_tokens: w.output_tokens,
                         output_token_count_source: OutputTokenCountSource::Usage,
                         itl_evidence: RequestItlEvidence::sse(true, 4, Some(8), 3, 1),
@@ -598,6 +625,19 @@ mod tests {
             Box::new(|r| r.repeat_metrics[0].output_token_count_source = "stream_chunks".into()),
             Box::new(|r| r.repeat_metrics[0].ttft_ms.p50 = f64::NAN),
             Box::new(|r| r.repeat_metrics[0].actual_input_tokens = u64::MAX),
+            Box::new(|r| r.server_input_tokens_per_request = None),
+            Box::new(|r| r.server_input_tokens_per_request.as_mut().unwrap()[0][0] = None),
+            Box::new(|r| {
+                r.server_input_tokens_per_request.as_mut().unwrap()[0][0] =
+                    Some(workload().max_model_len)
+            }),
+            Box::new(|r| r.repeat_metrics[0].server_input_tokens = Some(1)),
+            Box::new(|r| {
+                *r.server_input_tokens_per_request.as_mut().unwrap()[0][0]
+                    .as_mut()
+                    .unwrap() += 1;
+                *r.repeat_metrics[0].server_input_tokens.as_mut().unwrap() += 1;
+            }),
             Box::new(|r| r.ttft_ms.p50.mean = 0.1),
             Box::new(|r| r.actual_input_tokens_per_request.as_mut().unwrap()[0][0] = 31),
             Box::new(|r| r.backend = "cpu".into()),
