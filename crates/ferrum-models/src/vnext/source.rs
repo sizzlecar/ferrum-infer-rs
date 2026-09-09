@@ -608,11 +608,22 @@ fn resolved_source(
 }
 
 /// Recover a stable repository/revision identity only from an exact Hugging
-/// Face cache snapshot root or one direct artifact below it. The path is
+/// Face cache snapshot root or an artifact below it. Nested artifact directories
+/// retain the same snapshot identity; ambiguous nested cache roots are rejected.
+/// The path is
 /// inspected structurally without canonicalizing an LFS symlink into `blobs/`.
 pub fn huggingface_snapshot_identity(path: &Path) -> Option<HuggingFaceSnapshotIdentity> {
-    huggingface_snapshot_root_identity(path)
-        .or_else(|| path.parent().and_then(huggingface_snapshot_root_identity))
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let mut identities = path
+        .ancestors()
+        .filter_map(huggingface_snapshot_root_identity);
+    let identity = identities.next()?;
+    identities.next().is_none().then_some(identity)
 }
 
 fn huggingface_snapshot_root_identity(root: &Path) -> Option<HuggingFaceSnapshotIdentity> {
@@ -889,6 +900,15 @@ mod tests {
         .is_none());
         assert!(huggingface_snapshot_identity(Path::new(&format!(
             "/cache/models--Qwen--Nested--Model/snapshots/{revision}"
+        )))
+        .is_none());
+        let root = PathBuf::from(format!("/cache/models--Owner--Model/snapshots/{revision}"));
+        let nested = huggingface_snapshot_identity(&root.join("weights/quant/model.gguf")).unwrap();
+        assert_eq!(nested.repository_id, "Owner/Model");
+        assert_eq!(nested.revision, revision);
+        assert!(huggingface_snapshot_identity(&root.join("../other/model.gguf")).is_none());
+        assert!(huggingface_snapshot_identity(&root.join(format!(
+            "models--Other--Model/snapshots/{revision}/model.gguf"
         )))
         .is_none());
     }

@@ -187,6 +187,22 @@ This selects the exact snapshot through Ferrum's downloader and cache; aliases,
 branches and tags cannot be used as pins. The runner verifies the actual
 repository, revision and file fingerprints reported by both product entrypoints.
 
+For a GGUF repository, `pull`, `run` and `serve` accept `--gguf-file FILE` to
+select one repository-relative artifact, including a file in a subdirectory.
+The same selection works for a fresh download or a cache containing several
+quantizations. An immutable repository pin applies to the selected file:
+
+```sh
+ferrum pull unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523 --gguf-file Qwen3.5-4B-Q4_K_M.gguf
+ferrum run unsloth/Qwen3.5-4B-GGUF@e87f176479d0855a907a41277aca2f8ee7a09523 --gguf-file Qwen3.5-4B-Q4_K_M.gguf --disable-thinking
+```
+
+Semantic configuration and tokenizer files resolve independently from colocated
+metadata or the GGUF's declared source repository. `run` and `serve` also accept
+`--semantic-source DIR` and `--tokenizer-source DIR` for explicit metadata roles.
+A bare repository reuses one unambiguous cached GGUF; without a cached selection,
+choose an exact file instead of downloading every quantization.
+
 A stop probe derives an internal boundary from actual reasoning or final text.
 Baseline and replay keep the same prompt, mode and budget; checks require the
 exact nonempty prefix, no stop leakage and fewer generated tokens. If the default

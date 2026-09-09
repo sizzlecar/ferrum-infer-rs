@@ -325,6 +325,58 @@ impl Drop for HubFixture {
 }
 
 #[tokio::test]
+async fn gguf_download_selects_one_file_from_the_resolved_immutable_snapshot() {
+    let filename = "weights/model-Q4_K_M.gguf";
+    for revision in [None, Some(REVISION)] {
+        let hub = HubFixture::with_files(
+            vec![
+                HubFile::new(filename, b"frozen GGUF payload"),
+                HubFile::new("other.gguf", b"other recipe"),
+            ],
+            Some(vec![HubFile::new(filename, b"changed branch payload")]),
+        )
+        .await;
+        let path = hub
+            .downloader()
+            .download_gguf(MODEL_ID, revision, filename)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"frozen GGUF payload");
+        assert_eq!(hub.file_requests("GET", "other.gguf"), 0);
+        hub.assert_pinned_reads();
+        assert_eq!(
+            std::fs::read_to_string(hub.reference(revision.unwrap_or("main"))).unwrap(),
+            REVISION
+        );
+        if revision.is_some() {
+            assert!(!hub.main_ref().exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn fresh_gguf_repository_reports_file_selection_before_downloading_sidecars() {
+    let hub = HubFixture::with_files(
+        vec![
+            HubFile::new("model.gguf", b"GGUF payload"),
+            HubFile::new("config.json", b"{}"),
+        ],
+        None,
+    )
+    .await;
+    let error = hub
+        .downloader()
+        .download(MODEL_ID, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("--gguf-file"), "{error}");
+    assert_eq!(hub.file_requests("GET", "config.json"), 0);
+    assert_eq!(hub.file_requests("GET", "model.gguf"), 0);
+    assert!(!hub.main_ref().exists());
+}
+
+#[tokio::test]
 async fn fresh_download_preserves_standalone_chat_template_in_source_bundle() {
     let hub = HubFixture::start(true).await;
     let snapshot = hub.downloader().download(MODEL_ID, None).await.unwrap();
