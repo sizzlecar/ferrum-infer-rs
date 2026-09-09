@@ -103,6 +103,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer.rs").as_bytes(),
         include_str!("vnext_ops/transformer/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/native_swiglu.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks.rs").as_bytes(),
         include_str!("vnext_ops/native_io.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks/weights.rs").as_bytes(),

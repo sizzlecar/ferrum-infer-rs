@@ -81,6 +81,7 @@ mod moe_weights;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe_workspace;
 mod native_linear;
+mod native_swiglu;
 mod precision;
 
 use precision::{ResidualPrecision, RmsNormPrecision};
@@ -584,6 +585,7 @@ fn dense_swiglu_projection(
 pub(super) struct CudaDenseSwiGluProvider {
     descriptor: OperationProviderDescriptor,
     silu_mul: CudaFunction,
+    native: super::native_blocks::CudaNativeBlockKernels,
     #[cfg(feature = "vllm-marlin")]
     planar_silu_mul: CudaFunction,
     #[cfg(feature = "vllm-marlin")]
@@ -595,6 +597,10 @@ impl CudaDenseSwiGluProvider {
         let contract = dense_swiglu_contract().map_err(contract_error)?;
         let provider_fingerprint = implementation_fingerprint(&[
             include_str!("transformer.rs").as_bytes(),
+            include_str!("transformer/native_swiglu.rs").as_bytes(),
+            include_str!("native_blocks.rs").as_bytes(),
+            include_str!("native_blocks/weights.rs").as_bytes(),
+            crate::ptx::VNEXT_GGUF.as_bytes(),
             crate::ptx::FUSED_SILU_MUL.as_bytes(),
             SILU_MUL_FUNCTION_NAME.as_bytes(),
             #[cfg(feature = "vllm-marlin")]
@@ -607,13 +613,18 @@ impl CudaDenseSwiGluProvider {
             include_str!("../vllm_marlin.rs").as_bytes(),
         ]);
         #[cfg(not(feature = "vllm-marlin"))]
-        let descriptor = provider_descriptor(
+        let descriptor = provider_descriptor_with_formats(
             runtime,
             &contract,
             DENSE_SWIGLU_PROVIDER_ID,
             DENSE_SWIGLU_F16_CAPABILITY_ID,
             DENSE_SWIGLU_ESTIMATOR_ID,
             contiguous_bindings(3),
+            BTreeSet::from([
+                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
+            ]),
+            native_linear::quantization_formats().map_err(contract_error)?,
             provider_fingerprint,
         )?;
         #[cfg(feature = "vllm-marlin")]
@@ -637,6 +648,7 @@ impl CudaDenseSwiGluProvider {
         Ok(Self {
             descriptor,
             silu_mul,
+            native: super::native_blocks::CudaNativeBlockKernels::load(runtime.context())?,
             #[cfg(feature = "vllm-marlin")]
             planar_silu_mul,
             #[cfg(feature = "vllm-marlin")]
@@ -664,15 +676,19 @@ impl OperationResourceEstimator for CudaDenseSwiGluProvider {
         #[cfg(not(feature = "vllm-marlin"))]
         let formula = ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?;
         #[cfg(feature = "vllm-marlin")]
-        let formula = ProviderWorkspaceSizeFormula::affine(
-            self.projection_runtime
-                .workspace_bytes()
-                .map_err(invalid_plan)?
-                .checked_add(VALUE_ALIGNMENT_BYTES - 1)
-                .ok_or_else(|| invalid_plan("CUDA dense SwiGLU Marlin scratch overflows"))?,
-            0,
-            bytes_per_token,
-        )?;
+        let formula = if native_swiglu::uses_native(request.values()) {
+            ProviderWorkspaceSizeFormula::tokens(bytes_per_token)?
+        } else {
+            ProviderWorkspaceSizeFormula::affine(
+                self.projection_runtime
+                    .workspace_bytes()
+                    .map_err(invalid_plan)?
+                    .checked_add(VALUE_ALIGNMENT_BYTES - 1)
+                    .ok_or_else(|| invalid_plan("CUDA dense SwiGLU Marlin scratch overflows"))?,
+                0,
+                bytes_per_token,
+            )?
+        };
         let scratch = ProviderWorkspaceRequirement::from_formula(
             formula,
             VALUE_ALIGNMENT_BYTES,
@@ -701,6 +717,22 @@ impl OperationProvider<CudaDeviceRuntime> for CudaDenseSwiGluProvider {
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
+        if invocation
+            .participants()
+            .iter()
+            .any(|participant| native_swiglu::uses_native(participant.bindings()))
+        {
+            return native_swiglu::encode(
+                self.descriptor.provider_implementation_fingerprint(),
+                &self.native,
+                &self.silu_mul,
+                invocation,
+            )
+            .map(EncodedDeviceOperation::compute)
+            .map_err(|message| {
+                provider_failure(identity, "cuda.dense_swiglu.native.encode", message)
+            });
+        }
         #[cfg(feature = "vllm-marlin")]
         {
             let projection = dense_swiglu_projection(&invocation).map_err(|message| {
@@ -1313,6 +1345,14 @@ fn marlin_swiglu_provider_descriptor(
         DENSE_SWIGLU_ESTIMATOR_ID.as_bytes(),
         provider_fingerprint.as_bytes(),
     ]);
+    let mut quantization_formats = native_linear::quantization_formats().map_err(contract_error)?;
+    for format in [
+        COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID,
+        MARLIN_FP8_QUANTIZATION_FORMAT_ID,
+        MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID,
+    ] {
+        quantization_formats.insert(QuantizationFormatId::new(format).map_err(contract_error)?);
+    }
     OperationProviderDescriptor::new(
         ProviderId::new(DENSE_SWIGLU_PROVIDER_ID).map_err(contract_error)?,
         contract.descriptor().id.clone(),
@@ -1331,18 +1371,13 @@ fn marlin_swiglu_provider_descriptor(
         ]),
         BTreeSet::from([
             WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+            WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
             WeightFormatId::new(COMPRESSED_TENSORS_MARLIN_WEIGHT_FORMAT_ID)
                 .map_err(contract_error)?,
             WeightFormatId::new(MARLIN_FP8_WEIGHT_FORMAT_ID).map_err(contract_error)?,
             WeightFormatId::new(MARLIN_FP8_GROUP128_WEIGHT_FORMAT_ID).map_err(contract_error)?,
         ]),
-        BTreeSet::from([
-            QuantizationFormatId::new(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID)
-                .map_err(contract_error)?,
-            QuantizationFormatId::new(MARLIN_FP8_QUANTIZATION_FORMAT_ID).map_err(contract_error)?,
-            QuantizationFormatId::new(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID)
-                .map_err(contract_error)?,
-        ]),
+        quantization_formats,
         contiguous_bindings(3),
         DENSE_SWIGLU_ESTIMATOR_ID,
         ContractVersion::new(2, 0),
