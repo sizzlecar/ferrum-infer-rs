@@ -7,13 +7,13 @@ use ferrum_types::AttentionExecutionPolicy;
 use half::f16;
 use std::fmt::Debug;
 
-struct Guarded<T> {
+pub(super) struct Guarded<T> {
     device: CudaSlice<T>,
     original: Vec<T>,
 }
 
 impl<T: DeviceRepr + Clone + PartialEq + Debug> Guarded<T> {
-    fn new(stream: &Arc<CudaStream>, values: &[T], guard: T) -> Self {
+    pub(super) fn new(stream: &Arc<CudaStream>, values: &[T], guard: T) -> Self {
         let mut original = vec![guard.clone(); 8];
         original.extend_from_slice(values);
         original.extend(vec![guard; 8]);
@@ -23,11 +23,11 @@ impl<T: DeviceRepr + Clone + PartialEq + Debug> Guarded<T> {
         }
     }
 
-    fn pointer(&self, stream: &Arc<CudaStream>) -> u64 {
+    pub(super) fn pointer(&self, stream: &Arc<CudaStream>) -> u64 {
         self.device.device_ptr(stream).0 + (8 * std::mem::size_of::<T>()) as u64
     }
 
-    fn read(&self, stream: &Arc<CudaStream>) -> Vec<T> {
+    pub(super) fn read(&self, stream: &Arc<CudaStream>) -> Vec<T> {
         // Raw-pointer launchers retain buffers in this fixture on one stream.
         stream.synchronize().unwrap();
         let result = stream.clone_dtoh(&self.device).unwrap();
@@ -41,7 +41,7 @@ impl<T: DeviceRepr + Clone + PartialEq + Debug> Guarded<T> {
         result[8..end].to_vec()
     }
 
-    fn assert_unchanged(&self, stream: &Arc<CudaStream>) {
+    pub(super) fn assert_unchanged(&self, stream: &Arc<CudaStream>) {
         assert_eq!(self.read(stream), self.original[8..self.original.len() - 8]);
     }
 }
@@ -424,5 +424,92 @@ fn recurrent_cuda_semantics_preserve_f64_oracle_state_carry_and_isolated_slots()
                 );
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "requires an actual CUDA device"]
+fn recurrent_master_provider_preserves_hidden_precision_and_residual_aliasing_on_cuda() {
+    let runtime = CudaDeviceRuntime::new(
+        cuda_vnext_runtime_config(
+            0,
+            DeviceId::new("device.test.recurrent-master").unwrap(),
+            AttentionExecutionPolicy::default(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let provider = CudaGatedDeltaRecurrentAttentionProvider::new_f32_master(&runtime).unwrap();
+    assert_eq!(
+        provider.descriptor.operation_id().as_str(),
+        AttentionPrecision::F32Master.operation()
+    );
+    let stream = runtime.context().default_stream();
+    for hidden in [3_usize, 33, 256] {
+        let rows = 3;
+        let input = (0..rows * hidden)
+            .map(|i| 1.0001 + sample(i, 3, 0.00390625))
+            .collect::<Vec<_>>();
+        let weight = (0..hidden)
+            .map(|i| f16::from_f32(1.0 + sample(i, 5, 0.015625)))
+            .collect::<Vec<_>>();
+        let branch = (0..rows * hidden)
+            .map(|i| {
+                if i % 2 == 0 {
+                    f16::ZERO
+                } else {
+                    f16::from_f32(sample(i, 8, 0.03125))
+                }
+            })
+            .collect::<Vec<_>>();
+        let input_gpu = Guarded::new(&stream, &input, 123.0_f32);
+        let weight_gpu = Guarded::new(&stream, &weight, f16::from_f32(124.0));
+        let branch_gpu = Guarded::new(&stream, &branch, f16::from_f32(125.0));
+        let normalized = Guarded::new(&stream, &vec![f16::ZERO; input.len()], f16::from_f32(126.0));
+        launch_rms_norm(
+            &stream,
+            &provider.functions.rms_norm,
+            input_gpu.pointer(&stream),
+            weight_gpu.pointer(&stream),
+            normalized.pointer(&stream),
+            rows as u64,
+            hidden as i32,
+            1.0e-6,
+        )
+        .unwrap();
+        let actual = normalized.read(&stream);
+        for (row, x) in input.chunks_exact(hidden).enumerate() {
+            let inv = (x.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / hidden as f64
+                + 1.0e-6)
+                .sqrt()
+                .recip();
+            for col in 0..hidden {
+                let expected = f64::from(x[col]) * inv * weight[col].to_f64();
+                assert!(
+                    (actual[row * hidden + col].to_f64() - expected).abs()
+                        <= 0.0005 * expected.abs() + 1.0e-6
+                );
+            }
+        }
+        input_gpu.assert_unchanged(&stream);
+        launch_residual(
+            &stream,
+            &provider.functions.residual_add,
+            input_gpu.pointer(&stream),
+            branch_gpu.pointer(&stream),
+            input_gpu.pointer(&stream),
+            input.len() as u64,
+        )
+        .unwrap();
+        assert_eq!(
+            input_gpu.read(&stream),
+            input
+                .iter()
+                .zip(&branch)
+                .map(|(a, b)| *a + b.to_f32())
+                .collect::<Vec<_>>()
+        );
+        weight_gpu.assert_unchanged(&stream);
+        branch_gpu.assert_unchanged(&stream);
     }
 }

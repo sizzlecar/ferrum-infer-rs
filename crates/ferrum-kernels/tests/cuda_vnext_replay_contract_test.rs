@@ -323,13 +323,11 @@ fn typed_program_binding_patches_form_one_layout_owned_sparse_prelude() {
 #[test]
 fn direct_attention_bindings_do_not_rebuild_compute_commands() {
     assert!(RECURRENT_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
-    assert!(RECURRENT_ATTENTION_SOURCE.contains("encode_reusable_attention_bindings(invocation)"));
     assert!(CAUSAL_ATTENTION_SOURCE.contains("fn encode_reusable_execution_bindings("));
-    assert!(CAUSAL_ATTENTION_SOURCE.contains(
-        "encode_reusable_attention_bindings(\n            invocation,\n            self.semantics,\n            self.descriptor.operation_id().as_str(),\n        )"
-    ));
 
     for source in [RECURRENT_ATTENTION_SOURCE, CAUSAL_ATTENTION_SOURCE] {
+        // Typed precision and semantics can change the call's arguments. The
+        // invariant here is that the binding encoder builds no compute commands.
         let binding_only = source
             .split("fn encode_reusable_attention_bindings(")
             .nth(1)

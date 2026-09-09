@@ -9,21 +9,18 @@ use cudarc::nvrtc::Ptx;
 #[cfg(feature = "vllm-marlin")]
 use ferrum_interfaces::vnext::PhysicalWeightLayout;
 use ferrum_interfaces::vnext::{
-    gated_delta_recurrent_attention_contract, AttributeId, BatchedOperationInvocation,
-    CapabilityId, ContractVersion, DeviceBatchingForm, DeviceReusableExecutionTopologyFingerprint,
-    DeviceRuntime, DynamicStorageRequirement, ElementType, EncodedDeviceOperation,
-    EncodedReusableExecutionBindings, GatedDeltaDecayParameterization,
-    GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm, GatedDeltaExecutionPreference,
-    GatedDeltaValueHeadMapping, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
+    AttributeId, BatchedOperationInvocation, CapabilityId, ContractVersion, DeviceBatchingForm,
+    DeviceReusableExecutionTopologyFingerprint, DeviceRuntime, DynamicStorageRequirement,
+    ElementType, EncodedDeviceOperation, EncodedReusableExecutionBindings,
+    GatedDeltaDecayParameterization, GatedDeltaExecutionCapabilities, GatedDeltaExecutionForm,
+    GatedDeltaExecutionPreference, GatedDeltaValueHeadMapping, OperationContract, OperationFailure,
+    OperationInvocation, OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
     OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
     ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy, ProviderWorkspaceScope,
     ProviderWorkspaceSizeFormula, QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding,
     ResolvedValueRole, ReusableExecutionTopology, ReusableExecutionTopologyRequest,
     ReusableExecutionValueAddress, ReusableExecutionWorkspaceAddress, SemanticValue, VNextError,
     WeightFormatId, GATED_DELTA_EXECUTION_FORM_SELECTOR_VERSION,
-    GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
-    GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
 };
 use sha2::{Digest, Sha256};
 
@@ -62,10 +59,10 @@ use crate::marlin_fp8_materializer::{
     MARLIN_FP8_WEIGHT_FORMAT_ID,
 };
 
-const PROVIDER_ID: &str = "provider.cuda.gated_delta_recurrent_attention.f16";
-const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attention.f16";
-
-const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
+mod native_projection;
+mod precision;
+use crate::backend::cuda::vnext_ops::native_blocks::{weights, CudaNativeBlockKernels};
+use precision::AttentionPrecision;
 const PREPARE_FUNCTION: &str =
     "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect";
 const PREPARE_NEGATIVE_RATE_FUNCTION: &str =
@@ -79,7 +76,6 @@ const DELTA_TILED_INTERLEAVED_FUNCTION: &str =
     "vnext_gated_delta_varlen_tiled16_interleaved_f32_indirect";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
-const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
 #[cfg(feature = "vllm-marlin")]
 const PROJECTION_STITCH_FUNCTION: &str = "projection_stitch_f16";
 
@@ -90,6 +86,7 @@ const STATE_BINDING_SLOT_BYTES: u64 = 16;
 
 pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionProvider {
     descriptor: OperationProviderDescriptor,
+    precision: AttentionPrecision,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     functions: AttentionFunctions,
     #[cfg(feature = "vllm-marlin")]
@@ -98,6 +95,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
 
 #[derive(Clone)]
 struct AttentionFunctions {
+    native: CudaNativeBlockKernels,
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     prepare_negative_rate: CudaFunction,
@@ -118,10 +116,22 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
     pub(in crate::backend::cuda::vnext_ops) fn new(
         runtime: &CudaDeviceRuntime,
     ) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = gated_delta_recurrent_attention_contract().map_err(contract_error)?;
+        Self::with_precision(runtime, AttentionPrecision::F16)
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, AttentionPrecision::F32Master)
+    }
+
+    fn with_precision(
+        runtime: &CudaDeviceRuntime,
+        precision: AttentionPrecision,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = precision.contract().map_err(contract_error)?;
         let execution_capabilities = GatedDeltaExecutionCapabilities::recurrent_only();
-        let capability = CapabilityId::new(GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID)
-            .map_err(contract_error)?;
+        let capability = CapabilityId::new(precision.capability()).map_err(contract_error)?;
         if !runtime.descriptor().capabilities.contains(&capability) {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA runtime does not advertise recurrent gated-delta attention",
@@ -131,6 +141,12 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let source = include_str!("attention.rs");
         let mut provider_fingerprint_parts = vec![
             source.as_bytes(),
+            precision.operation().as_bytes(),
+            include_bytes!("attention/precision.rs"),
+            include_bytes!("attention/native_projection.rs"),
+            include_bytes!("../native_blocks.rs"),
+            include_bytes!("../native_blocks/weights.rs"),
+            crate::ptx::VNEXT_GGUF.as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::LINEAR_ATTENTION.as_bytes(),
             crate::ptx::GATED_DELTA_RULE.as_bytes(),
@@ -148,14 +164,23 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID.as_bytes(),
         ]);
         let provider_fingerprint = implementation_fingerprint(&provider_fingerprint_parts);
-        let estimator_fingerprint =
-            implementation_fingerprint(&[source.as_bytes(), ESTIMATOR_ID.as_bytes()]);
+        let estimator_fingerprint = implementation_fingerprint(&[
+            source.as_bytes(),
+            include_bytes!("attention/precision.rs"),
+            include_bytes!("attention/native_projection.rs"),
+            include_bytes!("../native_blocks/weights.rs"),
+            precision.estimator().as_bytes(),
+        ]);
         let mut provider_capabilities = BTreeSet::from([capability]);
         let mut accepted_weight_formats =
             BTreeSet::from([
                 WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
             ]);
-        let mut accepted_quantization_formats = BTreeSet::new();
+        let mut accepted_quantization_formats =
+            super::native_linear::quantization_formats().map_err(contract_error)?;
+        accepted_weight_formats.insert(
+            WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
+        );
         #[cfg(feature = "vllm-marlin")]
         {
             let marlin_capability =
@@ -207,7 +232,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             );
         }
         let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(PROVIDER_ID).map_err(contract_error)?,
+            ProviderId::new(precision.provider()).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -221,7 +246,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             accepted_weight_formats,
             accepted_quantization_formats,
             contiguous_bindings(10),
-            ESTIMATOR_ID,
+            precision.estimator(),
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )
@@ -248,7 +273,8 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             .load_module(Ptx::from_src(crate::ptx::RESIDUAL_ADD.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("attention residual module", error))?;
         let functions = AttentionFunctions {
-            rms_norm: load_function(&rms_module, RMS_NORM_FUNCTION, "attention RMSNorm")?,
+            native: CudaNativeBlockKernels::load(runtime.context())?,
+            rms_norm: load_function(&rms_module, precision.norm(), "attention RMSNorm")?,
             prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
             prepare_negative_rate: load_function(
                 &linear_module,
@@ -281,7 +307,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             f32_to_f16: load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?,
             residual_add: load_function(
                 &residual_module,
-                RESIDUAL_ADD_FUNCTION,
+                precision.residual(),
                 "attention residual",
             )?,
             #[cfg(feature = "vllm-marlin")]
@@ -293,6 +319,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         };
         Ok(Self {
             descriptor,
+            precision,
             execution_capabilities,
             functions,
             #[cfg(feature = "vllm-marlin")]
@@ -320,18 +347,14 @@ impl OperationResourceEstimator for CudaGatedDeltaRecurrentAttentionProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        ensure_estimator_request(
-            &self.descriptor,
-            &request,
-            GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID,
-        )?;
+        ensure_estimator_request(&self.descriptor, &request, self.precision.operation())?;
         let shape = AttentionShape::from_attributes(request.attributes()).map_err(invalid_plan)?;
-        #[cfg(feature = "vllm-marlin")]
-        let projection =
-            AttentionProjection::from_values(request.values(), self.projection_runtime)
-                .map_err(invalid_plan)?;
-        #[cfg(not(feature = "vllm-marlin"))]
-        let projection = AttentionProjection::F16;
+        let projection = AttentionProjection::from_values(
+            request.values(),
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
+        .map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
                 shape
@@ -403,7 +426,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         {
             return Ok(ReusableExecutionTopology::EagerBoundary);
         }
-        reusable_attention_topology(&request, self.execution_capabilities)
+        reusable_attention_topology(&request, self.execution_capabilities, self.precision)
             .map(ReusableExecutionTopology::Dynamic)
             .map_err(invalid_plan)
     }
@@ -416,6 +439,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         encode_attention(
             self.descriptor.provider_implementation_fingerprint(),
             &self.functions,
+            self.precision,
             self.execution_capabilities,
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
@@ -438,7 +462,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
         invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
     ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, OperationFailure> {
         let identity = invocation.participants()[0].identity().clone();
-        encode_reusable_attention_bindings(invocation).map_err(|message| {
+        encode_reusable_attention_bindings(invocation, self.precision).map_err(|message| {
             OperationFailure::new(
                 identity,
                 ProfilePhase::Forward,
@@ -454,8 +478,9 @@ impl OperationProvider<CudaDeviceRuntime> for CudaGatedDeltaRecurrentAttentionPr
 fn reusable_attention_topology(
     request: &ReusableExecutionTopologyRequest<'_>,
     execution_capabilities: GatedDeltaExecutionCapabilities,
+    precision: AttentionPrecision,
 ) -> Result<DeviceReusableExecutionTopologyFingerprint, String> {
-    if request.operation_id().as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID {
+    if request.operation_id().as_str() != precision.operation() {
         return Err("CUDA recurrent topology received another operation".to_owned());
     }
     let shape = AttentionShape::from_attributes(request.attributes())?;
@@ -731,6 +756,7 @@ struct CudaAttentionShape {
 #[derive(Debug, Clone, Copy)]
 enum AttentionProjection {
     F16,
+    Native,
     #[cfg(feature = "vllm-marlin")]
     MarlinFp8 {
         runtime: MarlinProjectionRuntime,
@@ -743,69 +769,80 @@ enum AttentionProjection {
 }
 
 impl AttentionProjection {
-    #[cfg(feature = "vllm-marlin")]
     fn from_values(
         values: &[ResolvedValueBinding],
-        runtime: MarlinProjectionRuntime,
+        #[cfg(feature = "vllm-marlin")] runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
-        let mut uses_fp8 = false;
-        let mut uses_segmented_fp8 = false;
-        let mut uses_compressed_tensors = false;
-        for ordinal in [2, 7] {
-            let binding = binding(values, ResolvedValueRole::Input, ordinal)?;
-            let weight = binding.weight().ok_or_else(|| {
-                format!("attention projection input {ordinal} lacks its physical weight layout")
-            })?;
-            let quantization_formats = weight.quantization_formats();
-            if quantization_formats.is_empty() {
-                continue;
-            }
-            if quantization_formats.len() != 1 {
-                return Err(format!(
+        if native_projection::uses_native(values)? {
+            return Ok(Self::Native);
+        }
+        #[cfg(not(feature = "vllm-marlin"))]
+        {
+            Ok(Self::F16)
+        }
+        #[cfg(feature = "vllm-marlin")]
+        {
+            let mut uses_fp8 = false;
+            let mut uses_segmented_fp8 = false;
+            let mut uses_compressed_tensors = false;
+            for ordinal in [2, 7] {
+                let binding = binding(values, ResolvedValueRole::Input, ordinal)?;
+                let weight = binding.weight().ok_or_else(|| {
+                    format!("attention projection input {ordinal} lacks its physical weight layout")
+                })?;
+                let quantization_formats = weight.quantization_formats();
+                if quantization_formats.is_empty() {
+                    continue;
+                }
+                if quantization_formats.len() != 1 {
+                    return Err(format!(
                     "attention projection input {ordinal} has more than one quantization format"
                 ));
+                }
+                match quantization_formats
+                    .iter()
+                    .next()
+                    .map(|format| format.as_str())
+                {
+                    Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
+                    | Some(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID) => {
+                        uses_fp8 = true;
+                        uses_segmented_fp8 |= matches!(
+                            weight.physical_layout(),
+                            PhysicalWeightLayout::Composite { .. }
+                        );
+                    }
+                    Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID) => {
+                        uses_compressed_tensors = true
+                    }
+                    _ => {
+                        return Err(format!(
+                            "attention projection input {ordinal} is not an admitted Marlin format"
+                        ))
+                    }
+                }
             }
-            match quantization_formats
-                .iter()
-                .next()
-                .map(|format| format.as_str())
-            {
-                Some(MARLIN_FP8_QUANTIZATION_FORMAT_ID)
-                | Some(MARLIN_FP8_GROUP128_QUANTIZATION_FORMAT_ID) => {
-                    uses_fp8 = true;
-                    uses_segmented_fp8 |= matches!(
-                        weight.physical_layout(),
-                        PhysicalWeightLayout::Composite { .. }
-                    );
-                }
-                Some(COMPRESSED_TENSORS_MARLIN_QUANTIZATION_FORMAT_ID) => {
-                    uses_compressed_tensors = true
-                }
-                _ => {
-                    return Err(format!(
-                        "attention projection input {ordinal} is not an admitted Marlin format"
-                    ))
-                }
+            if uses_fp8 && uses_compressed_tensors {
+                return Err(
+                    "recurrent attention cannot mix FP8 and INT4 projection ABIs".to_owned(),
+                );
             }
+            Ok(if uses_fp8 {
+                Self::MarlinFp8 {
+                    runtime,
+                    segmented: uses_segmented_fp8,
+                }
+            } else if uses_compressed_tensors {
+                Self::CompressedTensorsMarlin { runtime }
+            } else {
+                Self::F16
+            })
         }
-        if uses_fp8 && uses_compressed_tensors {
-            return Err("recurrent attention cannot mix FP8 and INT4 projection ABIs".to_owned());
-        }
-        Ok(if uses_fp8 {
-            Self::MarlinFp8 {
-                runtime,
-                segmented: uses_segmented_fp8,
-            }
-        } else if uses_compressed_tensors {
-            Self::CompressedTensorsMarlin { runtime }
-        } else {
-            Self::F16
-        })
     }
 
     fn workspace_bytes(self) -> Result<u64, String> {
         match self {
-            Self::F16 => Ok(0),
+            Self::F16 | Self::Native => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime, .. } => runtime.workspace_bytes(),
             #[cfg(feature = "vllm-marlin")]
@@ -828,7 +865,7 @@ impl AttentionProjection {
             | Self::MarlinFp8 {
                 segmented: true, ..
             } => segmented_projection_staging_bytes_per_token(qkvzba_features),
-            Self::F16 => Ok(0),
+            Self::F16 | Self::Native => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 {
                 segmented: false, ..
@@ -839,6 +876,7 @@ impl AttentionProjection {
     fn replay_tag(self) -> &'static str {
         match self {
             Self::F16 => "f16-cublas",
+            Self::Native => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 {
                 segmented: false, ..
@@ -1079,7 +1117,7 @@ struct AttentionStateBinding {
     delta_state_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SharedRegions {
     input_norm: usize,
     qkvzba: SharedProjectionWeight,
@@ -1092,8 +1130,12 @@ struct SharedRegions {
     binding: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum SharedProjectionWeight {
+    Native {
+        first_region: usize,
+        parts: Arc<[weights::MatrixPart]>,
+    },
     F16 {
         region: usize,
     },
@@ -1136,9 +1178,10 @@ enum SegmentedProjectionPart {
 }
 
 impl SharedProjectionWeight {
-    fn replay_tag(self) -> &'static str {
-        match self {
+    fn replay_tag(&self) -> &'static str {
+        match *self {
             Self::F16 { .. } => "f16",
+            Self::Native { .. } => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "marlin-fp8",
             #[cfg(feature = "vllm-marlin")]
@@ -1148,9 +1191,10 @@ impl SharedProjectionWeight {
         }
     }
 
-    fn dispatch_count(self) -> Result<u64, String> {
-        match self {
+    fn dispatch_count(&self, rows: u64) -> Result<u64, String> {
+        match *self {
             Self::F16 { .. } => Ok(1),
+            Self::Native { ref parts, .. } => native_projection::dispatch_count(parts.len(), rows),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => Ok(1),
             #[cfg(feature = "vllm-marlin")]
@@ -1173,9 +1217,9 @@ impl SharedProjectionWeight {
         }
     }
 
-    fn marlin_workspace_zero_count(self) -> Result<u64, String> {
-        match self {
-            Self::F16 { .. } => Ok(0),
+    fn marlin_workspace_zero_count(&self) -> Result<u64, String> {
+        match *self {
+            Self::F16 { .. } | Self::Native { .. } => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => Ok(1),
             #[cfg(feature = "vllm-marlin")]
@@ -1201,12 +1245,28 @@ impl SharedProjectionWeight {
     }
 
     fn bind_replay_topology(
-        self,
+        &self,
         mut replay_key: CudaCommandReplayKeyBuilder,
     ) -> CudaCommandReplayKeyBuilder {
         replay_key = replay_key.bytes(self.replay_tag().as_bytes());
-        match self {
+        match *self {
             Self::F16 { .. } => replay_key,
+            Self::Native {
+                first_region,
+                ref parts,
+            } => {
+                replay_key = replay_key.u64(first_region as u64).u64(parts.len() as u64);
+                for part in parts.iter() {
+                    replay_key = replay_key
+                        .u32(part.rows)
+                        .u32(part.columns)
+                        .u32(part.output_offset);
+                    for parameter in part.format.parameters() {
+                        replay_key = replay_key.u32(parameter);
+                    }
+                }
+                replay_key
+            }
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { group_size, .. } => replay_key.i32(group_size),
             #[cfg(feature = "vllm-marlin")]
@@ -1252,11 +1312,12 @@ impl SharedProjectionWeight {
 }
 
 fn attention_dispatches_per_launch(
-    qkvzba: SharedProjectionWeight,
-    output: SharedProjectionWeight,
+    qkvzba: &SharedProjectionWeight,
+    output: &SharedProjectionWeight,
+    rows: u64,
 ) -> Result<u64, String> {
-    let qkvzba = qkvzba.dispatch_count()?;
-    let output = output.dispatch_count()?;
+    let qkvzba = qkvzba.dispatch_count(rows)?;
+    let output = output.dispatch_count(rows)?;
     8_u64
         .checked_add(qkvzba)
         .and_then(|count| count.checked_add(output))
@@ -1264,8 +1325,8 @@ fn attention_dispatches_per_launch(
 }
 
 fn attention_transfers_per_launch(
-    qkvzba: SharedProjectionWeight,
-    output: SharedProjectionWeight,
+    qkvzba: &SharedProjectionWeight,
+    output: &SharedProjectionWeight,
 ) -> Result<u64, String> {
     let qkvzba = qkvzba.marlin_workspace_zero_count()?;
     let output = output.marlin_workspace_zero_count()?;
@@ -1278,27 +1339,29 @@ fn attention_transfers_per_launch(
 fn encode_attention(
     provider_fingerprint: &str,
     functions: &AttentionFunctions,
+    precision: AttentionPrecision,
     execution_capabilities: GatedDeltaExecutionCapabilities,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<EncodedDeviceOperation<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
-        || invocation.operation().id.as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID
+        || invocation.operation().id.as_str() != precision.operation()
     {
         return Err("CUDA recurrent attention received another or empty operation".to_owned());
     }
     let first = &invocation.participants()[0];
     let shape = AttentionShape::from_attributes(first.attributes())?;
-    #[cfg(feature = "vllm-marlin")]
-    let projection = AttentionProjection::from_values(first.bindings(), projection_runtime)?;
-    #[cfg(not(feature = "vllm-marlin"))]
-    let projection = AttentionProjection::F16;
-    validate_signature(first, shape)?;
+    let projection = AttentionProjection::from_values(
+        first.bindings(),
+        #[cfg(feature = "vllm-marlin")]
+        projection_runtime,
+    )?;
+    validate_signature(first, shape, precision)?;
     for participant in &invocation.participants()[1..] {
         if AttentionShape::from_attributes(participant.attributes())? != shape {
             return Err("CUDA recurrent attention participant attributes disagree".to_owned());
         }
-        validate_signature(participant, shape)?;
+        validate_signature(participant, shape, precision)?;
     }
     let program_binding = invocation.program_binding().cloned();
 
@@ -1357,7 +1420,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Input,
             0,
-            ElementType::F16,
+            precision.hidden(),
             total_tokens,
         )?);
         let output_region = compute_regions.len();
@@ -1365,7 +1428,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            precision.hidden(),
             total_tokens,
         )?);
         Some((input_region, output_region))
@@ -1464,7 +1527,7 @@ fn encode_attention(
             compute_regions.push(contiguous_token_region(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-                ElementType::F16,
+                precision.hidden(),
                 if input_packed {
                     packed.start
                 } else {
@@ -1476,7 +1539,7 @@ fn encode_attention(
             compute_regions.push(contiguous_token_region(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-                ElementType::F16,
+                precision.hidden(),
                 if output_packed {
                     packed.start
                 } else {
@@ -1525,8 +1588,7 @@ fn encode_attention(
     }
 
     let functions = functions.clone();
-    let dispatches_per_launch = attention_dispatches_per_launch(shared.qkvzba, shared.output)?;
-    let transfers_per_launch = attention_transfers_per_launch(shared.qkvzba, shared.output)?;
+    let transfers_per_launch = attention_transfers_per_launch(&shared.qkvzba, &shared.output)?;
     let mut replay_key = CudaCommandReplayKeyBuilder::new(
         provider_fingerprint,
         "vnext_gated_delta_recurrent_attention",
@@ -1584,9 +1646,12 @@ fn encode_attention(
     if u64::try_from(launches.len()).ok() != Some(attributed_launches) {
         return Err("CUDA recurrent attention launch attribution is inconsistent".to_owned());
     }
-    let logical_compute_dispatches = attributed_launches
-        .checked_mul(dispatches_per_launch)
-        .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())?;
+    let logical_compute_dispatches = launches.iter().try_fold(0_u64, |total, launch| {
+        let count = attention_dispatches_per_launch(&shared.qkvzba, &shared.output, launch.tokens)?;
+        total
+            .checked_add(count)
+            .ok_or_else(|| "CUDA recurrent attention dispatch attribution overflows".to_owned())
+    })?;
     let physical_transfer_commands = attributed_launches
         .checked_mul(transfers_per_launch)
         .ok_or_else(|| "CUDA recurrent attention transfer attribution overflows".to_owned())?;
@@ -1668,7 +1733,7 @@ fn encode_attention(
                         cuda_shape,
                         shape,
                         layout,
-                        shared,
+                        &shared,
                         projection,
                         *launch,
                         regions,
@@ -1702,9 +1767,10 @@ fn encode_attention(
 
 fn encode_reusable_attention_bindings(
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
+    precision: AttentionPrecision,
 ) -> Result<EncodedReusableExecutionBindings<CudaDeviceCommand>, String> {
     if invocation.participants().is_empty()
-        || invocation.operation().id.as_str() != GATED_DELTA_RECURRENT_ATTENTION_OPERATION_ID
+        || invocation.operation().id.as_str() != precision.operation()
     {
         return Err("CUDA recurrent attention received another or empty operation".to_owned());
     }
@@ -1849,7 +1915,7 @@ fn enqueue_attention(
     cuda: CudaAttentionShape,
     shape: AttentionShape,
     layout: ScratchLayout,
-    shared: SharedRegions,
+    shared: &SharedRegions,
     projection: AttentionProjection,
     launch: AttentionLaunch,
     regions: &[CudaBufferRegion],
@@ -1943,7 +2009,8 @@ fn enqueue_attention(
         stream,
         blas,
         projection,
-        shared.qkvzba,
+        &shared.qkvzba,
+        &functions.native,
         #[cfg(feature = "vllm-marlin")]
         &functions.projection_stitch,
         normalized,
@@ -2049,7 +2116,8 @@ fn enqueue_attention(
         stream,
         blas,
         projection,
-        shared.output,
+        &shared.output,
+        &functions.native,
         #[cfg(feature = "vllm-marlin")]
         &functions.projection_stitch,
         z,
@@ -2080,7 +2148,8 @@ fn launch_attention_projection(
     stream: &CudaStream,
     blas: &CudaBlas,
     projection: AttentionProjection,
-    weight: SharedProjectionWeight,
+    weight: &SharedProjectionWeight,
+    native: &CudaNativeBlockKernels,
     #[cfg(feature = "vllm-marlin")] projection_stitch: &CudaFunction,
     input: u64,
     output: u64,
@@ -2092,7 +2161,21 @@ fn launch_attention_projection(
     input_features: i32,
     operation: &'static str,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    match weight {
+    match *weight {
+        SharedProjectionWeight::Native {
+            first_region,
+            ref parts,
+        } => native_projection::launch(
+            stream,
+            native,
+            parts,
+            &regions[first_region..first_region + parts.len()],
+            input,
+            output,
+            rows,
+            output_features,
+            input_features,
+        ),
         SharedProjectionWeight::F16 { region } => launch_gemm_f16(
             blas,
             input,
@@ -2609,7 +2692,7 @@ fn launch_rms_norm(
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (rows, 1, 1),
-            block_dim: ((hidden_size as u32).min(1024), 1, 1),
+            block_dim: (super::rms_norm_threads(hidden_size), 1, 1),
             shared_mem_bytes: 0,
         })
     }
@@ -2838,6 +2921,7 @@ fn launch_residual(
 fn validate_signature(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     shape: AttentionShape,
+    precision: AttentionPrecision,
 ) -> Result<(), String> {
     let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
@@ -2879,8 +2963,8 @@ fn validate_signature(
     if *tokens == 0
         || *hidden_width != shape.hidden_size
         || output.tensor().dimensions() != [*tokens, shape.hidden_size]
-        || !f16_contiguous(hidden)
-        || !f16_contiguous(output)
+        || !contiguous(hidden, precision.hidden())
+        || !contiguous(output, precision.hidden())
         || expected.iter().any(|(binding, dimensions, element_type)| {
             binding.tensor().dimensions() != dimensions.as_slice()
                 || !contiguous(binding, *element_type)
@@ -3302,6 +3386,9 @@ fn push_shared_projection_weight(
             "attention projection input {ordinal} must have two logical dimensions"
         ));
     };
+    if native_projection::uses_native(invocation.participants()[0].bindings())? {
+        return native_projection::resolve_shared(regions, invocation, ordinal, logical_dimensions);
+    }
     #[cfg(feature = "vllm-marlin")]
     {
         let first_participant = &invocation.participants()[0];
@@ -3451,10 +3538,6 @@ fn scratch_region(
     buffer
         .retained_region(range, retention)
         .map_err(|error| error.to_string())
-}
-
-fn f16_contiguous(binding: &ResolvedValueBinding) -> bool {
-    contiguous(binding, ElementType::F16)
 }
 
 fn contiguous(binding: &ResolvedValueBinding, element_type: ElementType) -> bool {
@@ -3897,11 +3980,14 @@ mod tests {
             scales_region: 7,
             group_size: MARLIN_FP8_CHANNELWISE_GROUP_SIZE,
         };
-        assert_eq!(qkvzba.dispatch_count().unwrap(), 8);
-        assert_eq!(attention_dispatches_per_launch(qkvzba, output).unwrap(), 17);
+        assert_eq!(qkvzba.dispatch_count(3).unwrap(), 8);
+        assert_eq!(
+            attention_dispatches_per_launch(&qkvzba, &output, 3).unwrap(),
+            17
+        );
         assert_eq!(qkvzba.marlin_workspace_zero_count().unwrap(), 2);
         assert_eq!(output.marlin_workspace_zero_count().unwrap(), 1);
-        assert_eq!(attention_transfers_per_launch(qkvzba, output).unwrap(), 5);
+        assert_eq!(attention_transfers_per_launch(&qkvzba, &output).unwrap(), 5);
 
         let canonical = qkvzba
             .bind_replay_topology(CudaCommandReplayKeyBuilder::new("test", "attention"))
