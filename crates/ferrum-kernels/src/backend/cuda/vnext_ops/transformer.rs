@@ -16,23 +16,20 @@ use cudarc::nvrtc::Ptx;
 use ferrum_interfaces::vnext::PhysicalWeightLayout;
 use ferrum_interfaces::vnext::{
     constant_scale_contract, dense_geglu_tanh_contract, dense_linear_contract,
-    dense_swiglu_contract, logit_softcap_contract, residual_add_contract, rms_norm_contract,
-    AttributeId, BatchedOperationInvocation, CanonicalRational, CapabilityId, ContractVersion,
-    DeviceBatchingForm, DeviceRuntime, DynamicStorageRequirement, ElementType,
-    EncodedDeviceOperation, OperationContract, OperationFailure, OperationInvocation,
-    OperationProvider, OperationProviderDescriptor, OperationResourceEstimate,
-    OperationResourceEstimateRequest, OperationResourceEstimator, ProfilePhase, ProviderId,
-    ProviderStorageBindingRequirement, ProviderWorkspaceRequirement, ProviderWorkspaceReusePolicy,
-    ProviderWorkspaceScope, ProviderWorkspaceSizeFormula, QuantizationFormatId,
-    ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole, ReusableExecutionTopology,
-    ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
+    dense_swiglu_contract, logit_softcap_contract, AttributeId, BatchedOperationInvocation,
+    CanonicalRational, CapabilityId, ContractVersion, DeviceBatchingForm, DeviceRuntime,
+    DynamicStorageRequirement, ElementType, EncodedDeviceOperation, OperationContract,
+    OperationFailure, OperationInvocation, OperationProvider, OperationProviderDescriptor,
+    OperationResourceEstimate, OperationResourceEstimateRequest, OperationResourceEstimator,
+    ProfilePhase, ProviderId, ProviderStorageBindingRequirement, ProviderWorkspaceRequirement,
+    ProviderWorkspaceReusePolicy, ProviderWorkspaceScope, ProviderWorkspaceSizeFormula,
+    QuantizationFormatId, ResolvedTensorLayout, ResolvedValueBinding, ResolvedValueRole,
+    ReusableExecutionTopology, ReusableExecutionTopologyRequest, ReusableExecutionValueAddress,
     ReusableExecutionWorkspaceAddress, SemanticValue, VNextError, WeightFormatId,
     CONSTANT_SCALE_F16_CAPABILITY_ID, CONSTANT_SCALE_OPERATION_ID,
     DENSE_GEGLU_TANH_F16_CAPABILITY_ID, DENSE_GEGLU_TANH_OPERATION_ID,
     DENSE_LINEAR_F16_CAPABILITY_ID, DENSE_LINEAR_OPERATION_ID, DENSE_SWIGLU_F16_CAPABILITY_ID,
     DENSE_SWIGLU_OPERATION_ID, LOGIT_SOFTCAP_F16_CAPABILITY_ID, LOGIT_SOFTCAP_OPERATION_ID,
-    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_OPERATION_ID, RMS_NORM_F16_CAPABILITY_ID,
-    RMS_NORM_OPERATION_ID,
 };
 
 use super::super::vnext_runtime::{
@@ -84,6 +81,9 @@ mod moe_weights;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe_workspace;
 mod native_linear;
+mod precision;
+
+use precision::{ResidualPrecision, RmsNormPrecision};
 
 pub(super) use attention::CudaGatedDeltaRecurrentAttentionProvider;
 pub(super) use causal_attention::CudaCausalPagedAttentionProvider;
@@ -100,8 +100,6 @@ pub(super) use moe_weights::{
     GPTQ_MARLIN_CAPABILITY_ID,
 };
 
-const RMS_NORM_PROVIDER_ID: &str = "provider.cuda.rms_norm.f16";
-const RMS_NORM_ESTIMATOR_ID: &str = "resource-estimator.cuda.rms_norm.f16";
 const DENSE_LINEAR_PROVIDER_ID: &str = "provider.cuda.dense_linear.f16.cublas";
 const DENSE_LINEAR_ESTIMATOR_ID: &str = "resource-estimator.cuda.dense_linear.f16.cublas";
 #[cfg(feature = "vllm-marlin")]
@@ -117,17 +115,13 @@ const CONSTANT_SCALE_PROVIDER_ID: &str = "provider.cuda.constant_scale.f16";
 const CONSTANT_SCALE_ESTIMATOR_ID: &str = "resource-estimator.cuda.constant_scale.f16";
 const LOGIT_SOFTCAP_PROVIDER_ID: &str = "provider.cuda.logit_softcap.f16";
 const LOGIT_SOFTCAP_ESTIMATOR_ID: &str = "resource-estimator.cuda.logit_softcap.f16";
-const RESIDUAL_ADD_PROVIDER_ID: &str = "provider.cuda.residual_add.f16";
-const RESIDUAL_ADD_ESTIMATOR_ID: &str = "resource-estimator.cuda.residual_add.f16";
 
-const RMS_NORM_FUNCTION_NAME: &str = "rms_norm_f16";
 const SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_interleaved_f16";
 #[cfg(feature = "vllm-marlin")]
 const PLANAR_SILU_MUL_FUNCTION_NAME: &str = "fused_silu_mul_f16";
 const PLANAR_GELU_TANH_MUL_FUNCTION_NAME: &str = "fused_gelu_tanh_mul_f16";
 const SCALE_INPLACE_FUNCTION_NAME: &str = "scale_inplace_f16";
 const LOGIT_SOFTCAP_INPLACE_FUNCTION_NAME: &str = "logit_softcap_inplace_f16";
-const RESIDUAL_ADD_FUNCTION_NAME: &str = "residual_add_f16";
 const SWIGLU_SCRATCH_PARTS: u64 = 3;
 const GEGLU_SCRATCH_PARTS: u64 = 3;
 static CUDA_GEMM_ALPHA_F32: f32 = 1.0;
@@ -192,22 +186,46 @@ pub(super) fn static_contiguous_reusable_topology(
 pub(super) struct CudaRmsNormProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
+    precision: RmsNormPrecision,
 }
 
 impl CudaRmsNormProvider {
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = rms_norm_contract().map_err(contract_error)?;
-        let descriptor = provider_descriptor(
+        Self::with_precision(runtime, RmsNormPrecision::F16)
+    }
+
+    pub(super) fn new_f32_to_f16(
+        runtime: &CudaDeviceRuntime,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, RmsNormPrecision::F32ToF16)
+    }
+
+    pub(super) fn new_f32(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, RmsNormPrecision::F32)
+    }
+
+    fn with_precision(
+        runtime: &CudaDeviceRuntime,
+        precision: RmsNormPrecision,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = precision.contract().map_err(contract_error)?;
+        let descriptor = provider_descriptor_with_formats(
             runtime,
             &contract,
-            RMS_NORM_PROVIDER_ID,
-            RMS_NORM_F16_CAPABILITY_ID,
-            RMS_NORM_ESTIMATOR_ID,
+            precision.provider(),
+            precision.capability(),
+            precision.estimator(),
             contiguous_bindings(2),
+            BTreeSet::from([
+                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
+            ]),
+            native_linear::quantization_formats().map_err(contract_error)?,
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/precision.rs").as_bytes(),
                 crate::ptx::RMS_NORM.as_bytes(),
-                RMS_NORM_FUNCTION_NAME.as_bytes(),
+                precision.kernel().as_bytes(),
             ]),
         )?;
         let module = runtime
@@ -215,11 +233,12 @@ impl CudaRmsNormProvider {
             .load_module(Ptx::from_src(crate::ptx::RMS_NORM.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("RMSNorm module load", error))?;
         let function = module
-            .load_function(RMS_NORM_FUNCTION_NAME)
+            .load_function(precision.kernel())
             .map_err(|error| CudaDeviceRuntimeError::driver("RMSNorm function load", error))?;
         Ok(Self {
             descriptor,
             function,
+            precision,
         })
     }
 }
@@ -233,7 +252,11 @@ impl OperationResourceEstimator for CudaRmsNormProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(&self.descriptor, &request, RMS_NORM_OPERATION_ID)
+        estimate_without_workspace(
+            &self.descriptor,
+            &request,
+            self.descriptor.operation_id().as_str(),
+        )
     }
 }
 
@@ -253,6 +276,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaRmsNormProvider {
         encode_rms_norm(
             self.descriptor.provider_implementation_fingerprint(),
             &self.function,
+            self.precision,
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -1074,22 +1098,40 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLogitSoftcapProvider {
 pub(super) struct CudaResidualAddProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
+    precision: ResidualPrecision,
 }
 
 impl CudaResidualAddProvider {
     pub(super) fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = residual_add_contract().map_err(contract_error)?;
-        let descriptor = provider_descriptor(
+        Self::with_precision(runtime, ResidualPrecision::F16)
+    }
+
+    pub(super) fn new_f32_f16(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, ResidualPrecision::F32F16)
+    }
+
+    fn with_precision(
+        runtime: &CudaDeviceRuntime,
+        precision: ResidualPrecision,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = precision.contract().map_err(contract_error)?;
+        let descriptor = provider_descriptor_with_formats(
             runtime,
             &contract,
-            RESIDUAL_ADD_PROVIDER_ID,
-            RESIDUAL_ADD_F16_CAPABILITY_ID,
-            RESIDUAL_ADD_ESTIMATOR_ID,
+            precision.provider(),
+            precision.capability(),
+            precision.estimator(),
             contiguous_bindings(2),
+            BTreeSet::from([
+                WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?,
+                WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
+            ]),
+            native_linear::quantization_formats().map_err(contract_error)?,
             implementation_fingerprint(&[
                 include_str!("transformer.rs").as_bytes(),
+                include_str!("transformer/precision.rs").as_bytes(),
                 crate::ptx::RESIDUAL_ADD.as_bytes(),
-                RESIDUAL_ADD_FUNCTION_NAME.as_bytes(),
+                precision.kernel().as_bytes(),
             ]),
         )?;
         let module = runtime
@@ -1097,11 +1139,12 @@ impl CudaResidualAddProvider {
             .load_module(Ptx::from_src(crate::ptx::RESIDUAL_ADD.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("residual add module load", error))?;
         let function = module
-            .load_function(RESIDUAL_ADD_FUNCTION_NAME)
+            .load_function(precision.kernel())
             .map_err(|error| CudaDeviceRuntimeError::driver("residual add function load", error))?;
         Ok(Self {
             descriptor,
             function,
+            precision,
         })
     }
 }
@@ -1115,7 +1158,11 @@ impl OperationResourceEstimator for CudaResidualAddProvider {
         &self,
         request: OperationResourceEstimateRequest<'_>,
     ) -> Result<OperationResourceEstimate, VNextError> {
-        estimate_without_workspace(&self.descriptor, &request, RESIDUAL_ADD_OPERATION_ID)
+        estimate_without_workspace(
+            &self.descriptor,
+            &request,
+            self.descriptor.operation_id().as_str(),
+        )
     }
 }
 
@@ -1135,6 +1182,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaResidualAddProvider {
         encode_residual_add(
             self.descriptor.provider_implementation_fingerprint(),
             &self.function,
+            self.precision,
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -1421,16 +1469,23 @@ pub(super) fn estimate(
 fn encode_rms_norm(
     provider_fingerprint: &str,
     function: &CudaFunction,
+    precision: RmsNormPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(&invocation, RMS_NORM_OPERATION_ID)?;
+    ensure_invocation(&invocation, precision.operation())?;
     let first = &invocation.participants()[0];
     let first_input = binding(first.bindings(), ResolvedValueRole::Input, 0)?;
     let first_weight = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
     let first_output = binding(first.bindings(), ResolvedValueRole::Output, 0)?;
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
     let epsilon = rational_attribute(first.attributes(), "epsilon")?;
-    validate_rms_norm(first_input, first_weight, first_output, hidden_size)?;
+    validate_rms_norm(
+        first_input,
+        first_weight,
+        first_output,
+        hidden_size,
+        precision,
+    )?;
     for participant in &invocation.participants()[1..] {
         let input = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
         let weight = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
@@ -1440,14 +1495,14 @@ fn encode_rms_norm(
         {
             return Err("CUDA RMSNorm participant attributes disagree".to_owned());
         }
-        validate_rms_norm(input, weight, output, hidden_size)?;
+        validate_rms_norm(input, weight, output, hidden_size, precision)?;
     }
     let tokens = invocation.work_shape().immediate_tokens();
     let input = shared_token_region(
         &invocation,
         ResolvedValueRole::Input,
         0,
-        ElementType::F16,
+        precision.input(),
         tokens,
     )?;
     let weight = shared_full_region(&invocation, ResolvedValueRole::Input, 1, ElementType::F16)?;
@@ -1455,7 +1510,7 @@ fn encode_rms_norm(
         &invocation,
         ResolvedValueRole::Output,
         0,
-        ElementType::F16,
+        precision.output(),
         tokens,
     )?;
     let regions = vec![input, weight, output];
@@ -1488,7 +1543,7 @@ fn encode_rms_norm(
             unsafe {
                 builder.launch(LaunchConfig {
                     grid_dim: (rows, 1, 1),
-                    block_dim: ((hidden_size as u32).min(1024), 1, 1),
+                    block_dim: (rms_norm_threads(hidden_size), 1, 1),
                     shared_mem_bytes: 0,
                 })
             }
@@ -1506,6 +1561,12 @@ fn encode_rms_norm(
         )
     })
     .map_err(|error| error.to_string())
+}
+
+// The reduction uses complete warp masks, including for hidden dimensions
+// smaller than or not divisible by 32. Callers validate a positive i32 width.
+fn rms_norm_threads(hidden_size: i32) -> u32 {
+    (hidden_size as u32).div_ceil(32).min(32) * 32
 }
 
 #[derive(Clone, Copy)]
@@ -3843,15 +3904,22 @@ fn encode_logit_softcap(
 fn encode_residual_add(
     provider_fingerprint: &str,
     function: &CudaFunction,
+    precision: ResidualPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    ensure_invocation(&invocation, RESIDUAL_ADD_OPERATION_ID)?;
+    ensure_invocation(&invocation, precision.operation())?;
     let first = &invocation.participants()[0];
     let first_left = binding(first.bindings(), ResolvedValueRole::Input, 0)?;
     let first_right = binding(first.bindings(), ResolvedValueRole::Input, 1)?;
     let first_output = binding(first.bindings(), ResolvedValueRole::Output, 0)?;
     let hidden_size = unsigned_attribute(first.attributes(), "hidden_size")?;
-    validate_residual_add(first_left, first_right, first_output, hidden_size)?;
+    validate_residual_add(
+        first_left,
+        first_right,
+        first_output,
+        hidden_size,
+        precision,
+    )?;
     for participant in &invocation.participants()[1..] {
         let left = binding(participant.bindings(), ResolvedValueRole::Input, 0)?;
         let right = binding(participant.bindings(), ResolvedValueRole::Input, 1)?;
@@ -3859,7 +3927,7 @@ fn encode_residual_add(
         if unsigned_attribute(participant.attributes(), "hidden_size")? != hidden_size {
             return Err("CUDA residual add participant attributes disagree".to_owned());
         }
-        validate_residual_add(left, right, output, hidden_size)?;
+        validate_residual_add(left, right, output, hidden_size, precision)?;
     }
     let tokens = invocation.work_shape().immediate_tokens();
     let elements = tokens
@@ -3870,7 +3938,7 @@ fn encode_residual_add(
             &invocation,
             ResolvedValueRole::Input,
             0,
-            ElementType::F16,
+            precision.master(),
             tokens,
         )?,
         shared_token_region(
@@ -3884,7 +3952,7 @@ fn encode_residual_add(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            precision.master(),
             tokens,
         )?,
     ];
@@ -4073,6 +4141,7 @@ fn validate_rms_norm(
     weight: &ResolvedValueBinding,
     output: &ResolvedValueBinding,
     hidden_size: u64,
+    precision: RmsNormPrecision,
 ) -> Result<u64, String> {
     let [rows, input_hidden] = input.tensor().dimensions() else {
         return Err("CUDA RMSNorm input is not two-dimensional".to_owned());
@@ -4080,9 +4149,9 @@ fn validate_rms_norm(
     if *input_hidden != hidden_size
         || weight.tensor().dimensions() != [hidden_size]
         || output.tensor().dimensions() != [*rows, hidden_size]
-        || !f16_contiguous(input)
+        || !typed_contiguous(input, precision.input())
         || !f16_contiguous(weight)
-        || !f16_contiguous(output)
+        || !typed_contiguous(output, precision.output())
     {
         return Err("CUDA RMSNorm invocation differs from its resolved signature".to_owned());
     }
@@ -4240,6 +4309,7 @@ fn validate_residual_add(
     right: &ResolvedValueBinding,
     output: &ResolvedValueBinding,
     hidden_size: u64,
+    precision: ResidualPrecision,
 ) -> Result<u64, String> {
     let [tokens, input_hidden] = left.tensor().dimensions() else {
         return Err("CUDA residual add input is not two-dimensional".to_owned());
@@ -4247,9 +4317,9 @@ fn validate_residual_add(
     if *input_hidden != hidden_size
         || right.tensor().dimensions() != [*tokens, hidden_size]
         || output.tensor().dimensions() != [*tokens, hidden_size]
-        || !f16_contiguous(left)
+        || !typed_contiguous(left, precision.master())
         || !f16_contiguous(right)
-        || !f16_contiguous(output)
+        || !typed_contiguous(output, precision.master())
     {
         return Err("CUDA residual add invocation differs from its resolved signature".to_owned());
     }
@@ -4259,7 +4329,11 @@ fn validate_residual_add(
 }
 
 fn f16_contiguous(binding: &ResolvedValueBinding) -> bool {
-    binding.tensor().element_type() == ElementType::F16
+    typed_contiguous(binding, ElementType::F16)
+}
+
+fn typed_contiguous(binding: &ResolvedValueBinding, element_type: ElementType) -> bool {
+    binding.tensor().element_type() == element_type
         && matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
 }
 
