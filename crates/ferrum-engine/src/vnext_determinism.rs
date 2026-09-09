@@ -13,7 +13,7 @@ use ferrum_kernels::backend::cuda::{
 };
 use ferrum_models::vnext::DefinedProductionModel;
 use ferrum_models::{VNextDeterminismExecutionSpec, VNextExecutorConfig, VNextModelExecutor};
-use ferrum_types::{Device, EngineConfig, FerrumError, Result};
+use ferrum_types::{EngineConfig, FerrumError, Result};
 
 pub struct CudaVNextDeterminismCollector {
     executor: VNextModelExecutor<CudaDeviceRuntime>,
