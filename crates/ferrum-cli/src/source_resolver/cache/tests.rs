@@ -200,6 +200,47 @@ fn dangling_gguf_link_is_not_a_ready_cache() {
 }
 
 #[tokio::test]
+async fn local_gguf_directory_rejects_empty_and_ambiguous_weights() {
+    let cache = CacheFixture::new();
+    let local = cache.root().join("local-model");
+    fs::create_dir(&local).unwrap();
+    let first = local.join("a.gguf");
+    let second = local.join("b.gguf");
+    fs::write(&first, []).unwrap();
+
+    let error = resolve_model_source(
+        local.to_str().unwrap(),
+        cache.root(),
+        DownloadPolicy::NoDownload,
+        None,
+    )
+    .await
+    .err()
+    .expect("empty GGUF files are not usable weights")
+    .to_string();
+    assert!(error.contains("no supported weights"), "{error}");
+
+    fs::write(&first, b"first").unwrap();
+    fs::write(&second, b"second").unwrap();
+    let error = resolve_model_source(
+        local.to_str().unwrap(),
+        cache.root(),
+        DownloadPolicy::NoDownload,
+        None,
+    )
+    .await
+    .err()
+    .expect("multiple quantizations require an explicit file selection")
+    .to_string();
+    assert!(error.contains("explicit .gguf path"), "{error}");
+    assert!(
+        error.contains("a.gguf") && error.contains("b.gguf"),
+        "{error}"
+    );
+    assert!(!cache.root().join("hub").exists());
+}
+
+#[tokio::test]
 async fn explicit_tokenizer_with_gguf_preserves_colocated_semantics() {
     let cache = CacheFixture::new();
     let snapshot = cache.snapshot(CURRENT);
@@ -210,33 +251,39 @@ async fn explicit_tokenizer_with_gguf_preserves_colocated_semantics() {
     let tokenizer = cache.root().join("external-tokenizer");
     write_tokenizer(&tokenizer);
     let request = format!("{REPO}@{CURRENT}");
-    let product = resolve_model_source_with_product_sources(
-        &request,
-        cache.root(),
-        DownloadPolicy::NoDownload,
-        None,
-        &ProductSourceArgs {
-            semantic_source: None,
-            tokenizer_source: Some(tokenizer.clone()),
-        },
-    )
-    .await
-    .unwrap()
-    .into_product_engine_input();
-    let sources = product.model_sources.unwrap();
-    assert_eq!(
-        sources.semantic_root(),
-        snapshot.path.canonicalize().unwrap()
-    );
-    assert_eq!(sources.tokenizer_root(), tokenizer.canonicalize().unwrap());
-    assert_eq!(
-        sources
-            .original_sources()
-            .semantic
-            .requested_revision
-            .as_deref(),
-        Some(CURRENT)
-    );
+    for (model, revision) in [
+        (request.as_str(), Some(CURRENT)),
+        (snapshot.path.to_str().unwrap(), None),
+    ] {
+        let product = resolve_model_source_with_product_sources(
+            model,
+            cache.root(),
+            DownloadPolicy::NoDownload,
+            None,
+            &ProductSourceArgs {
+                semantic_source: None,
+                tokenizer_source: Some(tokenizer.clone()),
+            },
+        )
+        .await
+        .unwrap()
+        .into_product_engine_input();
+        let sources = product.model_sources.unwrap();
+        assert_eq!(sources.weights().path(), file.canonicalize().unwrap());
+        assert_eq!(
+            sources.semantic_root(),
+            snapshot.path.canonicalize().unwrap()
+        );
+        assert_eq!(sources.tokenizer_root(), tokenizer.canonicalize().unwrap());
+        assert_eq!(
+            sources
+                .original_sources()
+                .semantic
+                .requested_revision
+                .as_deref(),
+            revision
+        );
+    }
     assert!(!snapshot.path.join("tokenizer.json").exists());
 }
 

@@ -1089,7 +1089,9 @@ fn original_product_source(
 ) -> Result<OriginalModelSource> {
     match source {
         ModelSource::Local(location) => Ok(OriginalModelSource {
-            kind: if resolved_path.is_file() {
+            kind: if Path::new(location).is_dir() {
+                ModelSourceKind::LocalDirectory
+            } else if resolved_path.is_file() {
                 ModelSourceKind::LocalFile
             } else {
                 ModelSourceKind::LocalDirectory
@@ -1414,9 +1416,23 @@ async fn resolve_model_source_internal(
         ));
     }
 
-    // 2. GGUF file path.
-    if looks_like_gguf_path(model) {
-        let local_path = PathBuf::from(model);
+    // 2. GGUF file path or a local directory containing one unambiguous file.
+    // Reuse cache selection so directory and repository inputs agree about
+    // incomplete weights and never silently choose between quantizations.
+    let direct = PathBuf::from(model);
+    let local_gguf = if looks_like_gguf_path(model) {
+        Some(direct.clone())
+    } else if direct.is_dir() && detect_format(&direct) == ModelFormat::Unknown {
+        match cache::inspect_snapshot(&direct, model, cache_requirements)? {
+            CachedModel::Ready(source) if source.format == ModelFormat::GGUF => {
+                Some(source.local_path)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(local_path) = local_gguf {
         let source = ResolvedModelSource {
             original: model.to_string(),
             local_path,
@@ -1447,7 +1463,6 @@ async fn resolve_model_source_internal(
     }
 
     // 3. Local directory.
-    let direct = PathBuf::from(model);
     if direct.is_dir() {
         let format = detect_format(&direct);
         if format != ModelFormat::Unknown {
@@ -2266,34 +2281,45 @@ mod tests {
         let gguf = dir.join("Qwen3.5-4B-Instruct-Q4_K_M.gguf");
         std::fs::write(&gguf, b"fixture-gguf").unwrap();
 
-        let resolved = resolve_model_source(
-            gguf.to_str().unwrap(),
-            &dir.join("unused-cache"),
-            DownloadPolicy::NoDownload,
-            None,
-        )
-        .await
-        .unwrap();
-        let product = resolved.into_product_engine_input();
+        for requested_path in [&gguf, &dir] {
+            let resolved = resolve_model_source(
+                requested_path.to_str().unwrap(),
+                &dir.join("unused-cache"),
+                DownloadPolicy::NoDownload,
+                None,
+            )
+            .await
+            .unwrap();
+            let product = resolved.into_product_engine_input();
 
-        assert_eq!(product.source.local_path, gguf);
-        assert_eq!(product.source.format, ModelFormat::GGUF);
-        let sources = product.model_sources.as_ref().unwrap();
-        assert_eq!(sources.semantic_root(), dir.canonicalize().unwrap());
-        assert_eq!(sources.tokenizer_root(), dir.canonicalize().unwrap());
-        assert_eq!(sources.weights().path(), gguf.canonicalize().unwrap());
-        assert!(matches!(
-            ferrum_models::vnext::resolve_registered_model_from_sources(sources).unwrap(),
-            ferrum_models::vnext::ProductionModelRegistration::Registered(_)
-        ));
-        assert!(matches!(
-            product.engine_config.model.source.as_ref().unwrap(),
-            ModelSource::Local(path) if path == gguf.to_str().unwrap()
-        ));
-        assert_eq!(
-            product.engine_config.model.model_id.as_str(),
-            "Qwen3.5-4B-Instruct-Q4_K_M"
-        );
+            assert_eq!(product.source.local_path, gguf);
+            assert_eq!(product.source.format, ModelFormat::GGUF);
+            assert!(!product.source.from_cache);
+            let sources = product.model_sources.as_ref().unwrap();
+            assert_eq!(sources.semantic_root(), dir.canonicalize().unwrap());
+            assert_eq!(sources.tokenizer_root(), dir.canonicalize().unwrap());
+            assert_eq!(sources.weights().path(), gguf.canonicalize().unwrap());
+            assert_eq!(
+                sources.original_sources().weights.kind,
+                if requested_path.is_dir() {
+                    ModelSourceKind::LocalDirectory
+                } else {
+                    ModelSourceKind::LocalFile
+                }
+            );
+            assert!(matches!(
+                ferrum_models::vnext::resolve_registered_model_from_sources(sources).unwrap(),
+                ferrum_models::vnext::ProductionModelRegistration::Registered(_)
+            ));
+            assert!(matches!(
+                product.engine_config.model.source.as_ref().unwrap(),
+                ModelSource::Local(path) if path == requested_path.to_str().unwrap()
+            ));
+            assert_eq!(
+                product.engine_config.model.model_id.as_str(),
+                "Qwen3.5-4B-Instruct-Q4_K_M"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
