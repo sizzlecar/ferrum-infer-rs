@@ -1150,7 +1150,7 @@ pub async fn execute(cmd: RunCommand, config: CliConfig) -> Result<()> {
     // utils::setup_logging whitelists them at INFO level.
     eprintln!(
         "{}",
-        "Loading weights to GPU... (30s+ for >10 GB models)".dimmed()
+        "Loading model weights... (30s+ for >10 GB models)".dimmed()
     );
     let load_start = std::time::Instant::now();
     engine_config.sampling.default_params = build_sampling_params(&cmd);
