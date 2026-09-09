@@ -763,7 +763,7 @@ extern "C" __global__ void recurrent_gated_delta_rule_batch_indexed_packed_f32_b
       max_slots, key_heads, value_heads, key_dim, value_dim, scale);
 }
 
-template <typename StateT>
+template <typename StateT, bool InterleavedByKeyHead = false>
 static __device__ void recurrent_gated_delta_rule_varlen_f32_impl(
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -794,7 +794,8 @@ static __device__ void recurrent_gated_delta_rule_varlen_f32_impl(
   }
 
   const int repeat_factor = value_heads / key_heads;
-  const int key_head = value_head / repeat_factor;
+  const int key_head = InterleavedByKeyHead ? value_head % key_heads
+                                          : value_head / repeat_factor;
   const int state_len = value_heads * value_dim * key_dim;
   const StateT* sequence_initial_state =
       state_bindings == nullptr
@@ -918,6 +919,29 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_indirect(
       use_qk_l2norm, scale);
 }
 
+extern "C" __global__ void vnext_gated_delta_varlen_interleaved_f32_indirect(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const unsigned long long* __restrict__ state_bindings,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const int use_qk_l2norm,
+    const float scale) {
+  recurrent_gated_delta_rule_varlen_f32_impl<float, true>(
+      query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
+      nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
+      use_qk_l2norm, scale);
+}
+
 extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_state_f16(
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -942,7 +966,7 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_f32_state_f16(
       value_dim, use_qk_l2norm, scale);
 }
 
-template <typename StateT, int BV_TILE>
+template <typename StateT, int BV_TILE, bool InterleavedByKeyHead = false>
 static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
     const float* __restrict__ query,
     const float* __restrict__ key,
@@ -974,7 +998,8 @@ static __device__ void recurrent_gated_delta_rule_varlen_tiled_f32_impl(
 
   const int value_start = value_tile * BV_TILE;
   const int repeat_factor = value_heads / key_heads;
-  const int key_head = value_head / repeat_factor;
+  const int key_head = InterleavedByKeyHead ? value_head % key_heads
+                                          : value_head / repeat_factor;
   const int state_len = value_heads * value_dim * key_dim;
   const StateT* sequence_initial_state =
       state_bindings == nullptr
@@ -1151,6 +1176,28 @@ extern "C" __global__ void recurrent_gated_delta_rule_varlen_tiled16_f32_indirec
     const int value_dim,
     const float scale) {
   recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16>(
+      query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
+      nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
+      scale);
+}
+
+extern "C" __global__ void vnext_gated_delta_varlen_tiled16_interleaved_f32_indirect(
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ g,
+    const float* __restrict__ beta,
+    const unsigned long long* __restrict__ state_bindings,
+    const unsigned int* __restrict__ cu_seqlens,
+    float* __restrict__ out,
+    const int batch,
+    const int total_tokens,
+    const int key_heads,
+    const int value_heads,
+    const int key_dim,
+    const int value_dim,
+    const float scale) {
+  recurrent_gated_delta_rule_varlen_tiled_f32_impl<float, 16, true>(
       query, key, value, g, beta, nullptr, state_bindings, cu_seqlens, out,
       nullptr, batch, total_tokens, key_heads, value_heads, key_dim, value_dim,
       scale);

@@ -68,10 +68,15 @@ const ESTIMATOR_ID: &str = "resource-estimator.cuda.gated_delta_recurrent_attent
 const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
 const PREPARE_FUNCTION: &str =
     "linear_attention_prepare_varlen_packed_qkvzba_f16_params_f32_state_f16_z_f16_indirect";
+const PREPARE_NEGATIVE_RATE_FUNCTION: &str =
+    "vnext_linear_attention_prepare_negative_rate_f16_indirect";
 const CONV_STATE_COMMIT_FUNCTION: &str = "recurrent_conv_state_commit_f16_indirect";
 const QK_NORM_FUNCTION: &str = "linear_attention_qk_l2norm_f32";
 const DELTA_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_f32_indirect";
 const DELTA_TILED_FUNCTION: &str = "recurrent_gated_delta_rule_varlen_tiled16_f32_indirect";
+const DELTA_INTERLEAVED_FUNCTION: &str = "vnext_gated_delta_varlen_interleaved_f32_indirect";
+const DELTA_TILED_INTERLEAVED_FUNCTION: &str =
+    "vnext_gated_delta_varlen_tiled16_interleaved_f32_indirect";
 const GATED_NORM_FUNCTION: &str = "gated_rms_norm_f16_z_f32_weight";
 const F32_TO_F16_FUNCTION: &str = "f32_to_activation_f16";
 const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
@@ -95,10 +100,13 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaGatedDeltaRecurrentAttentionP
 struct AttentionFunctions {
     rms_norm: CudaFunction,
     prepare: CudaFunction,
+    prepare_negative_rate: CudaFunction,
     conv_state_commit: CudaFunction,
     qk_norm: CudaFunction,
     delta: CudaFunction,
     delta_tiled: CudaFunction,
+    delta_interleaved: CudaFunction,
+    delta_tiled_interleaved: CudaFunction,
     gated_norm: CudaFunction,
     f32_to_f16: CudaFunction,
     residual_add: CudaFunction,
@@ -242,6 +250,11 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
         let functions = AttentionFunctions {
             rms_norm: load_function(&rms_module, RMS_NORM_FUNCTION, "attention RMSNorm")?,
             prepare: load_function(&linear_module, PREPARE_FUNCTION, "attention prepare")?,
+            prepare_negative_rate: load_function(
+                &linear_module,
+                PREPARE_NEGATIVE_RATE_FUNCTION,
+                "attention negative-rate prepare",
+            )?,
             conv_state_commit: load_function(
                 &linear_module,
                 CONV_STATE_COMMIT_FUNCTION,
@@ -253,6 +266,16 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
                 &delta_module,
                 DELTA_TILED_FUNCTION,
                 "attention tiled delta",
+            )?,
+            delta_interleaved: load_function(
+                &delta_module,
+                DELTA_INTERLEAVED_FUNCTION,
+                "attention interleaved delta",
+            )?,
+            delta_tiled_interleaved: load_function(
+                &delta_module,
+                DELTA_TILED_INTERLEAVED_FUNCTION,
+                "attention tiled interleaved delta",
             )?,
             gated_norm: load_function(&linear_module, GATED_NORM_FUNCTION, "attention gated norm")?,
             f32_to_f16: load_function(&sandwich_module, F32_TO_F16_FUNCTION, "attention cast")?,
@@ -535,14 +558,6 @@ impl AttentionShape {
             decay_parameterization: decay_parameterization_attribute(attributes)?,
             value_head_mapping: value_head_mapping_attribute(attributes)?,
         };
-        if shape.decay_parameterization != GatedDeltaDecayParameterization::LogRate
-            || shape.value_head_mapping != GatedDeltaValueHeadMapping::GroupedByKeyHead
-        {
-            return Err(
-                "CUDA gated-delta safetensors provider requires log-rate decay and value heads grouped by key head"
-                    .to_owned(),
-            );
-        }
         let qk_features = shape.qk_features()?;
         let expected_qkv = qk_features
             .checked_mul(2)
@@ -647,6 +662,7 @@ impl AttentionShape {
             epsilon: self.epsilon,
             scale: (self.key_head_dim as f32).sqrt().recip(),
             tiled_delta: self.key_head_dim == 128 && self.value_head_dim == 128,
+            value_head_mapping: self.value_head_mapping,
         })
     }
 
@@ -709,6 +725,7 @@ struct CudaAttentionShape {
     epsilon: f32,
     scale: f32,
     tiled_delta: bool,
+    value_head_mapping: GatedDeltaValueHeadMapping,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1528,6 +1545,8 @@ fn encode_attention(
     .u64(shape.conv_state_width)
     .f32(shape.epsilon)
     .u64(shape.layer_index)
+    .bytes(shape.decay_parameterization.as_str().as_bytes())
+    .bytes(shape.value_head_mapping.as_str().as_bytes())
     .u64(total_tokens)
     .u64(layout.required_bytes)
     .u64(binding_layout.required_bytes)
@@ -1941,7 +1960,7 @@ fn enqueue_attention(
 
     launch_prepare(AttentionPrepareRequest {
         stream,
-        function: &functions.prepare,
+        function: functions.prepare_for(shape.decay_parameterization),
         buffers: AttentionPrepareBuffers {
             qkvzba,
             conv_weight: regions[shared.conv].device_ptr(),
@@ -2451,6 +2470,15 @@ struct AttentionPrepareRequest<'a> {
     context: AttentionPrepareContext,
 }
 
+impl AttentionFunctions {
+    fn prepare_for(&self, decay: GatedDeltaDecayParameterization) -> &CudaFunction {
+        match decay {
+            GatedDeltaDecayParameterization::LogRate => &self.prepare,
+            GatedDeltaDecayParameterization::NegativeRate => &self.prepare_negative_rate,
+        }
+    }
+}
+
 fn launch_prepare(request: AttentionPrepareRequest<'_>) -> Result<(), CudaDeviceRuntimeError> {
     let AttentionPrepareRequest {
         stream,
@@ -2645,10 +2673,13 @@ fn launch_delta(
             "attention delta batch is not positive",
         ));
     }
-    let function = if shape.tiled_delta {
-        &functions.delta_tiled
-    } else {
-        &functions.delta
+    let function = match (shape.tiled_delta, shape.value_head_mapping) {
+        (false, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta,
+        (true, GatedDeltaValueHeadMapping::GroupedByKeyHead) => &functions.delta_tiled,
+        (false, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => &functions.delta_interleaved,
+        (true, GatedDeltaValueHeadMapping::InterleavedByKeyHead) => {
+            &functions.delta_tiled_interleaved
+        }
     };
     let pointers = [
         query,
@@ -3622,12 +3653,15 @@ fn invalid_plan(reason: impl Into<String>) -> VNextError {
 }
 
 #[cfg(test)]
+mod recurrent_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[cfg(feature = "vllm-marlin")]
     use ferrum_interfaces::vnext::{CompositeWeightPart, WeightId};
 
-    fn test_shape() -> AttentionShape {
+    pub(super) fn test_shape() -> AttentionShape {
         AttentionShape {
             hidden_size: 16,
             key_heads: 2,
