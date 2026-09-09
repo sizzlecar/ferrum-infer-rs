@@ -323,6 +323,21 @@ impl ApiToolCallProtocol {
 }
 
 impl ApiChatRequest {
+    /// A forced native XML call must retain its declared envelope and tool name.
+    /// A bare argument-object grammar would mask the model's native wire format.
+    pub fn requires_native_tool_call(&self) -> bool {
+        self.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml
+            && match self.tool_choice.as_ref() {
+                Some(ApiToolChoice::Mode(mode)) => mode.eq_ignore_ascii_case("required"),
+                Some(ApiToolChoice::Function { tool_type, .. }) => tool_type == "function",
+                None => false,
+            }
+    }
+
+    pub fn allows_tool_name(&self, name: &str) -> bool {
+        api_tool_name_allowed(self, name)
+    }
+
     /// Automatic tool calls and hard final JSON are alternative output branches.
     /// A final object must never acquire tool-call semantics merely because its
     /// fields happen to match a function's argument schema.
@@ -474,9 +489,16 @@ pub fn api_response_from_classified_generated_text(
     if !matches!(finish_reason, FinishReason::Stop | FinishReason::EOS) {
         return Ok(None);
     }
-    if !chat_request.automatic_tools_with_hard_response_format() {
+    if !chat_request.automatic_tools_with_hard_response_format()
+        && !chat_request.requires_native_tool_call()
+    {
         return Err(crate::FerrumError::invalid_request(
-            "classified structured output requires automatic tools with a hard response format",
+            "classified structured output requires a composed tool output contract",
+        ));
+    }
+    if chat_request.requires_native_tool_call() && branch == StructuredOutputBranch::Final {
+        return Err(crate::FerrumError::invalid_request(
+            "a required native tool call cannot be classified as a final answer",
         ));
     }
 
@@ -615,7 +637,9 @@ fn parse_tool_calls_from_generated_text(
     text: &str,
     chat_request: &ApiChatRequest,
 ) -> Option<Vec<ApiToolCall>> {
-    if chat_request.automatic_tools_with_hard_response_format() {
+    if chat_request.automatic_tools_with_hard_response_format()
+        || chat_request.requires_native_tool_call()
+    {
         return parse_explicit_tool_call_envelopes(text, chat_request);
     }
     if chat_request.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
@@ -1092,6 +1116,14 @@ fn api_arguments_to_string(arguments: Option<&serde_json::Value>) -> String {
 }
 
 impl InferenceRequest {
+    /// Whether sampling must compile a grammar, including native tool-only output.
+    pub fn requires_structured_output(&self) -> bool {
+        !matches!(
+            self.sampling_params.response_format,
+            crate::ResponseFormat::Text
+        ) || matches!(self.api_request.as_ref(), Some(ApiRequest::Chat(chat)) if chat.requires_native_tool_call())
+    }
+
     /// Create a new inference request
     pub fn new(prompt: impl Into<String>, model_id: impl Into<ModelId>) -> Self {
         Self {

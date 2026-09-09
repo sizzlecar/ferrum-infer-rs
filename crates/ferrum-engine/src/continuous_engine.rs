@@ -3007,13 +3007,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let mut receiver_drop_wake =
             ClientReceiverDropWake::new(Arc::clone(&self.inner.work_notify));
-        let structured_factory = if matches!(
-            &request.sampling_params.response_format,
-            ferrum_types::ResponseFormat::Text
-        ) {
-            None
-        } else {
+        let structured_factory = if request.requires_structured_output() {
             Some(self.inner.structured_output_factory()?)
+        } else {
+            None
         };
         let mut seq_state =
             SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(
@@ -3127,13 +3124,10 @@ impl LlmInferenceEngine for ContinuousBatchEngine {
 
         // Publish tokenized state and the scheduler item under the same
         // iteration boundary; see the non-streaming path above.
-        let structured_factory = if matches!(
-            &request.sampling_params.response_format,
-            ferrum_types::ResponseFormat::Text
-        ) {
-            None
-        } else {
+        let structured_factory = if request.requires_structured_output() {
             Some(self.inner.structured_output_factory()?)
+        } else {
+            None
         };
         let mut seq_state =
             SequenceState::try_new_with_tokenizer_model_vocab_and_structured_factory(

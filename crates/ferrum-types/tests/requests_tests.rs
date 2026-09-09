@@ -901,7 +901,7 @@ fn generated_tool_call_json_rejects_partial_duplicate_or_unbounded_calls() {
 }
 
 #[test]
-fn function_parameter_xml_protocol_keeps_forced_json_arguments_fallback() {
+fn forced_native_tool_calls_require_their_envelope_and_reject_final_classification() {
     let request = chat_request_with_tool_protocol(
         Some(ApiToolChoice::Function {
             tool_type: "function".to_string(),
@@ -912,12 +912,34 @@ fn function_parameter_xml_protocol_keeps_forced_json_arguments_fallback() {
         ApiToolCallProtocol::FunctionParameterXml,
     );
 
-    let Some(ApiResponse::Chat(response)) =
-        api_response_after_stop(&request, r#"{"city":"Paris","unit":"c"}"#)
-    else {
-        panic!("expected forced JSON argument fallback");
+    assert!(request.requires_structured_output());
+    assert!(api_response_after_stop(&request, r#"{"city":"Paris","unit":"c"}"#).is_none());
+    let text = "<tool_call><function=weather><parameter=city>Paris</parameter><parameter=unit>c</parameter></function></tool_call>";
+    let Some(ApiResponse::Chat(response)) = api_response_from_classified_generated_text(
+        &request,
+        text,
+        FinishReason::Stop,
+        StructuredOutputBranch::ToolCall,
+    )
+    .unwrap() else {
+        panic!("expected complete native tool call");
     };
     assert_eq!(response.message.tool_calls[0].function.name, "weather");
+    assert!(api_response_from_classified_generated_text(
+        &request,
+        r#"{"city":"Paris","unit":"c"}"#,
+        FinishReason::Stop,
+        StructuredOutputBranch::Final
+    )
+    .is_err());
+    let json_request = chat_request_with_tool(Some(ApiToolChoice::Function {
+        tool_type: "function".into(),
+        function: ApiToolChoiceFunction {
+            name: "weather".into(),
+        },
+    }));
+    assert!(!json_request.requires_structured_output());
+    assert!(api_response_after_stop(&json_request, r#"{"city":"Paris","unit":"c"}"#).is_some());
 }
 
 #[test]

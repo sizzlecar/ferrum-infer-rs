@@ -123,6 +123,12 @@ pub(super) fn build(
     chat: &ApiChatRequest,
     protocol: ModelOutputProtocol,
 ) -> Result<Compiled> {
+    let tool_only = chat.requires_native_tool_call();
+    if tool_only && protocol == ModelOutputProtocol::HarmonyGptOss {
+        return Err(FerrumError::invalid_request(
+            "native XML tool framing cannot use the Harmony output protocol",
+        ));
+    }
     let mut builder = Builder {
         factory,
         rules: vec!["ws: /[ \\t\\r\\n]*/".into()],
@@ -131,23 +137,27 @@ pub(super) fn build(
         boundary_controls: HashSet::new(),
         markers: HashMap::new(),
     };
-    let final_schema = match response_format {
-        ResponseFormat::JsonObject => json!({"type":"object"}),
-        ResponseFormat::JsonSchema(schema) => serde_json::from_str(schema).map_err(|error| {
-            FerrumError::invalid_request(format!(
-                "response_format.schema is not valid JSON: {error}"
-            ))
-        })?,
-        ResponseFormat::Text => {
-            return Err(FerrumError::internal(
-                "automatic structured tools require a final schema",
-            ))
-        }
-    };
-    let final_rule = builder.schema("final_schema", final_schema)?;
-    builder
-        .rules
-        .push(format!("final_value[capture]: {final_rule}"));
+    if !tool_only {
+        let final_schema = match response_format {
+            ResponseFormat::JsonObject => json!({"type":"object"}),
+            ResponseFormat::JsonSchema(schema) => {
+                serde_json::from_str(schema).map_err(|error| {
+                    FerrumError::invalid_request(format!(
+                        "response_format.schema is not valid JSON: {error}"
+                    ))
+                })?
+            }
+            ResponseFormat::Text => {
+                return Err(FerrumError::internal(
+                    "automatic structured tools require a final schema",
+                ))
+            }
+        };
+        let final_rule = builder.schema("final_schema", final_schema)?;
+        builder
+            .rules
+            .push(format!("final_value[capture]: {final_rule}"));
+    }
     let mut calls = Vec::new();
     let mut named_calls = Vec::new();
     let mut argument_rules = Vec::new();
@@ -155,7 +165,10 @@ pub(super) fn build(
     for (index, tool) in chat
         .tools
         .iter()
-        .filter(|tool| tool.tool_type == "function")
+        .filter(|tool| {
+            tool.tool_type == "function"
+                && (!tool_only || chat.allows_tool_name(&tool.function.name))
+        })
         .enumerate()
     {
         let name = &tool.function.name;
@@ -228,7 +241,7 @@ pub(super) fn build(
     }
     if calls.is_empty() {
         return Err(FerrumError::invalid_request(
-            "automatic structured tools require a declared function",
+            "structured tools require an allowed declared function",
         ));
     }
     if chat.tool_call_protocol == ApiToolCallProtocol::FunctionParameterXml {
@@ -255,9 +268,11 @@ pub(super) fn build(
     builder.rules.push(format!(
         "tool_result[capture]: tool_call (ws tool_call){{0,31}}{bare}"
     ));
-    builder
-        .rules
-        .push("result: ws (final_value | tool_result) ws".into());
+    builder.rules.push(if tool_only {
+        "result: ws tool_result ws".into()
+    } else {
+        "result: ws (final_value | tool_result) ws".into()
+    });
 
     let mut headers = Vec::new();
     let mut following_headers = Vec::new();

@@ -1100,6 +1100,74 @@ async fn actual_sampler_keeps_final_schema_when_tools_are_available() {
 }
 
 #[tokio::test]
+async fn forced_native_tools_mask_bare_arguments_through_both_http_adapters() {
+    let protocol = ToolProtocol::FunctionParameterXml;
+    let envelope = protocol.envelope();
+    let bare = r#"{"city":"Paris"}"#;
+    let unselected = envelope.replace("weather", "delete_file");
+    for endpoint in [Endpoint::Chat, Endpoint::Responses] {
+        for stream in [false, true] {
+            for named in [false, true] {
+                for split in [false, true] {
+                    let tokenizer = branch_tokenizer(&[envelope, bare, &unselected]).await;
+                    let mut script = if split {
+                        tokenizer.encode(envelope, false).unwrap()
+                    } else {
+                        vec![tokenizer.token_id(envelope).unwrap()]
+                    };
+                    let first = script.remove(0);
+                    let mut steps = vec![LogitStep::candidates(vec![
+                        (tokenizer.token_id(bare).unwrap(), 400.0),
+                        (tokenizer.token_id(&unselected).unwrap(), 300.0),
+                        (tokenizer.token_id(EOS).unwrap(), 200.0),
+                        (first, 100.0),
+                    ])];
+                    steps.extend(script.into_iter().map(LogitStep::only));
+                    steps.push(LogitStep::only(tokenizer.token_id(EOS).unwrap()));
+                    let executor =
+                        Arc::new(ScriptedExecutor::from_steps(tokenizer.vocab_size(), steps));
+                    let mut wire = endpoint.request(weather_schema(), stream);
+                    wire.as_object_mut().unwrap().remove("response_format");
+                    wire.as_object_mut().unwrap().remove("text");
+                    wire["tool_choice"] = if named {
+                        match endpoint {
+                            Endpoint::Chat => {
+                                json!({"type":"function", "function":{"name":"weather"}})
+                            }
+                            Endpoint::Responses => json!({"type":"function", "name":"weather"}),
+                        }
+                    } else {
+                        json!("required")
+                    };
+                    let (result, _) = run_branch_request(
+                        tokenizer,
+                        executor,
+                        protocol.template(),
+                        endpoint,
+                        stream,
+                        wire,
+                        envelope,
+                        false,
+                    )
+                    .await;
+                    let result = result.unwrap();
+                    assert!(result.content.is_empty());
+                    assert_eq!(result.calls.len(), 1);
+                    assert_eq!(result.calls[0]["name"], "weather");
+                    assert_eq!(
+                        serde_json::from_str::<Value>(
+                            result.calls[0]["arguments"].as_str().unwrap()
+                        )
+                        .unwrap(),
+                        json!({"city":"Paris"}),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn actual_sampler_tracks_tool_framing_across_token_boundaries() {
     for protocol in [ToolProtocol::Json, ToolProtocol::FunctionParameterXml] {
         for endpoint in [Endpoint::Chat, Endpoint::Responses] {
