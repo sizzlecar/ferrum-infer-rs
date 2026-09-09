@@ -110,6 +110,136 @@ fn write_tokenizer(path: &Path) {
     .unwrap();
 }
 
+#[tokio::test]
+async fn a_single_cached_gguf_is_the_shared_product_weight_source() {
+    let cache = CacheFixture::new();
+    let snapshot = cache.snapshot(CURRENT).metadata();
+    let file = snapshot.path.join("model.gguf");
+    fs::write(&file, b"nonempty GGUF source fixture").unwrap();
+    cache.select(CURRENT);
+    assert!(model_cache_ready(&cache.model_dir));
+    for request in [REPO.to_owned(), format!("{REPO}@{CURRENT}")] {
+        // Product resolution is the common run/serve path and previously
+        // required SafeTensors despite list reporting this snapshot as ready.
+        let product = resolve_model_source_with_product_sources(
+            &request,
+            cache.root(),
+            DownloadPolicy::NoDownload,
+            None,
+            &ProductSourceArgs::default(),
+        )
+        .await
+        .unwrap()
+        .into_product_engine_input();
+        assert_eq!(product.source.local_path, file);
+        assert_eq!(product.source.format, ModelFormat::GGUF);
+        assert!(product.source.from_cache);
+        let sources = product.model_sources.unwrap();
+        assert_eq!(sources.weights().path(), file.canonicalize().unwrap());
+        assert_eq!(sources.original_sources().weights.location, REPO);
+    }
+}
+
+#[tokio::test]
+async fn cached_legacy_gguf_does_not_require_an_invented_metadata_repository() {
+    let cache = CacheFixture::new();
+    let snapshot = cache.snapshot(CURRENT);
+    let file = snapshot.path.join("model.gguf");
+    fs::write(&file, b"legacy GGUF source fixture").unwrap();
+    cache.select(CURRENT);
+    let product = resolve_model_source_with_product_sources(
+        REPO,
+        cache.root(),
+        DownloadPolicy::NoDownload,
+        None,
+        &ProductSourceArgs::default(),
+    )
+    .await
+    .unwrap()
+    .into_product_engine_input();
+    assert_eq!(product.source.local_path, file);
+    assert!(product.model_sources.is_none());
+}
+
+#[test]
+fn ambiguous_and_empty_gguf_caches_are_not_ready() {
+    let cache = CacheFixture::new();
+    let snapshot = cache.snapshot(CURRENT);
+    cache.select(CURRENT);
+    let first = snapshot.path.join("a.gguf");
+    let second = snapshot.path.join("b.gguf");
+    fs::write(&first, []).unwrap();
+    assert!(!model_cache_ready(&cache.model_dir));
+    fs::write(&first, b"first").unwrap();
+    fs::write(&second, b"second").unwrap();
+    assert!(!model_cache_ready(&cache.model_dir));
+    let error = inspect_cached_model(cache.root(), REPO, CacheRequirements::Product)
+        .err()
+        .expect("ambiguous selection must be explicit")
+        .to_string();
+    assert!(
+        error.contains("a.gguf") && error.contains("b.gguf"),
+        "{error}"
+    );
+    fs::remove_file(second).unwrap();
+    assert!(model_cache_ready(&cache.model_dir));
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_gguf_link_is_not_a_ready_cache() {
+    let cache = CacheFixture::new();
+    let snapshot = cache.snapshot(CURRENT);
+    std::os::unix::fs::symlink("missing-blob", snapshot.path.join("model.gguf")).unwrap();
+    cache.select(CURRENT);
+    assert!(!model_cache_ready(&cache.model_dir));
+    assert!(matches!(
+        inspect_cached_model(cache.root(), REPO, CacheRequirements::Product).unwrap(),
+        CachedModel::Missing(_)
+    ));
+}
+
+#[tokio::test]
+async fn explicit_tokenizer_with_gguf_preserves_colocated_semantics() {
+    let cache = CacheFixture::new();
+    let snapshot = cache.snapshot(CURRENT);
+    write_semantic(&snapshot.path);
+    let file = snapshot.path.join("model.gguf");
+    fs::write(&file, b"GGUF source fixture").unwrap();
+    cache.select(CURRENT);
+    let tokenizer = cache.root().join("external-tokenizer");
+    write_tokenizer(&tokenizer);
+    let request = format!("{REPO}@{CURRENT}");
+    let product = resolve_model_source_with_product_sources(
+        &request,
+        cache.root(),
+        DownloadPolicy::NoDownload,
+        None,
+        &ProductSourceArgs {
+            semantic_source: None,
+            tokenizer_source: Some(tokenizer.clone()),
+        },
+    )
+    .await
+    .unwrap()
+    .into_product_engine_input();
+    let sources = product.model_sources.unwrap();
+    assert_eq!(
+        sources.semantic_root(),
+        snapshot.path.canonicalize().unwrap()
+    );
+    assert_eq!(sources.tokenizer_root(), tokenizer.canonicalize().unwrap());
+    assert_eq!(
+        sources
+            .original_sources()
+            .semantic
+            .requested_revision
+            .as_deref(),
+        Some(CURRENT)
+    );
+    assert!(!snapshot.path.join("tokenizer.json").exists());
+}
+
 #[test]
 fn referenced_incomplete_snapshot_does_not_select_another_revision_or_list_ready() {
     let cache = CacheFixture::new();
