@@ -3803,15 +3803,14 @@ fn response_format_prompt_instruction(
             EffectiveChatOutputContract::StrictJsonSchemaContent
                 | EffectiveChatOutputContract::JsonObjectContent
         );
-    let tool_instruction = if model_template
-        .is_some_and(crate::chat_template::model_template_supports_tools)
-    {
-        "If a tool is needed, call it using the provided tool instructions and its argument schema."
-    } else {
-        "If a tool is needed, put a JSON object with the declared function name in the name field and its argument object in the arguments field inside <tool_call>...</tool_call>. This envelope distinguishes a tool call from a final JSON answer."
-    };
+    let native_tool_template =
+        model_template.is_some_and(crate::chat_template::model_template_supports_tools);
+    let tool_instruction = "If a tool is needed, put a JSON object with the declared function name in the name field and its argument object in the arguments field inside <tool_call>...</tool_call>. This envelope distinguishes a tool call from a final JSON answer.";
     if let Some(format) = request.response_format.as_ref() {
         return match format.format_type.as_str() {
+            "json_object" if automatic_tools && native_tool_template => {
+                Some(native_tool_final_format_instruction(r#"{"type":"object"}"#))
+            }
             "json_object" if automatic_tools => Some(format!(
                 "{tool_instruction} The response_format applies only to the final answer: output a single valid JSON object, with no markdown fences or extra text."
             )),
@@ -3822,7 +3821,9 @@ fn response_format_prompt_instruction(
             "json_schema" => {
                 let schema = format.json_schema.as_ref()?.schema.as_ref()?;
                 let schema_text = serde_json::to_string(schema).ok()?;
-                Some(if automatic_tools {
+                Some(if automatic_tools && native_tool_template {
+                    native_tool_final_format_instruction(&schema_text)
+                } else if automatic_tools {
                     format!(
                         "{tool_instruction} Complete any enabled reasoning before the final answer. The response_format applies only to the final answer: output a single valid JSON value satisfying this JSON Schema, with no markdown fences or extra text. Schema: {schema_text}"
                     )
@@ -3840,6 +3841,15 @@ fn response_format_prompt_instruction(
         };
     }
     None
+}
+
+fn native_tool_final_format_instruction(schema: &str) -> String {
+    // The model template owns tool selection and wire instructions. Give the
+    // final-answer schema its own section so it is not folded into those tool
+    // instructions, and leave the native call format unchanged.
+    format!(
+        "# Response Format\n\nYour final response should be a JSON value that conforms to the following schema:\n\n{schema}\n\nDo not wrap your JSON response in Markdown code blocks."
+    )
 }
 
 fn forced_tool_choice_response_format(
