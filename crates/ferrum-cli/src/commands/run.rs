@@ -2516,48 +2516,7 @@ fn discover_run_tokenizer_path(source_path: &Path) -> Option<PathBuf> {
 }
 
 pub fn select_device(backend: &str) -> Result<ferrum_types::Device> {
-    match backend.trim().to_lowercase().as_str() {
-        "cpu" => Ok(ferrum_types::Device::CPU),
-        "metal" => {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                return Ok(ferrum_types::Device::Metal);
-            }
-            #[cfg(not(all(target_os = "macos", feature = "metal")))]
-            {
-                Err(FerrumError::config(
-                    "requested backend 'metal' but this ferrum binary was not built with Metal support; use --backend auto/cpu or build with the metal feature",
-                ))
-            }
-        }
-        "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                return Ok(ferrum_types::Device::CUDA(0));
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                Err(FerrumError::config(
-                    "requested backend 'cuda' but this ferrum binary was not built with CUDA support; use --backend auto/cpu or build with the cuda feature",
-                ))
-            }
-        }
-        "auto" => {
-            #[cfg(all(target_os = "macos", feature = "metal"))]
-            {
-                return Ok(ferrum_types::Device::Metal);
-            }
-            #[cfg(feature = "cuda")]
-            {
-                return Ok(ferrum_types::Device::CUDA(0));
-            }
-            #[allow(unreachable_code)]
-            Ok(ferrum_types::Device::CPU)
-        }
-        other => Err(FerrumError::config(format!(
-            "unknown backend {other:?}; expected one of: auto, cpu, metal, cuda"
-        ))),
-    }
+    crate::backend_selection::select_device(backend)
 }
 
 fn build_chat_prompt(

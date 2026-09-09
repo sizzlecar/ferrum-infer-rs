@@ -6,6 +6,7 @@ use half::f16;
 use super::{AttnConfig, Backend};
 use ferrum_types::{FerrumError, Result};
 
+pub mod vnext_ops;
 pub mod vnext_runtime;
 
 // ── Q4_K_M block layout ────────────────────────────────────────────────

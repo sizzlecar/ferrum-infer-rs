@@ -212,6 +212,44 @@ impl CpuBufferRegion {
             && self.element_type == other.element_type
     }
 
+    /// Lock each distinct allocation once, in address order. Several value or
+    /// weight regions may share one arena; nested per-region locks would then
+    /// deadlock even when their byte ranges are disjoint.
+    pub(crate) fn with_regions<T>(
+        regions: &[Self],
+        operation: impl FnOnce(&mut CpuRegionSet<'_>) -> Result<T, CpuRuntimeError>,
+    ) -> Result<T, CpuRuntimeError> {
+        let mut allocations = regions
+            .iter()
+            .map(|region| &region.storage)
+            .collect::<Vec<_>>();
+        allocations.sort_unstable_by_key(|storage| Arc::as_ptr(storage));
+        allocations.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let indices = regions
+            .iter()
+            .map(|region| {
+                allocations
+                    .binary_search_by_key(&Arc::as_ptr(&region.storage), |storage| {
+                        Arc::as_ptr(storage)
+                    })
+                    .expect("every region belongs to the collected allocations")
+            })
+            .collect();
+        let guards = allocations
+            .iter()
+            .map(|storage| {
+                storage.lock().map_err(|_| {
+                    CpuRuntimeError::new("CPU buffer was poisoned by a failed computation")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        operation(&mut CpuRegionSet {
+            regions,
+            indices,
+            guards,
+        })
+    }
+
     pub(crate) fn with_read<T>(&self, read: impl FnOnce(&[u8]) -> T) -> Result<T, CpuRuntimeError> {
         let storage = self.lock()?;
         Ok(read(&storage.bytes()[self.range.clone()]))
@@ -252,5 +290,118 @@ impl CpuBufferRegion {
                 .copy_from_slice(&source.bytes()[self.range.clone()]);
         }
         Ok(())
+    }
+}
+
+/// Temporarily borrowed views of admitted allocations, never copied weights.
+pub(crate) struct CpuRegionSet<'a> {
+    regions: &'a [CpuBufferRegion],
+    indices: Vec<usize>,
+    guards: Vec<MutexGuard<'a, Storage>>,
+}
+
+impl CpuRegionSet<'_> {
+    pub(crate) fn read(&self, index: usize) -> &[u8] {
+        &self.guards[self.indices[index]].bytes()[self.regions[index].range.clone()]
+    }
+
+    pub(crate) fn write(&mut self, index: usize) -> &mut [u8] {
+        &mut self.guards[self.indices[index]].bytes_mut()[self.regions[index].range.clone()]
+    }
+
+    /// Give a kernel simultaneous input/output slices only after proving that
+    /// writes are disjoint from every read and other write. Read aliases are
+    /// allowed. In-place kernels use sequential read/write access instead.
+    pub(crate) fn with_io<const I: usize, const O: usize, T>(
+        &mut self,
+        reads: [usize; I],
+        writes: [usize; O],
+        operation: impl FnOnce([&[u8]; I], [&mut [u8]; O]) -> Result<T, CpuRuntimeError>,
+    ) -> Result<T, CpuRuntimeError> {
+        let pointers = self.io_pointers(&reads, &writes)?;
+        // SAFETY: All allocations are exclusively locked for this callback.
+        // Regions were range-checked when retained. The overlap checks above
+        // prove all mutable slices are mutually disjoint and have no read
+        // aliases, including when they share one allocation. The callback
+        // cannot return a reference borrowed from these temporary slices.
+        let inputs = reads.map(|index| unsafe {
+            std::slice::from_raw_parts(
+                pointers[self.indices[index]].add(self.regions[index].range.start),
+                self.regions[index].range.len(),
+            )
+        });
+        let outputs = writes.map(|index| unsafe {
+            std::slice::from_raw_parts_mut(
+                pointers[self.indices[index]].add(self.regions[index].range.start),
+                self.regions[index].range.len(),
+            )
+        });
+        operation(inputs, outputs)
+    }
+    fn io_pointers(
+        &mut self,
+        reads: &[usize],
+        writes: &[usize],
+    ) -> Result<Vec<*mut u8>, CpuRuntimeError> {
+        if reads
+            .iter()
+            .chain(writes)
+            .any(|&index| index >= self.regions.len())
+        {
+            return Err(CpuRuntimeError::new("CPU kernel region index is invalid"));
+        }
+        let overlaps = |left: usize, right: usize| {
+            self.indices[left] == self.indices[right]
+                && self.regions[left].range.start < self.regions[right].range.end
+                && self.regions[right].range.start < self.regions[left].range.end
+        };
+        for (position, &write) in writes.iter().enumerate() {
+            if reads
+                .iter()
+                .chain(&writes[..position])
+                .any(|&other| overlaps(write, other))
+            {
+                return Err(CpuRuntimeError::new(
+                    "CPU kernel output aliases another live binding",
+                ));
+            }
+        }
+        Ok(self
+            .guards
+            .iter_mut()
+            .map(|storage| storage.bytes_mut().as_mut_ptr())
+            .collect::<Vec<_>>())
+    }
+
+    /// Dynamic page counts use the same alias proof as fixed-arity operators.
+    pub(crate) fn with_io_slices<T>(
+        &mut self,
+        reads: &[usize],
+        writes: &[usize],
+        operation: impl FnOnce(&[&[u8]], &mut [&mut [u8]]) -> Result<T, CpuRuntimeError>,
+    ) -> Result<T, CpuRuntimeError> {
+        let pointers = self.io_pointers(reads, writes)?;
+        // SAFETY: io_pointers validates every retained range and excludes all
+        // mutable aliases while every owner allocation remains exclusively
+        // locked. Callback borrows cannot escape this scope.
+        let inputs = reads
+            .iter()
+            .map(|&index| unsafe {
+                std::slice::from_raw_parts(
+                    pointers[self.indices[index]].add(self.regions[index].range.start),
+                    self.regions[index].range.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut outputs = writes
+            .iter()
+            .map(|&index| unsafe {
+                std::slice::from_raw_parts_mut(
+                    pointers[self.indices[index]].add(self.regions[index].range.start),
+                    self.regions[index].range.len(),
+                )
+            })
+            .collect::<Vec<_>>();
+        operation(&inputs, &mut outputs)
     }
 }

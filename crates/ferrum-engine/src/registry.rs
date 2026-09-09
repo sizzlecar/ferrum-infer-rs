@@ -1149,6 +1149,7 @@ fn validate_registered_vnext_backend(
                 "registered vNext Metal composition requires the 'metal' feature on an Apple platform",
             ))
         }
+        (ProductionExecutionKind::CausalLanguage, Device::CPU) => Ok(()),
         (kind, device) => Err(FerrumError::unsupported(format!(
             "registered vNext model metadata {external_metadata_id} requires a {kind:?} backend composition, but {device} is not registered"
         ))),
@@ -1304,6 +1305,31 @@ fn create_registered_vnext_executor(
                     .resolved_model_plan()
                     .map(|plan| plan.fingerprint())
                     .unwrap_or("missing"),
+                "Resolved product model plan is authoritative for vNext execution"
+            );
+            Ok(Arc::new(executor))
+        }
+        (ProductionExecutionKind::CausalLanguage, Device::CPU) => {
+            let device_id = ferrum_interfaces::vnext::DeviceId::new("device.cpu.0")
+                .map_err(|error| FerrumError::device(error.to_string()))?;
+            let composition = ferrum_kernels::backend::cpu::vnext_ops::CpuVNextComposition::for_host(device_id)
+                .map_err(|error| FerrumError::device(format!("create vNext CPU runtime: {error}")))?;
+            let (runtime, operation_registry, weight_materializers, weight_materializer_id, catalog) = composition.into_parts()
+                .map_err(|error| FerrumError::config(error.to_string()))?;
+            let selection = ferrum_interfaces::vnext::WeightMaterializerSelection::exact(weight_materializer_id);
+            info!(
+                external_metadata_id = %registration.external_metadata_id(),
+                family_id = %prepared.definition().family_id(),
+                defined_model_reused = _defined_model_reused,
+                backend = "cpu",
+                "Resolving a defined model against the actual vNext runtime"
+            );
+            let executor = crate::product_composition::create_vnext_executor(
+                &config.engine_config, prepared.as_ref(), runtime, operation_registry,
+                weight_materializers, catalog, |_| Ok(selection.clone()),
+            )?;
+            info!(
+                resolved_plan_fingerprint = executor.resolved_model_plan().map(|plan| plan.fingerprint()).unwrap_or("missing"),
                 "Resolved product model plan is authoritative for vNext execution"
             );
             Ok(Arc::new(executor))
@@ -2102,21 +2128,26 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_registry_routes_registered_package_before_legacy_loading() {
+    fn qwen35_cpu_registry_requires_typed_sources_before_legacy_loading() {
         let dir = write_qwen35_fixture_model_dir();
         std::fs::remove_file(dir.join("model.safetensors")).unwrap();
         let config = qwen35_fixture_component_config(&dir);
 
         let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
-            Ok(_) => panic!("registered Qwen3.5 package unexpectedly accepted CPU execution"),
+            Ok(_) => panic!("registered Qwen3.5 package accepted missing tokenizer and weights"),
             Err(err) => err.to_string(),
         };
 
-        assert!(
-            err.contains(ferrum_models::vnext::qwen35::EXTERNAL_METADATA_ID),
-            "{err}"
-        );
-        assert!(err.contains("but cpu is not registered"), "{err}");
+        assert!(err.contains("tokenizer.json"), "{err}");
+        validate_registered_vnext_backend(
+            ferrum_models::vnext::ProductionExecutionKind::CausalLanguage,
+            &Device::CPU,
+            &ferrum_interfaces::vnext::ExternalModelMetadataId::new(
+                ferrum_models::vnext::qwen35::EXTERNAL_METADATA_ID,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2160,16 +2191,12 @@ mod tests {
         config.model_sources = Some(sources);
 
         let err = match tokio_test::block_on(LlmExecutorFactory.create(&config)) {
-            Ok(_) => panic!("registered Qwen3.5 GGUF unexpectedly accepted CPU execution"),
+            Ok(_) => panic!("registered Qwen3.5 CPU composition accepted a corrupt GGUF"),
             Err(err) => err.to_string(),
         };
 
-        assert!(
-            err.contains(ferrum_models::vnext::qwen35::EXTERNAL_METADATA_ID),
-            "{err}"
-        );
-        assert!(err.contains("but cpu is not registered"), "{err}");
-        assert!(!err.contains("GGUF"), "{err}");
+        assert!(err.contains("open vNext GGUF source"), "{err}");
+        assert!(err.contains("invalid GGUF header"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

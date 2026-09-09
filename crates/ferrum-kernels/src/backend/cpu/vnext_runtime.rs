@@ -17,13 +17,16 @@ use ferrum_interfaces::vnext::{
 };
 
 mod command;
+mod host_memory;
 mod memory;
 
 use command::CommandKind;
 pub use command::CpuDeviceCommand;
 pub(crate) use command::CpuKernelLaunch;
+pub(crate) use host_memory::host_memory_capacity;
 pub(crate) use memory::CpuBufferRegion;
 pub use memory::CpuDeviceBuffer;
+pub(crate) use memory::CpuRegionSet;
 use memory::{MemoryBudget, Storage};
 
 static NEXT_RUNTIME_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -329,7 +332,9 @@ impl DeviceRuntime for CpuDeviceRuntime {
         validate_submission_requirements(
             commands.timing_mode(),
             commands.compute_path_requirement(),
-            commands.reusable_execution_capture().is_some(),
+            commands
+                .reusable_execution_capture()
+                .map(|capture| (capture.node_count(), capture.eager_boundary_node_indices())),
         )
         .map_err(DefinitelyNotSubmitted::new)?;
         let attribution = commands
@@ -440,7 +445,7 @@ impl DeviceRuntime for CpuDeviceRuntime {
 fn validate_submission_requirements(
     timing: DeviceTimingMode,
     path: DeviceComputePathRequirement,
-    capture: bool,
+    capture: Option<(u32, &[u32])>,
 ) -> Result<(), CpuRuntimeError> {
     if timing != DeviceTimingMode::Off {
         return Err(CpuRuntimeError::new(
@@ -451,11 +456,20 @@ fn validate_submission_requirements(
         path,
         DeviceComputePathRequirement::ReplayedOnly
             | DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries
-    ) || capture
-    {
+    ) {
         return Err(CpuRuntimeError::new(
             "CPU runtime supports eager execution only",
         ));
+    }
+    // Core attaches this metadata to the full eager encoding even when every
+    // provider declares an eager boundary. It is not a replay requirement.
+    // Accept that topology without publishing a reusable executable catalog.
+    if let Some((nodes, boundaries)) = capture {
+        if nodes == 0 || !boundaries.iter().copied().eq(0..nodes) {
+            return Err(CpuRuntimeError::new(
+                "CPU capture topology contains a node that was not declared eager",
+            ));
+        }
     }
     Ok(())
 }

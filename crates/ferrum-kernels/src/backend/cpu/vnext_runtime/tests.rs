@@ -64,6 +64,102 @@ fn read(buffer: &CpuDeviceBuffer) -> Vec<u8> {
 }
 
 #[test]
+fn kernel_views_share_arenas_without_deadlocks_or_mutable_aliases() {
+    let runtime = runtime(16);
+    let arena = buffer(&runtime, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let regions = [
+        arena.region(0..4).unwrap(),
+        arena.region(4..8).unwrap(),
+        arena.region(2..6).unwrap(),
+    ];
+    CpuBufferRegion::with_regions(&regions, |views| {
+        views.with_io([0, 0], [1], |[left, right], [output]| {
+            for ((left, right), output) in left.iter().zip(right).zip(output) {
+                *output = left + right;
+            }
+            Ok(())
+        })?;
+        for (reads, writes) in [([0], [0, 1]), ([0], [1, 2]), ([1], [0, 2])] {
+            assert!(views
+                .with_io(reads, writes, |_, _| -> Result<(), CpuRuntimeError> {
+                    panic!("invalid aliases reached kernel")
+                })
+                .is_err());
+        }
+        assert!(views.with_io([0], [3], |_, _| Ok(())).is_err());
+        let value = views.read(0)[0];
+        views.write(0)[0] = value + 1;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(read(&arena), [2, 2, 3, 4, 2, 4, 6, 8]);
+    assert_eq!(runtime.resident_bytes(), 8);
+}
+
+#[test]
+fn kernel_views_keep_distinct_allocations_in_binding_order() {
+    let runtime = runtime(16);
+    let left = buffer(&runtime, &[2, 3]);
+    let right = buffer(&runtime, &[4, 5]);
+    let result = buffer(&runtime, &[0, 0]);
+    let regions = [
+        right.region(0..2).unwrap(),
+        result.region(0..2).unwrap(),
+        left.region(0..2).unwrap(),
+    ];
+    CpuBufferRegion::with_regions(&regions, |views| {
+        views.with_io([2, 0], [1], |[left, right], [output]| {
+            for ((left, right), output) in left.iter().zip(right).zip(output) {
+                *output = left * right;
+            }
+            Ok(())
+        })
+    })
+    .unwrap();
+    assert_eq!(read(&result), [8, 15]);
+}
+
+#[test]
+fn dynamic_kernel_views_validate_aliases_before_any_page_write() {
+    let runtime = runtime(32);
+    let arena = buffer(&runtime, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    let other = buffer(&runtime, &[9, 10, 11, 12]);
+    let regions = [
+        arena.region(0..4).unwrap(),
+        arena.region(4..8).unwrap(),
+        arena.region(2..6).unwrap(),
+        other.region(0..4).unwrap(),
+    ];
+    CpuBufferRegion::with_regions(&regions, |views| {
+        for (reads, writes) in [
+            (vec![0], vec![0]),
+            (vec![0], vec![2]),
+            (vec![], vec![1, 1]),
+            (vec![], vec![1, 2]),
+            (vec![4], vec![3]),
+            (vec![0], vec![4]),
+        ] {
+            assert!(views
+                .with_io_slices(&reads, &writes, |_, _| -> Result<(), CpuRuntimeError> {
+                    panic!("invalid dynamic bindings reached the kernel")
+                })
+                .is_err());
+        }
+        views.with_io_slices(&[0, 0], &[3, 1], |inputs, outputs| {
+            for output in outputs {
+                for (index, byte) in output.iter_mut().enumerate() {
+                    *byte = inputs[0][index] + inputs[1][index];
+                }
+            }
+            Ok(())
+        })
+    })
+    .unwrap();
+    assert_eq!(read(&arena), [1, 2, 3, 4, 2, 4, 6, 8]);
+    assert_eq!(read(&other), [2, 4, 6, 8]);
+}
+
+#[test]
 fn allocations_are_aligned_and_capacity_is_released_with_last_region() {
     let budget = MemoryBudget::new(257);
     for alignment in [1, 2, 16, 64, 4096] {
@@ -340,31 +436,70 @@ fn cpu_requires_host_descriptor_and_rejects_unimplemented_submission_modes() {
     assert!(validate_submission_requirements(
         DeviceTimingMode::Off,
         DeviceComputePathRequirement::EagerOnly,
-        false
+        None
     )
     .is_ok());
     assert!(validate_submission_requirements(
         DeviceTimingMode::Off,
         DeviceComputePathRequirement::Adaptive,
-        false
+        None
     )
     .is_ok());
     for path in [
         DeviceComputePathRequirement::ReplayedOnly,
         DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries,
     ] {
-        assert!(validate_submission_requirements(DeviceTimingMode::Off, path, false).is_err());
+        assert!(validate_submission_requirements(DeviceTimingMode::Off, path, None).is_err());
     }
     assert!(validate_submission_requirements(
         DeviceTimingMode::Verification,
         DeviceComputePathRequirement::Adaptive,
-        false
+        None
     )
     .is_err());
     assert!(validate_submission_requirements(
         DeviceTimingMode::Off,
         DeviceComputePathRequirement::Adaptive,
-        true
+        Some((2, &[0]))
     )
     .is_err());
+}
+
+#[test]
+fn adaptive_decode_metadata_accepts_all_eager_nodes_without_claiming_replay() {
+    for path in [
+        DeviceComputePathRequirement::EagerOnly,
+        DeviceComputePathRequirement::Adaptive,
+    ] {
+        assert!(validate_submission_requirements(
+            DeviceTimingMode::Off,
+            path,
+            Some((3, &[0, 1, 2]))
+        )
+        .is_ok());
+        for topology in [(3, &[0, 2][..]), (3, &[][..]), (0, &[][..])] {
+            assert!(
+                validate_submission_requirements(DeviceTimingMode::Off, path, Some(topology))
+                    .is_err()
+            );
+        }
+    }
+    for path in [
+        DeviceComputePathRequirement::ReplayedOnly,
+        DeviceComputePathRequirement::ReplayedWithDeclaredEagerBoundaries,
+    ] {
+        assert!(validate_submission_requirements(
+            DeviceTimingMode::Off,
+            path,
+            Some((3, &[0, 1, 2]))
+        )
+        .is_err());
+    }
+    let runtime = runtime(16);
+    let mut stream = runtime.create_stream().unwrap();
+    runtime.seal_reusable_executables(&mut stream).unwrap();
+    assert!(runtime
+        .reusable_execution_catalog(&stream)
+        .unwrap()
+        .is_empty());
 }

@@ -117,7 +117,7 @@ impl GgufBlockFormat {
     }
 
     #[inline]
-    fn decode_value(self, block: &[u8], index: usize) -> f32 {
+    pub(crate) fn decode_value(self, block: &[u8], index: usize) -> f32 {
         match self {
             Self::Q3K => {
                 let group = index / 16;
