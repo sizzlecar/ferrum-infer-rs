@@ -265,8 +265,13 @@ pub struct BenchReport {
     pub n_gen: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_input_tokens: Option<TokenLengthStats>,
+    /// Client-tokenized prompt content, before the server applies its template.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_input_tokens_per_request: Option<Vec<Vec<u32>>>,
+    /// Server usage.prompt_tokens in completion order, grouped by repeat.
+    /// Missing usage remains null; older reports omit the entire field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_input_tokens_per_request: Option<Vec<Vec<Option<u32>>>>,
     /// Per measured request output token counts for each repeat, in
     /// completion order. Failed requests keep their recorded count, usually 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -367,7 +372,9 @@ pub struct RequestRecord {
     pub success: bool,
     pub ttft_ms: f64,
     pub e2e_ms: f64,
+    /// Provided input length, excluding server-side chat-template additions.
     pub input_tokens: u32,
+    pub server_input_tokens: Option<u32>,
     pub output_tokens: u32,
     pub output_token_count_source: OutputTokenCountSource,
     pub itl_evidence: RequestItlEvidence,
@@ -418,6 +425,9 @@ pub struct BenchRepeatMetrics {
     pub warmup_completed: u32,
     pub warmup_errored: u32,
     pub actual_input_tokens: u64,
+    /// Sum of server usage.prompt_tokens, only when every request reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_input_tokens: Option<u64>,
     pub output_tokens: u64,
     pub output_token_count_source: String,
     #[serde(default)]
@@ -827,6 +837,13 @@ fn build_repeat_metrics(run: &RunRecord, repeat: u32, slo: &Slo) -> BenchRepeatM
     // the per-request vectors.
     let actual_input_tokens =
         checked_token_sum(&run.records, |record| record.input_tokens, "input");
+    let server_input_tokens = run.records.iter().try_fold(0_u64, |total, record| {
+        record.server_input_tokens.map(|tokens| {
+            total
+                .checked_add(u64::from(tokens))
+                .expect("server input token count overflow")
+        })
+    });
     let output_tokens = checked_token_sum(&run.records, |record| record.output_tokens, "output");
     let good = success
         .iter()
@@ -860,6 +877,7 @@ fn build_repeat_metrics(run: &RunRecord, repeat: u32, slo: &Slo) -> BenchRepeatM
         warmup_completed: run.warmup.completed,
         warmup_errored: run.warmup.errored,
         actual_input_tokens,
+        server_input_tokens,
         output_tokens,
         output_token_count_source: output_token_count_source(&run.records),
         itl_eligible_requests,
@@ -1197,6 +1215,16 @@ pub fn compute_metrics(
         n_gen,
         actual_input_tokens: None,
         actual_input_tokens_per_request: None,
+        server_input_tokens_per_request: Some(
+            runs.iter()
+                .map(|run| {
+                    run.records
+                        .iter()
+                        .map(|record| record.server_input_tokens)
+                        .collect()
+                })
+                .collect(),
+        ),
         output_tokens_per_request: Some(output_tokens_per_request),
         itl_evidence_per_request: Some(itl_evidence_per_request),
         output_token_count_source: None,
@@ -1264,6 +1292,7 @@ mod tests {
             ttft_ms: ttft,
             e2e_ms: e2e,
             input_tokens: in_tok,
+            server_input_tokens: None,
             output_tokens: out_tok,
             output_token_count_source: if out_tok > 0 {
                 OutputTokenCountSource::Usage
@@ -1286,6 +1315,7 @@ mod tests {
             ttft_ms: ttft,
             e2e_ms: e2e,
             input_tokens: in_tok,
+            server_input_tokens: None,
             output_tokens: out_tok,
             output_token_count_source: OutputTokenCountSource::Usage,
             itl_evidence: RequestItlEvidence::sse(
@@ -1363,6 +1393,36 @@ mod tests {
             vec![run],
             Env::default(),
         )
+    }
+
+    #[test]
+    fn server_input_usage_is_distinct_and_missing_observations_remain_missing() {
+        let mut first = req(true, 10.0, 20.0, 7, 2);
+        first.server_input_tokens = Some(23);
+        let mut second = req(true, 10.0, 20.0, 11, 2);
+        for observed in [Some(29), None] {
+            second.server_input_tokens = observed;
+            let report = compute_one(
+                make_run(vec![first.clone(), second.clone()], 1.0),
+                0,
+                Slo::default(),
+            );
+            assert_eq!(report.repeat_metrics[0].actual_input_tokens, 18);
+            assert_eq!(
+                report.repeat_metrics[0].server_input_tokens,
+                observed.map(|n| 23 + u64::from(n))
+            );
+            assert_eq!(
+                report.server_input_tokens_per_request,
+                Some(vec![vec![Some(23), observed]])
+            );
+            let restored: BenchReport =
+                serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+            assert_eq!(
+                restored.server_input_tokens_per_request,
+                report.server_input_tokens_per_request
+            );
+        }
     }
 
     #[test]

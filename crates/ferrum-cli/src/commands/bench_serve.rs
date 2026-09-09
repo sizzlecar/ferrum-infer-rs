@@ -316,6 +316,7 @@ struct OpenAiStreamDelta {
 
 #[derive(Debug, Deserialize)]
 struct OpenAiUsage {
+    prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
 }
 
@@ -643,6 +644,7 @@ fn failed_record(
         ttft_ms: 0.0,
         e2e_ms: start.elapsed().as_secs_f64() * 1000.0,
         input_tokens,
+        server_input_tokens: None,
         output_tokens: 0,
         output_token_count_source: OutputTokenCountSource::None,
         itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
@@ -664,6 +666,7 @@ fn join_failed_record(
         ttft_ms: 0.0,
         e2e_ms: 0.0,
         input_tokens,
+        server_input_tokens: None,
         output_tokens: 0,
         output_token_count_source: OutputTokenCountSource::None,
         itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
@@ -695,6 +698,7 @@ async fn collect_measured_handles(
 struct StreamState {
     start: Instant,
     input_tokens: u32,
+    usage_prompt_tokens: Option<u32>,
     first_token_time: Option<Instant>,
     last_token_time: Option<Instant>,
     output_delta_events: u32,
@@ -725,6 +729,7 @@ impl StreamState {
         Self {
             start,
             input_tokens,
+            usage_prompt_tokens: None,
             first_token_time: None,
             last_token_time: None,
             output_delta_events: 0,
@@ -770,6 +775,9 @@ impl StreamState {
             ));
         }
         if let Some(usage) = chunk.usage {
+            if let Some(tokens) = usage.prompt_tokens {
+                self.usage_prompt_tokens = Some(tokens);
+            }
             if let Some(tokens) = usage.completion_tokens {
                 self.usage_completion_tokens = Some(tokens);
             }
@@ -859,6 +867,7 @@ impl StreamState {
             ttft_ms,
             e2e_ms,
             input_tokens: self.input_tokens,
+            server_input_tokens: self.usage_prompt_tokens,
             output_tokens,
             output_token_count_source: source,
             itl_evidence,
@@ -2229,6 +2238,23 @@ mod tests {
         state.finish()
     }
 
+    #[test]
+    fn stream_preserves_server_prompt_usage_separately_from_content_length() {
+        for (usage, expected) in [
+            (r#"{"prompt_tokens":23,"completion_tokens":1}"#, Some(23)),
+            (r#"{"completion_tokens":1}"#, None),
+        ] {
+            let stream = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"OK\"}}}}]}}\n\ndata: {{\"choices\":[],\"usage\":{usage}}}\n\ndata: [DONE]\n\n"
+            );
+            let record = parse_sse_chunks(stream.as_bytes().chunks(3));
+            assert!(record.success);
+            assert_eq!(record.input_tokens, 7);
+            assert_eq!(record.server_input_tokens, expected);
+            assert_eq!(record.output_tokens, 1);
+        }
+    }
+
     fn stream_semantics(
         record: &RequestRecord,
     ) -> (
@@ -2552,6 +2578,7 @@ mod tests {
                 ttft_ms: 1.0,
                 e2e_ms: 2.0,
                 input_tokens: 7,
+                server_input_tokens: None,
                 output_tokens: 1,
                 output_token_count_source: OutputTokenCountSource::Usage,
                 itl_evidence: RequestItlEvidence::sse(true, 1, Some(1), 0, 0),
@@ -2794,6 +2821,7 @@ mod tests {
                 ttft_ms: 10.0,
                 e2e_ms: 30.0,
                 input_tokens: 2,
+                server_input_tokens: None,
                 output_tokens: 3,
                 output_token_count_source: OutputTokenCountSource::Usage,
                 itl_evidence: RequestItlEvidence::sse(true, 3, Some(3), 2, 0),
@@ -2811,6 +2839,7 @@ mod tests {
                 ttft_ms: 0.0,
                 e2e_ms: 30.0,
                 input_tokens: 2,
+                server_input_tokens: None,
                 output_tokens: 0,
                 output_token_count_source: OutputTokenCountSource::None,
                 itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
@@ -2931,6 +2960,7 @@ mod tests {
                     ttft_ms: 10.0,
                     e2e_ms: 30.0,
                     input_tokens: 4,
+                    server_input_tokens: None,
                     output_tokens: 3,
                     output_token_count_source: OutputTokenCountSource::Usage,
                     itl_evidence: RequestItlEvidence::sse(true, 3, Some(3), 2, 0),
@@ -2944,6 +2974,7 @@ mod tests {
                     ttft_ms: 0.0,
                     e2e_ms: 50.0,
                     input_tokens: 4,
+                    server_input_tokens: None,
                     output_tokens: 0,
                     output_token_count_source: OutputTokenCountSource::None,
                     itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::SseDeltaEvents),
@@ -3043,6 +3074,7 @@ mod tests {
                     ttft_ms: 10.0,
                     e2e_ms: 30.0,
                     input_tokens: 2,
+                    server_input_tokens: None,
                     output_tokens: 3,
                     output_token_count_source: OutputTokenCountSource::Usage,
                     itl_evidence: RequestItlEvidence::sse(true, 3, Some(3), 2, 0),

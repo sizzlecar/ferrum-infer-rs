@@ -357,6 +357,13 @@ precision, input/output lengths, concurrency, repetitions and uncertainty. Count
 valid outputs and errors alongside timing; SSE text events are not usage tokens.
 Correctness on a different GPU does not reproduce a README throughput number.
 
+In bench reports, `actual_input_tokens_per_request` records client-tokenized
+prompt content. `server_input_tokens_per_request` separately records
+`usage.prompt_tokens`, including the server's chat template. Missing server
+usage stays null; older reports omit the field. Release latency comparisons
+require observed server input lengths, verify their context budget and totals,
+and require the same rendered lengths for baseline and candidate.
+
 Configure release latency limits in
 [`policy.limits`](../.github/release-performance.json) before starting a release.
 The shared Mac temporarily allows 30% TTFT and 20% time-per-output-token

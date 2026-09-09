@@ -399,6 +399,7 @@ fn failed_bench_record(quality_issues: QualityIssueCounts) -> RequestRecord {
         ttft_ms: 0.0,
         e2e_ms: 0.0,
         input_tokens: 0,
+        server_input_tokens: None,
         output_tokens: 0,
         output_token_count_source: OutputTokenCountSource::None,
         itl_evidence: RequestItlEvidence::failed(ItlEvidenceSource::EngineTokenEvents),
@@ -526,6 +527,7 @@ async fn collect_stream(
         ttft_ms,
         e2e_ms,
         input_tokens: 0, // CLI bench doesn't tokenize; left as 0
+        server_input_tokens: None,
         output_tokens: token_count,
         output_token_count_source: if token_count > 0 {
             OutputTokenCountSource::StreamChunks

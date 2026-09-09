@@ -283,6 +283,7 @@ mod tests {
                 ttft_ms: ttft,
                 e2e_ms: e2e,
                 input_tokens: in_tok,
+                server_input_tokens: None,
                 output_tokens: out_tok,
                 output_token_count_source: OutputTokenCountSource::StreamChunks,
                 itl_evidence: crate::RequestItlEvidence::engine(success, out_tok, 0),

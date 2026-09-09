@@ -9473,13 +9473,17 @@ impl<R: DeviceRuntime> VNextModelExecutor<R> {
                 .unwrap_or_else(|error| serde_json::json!({"state": "serialization_failed", "message": error.to_string()})),
             "last_failure": self.metrics.last_failure.lock().clone(),
         });
-        snapshot
+        let fields = snapshot
             .as_object_mut()
-            .expect("vNext executor snapshot is an object")
-            .insert(
-                "attention_execution_policy".to_owned(),
-                serde_json::json!(self.policy.attention_execution()),
-            );
+            .expect("vNext executor snapshot is an object");
+        fields.insert(
+            "attention_execution_policy".to_owned(),
+            serde_json::json!(self.policy.attention_execution()),
+        );
+        fields.insert(
+            "numerical_execution".to_owned(),
+            serde_json::json!(self.resolved_plan.parts().numerical_execution),
+        );
         snapshot
     }
 }
