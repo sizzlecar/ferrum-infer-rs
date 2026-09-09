@@ -139,15 +139,25 @@ fn master_residual_preserves_f32_and_declared_inplace_alias_on_cuda() {
         .unwrap();
     for count in [1_usize, 33, 513] {
         let residual = (0..count)
-            .map(|i| match i % 4 {
+            .map(|i| match i % 8 {
                 0 => 70000.125_f32,
                 1 => 1.0001,
                 2 => -65000.125,
-                _ => 0.000000125,
+                3 => 0.000000125,
+                4 => f32::from_bits(1),
+                5 => f32::from_bits(0x807fffff),
+                6 => -0.0,
+                _ => f32::MIN_POSITIVE,
             })
             .collect::<Vec<_>>();
         let update = (0..count)
-            .map(|i| f16::from_f32(((i * 7 % 23) as f32 - 11.0) / 32.0))
+            .map(|i| {
+                f16::from_f32(if i % 8 >= 4 {
+                    0.0
+                } else {
+                    ((i * 7 % 23) as f32 - 11.0) / 32.0
+                })
+            })
             .collect::<Vec<_>>();
         let expected = residual
             .iter()

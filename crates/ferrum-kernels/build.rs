@@ -1414,10 +1414,18 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
     for kernel in CORE_PTX_KERNELS {
         let start = Instant::now();
         let mut flags = flags.clone();
-        if *kernel == gguf::KERNEL {
-            // Preserve specified F32 dequantization arithmetic and subnormals.
+        // Exact dequantization, residual sums and token selection must retain
+        // IEEE subnormals and division rounding. Include this policy in both
+        // the cache identity and the actual compiler invocation.
+        let precise_math = matches!(
+            *kernel,
+            gguf::KERNEL | "kernels/residual_add.cu" | "kernels/argmax_rows.cu"
+        );
+        if precise_math {
             flags.retain(|flag| flag != "--use_fast_math");
             flags.push("--fmad=false".into());
+        }
+        if *kernel == gguf::KERNEL {
             flags.push(format!("-I{}", out_dir.display()));
         }
         let legacy_signature = core_ptx_signature(kernel, &flags);
@@ -1490,12 +1498,13 @@ fn compile_core_ptx(out_dir: &Path, native_build_cache: Option<&CudaNativeBuildC
                     .arg("--expt-relaxed-constexpr")
                     .arg("-std=c++17")
                     .arg("-O3");
-                if *kernel == gguf::KERNEL {
-                    command
-                        .arg("--fmad=false")
-                        .arg(format!("-I{}", out_dir.display()));
+                if precise_math {
+                    command.arg("--fmad=false");
                 } else {
                     command.arg("--use_fast_math");
+                }
+                if *kernel == gguf::KERNEL {
+                    command.arg(format!("-I{}", out_dir.display()));
                 }
                 command.args(environment_option);
                 if let Some(cuda_include) = &cuda_include {

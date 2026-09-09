@@ -9,8 +9,9 @@ use ferrum_interfaces::vnext::{
     causal_paged_attention_contract, constant_scale_contract, dense_geglu_tanh_contract,
     dense_linear_contract, dense_swiglu_contract, gated_delta_recurrent_attention_contract,
     gpt_oss_causal_paged_attention_contract, hybrid_vnorm_causal_paged_attention_contract,
-    last_token_dense_linear_contract, last_token_masked_argmax_contract, logit_softcap_contract,
-    residual_add_contract, residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
+    last_token_dense_linear_contract, last_token_masked_argmax_contract,
+    last_token_masked_argmax_f32_contract, logit_softcap_contract, residual_add_contract,
+    residual_add_f32_f16_contract, rms_norm_contract, rms_norm_f32_contract,
     rms_norm_f32_to_f16_contract, token_embedding_contract, AttributeId,
     BatchedOperationInvocation, CapabilityCatalog, CapabilityId, ContractVersion,
     DeviceBatchingForm, DeviceId, DeviceReusableExecutionTopologyFingerprint, DeviceRuntime,
@@ -31,11 +32,11 @@ use ferrum_interfaces::vnext::{
     GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
     HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID, IDENTITY_WEIGHT_MATERIALIZER_ID,
     LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID, LAST_TOKEN_DENSE_LINEAR_OPERATION_ID,
-    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
-    LOGIT_SOFTCAP_F16_CAPABILITY_ID, RESIDUAL_ADD_F16_CAPABILITY_ID,
-    RESIDUAL_ADD_F32_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID, RMS_NORM_F32_CAPABILITY_ID,
-    RMS_NORM_F32_TO_F16_CAPABILITY_ID, TOKEN_EMBEDDING_F16_CAPABILITY_ID,
-    TOKEN_EMBEDDING_OPERATION_ID,
+    LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID, LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
+    LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID, LOGIT_SOFTCAP_F16_CAPABILITY_ID,
+    RESIDUAL_ADD_F16_CAPABILITY_ID, RESIDUAL_ADD_F32_F16_CAPABILITY_ID, RMS_NORM_F16_CAPABILITY_ID,
+    RMS_NORM_F32_CAPABILITY_ID, RMS_NORM_F32_TO_F16_CAPABILITY_ID,
+    TOKEN_EMBEDDING_F16_CAPABILITY_ID, TOKEN_EMBEDDING_OPERATION_ID,
 };
 #[cfg(feature = "vllm-moe-marlin")]
 use ferrum_interfaces::vnext::{
@@ -55,7 +56,9 @@ use super::vnext_runtime::{
 };
 
 mod native_blocks;
+mod selection;
 mod transformer;
+use selection::ArgmaxPrecision;
 
 const TOKEN_EMBEDDING_PROVIDER_ID: &str = "provider.cuda.token_embedding.f16";
 const TOKEN_EMBEDDING_ESTIMATOR_ID: &str = "resource-estimator.cuda.token_embedding.f16";
@@ -90,6 +93,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_runtime.rs").as_bytes(),
         include_str!("vnext_replay.rs").as_bytes(),
         include_str!("vnext_ops.rs").as_bytes(),
+        include_str!("vnext_ops/selection.rs").as_bytes(),
         include_str!("vnext_ops/transformer.rs").as_bytes(),
         include_str!("vnext_ops/transformer/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
@@ -171,6 +175,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         TOKEN_EMBEDDING_F16_CAPABILITY_ID,
         LAST_TOKEN_DENSE_LINEAR_F16_CAPABILITY_ID,
         LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
+        LAST_TOKEN_MASKED_ARGMAX_F32_CAPABILITY_ID,
         RMS_NORM_F16_CAPABILITY_ID,
         RMS_NORM_F32_TO_F16_CAPABILITY_ID,
         RMS_NORM_F32_CAPABILITY_ID,
@@ -343,6 +348,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(token_embedding_contract().map_err(contract_error)?),
         Box::new(last_token_dense_linear_contract().map_err(contract_error)?),
         Box::new(last_token_masked_argmax_contract().map_err(contract_error)?),
+        Box::new(last_token_masked_argmax_f32_contract().map_err(contract_error)?),
         Box::new(rms_norm_contract().map_err(contract_error)?),
         Box::new(rms_norm_f32_to_f16_contract().map_err(contract_error)?),
         Box::new(rms_norm_f32_contract().map_err(contract_error)?),
@@ -376,6 +382,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(CudaTokenEmbeddingProvider::new(runtime)?),
         Box::new(CudaLastTokenDenseLinearProvider::new(runtime)?),
         Box::new(CudaLastTokenMaskedArgmaxProvider::new(runtime)?),
+        Box::new(CudaLastTokenMaskedArgmaxProvider::new_f32(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new_f32_to_f16(runtime)?),
         Box::new(transformer::CudaRmsNormProvider::new_f32(runtime)?),
@@ -801,39 +808,48 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenDenseLinearProvider {
 pub struct CudaLastTokenMaskedArgmaxProvider {
     descriptor: OperationProviderDescriptor,
     function: CudaFunction,
+    precision: ArgmaxPrecision,
 }
 
 impl CudaLastTokenMaskedArgmaxProvider {
     pub fn new(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
-        let contract = last_token_masked_argmax_contract().map_err(contract_error)?;
-        let descriptor = transformer::provider_descriptor(
+        Self::with_precision(runtime, ArgmaxPrecision::F16)
+    }
+
+    pub fn new_f32(runtime: &CudaDeviceRuntime) -> Result<Self, CudaDeviceRuntimeError> {
+        Self::with_precision(runtime, ArgmaxPrecision::F32)
+    }
+
+    fn with_precision(
+        runtime: &CudaDeviceRuntime,
+        precision: ArgmaxPrecision,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = precision.contract().map_err(contract_error)?;
+        let descriptor = transformer::weightless_provider_descriptor(
             runtime,
             &contract,
-            LAST_TOKEN_MASKED_ARGMAX_PROVIDER_ID,
-            LAST_TOKEN_MASKED_ARGMAX_F16_CAPABILITY_ID,
-            LAST_TOKEN_MASKED_ARGMAX_ESTIMATOR_ID,
+            precision.provider(),
+            precision.capability(),
+            precision.estimator(),
             transformer::contiguous_bindings(5),
             implementation_fingerprint(&[
                 include_str!("vnext_ops.rs").as_bytes(),
+                include_str!("vnext_ops/selection.rs").as_bytes(),
                 crate::ptx::ARGMAX_ROWS.as_bytes(),
-                MASKED_ARGMAX_PRESERVING_LOGITS_FUNCTION_NAME.as_bytes(),
+                precision.kernel().as_bytes(),
             ]),
         )?;
         let module = runtime
             .context()
             .load_module(Ptx::from_src(crate::ptx::ARGMAX_ROWS.to_owned()))
             .map_err(|error| CudaDeviceRuntimeError::driver("masked argmax module load", error))?;
-        let function = module
-            .load_function(MASKED_ARGMAX_PRESERVING_LOGITS_FUNCTION_NAME)
-            .map_err(|error| {
-                CudaDeviceRuntimeError::driver(
-                    "masked argmax preserving-logits function load",
-                    error,
-                )
-            })?;
+        let function = module.load_function(precision.kernel()).map_err(|error| {
+            CudaDeviceRuntimeError::driver("masked argmax preserving-logits function load", error)
+        })?;
         Ok(Self {
             descriptor,
             function,
+            precision,
         })
     }
 }
@@ -850,11 +866,11 @@ impl OperationResourceEstimator for CudaLastTokenMaskedArgmaxProvider {
         transformer::ensure_estimator_request(
             &self.descriptor,
             &request,
-            LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID,
+            self.precision.operation(),
         )?;
         let vocabulary_size = unsigned_attribute(request.attributes(), "vocab_size")
             .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
-        let scratch_bytes = masked_argmax_scratch_stride(vocabulary_size)
+        let scratch_bytes = masked_argmax_scratch_stride(vocabulary_size, self.precision.element())
             .map_err(|reason| VNextError::InvalidExecutionPlan { reason })?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::actual_sequences(scratch_bytes)?,
@@ -891,6 +907,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaLastTokenMaskedArgmaxProvider 
         encode_last_token_masked_argmax(
             &self.function,
             self.descriptor.provider_implementation_fingerprint(),
+            self.precision,
             invocation,
         )
         .map(EncodedDeviceOperation::compute)
@@ -911,9 +928,10 @@ struct MaskedArgmaxLaunch {
 fn encode_last_token_masked_argmax(
     function: &CudaFunction,
     provider_fingerprint: &str,
+    precision: ArgmaxPrecision,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
 ) -> Result<CudaDeviceCommand, String> {
-    if invocation.operation().id.as_str() != LAST_TOKEN_MASKED_ARGMAX_OPERATION_ID
+    if invocation.operation().id.as_str() != precision.operation()
         || invocation.participants().is_empty()
     {
         return Err("CUDA masked argmax received another or empty operation".to_owned());
@@ -921,7 +939,7 @@ fn encode_last_token_masked_argmax(
 
     let first_vocabulary_size =
         unsigned_attribute(invocation.participants()[0].attributes(), "vocab_size")?;
-    let scratch_stride = masked_argmax_scratch_stride(first_vocabulary_size)?;
+    let scratch_stride = masked_argmax_scratch_stride(first_vocabulary_size, precision.element())?;
     let required_scratch_bytes = scratch_stride
         .checked_mul(invocation.participants().len() as u64)
         .ok_or_else(|| "CUDA masked argmax scratch size overflows".to_owned())?;
@@ -946,10 +964,11 @@ fn encode_last_token_masked_argmax(
             repetition_penalty,
             output,
             vocabulary_size,
+            precision.element(),
         )?;
 
         let first_region = regions.len();
-        regions.push(contiguous_region(participant, logits, ElementType::F16)?);
+        regions.push(contiguous_region(participant, logits, precision.element())?);
         regions.push(contiguous_region(participant, valid_mask, ElementType::U8)?);
         regions.push(contiguous_region(
             participant,
@@ -1057,9 +1076,12 @@ fn encode_last_token_masked_argmax(
     .map_err(|error| error.to_string())
 }
 
-fn masked_argmax_scratch_stride(vocabulary_size: u64) -> Result<u64, String> {
+fn masked_argmax_scratch_stride(
+    vocabulary_size: u64,
+    element_type: ElementType,
+) -> Result<u64, String> {
     let bytes = vocabulary_size
-        .checked_mul(ElementType::F16.size_bytes())
+        .checked_mul(element_type.size_bytes())
         .ok_or_else(|| "CUDA masked argmax scratch size overflows".to_owned())?;
     bytes
         .checked_add(VALUE_ALIGNMENT_BYTES - 1)
@@ -1076,11 +1098,12 @@ fn validate_masked_argmax_signature(
     repetition_penalty: &ResolvedValueBinding,
     output: &ResolvedValueBinding,
     vocabulary_size: u64,
+    logits_type: ElementType,
 ) -> Result<i32, String> {
     let contiguous = |binding: &ResolvedValueBinding| {
         matches!(binding.tensor().layout(), ResolvedTensorLayout::Contiguous)
     };
-    if logits.tensor().element_type() != ElementType::F16
+    if logits.tensor().element_type() != logits_type
         || valid_mask.tensor().element_type() != ElementType::U8
         || repetition_token_ids.tensor().element_type() != ElementType::U32
         || repetition_offsets.tensor().element_type() != ElementType::U32

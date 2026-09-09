@@ -1212,7 +1212,7 @@ pub(super) fn provider_descriptor(
     )
 }
 
-fn weightless_provider_descriptor(
+pub(super) fn weightless_provider_descriptor(
     runtime: &CudaDeviceRuntime,
     contract: &dyn OperationContract,
     provider_id: &str,
