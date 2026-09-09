@@ -235,6 +235,7 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const int head_dim,
     const int rope_dim,
     const int rope_frequency_denominator,
+    const int rope_pair_offset,
     const int query_projection_stride,
     const int query_head_stride,
     const int kv_projection_stride,
@@ -320,7 +321,6 @@ extern "C" __global__ void vnext_causal_prepare_f16(
   sum_squares = warp_reduce_sum(sum_squares);
   const float norm_scale = rsqrtf(sum_squares / (float)head_dim + epsilon);
   const int half_rope = rope_dim / 2;
-  const int neox_half = head_dim / 2;
 
   if (rope_interleaved != 0) {
     for (int pair = lane; pair < half_rope; pair += VNEXT_WARP_SIZE) {
@@ -349,12 +349,10 @@ extern "C" __global__ void vnext_causal_prepare_f16(
   } else {
     for (int pair = lane; pair < half_rope; pair += VNEXT_WARP_SIZE) {
       const int low = pair;
-      // Gemma 4 proportional partial RoPE pads the inactive frequencies to
-      // head_dim/2 and then applies the standard NeoX half split. Therefore
-      // an active pair mixes [pair, pair + head_dim/2], not
-      // [pair, pair + rope_dim/2]. Full-width RoPE is unchanged because the
-      // two offsets are equal in that case.
-      const int high = pair + neox_half;
+      // Pair geometry is resolved from the operation contract: ordinary
+      // partial RoPE splits the active prefix, while proportional RoPE
+      // splits the full head with inactive frequencies left unrotated.
+      const int high = pair + rope_pair_offset;
       const float x0 = __half2float(source[low]) * norm_scale *
                        __half2float(weight[low]);
       const float x1 = __half2float(source[high]) * norm_scale *
@@ -381,8 +379,8 @@ extern "C" __global__ void vnext_causal_prepare_f16(
     const bool rotated = rope_interleaved != 0
                              ? dim < rope_dim
                              : dim < half_rope ||
-                                   (dim >= neox_half &&
-                                    dim < neox_half + half_rope);
+                                   (dim >= rope_pair_offset &&
+                                    dim < rope_pair_offset + half_rope);
     if (rotated) {
       continue;
     }
