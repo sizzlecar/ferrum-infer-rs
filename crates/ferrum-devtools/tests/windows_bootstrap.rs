@@ -4,7 +4,11 @@
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::{fs, path::Path, process::Command};
+use std::{collections::BTreeMap, fs, path::Path, process::Command};
+
+#[path = "support/http_fixture.rs"]
+mod http_fixture;
+use http_fixture::Server;
 
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -23,6 +27,18 @@ fn powershell_in(
         .join("../../scripts/install.ps1")
         .canonicalize()
         .unwrap();
+    invoke_powershell_in(
+        system_directory,
+        &format!(". {}; {body}", quote(script.to_str().unwrap())),
+        environment,
+    )
+}
+
+fn invoke_powershell_in(
+    system_directory: &str,
+    body: &str,
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let program = Path::new(&std::env::var_os("SystemRoot").unwrap())
         .join(system_directory)
         .join("WindowsPowerShell/v1.0/powershell.exe");
@@ -37,8 +53,7 @@ fn powershell_in(
             "-Command",
         ])
         .arg(format!(
-            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); . {}; {body}",
-            quote(script.to_str().unwrap())
+            "$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); {body}"
         ))
         .envs(environment.iter().copied())
         // Let Windows PowerShell build its own module paths. A PowerShell 7
@@ -46,6 +61,71 @@ fn powershell_in(
         .env_remove("PSModulePath")
         .output()
         .unwrap()
+}
+
+#[test]
+fn downloaded_bootstrap_pipeline_executes_native_detection_and_rejects_missing_driver() {
+    // Serve unmodified candidate bytes and execute the README's IRM/IEX pipeline.
+    // Only the external driver-file lookup is replaced. This proves startup and
+    // no-driver rejection, not a complete installation from the public website.
+    let script =
+        fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/install.ps1")).unwrap();
+    let server = Server::new(BTreeMap::from([("/install.ps1".into(), script)]));
+    let body = format!(
+        r#"
+        $cpu = @(Get-CimInstance Win32_Processor | Select-Object -ExpandProperty Architecture -Unique)
+        function Test-Path {{ param($LiteralPath, $PathType); return $false }}
+        $failure = $null
+        try {{ irm {url} | iex }}
+        catch {{ $failure = [ordered]@{{message=$_.Exception.Message; error_id=$_.FullyQualifiedErrorId; cpu=$cpu; process_bits=([IntPtr]::Size*8)}} }}
+        if ($null -eq $failure) {{ throw 'installer unexpectedly succeeded without driver tools' }}
+        $failure | ConvertTo-Json -Compress
+        "#,
+        url = quote(&format!("{}/install.ps1", server.url)),
+    );
+    let system_root = std::env::var_os("SystemRoot").unwrap();
+    for directory in ["System32", "SysWOW64"] {
+        if directory == "SysWOW64"
+            && !Path::new(&system_root)
+                .join(directory)
+                .join("WindowsPowerShell/v1.0/powershell.exe")
+                .is_file()
+        {
+            continue;
+        }
+        let output = invoke_powershell_in(directory, &body, &[]);
+        require_success(&output);
+        let observed: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = observed["message"].as_str().unwrap();
+        if observed["cpu"] == json!([9]) {
+            assert!(
+                message.contains("NVIDIA driver tools were not found"),
+                "{observed}"
+            );
+        } else {
+            assert!(message.contains("native Windows x64 only"), "{observed}");
+        }
+        if directory == "SysWOW64" {
+            assert_eq!(observed["process_bits"], 32);
+        }
+    }
+}
+
+#[test]
+fn downloaded_bootstrap_pipeline_reports_http_failure() {
+    let server = Server::new(BTreeMap::new());
+    let output = invoke_powershell_in(
+        "System32",
+        &format!(
+            "irm {} | iex",
+            quote(&format!("{}/install.ps1", server.url))
+        ),
+        &[],
+    );
+    assert!(
+        !output.status.success(),
+        "a missing download must fail the pipeline"
+    );
 }
 
 #[test]
