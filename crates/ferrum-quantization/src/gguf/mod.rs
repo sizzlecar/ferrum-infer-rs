@@ -30,6 +30,7 @@ pub mod inventory;
 pub mod linear;
 pub mod loader;
 pub mod names;
+pub mod native;
 pub mod source;
 
 pub use file::GgufFile;
@@ -37,6 +38,7 @@ pub use inventory::{GgufInventory, GgufTensorInventory};
 pub use linear::{linear_from_qtensor, GgufLinear};
 pub use loader::GgufLoader;
 pub use names::{ferrum_to_gguf, ferrum_to_gguf_with_arch, gate_up_split_parts, qkv_split_parts};
+pub use native::{gguf_weight_encoding, NativeGgufFile, NativeGgufTensor};
 pub use source::{block_quantization_format, GgufWeightComponentSource};
 
 // Re-exports — callers can import these from `ferrum_quantization::gguf` rather

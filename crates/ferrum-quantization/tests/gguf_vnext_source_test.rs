@@ -10,6 +10,135 @@ use ferrum_interfaces::vnext::{
 use ferrum_quantization::GgufWeightComponentSource;
 use half::f16;
 
+struct NativeTensorFixture<'a> {
+    name: &'a str,
+    ggml_type: u32,
+    dimensions: &'a [u64],
+    payload: &'a [u8],
+}
+
+fn native_fixture(tensors: &[NativeTensorFixture<'_>]) -> tempfile::NamedTempFile {
+    fn string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    let mut header = b"GGUF".to_vec();
+    header.extend_from_slice(&3_u32.to_le_bytes());
+    header.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    header.extend_from_slice(&2_u64.to_le_bytes());
+    string(&mut header, "general.architecture");
+    header.extend_from_slice(&8_u32.to_le_bytes());
+    string(&mut header, "fixture");
+    string(&mut header, "general.quantization_version");
+    header.extend_from_slice(&4_u32.to_le_bytes());
+    header.extend_from_slice(&2_u32.to_le_bytes());
+    let mut payload = Vec::new();
+    for tensor in tensors {
+        payload.resize(payload.len().div_ceil(32) * 32, 0);
+        string(&mut header, tensor.name);
+        header.extend_from_slice(&(tensor.dimensions.len() as u32).to_le_bytes());
+        for dimension in tensor.dimensions.iter().rev() {
+            header.extend_from_slice(&dimension.to_le_bytes());
+        }
+        header.extend_from_slice(&tensor.ggml_type.to_le_bytes());
+        header.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        payload.extend_from_slice(tensor.payload);
+    }
+    header.resize(header.len().div_ceil(32) * 32, 0);
+    header.extend_from_slice(&payload);
+    let mut file = tempfile::NamedTempFile::with_suffix(".gguf").unwrap();
+    file.write_all(&header).unwrap();
+    file.flush().unwrap();
+    file
+}
+
+#[test]
+fn native_iq_source_preserves_complete_physical_encodings_and_retained_payloads() {
+    use ferrum_quantization::gguf::gguf_weight_encoding;
+
+    let iq3 = (0..220).map(|n| n as u8).collect::<Vec<_>>();
+    let iq4_nl = (0..36).map(|n| 255 - n as u8).collect::<Vec<_>>();
+    let iq4_xs = (0..272).map(|n| (n * 7) as u8).collect::<Vec<_>>();
+    let tensors = [
+        NativeTensorFixture {
+            name: "iq3.weight",
+            ggml_type: 21,
+            dimensions: &[2, 256],
+            payload: &iq3,
+        },
+        NativeTensorFixture {
+            name: "iq4_nl.weight",
+            ggml_type: 20,
+            dimensions: &[2, 32],
+            payload: &iq4_nl,
+        },
+        NativeTensorFixture {
+            name: "iq4_xs.weight",
+            ggml_type: 23,
+            dimensions: &[2, 256],
+            payload: &iq4_xs,
+        },
+    ];
+    let file = native_fixture(&tensors);
+    let source = GgufWeightComponentSource::open(file.path()).unwrap();
+    assert_eq!(source.file().quantization_version(), Some(2));
+    assert_eq!(source.file().tensor_count(), tensors.len());
+    let mut retained = Vec::new();
+    for tensor in tensors {
+        let info = source.file().tensor_info(tensor.name).unwrap();
+        assert_eq!(info.ggml_type, tensor.ggml_type);
+        assert_eq!(info.dimensions, tensor.dimensions);
+        let component = component(
+            "component.iq",
+            tensor.name,
+            vec![2, 1],
+            gguf_weight_encoding(tensor.ggml_type).unwrap(),
+        );
+        let payload = source.component(&component).unwrap();
+        assert_eq!(payload.element_type(), ElementType::U8);
+        assert_eq!(payload.bytes(), tensor.payload);
+        assert_eq!(
+            payload.bytes().as_ptr(),
+            source
+                .file()
+                .tensor_byte_slice(tensor.name)
+                .unwrap()
+                .as_ptr()
+        );
+        retained.push((
+            payload.retained_host_memory().unwrap().clone(),
+            tensor.payload.to_vec(),
+        ));
+        let mut wrong_abi = component.clone();
+        if let WeightEncoding::BlockQuantized(spec) = &mut wrong_abi.encoding {
+            spec.bytes_per_block += 1;
+        }
+        assert!(source.component(&wrong_abi).is_err());
+    }
+    drop(source);
+    for (region, expected) in retained {
+        assert_eq!(region.bytes(), expected);
+    }
+}
+
+#[test]
+fn native_source_rejects_truncated_payload_and_unknown_tensor_type() {
+    let file = native_fixture(&[NativeTensorFixture {
+        name: "truncated.weight",
+        ggml_type: 23,
+        dimensions: &[1, 256],
+        payload: &[0; 135],
+    }]);
+    assert!(GgufWeightComponentSource::open(file.path()).is_err());
+    let file = native_fixture(&[NativeTensorFixture {
+        name: "unknown.weight",
+        ggml_type: u32::MAX,
+        dimensions: &[1, 256],
+        payload: &[0; 136],
+    }]);
+    assert!(GgufWeightComponentSource::open(file.path()).is_err());
+}
+
 fn component(
     id: &str,
     external_name: &str,
