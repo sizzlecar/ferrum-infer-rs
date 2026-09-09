@@ -14,7 +14,9 @@ use serde::Serialize;
 use super::{block_quantization_format, GgmlDType};
 
 mod header;
+mod metadata;
 use header::{Header, TensorHeader};
+pub use metadata::GgufModelMetadata;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GgufTensorInventory {

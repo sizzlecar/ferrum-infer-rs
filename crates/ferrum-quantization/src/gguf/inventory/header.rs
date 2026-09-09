@@ -66,10 +66,13 @@ impl Header {
                 "general.architecture"
                     | "general.alignment"
                     | "general.quantization_version"
+                    | "general.source.repo_url"
+                    | "general.base_model.count"
                     | "split.no"
                     | "split.count"
                     | "split.tensors.count"
-            ) {
+            ) || base_model_repository_index(&key).is_some()
+            {
                 metadata.insert(key, reader.scalar(kind)?);
             } else {
                 reader.skip_value(kind, 0)?;
@@ -120,6 +123,14 @@ impl Header {
             data_offset: padded / alignment * alignment,
         })
     }
+}
+
+pub(super) fn base_model_repository_index(key: &str) -> Option<u64> {
+    let index = key
+        .strip_prefix("general.base_model.")?
+        .strip_suffix(".repo_url")?;
+    let parsed = index.parse::<u64>().ok()?;
+    (parsed.to_string() == index).then_some(parsed)
 }
 
 impl<R: Read + Seek> Reader<'_, R> {
