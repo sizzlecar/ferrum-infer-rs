@@ -305,6 +305,7 @@ impl CpuRegionSet<'_> {
         &self.guards[self.indices[index]].bytes()[self.regions[index].range.clone()]
     }
 
+    #[cfg(test)]
     pub(crate) fn write(&mut self, index: usize) -> &mut [u8] {
         &mut self.guards[self.indices[index]].bytes_mut()[self.regions[index].range.clone()]
     }
