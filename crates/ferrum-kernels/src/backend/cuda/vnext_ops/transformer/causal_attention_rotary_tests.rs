@@ -16,7 +16,7 @@ fn normalized(raw: &[f16], weights: Option<&[f16]>, epsilon: f32) -> Vec<f64> {
         .collect()
 }
 
-fn reference(
+pub(super) fn reference(
     raw: &[f16],
     weights: &[f16],
     shape: CausalAttentionShape,

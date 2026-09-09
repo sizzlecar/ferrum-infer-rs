@@ -81,8 +81,11 @@ mod moe_weights;
 #[cfg(feature = "vllm-moe-marlin")]
 mod moe_workspace;
 mod native_linear;
+mod native_matrix;
 mod native_swiglu;
 mod precision;
+#[cfg(test)]
+mod test_support;
 
 use precision::{ResidualPrecision, RmsNormPrecision};
 

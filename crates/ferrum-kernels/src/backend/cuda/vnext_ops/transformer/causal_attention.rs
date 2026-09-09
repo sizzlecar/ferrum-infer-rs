@@ -67,15 +67,22 @@ const PROVIDER_ID: &str = "provider.cuda.causal_paged_attention.f16";
 const ESTIMATOR_ID: &str = "resource-estimator.cuda.causal_paged_attention.f16";
 const GEMMA4_PROVIDER_ID: &str = "provider.cuda.gemma4_causal_paged_attention.f16";
 const GEMMA4_ESTIMATOR_ID: &str = "resource-estimator.cuda.gemma4_causal_paged_attention.f16";
-const RMS_NORM_FUNCTION: &str = "rms_norm_f16";
+#[cfg(test)]
+#[path = "causal_attention/numerical_tests.rs"]
+mod numerical_tests;
+mod precision;
+use super::native_matrix;
+use crate::backend::cuda::vnext_ops::native_blocks::CudaNativeBlockKernels;
+use ferrum_interfaces::vnext::{
+    causal_paged_attention_f32_master_contract, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+};
+use precision::CausalPrecision;
 const PREPARE_FUNCTION: &str = "vnext_causal_prepare_f16";
 const ATTENTION_FUNCTION: &str = "vnext_causal_attention_f16";
 const GROUPED_ATTENTION_FUNCTION: &str = "vnext_causal_attention_grouped_f16";
 const VARLEN_ADDRESSED_FUNCTION: &str = "vnext_paged_varlen_attn_vllm_addressed_f16";
 const VARLEN_TILED_ADDRESSED_FUNCTION: &str = "vnext_paged_varlen_attn_vllm_tiled_q4_addressed_f16";
 const ATTENTION_GATE_FUNCTION: &str = "qwen35_apply_attention_gate_f16";
-const RESIDUAL_ADD_FUNCTION: &str = "residual_add_f16";
-const RESIDUAL_ADD_INPLACE_FUNCTION: &str = "residual_add_inplace_f16";
 const COMPUTE_TOKEN_MAJOR_OPERATION: &str = "vnext.causal_attention.token_major_fallback";
 const COMPUTE_VLLM_FALLBACK_OPERATION: &str = "vnext.causal_attention.vllm_addressed_fallback";
 const COMPUTE_VLLM_VARLEN_OPERATION: &str = "vnext.causal_attention.vllm_varlen_addressed";
@@ -112,6 +119,7 @@ pub(in crate::backend::cuda::vnext_ops) struct CudaCausalPagedAttentionProvider 
     functions: CausalAttentionFunctions,
     attention_policy: AttentionExecutionPolicy,
     semantics: CausalAttentionSemantics,
+    precision: CausalPrecision,
     #[cfg(feature = "vllm-marlin")]
     projection_runtime: MarlinProjectionRuntime,
 }
@@ -158,6 +166,7 @@ impl CausalAttentionSemantics {
 
 #[derive(Clone)]
 struct CausalAttentionFunctions {
+    native: CudaNativeBlockKernels,
     rms_norm: CudaFunction,
     prepare: CudaFunction,
     attention: CudaFunction,
@@ -166,7 +175,7 @@ struct CausalAttentionFunctions {
     varlen_tiled_addressed: CudaFunction,
     attention_gate: CudaFunction,
     residual_add: CudaFunction,
-    residual_add_inplace: CudaFunction,
+    residual_add_inplace: Option<CudaFunction>,
 }
 
 impl CudaCausalPagedAttentionProvider {
@@ -186,6 +195,22 @@ impl CudaCausalPagedAttentionProvider {
             &contract,
             CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
             CausalAttentionSemantics::Standard,
+            CausalPrecision::F16,
+        )
+    }
+
+    pub(in crate::backend::cuda::vnext_ops) fn new_f32_master(
+        runtime: &CudaDeviceRuntime,
+        attention_policy: AttentionExecutionPolicy,
+    ) -> Result<Self, CudaDeviceRuntimeError> {
+        let contract = causal_paged_attention_f32_master_contract().map_err(contract_error)?;
+        Self::new_for_contract(
+            runtime,
+            attention_policy,
+            &contract,
+            CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+            CausalAttentionSemantics::Standard,
+            CausalPrecision::F32Master,
         )
     }
 
@@ -207,6 +232,7 @@ impl CudaCausalPagedAttentionProvider {
             contract,
             capability_id,
             CausalAttentionSemantics::Gemma4,
+            CausalPrecision::F16,
         )
     }
 
@@ -216,7 +242,13 @@ impl CudaCausalPagedAttentionProvider {
         contract: &dyn OperationContract,
         capability_id: &str,
         semantics: CausalAttentionSemantics,
+        precision: CausalPrecision,
     ) -> Result<Self, CudaDeviceRuntimeError> {
+        if semantics.has_post_attention_norm() && precision != CausalPrecision::F16 {
+            return Err(CudaDeviceRuntimeError::contract(
+                "post-normalized causal attention has no declared F32-master contract",
+            ));
+        }
         if !attention_policy.is_resolved() {
             return Err(CudaDeviceRuntimeError::contract(
                 "CUDA causal attention policy must be resolved before provider construction",
@@ -232,6 +264,12 @@ impl CudaCausalPagedAttentionProvider {
         let source = include_str!("causal_attention.rs");
         let mut provider_sources = vec![
             source.as_bytes(),
+            include_bytes!("causal_attention/precision.rs"),
+            include_bytes!("native_matrix.rs"),
+            include_bytes!("../native_blocks.rs"),
+            include_bytes!("../native_blocks/weights.rs"),
+            crate::ptx::VNEXT_GGUF.as_bytes(),
+            precision.provider_id(semantics).as_bytes(),
             crate::ptx::RMS_NORM.as_bytes(),
             crate::ptx::VNEXT_CAUSAL_ATTENTION.as_bytes(),
             crate::ptx::PAGED_VARLEN_ATTENTION_VLLM.as_bytes(),
@@ -262,7 +300,10 @@ impl CudaCausalPagedAttentionProvider {
         let provider_fingerprint = implementation_fingerprint(&provider_sources);
         let estimator_fingerprint = implementation_fingerprint(&[
             source.as_bytes(),
-            semantics.estimator_id().as_bytes(),
+            precision.estimator_id(semantics).as_bytes(),
+            include_bytes!("native_matrix.rs"),
+            include_bytes!("../native_blocks/weights.rs"),
+            include_bytes!("causal_attention/precision.rs"),
             semantics.fingerprint_tag(),
         ]);
         let mut provider_capabilities = BTreeSet::from([capability]);
@@ -270,7 +311,11 @@ impl CudaCausalPagedAttentionProvider {
             BTreeSet::from([
                 WeightFormatId::new(DENSE_SAFETENSORS_FORMAT_ID).map_err(contract_error)?
             ]);
-        let mut accepted_quantization_formats = BTreeSet::new();
+        let mut accepted_quantization_formats =
+            super::native_linear::quantization_formats().map_err(contract_error)?;
+        accepted_weight_formats.insert(
+            WeightFormatId::new("weight-format.gguf.native-block").map_err(contract_error)?,
+        );
         #[cfg(feature = "vllm-marlin")]
         {
             let fp8_marlin_capability =
@@ -363,7 +408,7 @@ impl CudaCausalPagedAttentionProvider {
             );
         }
         let descriptor = OperationProviderDescriptor::new(
-            ProviderId::new(semantics.provider_id()).map_err(contract_error)?,
+            ProviderId::new(precision.provider_id(semantics)).map_err(contract_error)?,
             contract.descriptor().id.clone(),
             contract
                 .descriptor()
@@ -377,7 +422,7 @@ impl CudaCausalPagedAttentionProvider {
             accepted_weight_formats,
             accepted_quantization_formats,
             storage_bindings(semantics).map_err(contract_error)?,
-            semantics.estimator_id(),
+            precision.estimator_id(semantics),
             ContractVersion::new(1, 0),
             estimator_fingerprint,
         )
@@ -414,7 +459,12 @@ impl CudaCausalPagedAttentionProvider {
                 CudaDeviceRuntimeError::driver("causal attention residual module", error)
             })?;
         let functions = CausalAttentionFunctions {
-            rms_norm: load_function(&rms_module, RMS_NORM_FUNCTION, "causal attention RMSNorm")?,
+            native: CudaNativeBlockKernels::load(runtime.context())?,
+            rms_norm: load_function(
+                &rms_module,
+                precision.rms_kernel(),
+                "causal attention RMSNorm",
+            )?,
             prepare: load_function(
                 &attention_module,
                 PREPARE_FUNCTION,
@@ -443,20 +493,22 @@ impl CudaCausalPagedAttentionProvider {
             )?,
             residual_add: load_function(
                 &residual_module,
-                RESIDUAL_ADD_FUNCTION,
+                precision.residual_kernel(),
                 "causal attention residual",
             )?,
-            residual_add_inplace: load_function(
-                &residual_module,
-                RESIDUAL_ADD_INPLACE_FUNCTION,
-                "causal attention in-place residual",
-            )?,
+            residual_add_inplace: precision
+                .inplace_residual_kernel()
+                .map(|name| {
+                    load_function(&residual_module, name, "causal attention in-place residual")
+                })
+                .transpose()?,
         };
         Ok(Self {
             descriptor,
             functions,
             attention_policy,
             semantics,
+            precision,
             #[cfg(feature = "vllm-marlin")]
             projection_runtime: MarlinProjectionRuntime::query(runtime)?,
         })
@@ -520,11 +572,12 @@ impl OperationResourceEstimator for CudaCausalPagedAttentionProvider {
         )?;
         let shape = CausalAttentionShape::from_attributes_for(request.attributes(), self.semantics)
             .map_err(invalid_plan)?;
-        #[cfg(feature = "vllm-marlin")]
-        let projection = CausalProjection::from_values(request.values(), self.projection_runtime)
-            .map_err(invalid_plan)?;
-        #[cfg(not(feature = "vllm-marlin"))]
-        let projection = CausalProjection::F16;
+        let projection = CausalProjection::from_values(
+            request.values(),
+            #[cfg(feature = "vllm-marlin")]
+            self.projection_runtime,
+        )
+        .map_err(invalid_plan)?;
         let scratch = ProviderWorkspaceRequirement::from_formula(
             ProviderWorkspaceSizeFormula::affine(
                 shape
@@ -602,6 +655,7 @@ impl OperationProvider<CudaDeviceRuntime> for CudaCausalPagedAttentionProvider {
             self.descriptor.provider_implementation_fingerprint(),
             self.attention_policy,
             self.semantics,
+            self.precision,
             self.descriptor.operation_id().as_str(),
             #[cfg(feature = "vllm-marlin")]
             self.projection_runtime,
@@ -1370,6 +1424,7 @@ fn causal_projection_abi(
 #[derive(Debug, Clone, Copy)]
 enum CausalProjection {
     F16,
+    Native,
     #[cfg(feature = "vllm-marlin")]
     MarlinFp8 {
         runtime: MarlinProjectionRuntime,
@@ -1381,33 +1436,42 @@ enum CausalProjection {
 }
 
 impl CausalProjection {
-    #[cfg(feature = "vllm-marlin")]
     fn from_values(
         values: &[ResolvedValueBinding],
-        runtime: MarlinProjectionRuntime,
+        #[cfg(feature = "vllm-marlin")] runtime: MarlinProjectionRuntime,
     ) -> Result<Self, String> {
-        let mut weights = Vec::with_capacity(4);
-        for ordinal in 2..=5 {
-            let value = binding(values, ResolvedValueRole::Input, ordinal)?;
-            let weight = value.weight().ok_or_else(|| {
-                format!(
+        if native_matrix::uses_native(values, &[2, 3, 4, 5])? {
+            return Ok(Self::Native);
+        }
+        #[cfg(not(feature = "vllm-marlin"))]
+        {
+            Ok(Self::F16)
+        }
+        #[cfg(feature = "vllm-marlin")]
+        {
+            let mut weights = Vec::with_capacity(4);
+            for ordinal in 2..=5 {
+                let value = binding(values, ResolvedValueRole::Input, ordinal)?;
+                let weight = value.weight().ok_or_else(|| {
+                    format!(
                     "causal attention projection input {ordinal} lacks its physical weight layout"
                 )
-            })?;
-            weights.push(causal_projection_weight_abi(
-                &weight.quantization_formats(),
-            )?);
+                })?;
+                weights.push(causal_projection_weight_abi(
+                    &weight.quantization_formats(),
+                )?);
+            }
+            Ok(match causal_projection_abi(weights)? {
+                CausalProjectionAbi::F16 => Self::F16,
+                CausalProjectionAbi::MarlinFp8 => Self::MarlinFp8 { runtime },
+                CausalProjectionAbi::MarlinInt4 => Self::MarlinInt4 { runtime },
+            })
         }
-        Ok(match causal_projection_abi(weights)? {
-            CausalProjectionAbi::F16 => Self::F16,
-            CausalProjectionAbi::MarlinFp8 => Self::MarlinFp8 { runtime },
-            CausalProjectionAbi::MarlinInt4 => Self::MarlinInt4 { runtime },
-        })
     }
 
     fn workspace_bytes(self) -> Result<u64, String> {
         match self {
-            Self::F16 => Ok(0),
+            Self::F16 | Self::Native => Ok(0),
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { runtime } | Self::MarlinInt4 { runtime } => runtime.workspace_bytes(),
         }
@@ -1424,6 +1488,7 @@ impl CausalProjection {
     fn replay_tag(self) -> &'static str {
         match self {
             Self::F16 => "f16-cublas",
+            Self::Native => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::MarlinFp8 { .. } => "mixed-fp8-marlin-f16-reduce",
             #[cfg(feature = "vllm-marlin")]
@@ -1573,7 +1638,7 @@ impl BindingLayout {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SharedRegions {
     input_norm: usize,
     query_weight: SharedProjectionWeight,
@@ -1587,8 +1652,9 @@ struct SharedRegions {
     binding: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum SharedProjectionWeight {
+    Native(native_matrix::SharedNativeMatrix),
     F16 {
         region: usize,
     },
@@ -1603,21 +1669,37 @@ enum SharedProjectionWeight {
 }
 
 impl SharedProjectionWeight {
-    fn replay_tag(self) -> &'static str {
-        match self {
+    fn replay_tag(&self) -> &'static str {
+        match *self {
             Self::F16 { .. } => "f16",
+            Self::Native(_) => "native-compressed",
             #[cfg(feature = "vllm-marlin")]
             Self::Marlin { weight_type, .. } => marlin_projection_replay_tag(weight_type),
         }
     }
 
     fn bind_replay_abi(
-        self,
+        &self,
         replay_key: CudaCommandReplayKeyBuilder,
     ) -> CudaCommandReplayKeyBuilder {
-        let replay_key = replay_key.bytes(self.replay_tag().as_bytes());
-        match self {
+        let mut replay_key = replay_key.bytes(self.replay_tag().as_bytes());
+        match *self {
             Self::F16 { .. } => replay_key.i32(0),
+            Self::Native(ref matrix) => {
+                replay_key = replay_key
+                    .u64(matrix.first_region as u64)
+                    .u64(matrix.parts.len() as u64);
+                for part in matrix.parts.iter() {
+                    replay_key = replay_key
+                        .u32(part.rows)
+                        .u32(part.columns)
+                        .u32(part.output_offset);
+                    for parameter in part.format.parameters() {
+                        replay_key = replay_key.u32(parameter);
+                    }
+                }
+                replay_key
+            }
             #[cfg(feature = "vllm-marlin")]
             Self::Marlin { group_size, .. } => replay_key.i32(group_size),
         }
@@ -1720,6 +1802,7 @@ fn encode_attention(
     provider_fingerprint: &str,
     attention_policy: AttentionExecutionPolicy,
     semantics: CausalAttentionSemantics,
+    precision: CausalPrecision,
     operation_id: &str,
     #[cfg(feature = "vllm-marlin")] projection_runtime: MarlinProjectionRuntime,
     invocation: BatchedOperationInvocation<'_, CudaDeviceBuffer>,
@@ -1729,11 +1812,12 @@ fn encode_attention(
     }
     let first = &invocation.participants()[0];
     let shape = CausalAttentionShape::from_attributes_for(first.attributes(), semantics)?;
-    #[cfg(feature = "vllm-marlin")]
-    let projection = CausalProjection::from_values(first.bindings(), projection_runtime)?;
-    #[cfg(not(feature = "vllm-marlin"))]
-    let projection = CausalProjection::F16;
-    validate_signature(first, shape, semantics)?;
+    let projection = CausalProjection::from_values(
+        first.bindings(),
+        #[cfg(feature = "vllm-marlin")]
+        projection_runtime,
+    )?;
+    validate_signature(first, shape, semantics, precision)?;
     for participant in &invocation.participants()[1..] {
         if CausalAttentionShape::from_attributes_for(participant.attributes(), semantics)? != shape
         {
@@ -1747,7 +1831,7 @@ fn encode_attention(
                 "CUDA causal attention participants use different projection ABIs".to_owned(),
             );
         }
-        validate_signature(participant, shape, semantics)?;
+        validate_signature(participant, shape, semantics, precision)?;
     }
     let program_binding = invocation.program_binding().cloned();
 
@@ -1819,7 +1903,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Input,
             0,
-            ElementType::F16,
+            precision.hidden(),
             total_tokens,
         )?);
         let output_region = compute_regions.len();
@@ -1827,7 +1911,7 @@ fn encode_attention(
             &invocation,
             ResolvedValueRole::Output,
             0,
-            ElementType::F16,
+            precision.hidden(),
             total_tokens,
         )?);
         Some(PackedCausalAttentionLaunch {
@@ -1866,7 +1950,7 @@ fn encode_attention(
             compute_regions.push(contiguous_token_region(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Input, 0)?,
-                ElementType::F16,
+                precision.hidden(),
                 if input_packed {
                     packed_range.start
                 } else {
@@ -1883,7 +1967,7 @@ fn encode_attention(
             compute_regions.push(contiguous_token_region(
                 participant,
                 binding(participant.bindings(), ResolvedValueRole::Output, 0)?,
-                ElementType::F16,
+                precision.hidden(),
                 if output_packed {
                     packed_range.start
                 } else {
@@ -2055,6 +2139,18 @@ fn encode_attention(
         shape.post_attention_norm,
         packed_enabled,
     );
+    let projection_extra = if packed_enabled {
+        native_projection_extra_dispatches(&shared, total_tokens)?
+    } else {
+        launches.iter().try_fold(0_u64, |total, launch| {
+            total
+                .checked_add(native_projection_extra_dispatches(&shared, launch.tokens)?)
+                .ok_or_else(|| "causal projection dispatch count overflows".to_owned())
+        })?
+    };
+    let compute_dispatch_count = compute_dispatch_count
+        .checked_add(projection_extra)
+        .ok_or_else(|| "causal compute dispatch count overflows".to_owned())?;
     let replay_key = launches
         .iter()
         .all(|launch| launch.replay_topology.is_partition_stable())
@@ -2149,7 +2245,7 @@ fn encode_attention(
                     cuda,
                     layout,
                     binding_layout,
-                    shared,
+                    &shared,
                     packed,
                     &launches,
                     regions,
@@ -2157,8 +2253,8 @@ fn encode_attention(
             } else {
                 for launch in &launches {
                     enqueue_attention(
-                        stream, blas, &functions, projection, shape, cuda, layout, shared, *launch,
-                        regions,
+                        stream, blas, &functions, projection, shape, cuda, layout, &shared,
+                        *launch, regions,
                     )?;
                 }
             }
@@ -2203,6 +2299,27 @@ fn encode_attention(
         binding_command,
         has_compiled_program_slot,
     ))
+}
+
+fn native_projection_extra_dispatches(shared: &SharedRegions, rows: u64) -> Result<u64, String> {
+    [
+        &shared.query_weight,
+        &shared.key_weight,
+        &shared.value_weight,
+        &shared.output_weight,
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, weight| {
+        let extra = match weight {
+            SharedProjectionWeight::Native(matrix) => {
+                native_matrix::dispatch_count(matrix.parts.len(), rows)? - 1
+            }
+            _ => 0,
+        };
+        total
+            .checked_add(extra)
+            .ok_or_else(|| "causal native projection dispatch count overflows".to_owned())
+    })
 }
 
 fn physical_dispatch_count(
@@ -2429,7 +2546,7 @@ fn enqueue_packed_attention(
     cuda: CudaCausalAttentionShape,
     layout: ScratchLayout,
     binding_layout: BindingLayout,
-    shared: SharedRegions,
+    shared: &SharedRegions,
     packed: PackedCausalAttentionLaunch,
     launches: &[CausalAttentionLaunch],
     regions: &[CudaBufferRegion],
@@ -2463,19 +2580,19 @@ fn enqueue_packed_attention(
     )?;
     for (weight, destination, out_features, operation) in [
         (
-            shared.query_weight,
+            &shared.query_weight,
             query_raw,
             cuda.query_projection_features,
             "packed causal attention Q GEMM",
         ),
         (
-            shared.key_weight,
+            &shared.key_weight,
             key_raw,
             cuda.kv_features,
             "packed causal attention K GEMM",
         ),
         (
-            shared.value_weight,
+            &shared.value_weight,
             value_raw,
             cuda.kv_features,
             "packed causal attention V GEMM",
@@ -2486,6 +2603,7 @@ fn enqueue_packed_attention(
             blas,
             projection,
             weight,
+            &functions.native,
             normalized,
             destination,
             scratch,
@@ -2607,7 +2725,8 @@ fn enqueue_packed_attention(
         stream,
         blas,
         projection,
-        shared.output_weight,
+        &shared.output_weight,
+        &functions.native,
         context,
         projected,
         scratch,
@@ -2645,7 +2764,7 @@ fn enqueue_packed_attention(
     launch_residual(
         stream,
         &functions.residual_add,
-        &functions.residual_add_inplace,
+        functions.residual_add_inplace.as_ref(),
         input,
         residual_branch,
         output,
@@ -2662,7 +2781,7 @@ fn enqueue_attention(
     logical: CausalAttentionShape,
     cuda: CudaCausalAttentionShape,
     layout: ScratchLayout,
-    shared: SharedRegions,
+    shared: &SharedRegions,
     launch: CausalAttentionLaunch,
     regions: &[CudaBufferRegion],
 ) -> Result<(), CudaDeviceRuntimeError> {
@@ -2701,19 +2820,19 @@ fn enqueue_attention(
     )?;
     for (weight, destination, out_features, operation) in [
         (
-            shared.query_weight,
+            &shared.query_weight,
             query_raw,
             cuda.query_projection_features,
             "causal attention Q GEMM",
         ),
         (
-            shared.key_weight,
+            &shared.key_weight,
             key_raw,
             cuda.kv_features,
             "causal attention K GEMM",
         ),
         (
-            shared.value_weight,
+            &shared.value_weight,
             value_raw,
             cuda.kv_features,
             "causal attention V GEMM",
@@ -2724,6 +2843,7 @@ fn enqueue_attention(
             blas,
             projection,
             weight,
+            &functions.native,
             normalized,
             destination,
             scratch,
@@ -2778,7 +2898,8 @@ fn enqueue_attention(
         stream,
         blas,
         projection,
-        shared.output_weight,
+        &shared.output_weight,
+        &functions.native,
         context,
         projected,
         scratch,
@@ -2816,7 +2937,7 @@ fn enqueue_attention(
     launch_residual(
         stream,
         &functions.residual_add,
-        &functions.residual_add_inplace,
+        functions.residual_add_inplace.as_ref(),
         input,
         residual_branch,
         output,
@@ -2829,7 +2950,8 @@ fn launch_causal_projection(
     stream: &CudaStream,
     blas: &CudaBlas,
     projection: CausalProjection,
-    weight: SharedProjectionWeight,
+    weight: &SharedProjectionWeight,
+    native: &CudaNativeBlockKernels,
     input: u64,
     output: u64,
     scratch: &CudaBufferRegion,
@@ -2840,7 +2962,18 @@ fn launch_causal_projection(
     input_features: i32,
     operation: &'static str,
 ) -> Result<(), CudaDeviceRuntimeError> {
-    match weight {
+    match *weight {
+        SharedProjectionWeight::Native(ref matrix) => native_matrix::launch(
+            stream,
+            native,
+            &matrix.parts,
+            &regions[matrix.first_region..matrix.first_region + matrix.parts.len()],
+            input,
+            output,
+            rows,
+            output_features,
+            input_features,
+        ),
         SharedProjectionWeight::F16 { region } => launch_gemm_f16(
             blas,
             input,
@@ -3400,7 +3533,7 @@ fn launch_rms_norm(
     unsafe {
         builder.launch(LaunchConfig {
             grid_dim: (rows, 1, 1),
-            block_dim: ((hidden_size as u32).min(1024), 1, 1),
+            block_dim: (super::rms_norm_threads(hidden_size), 1, 1),
             shared_mem_bytes: 0,
         })
     }
@@ -3411,7 +3544,7 @@ fn launch_rms_norm(
 fn launch_residual(
     stream: &CudaStream,
     function: &CudaFunction,
-    inplace_function: &CudaFunction,
+    inplace_function: Option<&CudaFunction>,
     input: u64,
     branch: u64,
     output: u64,
@@ -3427,7 +3560,7 @@ fn launch_residual(
         block_dim: (THREADS_PER_BLOCK, 1, 1),
         shared_mem_bytes: 0,
     };
-    let result = if input == output {
+    let result = if let Some(inplace_function) = inplace_function.filter(|_| input == output) {
         let mut builder = stream.launch_builder(inplace_function);
         builder.arg(&output);
         builder.arg(&branch);
@@ -3606,6 +3739,7 @@ fn validate_signature(
     participant: &OperationInvocation<'_, CudaDeviceBuffer>,
     shape: CausalAttentionShape,
     semantics: CausalAttentionSemantics,
+    precision: CausalPrecision,
 ) -> Result<(), String> {
     let value = |ordinal| binding(participant.bindings(), ResolvedValueRole::Input, ordinal);
     let hidden = value(0)?;
@@ -3638,8 +3772,10 @@ fn validate_signature(
     if *tokens == 0
         || *hidden_width != shape.hidden_size
         || output.tensor().dimensions() != [*tokens, shape.hidden_size]
-        || !f16_contiguous(hidden)
-        || !f16_contiguous(output)
+        || hidden.tensor().element_type() != precision.hidden()
+        || output.tensor().element_type() != precision.hidden()
+        || !matches!(hidden.tensor().layout(), ResolvedTensorLayout::Contiguous)
+        || !matches!(output.tensor().layout(), ResolvedTensorLayout::Contiguous)
         || expected.iter().any(|(binding, dimensions)| {
             binding.tensor().dimensions() != dimensions.as_slice() || !f16_contiguous(binding)
         })
@@ -3660,6 +3796,10 @@ fn push_shared_projection_weight(
             "causal attention projection input {ordinal} must have two logical dimensions"
         ));
     };
+    if native_matrix::uses_native(invocation.participants()[0].bindings(), &[2, 3, 4, 5])? {
+        return native_matrix::resolve_shared(regions, invocation, ordinal, logical_dimensions)
+            .map(SharedProjectionWeight::Native);
+    }
     #[cfg(feature = "vllm-marlin")]
     {
         let first_participant = &invocation.participants()[0];

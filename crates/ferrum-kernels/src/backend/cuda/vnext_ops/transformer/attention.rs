@@ -144,6 +144,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             precision.operation().as_bytes(),
             include_bytes!("attention/precision.rs"),
             include_bytes!("attention/native_projection.rs"),
+            include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             crate::ptx::VNEXT_GGUF.as_bytes(),
@@ -168,6 +169,7 @@ impl CudaGatedDeltaRecurrentAttentionProvider {
             source.as_bytes(),
             include_bytes!("attention/precision.rs"),
             include_bytes!("attention/native_projection.rs"),
+            include_bytes!("native_matrix.rs"),
             include_bytes!("../native_blocks/weights.rs"),
             precision.estimator().as_bytes(),
         ]);

@@ -103,8 +103,12 @@ fn mixed_composite_maps_component_identity_to_complete_logical_rows() {
 }
 
 #[test]
-fn native_matrix_rejects_strided_storage_and_wrong_quantized_axis() {
+fn native_matrix_accepts_explicit_contiguous_reshape_in_elements_and_blocks() {
     let mut source = schema();
+    let expected = parts(&source).unwrap();
+    // The raw file omits the singleton axis retained by the operation schema.
+    source.components[0].dimensions = vec![3, 2];
+    source.components[1].dimensions = vec![3, 512];
     let PhysicalWeightLayout::Composite { parts: children } =
         &mut source.tensors[0].physical_layout
     else {
@@ -115,6 +119,31 @@ fn native_matrix_rejects_strided_storage_and_wrong_quantized_axis() {
     };
     component.storage = PhysicalStorageLayout::Strided {
         strides_in_elements: vec![1536, 512, 1],
+        padding: PhysicalWeightPadding::Exact,
+    };
+    let PhysicalWeightLayout::BlockQuantized { blocks, .. } = children[1].layout.as_mut() else {
+        unreachable!()
+    };
+    blocks.storage = PhysicalStorageLayout::Strided {
+        strides_in_elements: vec![6, 2, 1],
+        padding: PhysicalWeightPadding::Exact,
+    };
+    assert_eq!(parts(&source).unwrap(), expected);
+}
+
+#[test]
+fn native_matrix_rejects_noncontiguous_storage_and_wrong_quantized_axis() {
+    let mut source = schema();
+    let PhysicalWeightLayout::Composite { parts: children } =
+        &mut source.tensors[0].physical_layout
+    else {
+        unreachable!()
+    };
+    let PhysicalWeightLayout::Stored { component } = children[0].layout.as_mut() else {
+        unreachable!()
+    };
+    component.storage = PhysicalStorageLayout::Strided {
+        strides_in_elements: vec![1536, 1, 3],
         padding: PhysicalWeightPadding::Exact,
     };
     assert!(parts(&source).is_err());
@@ -130,6 +159,26 @@ fn native_matrix_rejects_strided_storage_and_wrong_quantized_axis() {
     };
     *block_axis = 1;
     assert!(parts(&source).is_err());
+}
+
+#[test]
+fn native_matrix_storage_checks_stride_units_rank_and_extent() {
+    let storage = |strides| PhysicalStorageLayout::Strided {
+        strides_in_elements: strides,
+        padding: PhysicalWeightPadding::Exact,
+    };
+    // Singleton strides cannot change any addressed element.
+    assert!(exact_storage(&storage(vec![123, 512, 1]), &[1, 3, 512]).is_ok());
+    for (strides, shape) in [
+        (vec![513, 1], vec![3, 512]),
+        (vec![512, 2], vec![3, 512]),
+        (vec![512, 1], vec![1, 3, 512]),
+        (vec![512, 1], vec![3, 2]), // Blocks are not logical scalar elements.
+        (vec![1, 1], vec![0, 1]),
+        (vec![2, 1], vec![u64::MAX, 2]),
+    ] {
+        assert!(exact_storage(&storage(strides), &shape).is_err());
+    }
 }
 
 #[test]

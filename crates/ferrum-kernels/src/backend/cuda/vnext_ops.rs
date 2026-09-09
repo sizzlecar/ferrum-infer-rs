@@ -60,8 +60,10 @@ mod native_io;
 mod selection;
 mod transformer;
 use ferrum_interfaces::vnext::{
+    causal_paged_attention_f32_master_contract,
     gated_delta_recurrent_attention_f32_master_contract, last_token_dense_linear_f32_contract,
-    token_embedding_f32_master_contract, GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    token_embedding_f32_master_contract, CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
+    GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
     LAST_TOKEN_DENSE_LINEAR_F32_CAPABILITY_ID, TOKEN_EMBEDDING_F32_MASTER_CAPABILITY_ID,
 };
 use native_io::TokenPrecision;
@@ -104,6 +106,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer.rs").as_bytes(),
         include_str!("vnext_ops/transformer/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_linear.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/native_matrix.rs").as_bytes(),
         include_str!("vnext_ops/transformer/native_swiglu.rs").as_bytes(),
         include_str!("vnext_ops/native_blocks.rs").as_bytes(),
         include_str!("vnext_ops/native_io.rs").as_bytes(),
@@ -112,6 +115,7 @@ pub fn cuda_vnext_runtime_config(
         include_str!("vnext_ops/transformer/attention/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/attention/native_projection.rs").as_bytes(),
         include_str!("vnext_ops/transformer/causal_attention.rs").as_bytes(),
+        include_str!("vnext_ops/transformer/causal_attention/precision.rs").as_bytes(),
         include_str!("vnext_ops/transformer/gpt_oss_attention.rs").as_bytes(),
         crate::ptx::EMBEDDING_LOOKUP.as_bytes(),
         crate::ptx::ARGMAX_ROWS.as_bytes(),
@@ -202,6 +206,7 @@ pub fn cuda_vnext_capabilities() -> Result<BTreeSet<CapabilityId>, VNextError> {
         GATED_DELTA_RECURRENT_ATTENTION_F16_CAPABILITY_ID,
         GATED_DELTA_RECURRENT_ATTENTION_F32_MASTER_CAPABILITY_ID,
         CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
+        CAUSAL_PAGED_ATTENTION_F32_MASTER_CAPABILITY_ID,
         HYBRID_VNORM_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         GPT_OSS_CAUSAL_PAGED_ATTENTION_F16_CAPABILITY_ID,
         DEVICE_REUSABLE_EXECUTION_CAPABILITY_ID,
@@ -378,6 +383,7 @@ pub fn cuda_vnext_operation_registry(
         Box::new(gated_delta_recurrent_attention_contract().map_err(contract_error)?),
         Box::new(gated_delta_recurrent_attention_f32_master_contract().map_err(contract_error)?),
         Box::new(causal_paged_attention_contract().map_err(contract_error)?),
+        Box::new(causal_paged_attention_f32_master_contract().map_err(contract_error)?),
         Box::new(hybrid_vnorm_causal_paged_attention_contract().map_err(contract_error)?),
         Box::new(gpt_oss_causal_paged_attention_contract().map_err(contract_error)?),
     ];
@@ -420,6 +426,12 @@ pub fn cuda_vnext_operation_registry(
             runtime,
             runtime.attention_execution_policy(),
         )?),
+        Box::new(
+            transformer::CudaCausalPagedAttentionProvider::new_f32_master(
+                runtime,
+                runtime.attention_execution_policy(),
+            )?,
+        ),
         Box::new(transformer::CudaCausalPagedAttentionProvider::new_gemma4(
             runtime,
             runtime.attention_execution_policy(),
